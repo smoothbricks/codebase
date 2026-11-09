@@ -2530,7 +2530,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             } else {
                 RunSandboxMode::ReadWrite
             },
-            env: host_gate_environment(args.scope, std::env::vars_os())?,
+            env: host_gate_environment(args.scope, args.class, std::env::vars_os())?,
             trace: None,
             stdin,
             stdout_copy: args
@@ -2555,20 +2555,45 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
     })
 }
 
-/// A HostGate request carries the operator's ambient environment, including custom project
-/// variables, because its child starts from an empty environment. Other scopes forward nothing
-/// here, preserving ordinary Workspace behavior. The supervisor's existing caller_environment
-/// owns reserved/credential filtering; the public-name list limits records, not execution.
-/// The request carries UTF-8 names and values; an unrepresentable variable is refused, not dropped.
+/// A HostGate request carries the environment its child starts from, since that child starts
+/// from an empty one. At `gate` class it is a land's gate or a train's proof of one, and carries
+/// the declared commands' environment, the caller's identity and the host bootstrap `PATH`, so
+/// the proof runs as the land's gate will (02_workspaces.md "The declared commands' environment",
+/// 05_gateway.md "A train's proof is gate-class work"). At every other class it carries the
+/// operator's ambient environment, custom project variables included. Other scopes forward
+/// nothing here, preserving ordinary Workspace behavior. The supervisor's existing
+/// caller_environment owns reserved/credential filtering; the public-name list limits records,
+/// not execution. The request carries UTF-8 names and values; an unrepresentable variable is
+/// refused, not dropped.
 fn host_gate_environment(
     scope: cowshed_core::api::ExecScope,
+    class: cowshed_core::api::ExecClass,
     ambient: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<HashMap<String, String>> {
+    use cowshed_core::api::ExecClass;
     if scope != cowshed_core::api::ExecScope::HostGate {
         return Ok(HashMap::new());
     }
+    match class {
+        ExecClass::Gate => {
+            let ambient: HashMap<std::ffi::OsString, std::ffi::OsString> = ambient.collect();
+            utf8_environment(crate::declared_land::pure_environment(|name| {
+                ambient.get(std::ffi::OsStr::new(name)).cloned()
+            })?)
+        }
+        ExecClass::Background
+        | ExecClass::Interactive
+        | ExecClass::Resident
+        | ExecClass::InteractiveResident => utf8_environment(ambient),
+    }
+}
+
+/// The request's UTF-8 form of a host environment, refusing by name what it cannot carry.
+fn utf8_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<HashMap<String, String>> {
     let mut forwarded = HashMap::new();
-    for (name, value) in ambient {
+    for (name, value) in environment {
         let name = name.into_string().map_err(|_| {
             usage(
                 "the host gate forwards only UTF-8 environment names",
@@ -8151,8 +8176,12 @@ mod host_gate_environment_tests {
     #[test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
     fn host_controller_operator_environment_activates_the_checkout() {
-        let forwarded = host_gate_environment(ExecScope::HostGate, std::env::vars_os())
-            .expect("the operator's environment");
+        let forwarded = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Background,
+            std::env::vars_os(),
+        )
+        .expect("the operator's environment");
         let package = std::path::PathBuf::from(
             std::env::var_os("CARGO_MANIFEST_DIR").expect("runtime package root"),
         );
@@ -8172,8 +8201,75 @@ mod host_gate_environment_tests {
         );
     }
     use super::host_gate_environment;
-    use cowshed_core::api::ExecScope;
+    use cowshed_core::api::{ExecClass, ExecScope};
     use std::ffi::OsString;
+
+    /// A train's proof is its land's gate run early, and it runs as one (05_gateway.md "A train's
+    /// proof is gate-class work"): a gate-class host exec carries the declared commands'
+    /// environment (02_workspaces.md "The declared commands' environment"), never the agent
+    /// shell's. Measured 2026-11-09: a proof run from a shell holding a Nix stdenv's
+    /// `NIX_LDFLAGS`, `NIX_CC` and `LD` sent 297 native links past mbx's cache; sandboxed, 1.
+    /// Every other class at the host keeps the operator's environment.
+    #[test]
+    fn a_gate_class_host_exec_carries_the_declared_environment_not_the_callers() {
+        let operator = ambient(&[
+            ("PATH", "/nix/store/stdenv/bin:/usr/bin"),
+            ("HOME", "/Users/operator"),
+            ("USER", "operator"),
+            ("TERM", "xterm-256color"),
+            ("NIX_LDFLAGS", "-L/nix/store/libiconv/lib"),
+            ("NIX_CC", "/nix/store/clang-wrapper"),
+            ("LD", "ld"),
+            ("PROJECT_SETTING", "custom-value"),
+        ]);
+        let lookup = |name: &str| {
+            operator
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let declared: std::collections::HashMap<String, String> =
+            crate::declared_land::pure_environment(lookup)
+                .expect("the declared environment")
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.into_string().expect("a UTF-8 name"),
+                        value.into_string().expect("a UTF-8 value"),
+                    )
+                })
+                .collect();
+        let gate = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Gate,
+            operator.iter().cloned(),
+        )
+        .expect("a gate-class host environment");
+        assert_eq!(gate, declared);
+        for name in ["NIX_LDFLAGS", "NIX_CC", "LD", "PROJECT_SETTING"] {
+            assert!(
+                !gate.contains_key(name),
+                "{name} stays in the caller's shell"
+            );
+        }
+        assert_ne!(
+            gate.get("PATH").map(String::as_str),
+            Some("/nix/store/stdenv/bin:/usr/bin"),
+            "PATH is the bootstrap path, not the caller's"
+        );
+        assert_eq!(gate.get("USER").map(String::as_str), Some("operator"));
+
+        let background = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Background,
+            operator.iter().cloned(),
+        )
+        .expect("a background host environment");
+        assert_eq!(
+            background.get("NIX_LDFLAGS").map(String::as_str),
+            Some("-L/nix/store/libiconv/lib")
+        );
+    }
 
     fn ambient(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         pairs
@@ -8197,8 +8293,12 @@ mod host_gate_environment_tests {
             ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
             ("SDKROOT", "/operator/sdk"),
         ]);
-        let forwarded = host_gate_environment(ExecScope::HostGate, operator.iter().cloned())
-            .expect("a host gate environment");
+        let forwarded = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Background,
+            operator.iter().cloned(),
+        )
+        .expect("a host gate environment");
         let expected: std::collections::HashMap<String, String> = operator
             .iter()
             .map(|(name, value)| {
@@ -8210,9 +8310,13 @@ mod host_gate_environment_tests {
             .collect();
         assert_eq!(forwarded, expected);
         assert!(
-            host_gate_environment(ExecScope::Workspace, operator.into_iter())
-                .expect("an ordinary environment")
-                .is_empty()
+            host_gate_environment(
+                ExecScope::Workspace,
+                ExecClass::Background,
+                operator.into_iter()
+            )
+            .expect("an ordinary environment")
+            .is_empty()
         );
     }
 
@@ -8225,8 +8329,12 @@ mod host_gate_environment_tests {
             OsString::from("PROJECT_SETTING"),
             OsString::from_vec(vec![0xff, b'/']),
         )];
-        let error = host_gate_environment(ExecScope::HostGate, operator.into_iter())
-            .expect_err("a non-UTF-8 custom value cannot travel");
+        let error = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Background,
+            operator.into_iter(),
+        )
+        .expect_err("a non-UTF-8 custom value cannot travel");
         assert!(
             error.message.contains("PROJECT_SETTING"),
             "{}",
@@ -8243,8 +8351,12 @@ mod host_gate_environment_tests {
             ("PROJECT_SETTING", "custom-value"),
             ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
         ]);
-        let forwarded = host_gate_environment(ExecScope::HostGate, operator.into_iter())
-            .expect("a host gate environment");
+        let forwarded = host_gate_environment(
+            ExecScope::HostGate,
+            ExecClass::Background,
+            operator.into_iter(),
+        )
+        .expect("a host gate environment");
         assert!(cowshed_core::api::host_gate_env_name_allowed("PATH"));
         assert!(cowshed_core::api::host_gate_env_name_allowed("LC_CTYPE"));
         for name in ["PROJECT_SETTING", "SSL_CERT_FILE"] {

@@ -2947,7 +2947,7 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--host",
-            meaning: "run the argv once at the host boundary, outside the workspace sandbox, with the operator's environment and no session, at its own --class (background by default)",
+            meaning: "run the argv once at the host boundary, outside the workspace sandbox, with the operator's environment (the declared land's at --class gate) and no session, at its own --class (background by default)",
         },
     ],
 };

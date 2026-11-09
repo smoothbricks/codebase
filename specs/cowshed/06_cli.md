@@ -621,12 +621,14 @@ scheduler for something is a typed field of the API's exec request (07_api.md, "
 embedding process can ask for everything this command can.
 
 `--host` names where the command runs, not how it is scheduled. The argv runs once at the host boundary, outside the
-workspace sandbox and without shell activation, from an empty environment filled with the operator's own (07_api.md,
-"Task server scheduling and trusted host gates"). It composes with every `--class` and defaults to background like any
-exec: host unit work — a test that needs real APFS images or the host controller — runs at background nice +10 and waits
-out memory pressure like any background start (05_gateway.md, "Classes", "Memory pressure"), holds no install slot
-(05_gateway.md, "The install slot") and leaves the gate class to its lander. A land's gate asks for that class as
-`--class gate --host` (05_gateway.md, "A land is a gate job"). Unit work never passes `--class gate`.
+workspace sandbox and without shell activation, from an empty environment filled with the operator's own, except at
+`--class gate`: a gate at the host is a land's gate or a train's proof of one, and it gets the declared commands'
+environment instead (02_workspaces.md, "The declared commands' environment"; 07_api.md, "Task server scheduling and
+trusted host gates"). It composes with every `--class` and defaults to background like any exec: host unit work — a test
+that needs real APFS images or the host controller — runs at background nice +10 and waits out memory pressure like any
+background start (05_gateway.md, "Classes", "Memory pressure"), holds no install slot (05_gateway.md, "The install
+slot") and leaves the gate class to its lander. A land's gate asks for that class as `--class gate --host`
+(05_gateway.md, "A land is a gate job"). Unit work never passes `--class gate`.
 
 `--host` once required `--class gate`, because the host route was built for the land's real-APFS gate, and the tie made
 two things one. What keeps an unsandboxed command safe is its route, not its class: only the trusted coordinator route

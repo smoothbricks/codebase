@@ -2134,8 +2134,13 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
 - **A train's proof is gate-class work.** A train is the repository's next land: its owner proves the train's tree
   before asking for the land turn, so the land's own gate replays that proof from the Nx cache. That proof is the land's
   gate run early, and it runs as one: `cowshed exec <train> --class gate [--host] -- <gate command>`, from the trusted
-  route that alone grants the class. It takes no land turn, since nothing of it moves main. Ordinary unit work of a shed
-  that is no train stays background.
+  route that alone grants the class. It takes no land turn, since nothing of it moves main. Run at the host, it also
+  runs in the land's environment: a gate-class host exec carries the declared commands' environment (02_workspaces.md
+  "The declared commands' environment"), never its caller's shell (07_api.md "Task server scheduling and trusted host
+  gates"). Measured 2026-11-09: land-all-2's proof, run from an agent shell carrying a Nix stdenv's variables
+  (`NIX_LDFLAGS`, `NIX_BINTOOLS_WRAPPER_TARGET_HOST_*`, `NIX_CC`, `LD=ld`), sent 297 native links past mbx's cache as
+  `unportable-native-link`, and the same command sandboxed sent 1; in another repository's shed, one crate sent 16 at
+  the host and 0 sandboxed. Ordinary unit work of a shed that is no train stays background.
 - **Landing gets priority, never exclusivity.** No fork, attach, rebase, removal, release cleanup or other job waits for
   a gate to finish, and no agent holds work back, reads the host's load or keeps a quiet window for one. With mbx,
   low-priority work, unheld leaves and held jobs alike, continues through the same pool while normal-priority gate work

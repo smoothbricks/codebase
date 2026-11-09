@@ -2105,8 +2105,11 @@ session, and pairs with every class: it names where the command runs, and the cl
 worker gains host authority. The operator gate command explicitly selects its checkout environment. The host child
 starts from an empty environment and gets the ordinary request environment under the existing reserved/credential rules,
 its job's jobserver fifo and count, PWD and `NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md),
-not the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
-activation and overlays remain unchanged.
+not the supervisor's environment or authority. The CLI fills a HostGate request's environment by its class: at Gate, a
+land's gate or a train's proof of one, with the declared commands' environment (the caller's `HOME`, `USER`, `LOGNAME`,
+`TERM`, `LANG` and `SSH_AUTH_SOCK`, and the host bootstrap `PATH`; 02_workspaces.md "The declared commands'
+environment"), so the proof runs as the land's gate will; at every other class, with the operator's own, custom
+operator/project names included. Ordinary worker activation and overlays remain unchanged.
 
 The public environment-name policy is **record-only**, for **all scopes**: `JobAdmission.env` stores only
 `PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN BUN_INSTALL DEVELOPER_DIR` and

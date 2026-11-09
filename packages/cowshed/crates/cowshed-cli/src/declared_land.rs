@@ -84,7 +84,7 @@ where
 {
     let root = service.land_turn_root()?;
     let turn_directory = root.join(declaration.turn().as_str());
-    let environment = pure_environment()?;
+    let environment = pure_environment(|name| std::env::var_os(name))?;
     // Refuse before the turn what the land would refuse after its gate.
     let preflight = service
         .land(
@@ -639,16 +639,16 @@ pub(crate) fn declared_command(
     Ok(command)
 }
 
-/// The pure environment of this caller: its identity and the host bootstrap `PATH`.
-pub(crate) fn pure_environment() -> Result<Vec<(OsString, OsString)>> {
+/// The pure environment of a caller whose identity variables `caller` answers: that identity and
+/// the host bootstrap `PATH`.
+pub(crate) fn pure_environment(
+    caller: impl Fn(&str) -> Option<OsString>,
+) -> Result<Vec<(OsString, OsString)>> {
     let home = cowshed_core::gateway_sessions::canonical_home()?;
     let path = std::env::join_paths(declared::bootstrap_path(&home)).map_err(|error| {
         CowshedError::internal(format!("cannot build the bootstrap PATH: {error}"))
     })?;
-    Ok(declared::pure_environment(
-        |name| std::env::var_os(name),
-        path,
-    ))
+    Ok(declared::pure_environment(caller, path))
 }
 
 /// Step 3 starts from the push remote's head (02_workspaces.md "A declared land"). A writer that

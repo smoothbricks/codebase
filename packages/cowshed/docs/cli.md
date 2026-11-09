@@ -1757,9 +1757,12 @@ ended. On Linux the kernel does this itself: a background job's cgroup carries `
 exec request (07_api.md, "Exec and grants"), so the CLI asks for nothing an embedding process cannot.
 
 A host exec's child starts from an empty environment. `--host` carries the operator's environment, including custom
-operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing
-supervisor runtime rules withhold enrolled credentials and replace reserved jobserver variables with the job's own. A
-host exec still cannot name a session; an ordinary exec's environment is unchanged.
+operator and project variables, in the normal request, at every class but `gate`. A gate-class host exec is a land's
+gate or a train's proof of one, and carries the declared land's environment instead: the operator's `HOME`, `USER`,
+`LOGNAME`, `TERM`, `LANG` and `SSH_AUTH_SOCK`, and the host bootstrap `PATH`, nothing of the shell it was typed in.
+There is no execution environment-name allowlist: the existing supervisor runtime rules withhold enrolled credentials
+and replace reserved jobserver variables with the job's own. A host exec still cannot name a session; an ordinary exec's
+environment is unchanged.
 
 For every scope, keyed admission records contain only public environment names: `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `TMPDIR`, `LANG`, `TERM`, `TZ`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `BUN_INSTALL`, `DEVELOPER_DIR`

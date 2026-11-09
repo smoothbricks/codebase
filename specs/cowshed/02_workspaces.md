@@ -1313,7 +1313,11 @@ cowshed's directory, the host's Nix profile and program directories, the system 
 checkout as `direnv exec <main> <argv…>` when main has an `.envrc`, so it sees exactly main's devenv and never the
 caller's, and as `<argv…>` when it has none. It gets the held-command policies ("Held locks": `NX_DAEMON_START=never`,
 git's automatic gc, maintenance and fsmonitor off). The caller's environment is only identity: a gate that passes in one
-agent's shell and fails in another's has not gated anything.
+agent's shell and fails in another's has not gated anything. A train's proof, the land's gate run early as a gate-class
+host exec (05_gateway.md "A train's proof is gate-class work"), gets the same identity and bootstrap `PATH`; its argv
+runs as given in the train's checkout, so it names its own `direnv exec .`, and as every host exec it gets
+`NX_DAEMON_START=never` (07_api.md "Task server scheduling and trusted host gates"). It holds no lock, so the git
+policies of a held command do not apply to it.
 
 With `[land]` declared, a land into main refuses the primitive's caller-side options with exit 2 naming the route:
 `--check` (the declared gate is the check), `--target`, `--expected-workspace-incarnation`, `--expected-source-head`,

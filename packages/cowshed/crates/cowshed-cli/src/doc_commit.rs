@@ -87,7 +87,7 @@ where
         DocEdit::Patch(path) => Edit::Patch(read_input(Input::File(path))?),
         DocEdit::Icm(path) => Edit::Icm(read_input(Input::File(path))?),
     };
-    let environment = crate::declared_land::pure_environment()?;
+    let environment = crate::declared_land::pure_environment(|name| std::env::var_os(name))?;
     let icm = match &edit {
         Edit::Icm(_) => Some(icm_program()?),
         Edit::Patch(_) => None,
