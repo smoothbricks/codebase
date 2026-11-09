@@ -21,6 +21,11 @@ import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fix
  * started. A plugin worker is no command and makes none. Linux inotify has no such failure mode (no fseventsd between
  * the kernel and the watcher), so there the daemon only settles its watch before answering.
  *
+ * The daemon's first probe also proves the files it booted with. Its boot walk can predate a write its stream never
+ * reports: a daemon a shed's keeper starts while that shed's first check is writing an output booted without
+ * `a/generated.txt`, and no event for it came before the probe of the next check came back, so `a:test` was keyed on
+ * files that were not on disk. So the first probe of a daemon's life re-walks the files once it is back.
+ *
  * A host test: the dead stream is a daemon started under a Seatbelt profile that denies FSEvents, which `sandbox_apply`
  * refuses inside another sandbox, such as a cowshed job's.
  */
@@ -129,6 +134,26 @@ describe('the daemon answers from the files as they are when a request arrives',
         const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
         expect(log, 'the worker asked the daemon for files').toContain('Handled json message GLOB');
         expect(log.match(/watcher current: probe came back/g)?.length, log).toBe(1);
+      });
+    });
+    it('re-walks the files it booted with once its first probe comes back', async () => {
+      // A write the stream never reports, made after the daemon booted and before its first request: Nx's native watch
+      // drops its transient files (`_tmp_*_*`, `TRANSIENT_FILE_GLOBS`), which its walk still lists as project files.
+      // The cache holds the target's entry for the old bytes, from a run without a daemon, so a daemon answering from
+      // its boot walk calls the target cached.
+      await withNxFixture('nx-boot-walk-', async ({ workspace, socketDirectory }) => {
+        await fixtureWorkspace(workspace);
+        const unreported = join(workspace, 'p', '_tmp_input_1');
+        await writeFile(unreported, 'one\n');
+        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_TUI: 'false' };
+        expect((await copy(workspace, { ...env, NX_DAEMON: 'false' })).out, 'the run without a daemon').toBe('one\n');
+        const started = nx(workspace, env, [], 'daemon', '--start');
+        expect(started.status, started.output).toBe(0);
+        await writeFile(unreported, 'two\n');
+        const first = await copy(workspace, env);
+        expect(first.output, 'the stream is live').not.toContain('watcher stream stopped');
+        expect(first.output, 'no hit keyed on the boot walk').not.toContain('existing outputs match the cache');
+        expect(first.output, 'no restore keyed on the boot walk').not.toContain('[local cache]');
       });
     });
   }

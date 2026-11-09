@@ -1443,10 +1443,10 @@ index 12c1507aec3cf894bc18c680818bf76ec1533cca..00000000000000000000000000000000
 -}
 diff --git a/dist/src/daemon/server/file-watching/watch-probe.d.ts b/dist/src/daemon/server/file-watching/watch-probe.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..86526ad3fdf29ad815e3838deb54ae0442abadd3
+index 0000000000000000000000000000000000000000..30587ffc12d595af06589755d8455dab002218f0
 --- /dev/null
 +++ b/dist/src/daemon/server/file-watching/watch-probe.d.ts
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +import type { WatchEvent } from '../../../native';
 +/**
 + * The paths the daemon's watch must admit for its probes (`alwaysWatch`), to
@@ -1458,15 +1458,17 @@ index 0000000000000000000000000000000000000000..86526ad3fdf29ad815e3838deb54ae04
 +export declare function takeProbeEvents(events: WatchEvent[]): WatchEvent[];
 +/**
 + * Resolves `undefined` once everything written before the call has reached
-+ * the daemon, or the reason the watch's stream cannot be proven current.
++ * the daemon, or the reason the watch's stream cannot be proven current. The
++ * first call to resolve `undefined` also walks the files the daemon booted
++ * with again.
 + */
 +export declare function proveWatcherCurrent(): Promise<string | undefined>;
 diff --git a/dist/src/daemon/server/file-watching/watch-probe.js b/dist/src/daemon/server/file-watching/watch-probe.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..84f36a3e211cb168dc3c7d6e94157d542e6a1ec0
+index 0000000000000000000000000000000000000000..ca20d04762ecef4b49f9ab1ade15b1a5d1023739
 --- /dev/null
 +++ b/dist/src/daemon/server/file-watching/watch-probe.js
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,170 @@
 +'use strict';
 +Object.defineProperty(exports, '__esModule', { value: true });
 +exports.watchProbeAdmissions = watchProbeAdmissions;
@@ -1502,6 +1504,12 @@ index 0000000000000000000000000000000000000000..84f36a3e211cb168dc3c7d6e94157d54
 +let probeDirectory;
 +let streamStoppedReason;
 +let probeSequence = 0;
++// No event vouches for the daemon's boot walk: a write the walk read past
++// before the stream delivered it (a shed's first check writing an output while
++// the daemon its keeper started boots) reaches neither. The first probe that
++// comes back proves the stream from then on, so right after it the daemon
++// walks the files once more and routes what that walk finds changed.
++let bootWalkProven = false;
 +const probesAwaited = new Map();
 +function probeDirectoryInsideWorkspace() {
 +  const root = (0, node_fs_1.realpathSync)(workspace_root_1.workspaceRoot);
@@ -1620,6 +1628,11 @@ index 0000000000000000000000000000000000000000..84f36a3e211cb168dc3c7d6e94157d54
 +    logger_1.serverLogger.watcherLog(
 +      `watcher current: probe came back in ${(node_perf_hooks_1.performance.now() - writtenAt).toFixed(1)} ms`,
 +    );
++    if (!bootWalkProven) {
++      const changed = (0, project_graph_incremental_recomputation_1.rewalkWorkspaceChanges)();
++      bootWalkProven = true;
++      logger_1.serverLogger.watcherLog(`boot walk proven: the walk after the first probe found ${changed} files changed`);
++    }
 +    return undefined;
 +  } finally {
 +    probesAwaited.delete(probe);
@@ -1764,11 +1777,36 @@ index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba990
      if (latestNxTmpPath !== null) {
          logger_1.serverLogger.log('[LATEST-NX]: Reusing cached Nx installation from', latestNxTmpPath);
          return latestNxTmpPath;
+diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts b/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
+index 63638e921d68af659ca03f65e82a98c1e2e3f853..2e4f5cc7fb378f752a2539101659c36de509a84f 100644
+--- a/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
++++ b/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
+@@ -32,6 +32,12 @@ export declare function routeAppliedChanges(batch: ChangeBatch): void;
+  * saw is never missed.
+  */
+ export declare function flushPendingWorkspaceChanges(): Promise<void>;
++/**
++ * Walks the workspace's files again and routes what changed against the files
++ * the context held: for files no watch event vouches for, as the daemon's boot
++ * walk. Answers how many files changed.
++ */
++export declare function rewalkWorkspaceChanges(): number;
+ /**
+  * Applies changes a caller learned of on its own to the workspace context,
+  * then schedules the recomputation as for a batch the context applied.
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea29951cbc31f3 100644
+index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..a5a73e9d199a037493d91c9c16c85a06f9a697a9 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
 +++ b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-@@ -17,6 +17,7 @@ const error_types_1 = require("../../project-graph/error-types");
+@@ -4,6 +4,7 @@ exports.currentSourceMaps = exports.currentProjectGraph = exports.currentProject
+ exports.getCachedSerializedProjectGraphPromise = getCachedSerializedProjectGraphPromise;
+ exports.routeAppliedChanges = routeAppliedChanges;
+ exports.flushPendingWorkspaceChanges = flushPendingWorkspaceChanges;
++exports.rewalkWorkspaceChanges = rewalkWorkspaceChanges;
+ exports.scheduleProjectGraphRecomputation = scheduleProjectGraphRecomputation;
+ exports.scheduleInitialProjectGraphComputation = scheduleInitialProjectGraphComputation;
+ exports.registerProjectGraphRecomputationListener = registerProjectGraphRecomputationListener;
+@@ -17,6 +18,7 @@ const error_types_1 = require("../../project-graph/error-types");
  const file_map_utils_1 = require("../../project-graph/file-map-utils");
  const nx_deps_cache_1 = require("../../project-graph/nx-deps-cache");
  const get_plugins_1 = require("../../project-graph/plugins/get-plugins");
@@ -1776,7 +1814,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea2995
  const retrieve_workspace_files_1 = require("../../project-graph/utils/retrieve-workspace-files");
  const fileutils_1 = require("../../utils/fileutils");
  const workspace_context_1 = require("../../utils/workspace-context");
-@@ -77,7 +78,7 @@ function kickOffRecompute() {
+@@ -77,7 +79,7 @@ function kickOffRecompute() {
              // the plugin loader's) into one, so the snap hash and the plugin
              // set the compute uses always reflect the same disk state.
              const nxJson = (0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot);
@@ -1785,7 +1823,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea2995
              const plugins = await (0, get_plugins_1.getPluginsSeparated)(nxJson, workspace_root_1.workspaceRoot);
              // Plugin set we just loaded may already be stale vs disk.
              if (isStale(myPluginsHash))
-@@ -118,13 +119,13 @@ function isStale(expectedHash) {
+@@ -118,13 +120,13 @@ function isStale(expectedHash) {
   * pointer so awaiters chain onto it.
   */
  function chainToSuccessor(myPromise) {
@@ -1801,7 +1839,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea2995
  }
  async function getCachedSerializedProjectGraphPromise(socket) {
      // Subscribe the requesting client to the graph-construction topic
-@@ -238,13 +239,18 @@ function summarize(files) {
+@@ -238,13 +240,18 @@ function summarize(files) {
  }
  /**
   * Takes in changes the workspace context handed out: restarts the daemon if
@@ -1822,6 +1860,29 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..7b8e536cf989571698d2b693f9ea2995
          logger_1.serverLogger.watcherLog(`File changes detected (seq ${batch.seq}):\n` +
              `Created:\n${summarize((0, restart_checks_1.fileNames)(batch.createdFiles))}\n` +
              `Updated:\n${summarize((0, restart_checks_1.fileNames)(batch.updatedFiles))}\n` +
+@@ -268,6 +275,22 @@ async function flushPendingWorkspaceChanges() {
+     }
+     routeAppliedChanges(batch);
+ }
++/**
++ * Walks the workspace's files again and routes what changed against the files
++ * the context held: for files no watch event vouches for, as the daemon's boot
++ * walk. Answers how many files changed.
++ */
++function rewalkWorkspaceChanges() {
++    if (!(0, workspace_context_1.isWatchingWorkspaceContext)())
++        return 0;
++    (0, workspace_context_1.rescanWorkspaceContext)(workspace_root_1.workspaceRoot);
++    const batch = (0, workspace_context_1.takeAppliedWorkspaceChanges)(workspace_root_1.workspaceRoot);
++    if ((0, workspace_context_1.isEmptyBatch)(batch)) {
++        return 0;
++    }
++    routeAppliedChanges(batch);
++    return batch.createdFiles.length + batch.updatedFiles.length + batch.deletedFiles.length;
++}
+ /**
+  * Applies changes a caller learned of on its own to the workspace context,
+  * then schedules the recomputation as for a batch the context applied.
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178ccec8fbe42f 100644
 --- a/dist/src/daemon/server/restart-checks.d.ts
@@ -6631,11 +6692,36 @@ index 34dbaa2a5a44e6b7d1f69a516756b30939877bd7..09f95b73572a0d411f26d42aac2cfbf0
      }
  }
  exports.TaskHistory = TaskHistory;
+diff --git a/dist/src/utils/workspace-context.d.ts b/dist/src/utils/workspace-context.d.ts
+index 8a4b38e06755c303b2328ff9ef01d06f49a7c249..70397218ce0a137315732c6b7adfbb97758c2611 100644
+--- a/dist/src/utils/workspace-context.d.ts
++++ b/dist/src/utils/workspace-context.d.ts
+@@ -47,6 +47,12 @@ export declare function settleWorkspaceContext(workspaceRoot: string): ChangeBat
+  * watcher: for a caller that has just applied changes itself.
+  */
+ export declare function takeAppliedWorkspaceChanges(workspaceRoot: string): ChangeBatch;
++/**
++ * Walks the workspace again from the disk, never from another process's
++ * archive, and applies what the walk finds changed to the context: take those
++ * changes with `takeAppliedWorkspaceChanges`.
++ */
++export declare function rescanWorkspaceContext(workspaceRoot: string): void;
+ export declare function isWatchingWorkspaceContext(): boolean;
+ /**
+  * Listens for every event the context's watch delivers, including writes
 diff --git a/dist/src/utils/workspace-context.js b/dist/src/utils/workspace-context.js
-index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67ec169f5b8 100644
+index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..05de9601000f683210ef76c4939e925e11a5a6ed 100644
 --- a/dist/src/utils/workspace-context.js
 +++ b/dist/src/utils/workspace-context.js
-@@ -62,7 +62,7 @@ async function getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, use
+@@ -16,6 +16,7 @@ exports.getAllFileDataInContext = getAllFileDataInContext;
+ exports.subscribeToWorkspaceChanges = subscribeToWorkspaceChanges;
+ exports.settleWorkspaceContext = settleWorkspaceContext;
+ exports.takeAppliedWorkspaceChanges = takeAppliedWorkspaceChanges;
++exports.rescanWorkspaceContext = rescanWorkspaceContext;
+ exports.isWatchingWorkspaceContext = isWatchingWorkspaceContext;
+ exports.subscribeToWatchEvents = subscribeToWatchEvents;
+ exports.isEmptyBatch = isEmptyBatch;
+@@ -62,7 +63,7 @@ async function getNxWorkspaceFilesFromContext(workspaceRoot, projectRootMap, use
          await ensureFilesReady(workspaceRoot);
          return workspaceContext.getWorkspaceFiles(projectRootMap);
      }
@@ -6644,7 +6730,7 @@ index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67e
  }
  /**
   * Sync method to get files matching globs from workspace context.
-@@ -81,7 +81,7 @@ async function globWithWorkspaceContext(workspaceRoot, globs, exclude) {
+@@ -81,7 +82,7 @@ async function globWithWorkspaceContext(workspaceRoot, globs, exclude) {
          return workspaceContext.glob(globs, exclude);
      }
      else {
@@ -6653,7 +6739,7 @@ index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67e
      }
  }
  async function multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude) {
-@@ -89,21 +89,21 @@ async function multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude) {
+@@ -89,21 +90,21 @@ async function multiGlobWithWorkspaceContext(workspaceRoot, globs, exclude) {
          await ensureFilesReady(workspaceRoot);
          return workspaceContext.multiGlob(globs, exclude);
      }
@@ -6678,7 +6764,7 @@ index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67e
  }
  async function updateContextWithChangedFiles(workspaceRoot, createdFiles, updatedFiles, deletedFiles) {
      if (!client_1.daemonClient.enabled()) {
-@@ -117,7 +117,7 @@ async function updateContextWithChangedFiles(workspaceRoot, createdFiles, update
+@@ -117,7 +118,7 @@ async function updateContextWithChangedFiles(workspaceRoot, createdFiles, update
      }
      else {
          // daemon is enabled but we are not running on it, ask the daemon to update the context
@@ -6687,7 +6773,7 @@ index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67e
      }
  }
  /**
-@@ -147,7 +147,7 @@ async function getAllFileDataInContext(workspaceRoot) {
+@@ -147,7 +148,7 @@ async function getAllFileDataInContext(workspaceRoot) {
          await ensureFilesReady(workspaceRoot);
          return workspaceContext.allFileData();
      }
@@ -6696,7 +6782,23 @@ index 1b551e8dcab2b0b1e6ac46af9d46456e7b9a3eeb..bab5280fc705e522dfcc6aefe383f67e
  }
  /**
   * Listens for the changes a watching context applies: each change reaches the
-@@ -232,7 +232,7 @@ async function getFilesInDirectoryUsingContext(workspaceRoot, dir) {
+@@ -178,6 +179,15 @@ function takeAppliedWorkspaceChanges(workspaceRoot) {
+     ensureContextAvailable(workspaceRoot);
+     return workspaceContext.takeAppliedChanges();
+ }
++/**
++ * Walks the workspace again from the disk, never from another process's
++ * archive, and applies what the walk finds changed to the context: take those
++ * changes with `takeAppliedWorkspaceChanges`.
++ */
++function rescanWorkspaceContext(workspaceRoot) {
++    ensureContextAvailable(workspaceRoot);
++    workspaceContext.rescanAndDiff();
++}
+ function isWatchingWorkspaceContext() {
+     return !!contextOptions?.watch;
+ }
+@@ -232,7 +242,7 @@ async function getFilesInDirectoryUsingContext(workspaceRoot, dir) {
          await ensureFilesReady(workspaceRoot);
          return workspaceContext.getFilesInDirectory(dir);
      }

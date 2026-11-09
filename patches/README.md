@@ -828,6 +828,14 @@ no daemon between the kernel and the watcher that can stop serving it, and Nx re
 ignores where a probe could live; there the daemon only settles its watch, as Nx does before serving a graph, and an
 inotify overflow is Nx 24's own rescan.
 
+No event vouches for the daemon's boot walk. A write the walk read past before the stream delivered it reaches neither,
+and a later probe coming back does not bring it: a shed's keeper started the daemon while the shed's first check wrote
+`a/generated.txt`, no event for it arrived, and the next check's probe came back in 742–847 ms, so `a:test` was keyed
+without the file that was on disk (cowshed-cli `command_dispatch`'s Nx output-adoption cases). The first probe of a
+daemon's life that comes back therefore proves the stream from then on, and right after it the daemon walks the files
+once more, from the disk (`rescanAndDiff`, never another process's archive), and routes what that walk finds changed
+before it answers (`boot walk proven: … files changed`). Later probes walk nothing.
+
 Measured on macOS under Nx 23.2.1, a 47-task chain of cache hits: stock 0.51–0.82 s per run; patched 0.79–0.96 s, one
 probe of 63–103 ms per command. A probe before every file-state request cost 51 probes of 65–78 ms, 3.3–3.9 s per run,
 and was dropped. A burst of 20000 gitignored and 2000 tracked file writes cost the daemon 810–910 ms of CPU against
@@ -839,11 +847,12 @@ that denies FSEvents (which `sandbox_apply` refuses inside another sandbox) must
 `watcher stream stopped`, which continues without it, log it, and never call the changed input's target cached; a
 healthy daemon whose `.nxignore` hides every dot path must see its probe come back; and one whose workspace data and
 `node_modules` are linked from outside and has no `.git` must answer `cannot be proven current` and never serve a stale
-verdict. An isolated graph plugin that asks the daemon for files must leave one probe in the daemon's log, its
-command's. `nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a nested workspace whose `.gitignore` re-includes
-`keep.txt` under its parent repository's `*.txt`: a fresh walk indexes it, and the daemon must rebuild the target whose
-input it is once it changes. Drop the probe hunk only when the installed upstream watch reports a stopped stream,
-retaining the regression.
+verdict. A daemon whose input changed after it booted, in a file its watch never reports (`_tmp_*_*`, which its walk
+lists), must not call the target cached at its first command. An isolated graph plugin that asks the daemon for files
+must leave one probe in the daemon's log, its command's. `nx-daemon-watch-filter.test.ts` (an ordinary shard) holds a
+nested workspace whose `.gitignore` re-includes `keep.txt` under its parent repository's `*.txt`: a fresh walk indexes
+it, and the daemon must rebuild the target whose input it is once it changes. Drop the probe hunk only when the
+installed upstream watch reports a stopped stream, retaining the regression.
 
 ## Can the daemon hunks be dropped?
 
