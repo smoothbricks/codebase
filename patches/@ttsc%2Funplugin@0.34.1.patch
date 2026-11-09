@@ -1,0 +1,62 @@
+diff --git a/lib/core/transform/cache/createTransformCacheKey.js b/lib/core/transform/cache/createTransformCacheKey.js
+index e2cf154344e05f7cb4b3e1e99f83ca643b85e55d..03ba23c9a5d797605e20197183ce0c340d884c44 100644
+--- a/lib/core/transform/cache/createTransformCacheKey.js
++++ b/lib/core/transform/cache/createTransformCacheKey.js
+@@ -48,6 +48,12 @@ function createTransformCacheKey(props) {
+         plugins: JSON.stringify(props.plugins),
+         projectRoot: pathIdentityKey.pathIdentityKey(props.projectRoot ?? path.dirname(props.tsconfig), identities),
+         tsconfig: pathIdentityKey.pathIdentityKey(props.tsconfig, identities),
++        // smoothbricks patch: the compile runs under this process's environment
++        // (transformScratchEnvironment), and a plugin may lower by NODE_ENV
++        // (@smoothbricks/lmao-ttsc compiles trace statements away unless it is
++        // "test"), so a generation compiled under one value is no answer for
++        // another.
++        nodeEnv: process.env.NODE_ENV ?? null,
+     });
+ }
+ 
+diff --git a/lib/core/transform/cache/createTransformCacheKey.mjs b/lib/core/transform/cache/createTransformCacheKey.mjs
+index c405078d6a2b2b42f2244dd621be174a64e024a7..c7c222e98f57c90b1d8c656977838d43e671d771 100644
+--- a/lib/core/transform/cache/createTransformCacheKey.mjs
++++ b/lib/core/transform/cache/createTransformCacheKey.mjs
+@@ -46,6 +46,12 @@ function createTransformCacheKey(props) {
+         plugins: JSON.stringify(props.plugins),
+         projectRoot: pathIdentityKey(props.projectRoot ?? path.dirname(props.tsconfig), identities),
+         tsconfig: pathIdentityKey(props.tsconfig, identities),
++        // smoothbricks patch: the compile runs under this process's environment
++        // (transformScratchEnvironment), and a plugin may lower by NODE_ENV
++        // (@smoothbricks/lmao-ttsc compiles trace statements away unless it is
++        // "test"), so a generation compiled under one value is no answer for
++        // another.
++        nodeEnv: process.env.NODE_ENV ?? null,
+     });
+ }
+ 
+diff --git a/lib/core/transform/session/sharedCompileIdentity.js b/lib/core/transform/session/sharedCompileIdentity.js
+index ef517fae318b8ab716c187cc0c7e95d09bb5fa12..d68be76c897ef4d4ac17369e67c7815767511c3f 100644
+--- a/lib/core/transform/session/sharedCompileIdentity.js
++++ b/lib/core/transform/session/sharedCompileIdentity.js
+@@ -50,6 +50,9 @@ function sharedCompileIdentity(props) {
+         pluginSource.pluginBuildVersions(props.projectRoot),
+         unpluginVersion.unpluginVersion(),
+         `${process.platform}-${process.arch}`,
++        // smoothbricks patch: the NODE_ENV the compile runs under, which a
++        // plugin may lower by (see createTransformCacheKey).
++        process.env.NODE_ENV ?? null,
+     ]))
+         .digest("hex")
+         .slice(0, 32);
+diff --git a/lib/core/transform/session/sharedCompileIdentity.mjs b/lib/core/transform/session/sharedCompileIdentity.mjs
+index 023583732d66959964711b266e70f7c1c9d69660..b51e6b1fc34d26d7a67be8f551f2162550762b87 100644
+--- a/lib/core/transform/session/sharedCompileIdentity.mjs
++++ b/lib/core/transform/session/sharedCompileIdentity.mjs
+@@ -48,6 +48,9 @@ function sharedCompileIdentity(props) {
+         pluginBuildVersions(props.projectRoot),
+         unpluginVersion(),
+         `${process.platform}-${process.arch}`,
++        // smoothbricks patch: the NODE_ENV the compile runs under, which a
++        // plugin may lower by (see createTransformCacheKey).
++        process.env.NODE_ENV ?? null,
+     ]))
+         .digest("hex")
+         .slice(0, 32);

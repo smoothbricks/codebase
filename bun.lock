@@ -525,6 +525,7 @@
     "@uwdata/flechette@2.7.0": "patches/@uwdata%2Fflechette@2.7.0.patch",
     "ttsc@0.34.1": "patches/ttsc@0.34.1.patch",
     "scriptc@0.4.4": "patches/scriptc@0.4.4.patch",
+    "@ttsc/unplugin@0.34.1": "patches/@ttsc%2Funplugin@0.34.1.patch",
     "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",
     "typia@15.2.1": "patches/typia@15.2.1.patch",
     "nx@24.0.3": "patches/nx@24.0.3.patch",

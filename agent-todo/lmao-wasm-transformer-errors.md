@@ -126,6 +126,22 @@ four Deferred Work items that the 01q spec removed (WasmTracer, string pooling, 
   holding the two records compiles. Two colliding templates logged in one Op in one file each emit their own
   `$$lmaoVocabulary[n]` operand and resolve to their own text in the Arrow output.
 
+## The lmao-ttsc bun tests build the native plugin inside the test
+
+- Rule: a build a test needs is its own cached Nx target and the test target `dependsOn` it; the test only loads cached
+  bytes. A cold compile inside a test reads as a hung test and a compile error as a test red.
+- Code: `packages/lmao-ttsc/src/__tests__/bun-adapter.integration.test.ts` `beforeAll` runs `Bun.build` through the
+  `@ttsc/unplugin` adapter, and `trace-mode-cache.integration.test.ts` spawns `trace-mode-probe.ts`, which compiles
+  through the transform API. ttsc builds the linked plugin host from `plugin/driver` on first use ("building linked
+  plugin host … a cold Go cache can take several minutes"). `packages/lmao-ttsc/package.json` `test` depends only on
+  `...` and `go-test`, which builds Go test binaries, not the ttsc plugin host.
+- Work: add a `ttsc-plugin` target to lmao-ttsc whose command prepares the linked plugin host into `TTSC_CACHE_DIR`
+  (`.cache/ttsc-plugins`, the output `tooling/direnv/ttsc-env.sh` names for a repository's plugin build target), with
+  `plugin/**/*.go`, `plugin/go.mod`, `plugin.cjs`, the ttsc lock entry and `patches/ttsc@*.patch` as inputs and that
+  entry as its output; make `test` depend on it, as `smoo.typecheck.dependsOn` does for routed typechecks.
+- Acceptance: with a cold `.cache/ttsc-plugins`, `nx run lmao-ttsc:test` runs the plugin target first and no test output
+  prints "building linked plugin host".
+
 ## WASM memory follow-ups
 
 These were listed as open work in `specs/lmao/01q_wasm_memory_architecture.md` and now live here. Each is an
