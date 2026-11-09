@@ -32,9 +32,9 @@ const (
 )
 
 // traceEntriesFor maps the compile's NODE_ENV to its trace mode. Test runners
-// (bun test, vitest) set NODE_ENV=test before any transform runs, and ttsc hands
-// its compiler the host's environment; every other compile, NODE_ENV unset
-// included, is a production compile.
+// (bun test, vitest) set NODE_ENV=test before any transform runs, and the
+// plugin reads it through ttsc's tracked ctx.Env; every other compile, NODE_ENV
+// unset included, is a production compile.
 func traceEntriesFor(nodeEnv string) traceEntries {
 	if nodeEnv == "test" {
 		return traceEntriesKept

@@ -1,0 +1,718 @@
+diff --git a/lib/core/bridge/projectRecordArgumentsMatch.js b/lib/core/bridge/projectRecordArgumentsMatch.js
+index 9f35198e2af35d1fd355ae81dfb4cc859c98ba8a..a0d58c81046dc688e37d503f27f36f0086195d93 100644
+--- a/lib/core/bridge/projectRecordArgumentsMatch.js
++++ b/lib/core/bridge/projectRecordArgumentsMatch.js
+@@ -2,6 +2,7 @@
+ 
+ var captureCompilerArguments = require('../transform/tsconfig/captureCompilerArguments.js');
+ var resolveCompilerEnvironment = require('../transform/tsconfig/resolveCompilerEnvironment.js');
++var environmentInputMismatch = require('../transform/validation/environmentInputMismatch.js');
+ 
+ /**
+  * Require a record's captured invocation to match the current host context.
+@@ -9,13 +10,16 @@ var resolveCompilerEnvironment = require('../transform/tsconfig/resolveCompilerE
+  * A supplied identity describes the active adapter's explicit override too.
+  * Generic detached readers instead replay the recorded override against current
+  * inheritance. Older records lack that authority and require a new delivery.
++ * Every environment variable the generation's plugins read must also still have
++ * its recorded value, or stay unset, in the current compiler environment: the
++ * record stands for output those reads produced.
+  *
+- * @evidence contracts/common.md#principled-implementation Recorded effective arguments must match the active context or a current derivation using the recorded override; absent witnesses never certify unknown prior arguments.
++ * @evidence contracts/common.md#principled-implementation Recorded effective arguments must match the active context or a current derivation using the recorded override, and recorded environment reads must hold in the current compiler environment; absent witnesses never certify unknown prior arguments.
+  * @evidence contracts/common.md#clear-and-simple-design One predicate serves detached proof and watching bridge admission before filesystem evidence can authorize host cache restoration.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts Malformed inherited transport declines reuse rather than restoring a result compiled under different permission.
+- * @evidence contracts/common.md#meaningful-documentation Native prose states active versus generic comparison and legacy migration.
+- * @evidence contracts/portability.md#os-neutral-implementation The shared environment owner applies native Windows name selection and preserves argv/cwd spelling without platform guesses.
+- * @evidence contracts/performance.md#efficient-algorithms An active digest requires scalar comparison; generic replay additionally snapshots environment keys and encodes/hashes argument bytes through existing owners.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Malformed inherited transport declines reuse rather than restoring a result compiled under different permission, and a changed environment read is not excused by matching argument transport.
++ * @evidence contracts/common.md#meaningful-documentation Native prose states active versus generic comparison, environment reads and legacy migration.
++ * @evidence contracts/portability.md#os-neutral-implementation The shared environment owner applies native Windows name selection and preserves argv/cwd spelling without platform guesses; recorded reads compare under the same native name rule.
++ * @evidence contracts/performance.md#efficient-algorithms An active digest requires scalar comparison; generic replay additionally snapshots environment keys and encodes/hashes argument bytes through existing owners. Recorded reads add one environment snapshot and a lookup per name, only when the record carries any.
+  * @evidenceExclude contracts/performance.md#reuse-equivalent-work Current inheritance is observed on each generic proof; no prior environment verdict is retained.
+  * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Only call-local environment/encoding data is allocated; the record owner retains the witness.
+  */
+@@ -23,9 +27,12 @@ function projectRecordArgumentsMatch(record, currentIdentity) {
+     if (record.compilerArguments === undefined)
+         return false;
+     try {
+-        return (record.compilerArguments.identity ===
++        if (record.compilerArguments.identity !==
+             (currentIdentity ??
+-                captureCompilerArguments.captureCompilerArguments(resolveCompilerEnvironment.resolveCompilerEnvironment(record.compilerArguments.runExternalCode)).identity));
++                captureCompilerArguments.captureCompilerArguments(resolveCompilerEnvironment.resolveCompilerEnvironment(record.compilerArguments.runExternalCode)).identity))
++            return false;
++        return (record.environmentInputs === undefined ||
++            environmentInputMismatch.environmentInputMismatch(record.environmentInputs, resolveCompilerEnvironment.resolveCompilerEnvironment(record.compilerArguments.runExternalCode)) === undefined);
+     }
+     catch {
+         return false;
+diff --git a/lib/core/bridge/projectRecordArgumentsMatch.mjs b/lib/core/bridge/projectRecordArgumentsMatch.mjs
+index 7895796b09f3a3bf8a75978bc9f8ae2db6e9765e..7d9381413f77fb159631f91bbbe6f1d90058a069 100644
+--- a/lib/core/bridge/projectRecordArgumentsMatch.mjs
++++ b/lib/core/bridge/projectRecordArgumentsMatch.mjs
+@@ -1,5 +1,6 @@
+ import { captureCompilerArguments } from '../transform/tsconfig/captureCompilerArguments.mjs';
+ import { resolveCompilerEnvironment } from '../transform/tsconfig/resolveCompilerEnvironment.mjs';
++import { environmentInputMismatch } from '../transform/validation/environmentInputMismatch.mjs';
+ 
+ /**
+  * Require a record's captured invocation to match the current host context.
+@@ -7,13 +8,16 @@ import { resolveCompilerEnvironment } from '../transform/tsconfig/resolveCompile
+  * A supplied identity describes the active adapter's explicit override too.
+  * Generic detached readers instead replay the recorded override against current
+  * inheritance. Older records lack that authority and require a new delivery.
++ * Every environment variable the generation's plugins read must also still have
++ * its recorded value, or stay unset, in the current compiler environment: the
++ * record stands for output those reads produced.
+  *
+- * @evidence contracts/common.md#principled-implementation Recorded effective arguments must match the active context or a current derivation using the recorded override; absent witnesses never certify unknown prior arguments.
++ * @evidence contracts/common.md#principled-implementation Recorded effective arguments must match the active context or a current derivation using the recorded override, and recorded environment reads must hold in the current compiler environment; absent witnesses never certify unknown prior arguments.
+  * @evidence contracts/common.md#clear-and-simple-design One predicate serves detached proof and watching bridge admission before filesystem evidence can authorize host cache restoration.
+- * @evidence contracts/common.md#prohibited-implementation-shortcuts Malformed inherited transport declines reuse rather than restoring a result compiled under different permission.
+- * @evidence contracts/common.md#meaningful-documentation Native prose states active versus generic comparison and legacy migration.
+- * @evidence contracts/portability.md#os-neutral-implementation The shared environment owner applies native Windows name selection and preserves argv/cwd spelling without platform guesses.
+- * @evidence contracts/performance.md#efficient-algorithms An active digest requires scalar comparison; generic replay additionally snapshots environment keys and encodes/hashes argument bytes through existing owners.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts Malformed inherited transport declines reuse rather than restoring a result compiled under different permission, and a changed environment read is not excused by matching argument transport.
++ * @evidence contracts/common.md#meaningful-documentation Native prose states active versus generic comparison, environment reads and legacy migration.
++ * @evidence contracts/portability.md#os-neutral-implementation The shared environment owner applies native Windows name selection and preserves argv/cwd spelling without platform guesses; recorded reads compare under the same native name rule.
++ * @evidence contracts/performance.md#efficient-algorithms An active digest requires scalar comparison; generic replay additionally snapshots environment keys and encodes/hashes argument bytes through existing owners. Recorded reads add one environment snapshot and a lookup per name, only when the record carries any.
+  * @evidenceExclude contracts/performance.md#reuse-equivalent-work Current inheritance is observed on each generic proof; no prior environment verdict is retained.
+  * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Only call-local environment/encoding data is allocated; the record owner retains the witness.
+  */
+@@ -21,9 +25,12 @@ function projectRecordArgumentsMatch(record, currentIdentity) {
+     if (record.compilerArguments === undefined)
+         return false;
+     try {
+-        return (record.compilerArguments.identity ===
++        if (record.compilerArguments.identity !==
+             (currentIdentity ??
+-                captureCompilerArguments(resolveCompilerEnvironment(record.compilerArguments.runExternalCode)).identity));
++                captureCompilerArguments(resolveCompilerEnvironment(record.compilerArguments.runExternalCode)).identity))
++            return false;
++        return (record.environmentInputs === undefined ||
++            environmentInputMismatch(record.environmentInputs, resolveCompilerEnvironment(record.compilerArguments.runExternalCode)) === undefined);
+     }
+     catch {
+         return false;
+diff --git a/lib/core/bridge/readProjectRecordFile.js b/lib/core/bridge/readProjectRecordFile.js
+index 481540b0ecd74984c497eef5c3ab7dbe3025901c..ec80eedb5f99d1ac7f092f61f74e07d37a138d2f 100644
+--- a/lib/core/bridge/readProjectRecordFile.js
++++ b/lib/core/bridge/readProjectRecordFile.js
+@@ -50,7 +50,10 @@ function readProjectRecordFile(file) {
+         !isMembership(candidate.membership) ||
+         (candidate.compilerArguments !== undefined &&
+             !isCompilerArguments(candidate.compilerArguments)) ||
+-        (candidate.dependencies !== undefined && !isStrings(candidate.dependencies))) {
++        (candidate.dependencies !== undefined &&
++            !isStrings(candidate.dependencies)) ||
++        (candidate.environmentInputs !== undefined &&
++            !isEnvironmentInputs(candidate.environmentInputs))) {
+         return undefined;
+     }
+     return {
+@@ -60,6 +63,9 @@ function readProjectRecordFile(file) {
+         ...(candidate.dependencies === undefined
+             ? {}
+             : { dependencies: candidate.dependencies }),
++        ...(candidate.environmentInputs === undefined
++            ? {}
++            : { environmentInputs: candidate.environmentInputs }),
+         inputs: candidate.inputs,
+         membership: candidate.membership,
+         root: candidate.root,
+@@ -67,6 +73,11 @@ function readProjectRecordFile(file) {
+         tsconfig: candidate.tsconfig,
+     };
+ }
++/** Recorded environment reads: names to the value read, or null when unset. */
++function isEnvironmentInputs(value) {
++    return (isRecord(value) &&
++        Object.values(value).every((recorded) => recorded === null || typeof recorded === "string"));
++}
+ /** A JSON dictionary, excluding arrays and null. */
+ function isRecord(value) {
+     return typeof value === "object" && value !== null && !Array.isArray(value);
+diff --git a/lib/core/bridge/readProjectRecordFile.mjs b/lib/core/bridge/readProjectRecordFile.mjs
+index f96630cdaae03a41df6a29eb39070f5770e38f56..05c06a52451409c92bc819a1b5d49c3e65e02dc3 100644
+--- a/lib/core/bridge/readProjectRecordFile.mjs
++++ b/lib/core/bridge/readProjectRecordFile.mjs
+@@ -48,7 +48,10 @@ function readProjectRecordFile(file) {
+         !isMembership(candidate.membership) ||
+         (candidate.compilerArguments !== undefined &&
+             !isCompilerArguments(candidate.compilerArguments)) ||
+-        (candidate.dependencies !== undefined && !isStrings(candidate.dependencies))) {
++        (candidate.dependencies !== undefined &&
++            !isStrings(candidate.dependencies)) ||
++        (candidate.environmentInputs !== undefined &&
++            !isEnvironmentInputs(candidate.environmentInputs))) {
+         return undefined;
+     }
+     return {
+@@ -58,6 +61,9 @@ function readProjectRecordFile(file) {
+         ...(candidate.dependencies === undefined
+             ? {}
+             : { dependencies: candidate.dependencies }),
++        ...(candidate.environmentInputs === undefined
++            ? {}
++            : { environmentInputs: candidate.environmentInputs }),
+         inputs: candidate.inputs,
+         membership: candidate.membership,
+         root: candidate.root,
+@@ -65,6 +71,11 @@ function readProjectRecordFile(file) {
+         tsconfig: candidate.tsconfig,
+     };
+ }
++/** Recorded environment reads: names to the value read, or null when unset. */
++function isEnvironmentInputs(value) {
++    return (isRecord(value) &&
++        Object.values(value).every((recorded) => recorded === null || typeof recorded === "string"));
++}
+ /** A JSON dictionary, excluding arrays and null. */
+ function isRecord(value) {
+     return typeof value === "object" && value !== null && !Array.isArray(value);
+diff --git a/lib/core/transform/cache/selectCachedGenerationAction.js b/lib/core/transform/cache/selectCachedGenerationAction.js
+index 84d809206a07ed568d1d36415e29f9bb85734b73..4055994691f4766453fea5a8a1770f2ed7413970 100644
+--- a/lib/core/transform/cache/selectCachedGenerationAction.js
++++ b/lib/core/transform/cache/selectCachedGenerationAction.js
+@@ -2,6 +2,7 @@
+ 
+ var envelopeDerivation = require('../envelope/envelopeDerivation.js');
+ var isVolatileFile = require('../envelope/isVolatileFile.js');
++var environmentInputMismatch = require('../validation/environmentInputMismatch.js');
+ var matchesCachedSource = require('../validation/matchesCachedSource.js');
+ var evictGeneration = require('./evictGeneration.js');
+ 
+@@ -11,11 +12,14 @@ var evictGeneration = require('./evictGeneration.js');
+  * The caller owns awaiting, Promise-ownership checks and required native
+  * notification settling. A volatile or mismatching generation is evicted by
+  * identity; if eviction exposed a sibling replacement, the caller retries it.
+- * Otherwise the caller must capture a new generation. A serving decision does
+- * not perform output selection or host notification, which remain with
+- * delivery.
++ * Otherwise the caller must capture a new generation. A generation whose
++ * plugins read an environment variable that `environment`, the delivery's
++ * compiler environment snapshot, no longer gives the recorded value is
++ * mismatching on every path, the pass-shared first delivery included: no file
++ * proof can stand in for it. A serving decision does not perform output
++ * selection or host notification, which remain with delivery.
+  *
+- * @evidence contracts/common.md#principled-implementation The actual generation's volatility and recorded source proof decide serving; identity-guarded eviction then distinguishes a sibling's current replacement from an empty capture slot.
++ * @evidence contracts/common.md#principled-implementation The actual generation's volatility, recorded environment reads and recorded source proof decide serving; identity-guarded eviction then distinguishes a sibling's current replacement from an empty capture slot.
+  * @evidence contracts/common.md#clear-and-simple-design One synchronous operation selects serve/retry/capture and owns mismatch eviction, while its production caller owns awaiting, notification settling, native capture and output delivery.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts Decisions inspect the supplied actual generation and validators without fabricating a producer result, capability or success; no injectable compiler callback or test-only branch is introduced.
+  * @evidence contracts/common.md#meaningful-documentation Native prose states the caller's awaited-Promise and settled-notification responsibilities and separates the decision from producer and delivery effects.
+@@ -35,11 +39,14 @@ var evictGeneration = require('./evictGeneration.js');
+  * @evidence contracts/portability.md#os-neutral-implementation Generation derivation and source validation retain their actual filesystem identity and compiler policy; this coordinator adds no platform inference or path rewriting.
+  */
+ function selectCachedGenerationAction(props) {
+-    if (!isVolatileFile.isVolatileFile(envelopeDerivation.envelopeDerivation(props.cached), {
+-        file: props.file,
+-        projectRoot: props.cached.projectRoot,
+-        result: props.cached.result,
+-    }) &&
++    if (environmentInputMismatch.environmentInputMismatch(props.cached.result.type === "exception"
++        ? undefined
++        : props.cached.result.environmentInputs, props.environment) === undefined &&
++        !isVolatileFile.isVolatileFile(envelopeDerivation.envelopeDerivation(props.cached), {
++            file: props.file,
++            projectRoot: props.cached.projectRoot,
++            result: props.cached.result,
++        }) &&
+         matchesCachedSource.matchesCachedSource(props.cached, props.file, props.source, props.epoch, props.proof, props.reportDivergence)) {
+         return "serve";
+     }
+diff --git a/lib/core/transform/cache/selectCachedGenerationAction.mjs b/lib/core/transform/cache/selectCachedGenerationAction.mjs
+index b75a1c43e6a25b9ed57d39aac7254705cfb75a74..81e6d06ca4c013ac3f11a925fba03008cf9de98d 100644
+--- a/lib/core/transform/cache/selectCachedGenerationAction.mjs
++++ b/lib/core/transform/cache/selectCachedGenerationAction.mjs
+@@ -1,5 +1,6 @@
+ import { envelopeDerivation } from '../envelope/envelopeDerivation.mjs';
+ import { isVolatileFile } from '../envelope/isVolatileFile.mjs';
++import { environmentInputMismatch } from '../validation/environmentInputMismatch.mjs';
+ import { matchesCachedSource } from '../validation/matchesCachedSource.mjs';
+ import { evictGeneration } from './evictGeneration.mjs';
+ 
+@@ -9,11 +10,14 @@ import { evictGeneration } from './evictGeneration.mjs';
+  * The caller owns awaiting, Promise-ownership checks and required native
+  * notification settling. A volatile or mismatching generation is evicted by
+  * identity; if eviction exposed a sibling replacement, the caller retries it.
+- * Otherwise the caller must capture a new generation. A serving decision does
+- * not perform output selection or host notification, which remain with
+- * delivery.
++ * Otherwise the caller must capture a new generation. A generation whose
++ * plugins read an environment variable that `environment`, the delivery's
++ * compiler environment snapshot, no longer gives the recorded value is
++ * mismatching on every path, the pass-shared first delivery included: no file
++ * proof can stand in for it. A serving decision does not perform output
++ * selection or host notification, which remain with delivery.
+  *
+- * @evidence contracts/common.md#principled-implementation The actual generation's volatility and recorded source proof decide serving; identity-guarded eviction then distinguishes a sibling's current replacement from an empty capture slot.
++ * @evidence contracts/common.md#principled-implementation The actual generation's volatility, recorded environment reads and recorded source proof decide serving; identity-guarded eviction then distinguishes a sibling's current replacement from an empty capture slot.
+  * @evidence contracts/common.md#clear-and-simple-design One synchronous operation selects serve/retry/capture and owns mismatch eviction, while its production caller owns awaiting, notification settling, native capture and output delivery.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts Decisions inspect the supplied actual generation and validators without fabricating a producer result, capability or success; no injectable compiler callback or test-only branch is introduced.
+  * @evidence contracts/common.md#meaningful-documentation Native prose states the caller's awaited-Promise and settled-notification responsibilities and separates the decision from producer and delivery effects.
+@@ -33,11 +37,14 @@ import { evictGeneration } from './evictGeneration.mjs';
+  * @evidence contracts/portability.md#os-neutral-implementation Generation derivation and source validation retain their actual filesystem identity and compiler policy; this coordinator adds no platform inference or path rewriting.
+  */
+ function selectCachedGenerationAction(props) {
+-    if (!isVolatileFile(envelopeDerivation(props.cached), {
+-        file: props.file,
+-        projectRoot: props.cached.projectRoot,
+-        result: props.cached.result,
+-    }) &&
++    if (environmentInputMismatch(props.cached.result.type === "exception"
++        ? undefined
++        : props.cached.result.environmentInputs, props.environment) === undefined &&
++        !isVolatileFile(envelopeDerivation(props.cached), {
++            file: props.file,
++            projectRoot: props.cached.projectRoot,
++            result: props.cached.result,
++        }) &&
+         matchesCachedSource(props.cached, props.file, props.source, props.epoch, props.proof, props.reportDivergence)) {
+         return "serve";
+     }
+diff --git a/lib/core/transform/generation/captureTransformGeneration.js b/lib/core/transform/generation/captureTransformGeneration.js
+index d79bbc946ba65f94ee618bbd6ab628a404e66c93..de48f63b5bc0994fd6271cb614959797ddb798b5 100644
+--- a/lib/core/transform/generation/captureTransformGeneration.js
++++ b/lib/core/transform/generation/captureTransformGeneration.js
+@@ -217,7 +217,11 @@ async function captureTransformGeneration(props) {
+             })
+             : undefined;
+         const claim = props.session !== undefined && state !== undefined
+-            ? await claimSharedCompile.claimSharedCompile(props.session, sharedCompileIdentity.sharedCompileIdentity({ ...props, projectRoot }), state, { adopt: true, rejectedPublication: props.rejected })
++            ? await claimSharedCompile.claimSharedCompile(props.session, sharedCompileIdentity.sharedCompileIdentity({ ...props, projectRoot }), state, {
++                adopt: true,
++                environment: compilerEnvironment,
++                rejectedPublication: props.rejected,
++            })
+             : undefined;
+         if (claim?.kind === "compile") {
+             sharedClaim = claim;
+@@ -576,7 +580,9 @@ async function captureTransformGeneration(props) {
+         const graphFailures = compilerGraphInputProofFailures.compilerGraphInputProofFailures(cached);
+         mergeGenerationProofFailures.mergeGenerationProofFailures(failures, graphFailures);
+         mergeGenerationProofFailures.mergeGenerationProofFailures(failures, externalInputSnapshot.failures);
+-        const universalInputCapture = captureUniversalHostInputValidation.captureUniversalHostInputValidation(cached, props.currentFile);
++        // Recorded environment reads must hold under the environment this worker
++        // compiles under; a publication recorded under another value is refuted.
++        const universalInputCapture = captureUniversalHostInputValidation.captureUniversalHostInputValidation(cached, props.currentFile, compilerEnvironment);
+         restrictNotificationCoverageToProvenInputs.restrictNotificationCoverageToProvenInputs(hostInputTracker, cached, universalInputCapture.validation);
+         mergeGenerationProofFailures.mergeGenerationProofFailures(failures, universalInputCapture.failures);
+         const graphProofs = graphFailures.entries.length === 0 && graphFailures.omitted === 0;
+diff --git a/lib/core/transform/generation/captureTransformGeneration.mjs b/lib/core/transform/generation/captureTransformGeneration.mjs
+index f425f0cfaafa87552b10cfea85d6dd2815c4f7aa..7babf2bd954d60a283ce1196ea0916f8a306f745 100644
+--- a/lib/core/transform/generation/captureTransformGeneration.mjs
++++ b/lib/core/transform/generation/captureTransformGeneration.mjs
+@@ -215,7 +215,11 @@ async function captureTransformGeneration(props) {
+             })
+             : undefined;
+         const claim = props.session !== undefined && state !== undefined
+-            ? await claimSharedCompile(props.session, sharedCompileIdentity({ ...props, projectRoot }), state, { adopt: true, rejectedPublication: props.rejected })
++            ? await claimSharedCompile(props.session, sharedCompileIdentity({ ...props, projectRoot }), state, {
++                adopt: true,
++                environment: compilerEnvironment,
++                rejectedPublication: props.rejected,
++            })
+             : undefined;
+         if (claim?.kind === "compile") {
+             sharedClaim = claim;
+@@ -574,7 +578,9 @@ async function captureTransformGeneration(props) {
+         const graphFailures = compilerGraphInputProofFailures(cached);
+         mergeGenerationProofFailures(failures, graphFailures);
+         mergeGenerationProofFailures(failures, externalInputSnapshot.failures);
+-        const universalInputCapture = captureUniversalHostInputValidation(cached, props.currentFile);
++        // Recorded environment reads must hold under the environment this worker
++        // compiles under; a publication recorded under another value is refuted.
++        const universalInputCapture = captureUniversalHostInputValidation(cached, props.currentFile, compilerEnvironment);
+         restrictNotificationCoverageToProvenInputs(hostInputTracker, cached, universalInputCapture.validation);
+         mergeGenerationProofFailures(failures, universalInputCapture.failures);
+         const graphProofs = graphFailures.entries.length === 0 && graphFailures.omitted === 0;
+diff --git a/lib/core/transform/session/claimSharedCompile.js b/lib/core/transform/session/claimSharedCompile.js
+index 2bbeb8b36ddf5e3663063a4b4ccdde50ae32e3fc..e1a1f898f0f27923fd095c41aefd08a6f3c20fae 100644
+--- a/lib/core/transform/session/claimSharedCompile.js
++++ b/lib/core/transform/session/claimSharedCompile.js
+@@ -4,6 +4,7 @@ var crypto = require('node:crypto');
+ var fs = require('node:fs');
+ var path = require('node:path');
+ var isZombieProcess = require('../utils/isZombieProcess.js');
++var environmentInputMismatch = require('../validation/environmentInputMismatch.js');
+ 
+ /** How often a lock holder proves it is still working. */
+ const HEARTBEAT_MS = 1_000;
+@@ -59,6 +60,12 @@ const KEPT_STORE_BYTES = 256 * 1024 * 1024;
+  * for independent adoption proof. The digest is computed from the already read
+  * UTF-8 publication, without another filesystem query.
+  *
++ * Neither key names the environment variables the plugins read: only the
++ * compile discovers them. A publication is therefore adoptable only while each
++ * variable its envelope recorded has the recorded value, or stays unset, in the
++ * adopter's `environment`. An ineligible publication is treated like a rejected
++ * one: the worker takes the lock and its compile replaces it.
++ *
+  * Its place in the adapter's invalidation model, and the units beside it, are
+  * mapped in the maintainer page
+  * `website/src/content/docs/development/reference/unplugin-invalidation.mdx`.
+@@ -67,6 +74,8 @@ const KEPT_STORE_BYTES = 256 * 1024 * 1024;
+  * @param identity Caller-provided hex configuration digest used in store names.
+  * @param state Caller-provided hex project-state digest used in store names.
+  * @param options.adopt Whether an existing publication may be adopted.
++ * @param options.environment The adopter's compiler environment, which every
++ *   recorded environment read of an adopted publication must still match.
+  * @param options.rejectedPublication Digest of the exact previously refuted
+  *   payload; a replacement still requires the caller's full proof.
+  * @evidence contracts/common.md#principled-implementation
+@@ -141,7 +150,10 @@ async function claimSharedCompile(store, identity, state, options) {
+             if (options.adopt) {
+                 const published = await readPublication(publication);
+                 if (published !== undefined &&
+-                    published.fingerprint !== options.rejectedPublication) {
++                    published.fingerprint !== options.rejectedPublication &&
++                    environmentInputMismatch.environmentInputMismatch(published.value.result.type === "exception"
++                        ? undefined
++                        : published.value.result.environmentInputs, options.environment) === undefined) {
+                     await markUsed(publication);
+                     return {
+                         kind: "adopt",
+@@ -158,7 +170,10 @@ async function claimSharedCompile(store, identity, state, options) {
+                     // and the lock.
+                     const published = await readPublication(publication);
+                     if (published !== undefined &&
+-                        published.fingerprint !== options.rejectedPublication) {
++                        published.fingerprint !== options.rejectedPublication &&
++                        environmentInputMismatch.environmentInputMismatch(published.value.result.type === "exception"
++                            ? undefined
++                            : published.value.result.environmentInputs, options.environment) === undefined) {
+                         claim.release();
+                         await markUsed(publication);
+                         return {
+diff --git a/lib/core/transform/session/claimSharedCompile.mjs b/lib/core/transform/session/claimSharedCompile.mjs
+index 80002ff1ea04bd5d446b37e6e8254c0ec5aa5871..5a216a35658f395843971ef0ffc4219aa8e6770e 100644
+--- a/lib/core/transform/session/claimSharedCompile.mjs
++++ b/lib/core/transform/session/claimSharedCompile.mjs
+@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import { isZombieProcess } from '../utils/isZombieProcess.mjs';
++import { environmentInputMismatch } from '../validation/environmentInputMismatch.mjs';
+ 
+ /** How often a lock holder proves it is still working. */
+ const HEARTBEAT_MS = 1_000;
+@@ -57,6 +58,12 @@ const KEPT_STORE_BYTES = 256 * 1024 * 1024;
+  * for independent adoption proof. The digest is computed from the already read
+  * UTF-8 publication, without another filesystem query.
+  *
++ * Neither key names the environment variables the plugins read: only the
++ * compile discovers them. A publication is therefore adoptable only while each
++ * variable its envelope recorded has the recorded value, or stays unset, in the
++ * adopter's `environment`. An ineligible publication is treated like a rejected
++ * one: the worker takes the lock and its compile replaces it.
++ *
+  * Its place in the adapter's invalidation model, and the units beside it, are
+  * mapped in the maintainer page
+  * `website/src/content/docs/development/reference/unplugin-invalidation.mdx`.
+@@ -65,6 +72,8 @@ const KEPT_STORE_BYTES = 256 * 1024 * 1024;
+  * @param identity Caller-provided hex configuration digest used in store names.
+  * @param state Caller-provided hex project-state digest used in store names.
+  * @param options.adopt Whether an existing publication may be adopted.
++ * @param options.environment The adopter's compiler environment, which every
++ *   recorded environment read of an adopted publication must still match.
+  * @param options.rejectedPublication Digest of the exact previously refuted
+  *   payload; a replacement still requires the caller's full proof.
+  * @evidence contracts/common.md#principled-implementation
+@@ -139,7 +148,10 @@ async function claimSharedCompile(store, identity, state, options) {
+             if (options.adopt) {
+                 const published = await readPublication(publication);
+                 if (published !== undefined &&
+-                    published.fingerprint !== options.rejectedPublication) {
++                    published.fingerprint !== options.rejectedPublication &&
++                    environmentInputMismatch(published.value.result.type === "exception"
++                        ? undefined
++                        : published.value.result.environmentInputs, options.environment) === undefined) {
+                     await markUsed(publication);
+                     return {
+                         kind: "adopt",
+@@ -156,7 +168,10 @@ async function claimSharedCompile(store, identity, state, options) {
+                     // and the lock.
+                     const published = await readPublication(publication);
+                     if (published !== undefined &&
+-                        published.fingerprint !== options.rejectedPublication) {
++                        published.fingerprint !== options.rejectedPublication &&
++                        environmentInputMismatch(published.value.result.type === "exception"
++                            ? undefined
++                            : published.value.result.environmentInputs, options.environment) === undefined) {
+                         claim.release();
+                         await markUsed(publication);
+                         return {
+diff --git a/lib/core/transform/transformTtsc.js b/lib/core/transform/transformTtsc.js
+index c5cbd2dcdc1e3b3f9d4b8fab38caf64c8d4c83a7..324b0353510d0149670dd078345811efcc422cd5 100644
+--- a/lib/core/transform/transformTtsc.js
++++ b/lib/core/transform/transformTtsc.js
+@@ -221,6 +221,7 @@ async function runTransformTtsc(id, source, options, aliases, cache, hooks, prep
+                 generation: transformed,
+                 key,
+                 source,
++                environment: compilerEnvironment,
+                 reportDivergence: !preparing,
+             });
+             if (action === "retry") {
+diff --git a/lib/core/transform/transformTtsc.mjs b/lib/core/transform/transformTtsc.mjs
+index 4d9970126141a30bffe587a32af865f8de62abc1..a22014b1803bb9a5ba685da79963447ba95a4020 100644
+--- a/lib/core/transform/transformTtsc.mjs
++++ b/lib/core/transform/transformTtsc.mjs
+@@ -219,6 +219,7 @@ async function runTransformTtsc(id, source, options, aliases, cache, hooks, prep
+                 generation: transformed,
+                 key,
+                 source,
++                environment: compilerEnvironment,
+                 reportDivergence: !preparing,
+             });
+             if (action === "retry") {
+diff --git a/lib/core/transform/validation/captureUniversalHostInputValidation.js b/lib/core/transform/validation/captureUniversalHostInputValidation.js
+index 02a73b9a7f5c2152035766547a69fb3225c336c0..3a289da7cd9dc22621ab71b57cd9e02fa79a3847 100644
+--- a/lib/core/transform/validation/captureUniversalHostInputValidation.js
++++ b/lib/core/transform/validation/captureUniversalHostInputValidation.js
+@@ -16,6 +16,7 @@ var missingPathProbe = require('../inputs/missingPathProbe.js');
+ var pluginSourceHolds = require('../inputs/pluginSourceHolds.js');
+ var preparePluginBuildEnvironments = require('../inputs/preparePluginBuildEnvironments.js');
+ var sameHostInputRealpath = require('../inputs/sameHostInputRealpath.js');
++var environmentInputMismatch = require('./environmentInputMismatch.js');
+ var matchesRecordedInput = require('./matchesRecordedInput.js');
+ 
+ /**
+@@ -31,7 +32,13 @@ var matchesRecordedInput = require('./matchesRecordedInput.js');
+  * callers retain the original native observation API; result identity records
+  * async execution ownership even when preparation fails.
+  *
+- * @evidence contracts/common.md#principled-implementation Evaluation-time content and physical-target witnesses must agree with the generation snapshot before reuse; explicit producer observation unavailability remains distinct from changed, contradictory or unexplained missing proof, and every input is checked before classifying the attempt.
++ * Recorded environment reads are universal inputs too. Each must still have its
++ * recorded value, or stay unset, in `environment`, the compiler environment the
++ * generation is admitted under; an adopted publication recorded under another
++ * value fails here like a changed host input. They need no manifest entry:
++ * delivery compares them against its own snapshot.
++ *
++ * @evidence contracts/common.md#principled-implementation Evaluation-time content and physical-target witnesses and recorded environment values must agree with the generation snapshot before reuse; explicit producer observation unavailability remains distinct from changed, contradictory or unexplained missing proof, and every input is checked before classifying the attempt.
+  * @evidence contracts/common.md#clear-and-simple-design One admission operation builds the manifest; per-entry, grouped or exact-native absence and tree validators own its subsequent checks.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts A missing publication witness declines narrow reuse instead of certifying an input from a convenient newer read.
+  * @evidence contracts/common.md#meaningful-documentation Native prose explains failed admission and successful generation attachment; inline comments justify readable-state, blocker and tree distinctions.
+@@ -40,7 +47,9 @@ var matchesRecordedInput = require('./matchesRecordedInput.js');
+  * @evidence contracts/performance.md#efficient-algorithms Input selection materializes the union of producer lists/proof keys and scans U universal inputs and T plugin source trees. Async-owned environments share one synchronous batch, qualifying common SDK paths once across plugin directories. Comparisons include content bytes, physical identity/ancestor/case queries, paired metadata and exact candidate stat; source proof includes tree population/bytes and environment validation. These delegated costs and temporary input/manifest populations are not constant-time map insertion work.
+  * @evidence contracts/performance.md#reuse-equivalent-work This shared generation manifest records exactly qualified lexical spellings, separable signatures and tree environments for later validators; changed proof requires new admission.
+  */
+-function captureUniversalHostInputValidation(cached, currentFile) {
++function captureUniversalHostInputValidation(cached, currentFile, 
++/** Compiler environment the generation is admitted under. */
++environment) {
+     const filesystem = resultFilesystem.resultFilesystem(cached.result);
+     const state = envelopeDerivation.envelopeDerivation(cached);
+     const failures = createGenerationProofFailures.createGenerationProofFailures(cached.snapshotFailureClassifier);
+@@ -62,6 +71,14 @@ function captureUniversalHostInputValidation(cached, currentFile) {
+             detail: "observer-incomplete",
+         });
+     }
++    const environmentChanged = environmentInputMismatch.environmentInputMismatch(result.type === "exception" ? undefined : result.environmentInputs, environment);
++    if (environmentChanged !== undefined) {
++        recordGenerationProofFailure.recordGenerationProofFailure(failures, {
++            domain: "host",
++            kind: "environment-changed",
++            detail: environmentChanged,
++        });
++    }
+     for (const [input, reason] of Object.entries(proofFailures ?? {})) {
+         recordGenerationProofFailure.recordGenerationProofFailure(failures, {
+             domain: "host",
+diff --git a/lib/core/transform/validation/captureUniversalHostInputValidation.mjs b/lib/core/transform/validation/captureUniversalHostInputValidation.mjs
+index 49c67d33fb080e5f00fc051c7c782d54ef7d3899..82fd7bc0b7820b385621b003166b160351cc67f9 100644
+--- a/lib/core/transform/validation/captureUniversalHostInputValidation.mjs
++++ b/lib/core/transform/validation/captureUniversalHostInputValidation.mjs
+@@ -14,6 +14,7 @@ import { missingPathProbe } from '../inputs/missingPathProbe.mjs';
+ import { pluginSourceHolds } from '../inputs/pluginSourceHolds.mjs';
+ import { usesPreparedPluginBuildEnvironments } from '../inputs/preparePluginBuildEnvironments.mjs';
+ import { sameHostInputRealpath } from '../inputs/sameHostInputRealpath.mjs';
++import { environmentInputMismatch } from './environmentInputMismatch.mjs';
+ import { matchesRecordedInput } from './matchesRecordedInput.mjs';
+ 
+ /**
+@@ -29,7 +30,13 @@ import { matchesRecordedInput } from './matchesRecordedInput.mjs';
+  * callers retain the original native observation API; result identity records
+  * async execution ownership even when preparation fails.
+  *
+- * @evidence contracts/common.md#principled-implementation Evaluation-time content and physical-target witnesses must agree with the generation snapshot before reuse; explicit producer observation unavailability remains distinct from changed, contradictory or unexplained missing proof, and every input is checked before classifying the attempt.
++ * Recorded environment reads are universal inputs too. Each must still have its
++ * recorded value, or stay unset, in `environment`, the compiler environment the
++ * generation is admitted under; an adopted publication recorded under another
++ * value fails here like a changed host input. They need no manifest entry:
++ * delivery compares them against its own snapshot.
++ *
++ * @evidence contracts/common.md#principled-implementation Evaluation-time content and physical-target witnesses and recorded environment values must agree with the generation snapshot before reuse; explicit producer observation unavailability remains distinct from changed, contradictory or unexplained missing proof, and every input is checked before classifying the attempt.
+  * @evidence contracts/common.md#clear-and-simple-design One admission operation builds the manifest; per-entry, grouped or exact-native absence and tree validators own its subsequent checks.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts A missing publication witness declines narrow reuse instead of certifying an input from a convenient newer read.
+  * @evidence contracts/common.md#meaningful-documentation Native prose explains failed admission and successful generation attachment; inline comments justify readable-state, blocker and tree distinctions.
+@@ -38,7 +45,9 @@ import { matchesRecordedInput } from './matchesRecordedInput.mjs';
+  * @evidence contracts/performance.md#efficient-algorithms Input selection materializes the union of producer lists/proof keys and scans U universal inputs and T plugin source trees. Async-owned environments share one synchronous batch, qualifying common SDK paths once across plugin directories. Comparisons include content bytes, physical identity/ancestor/case queries, paired metadata and exact candidate stat; source proof includes tree population/bytes and environment validation. These delegated costs and temporary input/manifest populations are not constant-time map insertion work.
+  * @evidence contracts/performance.md#reuse-equivalent-work This shared generation manifest records exactly qualified lexical spellings, separable signatures and tree environments for later validators; changed proof requires new admission.
+  */
+-function captureUniversalHostInputValidation(cached, currentFile) {
++function captureUniversalHostInputValidation(cached, currentFile, 
++/** Compiler environment the generation is admitted under. */
++environment) {
+     const filesystem = resultFilesystem(cached.result);
+     const state = envelopeDerivation(cached);
+     const failures = createGenerationProofFailures(cached.snapshotFailureClassifier);
+@@ -60,6 +69,14 @@ function captureUniversalHostInputValidation(cached, currentFile) {
+             detail: "observer-incomplete",
+         });
+     }
++    const environmentChanged = environmentInputMismatch(result.type === "exception" ? undefined : result.environmentInputs, environment);
++    if (environmentChanged !== undefined) {
++        recordGenerationProofFailure(failures, {
++            domain: "host",
++            kind: "environment-changed",
++            detail: environmentChanged,
++        });
++    }
+     for (const [input, reason] of Object.entries(proofFailures ?? {})) {
+         recordGenerationProofFailure(failures, {
+             domain: "host",
+diff --git a/lib/core/transform/validation/environmentInputMismatch.js b/lib/core/transform/validation/environmentInputMismatch.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..7207cbcd103ab5946cc95df7136df0813fe5b3de
+--- /dev/null
++++ b/lib/core/transform/validation/environmentInputMismatch.js
+@@ -0,0 +1,46 @@
++'use strict';
++
++/**
++ * Name the first recorded environment read that no longer has its recorded
++ * value, or stays unset, in `environment`; `undefined` when every read holds.
++ *
++ * Native plugins record each variable they read through `ctx.Env` in the
++ * envelope's `environmentInputs`, which generations, publications and project
++ * records carry. Output is reusable only under an environment that would make
++ * every such read return what it returned, so callers compare against the
++ * compiler environment snapshot (`resolveCompilerEnvironment`) a recompile
++ * would run under. A cache key cannot carry these names: only the compile
++ * discovers them. An absent record, from an exception or from plugins that read
++ * no variable, always holds.
++ *
++ * @evidence contracts/common.md#principled-implementation Equality of each recorded value or absence with the supplied snapshot is exactly the condition under which the plugin's reads would repeat; unrecorded variables are not inputs and are ignored.
++ * @evidence contracts/common.md#clear-and-simple-design One predicate over the recorded map serves cached delivery, capture admission, shared-store adoption and persistent project records.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts No variable list, prefix or consumer name is special-cased; the recorded names alone decide what is compared.
++ * @evidence contracts/common.md#meaningful-documentation Native paragraphs state the returned name, the comparison environment, why a key cannot replace this proof and the empty case.
++ * @evidence contracts/portability.md#os-neutral-implementation Windows variable names compare case-insensitively against the snapshot, choosing the lexically first spelling as ttsc's sidecar environment does; other platforms compare names exactly.
++ * @evidence contracts/performance.md#efficient-algorithms One lookup per recorded name; on Windows each lookup scans the snapshot's names, O(recorded × environment) with both small.
++ * @evidenceExclude contracts/performance.md#reuse-equivalent-work The predicate decides reuse for its caller and retains no verdict.
++ * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Nothing is allocated beyond the returned name.
++ */
++function environmentInputMismatch(recorded, environment) {
++    for (const [name, value] of Object.entries(recorded ?? {})) {
++        let current;
++        if (process.platform === "win32") {
++            const identity = name.toUpperCase();
++            let selected;
++            for (const key of Object.keys(environment))
++                if (key.toUpperCase() === identity &&
++                    (selected === undefined || key < selected))
++                    selected = key;
++            current = selected === undefined ? undefined : environment[selected];
++        }
++        else if (Object.hasOwn(environment, name))
++            current = environment[name];
++        if ((current ?? null) !== value)
++            return name;
++    }
++    return undefined;
++}
++
++exports.environmentInputMismatch = environmentInputMismatch;
++//# sourceMappingURL=environmentInputMismatch.js.map
+diff --git a/lib/core/transform/validation/environmentInputMismatch.mjs b/lib/core/transform/validation/environmentInputMismatch.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..10039de54ee74247d4f1c86c665fa14f8a1d7e5d
+--- /dev/null
++++ b/lib/core/transform/validation/environmentInputMismatch.mjs
+@@ -0,0 +1,44 @@
++/**
++ * Name the first recorded environment read that no longer has its recorded
++ * value, or stays unset, in `environment`; `undefined` when every read holds.
++ *
++ * Native plugins record each variable they read through `ctx.Env` in the
++ * envelope's `environmentInputs`, which generations, publications and project
++ * records carry. Output is reusable only under an environment that would make
++ * every such read return what it returned, so callers compare against the
++ * compiler environment snapshot (`resolveCompilerEnvironment`) a recompile
++ * would run under. A cache key cannot carry these names: only the compile
++ * discovers them. An absent record, from an exception or from plugins that read
++ * no variable, always holds.
++ *
++ * @evidence contracts/common.md#principled-implementation Equality of each recorded value or absence with the supplied snapshot is exactly the condition under which the plugin's reads would repeat; unrecorded variables are not inputs and are ignored.
++ * @evidence contracts/common.md#clear-and-simple-design One predicate over the recorded map serves cached delivery, capture admission, shared-store adoption and persistent project records.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts No variable list, prefix or consumer name is special-cased; the recorded names alone decide what is compared.
++ * @evidence contracts/common.md#meaningful-documentation Native paragraphs state the returned name, the comparison environment, why a key cannot replace this proof and the empty case.
++ * @evidence contracts/portability.md#os-neutral-implementation Windows variable names compare case-insensitively against the snapshot, choosing the lexically first spelling as ttsc's sidecar environment does; other platforms compare names exactly.
++ * @evidence contracts/performance.md#efficient-algorithms One lookup per recorded name; on Windows each lookup scans the snapshot's names, O(recorded × environment) with both small.
++ * @evidenceExclude contracts/performance.md#reuse-equivalent-work The predicate decides reuse for its caller and retains no verdict.
++ * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Nothing is allocated beyond the returned name.
++ */
++function environmentInputMismatch(recorded, environment) {
++    for (const [name, value] of Object.entries(recorded ?? {})) {
++        let current;
++        if (process.platform === "win32") {
++            const identity = name.toUpperCase();
++            let selected;
++            for (const key of Object.keys(environment))
++                if (key.toUpperCase() === identity &&
++                    (selected === undefined || key < selected))
++                    selected = key;
++            current = selected === undefined ? undefined : environment[selected];
++        }
++        else if (Object.hasOwn(environment, name))
++            current = environment[name];
++        if ((current ?? null) !== value)
++            return name;
++    }
++    return undefined;
++}
++
++export { environmentInputMismatch };
++//# sourceMappingURL=environmentInputMismatch.mjs.map
+diff --git a/lib/core/transform/watch/notifyProjectRecord.js b/lib/core/transform/watch/notifyProjectRecord.js
+index ce28b20ee88fc71234b269e05bf1a83990981240..8cbaf2f08ea7e025c7d0da5f21f7938740fc5a83 100644
+--- a/lib/core/transform/watch/notifyProjectRecord.js
++++ b/lib/core/transform/watch/notifyProjectRecord.js
+@@ -188,11 +188,15 @@ function recordAvailable(file) {
+ /** The record of a generation over its evidenced inputs. */
+ function recordOf(cached, inputs) {
+     const dependencies = cached.externalDependencyInputs ?? [];
++    const environmentInputs = cached.result.type === "exception"
++        ? undefined
++        : cached.result.environmentInputs;
+     const record = {
+         ...(cached.compilerArguments === undefined
+             ? {}
+             : { compilerArguments: cached.compilerArguments }),
+         ...(dependencies.length === 0 ? {} : { dependencies }),
++        ...(environmentInputs === undefined ? {} : { environmentInputs }),
+         inputs: {},
+         membership: cached.projectDirectories === undefined
+             ? null
+diff --git a/lib/core/transform/watch/notifyProjectRecord.mjs b/lib/core/transform/watch/notifyProjectRecord.mjs
+index b8b10ed36b2d863d88fe1d4ed6afc381ba828cdc..c460aaa87892d7f4a4c42fea7cdb3a5b4962f0cc 100644
+--- a/lib/core/transform/watch/notifyProjectRecord.mjs
++++ b/lib/core/transform/watch/notifyProjectRecord.mjs
+@@ -186,11 +186,15 @@ function recordAvailable(file) {
+ /** The record of a generation over its evidenced inputs. */
+ function recordOf(cached, inputs) {
+     const dependencies = cached.externalDependencyInputs ?? [];
++    const environmentInputs = cached.result.type === "exception"
++        ? undefined
++        : cached.result.environmentInputs;
+     const record = {
+         ...(cached.compilerArguments === undefined
+             ? {}
+             : { compilerArguments: cached.compilerArguments }),
+         ...(dependencies.length === 0 ? {} : { dependencies }),
++        ...(environmentInputs === undefined ? {} : { environmentInputs }),
+         inputs: {},
+         membership: cached.projectDirectories === undefined
+             ? null

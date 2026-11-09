@@ -71,7 +71,10 @@ func (plugin) ApplyProgram(prog *driver.Program, ctx driver.PluginContext) error
 	if err := validateEntryConfig(ctx.Entry.Config); err != nil {
 		return err
 	}
-	transform, err := lmaoPluginTransform(prog, compilerOptions{cwd: ctx.Cwd, tsconfig: ctx.Tsconfig, trace: traceEntriesFor(os.Getenv("NODE_ENV"))})
+	// A tracked read: ttsc records NODE_ENV and its value as an input of this
+	// compile, so its caches prove reuse against it (spec 01o section 6.3).
+	nodeEnv, _ := ctx.Env("NODE_ENV")
+	transform, err := lmaoPluginTransform(prog, compilerOptions{cwd: ctx.Cwd, tsconfig: ctx.Tsconfig, trace: traceEntriesFor(nodeEnv)})
 	if err != nil {
 		return err
 	}

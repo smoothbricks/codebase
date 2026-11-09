@@ -355,7 +355,8 @@
     "ttsc@0.36.3": "patches/ttsc@0.36.3.patch",
     "typia@15.2.1": "patches/typia@15.2.1.patch",
     "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch",
-    "scriptc@0.4.4": "patches/scriptc@0.4.4.patch"
+    "scriptc@0.4.4": "patches/scriptc@0.4.4.patch",
+    "@ttsc/unplugin@0.36.3": "patches/@ttsc%2Funplugin@0.36.3.patch"
   },
   "overrides": {
     "typia": "15.2.1",

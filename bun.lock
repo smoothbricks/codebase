@@ -523,6 +523,7 @@
     "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch",
     "@nx/js@24.0.3": "patches/@nx%2Fjs@24.0.3.patch",
     "@uwdata/flechette@2.7.0": "patches/@uwdata%2Fflechette@2.7.0.patch",
+    "@ttsc/unplugin@0.36.3": "patches/@ttsc%2Funplugin@0.36.3.patch",
     "ttsc@0.36.3": "patches/ttsc@0.36.3.patch",
     "scriptc@0.4.4": "patches/scriptc@0.4.4.patch",
     "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",

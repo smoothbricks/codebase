@@ -49,6 +49,18 @@ scriptc compiles a package's ttsc-emitted JavaScript to a native executable (`sc
 
 Retire each when typia or scriptc removes its cause; bump both with typia.
 
+## Tracked environment reads (samchon/ttsc#1842)
+
+A ttsc plugin is a macro, and its output can depend on an environment variable. The managed `ttsc@0.36.3.patch` carries
+`PluginContext.Env(name)`: it returns `os.LookupEnv(name)` and records the name and value as an input of the compile, as
+Rust's `proc_macro::tracked_env::var` records an expansion's reads. The envelopes carry the record as
+`environmentInputs`, and ttsc's runtime build lane proves it before reusing a stored result.
+`@ttsc%2Funplugin@0.36.3.patch` proves the same record before every reuse: a cached delivery, shared-store adoption and
+project records. A recorded variable whose value changed recompiles. No tool names a variable. A plugin that reads none
+keeps today's keys and proofs. Both patches are the built output of
+[samchon/ttsc#1842](https://github.com/samchon/ttsc/pull/1842) on v0.36.3 (its `lib` diffs from a byte-identical base
+build) and retire when a release includes it. `@smoothbricks/lmao-ttsc` reads `NODE_ENV` this way.
+
 ## Activating a patch change
 
 Prepare Nx changes with `bun patch nx@24.0.3`, then use the registry-index regeneration flow:

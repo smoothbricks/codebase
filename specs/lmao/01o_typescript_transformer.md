@@ -663,12 +663,13 @@ surrounding code, a condition included, still runs. A trace entry's arguments th
 relies on.
 
 There is no runtime switch and no plugin-entry key: ttsc hands its compiler the host process's environment, so a test
-runner gets the kept mode without per-project setup. A process compiles under one `NODE_ENV`, and `@ttsc/unplugin` holds
-lmao-ttsc output only for its process's life: the pooled hosts' shared compile store (Metro, Next, Turbopack) withholds
-lmao-ttsc compiles, whose observations are incomplete. A cache that outlives a process keys on `NODE_ENV` by the
-plugin's own declaration, never a variable a tool hardcodes: the package declares
+runner gets the kept mode without per-project setup. The plugin reads `NODE_ENV` through ttsc's tracked accessor
+(`ctx.Env`), which records the read at its read site as a compile input, as a macro's tracked reads are (Rust's
+`proc_macro::tracked_env::var`, cargo's `rerun-if-env-changed`, Racket's `register-external-file`), so ttsc's own caches
+prove reuse against the recorded value and no tool names the variable. A task cache outlives processes and hashes before
+a task runs, so it keys on the package's declaration: `@smoothbricks/lmao-ttsc` declares
 `"smoo": { "compileEnv": ["NODE_ENV"] }`, which `@smoothbricks/nx-plugin` turns into `{ "env": "NODE_ENV" }` inputs on
-the targets it infers.
+the targets it infers for every direct dependent.
 
 A trace call anywhere else is `LMAO_TRACE_NOT_STATEMENT` in both modes: an initializer, argument, operand, return value
 or concise arrow body; a trace chained onto another entry (`log.info('a').trace('b')`) or followed by another log-level

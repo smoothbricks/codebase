@@ -436,9 +436,14 @@ executor refused its emits; the patch makes it print the build lane's header (`t
 with `PluginContext.ReportHostOutput(file string)`; each emit then hands the file's bytes to the host's writer after the
 compiler's own outputs (`driver/plugins.go`, `driver/rewrite.go`, `driver/emit_plugin.go`), so ttsc's build lane, its
 utility host and a plugin's own host such as typia's list it, and the executor keeps it. An unreported one is pruned as
-a file this emit did not produce. The packaged managed asset is the source, so clean managed installs receive the same
-repairs without a compiler fork or edits to the dependency cache. The registration applies only to that exact compiler
-version; the repository's lockfile continues to own its compiler pin.
+a file this emit did not produce. A linked plugin reads an environment variable with `PluginContext.Env(name)`, which
+returns `os.LookupEnv(name)` and records the name and value as an input of the compile, as a macro's tracked read does
+(Rust's `proc_macro::tracked_env::var`): the envelopes carry it as `environmentInputs`, and `--verbose` names the
+variables read (`// ttsc utility: environment inputs=[…]`). lmao-ttsc reads `NODE_ENV` this way. It is the Go half of
+[samchon/ttsc#1842](https://github.com/samchon/ttsc/pull/1842), and the managed patch drops it when that release lands.
+The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
+edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
+continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases

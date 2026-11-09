@@ -1,4 +1,163 @@
-diff --git a/node_modules/ttsc/driver/force_emit_analysis_options_test.go b/driver/force_emit_analysis_options_test.go
+diff --git a/cmd/ttsc/api_transform.go b/cmd/ttsc/api_transform.go
+index 4434cf69ea3b5128987c9216f871db13f827d7a4..681f59ebef551e99853737f28f1eff6f77f61262 100644
+--- a/cmd/ttsc/api_transform.go
++++ b/cmd/ttsc/api_transform.go
+@@ -55,6 +55,12 @@ type apiTransformResult struct {
+   // Null means absence; omitted keys leave symlink or junction identity unknown.
+   HostInputRealpaths map[string]*string `json:"hostInputRealpaths,omitempty"`
+ 
++  // EnvironmentInputs maps each environment variable a linked hook read
++  // through PluginContext.Env to the value it read; null means unset.
++  // Omitted when no hook read one. Names only identify inputs; values can be
++  // secrets and belong to the consumer's reuse check, not to logs.
++  EnvironmentInputs map[string]*string `json:"environmentInputs,omitempty"`
++
+   // ObservationsComplete is false only for an explicit unsupported observation
+   // boundary reported by a linked hook. Absence does not prove completeness.
+   ObservationsComplete *bool `json:"observationsComplete,omitempty"`
+@@ -115,6 +121,7 @@ func writeTransformedProgramResponse(prog *driver.Program, diags []driver.Diagno
+   var hostInputs []string
+   var hostInputHashes map[string]*string
+   var hostInputRealpaths map[string]*string
++  var environmentInputs map[string]*string
+   var observationsComplete *bool
+   if prog == nil {
+     unavailable := false
+@@ -134,6 +141,7 @@ func writeTransformedProgramResponse(prog *driver.Program, diags []driver.Diagno
+     hostInputs = prog.PluginHostInputs()
+     hostInputHashes = prog.PluginHostInputHashes()
+     hostInputRealpaths = prog.PluginHostInputRealpaths()
++    environmentInputs = prog.PluginEnvironmentInputs()
+     if prog.PluginObservationsIncomplete() {
+       incomplete := false
+       observationsComplete = &incomplete
+@@ -148,6 +156,7 @@ func writeTransformedProgramResponse(prog *driver.Program, diags []driver.Diagno
+     HostInputs:           hostInputs,
+     HostInputHashes:      hostInputHashes,
+     HostInputRealpaths:   hostInputRealpaths,
++    EnvironmentInputs:    environmentInputs,
+     ObservationsComplete: observationsComplete,
+     TypeScript:           typescript,
+   }
+diff --git a/cmd/ttsc/build.go b/cmd/ttsc/build.go
+index 3140699bdd3f26f8513f95d8750ed632a99fc425..f7b39f13238a59cefa2716d61ee978a73c369bbf 100644
+--- a/cmd/ttsc/build.go
++++ b/cmd/ttsc/build.go
+@@ -137,6 +137,7 @@ func writeBuildProgramResponse(prog *driver.Program, diags []driver.Diagnostic,
+         }
+         fmt.Fprintln(stdout, "  +", rel)
+       }
++      driver.WriteEnvironmentInputsSummary(stdout, "// ttsc: ", prog)
+     }
+     if request.manifestPath != "" {
+       // The manifest is intentionally just the emitted file list. Higher
+diff --git a/driver/check_observations.go b/driver/check_observations.go
+index ef50afa6c3f02f80951c4ebd367c670a842aa0db..8e48e460fcff160c3e7e8f77abc211ff060e766f 100644
+--- a/driver/check_observations.go
++++ b/driver/check_observations.go
+@@ -19,6 +19,8 @@ import (
+ // the population complete or repair missing or conflicting individual proofs.
+ // The caller owns a fresh result path, its parent directory and eventual artifact
+ // removal. Publication occurs only after a temporary write and close succeed.
++// Environment variables the hooks read through PluginContext.Env travel in
++// environmentInputs with their recorded values, omitted when none was read.
+ //
+ // @evidence contracts/common.md#principled-implementation The same loaded Program supplies recorded input names and consistent supplied content and physical-path reports; missing generation authority is explicitly incomplete, while diagnostics and individual conflicts retain their independent meanings.
+ // @evidence contracts/common.md#clear-and-simple-design One typed wire object keeps hook observations separate from human diagnostic streams and never reloads a second compiler generation to reconstruct them.
+@@ -52,6 +54,7 @@ func WriteCheckRecoveryObservationsJSON(fileName string, program *Program, recov
+   inputs := []string{}
+   hashes := map[string]*string{}
+   realpaths := map[string]*string{}
++  var environment map[string]*string
+   var complete *bool
+   var graph *TransformGraph
+   if program == nil {
+@@ -74,14 +77,16 @@ func WriteCheckRecoveryObservationsJSON(fileName string, program *Program, recov
+     if recorded := program.PluginHostInputRealpaths(); recorded != nil {
+       realpaths = recorded
+     }
++    environment = program.PluginEnvironmentInputs()
+   }
+   data, err := json.Marshal(struct {
+     Graph                *TransformGraph    `json:"graph,omitempty"`
+     HostInputs           []string           `json:"hostInputs"`
+     HostInputHashes      map[string]*string `json:"hostInputHashes"`
+     HostInputRealpaths   map[string]*string `json:"hostInputRealpaths"`
++    EnvironmentInputs    map[string]*string `json:"environmentInputs,omitempty"`
+     ObservationsComplete *bool              `json:"observationsComplete,omitempty"`
+-  }{graph, inputs, hashes, realpaths, complete})
++  }{graph, inputs, hashes, realpaths, environment, complete})
+   if err != nil {
+     return err
+   }
+diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
+index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890d236ea9b 100644
+--- a/driver/emit_plugin.go
++++ b/driver/emit_plugin.go
+@@ -427,7 +427,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
+       return diagnostics, err
+     }
+   }
+-  return diagnostics, output.flush()
++  if err := output.flush(); err != nil {
++    return diagnostics, err
++  }
++  // Files linked plugins reported writing beside these outputs follow them
++  // through the host's writer, so the host lists them too (ReportHostOutput).
++  _, err = p.writeHostOutputs(writeFile)
++  return diagnostics, err
+ }
+ 
+ // writePluginEmitOutput writes one artifact of the hand-assembled emit, passing
+diff --git a/driver/environment_inputs.go b/driver/environment_inputs.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4dcac95a1ea40978bba81e3e2ab9c5775b3c5b64
+--- /dev/null
++++ b/driver/environment_inputs.go
+@@ -0,0 +1,42 @@
++package driver
++
++import (
++  "encoding/json"
++  "fmt"
++  "io"
++  "sort"
++)
++
++// WriteEnvironmentInputsSummary writes the build summary line naming the
++// environment variables the Program's linked hooks read through
++// PluginContext.Env, as `<prefix>environment inputs=<sorted JSON array>`. It
++// writes nothing when no hook read one, so builds of plugins that read no
++// environment print the same summary as before. Only names are printed:
++// values can be secrets, and the envelope carries them to the consumers that
++// compare them. Like the summary lines around it, the write is best-effort.
++//
++// @evidence contracts/common.md#principled-implementation The names come from the same generation ledger the envelopes publish, sorted so the line is deterministic.
++// @evidence contracts/common.md#clear-and-simple-design One writer owns the line's format for every build lane; each lane supplies its own summary prefix.
++// @evidence contracts/common.md#prohibited-implementation-shortcuts Values never reach the output stream, and an empty ledger prints nothing rather than an empty list.
++// @evidence contracts/common.md#meaningful-documentation Native prose states the line format, the empty case, why values are withheld and the best-effort write following the documentation skill.
++// @evidenceExclude contracts/portability.md#os-neutral-implementation The writer formats recorded names and performs no native path or process operation.
++// @evidence contracts/performance.md#efficient-algorithms One ledger copy, an O(n log n) sort of the distinct names and one JSON encoding.
++// @evidenceExclude contracts/performance.md#reuse-equivalent-work Formatting a summary coordinates no shared computation.
++// @evidenceExclude contracts/performance.md#bound-retention-and-release-resources The name list and encoding are call-local; the caller owns the writer.
++func WriteEnvironmentInputsSummary(w io.Writer, prefix string, p *Program) {
++  inputs := p.PluginEnvironmentInputs()
++  if len(inputs) == 0 {
++    return
++  }
++  names := make([]string, 0, len(inputs))
++  for name := range inputs {
++    names = append(names, name)
++  }
++  sort.Strings(names)
++  encoded, err := json.Marshal(names)
++  if err != nil {
++    // encoding/json cannot fail on a []string.
++    panic(err)
++  }
++  fmt.Fprintf(w, "%senvironment inputs=%s\n", prefix, encoded)
++}
+diff --git a/driver/force_emit_analysis_options_test.go b/driver/force_emit_analysis_options_test.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72f1913cb5
 --- /dev/null
@@ -73,27 +232,8 @@ index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72
 +		t.Fatalf("forced emit did not rewrite the runtime import: %s", output["index.js"])
 +	}
 +}
-diff --git a/driver/emit_plugin.go b/driver/emit_plugin.go
-index 3793b3a406c2bf2643567a755d34e66a26eac5c8..3c690ac3d9a99be7914ad9aed76e5890d236ea9b 100644
---- a/driver/emit_plugin.go
-+++ b/driver/emit_plugin.go
-@@ -427,7 +427,13 @@ func (p *Program) EmitWithPluginTransformers(transforms []PluginTransform, write
-       return diagnostics, err
-     }
-   }
--  return diagnostics, output.flush()
-+  if err := output.flush(); err != nil {
-+    return diagnostics, err
-+  }
-+  // Files linked plugins reported writing beside these outputs follow them
-+  // through the host's writer, so the host lists them too (ReportHostOutput).
-+  _, err = p.writeHostOutputs(writeFile)
-+  return diagnostics, err
- }
- 
- // writePluginEmitOutput writes one artifact of the hand-assembled emit, passing
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db581bde3d2 100644
+index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa393fb9781a 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
 @@ -8,6 +8,8 @@ import (
@@ -105,15 +245,16 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
  )
  
  // LinkedPluginsEnv is the environment variable ttsc sets to pass the JSON
-@@ -169,6 +171,7 @@ type PluginContext struct {
+@@ -169,6 +171,8 @@ type PluginContext struct {
    reportFileDependencyRejected   func(string)
    reportFileComplete             func(string)
    reportEveryFileComplete        func()
++  readEnvironment                func(string) (string, bool)
 +  reportHostOutput               func(string)
  }
  
  // ReportObservationIncomplete declares that this hook's input population could
-@@ -195,6 +198,24 @@ func (ctx PluginContext) ReportObservationIncomplete() {
+@@ -195,6 +199,60 @@ func (ctx PluginContext) ReportObservationIncomplete() {
    }
  }
  
@@ -135,10 +276,46 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
 +  ctx.reportHostOutput(filepath.Clean(file))
 +}
 +
++// Env returns the value of the environment variable name, like os.LookupEnv,
++// and records the read as an input of this compiler generation. A plugin whose
++// output depends on a variable reads it here instead of calling os.Getenv, so
++// the envelope's environmentInputs names it and persistent hosts withdraw
++// output compiled under another value. The first read of a name fixes its
++// value for the whole generation: a later read returns the recorded value even
++// if the process environment changed in between, so the output never depends
++// on a value the record does not carry. ok is false for an unset variable, and
++// that absence is recorded too.
++//
++// A name that cannot name a variable (empty, or containing '=' or NUL) reads
++// as unset and is not recorded. A context without a driver callback reads the
++// process environment without recording it.
++//
++// The precedents are Rust's proc_macro::tracked_env::var, Cargo's
++// rerun-if-env-changed, and Racket's register-external-file: the read site
++// itself declares the dependency, so no tool keeps a list of variables.
++//
++// @evidence contracts/common.md#principled-implementation The read site records the exact name and value or absence it returned, and the generation ledger returns the first recorded value for every later read, so output and record cannot disagree.
++// @evidence contracts/common.md#clear-and-simple-design One callback delegates to the generation ledger; name validation precedes it and the uncallbacked context falls back to os.LookupEnv.
++// @evidence contracts/common.md#prohibited-implementation-shortcuts No static variable list, prefix rule or intercepted os.Getenv replaces the explicit read; values are not hashed or redacted, so equality checks compare what the plugin saw.
++// @evidence contracts/common.md#meaningful-documentation Native paragraphs state the lookup semantics, first-read fixing, absence recording, invalid names and the precedents following the documentation skill.
++// @evidence contracts/portability.md#os-neutral-implementation os.LookupEnv supplies the platform's own name matching, including Windows case-insensitivity; the recorded name keeps the caller's spelling and consumers compare it under their platform's environment rule.
++// @evidence contracts/performance.md#bound-retention-and-release-resources The ledger retains one name and value copy per distinct name read for the generation's lifetime; repeated reads add nothing. No handle is acquired and no cap is imposed.
++// @evidence contracts/performance.md#efficient-algorithms Name validation scans the name once; the ledger takes one lock and one map lookup, plus one os.LookupEnv on the first read of a name.
++// @evidenceExclude contracts/performance.md#reuse-equivalent-work Recording an input coordinates no completed or in-flight computation; consumers decide reuse from the record.
++func (ctx PluginContext) Env(name string) (string, bool) {
++  if name == "" || strings.ContainsAny(name, "=\x00") {
++    return "", false
++  }
++  if ctx.readEnvironment == nil {
++    return os.LookupEnv(name)
++  }
++  return ctx.readEnvironment(name)
++}
++
  // ReportHostInputHash declares the exact file state consumed by a native
  // plugin. hash is a lowercase SHA-256 digest for an observed file and nil for
  // a missing candidate. Conflicting observations are retained as host inputs
-@@ -506,11 +527,29 @@ type EmitTransformPlugin interface {
+@@ -506,11 +564,29 @@ type EmitTransformPlugin interface {
    EmitTransform(PluginContext) (PluginTransform, error)
  }
  
@@ -168,7 +345,67 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
    tsconfig     string
  }
  
-@@ -800,6 +839,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -518,9 +594,57 @@ type linkedPluginState struct {
+ // one hook cannot prove another hook's same-file dependency when that hook only
+ // reported the path, while ReportHostInput followed by ReportHostInputHash in
+ // one hook remains one complete observation.
++//
++// Environment reads are kept once per generation instead: a value is a
++// complete observation by itself, and every hook must see the value the
++// generation records, so the first read of a name fixes it for all of them.
+ type pluginHostInputScopes struct {
+-  mu     sync.Mutex
+-  scopes []*pluginHostInputs
++  mu          sync.Mutex
++  scopes      []*pluginHostInputs
++  environment map[string]*string
++}
++
++// readEnvironment returns the generation's recorded value of name, reading and
++// recording the process environment on the first read. A nil ledger records
++// nothing.
++func (inputs *pluginHostInputScopes) readEnvironment(name string) (string, bool) {
++  if inputs == nil {
++    return os.LookupEnv(name)
++  }
++  inputs.mu.Lock()
++  defer inputs.mu.Unlock()
++  recorded, exists := inputs.environment[name]
++  if !exists {
++    if value, ok := os.LookupEnv(name); ok {
++      recorded = &value
++    }
++    if inputs.environment == nil {
++      inputs.environment = map[string]*string{}
++    }
++    inputs.environment[name] = recorded
++  }
++  if recorded == nil {
++    return "", false
++  }
++  return *recorded, true
++}
++
++// environmentList copies the recorded environment reads, or returns nil when
++// no hook read one.
++func (inputs *pluginHostInputScopes) environmentList() map[string]*string {
++  if inputs == nil {
++    return nil
++  }
++  inputs.mu.Lock()
++  defer inputs.mu.Unlock()
++  if len(inputs.environment) == 0 {
++    return nil
++  }
++  environment := make(map[string]*string, len(inputs.environment))
++  for name, value := range inputs.environment {
++    environment[name] = cloneStringPointer(value)
++  }
++  return environment
+ }
+ 
+ type pluginHostInputs struct {
+@@ -800,6 +924,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
        cwd:          cwd,
        declarations: newPluginFileDeclarations(),
        inputs:       newPluginHostInputScopes(),
@@ -176,7 +413,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
        tsconfig:     tsconfigPath,
      }, nil
    }
-@@ -812,6 +852,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
+@@ -812,6 +937,7 @@ func loadLinkedPluginState(cwd, tsconfigPath string) (linkedPluginState, error)
      declarations: newPluginFileDeclarations(),
      entries:      entries,
      inputs:       newPluginHostInputScopes(),
@@ -184,7 +421,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -896,6 +937,42 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -896,6 +1022,42 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
    return out, nil
  }
  
@@ -227,10 +464,21 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
  // registeredPlugin returns the plugin registered at position index, or
  // (nil, false) when the index is out of range. Registration order matches
  // the order of linked Go init() calls.
-@@ -931,7 +1008,43 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -913,7 +1075,8 @@ func registeredPlugin(index int) (any, bool) {
+ // declarations are scoped per plugin instead: completeness is a claim about
+ // everything one plugin contributes to a file, so the claims of its preamble
+ // and program hooks are the same plugin's claim and must not be attributed
+-// separately.
++// separately. Environment reads go to the generation ledger, which fixes one
++// value per name for every hook.
+ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginContext {
+   inputs := state.inputs.newScope()
+   declaration := state.declarations.forPlugin(index)
+@@ -931,7 +1094,44 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileDependencyRejected:   declaration.rejectDependency,
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
++    readEnvironment:                state.inputs.readEnvironment,
 +    reportHostOutput:               state.outputs.add,
 +  }
 +}
@@ -256,7 +504,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
 +  defer outputs.mu.Unlock()
 +  if _, ok := outputs.seen[file]; ok {
 +    return
-+  }
+   }
 +  outputs.seen[file] = struct{}{}
 +  outputs.files = append(outputs.files, file)
 +}
@@ -264,18 +512,26 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..2964783d058000080d987044e1fe1db5
 +func (outputs *pluginHostOutputs) list() []string {
 +  if outputs == nil {
 +    return nil
-   }
++  }
 +  outputs.mu.Lock()
 +  defer outputs.mu.Unlock()
 +  return append([]string(nil), outputs.files...)
  }
  
  // hostInputs returns the exact native configuration inputs reported in this
+@@ -947,3 +1147,7 @@ func (state linkedPluginState) hostInputHashes() map[string]*string {
+ func (state linkedPluginState) hostInputRealpaths() map[string]*string {
+   return state.inputs.realpathList()
+ }
++
++func (state linkedPluginState) environmentInputs() map[string]*string {
++  return state.inputs.environmentList()
++}
 diff --git a/driver/program.go b/driver/program.go
-index f6ee81fb1af41deea022b92e838a7c4665eb9778..6dc6b4d77b7cde5051782478cdc527a1e9c29c7f 100644
+index 3a061b06bb7d1fa8ff5a8f7454634c158a6848a4..c5330185a700ac39c5ec87d7630d6cf4eb7ac953 100644
 --- a/driver/program.go
 +++ b/driver/program.go
-@@ -738,6 +738,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
+@@ -792,6 +792,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
    options := parsed.ParsedConfig.CompilerOptions
    options.NoEmit = core.TSFalse
    options.EmitDeclarationOnly = core.TSFalse
@@ -288,7 +544,36 @@ index f6ee81fb1af41deea022b92e838a7c4665eb9778..6dc6b4d77b7cde5051782478cdc527a1
  }
  
  // forceNoEmit sets noEmit so the program type-checks without writing files.
-@@ -1124,6 +1130,10 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+@@ -1069,6 +1075,28 @@ func (p *Program) PluginHostInputRealpaths() map[string]*string {
+   return p.plugins.hostInputRealpaths()
+ }
+ 
++// PluginEnvironmentInputs returns every environment variable a linked hook
++// read through PluginContext.Env while this Program was loaded or transformed,
++// keyed by the name the hook passed, with the value the generation recorded
++// for it. A nil value records that the variable was unset. The result is nil
++// when no hook read one, so a plugin that reads no environment leaves every
++// envelope unchanged. It does not run a pending ProgramPlugin hook.
++//
++// @evidence contracts/common.md#principled-implementation The ledger keeps the first value each name returned, so the reported value is the one every hook's output was computed from.
++// @evidence contracts/common.md#clear-and-simple-design One generation ledger owns the reads; this accessor copies it beside the host-input accessors.
++// @evidence contracts/common.md#prohibited-implementation-shortcuts Nothing is read from the process environment here; an unrecorded variable is never added after the fact.
++// @evidence contracts/common.md#meaningful-documentation Native prose defines keys, values, nil absence, the empty result and hook timing following the documentation skill.
++// @evidenceExclude contracts/portability.md#os-neutral-implementation Recorded names and values are returned without native environment access or name normalization.
++// @evidence contracts/performance.md#efficient-algorithms One lock and one copy of the recorded names and values; cost is linear in distinct names read.
++// @evidenceExclude contracts/performance.md#reuse-equivalent-work This accessor exposes recorded inputs without deciding reuse.
++// @evidenceExclude contracts/performance.md#bound-retention-and-release-resources The returned copy is caller-owned and no additional state is retained.
++func (p *Program) PluginEnvironmentInputs() map[string]*string {
++  if p == nil {
++    return nil
++  }
++  return p.plugins.environmentInputs()
++}
++
+ // PluginObservationsIncomplete reports whether any linked hook explicitly
+ // declared that its supported public API could not observe the input population
+ // for this generation. False means no such declaration, not completeness proof.
+@@ -1181,6 +1209,10 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
      }
    }
    raw = filterDiagnostics(raw)
@@ -404,10 +689,348 @@ index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3
  }
  
  func defaultWriteFile(fileName, text string) error {
+diff --git a/lib/compiler/internal/build/RuntimeBuildInputs.js b/lib/compiler/internal/build/RuntimeBuildInputs.js
+index 855c4b3fbcda8e55dac89e568405766864bf7139..858c6df808b105098372a8d46eea02ecdf8fa581 100644
+--- a/lib/compiler/internal/build/RuntimeBuildInputs.js
++++ b/lib/compiler/internal/build/RuntimeBuildInputs.js
+@@ -375,7 +375,9 @@ var RuntimeBuildInputs;
+                     });
+                     return false;
+                 }
+-                const accepted = RuntimeInputProof_1.RuntimeInputProof.holds(result, execution.projectRoot, emitDir);
++                // The plugins of this build would run under env, so a recorded
++                // environment read must still hold there.
++                const accepted = RuntimeInputProof_1.RuntimeInputProof.holds(result, execution.projectRoot, emitDir, env);
+                 if (!accepted)
+                     RuntimeBuildExplanation_1.RuntimeBuildExplanation.report({
+                         outcome: "rejected",
+diff --git a/lib/compiler/internal/build/RuntimeInputProof.js b/lib/compiler/internal/build/RuntimeInputProof.js
+index b64e043c810ad0834e98a441d012208a06d8aa81..35d3fef74ad87ad06e9677e5d46ea9364f59da58 100644
+--- a/lib/compiler/internal/build/RuntimeInputProof.js
++++ b/lib/compiler/internal/build/RuntimeInputProof.js
+@@ -7,6 +7,7 @@ exports.RuntimeInputProof = void 0;
+ const node_crypto_1 = __importDefault(require("node:crypto"));
+ const node_fs_1 = __importDefault(require("node:fs"));
+ const node_path_1 = __importDefault(require("node:path"));
++const SidecarEnvironment_1 = require("../sharedHost/SidecarEnvironment");
+ /**
+  * Replay the compiler and native input witnesses of a completed runtime build.
+  * Read predicates keep their original text or raw-byte codec; absence, entry
+@@ -27,21 +28,26 @@ var RuntimeInputProof;
+     /**
+      * Validate result-level host witnesses and every reported compiler predicate.
+      * The caller independently proves the selected compiler, project membership
+-     * and plugin selection; an absent graph alone grants no completeness.
++     * and plugin selection; an absent graph alone grants no completeness. Every
++     * recorded environment read must still have its value, or remain unset, in
++     * `environment`, the environment the build would spawn its plugins under.
+      *
+-     * @evidence contracts/common.md#principled-implementation Explicit incomplete observations and any graph failure reject reuse; host paths require both content and physical witnesses, and rich compiler predicates are replayed under their own codec.
++     * @evidence contracts/common.md#principled-implementation Explicit incomplete observations and any graph failure reject reuse; host paths require both content and physical witnesses, recorded environment reads require their exact value or absence, and rich compiler predicates are replayed under their own codec.
+      * @evidence contracts/common.md#clear-and-simple-design One admission pass delegates individual compiler observations and native codecs.
+-     * @evidence contracts/common.md#prohibited-implementation-shortcuts Missing witness fields never become an empty successful observation, and only the caller-owned private output subtree is excluded.
++     * @evidence contracts/common.md#prohibited-implementation-shortcuts Missing witness fields never become an empty successful observation, a changed environment value is a changed input, and only the caller-owned private output subtree is excluded.
+      * @evidence contracts/common.md#meaningful-documentation Native prose identifies result admission and the caller's separate completeness obligations.
+-     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution anchors producer-relative graph keys, and current physical paths come from native realpath.
++     * @evidence contracts/portability.md#os-neutral-implementation Native path resolution anchors producer-relative graph keys, current physical paths come from native realpath, and SidecarEnvironment.read applies Windows' case-insensitive variable names.
+      * @evidence contracts/performance.md#efficient-algorithms Input and predicate populations drive replay; each read hashes its actual bytes and directories sort immediate entry records.
+      * @evidence contracts/performance.md#reuse-equivalent-work Generation witnesses, rather than an identity-key match, decide whether a completed build remains reusable.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources Temporary path and predicate records are invocation-owned without retained handles or history.
+      */
+-    function holds(result, projectRoot, emitDir) {
++    function holds(result, projectRoot, emitDir, environment) {
+         if (result.observationsComplete === false ||
+             Object.keys(result.graph?.inputProofFailures ?? {}).length !== 0)
+             return false;
++        for (const [name, recorded] of Object.entries(result.environmentInputs ?? {}))
++            if ((SidecarEnvironment_1.SidecarEnvironment.read(environment, name) ?? null) !== recorded)
++                return false;
+         try {
+             for (const file of result.hostInputs ?? []) {
+                 const [currentPhysical, hash] = observeHostInput(file);
+diff --git a/lib/compiler/internal/build/appendBuildOutput.js b/lib/compiler/internal/build/appendBuildOutput.js
+index 17a19b74c4e7ba08c6cc77c31bcfff596ec9e30f..a9212bf6fc0d344d2ce068363faaa645eb74a76c 100644
+--- a/lib/compiler/internal/build/appendBuildOutput.js
++++ b/lib/compiler/internal/build/appendBuildOutput.js
+@@ -2,6 +2,7 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.appendBuildOutput = appendBuildOutput;
+ exports.mergeCheckGraphs = mergeCheckGraphs;
++const mergeEnvironmentInputs_1 = require("./mergeEnvironmentInputs");
+ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
+ /**
+  * Merge two `TtscBuildResult` values into one.
+@@ -15,6 +16,8 @@ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
+  * - Check inputs are unioned; independently compatible content and physical
+  *   witnesses survive. A lost witness cannot be restored by a later phase.
+  *   Explicit observation incompleteness is sticky.
++ * - `environmentInputs`: unioned; two phases that recorded different values for
++ *   one name withdraw reuse through `observationsComplete: false`.
+  *
+  * The shared normalizer moves combined stdout to stderr when the merged result
+  * failed and stderr is blank, preserving visibility for stderr-only consumers.
+@@ -47,6 +50,7 @@ function appendBuildOutput(left, right) {
+                 hostInputHashes: mergeInputWitnesses(left, right, "hostInputHashes", hostInputs),
+                 hostInputRealpaths: mergeInputWitnesses(left, right, "hostInputRealpaths", hostInputs),
+             }),
++        ...(0, mergeEnvironmentInputs_1.mergeEnvironmentInputs)(left.environmentInputs, right.environmentInputs),
+         ...(left.observationsComplete === false ||
+             right.observationsComplete === false
+             ? { observationsComplete: false }
+diff --git a/lib/compiler/internal/build/mergeEnvironmentInputs.js b/lib/compiler/internal/build/mergeEnvironmentInputs.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..17010bfbaedc7a28e821d676af7a350f22112877
+--- /dev/null
++++ b/lib/compiler/internal/build/mergeEnvironmentInputs.js
+@@ -0,0 +1,47 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.mergeEnvironmentInputs = mergeEnvironmentInputs;
++/**
++ * Union the environment reads of the native generations behind one result.
++ *
++ * Every phase of one compile spawns its plugins under the same environment, so
++ * a name normally carries one value across phases. If two phases recorded
++ * different values for a name, no single environment reproduces the result: the
++ * first value is kept and `observationsComplete: false` withdraws reuse, the
++ * same refusal an explicitly incomplete producer causes. The returned object
++ * spreads into a result and adds nothing when no phase read a variable.
++ *
++ * @evidence contracts/common.md#principled-implementation A name is an input of the merged result if any phase read it; contradictory values cannot be satisfied by one environment, so they withdraw reuse instead of picking a winner silently.
++ * @evidence contracts/common.md#clear-and-simple-design One merger serves phase composition and the transform router; the existing sticky observation marker carries a conflict rather than a new proof state.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts No current environment value is read to repair a conflict, and a conflicting name is not dropped, which would hide an input.
++ * @evidence contracts/common.md#meaningful-documentation Native prose explains why values normally agree, the conflict policy and the spreadable empty result.
++ * @evidenceExclude contracts/portability.md#os-neutral-implementation Recorded names and values are compared literally as producer data; native environment name rules belong to the consumers that look them up.
++ * @evidence contracts/performance.md#efficient-algorithms One pass over every group's entries with own-key lookups; linear in recorded names.
++ * @evidenceExclude contracts/performance.md#reuse-equivalent-work Combining supplied records coordinates no shared production.
++ * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources The returned record transfers to the caller; nothing is retained.
++ */
++function mergeEnvironmentInputs(...groups) {
++    const merged = {};
++    let conflicting = false;
++    for (const group of groups) {
++        for (const [name, value] of Object.entries(group ?? {})) {
++            if (Object.hasOwn(merged, name)) {
++                if (merged[name] !== value)
++                    conflicting = true;
++                continue;
++            }
++            // A literal wire name must not reach an inherited setter.
++            Object.defineProperty(merged, name, {
++                configurable: true,
++                enumerable: true,
++                value,
++                writable: true,
++            });
++        }
++    }
++    return {
++        ...(Object.keys(merged).length === 0 ? {} : { environmentInputs: merged }),
++        ...(conflicting ? { observationsComplete: false } : {}),
++    };
++}
++//# sourceMappingURL=mergeEnvironmentInputs.js.map
+\ No newline at end of file
+diff --git a/lib/compiler/internal/parseEnvironmentInputs.js b/lib/compiler/internal/parseEnvironmentInputs.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfba66dc36b5250461e07d0cddf1c0666541d4bb
+--- /dev/null
++++ b/lib/compiler/internal/parseEnvironmentInputs.js
+@@ -0,0 +1,43 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.parseEnvironmentInputs = parseEnvironmentInputs;
++/**
++ * Decode a native `environmentInputs` section: variable names to the value a
++ * plugin read through `ctx.Env`, or null for an unset variable.
++ *
++ * Each entry is a dependency of the whole generation, so a malformed section
++ * throws instead of dropping an entry, which would hide an input and let a
++ * consumer reuse output computed under another value. An absent or empty
++ * section decodes to `undefined`.
++ *
++ * @evidence contracts/common.md#principled-implementation Names must be non-empty strings and values strings or null; anything else fails the response rather than weakening the input record.
++ * @evidence contracts/common.md#clear-and-simple-design One decoder serves the transform envelope and the check/emit observation sidecar, which carry the same field.
++ * @evidence contracts/common.md#prohibited-implementation-shortcuts No value is read from the current environment and no malformed entry is silently discarded.
++ * @evidence contracts/common.md#meaningful-documentation Native prose states the wire shape, the failure policy and why it is strict.
++ * @evidenceExclude contracts/portability.md#os-neutral-implementation Names and values are retained as producer data; environment name rules belong to the consumers that look them up.
++ * @evidence contracts/performance.md#efficient-algorithms One pass over the section's entries; linear in names and value bytes.
++ * @evidenceExclude contracts/performance.md#reuse-equivalent-work Each response is decoded independently.
++ * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources The decoded record transfers to the caller; nothing is retained.
++ */
++function parseEnvironmentInputs(value) {
++    if (value === undefined)
++        return undefined;
++    if (typeof value !== "object" || value === null || Array.isArray(value)) {
++        throw new Error("ttsc: invalid native environment input record");
++    }
++    const output = {};
++    for (const [name, recorded] of Object.entries(value)) {
++        if (name.length === 0 ||
++            (recorded !== null && typeof recorded !== "string"))
++            throw new Error("ttsc: invalid native environment input entry");
++        // A literal wire name must not reach an inherited setter.
++        Object.defineProperty(output, name, {
++            configurable: true,
++            enumerable: true,
++            value: recorded,
++            writable: true,
++        });
++    }
++    return Object.keys(output).length === 0 ? undefined : output;
++}
++//# sourceMappingURL=parseEnvironmentInputs.js.map
+\ No newline at end of file
+diff --git a/lib/compiler/internal/parseNativeTransformOutput.js b/lib/compiler/internal/parseNativeTransformOutput.js
+index 56f9c61c7048af48686cbbab8dc9367cb3461b0d..2ff9f8dbacccacb6412526e5a534b7c711797040 100644
+--- a/lib/compiler/internal/parseNativeTransformOutput.js
++++ b/lib/compiler/internal/parseNativeTransformOutput.js
+@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.parseNativeTransformOutput = parseNativeTransformOutput;
+ exports.parseReferenceGraph = parseReferenceGraph;
+ const node_path_1 = __importDefault(require("node:path"));
++const parseEnvironmentInputs_1 = require("./parseEnvironmentInputs");
+ /**
+  * Parse the JSON envelope written by the native transform host to stdout.
+  *
+@@ -29,7 +30,9 @@ const node_path_1 = __importDefault(require("node:path"));
+  * Observation limits have a stricter protocol: completeness is only explicit
+  * false, and per-input reasons require absolute native paths and the supported
+  * unavailable reason. Invalid limit metadata fails instead of becoming an
+- * exemption; omission asserts no completeness.
++ * exemption; omission asserts no completeness. Recorded environment reads are
++ * strict too: dropping a malformed entry would hide an input, so a malformed
++ * `environmentInputs` section fails the response.
+  *
+  * @evidence contracts/common.md#principled-implementation Required source output is decoded as an object of strings; advisory members are retained only by their declared shape with literal source keys stored as own data properties, while malformed observation exemptions fail rather than authorize reuse.
+  * @evidence contracts/common.md#clear-and-simple-design This decoder owns the wire shape independently of process execution and proof revalidation; private helpers validate the distinct optional sections.
+@@ -61,6 +64,7 @@ stderr) {
+         const dependencies = parseDependencyLists(parsed.dependencies);
+         const dependenciesComplete = parseFileList(parsed.dependenciesComplete);
+         const graph = parseReferenceGraph(parsed.graph);
++        const environmentInputs = (0, parseEnvironmentInputs_1.parseEnvironmentInputs)(parsed.environmentInputs);
+         const hostInputHashes = parseHostInputHashes(parsed.hostInputHashes);
+         const hostInputRealpaths = parseHostInputRealpaths(parsed.hostInputRealpaths);
+         const hostInputs = parseFileList(parsed.hostInputs);
+@@ -69,6 +73,7 @@ stderr) {
+         return {
+             ...(dependencies === undefined ? {} : { dependencies }),
+             ...(dependenciesComplete === undefined ? {} : { dependenciesComplete }),
++            ...(environmentInputs === undefined ? {} : { environmentInputs }),
+             ...(graph === undefined ? {} : { graph }),
+             ...(hostInputHashes === undefined ? {} : { hostInputHashes }),
+             ...(hostInputRealpaths === undefined ? {} : { hostInputRealpaths }),
+diff --git a/lib/compiler/internal/runNativeCheckWithObservations.js b/lib/compiler/internal/runNativeCheckWithObservations.js
+index 6fd2b52ccdb5f81fe3c2fb317a1713cd4db15f37..a5ddfe21a1bba502985c6cea16d7b063b58f9666 100644
+--- a/lib/compiler/internal/runNativeCheckWithObservations.js
++++ b/lib/compiler/internal/runNativeCheckWithObservations.js
+@@ -7,6 +7,7 @@ exports.runNativeCheckWithObservations = runNativeCheckWithObservations;
+ const node_fs_1 = __importDefault(require("node:fs"));
+ const node_path_1 = __importDefault(require("node:path"));
+ const createCanonicalTempDirectory_1 = require("../../internal/createCanonicalTempDirectory");
++const parseEnvironmentInputs_1 = require("./parseEnvironmentInputs");
+ const parseNativeTransformOutput_1 = require("./parseNativeTransformOutput");
+ /**
+  * Execute a check or opted-in build with same-generation input observations,
+@@ -168,7 +169,9 @@ function parseObservations(value) {
+             graph.inputObservations === undefined &&
+             graph.inputRealpaths === undefined &&
+             graph.inputProofFailures === undefined);
++    const environmentInputs = (0, parseEnvironmentInputs_1.parseEnvironmentInputs)(value.environmentInputs);
+     return {
++        ...(environmentInputs === undefined ? {} : { environmentInputs }),
+         ...(graph === undefined ? {} : { graph }),
+         ...(graphUnavailable ? { observationsComplete: false } : {}),
+         hostInputs: [...inputs],
+diff --git a/lib/compiler/internal/transformProjectInMemory.js b/lib/compiler/internal/transformProjectInMemory.js
+index 999805a36b0a7f55bfcb421805ceba8fdd8da778..e1de410793dbefa35054f16308130423997eab2a 100644
+--- a/lib/compiler/internal/transformProjectInMemory.js
++++ b/lib/compiler/internal/transformProjectInMemory.js
+@@ -12,6 +12,7 @@ const loadProjectPlugins_1 = require("../../plugin/internal/load/loadProjectPlug
+ const realpathHostInputPaths_1 = require("../../plugin/internal/load/realpathHostInputPaths");
+ const CompilationSnapshot_1 = require("./CompilationSnapshot");
+ const appendBuildOutput_1 = require("./build/appendBuildOutput");
++const mergeEnvironmentInputs_1 = require("./build/mergeEnvironmentInputs");
+ const normalizeBuildOutput_1 = require("./build/normalizeBuildOutput");
+ const buildNativeCompiler_1 = require("./buildNativeCompiler");
+ const outputText_1 = require("./outputText");
+@@ -46,11 +47,13 @@ const spawnNative_1 = require("./spawnNative");
+  * Explicit unavailable-observation reports survive every lane so consumers can
+  * use a fresh successful result while withholding reuse. They cannot excuse a
+  * content or physical witness that changed or conflicted across stages.
+- * Opted-in checks supply their same-generation observations through a private
+- * sidecar on failure as well as success. A later transform cannot restore a
+- * check's rejected proof or replace it with an unavailable-input exemption.
+- * Other check hosts retain their existing descriptor and declared-input
+- * observation contract rather than inheriting the driver's protocol.
++ * Environment variables read by the check and transform stages are unioned into
++ * `environmentInputs`. Opted-in checks supply their same-generation
++ * observations through a private sidecar on failure as well as success. A later
++ * transform cannot restore a check's rejected proof or replace it with an
++ * unavailable-input exemption. Other check hosts retain their existing
++ * descriptor and declared-input observation contract rather than inheriting the
++ * driver's protocol.
+  *
+  * @returns A `{ result, typescript }` pair where `typescript` maps output paths
+  *   to their transformed TypeScript source text, and `pluginSources` the state
+@@ -140,6 +143,7 @@ function transformProjectWithNativeHost(options, project, baseline) {
+     const hostInputRealpaths = mergeCompatibleHostInputHashes(finalObservedHostInputRealpaths, finalOutputHostInputRealpaths, observedHostInputs, output.hostInputs);
+     return {
+         ...envelopeSideChannels(output),
++        ...(0, mergeEnvironmentInputs_1.mergeEnvironmentInputs)(output.environmentInputs),
+         ...observationLimitations([
+             baseline,
+             {
+@@ -184,6 +188,7 @@ function transformProjectWithPlugins(options, loaded) {
+     if (checked.status !== 0) {
+         return {
+             ...(checked.graph === undefined ? {} : { graph: checked.graph }),
++            ...(0, mergeEnvironmentInputs_1.mergeEnvironmentInputs)(checked.environmentInputs),
+             ...observationLimitations([loaded, checked], checkedHostInputHashes, checkedHostInputRealpaths, unprovenCheckInputs),
+             ...(checked.graph === undefined
+                 ? { observationsComplete: false }
+@@ -203,6 +208,7 @@ function transformProjectWithPlugins(options, loaded) {
+         const hostInputRealpaths = mergeCompatibleHostInputHashes(finalLoadedHostInputRealpaths, transformed.hostInputRealpaths, checkedHostInputs, transformed.hostInputs);
+         return {
+             ...envelopeSideChannels(transformed),
++            ...(0, mergeEnvironmentInputs_1.mergeEnvironmentInputs)(checked.environmentInputs, transformed.environmentInputs),
+             graph: mergeTransformGraphs(checked.graph, transformed.graph, checks.length),
+             ...observationLimitations([loaded, checked, transformed], hostInputHashes, hostInputRealpaths, unprovenCheckInputs),
+             hostInputHashes,
+@@ -236,6 +242,7 @@ function transformProjectWithPlugins(options, loaded) {
+     const hostInputRealpaths = mergeCompatibleHostInputHashes(finalLoadedHostInputRealpaths, finalOutputHostInputRealpaths, checkedHostInputs, output.hostInputs, deferredTransformInputs);
+     return {
+         ...envelopeSideChannels(output),
++        ...(0, mergeEnvironmentInputs_1.mergeEnvironmentInputs)(checked.environmentInputs, output.environmentInputs),
+         graph: mergeTransformGraphs(checked.graph, output.graph, checks.length),
+         ...observationLimitations([loaded, checked, output], hostInputHashes, hostInputRealpaths, unprovenCheckInputs),
+         hostInputHashes,
+diff --git a/lib/internal/CompilerResultAdapter.js b/lib/internal/CompilerResultAdapter.js
+index 7ff885f63d081b950730bd303aeeed70aada8067..a43778c1fe3711da0db4743b3f00b903fd22e01d 100644
+--- a/lib/internal/CompilerResultAdapter.js
++++ b/lib/internal/CompilerResultAdapter.js
+@@ -179,7 +179,7 @@ function toCompilerResult(project) {
+  * @evidenceExclude contracts/performance.md#bound-retention-and-release-resources Returned source/advisory objects remain reachable under caller ownership; this operation owns no process, lease or historical registry.
+  */
+ function toCompilerTransformation(project) {
+-    const { dependencies: reportedDependencies, dependenciesComplete, graph, hostInputHashes, hostInputProofFailures, hostInputRealpaths, hostInputs, observationsComplete, pluginSources, result, sourceMaps, typescript, volatile, } = project;
++    const { dependencies: reportedDependencies, dependenciesComplete, environmentInputs, graph, hostInputHashes, hostInputProofFailures, hostInputRealpaths, hostInputs, observationsComplete, pluginSources, result, sourceMaps, typescript, volatile, } = project;
+     let dependencies = reportedDependencies;
+     if (graph?.contentMapperInputs?.length) {
+         const keys = new Set([
+@@ -204,6 +204,7 @@ function toCompilerTransformation(project) {
+     const advisoryFields = {
+         ...(dependencies === undefined ? {} : { dependencies }),
+         ...(dependenciesComplete === undefined ? {} : { dependenciesComplete }),
++        ...(environmentInputs === undefined ? {} : { environmentInputs }),
+         ...(graph === undefined ? {} : { graph }),
+         ...(hostInputHashes === undefined ? {} : { hostInputHashes }),
+         ...(hostInputProofFailures === undefined ? {} : { hostInputProofFailures }),
 diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javascriptRuntimeCapabilities.js
+index 53dc81d7ae8b6eac246306ad8f94b01f2594689a..d6ad694d69deca3661f5b89b491a48f282b34d42 100644
 --- a/lib/internal/javascriptRuntimeCapabilities.js
 +++ b/lib/internal/javascriptRuntimeCapabilities.js
-@@ -43,6 +43,19 @@
+@@ -43,6 +43,19 @@ const spawnSyncWithLowDescriptors_1 = require("./spawnSyncWithLowDescriptors");
   * @evidence contracts/performance.md#bound-retention-and-release-resources The synchronous probe owns child completion and fallback captures; finally attempts capture close/removal, whose helper suppresses cleanup failures, so native/file release is unconfirmed on failure. Capability entries retain absolute spellings and path/identity text with no eviction quota; failed identity validation can remove an entry. Returned capability copies transfer to callers.
   */
  function javascriptRuntimeCapabilities(runtime, env, cwd, identities) {
@@ -428,9 +1051,10 @@ diff --git a/lib/internal/javascriptRuntimeCapabilities.js b/lib/internal/javasc
      // which would refuse the cache and run in the probe (#1740).
      const effectiveEnv = TtsxNodeOptions_1.TtsxNodeOptions.forHelpers(SidecarEnvironment_1.SidecarEnvironment.merge(process.env, env));
 diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/internal/load/loadProjectPlugins.js
+index b833157164e2125551debbd5c4eda35dd9d223fd..0e03aa37a66a08b3546a4edf0c3338a0083eaa7c 100644
 --- a/lib/plugin/internal/load/loadProjectPlugins.js
 +++ b/lib/plugin/internal/load/loadProjectPlugins.js
-@@ -275,10 +275,14 @@
+@@ -275,10 +275,14 @@ function loadProjectPlugins(options) {
          // With the witness of each such reading, so a build of a directory package
          // selection already read keys on that reading instead of probing Go again.
          const environmentWitnesses = new Map();
@@ -445,7 +1069,7 @@ diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/interna
          };
          // Records describing sources must never land inside one, so the store is
          // admitted for source proofs only once every source of the load is known.
-@@ -314,6 +318,7 @@
+@@ -314,6 +318,7 @@ function loadProjectPlugins(options) {
              // A worker owns the watch baseline now. Complete this handoff before Go
              // metadata or source proof consumes the roots, preserving #1728 (#1758).
              yield options.onWatchInputs([...interests].sort(), sourceIdentities);
@@ -453,7 +1077,7 @@ diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/interna
              const initialSize = interests.size;
              for (const candidate of candidates) {
                  // Nested source-only proposals replace the outer root manifests. Do not
-@@ -324,8 +329,10 @@
+@@ -324,8 +329,10 @@ function loadProjectPlugins(options) {
                      if (reportsPluginSource(directory))
                          interests.add(directory);
              }
@@ -465,7 +1089,7 @@ diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/interna
          }
          const proposals = NativeSourcePackages_1.NativeSourcePackages.propose(candidates.map((candidate) => ({
              ...candidate,
-@@ -370,6 +377,8 @@
+@@ -370,6 +377,8 @@ function loadProjectPlugins(options) {
          // Admission can now narrow the provisional interests without restamping the
          // retained package/module baselines. Final host errors still keep these roots.
          yield options.onWatchInputs?.(buildDirectories, sourceIdentities);
@@ -474,7 +1098,7 @@ diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/interna
          const keyedDirectories = new Set(buildDirectories);
          const linkedContributors = records
              .filter((record) => record.stage === "transform")
-@@ -564,7 +573,7 @@
+@@ -565,7 +574,7 @@ function loadProjectPlugins(options) {
                      env: effectiveEnv,
                      sourceDigest,
                      environment: environmentDigests.get(directory) ??
@@ -484,9 +1108,10 @@ diff --git a/lib/plugin/internal/load/loadProjectPlugins.js b/lib/plugin/interna
              ])),
              project,
 diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/source/GoSourceInputs.js
+index 6bf30f65eb6f046eb2b9d505f6838b330a444df4..abc3485a35c4e380dc6e4c07fbacf2553ff2e21a 100644
 --- a/lib/plugin/internal/source/GoSourceInputs.js
 +++ b/lib/plugin/internal/source/GoSourceInputs.js
-@@ -73,6 +73,16 @@
+@@ -73,6 +73,16 @@ var GoSourceInputs;
      function goBuildEnv(goBinary, goBuildCacheRoot, effectiveEnv = process.env) {
          const env = { ...effectiveEnv };
          env.GOWORK = "auto";
@@ -504,6 +1129,7 @@ diff --git a/lib/plugin/internal/source/GoSourceInputs.js b/lib/plugin/internal/
          // (`go mod edit`, `go env`, `go version`) call goBuildEnv with no cache root
          // and inherit ambient GOCACHE rather than receiving the managed build
 diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/internal/source/NativeSourcePackages.d.ts
+index 898f9333ddee1701d1f8af9b19c64c4f1263b9a4..037129fdcc7cf778c8f0eb4e7dd3da01f790864d 100644
 --- a/lib/plugin/internal/source/NativeSourcePackages.d.ts
 +++ b/lib/plugin/internal/source/NativeSourcePackages.d.ts
 @@ -1,5 +1,6 @@
@@ -513,7 +1139,7 @@ diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/i
  import { SourcePluginWorkspace } from "./SourcePluginWorkspace";
  /**
   * Observe Go-selected packages under the native builder's workspace policy.
-@@ -68,6 +69,11 @@
+@@ -68,6 +69,11 @@ export declare namespace NativeSourcePackages {
           * directory keys on that reading instead of probing Go again.
           */
          witnesses?: Map<string, PluginBuildEnvironmentWitness.Record>;
@@ -526,9 +1152,10 @@ diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/i
      /**
       * Observe entries together in a private module layout for their context.
 diff --git a/lib/plugin/internal/source/NativeSourcePackages.js b/lib/plugin/internal/source/NativeSourcePackages.js
+index 47a28235462559085e2cd4849d5920f2ae48395f..05ffe792a0e10a380c71a77bfa7533e103fccb1c 100644
 --- a/lib/plugin/internal/source/NativeSourcePackages.js
 +++ b/lib/plugin/internal/source/NativeSourcePackages.js
-@@ -391,7 +391,7 @@
+@@ -391,7 +391,7 @@ function selectionIdentity(opts, moduleRoot, goBinary, env, identities) {
          if (environment === undefined) {
              const hash = node_crypto_1.default.createHash("sha256");
              const witness = new Map();
@@ -538,9 +1165,10 @@ diff --git a/lib/plugin/internal/source/NativeSourcePackages.js b/lib/plugin/int
              readings.environments?.set(resolvedRoot, environment);
              readings.witnesses?.set(resolvedRoot, witness);
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
+index da585c3ce22340d4a7d3c2b2793ae5c951958372..63c842daefa4c15cbc17b778dd382ac038eed69a 100644
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 +++ b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
-@@ -20,10 +20,10 @@
+@@ -20,10 +20,10 @@ const pluginBuildEnvironment_1 = require("./pluginBuildEnvironment");
   * Cold asynchronous reads run in an exclusively owned worker. Its complete
   * environment snapshot is passed explicitly to the native reader. Publication
   * rechecks both current host variables and external witnesses after transfer.
@@ -555,7 +1183,7 @@ diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/
   *
   * @evidence contracts/common.md#principled-implementation Readings pair complete environment identity with the producer's native pre-read witness; cached reuse validates that witness and asynchronous publication rechecks variables/witness after transfer. Synchronous fresh reads publish their paired observations without an extra post-read holds call here; native metadata distinguishability remains a premise.
   * @evidence contracts/common.md#clear-and-simple-design One owner shares observation records across synchronous reads, cache-only proof and asynchronous preparation.
-@@ -253,7 +253,7 @@
+@@ -253,7 +253,7 @@ var PluginBuildEnvironmentReadings;
      function acquireWorker() {
          if (worker !== undefined)
              return worker;
@@ -565,6 +1193,7 @@ diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/
          const retire = () => {
              if (worker === created)
 diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
+index 596a3ef69b0dca254e16d30ab2787ec9342f2b0c..296d6ac8e79ddd8ba3bb825fb2b065ffa4e262ec 100644
 --- a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
 +++ b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
 @@ -21,7 +21,11 @@
@@ -581,9 +1210,10 @@ diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts b/lib/plug
   * @param root The source directory: a plugin's Go module root, an overlay
   *   module, a contributor's source, or a `replace` target outside the module.
 diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin/internal/source/collectPluginSourceFiles.js
+index a658d747d126ef367b1d2e984131447cc3f71010..2919c93daa252715add66be29b449df327c18e5b 100644
 --- a/lib/plugin/internal/source/collectPluginSourceFiles.js
 +++ b/lib/plugin/internal/source/collectPluginSourceFiles.js
-@@ -30,7 +30,11 @@
+@@ -30,7 +30,11 @@ const GoSourceInputs_1 = require("./GoSourceInputs");
   * A link (a symbolic link or a Windows junction) outside those directories is
   * refused rather than skipped. The build would compile what it names, which
   * neither this list nor anything keyed on it covers; a Go module zip excludes
@@ -596,7 +1226,7 @@ diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin
   *
   * @param root The source directory: a plugin's Go module root, an overlay
   *   module, a contributor's source, or a `replace` target outside the module.
-@@ -72,7 +76,8 @@
+@@ -72,7 +76,8 @@ function walk(root, dir, out) {
              // list, the key, nor a watch covers, and a copy of the module cannot
              // recreate a link without the symlink privilege on Windows.
              if (GoSourceInputs_1.GoSourceInputs.shouldPruneDirectory(entry.name) ||
@@ -606,7 +1236,7 @@ diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin
                  continue;
              throw new Error(`ttsc: plugin source ${root} contains a link at ${full}. A plugin's Go ` +
                  `sources are its own files, as a Go module zip holds them: replace the ` +
-@@ -92,4 +97,15 @@
+@@ -92,4 +97,15 @@ function walk(root, dir, out) {
          out.push(full);
      }
  }
@@ -624,9 +1254,10 @@ diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.js b/lib/plugin
  //# sourceMappingURL=collectPluginSourceFiles.js.map
 \ No newline at end of file
 diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts b/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
+index b8475fb40b83ea29d631368bc3273936ba94aec9..7464692c67e560ff9dc37c65381e4babeb3ee276 100644
 --- a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
 +++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts
-@@ -37,6 +37,10 @@
+@@ -37,6 +37,10 @@ import type { SourceBuildFilesystemOperations } from "./SourceBuildFilesystemOpe
   * @param identities Record store that lets a new process prove the GOROOT
   *   corpus and executable bytes from their metadata (`PluginContentIdentities`,
   *   #1722); without it every process reads them.
@@ -637,7 +1268,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts b/lib/pl
   * @evidence contracts/common.md#principled-implementation Fixed artifact flags, observed compiler bytes/version, selected reported-or-fallback build values, named command executables and selected SDK files enter the same framed identity used by source-state reporting. Fallback values and metadata-qualified reuse are explicit premises, not complete observation of arbitrary toolchain inputs. GOFLAGS enters without ttsc's own compiler-target tag, so the caller's environment reproduces a 7.1 load's digest; targets are separated by their overlay modules in the build key.
   * @evidence contracts/common.md#clear-and-simple-design Private helpers separate compiler identity, Go-reported settings, external variables and SDK content while sharing one hash sink and optional pre-read witness.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts Cache signatures include real identity/change metadata and effective invocation context; failed SDK witnessing refuses reuse rather than accepting a VERSION-only proxy.
-@@ -48,4 +52,18 @@
+@@ -48,4 +52,18 @@ import type { SourceBuildFilesystemOperations } from "./SourceBuildFilesystemOpe
   */
  export declare function hashPluginBuildEnvironment(hash: {
      update(data: string): unknown;
@@ -658,9 +1289,10 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.d.ts b/lib/pl
 +    };
 +}
 diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
+index 9a33d59cedb86a4e8228cbfe1034cd1001aa338c..d7ad8c6e97e7ba4e5990d3a6b9b8264145d54627 100644
 --- a/lib/plugin/internal/source/hashPluginBuildEnvironment.js
 +++ b/lib/plugin/internal/source/hashPluginBuildEnvironment.js
-@@ -50,6 +50,10 @@
+@@ -50,6 +50,10 @@ const spawnGoTool_1 = require("./spawnGoTool");
   * @param identities Record store that lets a new process prove the GOROOT
   *   corpus and executable bytes from their metadata (`PluginContentIdentities`,
   *   #1722); without it every process reads them.
@@ -671,7 +1303,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
   * @evidence contracts/common.md#principled-implementation Fixed artifact flags, observed compiler bytes/version, selected reported-or-fallback build values, named command executables and selected SDK files enter the same framed identity used by source-state reporting. Fallback values and metadata-qualified reuse are explicit premises, not complete observation of arbitrary toolchain inputs. GOFLAGS enters without ttsc's own compiler-target tag, so the caller's environment reproduces a 7.1 load's digest; targets are separated by their overlay modules in the build key.
   * @evidence contracts/common.md#clear-and-simple-design Private helpers separate compiler identity, Go-reported settings, external variables and SDK content while sharing one hash sink and optional pre-read witness.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts Cache signatures include real identity/change metadata and effective invocation context; failed SDK witnessing refuses reuse rather than accepting a VERSION-only proxy.
-@@ -59,7 +63,7 @@
+@@ -59,7 +63,7 @@ const spawnGoTool_1 = require("./spawnGoTool");
   * @evidence contracts/performance.md#reuse-equivalent-work Compiler memo identity includes selected path/file metadata and invocation cwd/environment; SDK aggregate reuse requires matching complete ordered metadata/topology. With a record store, a new process reuses the SDK aggregate and executable digests only while their signatures match the recorded ones and every stamp is separable from a freshly minted reference (#1722); `go version` and `go env` stay live because they report toolchain selection no file metadata shows. All of this relies on native metadata distinguishability and sequential observation premises. Physical directories expand once per selection policy while aliases retain edges; optional caller witnesses receive reached selected dependencies.
   * @evidence contracts/performance.md#bound-retention-and-release-resources Compiler, Go-environment-path and SDK maps retain historical distinct tool/context/root keys without eviction; persisted records belong to the single-file collector. SDK population/topology and full individual file reads contribute transient bytes; synchronous probes delegate process/capture lifetime to their owner and do not certify arbitrary descendants are gone. No independent entry/record/file/output byte ceiling is imposed here.
   */
@@ -680,7 +1312,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      // Fixed artifact policy must invalidate binaries and reported source states
      // together, including binaries cached before this policy was introduced.
      hash.update(JSON.stringify(["source-build-flags", GoSourceInputs_1.GoSourceInputs.BUILD_FLAGS]));
-@@ -69,7 +73,7 @@
+@@ -69,7 +73,7 @@ function hashPluginBuildEnvironment(hash, goBinary, directory, env, filesystem,
              resolveGoCompilerIdentity(goBinary, env, directory, witness, identities),
          ]));
      }
@@ -689,7 +1321,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      hashExternalGoBuildEnvironment(hash, env);
  }
  // Go build environment values that can change the produced binary or decide
-@@ -296,8 +300,8 @@
+@@ -296,8 +300,8 @@ function hashFile(file) {
      hash.update(node_fs_1.default.readFileSync(file));
      return hash.digest("hex");
  }
@@ -700,7 +1332,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      for (const key of GO_BUILD_ENV_KEYS) {
          const value = values.get(key);
          if (value !== undefined && value !== "") {
-@@ -305,7 +309,7 @@
+@@ -305,7 +309,7 @@ function hashGoBuildEnvironment(hash, goBinary, cwd, env, filesystem, witness, i
          }
      }
  }
@@ -709,7 +1341,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      const values = new Map();
      if (goBinary !== undefined) {
          const parsed = GoEnvironmentReading_1.GoEnvironmentReading.read(goBinary, cwd, env, GO_BUILD_ENV_KEYS, witness, identities);
-@@ -314,7 +318,7 @@
+@@ -314,7 +318,7 @@ function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, iden
                  for (const key of GO_BUILD_ENV_KEYS) {
                      const raw = parsed[key];
                      if (typeof raw === "string" && raw !== "") {
@@ -718,7 +1350,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
                      }
                  }
              }
-@@ -329,19 +333,19 @@
+@@ -329,19 +333,19 @@ function resolveGoBuildEnvironment(goBinary, cwd, env, filesystem, witness, iden
              continue;
          const value = env[key];
          if (value !== undefined && value !== "") {
@@ -741,7 +1373,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      }
      if (key === "GOFLAGS") {
          // ttsc's compiler-target tag is not the caller's Go environment. Omitting
-@@ -445,10 +449,12 @@
+@@ -445,10 +449,12 @@ function hashExternalGoBuildEnvironment(hash, env) {
      }
  }
  // GOROOT is usually stable but its selected source/tool payloads contribute to
@@ -758,7 +1390,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
  //
  // WARNING (#1186, #1722): this map lives only as long as the process. #1186
  // stopped at it, so every CLI launch, worker and bundler restart still read the
-@@ -456,12 +462,12 @@
+@@ -456,12 +462,12 @@ function hashExternalGoBuildEnvironment(hash, env) {
  // below is what carries the identity across processes; never drop it in favor
  // of this memo alone.
  const goRootIdentityCache = new Map();
@@ -773,7 +1405,7 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      if (!snapshot.complete)
          PluginBuildEnvironmentWitness_1.PluginBuildEnvironmentWitness.refuse(witness, resolved);
      if (snapshot.complete) {
-@@ -502,6 +508,29 @@
+@@ -502,6 +508,29 @@ function resolveGoRootCacheIdentity(goRoot, filesystem, witness, identities) {
      }
      return identity;
  }
@@ -804,9 +1436,10 @@ diff --git a/lib/plugin/internal/source/hashPluginBuildEnvironment.js b/lib/plug
      const out = [];
      const state = { complete: true, separable: references !== undefined };
 diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/internal/source/inspectPluginBuildLock.js
+index 1d9fba4c59143dc68efff3dba52499121f727b66..63d7ba0a344119dad76df5fdc2477c69dccb7ba9 100644
 --- a/lib/plugin/internal/source/inspectPluginBuildLock.js
 +++ b/lib/plugin/internal/source/inspectPluginBuildLock.js
-@@ -65,9 +65,16 @@
+@@ -65,9 +65,16 @@ function inspectPluginBuildLock(lockDir) {
  const PLUGIN_BUILD_LOCK_OBSERVER = node_crypto_1.default.randomBytes(16).toString("hex");
  function inspectV3PluginBuildLock(lockDir) {
      const generationDir = node_path_1.default.join(lockDir, PluginBuildLockProtocol_1.PluginBuildLockProtocol.PLUGIN_BUILD_LOCK_CURRENT_DIR);
@@ -824,7 +1457,7 @@ diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/i
              return { state: "released" };
          }
          throw new Error(`ttsc plugin build lock has no valid ${PluginBuildLockProtocol_1.PluginBuildLockProtocol.PLUGIN_BUILD_LOCK_GENERATION_FILE}: ${generationDir}`);
-@@ -269,6 +276,22 @@
+@@ -269,6 +276,22 @@ function readPluginBuildLockGeneration(generationDir) {
          return null;
      }
  }
@@ -848,6 +1481,7 @@ diff --git a/lib/plugin/internal/source/inspectPluginBuildLock.js b/lib/plugin/i
   * Whether a path lookup proves absence. Permission and sharing failures are
   * inconclusive, never evidence of a released or old abandoned generation.
 diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts b/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
+index fa3512f0805d2ae0feccc90b7b0a6bce9a1db2f3..7817e88063e6d5b7851ca587dc808d9411fc25d3 100644
 --- a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
 +++ b/lib/plugin/internal/source/pluginBuildEnvironment.d.ts
 @@ -1,5 +1,6 @@
@@ -857,7 +1491,7 @@ diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts b/lib/plugin
  /**
   * The digest of the environment a plugin build in `directory` is keyed on: the
   * Go compiler the build resolves there, the Go build environment `go env`
-@@ -23,6 +24,8 @@
+@@ -23,6 +24,8 @@ import type { PluginContentIdentities } from "./PluginContentIdentities";
   *   carries (`hashPluginBuildEnvironment`).
   * @param identities Record store that lets a new process prove the SDK and
   *   executables from metadata (#1722).
@@ -866,7 +1500,7 @@ diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts b/lib/plugin
   * @evidence contracts/common.md#principled-implementation The digest uses the same resolved compiler and environment serializer as the binary key, so reported toolchain state denotes the inputs actually used by the build.
   * @evidence contracts/common.md#clear-and-simple-design Compiler selection, executable resolution and hashing each stay with their owning helper; this function only composes one environment reading.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts The result comes from real Go/environment inputs, not a fixed compiler version or a caller-specific substitute.
-@@ -30,7 +33,7 @@
+@@ -30,7 +33,7 @@ import type { PluginContentIdentities } from "./PluginContentIdentities";
   * @evidence contracts/portability.md#os-neutral-implementation Executable identity is resolved before probing, and Node filesystem/process boundaries implement native spelling rather than assuming Windows or POSIX paths are interchangeable.
   * @evidence contracts/performance.md#efficient-algorithms The wrapper resolves the compiler/tool under the supplied environment before delegating full environment hashing. Native resolution/probes, SDK metadata/name/path sorting and changed-manifest full content reads contribute cost; the final hash output is fixed-width but streamed identity/input text and full-file buffers are not. No independent duplicate source-directory digest scan is added here.
   *
@@ -877,9 +1511,10 @@ diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.d.ts b/lib/plugin
 -export declare function pluginBuildEnvironment(directory: string, env?: NodeJS.ProcessEnv, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store): string;
 +export declare function pluginBuildEnvironment(directory: string, env?: NodeJS.ProcessEnv, witness?: PluginBuildEnvironmentWitness.Record, identities?: PluginContentIdentities.Store, goRoots?: GoRootBatch): string;
 diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.js b/lib/plugin/internal/source/pluginBuildEnvironment.js
+index 63041fd3831d6d51faebc61df12db26b5f852383..fb2694b9b12ba3029fd873b28e5dfb0492fb0a6f 100644
 --- a/lib/plugin/internal/source/pluginBuildEnvironment.js
 +++ b/lib/plugin/internal/source/pluginBuildEnvironment.js
-@@ -32,6 +32,8 @@
+@@ -32,6 +32,8 @@ const resolveGoCompiler_1 = require("./resolveGoCompiler");
   *   carries (`hashPluginBuildEnvironment`).
   * @param identities Record store that lets a new process prove the SDK and
   *   executables from metadata (#1722).
@@ -888,7 +1523,7 @@ diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.js b/lib/plugin/i
   * @evidence contracts/common.md#principled-implementation The digest uses the same resolved compiler and environment serializer as the binary key, so reported toolchain state denotes the inputs actually used by the build.
   * @evidence contracts/common.md#clear-and-simple-design Compiler selection, executable resolution and hashing each stay with their owning helper; this function only composes one environment reading.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts The result comes from real Go/environment inputs, not a fixed compiler version or a caller-specific substitute.
-@@ -39,13 +41,13 @@
+@@ -39,13 +41,13 @@ const resolveGoCompiler_1 = require("./resolveGoCompiler");
   * @evidence contracts/portability.md#os-neutral-implementation Executable identity is resolved before probing, and Node filesystem/process boundaries implement native spelling rather than assuming Windows or POSIX paths are interchangeable.
   * @evidence contracts/performance.md#efficient-algorithms The wrapper resolves the compiler/tool under the supplied environment before delegating full environment hashing. Native resolution/probes, SDK metadata/name/path sorting and changed-manifest full content reads contribute cost; the final hash output is fixed-width but streamed identity/input text and full-file buffers are not. No independent duplicate source-directory digest scan is added here.
   *
@@ -907,9 +1542,10 @@ diff --git a/lib/plugin/internal/source/pluginBuildEnvironment.js b/lib/plugin/i
  //# sourceMappingURL=pluginBuildEnvironment.js.map
 \ No newline at end of file
 diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/internal/source/waitForPluginBinary.js
+index 191b99ea9f36da615f82f921d40c185a56737bbd..a741af5a3e5d401f1827d896774d89bf7e2bd0c5 100644
 --- a/lib/plugin/internal/source/waitForPluginBinary.js
 +++ b/lib/plugin/internal/source/waitForPluginBinary.js
-@@ -25,6 +25,12 @@
+@@ -25,6 +25,12 @@ const inspectPluginBuildLock_1 = require("./inspectPluginBuildLock");
   * run. An opted-in synchronous owner can cancel observation or interrupt a
   * polling sleep; cancellation never retires the holder's generation.
   *
@@ -922,7 +1558,7 @@ diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/inte
   * @evidence contracts/common.md#principled-implementation Polling first refuses unknown/malformed native guards, suppresses publication while pending and rechecks after observed release; actual abandoned-owner observations retain their exact generation, while budget expiry fails without revoking a possibly active payload task.
   * @evidence contracts/common.md#clear-and-simple-design The loop separates publication, release, retirement and periodic status reporting; generation interpretation belongs to inspectPluginBuildLock.
   * @evidence contracts/common.md#prohibited-implementation-shortcuts Budget expiry throws instead of retiring a live-looking generation and compensating for concurrent callbacks; status output never substitutes for ownership evidence.
-@@ -43,22 +49,9 @@
+@@ -43,22 +49,9 @@ function waitForPluginBinary(opts) {
          OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
          SourceNativeRetirement_1.SourceNativeRetirement.assertAvailable(protocolDir);
          const protectedNativeInputs = SourceNativeRetirement_1.SourceNativeRetirement.isProtected(protocolDir);
@@ -945,7 +1581,7 @@ diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/inte
          if (lock.state === "abandoned") {
              return {
                  outcome: "abandoned",
-@@ -66,6 +59,12 @@
+@@ -66,6 +59,12 @@ function waitForPluginBinary(opts) {
                  fence: lock.fence,
              };
          }
@@ -959,7 +1595,7 @@ diff --git a/lib/plugin/internal/source/waitForPluginBinary.js b/lib/plugin/inte
              throw new Error(`ttsc: timed out after ${(0, formatDuration_1.formatDuration)(clock - startedAt)} waiting for ` +
                  `${opts.lockInfo.label} "${opts.lockInfo.pluginName}" at ${opts.lockDir}; ` +
 diff --git a/utility/host.go b/utility/host.go
-index fab9fcc72897ec54540a5f5e93dfe115bba102a5..9d72bb780e5e104f6a41889a712efe677bdfe3d8 100644
+index 5db2b9af70ee7b971659670bbe09d186ea90ada9..dcd04ca94c0900896b0e1bc04e9ed53e7da47b65 100644
 --- a/utility/host.go
 +++ b/utility/host.go
 @@ -7,6 +7,7 @@ import (
@@ -970,7 +1606,19 @@ index fab9fcc72897ec54540a5f5e93dfe115bba102a5..9d72bb780e5e104f6a41889a712efe67
    "strings"
  
    shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
-@@ -234,7 +235,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -79,6 +80,11 @@ type transformResult struct {
+   HostInputHashes      map[string]*string     `json:"hostInputHashes,omitempty"`
+   HostInputRealpaths   map[string]*string     `json:"hostInputRealpaths,omitempty"`
+ 
++  // EnvironmentInputs maps each environment variable a linked hook read
++  // through PluginContext.Env to the value it read; null means unset.
++  // Omitted when no hook read one.
++  EnvironmentInputs map[string]*string `json:"environmentInputs,omitempty"`
++
+   // ObservationsComplete is present only as false when a linked hook explicitly
+   // could not observe its input population. Absence is not completeness proof.
+   ObservationsComplete *bool `json:"observationsComplete,omitempty"`
+@@ -255,7 +261,10 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
      opts.quiet = false // --verbose overrides the default --quiet=true
    }
    if !opts.quiet {
@@ -982,7 +1630,7 @@ index fab9fcc72897ec54540a5f5e93dfe115bba102a5..9d72bb780e5e104f6a41889a712efe67
    }
    writeFile, finishPreamble := makeSourcePreambleWriteFile(prog)
    var snapshot func() map[string][]string
-@@ -284,6 +288,18 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
+@@ -305,6 +314,19 @@ func RunBuildWithIO(args []string, stdout, stderr io.Writer) int {
    }
    if !opts.quiet {
      fmt.Fprintf(opts.stdout, "// ttsc utility: emitted=%d files\n", len(emittedFiles))
@@ -998,6 +1646,15 @@ index fab9fcc72897ec54540a5f5e93dfe115bba102a5..9d72bb780e5e104f6a41889a712efe67
 +      }
 +      fmt.Fprintln(opts.stdout, "  +", rel)
 +    }
++    driver.WriteEnvironmentInputsSummary(opts.stdout, "// ttsc utility: ", prog)
    }
    return 0
  }
+@@ -398,6 +420,7 @@ func RunTransformWithIO(args []string, stdout, stderr io.Writer) int {
+     out.HostInputs = prog.PluginHostInputs()
+     out.HostInputHashes = prog.PluginHostInputHashes()
+     out.HostInputRealpaths = prog.PluginHostInputRealpaths()
++    out.EnvironmentInputs = prog.PluginEnvironmentInputs()
+     if prog.PluginObservationsIncomplete() {
+       incomplete := false
+       out.ObservationsComplete = &incomplete
