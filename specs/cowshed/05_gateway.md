@@ -1576,9 +1576,8 @@ process's disk I/O along with its CPU, and a throttled thread sleeps while it ho
   backing-store I/O. The gate took 1.53 times its time alone, against 1.69 times. On the host's own volume, throttle
   held the writers to 37 MB/s against 139 MB/s, and the gate still took 1.26 times against 1.31 times. What it lost was
   its barriers: its `F_FULLFSYNC`s took 1.8 s alone and 3.9 to 4.7 s beside the writers at every tier, because each one
-  flushes the whole device. [laws/io_tier.bend](laws/io_tier.bend) states the mechanism: a throttled request that holds
-  a lock a gate waits on moves only on its low turns (`throttled_holder_stalls_the_gate`), so the gate's wait grows from
-  the holder's own services to (bound + 1) times them (`throttle_stretches_a_lock_wait`).
+  flushes the whole device. [laws/io_tier.bend](laws/io_tier.bend) models the tiers: under `Tier`, a low request holding
+  a lock a gate waits on does not move while the window runs (`throttled_holder_stalls_the_gate`).
 
 ### Memory pressure
 

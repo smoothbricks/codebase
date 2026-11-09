@@ -281,9 +281,8 @@ def flat_live(+b: Nat, +l: Nat, +h: Nat, +q: +List<T>, +log: +List<T>)
     case 0n Con{x, t}:
       i => i
 
-# LAW (low I/O liveness): under every policy and every step, the passes left before a waiting
-# low request goes next stay within the bound, so a low request waits at most `bound` gate
-# services (plus, under Tier, the throttled services of a lock it holds).
+# LAW (the window stays bounded): under every policy and every step, if `left` is at most
+# `bound`, it still is after the step.
 law low_window_stays_bounded:
   for +p: Pol
   for +o: Op
@@ -318,8 +317,8 @@ def gate_first.if(+b: Nat, +l1: Nat, +q: +List<T>, +log: +List<T>, +w: Bool, +g:
     case False{} False{}:
       i => Empty.absurd({last(tier.if(b, q, log, False{}, False{}, 1n+l1)) == G{} : T}, i)
 
-# LAW (a gate's I/O never waits behind low I/O): with no lock held and passes left, a waiting
-# gate request is served next, whatever low requests arrived before it. Flat has no such law
+# LAW (under Tier a gate goes next): with no lock held and passes left, a waiting gate
+# request is served next, whatever low requests arrived before it. Flat has no such law
 # (`flat_gate_waits_behind_low`).
 law gate_goes_first:
   for +b: Nat
@@ -342,8 +341,8 @@ def aged_low.if(+b: Nat, +q: +List<T>, +log: +List<T>, +w: Bool, +g: Bool)
     case False{} g0:
       i => Empty.absurd({last(tier.if(b, q, log, False{}, g0, 0n)) == L{} : T}, i)
 
-# LAW (the bounded exception): once the window is spent, a waiting low request goes next,
-# ahead of every gate request.
+# LAW (the bounded exception): under Tier, with no lock held, once the window is spent a
+# waiting low request is served next, even if a gate request is waiting.
 law aged_low_goes_next:
   for +b: Nat
   for +q: +List<T>
@@ -370,8 +369,8 @@ law throttled_holder_stalls_the_gate:
 def throttled_holder_stalls_the_gate(b, l1, h1, q, log):
   ({==}, {==})
 
-# LAW (inheritance bounds it): under Inherit, every service moves the lock holder, so a gate
-# waits on a held lock exactly the holder's own remaining services and never a W.
+# LAW (inheritance moves the holder): under Inherit, while a lock is held, the next service
+# is the holder's and `held` falls by one.
 law inherited_holder_always_moves:
   for +b: Nat
   for +l: Nat
@@ -403,7 +402,7 @@ def low_is_live_under_a_gate_stream():
   {==}
 
 # A low request holding the lock for 2 services, bound 2, then a gate request: Tier serves the
-# gate on the 7th service ((bound + 1) x held + 1), Inherit on the 3rd (held + 1), Flat the 3rd.
+# gate on the 7th service, Inherit on the 3rd.
 law throttle_stretches_a_lock_wait:
   Sigma<&2, &2,
     {slog(run(Tier{}, [Hold{2n}, Arrive{G{}}, Serve{}, Serve{}, Serve{}, Serve{}, Serve{}, Serve{}, Serve{}], empty(2n))) == [G{}, L{}, W{}, W{}, L{}, W{}, W{}] : +List<T>},
