@@ -67,7 +67,7 @@
         ]
       },
       "cargo-wasm": {
-        "//": "Every workspace member's Cargo.toml is an input, not only columine's and bitmosaic's: .cargo/config.toml resolves features workspace-wide, so a host-only crate's manifest decides which features the wasm32 build compiles. Moving cowshed-shell's brush edge out of wasm32 changed event_processor.wasm's imports without touching any path this target used to hash. outputDir is the directory each configuration's recipes copy into and its declared outputs name, one option for both so the copy cannot differ from what Nx restores: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/wasm-memory-contract.ts loads the build its package's source authority names.",
+        "//": "Every workspace member's Cargo.toml is an input, not only columine's and bitmosaic's: .cargo/config.toml resolves features workspace-wide, so a host-only crate's manifest decides which features the wasm32 build compiles. Moving cowshed-shell's brush edge out of wasm32 changed event_processor.wasm's imports without touching any path this target used to hash. outputDir is the directory each configuration's recipes copy into and its declared outputs name, one option for both so the copy cannot differ from what Nx restores: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/wasm-memory-contract.ts loads the build its package's source authority names. cargoToolchain keys the devenv pin that supplies the nightly rustc and the binaryen wasm-opt both recipes run: no file of this target states either.",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
@@ -85,7 +85,8 @@
             ]
           },
           "{workspaceRoot}/.cargo/config.toml",
-          "{projectRoot}/justfile"
+          "{projectRoot}/justfile",
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/{options.outputDir}/columine.wasm",
