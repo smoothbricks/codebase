@@ -484,16 +484,17 @@ Bun has no module customization hooks, so a daemon whose CLI runs under Bun spaw
 rather than its own executable. `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM
 local plugin whose helpers change, and a third local plugin that must not reload.
 
-A local plugin's `preTasksExecution` runs in that worker whenever the client computes the run itself, and publishes its
-environment the way Nx expects: by setting `process.env`. Stock Nx's `LoadedNxPlugin` wraps `process.env` in a proxy
-that records those writes and returns them to the client, which applies them to the task processes, only when plugin
-isolation is on or a daemon is enabled. A worker the patch forces under `NX_ISOLATE_PLUGINS=false`, in a client with no
-daemon (one that never started it under `NX_DAEMON_START=never`, or whose daemon stopped under it), saw neither, so it
-installed no proxy: the hook set the worker's own environment and returned nothing, and every task of the run ran
-without the endpoints the hook had published (a reserved bounded-exec leaf refused to start for want of
-`MBX_RESERVATIONS_SOCKET`). The patch installs the proxy whenever the process is a plugin worker
-(`global.NX_PLUGIN_WORKER`). `nx-local-plugin-hook-env.test.ts` runs a real `nx run` under the job rule with no daemon
-against a local plugin whose hook sets a variable and requires its task to see it.
+A local plugin's `preTasksExecution` runs in a worker of the run's client, the process that runs the tasks
+([A run's task hooks run in its own process](#a-runs-task-hooks-run-in-its-own-process)), and publishes its environment
+the way Nx expects: by setting `process.env`. Stock Nx's `LoadedNxPlugin` wraps `process.env` in a proxy that records
+those writes and returns them to the client, which applies them to the task processes, only when plugin isolation is on
+or a daemon is enabled. A worker the patch forces under `NX_ISOLATE_PLUGINS=false`, in a client with no daemon (one that
+never started it under `NX_DAEMON_START=never`, or whose daemon stopped under it), saw neither, so it installed no
+proxy: the hook set the worker's own environment and returned nothing, and every task of the run ran without the
+endpoints the hook had published (a reserved bounded-exec leaf refused to start for want of `MBX_RESERVATIONS_SOCKET`).
+The patch installs the proxy whenever the process is a plugin worker (`global.NX_PLUGIN_WORKER`).
+`nx-local-plugin-hook-env.test.ts` runs a real `nx run` under the job rule with no daemon against a local plugin whose
+hook sets a variable and requires its task to see it.
 
 A `REQUEST_PROJECT_GRAPH` failure, including a plugin that fails to load, is a nonterminal error value: the daemon
 answers it with the shared `respondWithError` helper and keeps serving. A developer correcting a local plugin must not
@@ -554,12 +555,12 @@ cause. Every daemon request of a command continues from that error in its own pr
 `DaemonClient.orWithoutDaemon`, which notes the stop once per process and lets the connection go, so the caller's own
 in-process path answers: the project graph, task hashing (`DaemonBasedTaskHasher` builds the graph in this process once,
 for the in-process hasher's file data, and plans over it rather than with the planning context of the graph the daemon
-run planned over), output-hash record and compare (the outputs stamps below), the pre/post tasks-execution hooks, sync
-generators, the workspace-context file queries, and Nx 24's plugin-capabilities request (`getPluginCapabilities`) and
-affected-task selection (`selectAffectedTasks`). A run whose daemon stops under it therefore finishes. The client never
-calls `startInBackground` implicitly, and an explicit `nx daemon --start` (`command-line/daemon/daemon.js`), which would
-call it directly, is refused as policy: exit 1 with a reason naming the variable and the test fixture escape. Without
-the variable nothing changes.
+run planned over), output-hash record and compare (the outputs stamps below), sync generators, the workspace-context
+file queries, and Nx 24's plugin-capabilities request (`getPluginCapabilities`) and affected-task selection
+(`selectAffectedTasks`). A run whose daemon stops under it therefore finishes. The client never calls
+`startInBackground` implicitly, and an explicit `nx daemon --start` (`command-line/daemon/daemon.js`), which would call
+it directly, is refused as policy: exit 1 with a reason naming the variable and the test fixture escape. Without the
+variable nothing changes.
 
 A daemon that restarts itself opens the log file twice for its successor's stdout and stderr. The restart closes both
 descriptors right after the spawn, which keeps duplicates for the child, as the client's own start already did: left to
@@ -589,6 +590,33 @@ restarting daemon with the socket its clients were still writing to.
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression. Stock Nx starting the daemon is not enough; see
 [Can the daemon hunks be dropped?](#can-the-daemon-hunks-be-dropped).
+
+## A run's task hooks run in its own process
+
+Stock Nx sends a client's `preTasksExecution` and `postTasksExecution` to its daemon whenever it has one
+(`PRE_TASKS_EXECUTION`, `POST_TASKS_EXECUTION`), and the daemon runs the plugins' hooks in its own process, or a local
+plugin's in a plugin worker the daemon started. What a pre hook started for its run was then the daemon's.
+`@smoothbricks/nx-plugin`'s pre hook starts the run's `mbx reservations` endpoint and CPU pool and publishes their
+sockets to the run's tasks, so the endpoint was a child of the daemon, not of the run, and its standard input, which
+ends it, was the daemon's pipe. A daemon that stopped under a job's run, which then continues without it (above), took
+the endpoint along, and every later reserved leaf failed with `connect ENOENT …/mbx-r-*/r.sock`: a land gate on
+2026-11-09 granted none of its 175 reserved leaves after its daemon stopped. The post hook, which the client then ran in
+its own process, found nothing of the pre hook's to close.
+
+`runPreTasksExecution` and `runPostTasksExecution` (`project-graph/plugins/tasks-execution-hooks.js`) run the plugins'
+hooks in the process that runs the tasks, never in a daemon, and apply the environment the pre hook publishes to that
+process. The client's two daemon requests, the daemon's handlers (`daemon/server/handle-tasks-execution-hooks.js`) and
+their message types (`daemon/message-types/run-tasks-execution-hooks.js`) are gone. What a hook starts is a child of the
+run, or of its local plugin's worker, which is the client's child and exits when the client's connection to it ends, and
+so it ends with the run; the post hook runs where the pre hook ran. The client loads the workspace's plugins for the
+hooks, as a client without a daemon already did, and no longer sends the daemon the project and task graphs to run them
+in.
+
+`packages/nx-plugin/src/executors/bounded-exec/mbx-reservations-run.test.ts` runs the installed Nx and the compiled
+plugin against a fixture whose two reserved `bounded-exec` leaves ask a stand-in `mbx reservations`: the daemon is
+killed while the first holds its grant, the second is granted by the same endpoint after it, and the endpoint has ended
+once the run has. Before this hunk the second leaf failed with `connect ENOENT` on the endpoint's socket. Drop the hunk,
+and keep the test, once the Nx in use runs task hooks in the run's own process.
 
 ## A cache hit keeps the outputs a run left, without a daemon
 
@@ -850,9 +878,11 @@ checks merged into Nx 24's own `restart-checks.js`), without the hunks Nx 24 car
   lost connections (`P:903-917`, `P:688-693`).
 - **In-process continuation** (`cbf0b42671`): `orWithoutDaemon` and `continueWithoutDaemon` (`P:365-372`, `P:435-468`)
   and their callers: task hashing (`P:2941-2949`, `P:2999-3007`, `P:3019-3039`), the pre and post tasks-execution hooks
-  (`P:3542-3556`), the project graph (`P:3583-3589`), output-hash record and compare (`P:4975-4987`), sync generators
-  (`P:5425-5444`) and workspace-context file queries (`P:5604-5665`). The stopped watcher's reply carries the same tag
-  to every client, host shells included (`P:1876`), so these stay whoever starts the daemon.
+  (`P:3542-3556`; on 24.0.3 the hooks never reach a daemon,
+  [A run's task hooks run in its own process](#a-runs-task-hooks-run-in-its-own-process)), the project graph
+  (`P:3583-3589`), output-hash record and compare (`P:4975-4987`), sync generators (`P:5425-5444`) and workspace-context
+  file queries (`P:5604-5665`). The stopped watcher's reply carries the same tag to every client, host shells included
+  (`P:1876`), so these stay whoever starts the daemon.
 - **Lost-daemon handling** (`90dd74cfb7`, `2ed1e18cf5`, `8151e1c16d`, `446e01de66`): `loseDaemon` and the gates that
   read it (`P:411-412`, `P:476-492`, `P:627-629`, `P:700-703`, `P:735-737`); a failed reconnect or a version mismatch
   ends the use (`P:711-727`); the per-request pid check and `daemonGone` (`P:402-403`, `P:745-779`, `P:867-895`); the

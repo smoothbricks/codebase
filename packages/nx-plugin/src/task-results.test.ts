@@ -160,7 +160,7 @@ it('records hints through a daemon-backed Nx only under a checked receipt', asyn
     'task-results-daemon',
     async ({ workspace, socketDirectory }) => {
       await writeWorkspace(workspace);
-      // The daemon is on, as in normal use: the hooks run in the daemon, which receives the client's env.
+      // The daemon is on, as in normal use: it serves the graph, and the hooks run in the client, under its env.
       const daemon: Record<string, string> = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
       const { [RECEIPT_ENV]: _inherited, ...ordinary } = daemon;
       const hints = join(workspace, HINTS);

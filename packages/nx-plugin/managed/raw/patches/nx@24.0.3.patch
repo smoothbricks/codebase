@@ -358,19 +358,21 @@ index 757fd200dbd83f335c9868987e4135d4b7b580cb..1bf7e571cc66d3483f8b2ebb7b73ad8b
  }
  // Must be sync for the help output use case
 diff --git a/dist/src/daemon/client/client.d.ts b/dist/src/daemon/client/client.d.ts
-index d7ee773807a7d25214be89c5536c86a8e6589a44..7c3de650d6d61c4db3a0e1538ecf887eee7f6b4a 100644
+index d7ee773807a7d25214be89c5536c86a8e6589a44..fa08b44690e853ae7ff829115e75fd7897e8b71f 100644
 --- a/dist/src/daemon/client/client.d.ts
 +++ b/dist/src/daemon/client/client.d.ts
-@@ -3,7 +3,7 @@ import { FileData, ProjectGraph } from '../../config/project-graph';
+@@ -3,9 +3,7 @@ import { FileData, ProjectGraph } from '../../config/project-graph';
  import { Task, TaskGraph } from '../../config/task-graph';
  import type { UltracacheConfigurationVersion } from '../message-types/ultracache-configuration-version';
  import { Hash } from '../../hasher/task-hasher';
 -import { NxWorkspaceFiles, TaskOutputs, TaskRun, TaskTarget } from '../../native';
+-import { PreTasksExecutionContext } from '../../project-graph/plugins/public-api';
+-import type { MaybeStubbedPostTasksExecutionContext } from '../../project-graph/plugins/task-results-stub';
 +import { NxWorkspaceFiles, TaskOutputs } from '../../native';
- import { PreTasksExecutionContext } from '../../project-graph/plugins/public-api';
- import type { MaybeStubbedPostTasksExecutionContext } from '../../project-graph/plugins/task-results-stub';
  import { ConfigurationSourceMaps } from '../../project-graph/utils/project-configuration/source-maps';
-@@ -61,6 +61,14 @@ export declare class DaemonClient {
+ import type { FlushSyncGeneratorChangesResult, SyncGeneratorRunResult } from '../../utils/sync-generators';
+ import { type ConfigureAiAgentsStatusResponse } from '../message-types/configure-ai-agents';
+@@ -61,6 +59,14 @@ export declare class DaemonClient {
      private projectGraphListenerFramingFailures;
      private projectGraphListenerCallbacks;
      enabled(): boolean;
@@ -385,7 +387,7 @@ index d7ee773807a7d25214be89c5536c86a8e6589a44..7c3de650d6d61c4db3a0e1538ecf887e
      reset(): void;
      private createReadyPromise;
      private failDaemonReady;
-@@ -105,9 +113,6 @@ export declare class DaemonClient {
+@@ -105,9 +111,6 @@ export declare class DaemonClient {
      getFilesInDirectory(dir: string): Promise<string[]>;
      hashGlob(globs: string[], exclude?: string[]): Promise<string>;
      hashMultiGlob(globGroups: string[][]): Promise<string[]>;
@@ -395,19 +397,30 @@ index d7ee773807a7d25214be89c5536c86a8e6589a44..7c3de650d6d61c4db3a0e1538ecf887e
      getSyncGeneratorChanges(generators: string[]): Promise<SyncGeneratorRunResult[]>;
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
+@@ -118,8 +121,6 @@ export declare class DaemonClient {
+     /** Selection runs where hashing does, so the plans it builds are reused. */
+     selectAffectedTasks(request: AffectedTasksRequest): Promise<SelectAffectedTasksResponse>;
+     updateWorkspaceContext(createdFiles: string[], updatedFiles: string[], deletedFiles: string[]): Promise<void>;
+-    runPreTasksExecution(context: PreTasksExecutionContext): Promise<NodeJS.ProcessEnv[]>;
+-    runPostTasksExecution(context: MaybeStubbedPostTasksExecutionContext): Promise<void>;
+     getNxConsoleStatus(): Promise<NxConsoleStatusResponse>;
+     setNxConsolePreferenceAndInstall(preference: boolean): Promise<SetNxConsolePreferenceAndInstallResponse>;
+     getConfigureAiAgentsStatus(): Promise<ConfigureAiAgentsStatusResponse>;
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d19120f05 100644
+index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d09697f6a 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
-@@ -43,7 +43,6 @@ const nx_console_1 = require("../message-types/nx-console");
+@@ -41,9 +41,7 @@ const get_sync_generator_changes_1 = require("../message-types/get-sync-generato
+ const hash_glob_1 = require("../message-types/hash-glob");
+ const nx_console_1 = require("../message-types/nx-console");
  const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
- const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
+-const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
  const streaming_messages_1 = require("../message-types/streaming-messages");
 -const task_history_1 = require("../message-types/task-history");
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -56,6 +55,8 @@ var DaemonStatus;
+@@ -56,6 +54,8 @@ var DaemonStatus;
      DaemonStatus[DaemonStatus["DISCONNECTED"] = 1] = "DISCONNECTED";
      DaemonStatus[DaemonStatus["CONNECTED"] = 2] = "CONNECTED";
  })(DaemonStatus || (exports.DaemonStatus = DaemonStatus = {}));
@@ -416,7 +429,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
  const WAIT_FOR_SERVER_CONFIG = {
      delayMs: 10,
      maxAttempts: 6000, // 6000 * 10ms = 60 seconds
-@@ -107,6 +108,8 @@ class DaemonClient {
+@@ -107,6 +107,8 @@ class DaemonClient {
          this.projectGraphListenerFramingFailures = 0;
          this.projectGraphListenerCallbacks = new Map();
          this.envReflectionSent = false;
@@ -425,7 +438,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          try {
              this.nxJson = (0, configuration_1.readNxJson)();
          }
-@@ -150,12 +153,55 @@ class DaemonClient {
+@@ -150,12 +152,55 @@ class DaemonClient {
                  });
                  this._enabled = false;
              }
@@ -481,7 +494,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
      reset() {
          this.rejectFileWatcherRegistrations(new Error('Daemon client reset'));
          this.socketMessenger?.close();
-@@ -192,6 +238,24 @@ class DaemonClient {
+@@ -192,6 +237,24 @@ class DaemonClient {
          this._daemonStatus = DaemonStatus.DISCONNECTED;
          this._daemonReadyFailed?.(err);
      }
@@ -506,7 +519,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
      getSocketPath() {
          const daemonProcessJson = (0, cache_1.readDaemonProcessJsonCache)();
          if (daemonProcessJson?.socketPath) {
-@@ -328,6 +392,7 @@ class DaemonClient {
+@@ -328,6 +391,7 @@ class DaemonClient {
                  // failure would otherwise leave this channel silent forever.
                  this.fileWatcherMessenger?.close();
              });
@@ -514,7 +527,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              await this.sendFileWatcherRegistration(callbackId);
          })
              .catch((error) => {
-@@ -392,6 +457,48 @@ class DaemonClient {
+@@ -392,6 +456,48 @@ class DaemonClient {
              registration.reject(error);
          }
      }
@@ -563,7 +576,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
      async reconnectFileWatcher() {
          // Guard against concurrent reconnection attempts
          if (this.fileWatcherReconnecting) {
-@@ -483,6 +590,7 @@ class DaemonClient {
+@@ -483,6 +589,7 @@ class DaemonClient {
                  // not emit, so close explicitly to hand off to it.
                  this.fileWatcherMessenger?.close();
              });
@@ -571,7 +584,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              // Re-register all stored configs
              for (const cfg of this.fileWatcherConfigs.values()) {
                  this.fileWatcherMessenger.sendMessage({
-@@ -559,6 +667,7 @@ class DaemonClient {
+@@ -559,6 +666,7 @@ class DaemonClient {
                  }
                  this.projectGraphListenerMessenger?.close();
              });
@@ -579,7 +592,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              this.projectGraphListenerMessenger.sendMessage({
                  type: register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER,
              });
-@@ -659,6 +768,7 @@ class DaemonClient {
+@@ -659,6 +767,7 @@ class DaemonClient {
                  // not emit, so close explicitly to hand off to it.
                  this.projectGraphListenerMessenger?.close();
              });
@@ -587,7 +600,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              // Re-register
              this.projectGraphListenerMessenger.sendMessage({
                  type: register_project_graph_listener_1.REGISTER_PROJECT_GRAPH_LISTENER,
-@@ -749,27 +859,6 @@ class DaemonClient {
+@@ -749,27 +858,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -615,7 +628,28 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -890,6 +979,9 @@ class DaemonClient {
+@@ -813,20 +901,6 @@ class DaemonClient {
+         };
+         return this.sendToDaemonViaQueue(message);
+     }
+-    async runPreTasksExecution(context) {
+-        const message = {
+-            type: run_tasks_execution_hooks_1.PRE_TASKS_EXECUTION,
+-            context,
+-        };
+-        return this.sendToDaemonViaQueue(message);
+-    }
+-    async runPostTasksExecution(context) {
+-        const message = {
+-            type: run_tasks_execution_hooks_1.POST_TASKS_EXECUTION,
+-            context,
+-        };
+-        return this.sendToDaemonViaQueue(message);
+-    }
+     getNxConsoleStatus() {
+         const message = {
+             type: nx_console_1.GET_NX_CONSOLE_STATUS,
+@@ -890,6 +964,9 @@ class DaemonClient {
          if (this._pluginWorkerConnectionLost) {
              throw this._pluginWorkerConnectionLost;
          }
@@ -625,7 +659,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          if (this._daemonStatus == DaemonStatus.CONNECTED) {
              return;
          }
-@@ -915,6 +1007,10 @@ class DaemonClient {
+@@ -915,6 +992,10 @@ class DaemonClient {
                      }
                  }
                  if (!probe.available) {
@@ -636,7 +670,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
                      // Carried as a value so no other caller's probe can substitute for it.
                      daemonPid = await this.startInBackground(probe.refusal);
                  }
-@@ -953,17 +1049,36 @@ class DaemonClient {
+@@ -953,17 +1034,36 @@ class DaemonClient {
          }
      }
      async sendToDaemonViaQueue(messageToDaemon, spinner) {
@@ -683,7 +717,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -972,7 +1087,13 @@ class DaemonClient {
+@@ -972,7 +1072,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -698,7 +732,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -1018,12 +1139,22 @@ class DaemonClient {
+@@ -1018,12 +1124,22 @@ class DaemonClient {
              else {
                  error = daemonProcessException(err.toString());
              }
@@ -721,7 +755,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          // A plugin worker cannot bring a daemon back — `startInBackground` throws
          // in one — and it is usually hosted by the daemon that just died, so the
          // 60s reconnect poll almost always ends in the same failure. Make the loss
-@@ -1066,16 +1197,18 @@ class DaemonClient {
+@@ -1066,16 +1182,18 @@ class DaemonClient {
              }
          }
          catch (err) {
@@ -748,7 +782,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              throw err;
          }
      }
-@@ -1137,14 +1270,31 @@ class DaemonClient {
+@@ -1137,14 +1255,31 @@ class DaemonClient {
          return { available: false, refusal };
      }
      async sendMessageToDaemon(message) {
@@ -780,7 +814,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          return new Promise((resolve, reject) => {
              perf_hooks_1.performance.mark('sendMessageToDaemon-start');
              // An open promise isn't enough to keep the event loop
-@@ -1155,12 +1305,25 @@ class DaemonClient {
+@@ -1155,12 +1290,25 @@ class DaemonClient {
              keepAlive = setTimeout(() => {
                  reject(new Error('The daemon timed out while processing ' + message.type));
              }, 20 * 60 * 1000);
@@ -806,7 +840,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          });
      }
      async registerDaemonProcessWithMetricsService(daemonPid) {
-@@ -1194,7 +1357,13 @@ class DaemonClient {
+@@ -1194,7 +1342,13 @@ class DaemonClient {
                  console[parsedResult.level](parsedResult.message);
                  return;
              }
@@ -821,7 +855,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
                  this.currentReject(parsedResult.error);
              }
              else {
-@@ -1271,8 +1440,11 @@ class DaemonClient {
+@@ -1271,8 +1425,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -835,7 +869,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1300,19 +1472,31 @@ class DaemonClient {
+@@ -1300,19 +1457,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -877,7 +911,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..0555ac8faebbe0d3dae8e758a0e6b51d
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1339,6 +1523,59 @@ function isDocker() {
+@@ -1339,6 +1508,59 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -1304,6 +1338,51 @@ index e7a63499d18a3a8896fb117591356c3bb138032a..8d03082ada878fedd70c6245791f4c69
  }
  /**
   * Throws on a message this receiver must not act on. The daemon catches it and
+diff --git a/dist/src/daemon/message-types/run-tasks-execution-hooks.d.ts b/dist/src/daemon/message-types/run-tasks-execution-hooks.d.ts
+deleted file mode 100644
+index f3986f288394dd45b36ee70c3e8cd5b0230c3391..0000000000000000000000000000000000000000
+--- a/dist/src/daemon/message-types/run-tasks-execution-hooks.d.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-import type { PreTasksExecutionContext } from '../../project-graph/plugins';
+-import type { MaybeStubbedPostTasksExecutionContext } from '../../project-graph/plugins/task-results-stub';
+-export declare const PRE_TASKS_EXECUTION: 'PRE_TASKS_EXECUTION';
+-export declare const POST_TASKS_EXECUTION: 'POST_TASKS_EXECUTION';
+-export type HandlePreTasksExecutionMessage = {
+-    type: typeof PRE_TASKS_EXECUTION;
+-    context: PreTasksExecutionContext;
+-};
+-export type HandlePostTasksExecutionMessage = {
+-    type: typeof POST_TASKS_EXECUTION;
+-    context: MaybeStubbedPostTasksExecutionContext;
+-};
+-export declare function isHandlePreTasksExecutionMessage(message: unknown): message is HandlePreTasksExecutionMessage;
+-export declare function isHandlePostTasksExecutionMessage(message: unknown): message is HandlePostTasksExecutionMessage;
+diff --git a/dist/src/daemon/message-types/run-tasks-execution-hooks.js b/dist/src/daemon/message-types/run-tasks-execution-hooks.js
+deleted file mode 100644
+index ba3abde11e4c444339882a65e3368e6f5054f56f..0000000000000000000000000000000000000000
+--- a/dist/src/daemon/message-types/run-tasks-execution-hooks.js
++++ /dev/null
+@@ -1,19 +0,0 @@
+-"use strict";
+-Object.defineProperty(exports, "__esModule", { value: true });
+-exports.POST_TASKS_EXECUTION = exports.PRE_TASKS_EXECUTION = void 0;
+-exports.isHandlePreTasksExecutionMessage = isHandlePreTasksExecutionMessage;
+-exports.isHandlePostTasksExecutionMessage = isHandlePostTasksExecutionMessage;
+-exports.PRE_TASKS_EXECUTION = 'PRE_TASKS_EXECUTION';
+-exports.POST_TASKS_EXECUTION = 'POST_TASKS_EXECUTION';
+-function isHandlePreTasksExecutionMessage(message) {
+-    return (typeof message === 'object' &&
+-        message !== null &&
+-        'type' in message &&
+-        message['type'] === exports.PRE_TASKS_EXECUTION);
+-}
+-function isHandlePostTasksExecutionMessage(message) {
+-    return (typeof message === 'object' &&
+-        message !== null &&
+-        'type' in message &&
+-        message['type'] === exports.POST_TASKS_EXECUTION);
+-}
 diff --git a/dist/src/daemon/message-types/task-history.d.ts b/dist/src/daemon/message-types/task-history.d.ts
 deleted file mode 100644
 index cc2b606d99db19beb05d85e5ec2f13600712e7bd..0000000000000000000000000000000000000000
@@ -1601,6 +1680,73 @@ index 0051f7f97f0d9c05341f8cbaa7f51eb851051077..00000000000000000000000000000000
 -        response: history,
 -        description: 'handleGetEstimatedTaskTimings',
 -    };
+-}
+diff --git a/dist/src/daemon/server/handle-tasks-execution-hooks.d.ts b/dist/src/daemon/server/handle-tasks-execution-hooks.d.ts
+deleted file mode 100644
+index b7a9b3637f1306a650cc3954172fe93b82c2db40..0000000000000000000000000000000000000000
+--- a/dist/src/daemon/server/handle-tasks-execution-hooks.d.ts
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import type { PreTasksExecutionContext } from '../../project-graph/plugins/public-api';
+-import type { MaybeStubbedPostTasksExecutionContext } from '../../project-graph/plugins/task-results-stub';
+-export declare function handleRunPreTasksExecution(context: PreTasksExecutionContext): Promise<{
+-    response: NodeJS.ProcessEnv[];
+-    description: string;
+-    error?: undefined;
+-} | {
+-    response?: undefined;
+-    error: any;
+-    description: string;
+-}>;
+-export declare function handleRunPostTasksExecution(context: MaybeStubbedPostTasksExecutionContext): Promise<{
+-    error?: undefined;
+-    response: string;
+-    description: string;
+-} | {
+-    response?: undefined;
+-    error: any;
+-    description: string;
+-}>;
+diff --git a/dist/src/daemon/server/handle-tasks-execution-hooks.js b/dist/src/daemon/server/handle-tasks-execution-hooks.js
+deleted file mode 100644
+index 2d5c114ed5c9b2b55acd614d8c306fabc362b408..0000000000000000000000000000000000000000
+--- a/dist/src/daemon/server/handle-tasks-execution-hooks.js
++++ /dev/null
+@@ -1,35 +0,0 @@
+-"use strict";
+-Object.defineProperty(exports, "__esModule", { value: true });
+-exports.handleRunPreTasksExecution = handleRunPreTasksExecution;
+-exports.handleRunPostTasksExecution = handleRunPostTasksExecution;
+-const tasks_execution_hooks_1 = require("../../project-graph/plugins/tasks-execution-hooks");
+-async function handleRunPreTasksExecution(context) {
+-    try {
+-        const envs = await (0, tasks_execution_hooks_1.runPreTasksExecution)(context);
+-        return {
+-            response: envs,
+-            description: 'handleRunPreTasksExecution',
+-        };
+-    }
+-    catch (e) {
+-        return {
+-            error: e,
+-            description: `Error when running preTasksExecution.`,
+-        };
+-    }
+-}
+-async function handleRunPostTasksExecution(context) {
+-    try {
+-        await (0, tasks_execution_hooks_1.runPostTasksExecution)(context);
+-        return {
+-            response: 'true',
+-            description: 'handleRunPostTasksExecution',
+-        };
+-    }
+-    catch (e) {
+-        return {
+-            error: e,
+-            description: `Error when running postTasksExecution.`,
+-        };
+-    }
 -}
 diff --git a/dist/src/daemon/server/latest-nx.js b/dist/src/daemon/server/latest-nx.js
 index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba99064395f3d 100644
@@ -2235,7 +2381,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
  }
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bfa7709a66 100644
+index 5989aac4d2d8d860033f93d369efb54133a4d715..9064121a456494d96f611ac8043b8fdf265a4ad5 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -8,16 +8,12 @@ const fs_1 = require("fs");
@@ -2255,10 +2401,11 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
  const installed_nx_version_1 = require("../../utils/installed-nx-version");
  const logger_1 = require("../logger");
  const configure_ai_agents_1 = require("../message-types/configure-ai-agents");
-@@ -36,11 +32,12 @@ const hash_glob_1 = require("../message-types/hash-glob");
+@@ -35,12 +31,12 @@ const glob_1 = require("../message-types/glob");
+ const hash_glob_1 = require("../message-types/hash-glob");
  const nx_console_1 = require("../message-types/nx-console");
  const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
- const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
+-const run_tasks_execution_hooks_1 = require("../message-types/run-tasks-execution-hooks");
 -const task_history_1 = require("../message-types/task-history");
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const socket_utils_1 = require("../socket-utils");
@@ -2269,15 +2416,16 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
  const handle_configure_ai_agents_1 = require("./handle-configure-ai-agents");
  const handle_context_file_data_1 = require("./handle-context-file-data");
  const handle_flush_sync_generator_changes_to_disk_1 = require("./handle-flush-sync-generator-changes-to-disk");
-@@ -60,7 +57,6 @@ const handle_outputs_tracking_1 = require("./handle-outputs-tracking");
+@@ -60,8 +56,6 @@ const handle_outputs_tracking_1 = require("./handle-outputs-tracking");
  const handle_process_in_background_1 = require("./handle-process-in-background");
  const handle_request_project_graph_1 = require("./handle-request-project-graph");
  const handle_request_shutdown_1 = require("./handle-request-shutdown");
 -const handle_task_history_1 = require("./handle-task-history");
- const handle_tasks_execution_hooks_1 = require("./handle-tasks-execution-hooks");
+-const handle_tasks_execution_hooks_1 = require("./handle-tasks-execution-hooks");
  const handle_update_workspace_context_1 = require("./handle-update-workspace-context");
  const handle_watch_events_1 = require("./handle-watch-events");
-@@ -70,7 +66,6 @@ const project_graph_listener_sockets_1 = require("./project-graph-listener-socke
+ const project_graph_incremental_recomputation_1 = require("./project-graph-incremental-recomputation");
+@@ -70,7 +64,6 @@ const project_graph_listener_sockets_1 = require("./project-graph-listener-socke
  const shutdown_utils_1 = require("./shutdown-utils");
  const sync_generators_1 = require("./sync-generators");
  const workspace_context_1 = require("../../utils/workspace-context");
@@ -2285,7 +2433,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
  let workspaceWatcherError;
  global.NX_DAEMON = true;
  process.env.NX_DAEMON_PROCESS = 'true';
-@@ -102,11 +97,17 @@ const server = (0, net_1.createServer)(async (socket) => {
+@@ -102,11 +95,17 @@ const server = (0, net_1.createServer)(async (socket) => {
          numberOfOpenConnections -= 1;
          exports.openSockets.delete(socket);
          logger_1.serverLogger.log(`Closed a connection. Number of open connections: ${numberOfOpenConnections}`);
@@ -2303,7 +2451,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
  async function handleMessage(socket, data) {
      if (workspaceWatcherError) {
          await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `File watcher error in the workspace '${workspace_root_1.workspaceRoot}'.`, workspaceWatcherError);
-@@ -139,14 +140,46 @@ async function handleMessage(socket, data) {
+@@ -139,14 +138,46 @@ async function handleMessage(socket, data) {
              return;
          }
      }
@@ -2351,7 +2499,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
      }
      else if (payload.type === 'HASH_TASKS') {
          await handleResult(socket, 'HASH_TASKS', () => (0, handle_hash_tasks_1.handleHashTasks)(payload), mode);
-@@ -206,15 +239,6 @@ async function handleMessage(socket, data) {
+@@ -206,15 +237,6 @@ async function handleMessage(socket, data) {
      else if ((0, hash_glob_1.isHandleHashMultiGlobMessage)(payload)) {
          await handleResult(socket, hash_glob_1.HASH_GLOB, () => (0, handle_hash_glob_1.handleHashMultiGlob)(payload.globGroups), mode);
      }
@@ -2367,7 +2515,20 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
      else if ((0, force_shutdown_1.isHandleForceShutdownMessage)(payload)) {
          await handleResult(socket, 'FORCE_SHUTDOWN', () => (0, handle_force_shutdown_1.handleForceShutdown)(server), mode);
      }
-@@ -258,6 +282,22 @@ async function handleMessage(socket, data) {
+@@ -236,12 +258,6 @@ async function handleMessage(socket, data) {
+     else if ((0, update_workspace_context_1.isHandleUpdateWorkspaceContextMessage)(payload)) {
+         await handleResult(socket, update_workspace_context_1.UPDATE_WORKSPACE_CONTEXT, () => (0, handle_update_workspace_context_1.handleUpdateWorkspaceContext)(payload.createdFiles, payload.updatedFiles, payload.deletedFiles), mode);
+     }
+-    else if ((0, run_tasks_execution_hooks_1.isHandlePreTasksExecutionMessage)(payload)) {
+-        await handleResult(socket, run_tasks_execution_hooks_1.PRE_TASKS_EXECUTION, () => (0, handle_tasks_execution_hooks_1.handleRunPreTasksExecution)(payload.context), mode);
+-    }
+-    else if ((0, run_tasks_execution_hooks_1.isHandlePostTasksExecutionMessage)(payload)) {
+-        await handleResult(socket, run_tasks_execution_hooks_1.POST_TASKS_EXECUTION, () => (0, handle_tasks_execution_hooks_1.handleRunPostTasksExecution)(payload.context), mode);
+-    }
+     else if ((0, nx_console_1.isHandleGetNxConsoleStatusMessage)(payload)) {
+         await handleResult(socket, nx_console_1.GET_NX_CONSOLE_STATUS, () => (0, handle_nx_console_1.handleGetNxConsoleStatus)(), mode);
+     }
+@@ -258,6 +274,22 @@ async function handleMessage(socket, data) {
          await (0, shutdown_utils_1.respondWithErrorAndExit)(socket, `Invalid payload from the client`, new Error(`Unsupported payload sent to daemon server: ${(0, consume_messages_from_socket_1.describeMessage)(unparsedPayload, { maxBytes: 200 })}`));
      }
  }
@@ -2390,7 +2551,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
  async function handleResult(socket, type, hrFn, mode, respondToError = shutdown_utils_1.respondWithErrorAndExit) {
      let hr;
      const startMark = new Date();
-@@ -283,9 +323,10 @@ async function handleResult(socket, type, hrFn, mode, respondToError = shutdown_
+@@ -283,9 +315,10 @@ async function handleResult(socket, type, hrFn, mode, respondToError = shutdown_
      logger_1.serverLogger.log(`Handled ${mode} message ${type}. Handling time: ${doneHandlingMark.getTime() - startMark.getTime()}. Response time: ${endMark.getTime() - doneHandlingMark.getTime()}.`);
  }
  function handleInactivityTimeout() {
@@ -2403,7 +2564,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
          (0, shutdown_utils_1.resetInactivityTimeout)(handleInactivityTimeout);
      }
      else {
-@@ -314,35 +355,21 @@ function registerProcessTerminationListeners() {
+@@ -314,35 +347,21 @@ function registerProcessTerminationListeners() {
          sockets: exports.openSockets,
      }));
  }
@@ -2453,7 +2614,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
      }
  }
  /**
-@@ -365,6 +392,10 @@ const handleWorkspaceChanges = (err, batch) => {
+@@ -365,6 +384,10 @@ const handleWorkspaceChanges = (err, batch) => {
              (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(error);
              return;
          }
@@ -2464,7 +2625,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
          (0, project_graph_incremental_recomputation_1.routeAppliedChanges)(batch);
      }
      catch (err) {
-@@ -374,68 +405,90 @@ const handleWorkspaceChanges = (err, batch) => {
+@@ -374,68 +397,90 @@ const handleWorkspaceChanges = (err, batch) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -2595,7 +2756,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..c6b75a1303a3a5ffb47fc38d928dd1bf
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -461,33 +514,16 @@ async function startServer() {
+@@ -461,33 +506,16 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
@@ -4338,29 +4499,125 @@ index 9014799cfb98f624d9d2b04891c3c9d876c64916..e29dd0e015e0e63ccdd27c2036b0395f
  };
  export type PostTasksExecutionContext = {
 diff --git a/dist/src/project-graph/plugins/tasks-execution-hooks.js b/dist/src/project-graph/plugins/tasks-execution-hooks.js
-index 867a717e26592ed291df332083e1aded275dc404..00002ce0f95cd73eafaca9a113f856f29a27d086 100644
+index 867a717e26592ed291df332083e1aded275dc404..8af158796c275950c11c55953b6deb63ff353c95 100644
 --- a/dist/src/project-graph/plugins/tasks-execution-hooks.js
 +++ b/dist/src/project-graph/plugins/tasks-execution-hooks.js
-@@ -41,8 +41,10 @@ async function runPreTasksExecution(pluginContext) {
-         return envs;
-     }
-     else {
+@@ -4,46 +4,39 @@ exports.runPreTasksExecution = runPreTasksExecution;
+ exports.runPostTasksExecution = runPostTasksExecution;
+ const nx_json_1 = require("../../config/nx-json");
+ const get_plugins_1 = require("./get-plugins");
+-const is_on_daemon_1 = require("../../daemon/is-on-daemon");
+-const client_1 = require("../../daemon/client/client");
+ const workspace_root_1 = require("../../utils/workspace-root");
+-const task_results_stub_1 = require("./task-results-stub");
+ const nx_plugin_capabilities_1 = require("./nx-plugin-capabilities");
+ /** True only when the cached graph's recorded rows show no plugin has `hook`; unknown is false. */
+ function knownThatNoPluginRegisters(hook) {
+     const recorded = (0, nx_plugin_capabilities_1.capabilitiesOfNxPluginsReadFromCache)();
+     return !!recorded && !recorded.some((capabilities) => capabilities[hook]);
+ }
++// The task hooks run in the process that runs the tasks, never in a daemon. What a pre hook starts for its run (a
++// process, a socket it publishes to the tasks) is then a child of the run that ends with it, and the post hook runs
++// where the pre hook ran. Run in the daemon, it was the daemon's: a daemon that stopped under the run took it along,
++// and the post hook the client then ran in its own process found nothing of the pre hook's.
+ async function runPreTasksExecution(pluginContext) {
+-    if ((0, is_on_daemon_1.isOnDaemon)() || !(0, client_1.isDaemonEnabled)()) {
+-        if (knownThatNoPluginRegisters('hasPreTasksExecution')) {
+-            return [];
++    if (knownThatNoPluginRegisters('hasPreTasksExecution')) {
++        return [];
++    }
++    performance.mark(`preTasksExecution:start`);
++    const plugins = await (0, get_plugins_1.getPlugins)((0, nx_json_1.readNxJson)(pluginContext.workspaceRoot), pluginContext.workspaceRoot);
++    const envs = await Promise.all(plugins
++        .filter((p) => p.preTasksExecution)
++        .map(async (plugin) => {
++        performance.mark(`${plugin.name}:preTasksExecution:start`);
++        try {
++            return await plugin.preTasksExecution(pluginContext);
+         }
+-        performance.mark(`preTasksExecution:start`);
+-        const plugins = await (0, get_plugins_1.getPlugins)((0, nx_json_1.readNxJson)(pluginContext.workspaceRoot), pluginContext.workspaceRoot);
+-        const envs = await Promise.all(plugins
+-            .filter((p) => p.preTasksExecution)
+-            .map(async (plugin) => {
+-            performance.mark(`${plugin.name}:preTasksExecution:start`);
+-            try {
+-                return await plugin.preTasksExecution(pluginContext);
+-            }
+-            finally {
+-                performance.mark(`${plugin.name}:preTasksExecution:end`);
+-                performance.measure(`${plugin.name}:preTasksExecution`, `${plugin.name}:preTasksExecution:start`, `${plugin.name}:preTasksExecution:end`);
+-            }
+-        }));
+-        if (!(0, client_1.isDaemonEnabled)()) {
+-            applyProcessEnvs(envs);
++        finally {
++            performance.mark(`${plugin.name}:preTasksExecution:end`);
++            performance.measure(`${plugin.name}:preTasksExecution`, `${plugin.name}:preTasksExecution:start`, `${plugin.name}:preTasksExecution:end`);
+         }
+-        performance.mark(`preTasksExecution:end`);
+-        performance.measure(`preTasksExecution`, `preTasksExecution:start`, `preTasksExecution:end`);
+-        return envs;
+-    }
+-    else {
 -        const envs = await client_1.daemonClient.runPreTasksExecution(pluginContext);
 -        applyProcessEnvs(envs);
-+        return client_1.daemonClient.orWithoutDaemon(async () => {
-+            const envs = await client_1.daemonClient.runPreTasksExecution(pluginContext);
-+            applyProcessEnvs(envs);
-+        }, () => runPreTasksExecution(pluginContext));
-     }
+-    }
++    }));
++    applyProcessEnvs(envs);
++    performance.mark(`preTasksExecution:end`);
++    performance.measure(`preTasksExecution`, `preTasksExecution:start`, `preTasksExecution:end`);
++    return envs;
  }
  function applyProcessEnvs(envs) {
-@@ -75,6 +77,6 @@ async function runPostTasksExecution(context) {
-         performance.measure(`postTasksExecution`, `postTasksExecution:start`, `postTasksExecution:end`);
+     for (const env of envs) {
+@@ -53,28 +46,23 @@ function applyProcessEnvs(envs) {
      }
-     else {
+ }
+ async function runPostTasksExecution(context) {
+-    if ((0, is_on_daemon_1.isOnDaemon)() || !(0, client_1.isDaemonEnabled)()) {
+-        if (knownThatNoPluginRegisters('hasPostTasksExecution')) {
+-            return;
+-        }
+-        performance.mark(`postTasksExecution:start`);
+-        const plugins = await (0, get_plugins_1.getPlugins)((0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot));
+-        await Promise.all(plugins
+-            .filter((p) => p.postTasksExecution)
+-            .map(async (plugin) => {
+-            performance.mark(`${plugin.name}:postTasksExecution:start`);
+-            try {
+-                await plugin.postTasksExecution(context);
+-            }
+-            finally {
+-                performance.mark(`${plugin.name}:postTasksExecution:end`);
+-                performance.measure(`${plugin.name}:postTasksExecution`, `${plugin.name}:postTasksExecution:start`, `${plugin.name}:postTasksExecution:end`);
+-            }
+-        }));
+-        performance.mark(`postTasksExecution:end`);
+-        performance.measure(`postTasksExecution`, `postTasksExecution:start`, `postTasksExecution:end`);
+-    }
+-    else {
 -        await client_1.daemonClient.runPostTasksExecution((0, task_results_stub_1.stubTerminalOutputs)(context));
-+        await client_1.daemonClient.orWithoutDaemon(() => client_1.daemonClient.runPostTasksExecution((0, task_results_stub_1.stubTerminalOutputs)(context)), () => runPostTasksExecution(context));
++    if (knownThatNoPluginRegisters('hasPostTasksExecution')) {
++        return;
      }
++    performance.mark(`postTasksExecution:start`);
++    const plugins = await (0, get_plugins_1.getPlugins)((0, nx_json_1.readNxJson)(workspace_root_1.workspaceRoot));
++    await Promise.all(plugins
++        .filter((p) => p.postTasksExecution)
++        .map(async (plugin) => {
++        performance.mark(`${plugin.name}:postTasksExecution:start`);
++        try {
++            await plugin.postTasksExecution(context);
++        }
++        finally {
++            performance.mark(`${plugin.name}:postTasksExecution:end`);
++            performance.measure(`${plugin.name}:postTasksExecution`, `${plugin.name}:postTasksExecution:start`, `${plugin.name}:postTasksExecution:end`);
++        }
++    }));
++    performance.mark(`postTasksExecution:end`);
++    performance.measure(`postTasksExecution`, `postTasksExecution:start`, `postTasksExecution:end`);
  }
 diff --git a/dist/src/project-graph/project-graph.js b/dist/src/project-graph/project-graph.js
 index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a635a87a95 100644

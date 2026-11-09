@@ -1859,26 +1859,33 @@ pool (`MBX_SCHEDULER=1`, no enclosing reservation), starts one `mbx reservations
 its PATH name, the canonical mbx environment's, which leads with the installed mbx (14_nix.md, "mbx"), on a socket in an
 owned directory of the job's socket namespace, waits up to the control-plane bound for its `listening` line, and
 publishes the socket in `MBX_RESERVATIONS_SOCKET`, which every task inherits. Its `postTasksExecution` closes the
-endpoint's standard input, which ends it with every grant it still serves. Each task's `bounded-exec` opens one
-connection to it per process and asks on it for each reserved leaf, `{"type":"reserve","id":n,"cpus":c,"priority":p}`;
-the answer is the cores granted, and the leaf's end releases them (`{"type":"release","id":n}`) once its subtree is
-retired (11_shell.md, "Job admission and class placement"). A request carries only the fields the host's installed mbx
-accepts, since the endpoint is the host's mbx ("Pool selection and revision"): a field a newer mbx adds enters the
-plugin's requests once that mbx is the host's. A connection that closes, its executor dead, releases everything it held
-and withdraws what still waits. The leaf's shell asks its executor on descriptor 5, one line naming its count (`c`, at
-most `g`, the units below), says `cowshed: mbx reserve wait start cpus=<c> priority=<p>`, reads back the cores granted,
-closes the descriptor, and runs its command in the same shell with `MBX_RESERVE_CPUS` set to that count,
-`MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`, what `mbx reserve` gives its own command, so no process starts for
-the reservation. A refusal ends the descriptor unanswered and fails the leaf, naming mbx's error. A run whose endpoint
-did not start says why in its own output and publishes the same reason to its tasks in
-`BOUNDED_EXEC_RESERVATIONS_UNSERVED`, and its reserved leaves refuse to run, naming `MBX_RESERVATIONS_SOCKET` and that
-reason: a gate's failures-only output shows each leaf's refusal, never the run's own warning. A leaf whose run published
-neither says so, since then its run's `preTasksExecution` never served it or its environment never reached the task. No
-reserved leaf runs beside the pool. A leaf ended before its grant records a `queued` verdict with its wait on the
-endpoint. Enforced by the stand-in endpoint cases of `executor.test.ts` (a run of reserved leaves starts no mbx process
-and asks over one connection, each runner on its grant; a leaf whose run serves none names why),
-`mbx-reservations.test.ts` (the client and the run hook) and `mbx-pool.test.ts` (the leaf's shell), and by mbx's own
-suite for the endpoint.
+endpoint's standard input, which ends it with every grant it still serves. The endpoint lives as long as the run's
+client: Nx runs the plugin's task hooks in the process that runs the tasks, never in a daemon (`patches/README.md`, "A
+run's task hooks run in its own process"), so the endpoint is a child of that run that ends with it (14_nix.md, "mbx"),
+and a daemon that stops under the run (`patches/README.md`, "A job's client never starts a daemon") takes no endpoint
+along. Run in the daemon, the endpoint was the daemon's child and ended with it: a land gate whose daemon stopped
+mid-run on 2026-11-09 failed each later reserved leaf with `connect ENOENT …/mbx-r-*/r.sock`. Each task's `bounded-exec`
+opens one connection to it per process and asks on it for each reserved leaf,
+`{"type":"reserve","id":n,"cpus":c,"priority":p}`; the answer is the cores granted, and the leaf's end releases them
+(`{"type":"release","id":n}`) once its subtree is retired (11_shell.md, "Job admission and class placement"). A request
+carries only the fields the host's installed mbx accepts, since the endpoint is the host's mbx ("Pool selection and
+revision"): a field a newer mbx adds enters the plugin's requests once that mbx is the host's. A connection that closes,
+its executor dead, releases everything it held and withdraws what still waits. The leaf's shell asks its executor on
+descriptor 5, one line naming its count (`c`, at most `g`, the units below), says
+`cowshed: mbx reserve wait start cpus=<c> priority=<p>`, reads back the cores granted, closes the descriptor, and runs
+its command in the same shell with `MBX_RESERVE_CPUS` set to that count, `MBX_SCHED_DISABLE=1` and an empty
+`MBX_SCHED_DIR`, what `mbx reserve` gives its own command, so no process starts for the reservation. A refusal ends the
+descriptor unanswered and fails the leaf, naming mbx's error. A run whose endpoint did not start says why in its own
+output and publishes the same reason to its tasks in `BOUNDED_EXEC_RESERVATIONS_UNSERVED`, and its reserved leaves
+refuse to run, naming `MBX_RESERVATIONS_SOCKET` and that reason: a gate's failures-only output shows each leaf's
+refusal, never the run's own warning. A leaf whose run published neither says so, since then its run's
+`preTasksExecution` never served it or its environment never reached the task. No reserved leaf runs beside the pool. A
+leaf ended before its grant records a `queued` verdict with its wait on the endpoint. Enforced by the stand-in endpoint
+cases of `executor.test.ts` (a run of reserved leaves starts no mbx process and asks over one connection, each runner on
+its grant; a leaf whose run serves none names why), `mbx-reservations.test.ts` (the client and the run hook),
+`mbx-reservations-run.test.ts` (a real Nx run of the compiled plugin whose daemon is killed while its first reserved
+leaf holds a grant: the next leaf is granted by the same endpoint, and the endpoint has ended once the run has) and
+`mbx-pool.test.ts` (the leaf's shell), and by mbx's own suite for the endpoint.
 
 **A Vitest or Go test leaf enters no pool.** It reserves nothing and runs with its own default workers, uncapped
 (owner's ruling, 2026-10-31). Reserved at that default, which sizes to the host (Vitest one worker per core but one, Go

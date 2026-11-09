@@ -16,7 +16,9 @@ import { type MbxPriority, mbxPool } from './mbx-pool.js';
  * table recycling. With mbx's pool, the run's `preTasksExecution` starts `mbx reservations <socket>` once and publishes
  * the socket in `RESERVATIONS_ENV`, which every task inherits; each task's executor asks it for its leaf's cores over
  * one connection per process (`reserveCores`), and the run's `postTasksExecution` closes the endpoint's standard input,
- * which ends it. Admission is `mbx reserve`'s: the same pool, priority and order. A grant lasts until its leaf ends, or
+ * which ends it. Nx runs both hooks in the process that runs the tasks, never in a daemon (patches/README.md, "A run's
+ * task hooks run in its own process"), so the endpoint is a child of the run and ends with it, whatever becomes of the
+ * run's daemon. Admission is `mbx reserve`'s: the same pool, priority and order. A grant lasts until its leaf ends, or
  * until its connection closes, so an executor that dies gives back what it held.
  */
 export const RESERVATIONS_ENV = 'MBX_RESERVATIONS_SOCKET';

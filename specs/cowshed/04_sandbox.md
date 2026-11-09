@@ -1060,10 +1060,12 @@ the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). 
 that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding, not a per-project
 flag or filesystem grant.
 
-A hook a worker runs sets `process.env` as Nx expects, and the patched worker records those writes whatever the
-isolation setting and the daemon say, so the environment a `preTasksExecution` publishes (the run's CPU pool and
-reservation endpoints) reaches the run's task processes also when the client that computes the run has no daemon
-(`patches/README.md`, "Event-driven daemon validity"; `packages/nx-plugin/src/nx-local-plugin-hook-env.test.ts`).
+The plugins' task hooks run in the run's own client, never in its daemon, so what a `preTasksExecution` starts for the
+run (its CPU pool and reservation endpoints) is a child of the run that ends with it, and a daemon that stops under the
+run takes none of it along (`patches/README.md`, "A run's task hooks run in its own process"). A hook a worker runs sets
+`process.env` as Nx expects, and the patched worker records those writes whatever the isolation setting and the daemon
+say, so the environment a `preTasksExecution` publishes reaches the run's task processes whether or not the client has a
+daemon (`patches/README.md`, "Event-driven daemon validity"; `packages/nx-plugin/src/nx-local-plugin-hook-env.test.ts`).
 
 A graph-request failure, including a local plugin load refusal, is answered without stopping the daemon. A source fix
 can retry graph preparation without replacing that daemon or unrelated plugin workers. Other daemon and protocol errors

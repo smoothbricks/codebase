@@ -50,8 +50,9 @@ export interface ProducerSourceWitness {
   readonly outputs: readonly string[];
 }
 /**
- * Git as receipts read it: the checkout and nothing of the operator's home. The producer hooks run in whichever process
- * Nx runs plugins in, a workspace's sandboxed daemon included, which adopts a host client's HOME; git with that HOME
+ * Git as receipts read it: the checkout and nothing of the operator's home. The producer hooks run in the process that
+ * runs the tasks (patches/README.md, "A run's task hooks run in its own process"), a host shell's or a sandboxed job's,
+ * under whatever HOME that process has; git with the operator's HOME
  * reads the operator's global configuration, the sandbox denies it, and git dies (specs/cowshed/04_sandbox.md, the
  * runtime-input contract). A receipt's tree, HEAD and tracked-file status are read under the repository's own
  * configuration alone, so a host run and a sandboxed run agree on them.
