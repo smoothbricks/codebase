@@ -32,7 +32,8 @@ Facts are strongly-typed template literals. Invalid facts = compile errors.
 | `ScopeFact` | `scope:${key}: ${value}` | `scope:requestId: req-abc` |
 | `FFFact`    | `ff:${flag}: ${value}`   | `ff:darkMode: true`        |
 
-Span states: `started`, `ok`, `err(CODE)`, `exception(msg)`
+Span states: `started`, `retry` (one per retried attempt), `ok`, `err(CODE)`, `exception(msg)`. A span still running
+when its facts are read (a test's own span) states `started` and no outcome.
 
 ## Usage
 
@@ -71,6 +72,9 @@ expect(facts.hasMatch('span:*: err(*)')).toBe(false);
 | `byNamespace('span')`           | Filter to namespace                    |
 | `spans()` / `logs()` / `tags()` | Typed filters                          |
 | `match(pattern)`                | Return matching facts                  |
+
+`querySpan(buffer).ownFacts()` reads one span's own facts (its lifecycle, retries, tags and logs), never a descendant's,
+so a tag or outcome selects that span alone: `spans.filter((s) => s.ownFacts().has(tagFact('result', 'done')))`.
 
 ## Buffer Layout (Why This Works)
 

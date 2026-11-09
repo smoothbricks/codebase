@@ -18,6 +18,7 @@ import {
   ENTRY_TYPE_SPAN_ERR,
   ENTRY_TYPE_SPAN_EXCEPTION,
   ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_RETRY,
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
@@ -34,6 +35,7 @@ import {
   spanErr,
   spanException,
   spanOk,
+  spanRetry,
   spanStarted,
   type TraceFact,
   tagFact,
@@ -174,6 +176,21 @@ export function extractFacts<T extends LogSchema>(
 }
 
 /**
+ * Extract one span's own facts: its lifecycle, retries, tags and logs, none of its descendants'. A span's facts from
+ * {@link extractFacts} include every child's; this answers what the span itself recorded.
+ */
+export function extractOwnFacts<T extends LogSchema>(
+  buffer: SpanBuffer<T>,
+  options: ExtractFactsOptions = {},
+): FactArray {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const facts: TraceFact[] = [];
+  enterBuffer(buffer, facts, opts);
+  leaveBuffer(buffer, facts, opts);
+  return createFactArray(facts);
+}
+
+/**
  * Walk a buffer and its children, extracting facts.
  */
 function enterBuffer<T extends LogSchema>(
@@ -209,6 +226,9 @@ function enterBuffer<T extends LogSchema>(
       case ENTRY_TYPE_FF_USAGE:
         if (opts.includeFF) extractFFfacts(buffer, row, facts);
         break;
+      case ENTRY_TYPE_SPAN_RETRY:
+        facts.push(spanRetry(spanName));
+        break;
     }
   }
 }
@@ -230,7 +250,9 @@ function leaveBuffer<T extends LogSchema>(
         facts.push(spanErr(spanName, getErrorCode(buffer, 1)));
         break;
       case ENTRY_TYPE_SPAN_EXCEPTION:
-        facts.push(spanException(spanName, getExceptionMessage(buffer, 1)));
+        // A running span's end row is pre-armed as an exception at timestamp 0 so an abandoned span still ends;
+        // until the span really ends it has no outcome to state.
+        if (buffer.timestamp[1] !== 0n) facts.push(spanException(spanName, getExceptionMessage(buffer, 1)));
         break;
     }
   }

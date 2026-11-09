@@ -19,7 +19,7 @@ import { resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { iterateSpanChildren, iterateSpanTree } from '../traceTopology.js';
 import type { SpanBuffer } from '../types.js';
-import { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
+import { type ExtractFactsOptions, extractFacts, extractOwnFacts } from './extractFacts.js';
 import type { FactArray } from './facts.js';
 
 export interface QueryableSpan<T extends LogSchema = LogSchema> {
@@ -28,6 +28,9 @@ export interface QueryableSpan<T extends LogSchema = LogSchema> {
 
   /** Extract all facts from this span and its children */
   facts(options?: ExtractFactsOptions): FactArray;
+
+  /** Extract this span's own facts: its lifecycle, retries, tags and logs, none of its descendants' */
+  ownFacts(options?: ExtractFactsOptions): FactArray;
 
   /** Find first child span by name (depth-first) */
   find(name: string): QueryableSpan<T> | undefined;
@@ -59,6 +62,10 @@ class QueryableSpanImpl<T extends LogSchema> implements QueryableSpan<T> {
 
   facts(options?: ExtractFactsOptions): FactArray {
     return extractFacts(this.buffer, options);
+  }
+
+  ownFacts(options?: ExtractFactsOptions): FactArray {
+    return extractOwnFacts(this.buffer, options);
   }
 
   find(name: string): QueryableSpan<T> | undefined {

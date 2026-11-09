@@ -83,6 +83,7 @@ export {
   spanErr,
   spanException,
   spanOk,
+  spanRetry,
   spanStarted,
   // Tag facts
   type TagFact,

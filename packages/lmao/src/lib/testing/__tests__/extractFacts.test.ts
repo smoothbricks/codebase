@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'bun:test';
 import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
+import { Transient } from '../../errors/Transient.js';
 import { defineCodeError } from '../../result.js';
 import { S } from '../../schema/builder.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
@@ -12,7 +13,7 @@ import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { extractFacts } from '../extractFacts.js';
-import { ffFact, logInfo, logWarn, spanErr, spanOk, spanStarted, tagFact } from '../facts.js';
+import { ffFact, logInfo, logWarn, spanErr, spanOk, spanRetry, spanStarted, tagFact } from '../facts.js';
 
 // Define a test error for ctx.err tests
 const NOT_FOUND = defineCodeError('NOT_FOUND')<{ detail: string }>();
@@ -275,5 +276,67 @@ describe('trace-testing patterns', () => {
     // 5. No errors occurred
     expect(facts.hasMatch('span:*: err(*)')).toBe(false);
     expect(facts.hasMatch('log:error: *')).toBe(false);
+  });
+});
+
+describe('extractFacts on a span that is still running', () => {
+  const opContext = defineOpContext({ logSchema: defineLogSchema({ step: S.category() }) });
+
+  it('states a running span as started with no outcome, and its outcome once it ends', async () => {
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    let whileRunning: readonly string[] = [];
+    await tracer.trace('test', async (ctx) => {
+      await ctx.span('step', (step) => step.ok(undefined));
+      whileRunning = [...extractFacts(ctx.buffer, { includeTags: false, includeScope: false })];
+      return ctx.ok(undefined);
+    });
+
+    expect(whileRunning).toEqual([spanStarted('test'), spanStarted('step'), spanOk('step')]);
+    const root = tracer.rootBuffers[0];
+    if (!root) throw new Error('the traced run left no root buffer');
+    expect(extractFacts(root).has(spanOk('test'))).toBe(true);
+  });
+});
+
+describe('extractFacts on a retried span', () => {
+  const opContext = defineOpContext({ logSchema: defineLogSchema({ step: S.category() }) });
+  const UNAVAILABLE = Transient<{ status: number }>('UNAVAILABLE', {
+    backoff: 'fixed',
+    maxAttempts: 3,
+    baseDelayMs: 0,
+    jitter: false,
+  });
+
+  it('states each retry the span took, then its outcome', async () => {
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    let failures = 2;
+    await tracer.trace('run', async (ctx) => {
+      await ctx.span('fetch', (attempt) => {
+        if (failures > 0) {
+          failures -= 1;
+          return attempt.err(UNAVAILABLE({ status: 503 }));
+        }
+        return attempt.ok(undefined);
+      });
+      return ctx.ok(undefined);
+    });
+
+    const root = tracer.rootBuffers[0];
+    if (!root) throw new Error('the traced run left no root buffer');
+    const facts = extractFacts(root);
+    expect(facts.match('span:fetch: retry')).toHaveLength(2);
+    expect(facts.hasInOrder([spanStarted('fetch'), spanRetry('fetch'), spanOk('fetch')])).toBe(true);
+  });
+
+  it('states no retry for a span that succeeded first time', async () => {
+    const tracer = new TestTracer(opContext, createTestTracerOptions());
+    await tracer.trace('run', async (ctx) => {
+      await ctx.span('fetch', (attempt) => attempt.ok(undefined));
+      return ctx.ok(undefined);
+    });
+
+    const root = tracer.rootBuffers[0];
+    if (!root) throw new Error('the traced run left no root buffer');
+    expect(extractFacts(root).hasMatch('span:fetch: retry')).toBe(false);
   });
 });

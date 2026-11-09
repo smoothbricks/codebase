@@ -34,7 +34,7 @@ export type FactNamespace = 'span' | 'log' | 'tag' | 'scope' | 'ff' | 'metric';
 /**
  * Span lifecycle states.
  */
-export type SpanState = 'started' | 'ok' | `err(${string})` | `exception(${string})`;
+export type SpanState = 'started' | 'retry' | 'ok' | `err(${string})` | `exception(${string})`;
 
 /**
  * A span fact: `span:${name}: ${state}`
@@ -43,6 +43,7 @@ export type SpanState = 'started' | 'ok' | `err(${string})` | `exception(${strin
  * type F1 = SpanFact<'fetch-user', 'started'>;  // "span:fetch-user: started"
  * type F2 = SpanFact<'fetch-user', 'ok'>;       // "span:fetch-user: ok"
  * type F3 = SpanFact<'fetch-user', 'err(NOT_FOUND)'>; // "span:fetch-user: err(NOT_FOUND)"
+ * type F4 = SpanFact<'fetch-user', 'retry'>;    // "span:fetch-user: retry", one per retried attempt
  */
 export type SpanFact<Name extends string = string, State extends SpanState = SpanState> = `span:${Name}: ${State}`;
 
@@ -65,6 +66,13 @@ export function spanStarted<N extends string>(name: N): SpanFact<N, 'started'> {
  */
 export function spanOk<N extends string>(name: N): SpanFact<N, 'ok'> {
   return `span:${name}: ok` as SpanFact<N, 'ok'>;
+}
+
+/**
+ * Create a span:retry fact: the span's attempt failed transiently and it retried.
+ */
+export function spanRetry<N extends string>(name: N): SpanFact<N, 'retry'> {
+  return `span:${name}: retry` as SpanFact<N, 'retry'>;
 }
 
 /**
