@@ -9,6 +9,7 @@ mod common;
 
 use bitmosaic::Bitmosaic;
 use columine_types::PROGRAM_MAGIC;
+use columine_types::operand::encode_index;
 use columine_types::types::{
     AggType, ErrorCode, Opcode, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
     state_num_slots,
@@ -19,7 +20,10 @@ use columine_vm::hashmap_ops::{CmpType, Strategy};
 use columine_vm::key_index::Key;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::row_exprs::StoredRow;
-use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::state_init::{
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
+    init_state,
+};
 use columine_vm::vm::{Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;
 
@@ -500,6 +504,67 @@ fn a_row_the_removal_cut_skips_records_nothing() {
     );
 }
 
+/// A counts fold whose new rows' init frames fill the struct map's arena
+/// while its rows are far below the admission bound: the refusal names the
+/// arena, and one growth for that room lets the batch through with the rows
+/// unchanged. Named as the rows, the growth would double rows the slot never
+/// lacked, every replay asking again, without bound.
+#[test]
+fn a_counts_fold_that_fills_its_arena_asks_for_arena_room() {
+    const PREFIX: usize = 200;
+    let init = struct_map(0, 16, &[StructFieldType::Vo]);
+    let mut reduce = vec![
+        Opcode::BatchStructMapCountsFold as u8,
+        0,
+        ADD_K1,
+        0,
+        INIT_OFFSETS,
+        INIT_VALUES,
+        0,
+        1,
+        4,
+        4,
+        1,
+        ZERO,
+        0,
+    ];
+    reduce.extend_from_slice(encode_index(PREFIX as u32).as_bytes());
+    reduce.extend_from_slice(&[b'P'; PREFIX]);
+    let code = program(1, &init, &reduce);
+    let mut state = image(&code);
+    let frame = [&[b'P'; PREFIX][..], &COUNTS_INIT[1..]].concat();
+    let one = |key: u32| {
+        let mut rows = batch(&[add(key, 0, 1, 0)]);
+        rows.cols[usize::from(INIT_OFFSETS)] =
+            u32s_as_bytes(&[0, u32::try_from(frame.len()).unwrap()]).to_vec();
+        rows.cols[usize::from(INIT_VALUES)] = frame.clone();
+        rows
+    };
+    let capacity = |state: &[u8]| {
+        columine_vm::bytes::read_u32(state, slot_meta_base(0) + SlotMetaOffset::CAPACITY)
+    };
+    let rows = capacity(&state);
+    let mut vm = Vm::default();
+    let mut key = 1;
+    while run(&mut vm, &mut state, &code, &one(key)) == OK {
+        key += 1;
+    }
+    assert!(
+        key < rows / 2,
+        "fixture: the arena fills at key {key}, far below {rows} rows"
+    );
+    assert_eq!(
+        Some(GrowthRoom::Arena),
+        vm.needs_growth_room(),
+        "the arena ran out"
+    );
+
+    let room = vm.needs_growth_room().unwrap();
+    let mut next = vec![0u8; calculate_grown_state_size(&state, 0, room).unwrap() as usize];
+    vm.grow_state(&state, &mut next, 0, room).unwrap();
+    assert_eq!(rows, capacity(&next), "the rows never ran out");
+    assert_eq!(OK, run(&mut vm, &mut next, &code, &one(key)));
+}
 #[test]
 fn a_counts_fold_records_once_though_admission_dry_runs_it() {
     let init = struct_map(0, 16, &[StructFieldType::Vo]);

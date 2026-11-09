@@ -3893,11 +3893,12 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
             let Ok(len) = u32::try_from(sample.init().len()) else {
                 return ErrorCode::InvalidCellValue as u32;
             };
+            // The arena, not the rows, lacks room: growth_of names it so.
             let Some(next_used) = arena.used.checked_add(len) else {
-                return NEEDS_GROWTH;
+                return ErrorCode::ArenaOverflow as u32;
             };
             if next_used > arena.capacity {
-                return NEEDS_GROWTH;
+                return ErrorCode::ArenaOverflow as u32;
             }
             (arena.data + arena.used, len, next_used)
         }
