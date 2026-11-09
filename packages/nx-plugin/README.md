@@ -1463,18 +1463,29 @@ this local relationship explicit for inferred `tsc-js` targets that also have in
 JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
 
 A self-hosted workspace that owns the plugin's cowshed dependency builds its declared `napi-native` and independent
-`lineage-js` producers before **every bounded-exec task**, including declared Bun targets, inferred Cargo shards and
-root serial groups. Native tool discovery resolves that local owner from the linked package manifest, not a repository
-path or project-name alias; an installed consumer takes no local producer edge because its package ships the addon and
-lineage entry. The plugin's compile and typecheck targets require only `lineage-js`, never the addon or cowshed's full
-API build. Its runtime-only cowshed project dependency is excluded from ordinary caret build edges, avoiding the
-executor bootstrap cycle. Bounded targets key on the produced addon and lineage JavaScript bytes through their producer
-edges, not the workspace’s Rust sources. Declarations that replace `dependsOn` or `inputs` keep the inferred
-preconditions with Nx’s `"..."` token. When a declaration changes an inferred executor to bounded-exec, its compatible
-inferred base contains only these runtime prerequisites and output inputs; the incompatible executor’s command and
-inputs do not leak across the normal Nx override. The canonical dependency-free `release-check` is the exception: it
-judges already assembled shipping artifacts and verifies the addon is present, without compiling at runtime or disabling
-the observer (specs/cowshed/06_cli.md, `release-check`).
+`lineage-js` producers before **every bounded-exec task that runs as an mbx Cargo leaf**: a command whose runner Cargo
+builds (`cargo test`, `cargo nextest run` without `--binaries-metadata` or `--archive-file`, `cargo mutants`), as the
+executor classifies it (`runsAsCargoLeaf`, from the command line `boundedCommand` composes, in the declaration's or the
+inference's options or any configuration's). Only such a leaf's admission wait is read from mbx's activity report and
+its waiters' native lineage, the one load of cowshed's `process-lineage` entry and its addon (specs/cowshed/11_shell.md,
+"Cargo test-runner boundaries"); a Bun suite, a script or a nextest run of prebuilt binaries is reserved instead and
+never loads them, so it takes no edge. What the observer reads decides only whether that wait is credited against the
+idle bound (Bounded exec key, below), so no bounded target keys the addon or lineage bytes for it: a command that itself
+reads a producer's output depends on that producer and keys its output, as cowshed's Cargo runners do for the `dist/ts`
+entry and host addon their Node embedder loads (`nx.json` `targetDefaults`). Native tool discovery resolves the local
+owner from the linked package manifest, not a repository path or project-name alias; an installed consumer takes no
+local producer edge because its package ships the addon and lineage entry. The plugin's compile and typecheck targets
+require only `lineage-js`, never the addon or cowshed's full API build. Its runtime-only cowshed project dependency is
+excluded from ordinary caret build edges, avoiding the executor bootstrap cycle. Declarations that replace `dependsOn`
+keep the inferred preconditions with Nx’s `"..."` token. When a declaration changes an inferred executor to
+bounded-exec, its compatible inferred base contains only these runtime prerequisites; the incompatible executor’s
+command and inputs do not leak across the normal Nx override. The canonical dependency-free `release-check` is the
+exception: it judges already assembled shipping artifacts and verifies the addon is present, without compiling at
+runtime or disabling the observer (specs/cowshed/06_cli.md, `release-check`).
+
+A target of a napi package whose run sets `NAPI_DEBUG_ADDON=1`, in its declaration or inference, loads the package's
+dev-profile addon from `napi-debug`'s `.cache/native-debug`: it depends on `napi-debug` and keys
+`{dependentTasksOutputFiles: "**/*.node", transitive: false}`.
 
 <a id="smoo/nx-plugin!n/executor-build-edge"></a>A self-hosted workspace that owns this plugin's package also orders
 **every target that runs one of the plugin's executors**, in every project but the plugin, after the plugin's own

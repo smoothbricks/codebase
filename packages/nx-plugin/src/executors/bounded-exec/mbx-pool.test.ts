@@ -8,6 +8,7 @@ import {
   mbxIdleGated,
   mbxLeaf,
   mbxPool,
+  runsAsCargoLeaf,
   runsPrebuiltNextest,
   withCountedReservation,
   withMbxLeaf,
@@ -275,5 +276,24 @@ describe("mbx's one pool at the leaf", () => {
     for (const disabled of [{ MBX_SCHEDULER: '0' }, { MBX_SCHED_DISABLE: '1' }, { MBX_DISABLE: '1' }]) {
       expect(mbxIdleGated({ kind: 'cargo' }, command, { MBX_SCHEDULER_TESTS: '1', ...disabled })).toBe(false);
     }
+  });
+});
+
+describe.each([
+  ['a cargo test that builds', 'cargo test -p cowshed-napi', true],
+  ['a nextest run that builds', 'cargo --frozen nextest run --workspace', true],
+  ['cargo-mutants', 'cargo --frozen mutants --workspace', true],
+  [
+    'a nextest run of prebuilt binaries',
+    'cargo --frozen nextest run --binaries-metadata m.json --cargo-metadata c.json',
+    false,
+  ],
+  ['a nextest run of an archive', 'cargo nextest run --archive-file tests.tar.zst', false],
+  ['a Bun suite', 'bun test --timeout=0', false],
+  ['a Go suite', 'go test ./...', false],
+  ['a script', 'packages/cowshed/.cache/api-generator/cowshed-api-gen check packages/cowshed', false],
+])('a Cargo leaf, whose admission observer alone loads the lineage addon: %s', (_title, command, expected) => {
+  it(expected ? 'is one' : 'is not one', () => {
+    expect(runsAsCargoLeaf(command)).toBe(expected);
   });
 });

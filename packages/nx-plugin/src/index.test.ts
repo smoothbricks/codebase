@@ -1524,7 +1524,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('orders every local bounded observer after the manifest-owned cowshed producers without loading its addon', async () => {
+  it('orders only a Cargo-leaf bounded target after the manifest-owned cowshed producers, keys none of their bytes, and never loads the addon', async () => {
     const workspace = await createWorkspace();
     const bounded: TargetConfiguration = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1548,6 +1548,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       },
       build: { dependsOn: ['tsc-js'] },
       'release-check': { executor: '@smoothbricks/nx-plugin:bounded-exec', cache: false },
+      // The bounded observer loads the addon only while a Cargo leaf waits for mbx admission.
+      'cargo-check': { ...bounded, options: { command: 'cargo test -p cowshed-napi', idleTimeoutMs: 180000 } },
+      // The package's loader reads napi-debug's addon under NAPI_DEBUG_ADDON=1.
+      'host-napi-test': {
+        ...bounded,
+        options: { command: 'bun test host.napi.test.ts', env: { NAPI_DEBUG_ADDON: '1' }, idleTimeoutMs: 180000 },
+      },
     };
     const projects = [
       { file: 'package.json', name: 'workspace', targets: {}, manifest: { name: 'workspace' } },
@@ -1648,24 +1655,48 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(nodes.workspace?.data.targets?.['cargo-test-group-exclusive']?.executor).toBe(
         '@smoothbricks/nx-plugin:bounded-exec',
       );
+      const cargoLeaves = new Set(['lineage-owner:cargo-check', 'workspace:mutation']);
       for (const node of Object.values(nodes)) {
         for (const [name, target] of Object.entries(node.data.targets ?? {})) {
           if (target.executor !== '@smoothbricks/nx-plugin:bounded-exec' || name === 'release-check') continue;
-          expect(target.dependsOn, `${node.name}:${name}`).toContainEqual(addon);
-          expect(target.dependsOn, `${node.name}:${name}`).toContainEqual(lineage);
+          const id = `${node.name}:${name}`;
+          const tasks = createTaskGraph(graph, {}, [node.name], [name], undefined, {});
+          expect(findCycles(tasks)).toBeNull();
+          const direct = (tasks.dependencies[id] ?? []).map((edge) => edge.id);
+          expect(direct.includes('lineage-owner:napi-native'), id).toBe(cargoLeaves.has(id));
+          expect(direct.includes('lineage-owner:lineage-js'), id).toBe(cargoLeaves.has(id));
           expect(
-            target.dependsOn?.filter((dependency) => JSON.stringify(dependency) === JSON.stringify(addon)),
-          ).toHaveLength(1);
-          expect(target.inputs).toContainEqual({ dependentTasksOutputFiles: '**/*.node', transitive: true });
-          expect(target.inputs).toContainEqual({
+            target.dependsOn?.filter((dependency) => JSON.stringify(dependency) === JSON.stringify(addon)) ?? [],
+            id,
+          ).toHaveLength(cargoLeaves.has(id) ? 1 : 0);
+          expect(target.inputs ?? [], id).not.toContainEqual({
+            dependentTasksOutputFiles: '**/*.node',
+            transitive: true,
+          });
+          expect(target.inputs ?? [], id).not.toContainEqual({
             dependentTasksOutputFiles: '**/dist/lineage/**/*.js',
             transitive: true,
           });
-          expect(target.inputs).not.toContain('{workspaceRoot}/**/*.rs');
-          const tasks = createTaskGraph(graph, {}, [node.name], [name], undefined, {});
-          expect(findCycles(tasks)).toBeNull();
+          expect(target.inputs ?? [], id).not.toContain('{workspaceRoot}/**/*.rs');
         }
       }
+      // api-check gates the TypeScript build and, through the wire fixtures, the Cargo test build: the addon build never
+      // sits in front of it. It reaches lineage-js only through the plugin build its executor runs from (the plugin
+      // compiles against dist/lineage), never by an observer edge of its own.
+      const apiCheck = createTaskGraph(graph, {}, ['lineage-owner'], ['api-check'], undefined, {});
+      expect(Object.keys(apiCheck.tasks)).not.toContain('lineage-owner:napi-native');
+      expect(apiCheck.dependencies['lineage-owner:api-check']?.map((edge) => edge.id)).toEqual([
+        'graph-plugin:build',
+        'lineage-owner:api-generator',
+      ]);
+      const hostNapi = nodes['lineage-owner']?.data.targets?.['host-napi-test'];
+      expect(hostNapi?.dependsOn).toContain('napi-debug');
+      expect(hostNapi?.inputs).toContainEqual({ dependentTasksOutputFiles: '**/*.node', transitive: false });
+      expect(hostNapi?.inputs).toContain('{projectRoot}/checks.ts');
+      const hostNapiTasks = createTaskGraph(graph, {}, ['lineage-owner'], ['host-napi-test'], undefined, {});
+      expect(hostNapiTasks.dependencies['lineage-owner:host-napi-test']?.map((edge) => edge.id)).toContain(
+        'lineage-owner:napi-debug',
+      );
       const plugin = nodes['graph-plugin']?.data.targets ?? {};
       for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
         expect(plugin[name]?.dependsOn).toContainEqual(lineage);
@@ -1688,7 +1719,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(owner.build?.dependsOn).toEqual(['tsc-js']);
       const build = createTaskGraph(graph, {}, ['lineage-owner'], ['build'], undefined, {});
       expect(findCycles(build)).toBeNull();
-      expect(Object.keys(build.tasks)).toContain('lineage-owner:napi-native');
+      expect(Object.keys(build.tasks)).not.toContain('lineage-owner:napi-native');
       expect(Object.keys(build.tasks)).toContain('lineage-owner:lineage-js');
     } finally {
       await workspace.cleanup();

@@ -64,3 +64,22 @@ export interface BoundedExecCommand {
   args?: string | string[];
   __unparsed__?: string[];
 }
+
+/**
+ * The command line a run of `options` starts: `command`, then `args`, then the arguments Nx forwards from its own
+ * command line unless `forwardAllArgs` is false. The executor runs it and graph inference reads its runner from it.
+ */
+export function boundedCommand(
+  options: Pick<BoundedExecCommand, 'command' | 'args' | 'forwardAllArgs' | '__unparsed__'>,
+): string {
+  const parts = [options.command];
+  if (Array.isArray(options.args)) {
+    parts.push(...options.args);
+  } else if (options.args) {
+    parts.push(options.args);
+  }
+  if (options.forwardAllArgs !== false && options.__unparsed__?.length) {
+    parts.push(...options.__unparsed__);
+  }
+  return parts.join(' ');
+}

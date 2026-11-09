@@ -62,7 +62,7 @@ import {
 import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
-import type { BoundedExecOptions } from './schema.js';
+import { type BoundedExecOptions, boundedCommand } from './schema.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
   type BoundedExecRecord,
@@ -341,7 +341,7 @@ async function runCommand(
   if (directory !== null) {
     await clearTaskDirectory(directory);
   }
-  const requested = buildCommand(options);
+  const requested = boundedCommand(options);
   const timeoutMs = options.timeoutMs;
   const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
@@ -1441,19 +1441,6 @@ function resolveCwd(cwd: string | undefined, root: string): string {
     return root;
   }
   return isAbsolute(cwd) ? cwd : join(root, cwd);
-}
-
-function buildCommand(options: BoundedExecOptions): string {
-  const parts = [options.command];
-  if (Array.isArray(options.args)) {
-    parts.push(...options.args);
-  } else if (options.args) {
-    parts.push(options.args);
-  }
-  if (options.forwardAllArgs !== false && options.__unparsed__?.length) {
-    parts.push(...options.__unparsed__);
-  }
-  return parts.join(' ');
 }
 
 /** Owned scratch is the command's TMPDIR unless the target names one itself. */

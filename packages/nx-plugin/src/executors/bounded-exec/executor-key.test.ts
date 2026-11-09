@@ -71,7 +71,7 @@ function keyedModules(): string[] {
 /**
  * What decides the command a task runs, its environment or the verdict of a run that passes, and so must stay keyed:
  * the executor itself, the sizing of the runner to its grant, the report flags, the lifecycle hooks, the jobserver and
- * pool environment, the mbx leaf wrapping, the verdict and its test results.
+ * pool environment, the mbx leaf wrapping, the command line (schema.ts), the verdict and its test results.
  */
 const KEYED = [
   'executors/bounded-exec/bounds.ts',
@@ -88,6 +88,7 @@ const KEYED = [
   'executors/bounded-exec/runner-lifecycle.ts',
   'executors/bounded-exec/runner-sizing.ts',
   'executors/bounded-exec/runtime-pin.ts',
+  'executors/bounded-exec/schema.ts',
   'executors/bounded-exec/test-result-writer.ts',
   'executors/bounded-exec/test-results.ts',
   'executors/bounded-exec/verdict.ts',

@@ -85,8 +85,10 @@ import {
   type AllVerdictsOptions,
   ESLINT_SOURCES_TOKEN,
 } from './executors/all-verdicts/schema.js';
+import { runsAsCargoLeaf } from './executors/bounded-exec/mbx-pool.js';
 import { closeRunReservations, serveRunReservations } from './executors/bounded-exec/mbx-reservations.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
+import { boundedCommand } from './executors/bounded-exec/schema.js';
 import { ffiPathProblem } from './executors/scriptc-native/ffi-paths.js';
 import type { ScriptcNativeFfi } from './executors/scriptc-native/schema.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
@@ -2464,8 +2466,12 @@ async function createProjectTargets(
     }
   }
 
-  // Runtime observers need the local addon, not the package aggregate (which can deliberately build only JS).
-  // Declarations retain these prerequisites and output inputs with Nx's ordinary "..." merge token.
+  // bounded-exec's admission observer loads cowshed's process-lineage entry, and through it the addon, only while a
+  // Cargo leaf waits for mbx admission (specs/cowshed/11_shell.md, "Cargo test-runner boundaries"; mbx-queue.ts). Such
+  // a target runs after the local producers so the observer finds them. Its reading only decides whether that wait is
+  // credited against the idle bound, so the producers' bytes key no target (README, "Bounded exec key"): a command that
+  // reads them keys them itself. A command named in either the declaration or the inference counts.
+  // Declarations retain these prerequisites with Nx's ordinary "..." merge token.
   // The canonical release-check instead judges prebuilt shipping artifacts and must remain dependency-free.
   const observerProducers = [...nativeToolDependsOn(nativeTools, 'cowshed'), ...lineageProducer];
   if (observerProducers.length > 0) {
@@ -2478,16 +2484,39 @@ async function createProjectTargets(
       if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) {
         targets[name] = {};
       }
+      const runs = [...targetOptionSets(declared), ...targetOptionSets(targets[name])];
+      if (!runs.some((options) => runsAsCargoLeaf(boundedCommandLine(options) ?? ''))) continue;
       targets[name] ??= {};
       const target = targets[name];
       target.dependsOn = [...(target.dependsOn ?? []), ...observerProducers];
+    }
+  }
+
+  // The package's addon loader reads napi-debug's dev-profile addon when NAPI_DEBUG_ADDON=1 (createNapiTestTarget), so
+  // a target whose run sets it, in its declaration or its inference, runs after that build and keys the addon it writes.
+  if (targets['napi-debug'] !== undefined) {
+    for (const name of new Set([...Object.keys(targets), ...Object.keys(declaredTargets)])) {
+      const declared = declaredTargets[name];
+      const runs = [...targetOptionSets(declared), ...targetOptionSets(targets[name])];
+      if (!runs.some((options) => isRecord(options.env) && options.env.NAPI_DEBUG_ADDON === '1')) continue;
+      const executor =
+        isRecord(declared) && declared.executor !== undefined ? declared.executor : targets[name]?.executor;
+      // Nx discards an incompatible executor's inferred configuration; only the addon prerequisite belongs below it.
+      if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) {
+        targets[name] = {};
+      }
+      targets[name] ??= {};
+      const target = targets[name];
+      const named = [
+        ...(target.dependsOn ?? []),
+        ...(isRecord(declared) && Array.isArray(declared.dependsOn) ? declared.dependsOn : []),
+      ];
+      if (!named.includes('napi-debug')) {
+        target.dependsOn = [...(target.dependsOn ?? []), 'napi-debug'];
+      }
       const inputs =
         target.inputs ?? (isRecord(declared) && Array.isArray(declared.inputs) ? [] : ['default', '^production']);
-      target.inputs = [
-        ...inputs,
-        { dependentTasksOutputFiles: '**/*.node', transitive: true },
-        { dependentTasksOutputFiles: '**/dist/lineage/**/*.js', transitive: true },
-      ];
+      target.inputs = [...inputs, { dependentTasksOutputFiles: '**/*.node', transitive: false }];
     }
   }
 
@@ -2992,6 +3021,28 @@ function createNapiTargets(
     };
   }
   return targets;
+}
+
+/** A target's own options and each of its configurations' options, as one declaration or inference states them. */
+function targetOptionSets(target: unknown): Record<string, unknown>[] {
+  if (!isRecord(target)) return [];
+  const configurations = isRecord(target.configurations) ? Object.values(target.configurations) : [];
+  return [target.options, ...configurations].filter(isRecord);
+}
+
+/** The command line a bounded-exec run with `options` starts (`boundedCommand`), or null when they name no command. */
+function boundedCommandLine(options: Record<string, unknown>): string | null {
+  const { command, args } = options;
+  if (typeof command !== 'string') return null;
+  return boundedCommand({
+    command,
+    args:
+      typeof args === 'string'
+        ? args
+        : Array.isArray(args)
+          ? args.filter((arg): arg is string => typeof arg === 'string')
+          : undefined,
+  });
 }
 
 function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean): TargetConfiguration {
