@@ -27,6 +27,7 @@ use crate::row_exprs::{
 };
 use crate::state_init;
 use crate::vm::Vm;
+use core::cell::OnceCell;
 use core::marker::PhantomData;
 
 pub use crate::program_inputs::{InputAdmissionError, ProgramScratch};
@@ -94,6 +95,11 @@ pub struct AdmittedProgram<A: VoProgramAdmission, I: KeyIndex = HashIndex> {
     /// The reduce section's reads, derived once at admission: what every bind
     /// of this program checks its live and wide columns against.
     reads: ReduceReads,
+    /// The row-expression table, parsed and admitted once, at the first
+    /// [`Self::execute_bound`], through the evaluator that bind was handed:
+    /// every evaluator one embedder passes for a program implements one
+    /// expression language, so the plan is the program's.
+    rows: OnceCell<RowPlan>,
     magic: u32,
     /// The image size of this program under family `I`.
     state_size: u32,
@@ -269,6 +275,7 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
             inputs,
             binds_rows,
             reads,
+            rows: OnceCell::new(),
             magic,
             state_size,
             family: PhantomData,
@@ -322,21 +329,14 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
         )
     }
 
-    /// This program's row-expression table, parsed and admitted once through
-    /// `eval` against the reduce reads admission derived ([`RowPlan::of`]):
-    /// the plan every [`Self::execute_bound`] of this program runs. The
-    /// embedder makes it once, beside the program, with the evaluator of its
-    /// expression language.
-    pub fn plan_rows<E: RowExpression>(&self, eval: &mut E) -> Result<RowPlan, ErrorCode> {
-        RowPlan::of(&self.bytecode, &self.reads, eval)
-    }
     /// Bind the row-expression table over `cols`, admit the selected VO frames
     /// against that bound column set, then run `execute` on it with the
     /// batch's live columns. A scope filter, FLAT_MAP offsets or VO column
     /// may be a derived column, so admission must read the same cells the
     /// reduce section will: a host placeholder for a derived column is never
-    /// what admission sees. Binding runs `plan`, this program's
-    /// [`Self::plan_rows`], reads `state` and writes only `rows` and
+    /// what admission sees. Binding runs this program's row plan, made from
+    /// `eval` at the first bound batch ([`RowPlan::of`]) and kept, reads
+    /// `state` and writes only `rows` and
     /// `cols`; every refusal happens before `execute` runs. A program without
     /// a table binds nothing and its live columns are empty.
     ///
@@ -351,12 +351,19 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
         cols: &mut [&'a [u8]],
         batch_len: u32,
         scratch: &mut ProgramScratch,
-        plan: &RowPlan,
         eval: &mut E,
         strings: &mut S,
         rows: &'a mut RowColumns,
         execute: impl FnOnce(&[u8], &mut [u8], &[&[u8]], &mut LiveColumns<'_, '_>, &S) -> u32,
     ) -> Result<u32, InputAdmissionError> {
+        let plan = match self.rows.get() {
+            Some(plan) => plan,
+            None => {
+                let plan = RowPlan::of(&self.bytecode, &self.reads, eval)
+                    .map_err(InputAdmissionError::Rows)?;
+                self.rows.get_or_init(|| plan)
+            }
+        };
         let mut live = bind_row_columns(
             &self.bytecode,
             plan,
@@ -745,6 +752,7 @@ mod tests {
             admission: UnavailableVoAdmission,
             inputs,
             binds_rows: true,
+            rows: core::cell::OnceCell::new(),
             reads,
             magic: PROGRAM_MAGIC,
             state_size: 0,
@@ -795,7 +803,6 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
-            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -824,7 +831,6 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
-            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -853,10 +859,21 @@ mod tests {
             Err(InputAdmissionError::UnboundRows)
         );
 
+        let refused = admitted(&[]);
+        let mut cols: [&[u8]; 6] = [&types, &offsets, b"ab", &key, &[], &[]];
+        let mut rows = RowColumns::new();
         assert_eq!(
-            admitted(&[]).plan_rows(&mut Constant).err(),
-            Some(ErrorCode::InvalidProgram),
-            "the evaluator refuses the empty expression when the table is planned"
+            refused.execute_bound(
+                &mut [],
+                &mut cols,
+                1,
+                &mut scratch,
+                &mut Constant,
+                &mut NoStrings,
+                &mut rows,
+                |_, _, _, _, _| unreachable!("never run"),
+            ),
+            Err(InputAdmissionError::Rows(ErrorCode::InvalidProgram))
         );
     }
 
@@ -885,7 +902,6 @@ mod tests {
             &mut cols,
             1,
             &mut scratch,
-            &program.plan_rows(&mut Constant).expect("the table plans"),
             &mut Constant,
             &mut NoStrings,
             &mut rows,
@@ -916,7 +932,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -953,7 +968,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1020,7 +1034,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1052,7 +1065,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &program.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1086,7 +1098,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &live.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1126,9 +1137,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &bound_split
-                    .plan_rows(&mut Constant)
-                    .expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,
@@ -1168,7 +1176,6 @@ mod tests {
                 &mut cols,
                 1,
                 &mut scratch,
-                &live.plan_rows(&mut Constant).expect("the table plans"),
                 &mut Constant,
                 &mut NoStrings,
                 &mut rows,

@@ -98,11 +98,6 @@ consumer = "private"
 why = "a host keeps a fact derived from the state image current from each pass's journal records instead of rescanning the image"
 
 
-# A private consumer's row-expression evaluator calls `BatchView::derived_lane`.
-[[package.metadata.wiring.external]]
-item = "derived_lane"
-consumer = "private"
-why = "an embedder's row-expression evaluator refuses, at admission, a read of an earlier entry's derived column at another lane"
 
 [dependencies]
 bitmosaic = { workspace = true }

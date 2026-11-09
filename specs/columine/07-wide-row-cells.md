@@ -37,12 +37,13 @@ so every program written before stays byte-identical and binds as before.
 `RowExpression::admit(expr, lane, reads)` and `RowExpression::eval(expr, lane, batch, row, strings)`
 ([row interning](09-row-interning.md)) receive the entry's lane. Admission is the program's, not a batch's:
 `RowPlan::of(program, reduce_reads, eval)` parses the table and admits each entry once, and every
-`bind_row_columns(program, plan, …)` of that program runs the plan, so no bind parses the table or admits an entry again
-(a host that binds the same program for every committed row pays the admission per row without it). An evaluator refuses
-at admission, with `InvalidProgram`, an expression that cannot answer the lane, such as a predicate in a wide lane, and
-names to `reads` each column the expression reads and the lane it reads it at. It answers each row with a `RowCell`
-(`U32`, `F64` or `I64`). The bind stores a cell only in its entry's lane. A cell of another lane, or a value the lane
-cannot hold, refuses the bind with `InvalidCellValue` before any column is spliced.
+`bind_row_columns(program, plan, …)` of that program runs the plan (an `AdmittedProgram` makes its plan at its first
+`execute_bound` and keeps it), so no bind parses the table or admits an entry again (a host that binds the same program
+for every committed row pays the admission per row without it). An evaluator refuses at admission, with
+`InvalidProgram`, an expression that cannot answer the lane, such as a predicate in a wide lane, and names to `reads`
+each column the expression reads and the lane it reads it at. It answers each row with a `RowCell` (`U32`, `F64` or
+`I64`). The bind stores a cell only in its entry's lane. A cell of another lane, or a value the lane cannot hold,
+refuses the bind with `InvalidCellValue` before any column is spliced.
 
 `RowColumns` keeps each entry's cells in 8-byte words, two u32 cells or one wide cell to a word, so a wide column is
 aligned for its typed view. The splice hands an entry's column to the reduce section as `batch_len` cells of the lane's
