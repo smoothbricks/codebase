@@ -211,7 +211,7 @@ fn parse_then_prepare<F, T>(arguments: &[OsString], prepare: F) -> Result<T, arg
 where
     F: FnOnce(args::Cli) -> T,
 {
-    let parsed = args::parse_args_in(arguments, |name| std::env::var_os(name))?;
+    let parsed = args::parse_args(arguments)?;
     Ok(prepare(parsed))
 }
 
@@ -940,6 +940,25 @@ mod tests {
         assert!(
             hangup_still_ignored.expect("read SIGHUP disposition"),
             "installing the watch replaced the inherited SIG_IGN"
+        );
+    }
+
+    /// A line holds only when it names `--want`: an agent shell's `COWSHED_EXEC_WANT` once made
+    /// every `cowshed exec` it ran a held job, a brief `git commit` included (2026-11-10: held at
+    /// 4 cores and queued behind a full pool), and the owner removed that default, 2026-11-10.
+    #[test]
+    fn a_shell_s_cowshed_exec_want_holds_no_line() {
+        // SAFETY: nextest runs each test in a process of its own, and this one starts no thread
+        // before it sets the variable.
+        unsafe { std::env::set_var("COWSHED_EXEC_WANT", "4") };
+        let argv = ["exec", "raven", "--", "git", "commit"].map(OsString::from);
+        let parsed = parse_then_prepare(&argv, |cli| cli).expect("exec parses");
+        let args::Command::Exec(exec) = parsed.command else {
+            panic!("exec parses as exec");
+        };
+        assert_eq!(
+            exec.want, None,
+            "the shell's COWSHED_EXEC_WANT sized a line that named no want"
         );
     }
 

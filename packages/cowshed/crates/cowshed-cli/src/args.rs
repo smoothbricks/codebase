@@ -752,32 +752,9 @@ impl fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
-/// The environment variable `exec` falls back to for `--want` when its line names none, so a
-/// shell that always runs heavy work sets it once and every `exec` it starts declares its hold
-/// (05_gateway.md "Held jobs"). The line's own `--want` outranks it, and an empty value is no
-/// default, which leaves a brief command in such a shell a way to run unheld.
-pub const EXEC_WANT_ENV: &str = "COWSHED_EXEC_WANT";
-
-/// What the parser may read of the process's environment: a variable's value, when it is set.
-type Environment<'a> = &'a dyn Fn(&str) -> Option<OsString>;
-
 /// Parses a command line as typed, reading no environment: every default a line leaves out is the
-/// command's own. The process's environment enters through [`parse_args_in`], so what a test
-/// asserts never depends on the shell that runs it.
+/// command's own, so a line means the same in every shell.
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString>,
-{
-    parse_args_in(args, |_| None)
-}
-
-/// Parses a command line, reading `environment` for the defaults a line leaves to it
-/// ([`EXEC_WANT_ENV`]).
-pub fn parse_args_in<I, T>(
-    args: I,
-    environment: impl Fn(&str) -> Option<OsString>,
-) -> Result<Cli, UsageError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
@@ -787,7 +764,7 @@ where
         return Ok(cli);
     }
     match cli_command().try_get_matches_from(&args) {
-        Ok(matches) => cli_from_matches(matches, &environment),
+        Ok(matches) => cli_from_matches(matches),
         Err(error) if error.kind() == ErrorKind::DisplayVersion => Ok(Cli {
             global: GlobalOptions::default(),
             command: Command::Version,
@@ -1268,7 +1245,7 @@ fn positional(name: &'static str, _range: std::ops::RangeInclusive<usize>) -> Ar
         .num_args(1)
 }
 
-fn cli_from_matches(matches: ArgMatches, environment: Environment<'_>) -> Result<Cli, UsageError> {
+fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
     let Some((name, leaf)) = matches.subcommand() else {
         return Err(UsageError::missing_command());
     };
@@ -1282,7 +1259,7 @@ fn cli_from_matches(matches: ArgMatches, environment: Environment<'_>) -> Result
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
         "build-state" => Command::BuildState,
-        "exec" => parse_exec(leaf, environment)?,
+        "exec" => parse_exec(leaf)?,
         "grant" => parse_grant(leaf)?,
         "revoke" => parse_revoke(leaf)?,
         "rm" => parse_remove(leaf)?,
@@ -2912,7 +2889,7 @@ const EXEC: CommandSpec = CommandSpec {
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
         "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
-        "Every job starts at its class's nice (on Linux, its job cgroup's weight), and the kernel schedules it beside everything else on the host. A job that holds nothing of mbx's pool starts at once. A line that names no `--want` takes the shell's `COWSHED_EXEC_WANT` and is held when it is set, a brief `git commit` included: `COWSHED_EXEC_WANT= cowshed exec …` runs a brief command unheld, and `--class interactive` is never held. An ordinary command is `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. It is never held and takes no `--want`: its builds and tests enter mbx's pool leaf by leaf at the interactive priority, and it decays to the gate's nice after 30 s and to background's after 120 s. `--class gate` admits the command as the operator's gate, at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. Every job has its own jobserver with as many slots as the host has cores, which its make, Cargo and test runners share, and a `cowshed exec` it starts in its own workspace shares it too; `--want <n>` gives the job fewer. In a project with mbx, `--want <n>` also declares the job heavy: it stays queued, saying so on stderr, until mbx's pool grants it as many of those cores as are free, at least one, and holds them for its life; a resident and an exec started inside a held job are never held. A background job waits, queued, while the host reports memory pressure, and starts once it eases; on macOS, while pressure is critical, the youngest background or resident job is ended and fails with `memory`. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed, so a gate whose lander is gone never holds up the next land and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names.",
+        "Every job starts at its class's nice (on Linux, its job cgroup's weight), and the kernel schedules it beside everything else on the host. A job that holds nothing of mbx's pool starts at once. A job that names no `--want` starts at once, a brief `git commit` included, and `--class interactive` is never held. An ordinary command is `background` and runs at nice +10. `--class interactive` names a command someone is waiting on: it runs at its supervisor's own nice, ahead of a gate at +5 and background at +10 whenever cores are contended, and a workspace may ask for it. It is never held and takes no `--want`: its builds and tests enter mbx's pool leaf by leaf at the interactive priority, and it decays to the gate's nice after 30 s and to background's after 120 s. `--class gate` admits the command as the operator's gate, at nice +5. Only this trusted route may ask for a gate; a workspace's own capability is refused. Every job has its own jobserver with as many slots as the host has cores, which its make, Cargo and test runners share, and a `cowshed exec` it starts in its own workspace shares it too; `--want <n>` gives the job fewer. In a project with mbx, `--want <n>` also declares the job heavy: it stays queued, saying so on stderr, until mbx's pool grants it as many of those cores as are free, at least one, and holds them for its life; a resident and an exec started inside a held job are never held. A background job waits, queued, while the host reports memory pressure, and starts once it eases; on macOS, while pressure is critical, the youngest background or resident job is ended and fails with `memory`. A foreground job lives as long as this exec does: if exec ends first, however it ends, the job is killed, so a gate whose lander is gone never holds up the next land and a caller's timeout leaves no orphan; `--timeout` lets it run on, and `--background` never holds it. `--host` runs the command once at the host boundary, outside the workspace sandbox, at the class it names.",
         "`--class resident` admits a process that stays up to serve requests and is idle between them — a daemon, a worker — at nice +10; an idle resident costs the host nothing, and is never held in mbx's pool. `--class interactive-resident` is the same resident at nice 0, for a worker whose requests someone waits on, and differs in nothing else.",
     ],
     options: &[
@@ -2962,7 +2939,7 @@ const EXEC: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--want <n>",
-            meaning: "the slots of the job's own jobserver, which its build and test runners share (default and ceiling: the host's cores); in a project with mbx it also holds up to that many of the pool's cores for the job's life; a line that names none takes the COWSHED_EXEC_WANT environment variable when it is set and not empty",
+            meaning: "the slots of the job's own jobserver, which its build and test runners share (default and ceiling: the host's cores); in a project with mbx it also holds up to that many of the pool's cores for the job's life",
         },
         Opt {
             spelling: "--class <background|interactive|gate|resident|interactive-resident>",
@@ -2975,7 +2952,7 @@ const EXEC: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Command, UsageError> {
+fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &EXEC;
     let mut stdin = None;
     if flagged(matches, "stdin") {
@@ -3037,8 +3014,8 @@ fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Comm
         },
     };
     // A gate and interactive work are admitted leaf by leaf at their class's priority, never held
-    // ("Gates and lands"): an agent shell's COWSHED_EXEC_WANT never sizes one, and a line that
-    // names a want for one is refused by name rather than run on fewer cores.
+    // ("Gates and lands"): a line that names a want for one is refused by name rather than run on
+    // fewer cores.
     let want = if class.is_admitted_leaf_by_leaf() {
         if matches.contains_id("want") {
             return Err(UsageError::new(
@@ -3051,7 +3028,7 @@ fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Comm
         }
         None
     } else {
-        exec_want(matches, environment, USAGE)?
+        exec_want(matches, USAGE)?
     };
     let host = flagged(matches, "host");
     if host && session.is_some() {
@@ -3089,30 +3066,24 @@ fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Comm
     }))
 }
 
-/// `exec`'s `--want`: the line's own, else `EXEC_WANT_ENV`, else none. The line outranks the
-/// environment before either is checked, so a good `--want` runs under any environment, and a
-/// value that is not a positive whole number is refused by the spelling that carried it.
+/// `exec`'s `--want`: the line's own, or none, for a line holds only when it names one. A value
+/// that is not a positive whole number is refused by name.
 fn exec_want(
     matches: &ArgMatches,
-    environment: Environment<'_>,
     usage: &'static CommandSpec,
 ) -> Result<Option<NonZeroUsize>, UsageError> {
-    let (spelling, value) = match os(matches, "want") {
-        Some(value) => ("--want", value),
-        None => match environment(EXEC_WANT_ENV).filter(|value| !value.is_empty()) {
-            Some(value) => (EXEC_WANT_ENV, value),
-            None => return Ok(None),
-        },
+    let Some(value) = os(matches, "want") else {
+        return Ok(None);
     };
-    usize::try_from(positive_count(spelling, &value, usage)?)
+    usize::try_from(positive_count("--want", &value, usage)?)
         .ok()
         .and_then(NonZeroUsize::new)
         .map(Some)
-        .ok_or_else(|| UsageError::new(format!("{spelling} is too large for this platform"), usage))
+        .ok_or_else(|| UsageError::new("--want is too large for this platform", usage))
 }
 
-/// A positive whole number as `spelling` (`--want`, or an environment variable) carried it,
-/// refused as usage when it is zero or not a number.
+/// A positive whole number as the option `spelling` carried it, refused as usage when it is zero
+/// or not a number.
 fn positive_count(
     spelling: &str,
     value: &OsStr,
@@ -4219,17 +4190,14 @@ mod tests {
     }
 
     #[test]
-    fn exec_help_never_promises_an_unheld_start_the_shells_want_overrides() {
-        // Measured 2026-11-10: `cowshed exec <ws> -- git commit` from an agent shell with
-        // COWSHED_EXEC_WANT=4 was held at 4 cores and queued at host admission behind a full pool.
+    fn exec_help_promises_an_unheld_start_to_a_line_that_names_no_want() {
+        // Measured 2026-11-10: `cowshed exec <ws> -- git commit` from an agent shell with a default
+        // want of 4 was held at 4 cores and queued at host admission behind a full pool; the owner
+        // removed the default, 2026-11-10, and a line holds only when it names `--want`.
         let words = EXEC.page().split_whitespace().collect::<Vec<_>>().join(" ");
         let promise = "A job that names no `--want` starts at once";
-        assert!(!words.contains(promise), "{promise}: {words}");
-        assert!(
-            words.contains("A job that holds nothing of mbx's pool starts at once"),
-            "{words}"
-        );
-        assert!(words.contains("runs a brief command unheld"), "{words}");
+        assert!(words.contains(promise), "{promise}: {words}");
+        assert!(!words.contains("COWSHED_EXEC_WANT"), "{words}");
     }
 
     #[test]
@@ -5044,97 +5012,64 @@ mod tests {
     }
 
     #[test]
-    fn exec_takes_its_want_from_the_line_then_the_environment() {
-        // (the line's `--want`, `COWSHED_EXEC_WANT`, the want exec names or the refusal it gets)
+    fn exec_takes_its_want_from_its_line_alone() {
+        // (the line's `--want`, the want exec names or the refusal it gets)
         let table = [
-            (None, None, Ok(None)),
-            (Some("12"), None, Ok(Some(12))),
-            (None, Some("4"), Ok(Some(4))),
-            (Some("12"), Some("4"), Ok(Some(12))),
-            (Some("12"), Some("lots"), Ok(Some(12))),
-            (None, Some(""), Ok(None)),
-            (
-                None,
-                Some("lots"),
-                Err("COWSHED_EXEC_WANT must be a positive whole number, got `lots`"),
-            ),
-            (
-                None,
-                Some("0"),
-                Err("COWSHED_EXEC_WANT must be a positive whole number, got `0`"),
-            ),
+            (None, Ok(None)),
+            (Some("12"), Ok(Some(12))),
+            (Some("1"), Ok(Some(1))),
             (
                 Some("0"),
-                Some("4"),
                 Err("--want must be a positive whole number, got `0`"),
             ),
             (
                 Some("lots"),
-                None,
                 Err("--want must be a positive whole number, got `lots`"),
             ),
         ];
-        for (flag, environment, expected) in table {
+        for (flag, expected) in table {
             let mut line = vec!["exec", "raven"];
             if let Some(count) = flag {
                 line.extend(["--want", count]);
             }
             line.extend(["--", "nextest"]);
-            let parsed = parse_args_in(line.clone(), |name| {
-                assert_eq!(name, EXEC_WANT_ENV, "exec reads no other variable");
-                environment.map(OsString::from)
-            });
-            match (parsed, expected) {
+            match (parse_args(line.clone()), expected) {
                 (
                     Ok(Cli {
                         command: Command::Exec(exec),
                         ..
                     }),
                     Ok(want),
-                ) => assert_eq!(
-                    exec.want.map(NonZeroUsize::get),
-                    want,
-                    "{line:?} under {environment:?}"
-                ),
+                ) => assert_eq!(exec.want.map(NonZeroUsize::get), want, "{line:?}"),
                 (Err(error), Err(mention)) => {
                     assert!(
                         error.message.contains(mention),
-                        "{line:?} under {environment:?}: {}",
+                        "{line:?}: {}",
                         error.message
                     );
-                    assert_eq!(error.exit_code(), 2, "{line:?} under {environment:?}");
+                    assert_eq!(error.exit_code(), 2, "{line:?}");
                 }
-                (parsed, expected) => {
-                    panic!("{line:?} under {environment:?}: {parsed:?}, expected {expected:?}")
-                }
+                (parsed, expected) => panic!("{line:?}: {parsed:?}, expected {expected:?}"),
             }
         }
-
-        // Only exec reads the variable: a bad value there never keeps another command from parsing.
-        parse_args_in(["ls"], |_| Some(OsString::from("lots"))).expect("ls reads no environment");
     }
 
     #[test]
-    fn a_gate_and_interactive_work_take_no_want_from_the_environment_and_refuse_one_on_their_line()
-    {
+    fn a_gate_and_interactive_work_refuse_a_want_on_their_line() {
         for (spelled, class) in [
             ("gate", ExecClass::Gate),
             ("interactive", ExecClass::Interactive),
         ] {
             let line = ["exec", "raven", "--class", spelled, "--", "x"];
-            let parsed =
-                parse_args_in(line, |_| Some(OsString::from("4"))).expect("the class parses");
+            let parsed = parse_args(line).expect("the class parses");
             let Command::Exec(exec) = parsed.command else {
                 panic!("exec parses as exec");
             };
             assert_eq!(exec.class, class);
-            assert_eq!(exec.want, None, "COWSHED_EXEC_WANT never sizes {spelled}");
-            let error = parse_args_in(
-                [
-                    "exec", "raven", "--class", spelled, "--want", "4", "--", "x",
-                ],
-                |_| None,
-            )
+            assert_eq!(exec.want, None);
+            let error = parse_args([
+                "exec", "raven", "--class", spelled, "--want", "4", "--", "x",
+            ])
             .expect_err("its --want is refused");
             assert!(
                 error

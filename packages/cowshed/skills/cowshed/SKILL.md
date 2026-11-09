@@ -161,10 +161,9 @@ Cowshed stores nothing about it, so whoever runs the round tracks which units be
   throttles its disk I/O, and a throttled process holding the store's filesystem work stalls every process behind it
   (inside the sandbox it fails with EPERM anyway).
 
-- A line that names no `--want` takes the shell's `COWSHED_EXEC_WANT` and is a held job when it is set: it waits for
-  that many of mbx's cores before it starts, a brief `git commit` or `git status` included. Run a brief command as
-  `COWSHED_EXEC_WANT= cowshed exec …`, and a check you wait on (lint, typecheck, one test, a commit's hooks) as
-  `--class interactive`, which is never held.
+- A line holds only when it names `--want`: a brief command (`git commit`, `git status`) names none and starts at once,
+  and a check you wait on (lint, typecheck, one test, a commit's hooks) runs as `--class interactive`, which is never
+  held.
 - Never `direnv exec` a shed from the host (`cd "$(cowshed path <ws>)" && direnv exec . …`). devenv evaluates a shell
   per path, `TMPDIR` and runtime directory (specs/cowshed/03_caches.md "Sandboxed shells evaluate devenv in place"), so
   a host entry is a second cold evaluation of the same shed beside the sandbox's own (measured 2026-10-20: 197 s on top

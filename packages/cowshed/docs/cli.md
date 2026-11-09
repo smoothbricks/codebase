@@ -1741,8 +1741,8 @@ second `cowshed: host admission queued position=<i> waiters=<w> held_cpus=<c> le
 `cowshed: host admission wait done elapsed=<waited> status=ok cpus=<granted>` (or `status=err`). A hold mbx does not
 grant fails the job with `cpuAdmission`. One hold per pool priority of a checkout waits in the pool at a time, so a gate
 never waits behind its own checkout's background job. Name `--want` on every build, test suite or Nx run; a brief
-command names none. A line that names no `--want` takes `COWSHED_EXEC_WANT`, when it is set and not empty. A resident,
-and an exec a held job starts, are never held.
+command names none. A line that names no `--want` holds nothing. A resident, and an exec a held job starts, are never
+held.
 
 A background job without mbx waits to start while the host reports memory pressure (05_gateway.md, "Memory pressure",
 "Admission"): macOS `kern.memorystatus_vm_pressure_level` at warning or above, Linux `/proc/pressure/memory`

@@ -1513,14 +1513,13 @@ output: it is one `info` row of the job's span (`job.decayed.gate`, `job.decayed
 segments"), a transition recorded for its own reason, and mbx's decision row names each decayed ask (on Linux, where a
 job's cgroup cannot move between class cgroups, the nice step is skipped, its row still recorded, and the pool band
 alone decays). An interactive-resident serves many short requests and does not decay. Interactive work is never held:
-like a gate, its leaves are admitted one by one (`cowshed exec --class interactive` reads no `COWSHED_EXEC_WANT` and
-refuses `--want`). The owner's rulings, 2026-11-10: "a coding agent must be able to execute 1 test under interactive,
-above background", with the decay through the gate's band to background. The same mapping supplies
-`mbx reserve --priority` and the priority of a leaf's request to its Nx run's reservation endpoint. The supervisor
-exports the job's value again as `COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical
-`low`, so a shell activation inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31
-every reservation of a downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create
-another pool.
+like a gate, its leaves are admitted one by one (`cowshed exec --class interactive` refuses `--want`). The owner's
+rulings, 2026-11-10: "a coding agent must be able to execute 1 test under interactive, above background", with the decay
+through the gate's band to background. The same mapping supplies `mbx reserve --priority` and the priority of a leaf's
+request to its Nx run's reservation endpoint. The supervisor exports the job's value again as
+`COWSHED_MBX_SCHEDULER_PRIORITY`, which `.cowshed/env` restores after its own canonical `low`, so a shell activation
+inside a gate's command (a `direnv exec` in its script, say) keeps `normal`; on 2026-10-31 every reservation of a
+downstream land gate entered the pool at `low`. Kernel nice and cgroup placement do not create another pool.
 
 | Class                  | What runs in it                                                                                                       | Nice | Linux cgroup                                                                 | Without mbx: waits on memory pressure | Without mbx: ended at macOS Critical |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------- | ---- | ---------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------ |
@@ -1752,17 +1751,15 @@ host's load.
   held: its tokens are its requester's, and a held requester's hold covers it, so it runs with what the hold gives its
   own job ("Inside the hold"). A resident is never held: it idles between requests, and a hold would keep its cores
   while it does. A gate is never held: its leaves are admitted one by one at its class's priority on the host's cores
-  ("Gates and lands"), and `cowshed exec --class gate` takes no `COWSHED_EXEC_WANT` and refuses a `--want` by name.
-  Measured 2026-11-09: a land's proof run from an agent shell that sets `COWSHED_EXEC_WANT=4` was held and granted one
-  core, and its whole tree ran on that core for 1.5 h. Without mbx a hold declares nothing, and a named want keeps its
-  meaning, the jobserver count alone.
+  ("Gates and lands"), and `cowshed exec --class gate` refuses a `--want` by name. Measured 2026-11-09: a land's proof
+  run from an agent shell that set a default want of 4 was held and granted one core, and its whole tree ran on that
+  core for 1.5 h. Without mbx a hold declares nothing, and a named want keeps its meaning, the jobserver count alone.
 - **What an agent declares.** Every build, test suite, Nx run or gate task an agent starts names `--want n`, `n` being
   the cores it should hold: 4 for a focused suite or one project's targets, up to the host's cores for a run across the
-  repository. A brief command (a git query, one file's lint, a status read) names none. `cowshed exec` takes
-  `COWSHED_EXEC_WANT` as the `--want` a line leaves out, so an agent's shell sets it once: a `--want` on the line wins,
-  an empty value is no default (a brief command runs unheld with `COWSHED_EXEC_WANT=`), and a value that is not a
-  positive whole number is refused by name. Agents do not read the host's load, wait for a quiet host, or hold work back
-  for a gate: admission does that.
+  repository. A brief command (a git query, one file's lint, a status read) names none, and a line that names no
+  `--want` holds nothing: a want is never a shell's default, since a default sized every line the shell ran, a land's
+  proof and a brief `git commit` alike (the 2026-11-09 measurement above; the owner removed the default, 2026-11-10).
+  Agents do not read the host's load, wait for a quiet host, or hold work back for a gate: admission does that.
 - **The budget.** The pool's own budget, CPU cores and memory bytes, never a load average: mbx's `scheduler.cpus` less
   `scheduler.reserve_cpus`, and `scheduler.memory`. A hold asks `--cpus g` and is charged the cores it is granted. Its
   memory charge is the job identity's last recorded terminal peak (13_telemetry.md, "Job resource peaks") once
