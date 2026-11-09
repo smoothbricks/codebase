@@ -2043,6 +2043,23 @@ pub async fn execute_host_setup(
                 PlannedFstab::Deferred(reason) => FstabOutcome::Skipped(reason),
             }
         };
+        // The build-cache volume keeps no event log from its next mount (01a_apfs.md, "Dedicated
+        // build-cache volume"). The log is host load, not what setup was asked for, so a failure
+        // to opt out is reported and setup stands, as an image mount's is.
+        match tokio::task::spawn_blocking(|| {
+            provisioned_build_cache()
+                .map(|mountpoint| opt_build_cache_out_of_event_log(&mountpoint))
+        })
+        .await
+        {
+            Ok(None | Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => cowshed_os::eprintln!(
+                "cowshed: setup: the build-cache volume keeps fseventsd's event log: {error}"
+            ),
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: setup: the build-cache event-log opt-out lane failed: {error}"
+            ),
+        }
         Ok(HostSetupReport {
             action_outcomes,
             volumes: initial.volumes,
@@ -4482,6 +4499,33 @@ pub fn provisioned_build_cache() -> Option<PathBuf> {
     require_mounted_marker(Some(&marker), VolumeRole::BuildCache, SubstrateKind::Apfs)
         .ok()
         .map(|_| mountpoint.to_owned())
+}
+
+/// Opt the build-cache volume mounted at `mountpoint` out of fseventsd's persistent event log
+/// with the image backend's own marker (01a_apfs.md, "Dedicated build-cache volume"): its
+/// contents are rebuildable, and a logged volume makes fseventsd record every file an mbx
+/// collection unlinks. The marker governs the volume's next mount. The volume is mounted
+/// `noowners`, so even a log root's fseventsd created is this user's to mark and none is
+/// retired: a `.fseventsd` that still refuses the marker, or anything but an empty regular
+/// marker, is an error, left as found.
+fn opt_build_cache_out_of_event_log(mountpoint: &Path) -> Result<(), HostError> {
+    let event_log = mountpoint.join(cowshed_apfs::EVENT_LOG_DIRECTORY);
+    match cowshed_apfs::opt_out_of_event_log(mountpoint) {
+        Ok(cowshed_apfs::EventLog::OptedOut) => Ok(()),
+        Ok(cowshed_apfs::EventLog::Inherited) => Err(HostError::new(format!(
+            "{event_log:?} refuses this user its {} marker",
+            cowshed_apfs::EVENT_LOG_OPT_OUT
+        ))),
+        Ok(cowshed_apfs::EventLog::Squatted) => Err(HostError::new(format!(
+            "{event_log:?} is not a directory, or its {} is not an empty regular file; left as found",
+            cowshed_apfs::EVENT_LOG_OPT_OUT
+        ))),
+        Err(source) => Err(host_io_error(
+            "opt out of fseventsd's event log at",
+            &event_log,
+            source,
+        )),
+    }
 }
 
 fn read_marker_no_follow(root: &Path) -> Result<Option<Vec<u8>>, HostError> {
@@ -8873,6 +8917,52 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert!(write_marker_atomic(&marker, b"attack").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"unchanged");
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn setup_opts_the_build_cache_volume_out_of_the_event_log() {
+        // A scratch directory stands in for the mounted volume: the marker is planted relative
+        // to the root it holds open, whatever filesystem that root is on.
+        let volume =
+            std::env::temp_dir().join(format!("cowshed-bootstrap-native-test-{}", Uuid::new_v4()));
+        fs::create_dir(&volume).unwrap();
+        let event_log = volume.join(".fseventsd");
+        let marker = event_log.join("no_log");
+        let assert_opted_out = |label: &str| {
+            let found = fs::symlink_metadata(&marker)
+                .unwrap_or_else(|error| panic!("{label}: the opt-out marker: {error}"));
+            assert!(
+                found.file_type().is_file() && found.len() == 0,
+                "{label}: {found:?}"
+            );
+        };
+
+        // A volume with no event log gains the marker; a second setup leaves it as it is.
+        opt_build_cache_out_of_event_log(&volume).expect("a fresh volume");
+        assert_opted_out("fresh");
+        opt_build_cache_out_of_event_log(&volume).expect("an opted-out volume");
+        assert_opted_out("again");
+
+        // The live volume: a log fseventsd keeps, which the noowners mount shows as this
+        // user's 0700 directory. The marker joins it and the records stay.
+        fs::remove_dir_all(&event_log).unwrap();
+        fs::create_dir(&event_log).unwrap();
+        fs::set_permissions(&event_log, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(event_log.join("0000000000a1b2c3"), b"records").unwrap();
+        fs::write(event_log.join("fseventsd-uuid"), b"uuid").unwrap();
+        opt_build_cache_out_of_event_log(&volume).expect("a logged volume");
+        assert_opted_out("logged");
+        assert_eq!(
+            fs::read(event_log.join("0000000000a1b2c3")).unwrap(),
+            b"records"
+        );
+
+        // Anything but an empty regular marker is an error, left as found.
+        fs::remove_file(&marker).unwrap();
+        fs::write(&marker, b"not empty").unwrap();
+        assert!(opt_build_cache_out_of_event_log(&volume).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), b"not empty");
+        fs::remove_dir_all(&volume).unwrap();
     }
 
     #[test]

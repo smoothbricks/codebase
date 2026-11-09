@@ -574,13 +574,15 @@ Find the symptom in the left column and follow the link.
   missing with no drop flag, logged or not (_measured_).
 - **Rule.** Every read-write image mount opts its volume out with an empty `no_log` marker as soon as `mount_apfs`
   succeeds, retiring a root-owned log through one `nobrowse,noowners` remount that leaves the directory `0711`, and a
-  failure to opt out is reported while the mount stands.
+  failure to opt out is reported while the mount stands. `cowshed setup` plants the same marker on the build-cache
+  volume, which no image mount reaches.
 - **Owners.** [01a_apfs.md §The event log](./01a_apfs.md#the-event-log);
   [01a_apfs.md §Mount and per-volume policy](./01a_apfs.md#mount-and-per-volume-policy);
+  [01a_apfs.md §Dedicated build-cache volume](./01a_apfs.md#dedicated-build-cache-volume);
   [02_workspaces.md §The safe-to-clone-main invariant](./02_workspaces.md#the-safe-to-clone-main-invariant) (root-owned
   volume bookkeeping in a clone). Code: [`cowshed-apfs/src/lib.rs`] `opt_out_of_event_log`,
-  `retire_inherited_event_log`, `EVENT_LOG_OPT_OUT`. See also
-  [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime).
+  `retire_inherited_event_log`, `EVENT_LOG_OPT_OUT`; [`cowshed-core/src/storage/bootstrap/native/macos.rs`]
+  `opt_build_cache_out_of_event_log`. See also [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime).
 
 ### `fseventsd` slows with uptime
 

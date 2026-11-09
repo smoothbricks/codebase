@@ -4703,7 +4703,7 @@ pub const VOLUME_METADATA: [&str; 5] = [
 
 /// Where a mounted volume stands with fseventsd's persistent event log.
 #[derive(Debug, Eq, PartialEq)]
-enum EventLog {
+pub enum EventLog {
     /// `.fseventsd` is a real directory holding an empty regular `no_log`: no log from the next
     /// mount.
     OptedOut,
@@ -4760,7 +4760,7 @@ fn open_volume_root(mount_point: &Path) -> io::Result<File> {
 /// Plant the opt-out marker under `mount_point` unless it is there, answering where the volume
 /// stands. Every step is relative to a descriptor opened without following a symlink, so a
 /// `.fseventsd` swapped for a symlink mid-way is refused, never written through.
-fn opt_out_of_event_log(mount_point: &Path) -> io::Result<EventLog> {
+pub fn opt_out_of_event_log(mount_point: &Path) -> io::Result<EventLog> {
     let root = open_volume_root(mount_point)?;
     // SAFETY: `root` is an open directory fd and the name a NUL-terminated component.
     if unsafe { libc::mkdirat(root.as_raw_fd(), EVENT_LOG_DIRECTORY_C.as_ptr(), 0o700) } != 0 {
