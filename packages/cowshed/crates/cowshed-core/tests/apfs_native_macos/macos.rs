@@ -5987,8 +5987,7 @@ fn mounting_an_image_whose_volume_is_mounted_releases_nothing_and_refuses() {
             MountAccess::ReadWrite,
             false,
         )
-        .err()
-        .expect("a mounted attachment is never released to attach again");
+        .expect_err("a mounted attachment is never released to attach again");
 
     assert!(
         refused

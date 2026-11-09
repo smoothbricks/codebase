@@ -517,7 +517,7 @@ fn the_ledger_is_the_model_on_its_corpus() {
             .unwrap_or_else(|why| panic!("cap {} bound {}: {why}", c0 + 1, b0 + 1));
         seen.add(pair.seen);
     }
-    eprintln!("corpus reached {seen:?}");
+    cowshed_os::eprintln!("corpus reached {seen:?}");
 }
 
 /// The model's seeded draws: longer sequences, the same stream every target draws. The runs
@@ -534,7 +534,7 @@ fn the_ledger_is_the_model_on_seeded_inputs() {
             .unwrap_or_else(|why| panic!("cap {} bound {}: {why}", c0 + 1, b0 + 1));
         seen.add(pair.seen);
     }
-    eprintln!("seeded draws reached {seen:?}");
+    cowshed_os::eprintln!("seeded draws reached {seen:?}");
     seen.assert_reaches_all(10);
 }
 
@@ -703,7 +703,7 @@ fn the_seeded_counterexamples_to_gate_io_priority_shrink_to_two_asks() {
         }
     }
     let (c0, b0, mut inputs) = first.expect("a seeded draw refutes gate_io_priority");
-    eprintln!("{refuted} of {draws} seeded draws refute gate_io_priority");
+    cowshed_os::eprintln!("{refuted} of {draws} seeded draws refute gate_io_priority");
     // each step drops one input or turns one gate's lease into a background one, while the ledger
     // still makes a gate's lease wait behind a background lease
     while let Some(smaller) = (0..inputs.len())
