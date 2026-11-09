@@ -7254,10 +7254,13 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
 }
 /// Interactive work decays (05_gateway.md "Classes"): past 120 s its whole group runs at the gate's
 /// nice, past 240 s at background's. The job's stderr is its command's alone: an agent reads it as
-/// the command's output, so the decay writes nothing there.
+/// the command's output, so the decay writes nothing there. A cow sandbox refuses setpriority on
+/// the job's group, so the test runs in the host-controller lane (08_testing.md "Host-controller
+/// authority").
 #[cfg(target_os = "macos")]
 #[tokio::test(start_paused = true)]
-async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_interactive_work_decays_to_the_gate_s_nice_then_background_s() {
     use cowshed_core::runtime::placement::{INTERACTIVE_TO_BACKGROUND, INTERACTIVE_TO_GATE, macos};
     let (supervisor_config, _root) =
         isolated_config(&temp_parent::scratch_parent(), "interactive-decay");
