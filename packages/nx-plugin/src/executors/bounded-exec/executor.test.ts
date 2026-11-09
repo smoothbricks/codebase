@@ -434,6 +434,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
                 offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
                 outcome: 'holders',
                 lockWaits: [],
+                cpuRising: [],
                 text: 'owned pre-signal process observation\n',
               };
             },
@@ -452,6 +453,51 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         expect(result.terminalOutput).toContain('no empty-holder conclusion');
       }
     }
+  });
+
+  it('records the processes its snapshot saw gain CPU in the wedged verdict, and still expires at the idle bound', async () => {
+    if (process.platform === 'win32') return;
+    const workspace = await createWorkspace();
+    const record = { task: { id: 'app:test', hash: 'h' }, directory: join(workspace.root, 'snapshot') };
+    await workspace.write('snapshot-clock.js', "setInterval(() => console.log('snapshot-clock'), 20);\n");
+    const cpuRising = [{ pid: 4242, command: 'rustc --crate-name hang_fixture', gainedMs: 7_000 }];
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('snapshot-clock\n'),
+      HANG_CAPTURE_MS,
+      () =>
+        runBoundedExec(
+          { command: 'node snapshot-clock.js', idleTimeoutMs: 2 * HANG_CAPTURE_MS, killAfterMs: 0 },
+          { ...workspace.context, record },
+          createProcessTreeKiller(),
+          null,
+          null,
+          async (request) => {
+            const capturedAtMs = Date.now();
+            return {
+              startedAtMs: capturedAtMs,
+              capturedAtMs,
+              offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+              outcome: 'holders',
+              lockWaits: [],
+              cpuRising,
+              text: 'CPU rose in the tree\n',
+            };
+          },
+        ),
+    );
+    expect(result.success).toBe(false);
+    // The rising process is evidence for the verdict; it moved no bound.
+    expect(result.terminalOutput).toContain(
+      `no test finished for ${2 * HANG_CAPTURE_MS}ms (idleTimeoutMs=${2 * HANG_CAPTURE_MS})`,
+    );
+    expect((await readRecord(record.directory))?.verdict).toEqual({
+      outcome: 'wedged',
+      idleMs: 2 * HANG_CAPTURE_MS,
+      elapsedMs: expect.any(Number),
+      tests: [],
+      lockWaits: [],
+      cpuRising,
+    });
   });
 
   it("names the command its peak waiter started as the runner a hang snapshot samples, in the waiter's group", async () => {
@@ -644,6 +690,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
                 offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
                 outcome: 'holders',
                 lockWaits: [],
+                cpuRising: [],
                 text: `capture-interval-${ordinal}\n`,
               };
             },

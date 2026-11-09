@@ -2215,8 +2215,10 @@ again. Darwin can answer `EPERM` for an unreaped zombie-only group, and an ambie
 Failed fixtures retain their cleanup obligation rather than suppressing signal errors.
 
 The final-ten-second pre-signal snapshot attributes the runner's process tree, its leader and leaf call stacks and
-observed resources, with explicit incomplete/raced results and no delay to termination. Its timing, visibility and
-evidence contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
+observed resources, with explicit incomplete/raced results and no delay to termination. Its two process censuses, at
+least five seconds apart inside that window, name each process whose CPU time rose by at least two counted seconds and
+classify the expiry as a build inside the test; CPU never restarts the idle bound. Its timing, visibility and evidence
+contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
 
 The snapshot-reset regression orders capture, test completion, and expiry through IPC, not heartbeat cadence. It
 deliberately holds the first capture's progress publication while another heartbeat arrives; only the observed PASS
@@ -2632,7 +2634,10 @@ task id and the hash it ran at:
   the JUnit report says it aborted when the bound stopped it. Its `lockWaits` lists only regular files the run holds on
   numbered descriptors that processes outside the run also hold open, naming those holders' pids and commands. This is
   open-handle evidence, not kernel lock-owner proof. The open-file census runs only on macOS, so on every other platform
-  `lockWaits` is always empty. An incomplete or raced capture records none.
+  `lockWaits` is always empty. An incomplete or raced capture records none. Its `cpuRising` lists each process of the
+  run's tree whose CPU time rose by at least two counted seconds between the snapshot's two process censuses, with its
+  pid, command and gain: a build inside the test, which is a defect and not a hang. It is empty when no process rose or
+  the closing census did not complete, and a record written before it carries none.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the
@@ -2825,8 +2830,9 @@ to the command, which the keyed modules decide. Each entry, and what the executo
   the run's view of it. Its text is said on stderr and its waiting decides whether the idle bound is credited, which can
   fail a run and never changes one that passes. `bounds.js` stays keyed: it decides when a bound fires.
 - `hang-diagnostics.js`: the snapshot taken shortly before the no-progress bound fires. It probes with `ps`, `lsof` and
-  `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its text and lock
-  waits are read only once the bound has expired the run, which fails it.
+  `sample`, which suspends the runner for about a second, and signals nothing but its own probes. Its two `ps` censuses
+  are its two CPU samples, paused apart inside its window to be at least five seconds apart. Its text, lock waits and
+  CPU rises are read only once the bound has expired the run, which fails it.
 - `testing.js` (and `ensure-built`, whose workspace-root finder it uses, and the producer receipt modules it imports):
   the host census the executor quotes when a lease release fails, and the directory a CPU pool binds its socket in. A
   directory that cannot be made refuses the run.

@@ -2,6 +2,14 @@ import { spawn } from 'node:child_process';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { type ProcessEntry, withDescendants } from '../../testing.js';
 import {
+  CPU_RISE_MIN_MS,
+  CPU_RISING_CLASS,
+  type CpuRise,
+  cpuChange,
+  describeCpuRise,
+  parseCpuTimeMs,
+} from './cpu-rise.js';
+import {
   describeHolders,
   type LockWait,
   lockCandidates,
@@ -16,7 +24,14 @@ import {
  */
 export const HANG_CAPTURE_MS = 10_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
-const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,lstart=,command=';
+const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,cputime=,lstart=,command=';
+/**
+ * The least time between the two process censuses, which are the snapshot's two CPU samples. ps counts CPU time in whole
+ * seconds and a process is named after two counted seconds (CPU_RISE_MIN_MS), so five seconds show a process at 40% of a
+ * core. On Darwin the stack samples have usually spent most of it; elsewhere, or when sudo refuses them, the snapshot
+ * pauses, inside its window and early enough that the closing census keeps its own limit.
+ */
+const CPU_INTERVAL_MS = 5_000;
 /**
  * Stack samples: `sample` suspends a process every millisecond for one second and reports its threads' call graph. The
  * runner and at most this many leaf processes are sampled, all at once. `-mayDie` is not passed: it reads symbols
@@ -58,6 +73,11 @@ export interface HangDiagnostics {
   outcome: 'holders' | 'none' | 'incomplete';
   /** Lock waits the snapshot names: empty unless the capture is complete, and always empty without the open-file census. */
   lockWaits: readonly LockWait[];
+  /**
+   * The processes of the tree whose CPU time rose between the two censuses, largest gain first: empty when none did, and
+   * when the closing census did not complete. A build inside the test, never a restart of the idle bound.
+   */
+  cpuRising: readonly CpuRise[];
   text: string;
 }
 
@@ -77,15 +97,31 @@ export type HangProbeResult =
 export interface HangDiagnosticHost {
   platform: NodeJS.Platform;
   probe(file: string, args: readonly string[], timeoutMs: number, signal: AbortSignal): Promise<HangProbeResult>;
+  /** Waits `ms`, or until `signal` aborts: the capture's end ends its own CPU interval. */
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
 }
 
 interface ObservedProcess extends ProcessEntry {
   pgid: number;
   started: string;
+  cpuMs: number | null;
   raw: string;
 }
 
-const host: HangDiagnosticHost = { platform: process.platform, probe: runProbe };
+const host: HangDiagnosticHost = { platform: process.platform, probe: runProbe, sleep: sleepUnlessAborted };
+
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+    if (signal.aborted) done();
+  });
+}
 
 /** A pre-expiry observation, never an assertion that an open file is a contested lock. */
 export function captureHangDiagnostics(
@@ -104,6 +140,7 @@ export function captureHangDiagnostics(
   const during = (): string => (active.size === 0 ? 'process census' : [...active].join(', '));
   let finished = false;
   let waits: readonly LockWait[] = [];
+  let rising: readonly CpuRise[] = [];
   // This package targets lib es2022, which does not declare Promise.withResolvers.
   return new Promise((resolve) => {
     const finish = (outcome: HangDiagnostics['outcome']): void => {
@@ -120,6 +157,7 @@ export function captureHangDiagnostics(
         offsetFromExpiryMs,
         outcome,
         lockWaits: outcome === 'incomplete' ? [] : waits,
+        cpuRising: rising,
         text: `${lines.join('\n')}\nHang snapshot outcome=${outcome} capturedAtMs=${capturedAtMs} offsetFromExpiryMs=${offsetFromExpiryMs}\n`,
       });
     };
@@ -171,31 +209,41 @@ export function captureHangDiagnostics(
       const parsed: ObservedProcess[] = [];
       for (const row of result.stdout.split('\n').filter((line) => line.trim() !== '')) {
         const match =
-          /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$/.exec(
+          /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$/.exec(
             row,
           );
         if (match === null) {
           lines.push(`${name}: could not decode ps row: ${row}`);
           return null;
         }
-        const [, pid, ppid, pgid, stat, , , started, command] = match;
+        const [, pid, ppid, pgid, stat, , , cputime, started, command] = match;
         if (
           pid === undefined ||
           ppid === undefined ||
           pgid === undefined ||
           stat === undefined ||
+          cputime === undefined ||
           started === undefined ||
           command === undefined
         ) {
           lines.push(`${name}: incomplete ps row: ${row}`);
           return null;
         }
-        parsed.push({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), stat, started, command, raw: row });
+        parsed.push({
+          pid: Number(pid),
+          ppid: Number(ppid),
+          pgid: Number(pgid),
+          stat,
+          cpuMs: parseCpuTimeMs(cputime),
+          started,
+          command,
+          raw: row,
+        });
       }
       const roots = [request.pid, ...parsed.filter((entry) => entry.pgid === request.pgid).map((entry) => entry.pid)];
       const selected = new Set(withDescendants(parsed, roots).map((entry) => entry.pid));
       const tree = parsed.filter((entry) => selected.has(entry.pid));
-      lines.push(`${name}: PID PPID PGID STAT %CPU ELAPSED STARTED COMMAND`);
+      lines.push(`${name}: PID PPID PGID STAT %CPU ELAPSED CPUTIME STARTED COMMAND`);
       lines.push(...tree.map((entry) => entry.raw));
       if (!tree.some((entry) => entry.pid === request.pid)) {
         lines.push(`${name}: root pid ${request.pid} exited or is not visible; capture raced or is incomplete.`);
@@ -267,6 +315,7 @@ export function captureHangDiagnostics(
       const before = await census('ps before');
       if (finished) return;
       if (before === null) return finish('incomplete');
+      const beforeAtMs = Date.now();
       let incomplete = false;
       let observed = before.length > 0;
       if (source.platform === 'darwin') {
@@ -327,9 +376,17 @@ export function captureHangDiagnostics(
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);
         lines.push(`Stack samples not provided on ${source.platform}; no blocking call is observed.`);
       }
+      const settleMs = Math.min(beforeAtMs + CPU_INTERVAL_MS, endsAtMs - CENSUS_LIMIT_MS) - Date.now();
+      if (settleMs > 0) {
+        active.add('CPU interval');
+        await source.sleep(settleMs, controller.signal);
+        active.delete('CPU interval');
+        if (finished) return;
+      }
       const after = await census('ps after');
       if (finished) return;
       if (after === null) return finish('incomplete');
+      const afterAtMs = Date.now();
       if (
         before.length !== after.length ||
         before.some(
@@ -347,6 +404,25 @@ export function captureHangDiagnostics(
       ) {
         incomplete = true;
         lines.push('Process identities or membership changed during capture; open-file census raced.');
+      }
+      const change = cpuChange(before, after);
+      rising = change.rising;
+      const intervalMs = afterAtMs - beforeAtMs;
+      if (change.unread.length > 0) {
+        lines.push(
+          `CPU time not read for pid ${change.unread.join(', ')}: ps printed none that parses, so they are not counted idle.`,
+        );
+      }
+      if (rising.length > 0) {
+        lines.push(
+          `CPU rose in the tree over about ${intervalMs}ms between the censuses (ps counts whole seconds):`,
+          ...rising.map((rise) => `  ${describeCpuRise(rise)}`),
+          `Classification: ${CPU_RISING_CLASS}`,
+        );
+      } else {
+        lines.push(
+          `CPU: no process of the tree gained ${CPU_RISE_MIN_MS / 1_000} s of CPU over about ${intervalMs}ms between the censuses (ps counts whole seconds).`,
+        );
       }
       if (!incomplete) {
         for (const wait of waits) {

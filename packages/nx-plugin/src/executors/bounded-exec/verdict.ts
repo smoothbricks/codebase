@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import typia from 'typia';
 import type { CpuGrantRecord } from './cpu-grant.js';
 import { parseCpuGrant } from './cpu-grant.js';
+import { CPU_RISING_CLASS, type CpuRise, describeCpuRises } from './cpu-rise.js';
 import type { CpuWaitRow } from './lease-wait.js';
 import { describeHolders, type LockWait, type Opener } from './lock-wait.js';
 import type { MbxQueuedRequest } from './mbx-queue.js';
@@ -23,7 +24,9 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  *   exceed it too. The verdict names tests reported running but never finished and tests the report says were
  *   aborted; diagnostics distinguish a stalled wait from a progressing but oversized lifecycle.
  *   When the snapshot named a lock wait, `lockWaits` names the file the run holds on a numbered descriptor and the
- *   processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner.
+ *   processes outside the run that also hold it open: open-handle evidence, not a kernel lock owner. When it named a
+ *   process whose CPU time rose, `cpuRising` names it: a build inside the test, which is a defect and not a hang. CPU
+ *   never restarts the bound, which counts finished tests only.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
@@ -50,6 +53,8 @@ export type BoundedExecVerdict =
       readonly tests: readonly string[];
       /** Lock waits the snapshot named: holder evidence (open handles), not a kernel lock owner. */
       readonly lockWaits: readonly LockWait[];
+      /** Processes of the run's tree whose CPU time rose while the bound counted down: a build inside the test. */
+      readonly cpuRising: readonly CpuRise[];
     }
   | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
@@ -60,6 +65,7 @@ export interface AdmissionQueueWait {
   readonly requests: readonly MbxQueuedRequest[];
 }
 const isQueuedVerdict = typia.createIs<Extract<BoundedExecVerdict, { outcome: 'queued' }>>();
+const isCpuRising = typia.createIs<readonly CpuRise[]>();
 
 /**
  * The task's RAM temp volume, read when a line saying ENOSPC arrived: the writer's own lease and the space left on the
@@ -344,6 +350,8 @@ export interface RunEnd {
   readonly noSpace: NoSpaceSighting | null;
   /** The lock waits the expiry's snapshot named; empty when none, or when that capture did not complete. */
   readonly lockWaits: readonly LockWait[];
+  /** The processes the expiry's snapshot saw gain CPU time; empty when none did, or when that capture did not finish. */
+  readonly cpuRising: readonly CpuRise[];
   /** Explicit observed queue evidence before first admission; absent after any grant. */
   readonly admissionQueue?: AdmissionQueueWait | null;
 }
@@ -366,7 +374,14 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
   }
   if (run.expiry?.kind === 'idle') {
     const tests = [...new Set([...run.expiry.tests, ...(run.report?.cancelled ?? [])])];
-    return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs, tests, lockWaits: run.lockWaits };
+    return {
+      outcome: 'wedged',
+      idleMs: run.expiry.limitMs,
+      elapsedMs: run.elapsedMs,
+      tests,
+      lockWaits: run.lockWaits,
+      cpuRising: run.cpuRising,
+    };
   }
   if (run.report !== null && run.report.failed.length > 0) {
     return { outcome: 'failed', exitCode: run.exitCode, tests: run.report.failed };
@@ -556,15 +571,25 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
         }
         break;
       case 'wedged': {
-        // A record written before lock waits were named carries none.
+        // A record written before lock waits or CPU rises were named carries none.
         const lockWaits = value.lockWaits === undefined ? [] : parseLockWaits(value.lockWaits);
+        const recorded: unknown = value.cpuRising;
+        const cpuRising = recorded === undefined ? [] : isCpuRising(recorded) ? recorded : null;
         if (
           typeof value.idleMs === 'number' &&
           typeof value.elapsedMs === 'number' &&
           isStrings(value.tests) &&
-          lockWaits !== null
+          lockWaits !== null &&
+          cpuRising !== null
         ) {
-          return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs, tests: value.tests, lockWaits };
+          return {
+            outcome: 'wedged',
+            idleMs: value.idleMs,
+            elapsedMs: value.elapsedMs,
+            tests: value.tests,
+            lockWaits,
+            cpuRising,
+          };
         }
         break;
       }
@@ -714,14 +739,17 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
         : verdict.bound === 'fixture'
           ? `its fixture outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
           : `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`;
-    case 'wedged':
-      return `wedged: no test finished for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${
+    case 'wedged': {
+      const locks = verdict.lockWaits.map(
+        (wait) => `; waiting on a lock: ${wait.path} held open by ${describeHolders(wait.holders)}`,
+      );
+      const cpu = verdict.cpuRising.length > 0 ? [`; ${CPU_RISING_CLASS}: ${describeCpuRises(verdict.cpuRising)}`] : [];
+      const running =
         verdict.tests.length > 0
           ? `still running: ${verdict.tests.join(', ')}`
-          : 'the runner named no test still running'
-      }${verdict.lockWaits
-        .map((wait) => `; waiting on a lock: ${wait.path} held open by ${describeHolders(wait.holders)}`)
-        .join('')}`;
+          : 'the runner named no test still running';
+      return `wedged: no test finished for ${verdict.idleMs}ms after ${verdict.elapsedMs}ms; ${running}${[...locks, ...cpu].join('')}`;
+    }
     case 'no-space':
       return `${describeNoSpace(verdict)}${verdict.tests.length > 0 ? `; the tests that then failed: ${verdict.tests.join(', ')}` : ''}`;
     case 'failed':

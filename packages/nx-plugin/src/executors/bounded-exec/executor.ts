@@ -17,6 +17,7 @@ import { AdmissionObservation, type QueueHost } from './admission-queue.js';
 import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
 import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment } from './child-exit-diagnostics.js';
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
+import type { CpuRise } from './cpu-rise.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
@@ -137,6 +138,8 @@ interface RunState {
   noSpace: Promise<NoSpaceSighting> | null;
   /** The lock waits the expiry's snapshot named: empty unless that capture completed. Judged with the expiry. */
   lockWaits: readonly LockWait[];
+  /** The processes the expiry's snapshot saw gain CPU time: empty unless that capture completed. Judged with the expiry. */
+  cpuRising: readonly CpuRise[];
 }
 
 export interface ProcessTreeKiller {
@@ -361,6 +364,7 @@ async function runCommand(
     retireError: null,
     noSpace: null,
     lockWaits: [],
+    cpuRising: [],
   };
   const appendStdout = (chunk: Buffer | string): void => {
     const text = chunk.toString();
@@ -642,6 +646,7 @@ async function runCommand(
     operational: boolean,
     noSpace: NoSpaceSighting | null,
     lockWaits: readonly LockWait[],
+    cpuRising: readonly CpuRise[],
     peakBytes: number | null,
   ): Promise<void> => {
     if (context.record === undefined) {
@@ -677,6 +682,7 @@ async function runCommand(
             report,
             noSpace,
             lockWaits,
+            cpuRising,
             admissionQueue,
           });
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
@@ -697,7 +703,7 @@ async function runCommand(
     await releaseCpu();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
-    await recordRun(1, null, Date.now() - asked, false, null, [], null);
+    await recordRun(1, null, Date.now() - asked, false, null, [], [], null);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
@@ -1093,6 +1099,7 @@ async function runCommand(
           state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null,
           state.noSpace === null ? null : await state.noSpace,
           state.lockWaits,
+          state.cpuRising,
           null,
         ),
       )
@@ -1161,6 +1168,7 @@ async function runCommand(
     if (bound.kind === 'idle') {
       const observed = idleCapture?.result;
       state.lockWaits = observed?.kind === 'captured' ? observed.snapshot.lockWaits : [];
+      state.cpuRising = observed?.kind === 'captured' ? observed.snapshot.cpuRising : [];
       appendStderr(
         `Hang diagnostics: runner pid=${runner ?? 'unavailable'} pgid=${
           process.platform === 'win32' ? 'unavailable' : (child.pid ?? 'unavailable')
@@ -1414,7 +1422,16 @@ async function runCommand(
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
-  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits, peakBytes);
+  await recordRun(
+    code,
+    state.expiry,
+    Date.now() - startedAt,
+    operationalFailure,
+    seen,
+    state.lockWaits,
+    state.cpuRising,
+    peakBytes,
+  );
   const killedForMemory = killedFromOutside({
     sentSignal: state.sentSignal,
     bounded: state.expiry !== null,
