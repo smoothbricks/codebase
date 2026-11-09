@@ -35,7 +35,7 @@ use crate::nested;
 use crate::removal_cut::{self, CutKey, RemovalCuts, SlotCuts};
 use crate::row_exprs::{LiveColumns, StoredBinding, StoredRow};
 use crate::scratch::ScratchDemand;
-use crate::state_init::{self, EVICTION_ENTRY_SIZE};
+use crate::state_init::{self, EVICTION_ENTRY_SIZE, GrowthRoom};
 use crate::struct_map::{
     ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
     scalar_order_key,
@@ -1082,10 +1082,11 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     /// Whether the batch now running reserved and sealed its scratch: a
     /// container call it makes runs inside that reservation.
     scratch_sealed: bool,
-    /// The slot whose capacity refused the last batch with `NEEDS_GROWTH`, or
-    /// `None` when it did not ask for growth. Each VM owns its register, so
-    /// VMs that run on different threads never read each other's refusals.
-    needs_growth_slot: Option<u32>,
+    /// The slot whose capacity refused the last batch with `NEEDS_GROWTH`, and
+    /// the room it lacked, or `None` when it did not ask for growth. Each VM
+    /// owns its register, so VMs that run on different threads never read each
+    /// other's refusals.
+    needs_growth: Option<(u32, GrowthRoom)>,
     row_code: Vec<u8>,
 }
 
@@ -1121,7 +1122,7 @@ impl<I: KeyIndex> Vm<I> {
             keys: KeyScratch::default(),
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
-            needs_growth_slot: None,
+            needs_growth: None,
             row_code: Vec::new(),
         }
     }
@@ -1154,29 +1155,40 @@ impl<I: KeyIndex> Vm<I> {
     /// The slot that asked for growth when the last batch returned
     /// `NEEDS_GROWTH`, or `None` when it did not.
     pub fn needs_growth_slot(&self) -> Option<u32> {
-        self.needs_growth_slot
+        self.needs_growth.map(|(slot, _)| slot)
+    }
+
+    /// The room the slot that asked for growth lacked: its rows, or a struct
+    /// map's arena. A host grows the slot for exactly this room.
+    pub fn needs_growth_room(&self) -> Option<GrowthRoom> {
+        self.needs_growth.map(|(_, room)| room)
     }
 
     /// Record that `slot` refused for capacity. A layer that writes this VM's
     /// state outside its kernels (a RETE derived-facts table) and answers
     /// `NEEDS_GROWTH` names its slot here, as the kernels do.
     pub fn signal_needs_growth(&mut self, slot: u32) {
-        self.needs_growth_slot = Some(slot);
+        self.needs_growth = Some((slot, GrowthRoom::Rows));
     }
 
     /// Map a capacity failure to `NEEDS_GROWTH` and record its slot.
     fn signal_growth(&mut self, slot: u32, result: ErrorCode) -> u32 {
         if result == ErrorCode::CapacityExceeded {
-            self.needs_growth_slot = Some(slot);
+            self.needs_growth = Some((slot, GrowthRoom::Rows));
             return NEEDS_GROWTH;
         }
         result as u32
     }
 
-    /// Record `slot` when a kernel answered `NEEDS_GROWTH` for it.
+    /// Record `slot` when a kernel answered `NEEDS_GROWTH` for it, or its
+    /// arena when a struct-map kernel answered `ArenaOverflow`, which becomes
+    /// `NEEDS_GROWTH` here.
     fn growth_of(&mut self, slot: u32, result: u32) -> u32 {
         if result == NEEDS_GROWTH {
-            self.needs_growth_slot = Some(slot);
+            self.needs_growth = Some((slot, GrowthRoom::Rows));
+        } else if result == ErrorCode::ArenaOverflow as u32 {
+            self.needs_growth = Some((slot, GrowthRoom::Arena));
+            return NEEDS_GROWTH;
         }
         result
     }
@@ -3793,7 +3805,7 @@ fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     } else {
         match ArenaWrites::prepare(state, &row, array_fields) {
             Ok(plan) => Some(plan),
-            Err(ErrorCode::ArenaOverflow) => return NEEDS_GROWTH,
+            Err(ErrorCode::ArenaOverflow) => return ErrorCode::ArenaOverflow as u32,
             Err(error) => return error as u32,
         }
     };
@@ -4473,7 +4485,7 @@ impl<I: KeyIndex> Vm<I> {
         live: Option<&mut LiveColumns<'_, '_>>,
         cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
-        self.needs_growth_slot = None;
+        self.needs_growth = None;
         if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
             || bytes::read_u32(state, 0) != I::STATE_MAGIC
             || state[StateHeaderOffset::FORMAT_VERSION as usize] != I::FORMAT_VERSION
@@ -7880,7 +7892,7 @@ impl<I: KeyIndex> Vm<I> {
                     ));
 
                     if count >= capacity {
-                        self.needs_growth_slot = Some(slot);
+                        self.needs_growth = Some((slot, GrowthRoom::Rows));
                         return NEEDS_GROWTH;
                     }
 
@@ -7973,7 +7985,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
 
                     if count >= capacity {
-                        self.needs_growth_slot = Some(slot);
+                        self.needs_growth = Some((slot, GrowthRoom::Rows));
                         return NEEDS_GROWTH;
                     }
 
@@ -8185,18 +8197,20 @@ impl<I: KeyIndex> Vm<I> {
     // =========================================================================
     // Undo-log surface
 
-    /// Grow only a committed image. The owner of a speculative window must
+    /// Grow only a committed image, for the room its refusal lacked
+    /// ([`Self::needs_growth_room`]). The owner of a speculative window must
     /// roll back and end that window, grow, then retry the full window.
     pub fn grow_state(
         &mut self,
         old_state: &[u8],
         new_state: &mut [u8],
         slot: u32,
+        room: GrowthRoom,
     ) -> Result<(), ErrorCode> {
         if self.undo.enabled {
             return Err(ErrorCode::NeedsGrowth);
         }
-        state_init::grow_state_in::<I>(old_state, new_state, slot)
+        state_init::grow_state_in::<I>(old_state, new_state, slot, room)
     }
 
     /// Seal a committed image ([`crate::seal::seal_state`]): every struct map's

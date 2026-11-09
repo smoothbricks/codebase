@@ -39,6 +39,17 @@ allocate nothing beyond the family's scratch.
 timestamp cell and, compacted in ordinal order, its arena payloads. `seal` rebuilds a region canonically: its bytes
 become a function of its keys and capacity alone, and it names each key's new ordinal (section 6).
 
+A struct map's `NEEDS_GROWTH` names the slot, and growth gives room only to what ran out (`GrowthRoom`). The VM that
+refused the batch records the room beside the slot in its needs-growth register (`Vm::needs_growth_room`, wasm
+`vm_get_needs_growth_room`), and the host passes it to `calculate_grown_state_size` and `grow_state`: capacity admission
+refuses on the batch's demand before any write, so the image alone cannot tell. A new key past the family's admission
+bound (`max_rows`) is the rows: they double through `grow`, and the arena keeps its capacity and is compacted as the
+rows move. A payload past the arena's free bytes is the arena: the arena is bump-allocated, so a rewritten row's earlier
+payload stays in it until growth or `seal` compacts it. The arena then compacts at its current capacity when its live
+payload is at most half of that capacity and compaction frees bytes, and only the arena doubles otherwise; the rows keep
+their capacity. Every growth gives the slot room, which a host checks with `SlotRoom::exceeds`: a larger capacity, or at
+the same capacity fewer occupied cells, a larger arena, or the same arena with fewer used bytes.
+
 Key lanes are declared by the program (section 3). A family that orders keys reads an interned lane's UTF-8 bytes
 through the caller's resolver, `InternBytes`; an id it cannot resolve is a refusal value. Each call takes a `KeyCx`: the
 resolver and the family's `Scratch`, which one VM owns and lends to each batch.

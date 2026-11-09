@@ -50,7 +50,7 @@ use crate::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable, max_load_for_cap};
 use crate::key_index::{HashIndex, InternBytes, KeyCx, KeyIndex, KeyLanes};
 use crate::meta::SlotMetaView;
 use crate::nested::{self, NestedPrefix};
-use crate::state_init;
+use crate::state_init::{self, GrowthRoom};
 use crate::struct_map::{ArenaRegion, StructMap2Slot, StructMapSlot};
 use bitmosaic::{Bitmosaic, BitmosaicView, IMAGE_ID_LEN};
 use columine_types::types::{
@@ -1166,11 +1166,11 @@ fn reserve_image(size: u32) -> CauseResult<Vec<u8>> {
     Ok(image)
 }
 
-fn grow_image<I: KeyIndex>(image: &mut Vec<u8>, slot: u32) -> CauseResult<()> {
-    let new_size = state_init::calculate_grown_state_size_in::<I>(image, slot)
+fn grow_image<I: KeyIndex>(image: &mut Vec<u8>, slot: u32, room: GrowthRoom) -> CauseResult<()> {
+    let new_size = state_init::calculate_grown_state_size_in::<I>(image, slot, room)
         .map_err(LogicalExportCause::Vm)?;
     let mut next = reserve_image(new_size)?;
-    state_init::grow_state_in::<I>(image, &mut next, slot).map_err(LogicalExportCause::Vm)?;
+    state_init::grow_state_in::<I>(image, &mut next, slot, room).map_err(LogicalExportCause::Vm)?;
     *image = next;
     Ok(())
 }
@@ -1182,11 +1182,23 @@ fn grow_until<I: KeyIndex>(
     slot: u32,
     mut fits: impl FnMut(&[u8]) -> CauseResult<bool>,
 ) -> CauseResult<()> {
+    grow_struct_until::<I>(image, slot, |img| {
+        Ok((!fits(img)?).then_some(GrowthRoom::Rows))
+    })
+}
+
+/// Grow a struct map until `short` names no room it lacks: its rows, or its
+/// arena, which an empty slot's growth doubles alone.
+fn grow_struct_until<I: KeyIndex>(
+    image: &mut Vec<u8>,
+    slot: u32,
+    mut short: impl FnMut(&[u8]) -> CauseResult<Option<GrowthRoom>>,
+) -> CauseResult<()> {
     for _ in 0..64 {
-        if fits(image)? {
+        let Some(room) = short(image)? else {
             return Ok(());
-        }
-        grow_image::<I>(image, slot)?;
+        };
+        grow_image::<I>(image, slot, room)?;
     }
     Err(LogicalExportCause::Capacity {
         needed: u64::MAX,
@@ -1770,18 +1782,21 @@ fn import_slot_inner<I: KeyIndex>(
         }
         SlotType::StructMap => {
             let rows = logical.rows.len() as u32;
-            grow_until::<I>(image, slot, |img| {
+            grow_struct_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
                 if rows > I::max_rows(m.capacity) {
-                    return Ok(false);
+                    return Ok(Some(GrowthRoom::Rows));
                 }
                 let map = StructMapSlot::<I>::bind_in(img, slot);
                 if map.arena_header_off == 0 {
-                    return Ok(true);
+                    return Ok(None);
                 }
                 let arena =
                     ArenaRegion::bind(img, map.arena_header_off).map_err(LogicalExportCause::Vm)?;
-                Ok(u64::from(arena.capacity) >= arena_demand(logical))
+                Ok(
+                    (u64::from(arena.capacity) < arena_demand(logical))
+                        .then_some(GrowthRoom::Arena),
+                )
             })?;
             let meta = bind_target::<I>(image, logical)?;
             let (descriptor, _, _, _) = target_descriptor(image, &meta)?;
@@ -1827,17 +1842,20 @@ fn import_slot_inner<I: KeyIndex>(
         }
         SlotType::StructMap2 => {
             let rows = logical.rows.len() as u32;
-            grow_until::<I>(image, slot, |img| {
+            grow_struct_until::<I>(image, slot, |img| {
                 let m = SlotMetaView::read(img, slot);
                 if rows > I::max_rows(m.capacity) {
-                    return Ok(false);
+                    return Ok(Some(GrowthRoom::Rows));
                 }
                 let header = bytes::read_u32(img, m.meta_base + SlotMetaOffset::GRACE_SECONDS);
                 if header == 0 {
-                    return Ok(true);
+                    return Ok(None);
                 }
                 let arena = ArenaRegion::bind(img, header).map_err(LogicalExportCause::Vm)?;
-                Ok(u64::from(arena.capacity) >= arena_demand(logical))
+                Ok(
+                    (u64::from(arena.capacity) < arena_demand(logical))
+                        .then_some(GrowthRoom::Arena),
+                )
             })?;
             let meta = bind_target::<I>(image, logical)?;
             let (descriptor, _, _, _) = target_descriptor(image, &meta)?;

@@ -325,12 +325,12 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     expect(invoke(exports, 'vm_init_state', statePtr, programPtr, bytecode.length)).toBe(ErrorCode.OK);
     const initial = new Uint8Array(memory.buffer, statePtr, size).slice();
     const outPtr = programPtr + 4096;
-    expect(invoke(exports, 'vm_calculate_grown_state_size', statePtr, size, 0, outPtr)).toBe(ErrorCode.OK);
+    expect(invoke(exports, 'vm_calculate_grown_state_size', statePtr, size, 0, 0, outPtr)).toBe(ErrorCode.OK);
     const grownSize = new DataView(memory.buffer).getUint32(outPtr, true);
-    expect(invoke(exports, 'vm_grow_state', statePtr, size, statePtr, grownSize, 0)).toBe(ErrorCode.INVALID_STATE);
+    expect(invoke(exports, 'vm_grow_state', statePtr, size, statePtr, grownSize, 0, 0)).toBe(ErrorCode.INVALID_STATE);
     const newPtr = programPtr + 8192;
     expect(region.reserve(newPtr + grownSize - base)).toBe(base);
-    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize - 1, 0)).toBe(ErrorCode.INVALID_STATE);
+    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize - 1, 0, 0)).toBe(ErrorCode.INVALID_STATE);
     expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(initial);
     expect(invoke(exports, 'vm_struct_map_arena_field', statePtr, 31, 0, 7, 0, outPtr)).toBe(ErrorCode.INVALID_STATE);
     expect(invoke(exports, 'vm_struct_map_arena_field', statePtr, size, 0, 7, 0, statePtr)).toBe(
@@ -341,7 +341,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     );
     expect(invoke(exports, 'vm_undo_enable', statePtr, size)).toBe(ErrorCode.OK);
     const untouchedGrowthDestination = new Uint8Array(memory.buffer, newPtr, grownSize).slice();
-    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize, 0)).toBe(ErrorCode.NEEDS_GROWTH);
+    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize, 0, 0)).toBe(ErrorCode.NEEDS_GROWTH);
     expect(new Uint8Array(memory.buffer, newPtr, grownSize)).toEqual(untouchedGrowthDestination);
     expect(invoke(exports, 'vm_undo_rollback', statePtr, size, 0, statePtr)).toBe(ErrorCode.INVALID_STATE);
     expect(invoke(exports, 'vm_delta_required_state_size', memory.buffer.byteLength - 1, 24, 24, size, outPtr)).toBe(
@@ -357,7 +357,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     if (typeof commit !== 'function') throw new Error('real wasm artifact is missing vm_undo_commit');
     commit(statePtr, 0);
     new Uint8Array(memory.buffer, newPtr, grownSize).fill(0);
-    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize, 0)).toBe(ErrorCode.OK);
+    expect(invoke(exports, 'vm_grow_state', statePtr, size, newPtr, grownSize, 0, 0)).toBe(ErrorCode.OK);
     expect(new Uint8Array(memory.buffer, statePtr, size)).toEqual(initial);
   });
 

@@ -5,7 +5,7 @@ use columine_types::types::{
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    calculate_grown_state_size, calculate_state_size, grow_state, init_state,
+    GrowthRoom, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{CheckedStructMap2, Vm, i64s_as_bytes, u32s_as_bytes};
@@ -315,9 +315,10 @@ fn growth_rehash_preserves_same_first_lane_pairs_and_checkpoint_forks() {
     );
 
     let old_capacity = StructMap2Slot::bind(&state, 0).capacity;
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut grown, 0).unwrap();
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
     assert!(pair_row(&grown, 5, 10).is_some());
     assert!(pair_row(&grown, 5, 11).is_some());
@@ -842,9 +843,10 @@ fn max_i64x2_rejected_batch_rolls_back_and_growth_rehashes_collisions() {
         )
     );
     let old_capacity = StructMap2Slot::bind(&state, 0).capacity;
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut grown = vec![0; grown_size as usize];
-    grow_state(&state, &mut grown, 0).unwrap();
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).unwrap();
     assert_eq!(StructMap2Slot::bind(&grown, 0).capacity, old_capacity * 2);
     assert_eq!(tuple_winner(&grown, 77, second1), Some((201, 3, 5)));
     assert_eq!(tuple_winner(&grown, 77, second2), Some((202, 4, 6)));

@@ -1589,11 +1589,144 @@ fn region_end<I: KeyIndex>(region: IndexRegion) -> u32 {
         .unwrap_or_else(|_| columine_types::die!("invariant: a checked index region ends in u32"))
 }
 
-/// The capacity one slot grows to: a struct map's family decides its own.
-fn grown_slot_capacity<I: KeyIndex>(kind: SlotType, capacity: u32) -> Result<u32, ErrorCode> {
-    match kind {
-        SlotType::StructMap | SlotType::StructMap2 => I::grown_capacity(capacity),
-        _ => grown_capacity(capacity),
+/// What a slot's growth gives room to, as the VM that refused the batch
+/// recorded it ([`crate::vm::Vm::needs_growth_room`]). Only a struct map with
+/// an arena tells the two apart; every other slot grows its one capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrowthRoom {
+    /// The rows: a new key past the key index's admission bound.
+    Rows,
+    /// The arena: a payload past the arena's free bytes.
+    Arena,
+}
+
+impl GrowthRoom {
+    /// The room's ABI word: 0 for the rows, 1 for the arena.
+    pub const fn abi(self) -> u32 {
+        match self {
+            Self::Rows => 0,
+            Self::Arena => 1,
+        }
+    }
+
+    /// The room an ABI word names, or `None` for a word that names none.
+    pub const fn from_abi(word: u32) -> Option<Self> {
+        match word {
+            0 => Some(Self::Rows),
+            1 => Some(Self::Arena),
+            _ => None,
+        }
+    }
+}
+
+/// A grown slot's capacities: its rows, and a struct map's arena.
+#[derive(Clone, Copy, Debug)]
+struct GrownSlot {
+    rows: u32,
+    arena: Option<u32>,
+}
+
+/// The capacities one slot grows to. Every slot but a struct map doubles. A
+/// struct map grows only what ran out: its rows double and its arena keeps its
+/// capacity, or its arena compacts at its capacity when its live payload is at
+/// most half of it and compaction frees bytes, and doubles alone otherwise. So
+/// every growth gives the slot room ([`SlotRoom::exceeds`]).
+fn grown_slot<I: KeyIndex>(
+    state: &[u8],
+    slot: u32,
+    m: &OldSlotMeta,
+    room: GrowthRoom,
+) -> Result<GrownSlot, ErrorCode> {
+    if !matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
+        return Ok(GrownSlot {
+            rows: grown_capacity(m.capacity)?,
+            arena: None,
+        });
+    }
+    let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+    let header = overlay_arena_hdr(state, meta);
+    let arena = if header == 0 {
+        None
+    } else {
+        Some(ArenaRegion::bind(state, header)?)
+    };
+    match (room, arena) {
+        (GrowthRoom::Rows, arena) => Ok(GrownSlot {
+            rows: I::grown_capacity(m.capacity)?,
+            arena: arena.map(|arena| arena.capacity),
+        }),
+        (GrowthRoom::Arena, None) => Err(ErrorCode::InvalidState),
+        (GrowthRoom::Arena, Some(arena)) => {
+            let live = live_arena_bytes::<I>(state, meta, m.slot_type, arena)?;
+            let compacts = live * 2 <= u64::from(arena.capacity) && live < u64::from(arena.used);
+            let capacity = if compacts {
+                arena.capacity
+            } else {
+                arena
+                    .capacity
+                    .checked_mul(2)
+                    .ok_or(ErrorCode::InvalidState)?
+            };
+            Ok(GrownSlot {
+                rows: m.capacity,
+                arena: Some(capacity),
+            })
+        }
+    }
+}
+
+/// The room a slot has, as a host checks that a growth gave some: its capacity
+/// and occupied cells (a derived-fact table counts its tombstones), and a
+/// struct map's arena capacity and used bytes (zero without an arena).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotRoom {
+    pub capacity: u32,
+    pub occupied: u32,
+    pub arena_capacity: u32,
+    pub arena_used: u32,
+}
+
+impl SlotRoom {
+    /// `slot`'s room in `state`, or `None` when its metadata or arena header
+    /// lies past the image.
+    pub fn read(state: &[u8], slot: u32) -> Option<Self> {
+        let word = |at: u32| {
+            let at = usize::try_from(at).ok()?;
+            state
+                .get(at..at.checked_add(4)?)
+                .map(|cell| bytes::read_u32(cell, 0))
+        };
+        let meta = slot
+            .checked_mul(SLOT_META_SIZE)?
+            .checked_add(STATE_HEADER_SIZE)?;
+        let kind = *state.get(usize::try_from(meta + SlotMetaOffset::TYPE_FLAGS).ok()?)? & 0x0f;
+        let header = match SlotType::from_u8(kind)? {
+            SlotType::StructMap | SlotType::StructMap2 => word(meta + STRUCT_ARENA_HDR)?,
+            _ => 0,
+        };
+        let (arena_capacity, arena_used) = if header == 0 {
+            (0, 0)
+        } else {
+            (word(header)?, word(header.checked_add(4)?)?)
+        };
+        Some(Self {
+            capacity: word(meta + SlotMetaOffset::CAPACITY)?,
+            occupied: word(meta + SlotMetaOffset::SIZE)?,
+            arena_capacity,
+            arena_used,
+        })
+    }
+
+    /// Whether `self` gives a slot more room than `old`: a larger capacity;
+    /// or at the same capacity, fewer occupied cells, a larger arena, or the
+    /// same arena with fewer used bytes.
+    pub fn exceeds(self, old: Self) -> bool {
+        self.capacity > old.capacity
+            || (self.capacity == old.capacity
+                && (self.occupied < old.occupied
+                    || self.arena_capacity > old.arena_capacity
+                    || (self.arena_capacity == old.arena_capacity
+                        && self.arena_used < old.arena_used)))
     }
 }
 
@@ -1899,15 +2032,21 @@ fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap
     )
 }
 
-/// Calculate the checked extent after doubling one slot and its arena.
-pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> Result<u32, ErrorCode> {
-    calculate_grown_state_size_in::<HashIndex>(old_state, grown_slot_idx)
+/// Calculate the checked extent after growing one slot for `room`
+/// ([`grown_slot`]).
+pub fn calculate_grown_state_size(
+    old_state: &[u8],
+    grown_slot_idx: u32,
+    room: GrowthRoom,
+) -> Result<u32, ErrorCode> {
+    calculate_grown_state_size_in::<HashIndex>(old_state, grown_slot_idx, room)
 }
 
 /// [`calculate_grown_state_size`] for an image of key-index family `I`.
 pub fn calculate_grown_state_size_in<I: KeyIndex>(
     old_state: &[u8],
     grown_slot_idx: u32,
+    room: GrowthRoom,
 ) -> Result<u32, ErrorCode> {
     let (num_slots, metadata_end) = state_geometry::<I>(old_state)?;
     if grown_slot_idx >= num_slots {
@@ -1919,21 +2058,19 @@ pub fn calculate_grown_state_size_in<I: KeyIndex>(
         validate_slot_geometry::<I>(old_state, slot, limit, OuterPointers::Walk)?;
         let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
         let m = read_old_slot_meta(old_state, slot);
-        let cap = if slot == grown_slot_idx {
-            grown_slot_capacity::<I>(m.slot_type, m.capacity)?
+        let grown = if slot == grown_slot_idx {
+            Some(grown_slot::<I>(old_state, slot, &m, room)?)
         } else {
-            m.capacity
+            None
         };
+        let cap = grown.map_or(m.capacity, |grown| grown.rows);
         let mut size = u64::from(checked_primary_size::<I>(old_state, meta, &m, cap)?);
         if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
             let header = overlay_arena_hdr(old_state, meta);
             if header != 0 {
-                let capacity = bytes::read_u32(old_state, header);
-                let capacity = if slot == grown_slot_idx {
-                    capacity.checked_mul(2).ok_or(ErrorCode::InvalidState)?
-                } else {
-                    capacity
-                };
+                let capacity = grown
+                    .and_then(|grown| grown.arena)
+                    .unwrap_or_else(|| bytes::read_u32(old_state, header));
                 size += u64::from(ARENA_HEADER_SIZE) + u64::from(capacity);
             }
         }
@@ -1954,14 +2091,15 @@ pub fn calculate_grown_state_size_in<I: KeyIndex>(
 }
 
 /// Copy old state into `new_state` (which must be zeroed and large enough for
-/// [`calculate_grown_state_size`]), rehashing the grown slot and recomputing
-/// every slot's offsets.
+/// [`calculate_grown_state_size`]), growing the slot for `room` and
+/// recomputing every slot's offsets.
 pub fn grow_state(
     old_state: &[u8],
     new_state: &mut [u8],
     grown_slot_idx: u32,
+    room: GrowthRoom,
 ) -> Result<(), ErrorCode> {
-    grow_state_in::<HashIndex>(old_state, new_state, grown_slot_idx)
+    grow_state_in::<HashIndex>(old_state, new_state, grown_slot_idx, room)
 }
 
 /// [`grow_state`] for an image of key-index family `I`: a grown struct map's
@@ -1970,12 +2108,19 @@ pub fn grow_state_in<I: KeyIndex>(
     old_state: &[u8],
     new_state: &mut [u8],
     grown_slot_idx: u32,
+    room: GrowthRoom,
 ) -> Result<(), ErrorCode> {
-    let required = calculate_grown_state_size_in::<I>(old_state, grown_slot_idx)?;
+    let required = calculate_grown_state_size_in::<I>(old_state, grown_slot_idx, room)?;
     if new_state.len() < required as usize {
         return Err(ErrorCode::InvalidState);
     }
-    validate_struct_arenas::<I>(old_state, grown_slot_idx)?;
+    let grown = grown_slot::<I>(
+        old_state,
+        grown_slot_idx,
+        &read_old_slot_meta(old_state, grown_slot_idx),
+        room,
+    )?;
+    validate_struct_arenas::<I>(old_state, grown_slot_idx, grown.arena)?;
     let num_slots = state_num_slots(old_state);
     new_state[..required as usize].fill(0);
 
@@ -1991,7 +2136,7 @@ pub fn grow_state_in<I: KeyIndex>(
         let old_cap = m.capacity;
 
         let new_cap = if slot_i == grown_slot_idx {
-            grown_slot_capacity::<I>(m.slot_type, old_cap)?
+            grown.rows
         } else {
             old_cap
         };
@@ -2151,10 +2296,7 @@ pub fn grow_state_in<I: KeyIndex>(
                     let old_arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
                     if old_arena_hdr_off != 0 {
                         let old_arena = ArenaRegion::bind(old_state, old_arena_hdr_off)?;
-                        let new_arena_cap = old_arena
-                            .capacity
-                            .checked_mul(2)
-                            .ok_or(ErrorCode::InvalidState)?;
+                        let new_arena_cap = grown.arena.ok_or(ErrorCode::InvalidState)?;
                         let struct_data_size = struct_map_primary_size_from_meta::<I>(
                             old_state,
                             meta_base,
@@ -2703,9 +2845,14 @@ impl Declarations {
     }
 }
 
-/// Geometry was checked by sizing; validate live references and compaction span
-/// before any destination write. The descriptor and row offsets are reused.
-fn validate_struct_arenas<I: KeyIndex>(state: &[u8], grown_slot: u32) -> Result<(), ErrorCode> {
+/// Geometry was checked by sizing; validate live references in every struct
+/// map's arena, and that the grown slot's live payload fits its grown arena,
+/// before any destination write.
+fn validate_struct_arenas<I: KeyIndex>(
+    state: &[u8],
+    grown_slot: u32,
+    grown_arena: Option<u32>,
+) -> Result<(), ErrorCode> {
     for slot in 0..state_num_slots(state) {
         let meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
         let kind = SlotType::from_u8(state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f)
@@ -2717,48 +2864,58 @@ fn validate_struct_arenas<I: KeyIndex>(state: &[u8], grown_slot: u32) -> Result<
         if header == 0 {
             continue;
         }
-        let nf = state[(meta + STRUCT_NUM_FIELDS) as usize];
-        let cap = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
-        let rs = overlay_row_size(state, meta);
-        let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
-        let descriptor = &state[off as usize..off as usize + usize::from(nf)];
-        let region = IndexRegion {
-            at: off + align8(u32::from(nf)),
-            capacity: cap,
-            lanes: struct_key_lanes(state, meta, kind)?,
-        };
-        let rows = region_end::<I>(region);
-        let arena = ArenaRegion::bind(state, header)?;
-        let mut compact_bytes = 0u64;
-        for pos in 0..cap {
-            if I::key_at(state, region, pos).is_none() {
-                continue;
-            }
-            let row = rows + pos * rs;
-            let mut field_offset = u32::from(nf).div_ceil(8);
-            for (field_idx, &field_type) in descriptor.iter().enumerate() {
-                let field_type =
-                    StructFieldType::from_u8(field_type).ok_or(ErrorCode::InvalidState)?;
-                if is_arena_field_type(field_type)
-                    && state[row as usize + field_idx / 8] & (1 << (field_idx % 8)) != 0
-                {
-                    let field = row + field_offset;
-                    let payload = arena.bytes(
-                        state,
-                        bytes::read_u32(state, field),
-                        bytes::read_u32(state, field + 4),
-                        arena_elem_size(field_type),
-                    )?;
-                    compact_bytes += payload.len() as u64;
-                }
-                field_offset += columine_types::types::struct_field_size(field_type);
-            }
-        }
-        if slot == grown_slot && compact_bytes > u64::from(arena.capacity) * 2 {
+        let live = live_arena_bytes::<I>(state, meta, kind, ArenaRegion::bind(state, header)?)?;
+        if slot == grown_slot && grown_arena.is_some_and(|capacity| live > u64::from(capacity)) {
             return Err(ErrorCode::InvalidState);
         }
     }
     Ok(())
+}
+
+/// The payload bytes a struct map's live rows hold in `arena`: what
+/// compaction keeps. Every live reference is checked against the arena.
+fn live_arena_bytes<I: KeyIndex>(
+    state: &[u8],
+    meta: u32,
+    kind: SlotType,
+    arena: ArenaRegion,
+) -> Result<u64, ErrorCode> {
+    let nf = state[(meta + STRUCT_NUM_FIELDS) as usize];
+    let cap = bytes::read_u32(state, meta + SlotMetaOffset::CAPACITY);
+    let rs = overlay_row_size(state, meta);
+    let off = bytes::read_u32(state, meta + SlotMetaOffset::OFFSET);
+    let descriptor = &state[off as usize..off as usize + usize::from(nf)];
+    let region = IndexRegion {
+        at: off + align8(u32::from(nf)),
+        capacity: cap,
+        lanes: struct_key_lanes(state, meta, kind)?,
+    };
+    let rows = region_end::<I>(region);
+    let mut live = 0u64;
+    for pos in 0..cap {
+        if I::key_at(state, region, pos).is_none() {
+            continue;
+        }
+        let row = rows + pos * rs;
+        let mut field_offset = u32::from(nf).div_ceil(8);
+        for (field_idx, &field_type) in descriptor.iter().enumerate() {
+            let field_type = StructFieldType::from_u8(field_type).ok_or(ErrorCode::InvalidState)?;
+            if is_arena_field_type(field_type)
+                && state[row as usize + field_idx / 8] & (1 << (field_idx % 8)) != 0
+            {
+                let field = row + field_offset;
+                let payload = arena.bytes(
+                    state,
+                    bytes::read_u32(state, field),
+                    bytes::read_u32(state, field + 4),
+                    arena_elem_size(field_type),
+                )?;
+                live += payload.len() as u64;
+            }
+            field_offset += columine_types::types::struct_field_size(field_type);
+        }
+    }
+    Ok(live)
 }
 
 /// Relocate absolute inner pointers while copying or rehashing an outer table.

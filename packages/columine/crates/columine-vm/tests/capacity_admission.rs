@@ -22,8 +22,8 @@ use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{outer_keys_offset, outer_ptrs_offset};
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
-    validate_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
+    init_state, validate_state,
 };
 use columine_vm::vm::{CheckedMap, Vm, f64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
@@ -127,10 +127,10 @@ fn for_each(body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn grow(vm: &mut Vm, state: &[u8], slot: u32) -> Vec<u8> {
-    let size = calculate_grown_state_size(state, slot).expect("grown size");
+fn grow(vm: &mut Vm, state: &[u8], slot: u32, room: GrowthRoom) -> Vec<u8> {
+    let size = calculate_grown_state_size(state, slot, room).expect("grown size");
     let mut next = vec![0u8; size as usize];
-    vm.grow_state(state, &mut next, slot).expect("grow");
+    vm.grow_state(state, &mut next, slot, room).expect("grow");
     next
 }
 
@@ -144,7 +144,8 @@ fn run_growing(vm: &mut Vm, state: &mut Vec<u8>, prog: &[u8], cols: &[&[u8]], ro
             NEEDS_GROWTH => {
                 assert_eq!(&before, state, "a refused batch wrote state");
                 let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
-                *state = grow(vm, state, slot);
+                let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+                *state = grow(vm, state, slot, room);
             }
             other => panic!("batch refused with {other}"),
         }
@@ -245,7 +246,8 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
     );
     vm.undo_commit();
 
-    let mut grown = grow(&mut vm, &state, 0);
+    let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+    let mut grown = grow(&mut vm, &state, 0, room);
     assert_eq!(OK, upsert(&mut vm, &mut grown, &prog, &[1, 2, 200]));
     assert_eq!(Some(2000), CheckedMap::bind(&grown, 0).unwrap().get(200));
 
@@ -1089,7 +1091,10 @@ fn nested_initial_containers_are_admitted_against_the_spent_arena() {
                 let slot = trial_vm
                     .needs_growth_slot()
                     .expect("NEEDS_GROWTH names its slot");
-                state = grow(&mut vm, &state, slot);
+                let room = trial_vm
+                    .needs_growth_room()
+                    .expect("NEEDS_GROWTH names its room");
+                state = grow(&mut vm, &state, slot, room);
             }
             other => panic!("trial batch refused with {other}"),
         }

@@ -10,8 +10,9 @@ use columine_types::types::{
 };
 use columine_vm::bytes;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
-    calculate_grown_state_size, calculate_state_size, grow_state, init_state, struct_field_offset,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, ProgramInvalidCause,
+    SizingRefusal, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
+    struct_field_offset,
 };
 use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{
@@ -657,10 +658,11 @@ fn struct_map_growth_preserves_entries() {
         NEEDS_GROWTH,
         vm.execute_batch(&mut state, &prog, &cols12, 1)
     );
+    let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size = calculate_grown_state_size(&state, 0, room).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut new_state, 0).expect("grow_state");
+    grow_state(&state, &mut new_state, 0, room).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     for i in 0..11u32 {

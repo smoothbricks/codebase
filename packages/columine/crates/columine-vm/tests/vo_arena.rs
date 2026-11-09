@@ -29,8 +29,8 @@ use columine_types::types::{
 use columine_vm::bytes;
 use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{
-    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
-    calculate_grown_state_size, calculate_state_size, init_state,
+    ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, ProgramInvalidCause,
+    SizingRefusal, SlotRoom, calculate_grown_state_size, calculate_state_size, init_state,
 };
 use columine_vm::struct_map::StructMapSlot;
 use columine_vm::vm::{UNDO_POSITION_OVERFLOWED, Vm, u32s_as_bytes};
@@ -182,10 +182,10 @@ fn init(prog: &[u8]) -> Vec<u8> {
 
 /// Grow slot `SLOT` through the VM's own entry point. The VM refuses growth
 /// while an undo window is active, so callers end the window first.
-fn grown(vm: &mut Vm, state: &[u8]) -> Vec<u8> {
-    let size = calculate_grown_state_size(state, SLOT).expect("grown state size");
+fn grown(vm: &mut Vm, state: &[u8], room: GrowthRoom) -> Vec<u8> {
+    let size = calculate_grown_state_size(state, SLOT, room).expect("grown state size");
     let mut next = vec![0u8; at(size)];
-    vm.grow_state(state, &mut next, SLOT)
+    vm.grow_state(state, &mut next, SLOT, room)
         .expect("Vm::grow_state");
     next
 }
@@ -336,6 +336,9 @@ fn arena_used(state: &[u8]) -> u32 {
     bytes::read_u32(state, arena_header(state) + 4)
 }
 
+fn row_capacity(state: &[u8]) -> u32 {
+    bytes::read_u32(state, slot_meta_base(SLOT) + SlotMetaOffset::CAPACITY)
+}
 fn arena_data(state: &[u8]) -> &[u8] {
     let base = arena_header(state) + ARENA_HEADER_SIZE;
     &state[at(base)..at(base + arena_capacity(state))]
@@ -1083,8 +1086,14 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     vm.undo_commit();
     assert_eq!(before_summed, state, "rollback must restore the image");
 
-    let mut next = grown(&mut vm, &state);
-    assert_eq!(capacity * 2, arena_capacity(&next));
+    let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+    assert_eq!(GrowthRoom::Arena, room, "the arena ran out, not the rows");
+    let mut next = grown(&mut vm, &state, room);
+    assert_eq!(
+        capacity,
+        arena_capacity(&next),
+        "the live payload fits half the arena"
+    );
     assert_eq!(400, arena_used(&next), "the dead frame must be dropped");
     assert_eq!(Ok(Some(live1.as_slice())), vo(&next, 1));
     assert_eq!(Ok(Some(live2.as_slice())), vo(&next, 2));
@@ -1108,6 +1117,191 @@ fn arena_overflow_refuses_without_row_write_then_growth_compacts_live_bytes() {
     assert_delta_roundtrip(&mut vm, &before, &after, 0);
 }
 
+/// Overflow `state`'s arena with one more rewrite of key 1, refused before any
+/// write for the arena, and answer the image grown for it.
+fn grown_after_overflow(prog: &[u8], state: &mut [u8], rewrite: &[u8]) -> Vec<u8> {
+    let overflowing = Rows::of([(1, rewrite)]);
+    let refused = assert_refused_untouched(
+        "rewrite past the arena",
+        prog,
+        state,
+        &overflowing.cols(),
+        overflowing.len(),
+        ErrorCode::NeedsGrowth,
+    );
+    assert_eq!(Some(SLOT), refused);
+    let mut vm = Vm::default();
+    let mut attempt = state.to_vec();
+    assert_eq!(
+        ErrorCode::NeedsGrowth,
+        run(&mut vm, &mut attempt, prog, &overflowing)
+    );
+    assert_eq!(
+        Some(GrowthRoom::Arena),
+        vm.needs_growth_room(),
+        "the arena ran out"
+    );
+    grown(&mut Vm::default(), state, GrowthRoom::Arena)
+}
+
+/// An arena filled by rewrites of one row holds mostly superseded payloads.
+/// Its growth compacts it at its capacity: neither the arena nor the rows,
+/// which never ran out, double.
+#[test]
+fn an_arena_full_of_rewritten_payloads_compacts_at_its_capacity_and_keeps_its_rows() {
+    let prog = vo_program();
+    let mut state = init(&prog);
+    let rows = row_capacity(&state);
+    let capacity = arena_capacity(&state);
+    let mut round = 0u8;
+    while arena_used(&state) + 100 <= capacity {
+        round += 1;
+        run_ok(&mut state, &prog, &Rows::of([(1, &[round; 100][..])]));
+    }
+    assert!(
+        round > 2,
+        "fixture: most of the arena is superseded payload"
+    );
+
+    let mut next = grown_after_overflow(&prog, &mut state, &[9; 100]);
+    assert_eq!(
+        rows,
+        row_capacity(&next),
+        "no key passed the admission bound"
+    );
+    assert_eq!(
+        capacity,
+        arena_capacity(&next),
+        "the live payload fits half the arena"
+    );
+    assert_eq!(100, arena_used(&next), "only the live payload survives");
+    assert_eq!(Ok(Some(&[round; 100][..])), vo(&next, 1));
+    assert_tightly_compacted(&next, &[1]);
+
+    run_ok(&mut next, &prog, &Rows::of([(1, &[9u8; 100][..])]));
+    assert_eq!(Ok(Some(&[9u8; 100][..])), vo(&next, 1));
+}
+
+/// A live payload past half the arena doubles the arena alone.
+#[test]
+fn an_arena_whose_live_payload_passes_half_doubles_and_keeps_its_rows() {
+    let prog = vo_program();
+    let mut state = init(&prog);
+    let rows = row_capacity(&state);
+    let capacity = arena_capacity(&state);
+    let live = vec![3u8; at(capacity / 2 + 8)];
+    run_ok(
+        &mut state,
+        &prog,
+        &Rows::of([(1, &[0u8; 64][..]), (2, live.as_slice())]),
+    );
+    run_ok(&mut state, &prog, &Rows::of([(1, &[1u8; 64][..])]));
+
+    let next = grown_after_overflow(&prog, &mut state, &vec![2u8; at(capacity)]);
+    assert_eq!(rows, row_capacity(&next));
+    assert_eq!(capacity * 2, arena_capacity(&next));
+    assert_eq!(64 + len_u32(live.len()), arena_used(&next));
+    assert_eq!(Ok(Some(live.as_slice())), vo(&next, 2));
+}
+
+/// A payload larger than the arena's free bytes over a garbage-free arena:
+/// compaction would free nothing, so the arena doubles, and every growth gives
+/// the slot room.
+#[test]
+fn an_arena_with_nothing_to_compact_doubles_even_below_half_live() {
+    let prog = vo_program();
+    let mut state = init(&prog);
+    let capacity = arena_capacity(&state);
+    run_ok(&mut state, &prog, &Rows::of([(2, &[5u8; 100][..])]));
+
+    let next = grown_after_overflow(&prog, &mut state, &vec![6u8; at(capacity - 50)]);
+    assert_eq!(capacity * 2, arena_capacity(&next));
+    assert_eq!(100, arena_used(&next));
+}
+
+/// A new key past the admission bound doubles the rows; the arena, which did
+/// not run out, keeps its capacity and is compacted as the rows move.
+#[test]
+fn a_key_past_the_admission_bound_doubles_the_rows_and_keeps_the_arena() {
+    let prog = vo_program();
+    let mut state = init(&prog);
+    let rows = row_capacity(&state);
+    let capacity = arena_capacity(&state);
+    let mut key = 1u32;
+    let room = loop {
+        let batch = Rows::of([(key, &[1u8; 4][..])]);
+        let mut vm = Vm::default();
+        let mut attempt = state.clone();
+        match run(&mut vm, &mut attempt, &prog, &batch) {
+            ErrorCode::Ok => state = attempt,
+            ErrorCode::NeedsGrowth => break vm.needs_growth_room(),
+            other => panic!("key {key}: {other:?}"),
+        }
+        key += 1;
+    };
+    assert_eq!(Some(GrowthRoom::Rows), room, "the rows ran out");
+    let next = grown(&mut Vm::default(), &state, GrowthRoom::Rows);
+    assert!(row_capacity(&next) > rows, "the rows ran out");
+    assert_eq!(capacity, arena_capacity(&next), "the arena did not");
+    assert_eq!(4 * (key - 1), arena_used(&next));
+}
+
+/// A growth gives its slot room when it raises its capacity; or keeps it and
+/// frees occupied cells, raises the arena, or keeps the arena and frees used
+/// bytes. Anything else would replay the batch into the refusal it grew for.
+#[test]
+fn only_more_capacity_freed_cells_a_larger_arena_or_freed_arena_bytes_is_room() {
+    let old = SlotRoom {
+        capacity: 64,
+        occupied: 40,
+        arena_capacity: 4096,
+        arena_used: 4000,
+    };
+    let room = |capacity, occupied, arena_capacity, arena_used| SlotRoom {
+        capacity,
+        occupied,
+        arena_capacity,
+        arena_used,
+    };
+    assert!(room(128, 40, 4096, 4000).exceeds(old), "a doubled capacity");
+    assert!(room(64, 12, 4096, 4000).exceeds(old), "freed cells");
+    assert!(room(64, 40, 8192, 4000).exceeds(old), "a doubled arena");
+    assert!(room(64, 40, 4096, 900).exceeds(old), "a compacted arena");
+    assert!(!old.exceeds(old), "an unchanged slot gained nothing");
+    assert!(
+        !room(64, 41, 4096, 4000).exceeds(old),
+        "more occupied cells"
+    );
+    assert!(
+        !room(64, 40, 4096, 4001).exceeds(old),
+        "more arena bytes used"
+    );
+    assert!(
+        !room(64, 40, 2048, 0).exceeds(old),
+        "a smaller arena, however empty"
+    );
+    assert!(
+        !room(32, 0, 8192, 0).exceeds(old),
+        "a smaller capacity, however empty"
+    );
+
+    // Each growth the rule above makes gives room.
+    let prog = vo_program();
+    let mut state = init(&prog);
+    let capacity = arena_capacity(&state);
+    let mut round = 0u8;
+    while arena_used(&state) + 100 <= capacity {
+        round += 1;
+        run_ok(&mut state, &prog, &Rows::of([(1, &[round; 100][..])]));
+    }
+    let next = grown(&mut Vm::default(), &state, GrowthRoom::Arena);
+    let (before, after) = (SlotRoom::read(&state, SLOT), SlotRoom::read(&next, SLOT));
+    assert!(
+        after
+            .zip(before)
+            .is_some_and(|(after, before)| after.exceeds(before))
+    );
+}
 #[test]
 fn empty_payload_after_abandoned_frame_survives_growth_compaction() {
     let prog = vo_program();
@@ -1119,7 +1313,7 @@ fn empty_payload_after_abandoned_frame_survives_growth_compaction() {
     assert_eq!((610, 0), stored_ref(&state, 1));
 
     let mut vm = Vm::default();
-    let next = grown(&mut vm, &state);
+    let next = grown(&mut vm, &state, GrowthRoom::Arena);
     assert_eq!(10, arena_used(&next));
     assert_eq!(Ok(Some(&[][..])), vo(&next, 1));
     assert_eq!(Ok(Some(&[4u8; 10][..])), vo(&next, 2));
@@ -1252,10 +1446,14 @@ fn growth_refuses_while_an_undo_window_is_active() {
     run_ok(&mut state, &prog, &Rows::of([(1, &[1u8][..])]));
     let mut vm = Vm::default();
     vm.undo_enable(&state).expect("undo window opens");
-    let mut next = vec![0u8; at(calculate_grown_state_size(&state, SLOT).expect("grown size"))];
+    let mut next =
+        vec![
+            0u8;
+            at(calculate_grown_state_size(&state, SLOT, GrowthRoom::Rows).expect("grown size"))
+        ];
     assert_eq!(
         Err(ErrorCode::NeedsGrowth),
-        vm.grow_state(&state, &mut next, SLOT)
+        vm.grow_state(&state, &mut next, SLOT, GrowthRoom::Rows)
     );
     assert!(
         next.iter().all(|&byte| byte == 0),
@@ -1263,7 +1461,10 @@ fn growth_refuses_while_an_undo_window_is_active() {
     );
 
     vm.undo_commit();
-    assert_eq!(Ok(()), vm.grow_state(&state, &mut next, SLOT));
+    assert_eq!(
+        Ok(()),
+        vm.grow_state(&state, &mut next, SLOT, GrowthRoom::Rows)
+    );
     assert_eq!(1, StructMapSlot::bind(&next, SLOT).size(&next));
     assert_eq!(Ok(Some(&[1u8][..])), vo(&next, 1));
 }
@@ -1283,7 +1484,7 @@ fn savepoints_taken_before_growth_do_not_survive_the_resize() {
     assert!(stale > 0, "the savepoint must cover a real batch");
     vm.undo_commit();
 
-    let mut next = grown(&mut vm, &state);
+    let mut next = grown(&mut vm, &state, GrowthRoom::Rows);
     let grown_image = next.clone();
     vm.undo_enable(&next).expect("undo window opens");
     assert_eq!(
@@ -1963,10 +2164,11 @@ proptest! {
                 // back to its checkpoint, ends the window, grows through the VM,
                 // and replays the whole batch.
                 prop_assert_eq!(Some(SLOT), vm.needs_growth_slot());
+                let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
                 rollback(&mut vm, &mut state, checkpoint);
                 vm.undo_commit();
                 prop_assert_eq!(&before, &state);
-                state = grown(&mut vm, &state);
+                state = grown(&mut vm, &state, room);
                 prop_assert_eq!(live_bytes(&model), arena_used(&state));
                 assert_matches_model(&state, &model);
                 let keys: Vec<u32> = model.keys().copied().collect();

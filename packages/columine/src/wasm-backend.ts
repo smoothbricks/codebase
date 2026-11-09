@@ -115,13 +115,22 @@ interface VmExports {
   vm_reset_state(statePtr: number, programPtr: number, programLen: number): number;
   vm_validate_state(statePtr: number, stateLen: number): number;
   vm_get_needs_growth_slot(): number;
-  vm_calculate_grown_state_size(oldStatePtr: number, oldStateLen: number, grownSlot: number, outPtr: number): number;
+  /** The room the slot lacked: 0 its rows, 1 a struct map's arena. */
+  vm_get_needs_growth_room(): number;
+  vm_calculate_grown_state_size(
+    oldStatePtr: number,
+    oldStateLen: number,
+    grownSlot: number,
+    grownRoom: number,
+    outPtr: number,
+  ): number;
   vm_grow_state(
     oldStatePtr: number,
     oldStateLen: number,
     newStatePtr: number,
     newStateLen: number,
     grownSlot: number,
+    grownRoom: number,
   ): number;
   vm_execute_batch(
     stateBase: number,
@@ -244,6 +253,7 @@ const VM_EXPORT_NAMES = [
   'vm_reset_state',
   'vm_validate_state',
   'vm_get_needs_growth_slot',
+  'vm_get_needs_growth_room',
   'vm_calculate_grown_state_size',
   'vm_grow_state',
   'vm_execute_batch',
@@ -510,13 +520,21 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
   const growFromAuthority = (state: WasmStateHandle, program: ReducerProgram): number => {
     if (undoEnabled) return ErrorCode.NEEDS_GROWTH;
     const grownSlot = wasmInstance.exports.vm_get_needs_growth_slot() >>> 0;
+    const grownRoom = wasmInstance.exports.vm_get_needs_growth_room() >>> 0;
     if (grownSlot >= program.numSlots) return ErrorCode.INVALID_SLOT;
     const statePtr = stageState(state, 4);
     const outPtr = align8(statePtr + state.size);
-    const sized = wasmInstance.exports.vm_calculate_grown_state_size(statePtr, state.size, grownSlot, outPtr);
+    const sized = wasmInstance.exports.vm_calculate_grown_state_size(
+      statePtr,
+      state.size,
+      grownSlot,
+      grownRoom,
+      outPtr,
+    );
     if (sized !== ErrorCode.OK) return sized;
     const grownSize = new DataView(wasmInstance.memory.buffer).getUint32(outPtr, true);
-    if (grownSize <= state.size) return ErrorCode.INVALID_STATE;
+    // An arena compacted at its capacity gives room in an image of the same size.
+    if (grownSize < state.size) return ErrorCode.INVALID_STATE;
     // The grown image follows the old one in the same working set. A larger
     // reservation may move the region, which carries no contents: re-upload.
     const grownBase = wasmInstance.region.reserve(align8(state.size) + grownSize);
@@ -525,7 +543,14 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
     }
     const newStatePtr = align8(grownBase + state.size);
     new Uint8Array(wasmInstance.memory.buffer, newStatePtr, grownSize).fill(0);
-    const result = wasmInstance.exports.vm_grow_state(grownBase, state.size, newStatePtr, grownSize, grownSlot);
+    const result = wasmInstance.exports.vm_grow_state(
+      grownBase,
+      state.size,
+      newStatePtr,
+      grownSize,
+      grownSlot,
+      grownRoom,
+    );
     if (result !== ErrorCode.OK) return result;
     copyStateOut(state, newStatePtr, grownSize, grownSize);
     return ErrorCode.OK;

@@ -12,7 +12,7 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::nested_slot_data_size;
 use columine_vm::slot_growth::slot_data_size;
 use columine_vm::state_init::{
-    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, ProgramInvalidCause, SizingRefusal,
+    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, GrowthRoom, ProgramInvalidCause, SizingRefusal,
     arena_initial_capacity_64, calculate_grown_state_size, calculate_state_size,
     compute_struct_row_layout_padded, grow_state, init_state, reset_state,
     struct_map_slot_data_size, ttl_side_buffer_size, validate_state,
@@ -533,7 +533,8 @@ fn calculate_grown_state_size_hashmap_cap_doubles() {
     )
     .expect("init must succeed");
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     assert!(grown_size > size);
 
     let new_cap = 32u32; // nextPowerOf2(16*2)
@@ -826,9 +827,10 @@ fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
         insert_into_hashmap(&mut state, offset, cap, i, i * 10);
     }
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut grown, 0).expect("grow must succeed");
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).expect("grow must succeed");
 
     let new_offset = bytes::read_u32(&grown, meta);
     let new_cap = bytes::read_u32(&grown, meta + 4);
@@ -867,9 +869,10 @@ fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
     bytes::write_u32(&mut state, old_derived + capacity * 12 + 4, 0x5566_7788);
     bytes::write_u32(&mut state, old_derived + capacity * 12 + 12, 0xddee_ff00);
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut grown, 0).expect("grow must succeed");
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).expect("grow must succeed");
 
     let new_derived = bytes::read_u32(&grown, StateHeaderOffset::DERIVED_FACTS_OFFSET);
     assert_ne!(new_derived, old_derived);
@@ -933,9 +936,10 @@ fn grow_state_struct_map_rehashes_rows() {
     bytes::write_i64(&mut state, row + 1 + 4, -9); // INT64 field
     bytes::write_u32(&mut state, meta + 8, 1);
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut grown = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut grown, 0).expect("grow must succeed");
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).expect("grow must succeed");
 
     let new_offset = bytes::read_u32(&grown, meta);
     let new_cap = bytes::read_u32(&grown, meta + 4);
@@ -1233,9 +1237,9 @@ proptest! {
             insert_into_hashmap(&mut state, offset, cap, k, k.wrapping_mul(7));
         }
 
-        let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry") as usize;
+        let grown_size = calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry") as usize;
         let mut grown = vec![0u8; grown_size];
-        grow_state(&state, &mut grown, 0).expect("grow");
+        grow_state(&state, &mut grown, 0, GrowthRoom::Rows).expect("grow");
 
         let new_offset = bytes::read_u32(&grown, meta);
         let new_cap = bytes::read_u32(&grown, meta + 4);
@@ -1266,14 +1270,14 @@ proptest! {
         let meta = STATE_HEADER_SIZE;
         let cap1 = bytes::read_u32(&state, meta + 4);
 
-        let g1_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry") as usize;
+        let g1_size = calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry") as usize;
         let mut g1 = vec![0u8; g1_size];
-        grow_state(&state, &mut g1, 0).expect("grow 1");
+        grow_state(&state, &mut g1, 0, GrowthRoom::Rows).expect("grow 1");
         prop_assert_eq!(bytes::read_u32(&g1, meta + 4), next_pow2_check(cap1 * 2));
 
-        let g2_size = calculate_grown_state_size(&g1, 0).expect("valid growth geometry") as usize;
+        let g2_size = calculate_grown_state_size(&g1, 0, GrowthRoom::Rows).expect("valid growth geometry") as usize;
         let mut g2 = vec![0u8; g2_size];
-        grow_state(&g1, &mut g2, 0).expect("grow 2");
+        grow_state(&g1, &mut g2, 0, GrowthRoom::Rows).expect("grow 2");
         prop_assert_eq!(bytes::read_u32(&g2, meta + 4), next_pow2_check(cap1 * 4));
     }
 }

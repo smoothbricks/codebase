@@ -14,7 +14,7 @@ use columine_vm::bitmap_ops::{
 use columine_vm::hooks::NoVm;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, GrowthRoom,
     calculate_grown_state_size, calculate_state_size, grow_state, init_state,
 };
 use columine_vm::temporal::TEMPORAL_MAGIC;
@@ -633,14 +633,15 @@ fn growth_copies_only_the_image_and_zeroes_the_new_capacity() {
         .expect("image parses")
         .to_vec();
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry") as usize;
+    let grown_size = calculate_grown_state_size(&state, 0, GrowthRoom::Rows)
+        .expect("valid growth geometry") as usize;
     let mut grown = vec![0u8; grown_size];
     // Dirty exactly the region the grown bitmap slot will own: growth must
     // zero it, not inherit it. The slot offset is unchanged because the slot
     // count is.
     let dirty = meta.offset as usize;
     grown[dirty..dirty + bitmap_payload_capacity(32) as usize].fill(0xa5);
-    grow_state(&state, &mut grown, 0).expect("grow");
+    grow_state(&state, &mut grown, 0, GrowthRoom::Rows).expect("grow");
 
     let grown_meta = SlotMetaView::read(&grown, 0);
     assert_eq!(grown_meta.capacity, 32);
@@ -692,13 +693,13 @@ fn growth_refuses_an_unreadable_old_image() {
         let before = state.clone();
 
         assert_eq!(
-            calculate_grown_state_size(&state, 0),
+            calculate_grown_state_size(&state, 0, GrowthRoom::Rows),
             Err(ErrorCode::InvalidState)
         );
         let mut grown = vec![0xa5u8; state.len() * 2];
         let destination_before = grown.clone();
         assert_eq!(
-            grow_state(&state, &mut grown, 0),
+            grow_state(&state, &mut grown, 0, GrowthRoom::Rows),
             Err(ErrorCode::InvalidState),
             "a corrupt bitmap slot refuses growth"
         );

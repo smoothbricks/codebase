@@ -179,17 +179,19 @@ fn actual_bounds_and_committed_growth_preserve_both_window_authorities() {
     let mut output = [0xa5; 4];
     __register_region(output.as_ptr(), output.len());
     assert_eq!(
-        unsafe { vm_calculate_grown_state_size(state.as_ptr(), size + 1, 0, output.as_mut_ptr()) },
+        unsafe {
+            vm_calculate_grown_state_size(state.as_ptr(), size + 1, 0, 0, output.as_mut_ptr())
+        },
         ErrorCode::InvalidState as u32
     );
     assert_eq!(output, [0xa5; 4]);
     assert_eq!(
-        unsafe { vm_calculate_grown_state_size(state.as_ptr(), size, 0, state.as_mut_ptr()) },
+        unsafe { vm_calculate_grown_state_size(state.as_ptr(), size, 0, 0, state.as_mut_ptr()) },
         ErrorCode::InvalidState as u32
     );
     assert_eq!(state, before_growth);
     assert_eq!(
-        unsafe { vm_calculate_grown_state_size(state.as_ptr(), size, 0, output.as_mut_ptr()) },
+        unsafe { vm_calculate_grown_state_size(state.as_ptr(), size, 0, 0, output.as_mut_ptr()) },
         ErrorCode::Ok as u32
     );
     let grown_size = u32::from_le_bytes(output);
@@ -198,7 +200,7 @@ fn actual_bounds_and_committed_growth_preserve_both_window_authorities() {
     let untouched = grown.clone();
     let before_checkpoint = unsafe { vm_undo_checkpoint(state.as_mut_ptr()) };
     assert_eq!(
-        unsafe { vm_grow_state(state.as_ptr(), size, grown.as_mut_ptr(), grown_size, 0) },
+        unsafe { vm_grow_state(state.as_ptr(), size, grown.as_mut_ptr(), grown_size, 0, 0) },
         ErrorCode::NeedsGrowth as u32
     );
     assert_eq!(grown, untouched);
@@ -217,18 +219,27 @@ fn actual_bounds_and_committed_growth_preserve_both_window_authorities() {
     unsafe { vm_undo_commit(state.as_mut_ptr(), checkpoint) };
 
     assert_eq!(
-        unsafe { vm_grow_state(state.as_ptr(), size, grown.as_mut_ptr(), grown_size - 1, 0) },
+        unsafe {
+            vm_grow_state(
+                state.as_ptr(),
+                size,
+                grown.as_mut_ptr(),
+                grown_size - 1,
+                0,
+                0,
+            )
+        },
         ErrorCode::InvalidState as u32
     );
     assert_eq!(grown, untouched);
     assert_eq!(
-        unsafe { vm_grow_state(state.as_ptr(), size, state.as_mut_ptr(), size, 0) },
+        unsafe { vm_grow_state(state.as_ptr(), size, state.as_mut_ptr(), size, 0, 0) },
         ErrorCode::InvalidState as u32
     );
     assert_eq!(state, initial);
     grown.fill(0);
     assert_eq!(
-        unsafe { vm_grow_state(state.as_ptr(), size, grown.as_mut_ptr(), grown_size, 0) },
+        unsafe { vm_grow_state(state.as_ptr(), size, grown.as_mut_ptr(), grown_size, 0, 0) },
         ErrorCode::Ok as u32
     );
     assert_eq!(

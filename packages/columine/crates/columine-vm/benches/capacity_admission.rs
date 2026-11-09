@@ -19,7 +19,8 @@ use std::time::Instant;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{ErrorCode, Opcode, SlotType};
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
+    init_state,
 };
 use columine_vm::vm::{Vm, u32s_as_bytes};
 
@@ -179,9 +180,10 @@ fn stream(batches: u32, rows: usize, new_percent: u64) {
                 OK => break,
                 NEEDS_GROWTH => {
                     let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
-                    let size = calculate_grown_state_size(&state, slot).expect("grown size");
+                    let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+                    let size = calculate_grown_state_size(&state, slot, room).expect("grown size");
                     let mut next = vec![0u8; size as usize];
-                    vm.grow_state(&state, &mut next, slot).expect("grow");
+                    vm.grow_state(&state, &mut next, slot, room).expect("grow");
                     state = next;
                     growths += 1;
                 }

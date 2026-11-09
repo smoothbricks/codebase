@@ -45,7 +45,7 @@ use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{ErrorCode, STATE_HEADER_SIZE};
 use columine_vm::bytes;
 use columine_vm::key_index::NoStrings;
-use columine_vm::state_init::{self, SIZING_RECORD_LEN, sizing_record};
+use columine_vm::state_init::{self, GrowthRoom, SIZING_RECORD_LEN, sizing_record};
 use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap2, Vm};
 
 // =============================================================================
@@ -370,17 +370,32 @@ pub extern "C" fn vm_get_needs_growth_slot() -> u32 {
         .unwrap_or(state_init::NO_GROWTH_SLOT)
 }
 
+/// The room the slot that asked for growth lacked, as `GrowthRoom::abi`
+/// words (0 its rows, 1 a struct map's arena), or `NO_GROWTH_SLOT` when the
+/// runtime VM's last batch asked for none. The host passes it to sizing and
+/// growth.
+#[unsafe(no_mangle)]
+pub extern "C" fn vm_get_needs_growth_room() -> u32 {
+    rt().vm
+        .needs_growth_room()
+        .map_or(state_init::NO_GROWTH_SLOT, GrowthRoom::abi)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vm_calculate_grown_state_size(
     old_state_ptr: *const u8,
     old_state_len: u32,
     grown_slot_idx: u32,
+    grown_room: u32,
     out_ptr: *mut u8,
 ) -> u32 {
     if !range_is_bounded(out_ptr as usize, 4) || !disjoint(old_state_ptr, old_state_len, out_ptr, 4)
     {
         return ErrorCode::InvalidState as u32;
     }
+    let Some(room) = GrowthRoom::from_abi(grown_room) else {
+        return ErrorCode::InvalidState as u32;
+    };
     let old = match unsafe { bounded_buf(old_state_ptr, old_state_len) } {
         Ok(state) => state,
         Err(_) => return ErrorCode::InvalidState as u32,
@@ -388,7 +403,7 @@ pub unsafe extern "C" fn vm_calculate_grown_state_size(
     unsafe {
         write_extent(
             out_ptr,
-            state_init::calculate_grown_state_size(old, grown_slot_idx),
+            state_init::calculate_grown_state_size(old, grown_slot_idx, room),
         )
     }
 }
@@ -400,6 +415,7 @@ pub unsafe extern "C" fn vm_grow_state(
     new_state_ptr: *mut u8,
     new_state_len: u32,
     grown_slot_idx: u32,
+    grown_room: u32,
 ) -> u32 {
     if !range_is_bounded(old_state_ptr as usize, old_state_len as usize)
         || !range_is_bounded(new_state_ptr as usize, new_state_len as usize)
@@ -407,9 +423,12 @@ pub unsafe extern "C" fn vm_grow_state(
     {
         return ErrorCode::InvalidState as u32;
     }
+    let Some(room) = GrowthRoom::from_abi(grown_room) else {
+        return ErrorCode::InvalidState as u32;
+    };
     let old = unsafe { core::slice::from_raw_parts(old_state_ptr, old_state_len as usize) };
     let new = unsafe { core::slice::from_raw_parts_mut(new_state_ptr, new_state_len as usize) };
-    err_code(rt().vm.grow_state(old, new, grown_slot_idx))
+    err_code(rt().vm.grow_state(old, new, grown_slot_idx, room))
 }
 
 // =============================================================================

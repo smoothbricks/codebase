@@ -37,7 +37,8 @@ use columine_vm::row_exprs::{
     RowPlan, StoredBinding, StoredRow, bind_row_columns,
 };
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_grown_state_size, calculate_state_size, init_state,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
+    init_state,
 };
 use columine_vm::vm::{Vm, col_i64_exact, col_u32_exact, i64s_as_bytes, u32s_as_bytes};
 use common::memory::with_allocations;
@@ -900,9 +901,10 @@ fn run_growing(
             NEEDS_GROWTH => {
                 assert_eq!(&before, state, "a refused batch wrote state");
                 let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
-                let size = calculate_grown_state_size(state, slot).expect("grown size");
+                let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+                let size = calculate_grown_state_size(state, slot, room).expect("grown size");
                 let mut next = vec![0u8; usize::try_from(size).expect("size fits usize")];
-                vm.grow_state(state, &mut next, slot).expect("grow");
+                vm.grow_state(state, &mut next, slot, room).expect("grow");
                 *state = next;
             }
             other => panic!("batch refused with {other}"),

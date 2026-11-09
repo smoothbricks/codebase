@@ -53,7 +53,9 @@ fn checked_binding_accepts_unordered_offsets_and_rejects_every_corrupt_geometry(
     let first = state_init::bind_struct_map(&state, 1).expect("physically first slot");
     let second = state_init::bind_struct_map(&state, 0).expect("physically second slot");
     assert!(first.slot_offset < second.slot_offset);
-    assert!(state_init::calculate_grown_state_size(&state, 1).is_ok());
+    assert!(
+        state_init::calculate_grown_state_size(&state, 1, state_init::GrowthRoom::Rows).is_ok()
+    );
     assert!(matches!(
         state_init::bind_struct_map(&state, 2),
         Err(ErrorCode::InvalidSlot)
@@ -95,7 +97,7 @@ fn checked_binding_accepts_unordered_offsets_and_rejects_every_corrupt_geometry(
         let mut destination = vec![0xa5; state.len() * 2];
         let before = destination.clone();
         assert_eq!(
-            state_init::grow_state(&corrupt, &mut destination, 1),
+            state_init::grow_state(&corrupt, &mut destination, 1, state_init::GrowthRoom::Rows),
             Err(ErrorCode::InvalidState)
         );
         assert_eq!(
@@ -153,17 +155,17 @@ fn init_and_growth_refuse_short_destinations_without_touching_them() {
     );
     assert_eq!(short, before);
     let state = initialized();
-    let required =
-        state_init::calculate_grown_state_size(&state, 1).expect("checked growth extent");
+    let required = state_init::calculate_grown_state_size(&state, 1, state_init::GrowthRoom::Rows)
+        .expect("checked growth extent");
     let mut short = vec![0xa5; required as usize - 1];
     let before = short.clone();
     assert_eq!(
-        state_init::grow_state(&state, &mut short, 1),
+        state_init::grow_state(&state, &mut short, 1, state_init::GrowthRoom::Rows),
         Err(ErrorCode::InvalidState)
     );
     assert_eq!(short, before);
     assert_eq!(
-        state_init::calculate_grown_state_size(&state, 2),
+        state_init::calculate_grown_state_size(&state, 2, state_init::GrowthRoom::Rows),
         Err(ErrorCode::InvalidSlot)
     );
 }
@@ -232,17 +234,18 @@ proptest::proptest! {
             if result == ErrorCode::Ok as u32 { break; }
             proptest::prop_assert_eq!(result, ErrorCode::NeedsGrowth as u32);
             let slot = vm.needs_growth_slot().expect("NEEDS_GROWTH names its slot");
-            let required = state_init::calculate_grown_state_size(&committed, slot).expect("checked growth");
+            let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
+            let required = state_init::calculate_grown_state_size(&committed, slot, room).expect("checked growth");
             let mut grown = vec![0; required as usize];
             let active_checkpoint = vm.undo_checkpoint();
-            proptest::prop_assert_eq!(vm.grow_state(&state, &mut grown, slot), Err(ErrorCode::NeedsGrowth));
+            proptest::prop_assert_eq!(vm.grow_state(&state, &mut grown, slot, room), Err(ErrorCode::NeedsGrowth));
             proptest::prop_assert_eq!(vm.undo_checkpoint(), active_checkpoint);
             proptest::prop_assert!(grown.iter().all(|&byte| byte == 0));
             let logical = vm.undo_rollback(&mut state, checkpoint).expect("full-window rollback");
             proptest::prop_assert_eq!(logical, state.len() as u32);
             proptest::prop_assert_eq!(&state, &committed);
             vm.undo_commit();
-            vm.grow_state(&state, &mut grown, slot).expect("committed growth");
+            vm.grow_state(&state, &mut grown, slot, room).expect("committed growth");
             proptest::prop_assert_eq!(&state, &committed, "growth preserves its old authority");
             proptest::prop_assert_eq!(columine_vm::vm::CheckedMap::bind(&grown, 0).map(|map| map.get(0)), Ok(Some(42)));
             proptest::prop_assert_eq!(bytes::read_u32(&grown, STATE_HEADER_SIZE + SlotMetaOffset::SIZE), 1);

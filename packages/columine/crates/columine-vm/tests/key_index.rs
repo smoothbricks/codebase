@@ -12,7 +12,7 @@ use columine_vm::bytes;
 use columine_vm::key_index::{HashIndex, KeyIndex, KeyLanes, LaneKind, NoStrings};
 use columine_vm::logical_export::{SlotEncoding, export_slot};
 use columine_vm::state_init::{
-    DEFAULT_ACCEPTED_PROGRAM_MAGICS, ProgramInvalidCause, SizingRefusal,
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, ProgramInvalidCause, SizingRefusal,
     calculate_grown_state_size, calculate_state_size, init_state, validate_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
@@ -528,7 +528,7 @@ fn a_state_header_of_another_family_is_refused() {
 
     assert_eq!(validate_state(&foreign), Err(ErrorCode::InvalidState));
     assert_eq!(
-        calculate_grown_state_size(&foreign, PAIRS),
+        calculate_grown_state_size(&foreign, PAIRS, GrowthRoom::Rows),
         Err(ErrorCode::InvalidState)
     );
     assert!(matches!(

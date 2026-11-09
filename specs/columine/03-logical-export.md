@@ -42,8 +42,9 @@ writes because the imported image is a new snapshot, not a mutation of a live on
 (aggregates and scalars are overwritten whole), duplicate and sentinel keys refuse, a row whose comparison timestamp the
 target cannot store (or that lacks one the target stores) refuses rather than inventing or dropping it, an aggregate
 whose stated subtype differs from the target's (including a nested slot's inner aggregate) refuses, and when rows, a
-bitmap image, a struct arena, or an eviction index outgrow the target slot the image grows through grow_state, so
-unchanged regions copy exactly the way growth copies them. Change flags stay clear.
+bitmap image, a struct arena, or an eviction index outgrow the target slot the image grows through grow_state for the
+room the slot lacks (a struct map's rows or its arena), so unchanged regions copy exactly the way growth copies them.
+Change flags stay clear.
 
 A condition-tree import writes derived-facts cells at their exported positions, tombstones included, so probe chains
 survive; importing into a table of another capacity leaves rehashing to the owner of the derived-facts table, as after

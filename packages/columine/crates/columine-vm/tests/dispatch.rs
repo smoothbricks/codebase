@@ -12,7 +12,8 @@ use columine_vm::bytes;
 use columine_vm::hashmap_ops::{CmpType, Strategy};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::state_init::{
-    EVICTION_ENTRY_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
+    EVICTION_ENTRY_SIZE, GrowthRoom, calculate_grown_state_size, calculate_state_size, grow_state,
+    init_state,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use columine_vm::temporal::TEMPORAL_MAGIC;
@@ -792,9 +793,10 @@ fn slot_growth_grow_preserves_hashmap_entries_and_aggregate() {
     let agg_off = slot_offset(&state, 1);
     assert_eq!(11, bytes::read_u64(&state, agg_off));
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size =
+        calculate_grown_state_size(&state, 0, GrowthRoom::Rows).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut new_state, 0).expect("grow_state");
+    grow_state(&state, &mut new_state, 0, GrowthRoom::Rows).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     assert_eq!(11, slot_size(&new_state, 0));
@@ -833,10 +835,11 @@ fn slot_growth_hashset_growth_preserves_elements() {
     let elem = [5000u32];
     let cols: Vec<&[u8]> = vec![u32s_as_bytes(&elem)];
     assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1));
+    let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
 
-    let grown_size = calculate_grown_state_size(&state, 0).expect("valid growth geometry");
+    let grown_size = calculate_grown_state_size(&state, 0, room).expect("valid growth geometry");
     let mut new_state = vec![0u8; grown_size as usize];
-    grow_state(&state, &mut new_state, 0).expect("grow_state");
+    grow_state(&state, &mut new_state, 0, room).expect("grow_state");
 
     assert_eq!(32, slot_cap(&new_state, 0));
     assert_eq!(11, slot_size(&new_state, 0));
@@ -3779,12 +3782,13 @@ fn growth_reports_and_grows_a_slot_past_one_byte() {
     assert_eq!(vm.needs_growth_slot(), Some(299));
 
     while vm.execute_batch(&mut state, &prog, &cols, 40) == NEEDS_GROWTH {
+        let room = vm.needs_growth_room().expect("NEEDS_GROWTH names its room");
         let mut grown = vec![
             0u8;
-            calculate_grown_state_size(&state, 299).expect("valid growth geometry")
+            calculate_grown_state_size(&state, 299, room).expect("valid growth geometry")
                 as usize
         ];
-        grow_state(&state, &mut grown, 299).expect("grow_state");
+        grow_state(&state, &mut grown, 299, room).expect("grow_state");
         state = grown;
     }
     let set = CheckedSet::bind(&state, 299).expect("valid set slot");
