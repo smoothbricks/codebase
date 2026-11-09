@@ -22,8 +22,10 @@
 # reads spelled physically so one -oso_prefix strips them all from a macOS debug map, and
 # -Zosx-rpath-install-name keyed as written rather than bypassing every compilation that carries
 # it, and each pool priority ordered by predicted run time with aged requests first, a reservation
-# named by its class (`mbx reserve --name`, the endpoint's `name`) so its run time is predicted, from
-# smoothbricks/mr-boxington at the pinned revision.
+# named by its class (`mbx reserve --name`, the endpoint's `name`) so its run time is predicted, and an
+# interactive priority above the gate's that decays to normal at 120 s and low at 240 s of its job's
+# age (MBX_SCHEDULER_JOB_STARTED_MS), each band its own lane, and a Nix shell's link variables refused
+# only when the driver's own ld is a wrapper, from smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -35,7 +37,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/702a07a3dad1712f238de3d9ca95c635e8839e3c";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/b9681c887a0931fab593bc224bb2b4ac61669233";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
