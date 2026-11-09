@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { readdir, readFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
+import { matchGlobPaths } from 'nx/src/native/index.js';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { parse as parseToml } from 'smol-toml';
 import typia from 'typia';
@@ -327,6 +328,21 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
           ...(tasks.dependencies[id] ?? []).map((edge) => edge.id),
         ]);
         expect(reached, `${platform} ${lane}`).toContain(`nextest-extract:${producer}`);
+      }
+      // The runner's command (`target-dir`) and fixture (`ensure`) run the helper that producer builds, so its bytes key
+      // every runner, each crate's pieces as well as the groups.
+      const helper = `packages/nextest-extract/dist/bin/${platform}-${arch}/smoo-nx-nextest-binaries`;
+      for (const [project, target] of [
+        [ROOT_PROJECT, DEVICE_GROUP],
+        ['cowshed', 'cargo-test-cowshed-core-shard1'],
+        ['lmao', 'cargo-test-lmao-core'],
+      ] as const) {
+        const runner = inferred.nodes[project]?.data.targets?.[target];
+        if (typeof runner?.options?.command !== 'string') continue;
+        const globs = (runner.inputs ?? []).flatMap((input) =>
+          typeof input === 'object' && 'dependentTasksOutputFiles' in input ? [input.dependentTasksOutputFiles] : [],
+        );
+        expect(matchGlobPaths(globs, [helper])[0], `${platform} ${project}:${target}`).toBe(true);
       }
     }
     const nx = await readRecord('nx.json', JSON.parse);

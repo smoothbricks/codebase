@@ -861,8 +861,7 @@ function createCargoWasmTarget(
  * Nx there is no task hash, and a build no task names is refused here rather
  * than by every runner.
  *
- * `inputs` is the workspace's Cargo union. The build runs the nextest helper it
- * depends on (`record`), so a workspace that builds that helper keys its bytes.
+ * `inputs` is the workspace's Cargo union; the build also runs the nextest helper (`record`).
  */
 function createCargoTestBuildTarget(
   projectRoot: string,
@@ -870,19 +869,12 @@ function createCargoTestBuildTarget(
   nativeTools: NativeTools | null,
   inputs: NonNullable<TargetConfiguration['inputs']>,
 ): TargetConfiguration {
-  const helperBin = 'smoo-nx-nextest-binaries';
-  const helper = nativeToolCommand(nativeTools, projectRoot, 'nextest-extract', helperBin);
-  const helperProducer = nativeToolDependsOn(nativeTools, 'nextest-extract');
+  const helper = nativeToolCommand(nativeTools, projectRoot, 'nextest-extract', NEXTEST_HELPER_BIN);
   return {
     executor: 'nx:run-commands',
     metadata: CARGO_PRODUCER_METADATA,
     cache: true,
-    inputs: [
-      ...inputs,
-      ...(helperProducer.length > 0 && nativeTools !== null
-        ? [{ dependentTasksOutputFiles: `**/dist/bin/${nativeTools.platform}/${helperBin}`, transitive: false }]
-        : []),
-    ],
+    inputs: [...inputs, ...nextestHelperInputs(nativeTools)],
     outputs: [
       `{projectRoot}/${NEXTEST_BINARIES_METADATA}`,
       `{projectRoot}/${NEXTEST_CARGO_METADATA}`,
@@ -910,6 +902,21 @@ function createCargoTestBuildTarget(
  */
 function nextestBinariesBuild(toolConfig: string): string {
   return cargoFrozen(`${NEXTEST_BINARIES_BUILD_ARGS.join(' ')} ${toolConfig}`);
+}
+
+/** The nextest helper the test build and every runner run (`record`, `ensure`, `target-dir`). */
+const NEXTEST_HELPER_BIN = 'smoo-nx-nextest-binaries';
+
+/**
+ * The helper's bytes, for a target that runs it, where this workspace builds it: the producer edge orders the build and
+ * this input keys what the target runs. An installed helper is its package's, keyed as the package.
+ */
+function nextestHelperInputs(
+  nativeTools: NativeTools | null,
+): { dependentTasksOutputFiles: string; transitive: false }[] {
+  return nativeTools !== null && nativeToolDependsOn(nativeTools, 'nextest-extract').length > 0
+    ? [{ dependentTasksOutputFiles: `**/dist/bin/${nativeTools.platform}/${NEXTEST_HELPER_BIN}`, transitive: false }]
+    : [];
 }
 
 /**
@@ -3526,7 +3533,7 @@ const NEXTEST_BINARIES_FIXTURE_TIMEOUT_MS = 3_600_000;
  * from the run's, and names the crates loudly when mbx had to compile (smoo-nx-nextest-binaries).
  */
 function nextestRunnerFixture(workspace: CargoWorkspace, nativeTools: NativeTools | null): string {
-  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
+  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', NEXTEST_HELPER_BIN);
   return `${helper} ensure ${NEXTEST_BINARIES_METADATA} ${NEXTEST_BUILD_KEY} -- ${nextestBinariesBuild(nextestToolConfigArg(workspace.projectRoot))}`;
 }
 
@@ -3544,7 +3551,7 @@ function nextestRunnerCommand(
 ): string {
   const toolConfig = nextestToolConfigArg(workspace.projectRoot);
   // Relative to the runner's cwd, so the hashed command is the same in every checkout.
-  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', 'smoo-nx-nextest-binaries');
+  const helper = nativeToolCommand(nativeTools, workspace.projectRoot, 'nextest-extract', NEXTEST_HELPER_BIN);
   const reuseBuild =
     `--binaries-metadata ${NEXTEST_BINARIES_METADATA} --cargo-metadata ${NEXTEST_CARGO_METADATA} ` +
     `--target-dir-remap "$(${helper} target-dir)"`;
@@ -3564,7 +3571,8 @@ function cargoTestRunnerTarget(
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
-    inputs,
+    // The command (`target-dir`) and the fixture (`ensure`) run the nextest helper.
+    inputs: [...inputs, ...nextestHelperInputs(nativeTools)],
     dependsOn: [build, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
       command: nextestRunnerCommand(
@@ -3602,7 +3610,7 @@ function cargoTestGroupTarget(
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
-    inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND)],
+    inputs: [...inputs, fileHashInput(PLUGIN_NEXTEST_CODE_BOUND), ...nextestHelperInputs(nativeTools)],
     dependsOn: [CARGO_TEST_BUILD_TARGET, ...nativeToolDependsOn(nativeTools, 'nextest-extract')],
     options: {
       command: nextestRunnerCommand('run', workspace, nativeTools, group.filter, ' --no-fail-fast --no-tests=fail'),

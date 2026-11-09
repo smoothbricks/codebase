@@ -1308,9 +1308,10 @@ Concrete targets come from concrete files:
   `dependsOn` that a compile can read: one `{dependentTasksOutputFiles: "<fileset>", transitive: false}` per positive
   file set of that union, its `{workspaceRoot}/` anchor dropped because Nx matches the glob against each output's
   workspace-relative path. A generated crate source, a compiled-in file or a manifest a producer writes keys them; a
-  producer's output anywhere else, such as a TypeScript package's `dist`, keys none of them. The test build also keys
-  the local nextest helper it runs (`**/dist/bin/<platform>/smoo-nx-nextest-binaries`) where the workspace builds it.
-  Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs
+  producer's output anywhere else, such as a TypeScript package's `dist`, keys none of them. The test build (`record`)
+  and every runner, each crate's pieces and the serial groups (`target-dir` in the command, `ensure` in the fixture),
+  key the local nextest helper they run (`**/dist/bin/<platform>/smoo-nx-nextest-binaries`) where the workspace builds
+  it. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs
   include the crates Cargo builds for that crate's tests (from Cargo's locked resolve: its dependencies and its own
   dev-dependencies, never the dev-dependencies of the crates below it), and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
