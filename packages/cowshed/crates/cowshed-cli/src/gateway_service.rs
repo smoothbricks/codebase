@@ -367,17 +367,11 @@ pub async fn reconcile_native_project(
     reconcile_project_for_backend(repo_id, storage, assigner, GatewayStoreBackend::Native).await
 }
 
-/// Reconcile a caller-owned directory store's project: its sessions derive from the
-/// directory host's proven mount records, not the kernel mount table.
-pub async fn reconcile_directory_project(
-    repo_id: &RepoId,
-    storage: &ValidatedHostStorage,
-    assigner: &dyn PortSlotAssigner,
-) -> Result<ReconcileReport> {
-    reconcile_project_for_backend(repo_id, storage, assigner, GatewayStoreBackend::Directory).await
-}
-
-async fn reconcile_project_for_backend(
+/// Reconcile one project's gateway sessions against its store's inventory: the one function every
+/// path that changes a project's sessions runs, the CLI verbs through [`crate::runtime::ActorBridge`]
+/// and `cowshed controller` after a retire (06_cli.md). A directory store's sessions derive from
+/// the directory host's proven mount records, not the kernel mount table.
+pub async fn reconcile_project_for_backend(
     repo_id: &RepoId,
     storage: &ValidatedHostStorage,
     assigner: &dyn PortSlotAssigner,

@@ -9,19 +9,29 @@
 //!
 //! Gateway reconciliation belongs to Core work admission after route and live-incarnation
 //! fences (05_gateway.md "Control plane"). This relay forwards both worker and coordinator
-//! execution unchanged; it performs no preflight effects before Core authorizes the request.
+//! execution unchanged; it performs no preflight effects before Core authorizes the request. Its one
+//! effect of its own comes after a retire, which it serves like any other call: it reconciles the
+//! project's gateway sessions through the function the CLI verbs run, before it answers
+//! (06_cli.md, `cowshed controller`).
 
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::gateway_service::{self, PortSlotAssigner};
+use async_trait::async_trait;
+use cowshed_core::api::EmptyResult;
+use cowshed_core::api::operations::{CoordinatorAssignSlot, OperationRequest, SlotRequest};
 use cowshed_core::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, serve_controller_connection,
 };
+use cowshed_core::metadata::WorkspaceName;
+use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
-use cowshed_core::{CowshedError, Result};
+use cowshed_core::{CowshedError, GatewayStoreBackend, Result, ValidatedHostStorage};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -96,11 +106,30 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
         crate::gateway_service::runtime_control,
     )
     .await?;
+    serve_runtime(runtime, GatewayStoreBackend::Native, socket).await
+}
+
+/// Serve one coordinator connection on `socket` over an opened `runtime` of the `backend` store
+/// until its peer closes it, then shut the project down.
+pub async fn serve_runtime(
+    runtime: ProjectRuntime,
+    backend: GatewayStoreBackend,
+    socket: OwnedFd,
+) -> Result<()> {
     let authority = ConnectionAuthority::Coordinator {
         repo_id: runtime.descriptor().repo_id.clone(),
     };
+    let gateway = Arc::new(ProjectGateway {
+        repo_id: runtime.descriptor().repo_id.clone(),
+        storage: runtime.descriptor().storage.clone(),
+        backend,
+        slots: RouterSlots {
+            router: runtime.router(),
+            repo_id: runtime.descriptor().repo_id.clone(),
+        },
+    });
     let (router, calls) = RouterHandle::relaying(RELAY_CAPACITY, &runtime.router());
-    let relay = tokio::spawn(relay(calls, runtime.router()));
+    let relay = tokio::spawn(relay(calls, runtime.router(), gateway));
     let served = serve_controller_connection(socket, authority, router).await;
     let relayed = relay
         .await
@@ -109,15 +138,80 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     served.and(relayed).and(shutdown)
 }
 
+/// The gateway sessions of the project this controller serves, reconciled the way every CLI verb
+/// that changes the project reconciles them (06_cli.md, `cowshed controller`).
+struct ProjectGateway {
+    repo_id: RepoId,
+    storage: ValidatedHostStorage,
+    backend: GatewayStoreBackend,
+    slots: RouterSlots,
+}
+
+impl ProjectGateway {
+    async fn reconcile(&self) -> Result<()> {
+        gateway_service::reconcile_project_for_backend(
+            &self.repo_id,
+            &self.storage,
+            &self.slots,
+            self.backend,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// Port-slot assignment through the served runtime's own router, as the CLI's embedded
+/// coordinator asks it: a reconcile that moves a workspace off an occupied port block publishes
+/// the replacement grant through the project's actor.
+struct RouterSlots {
+    router: RouterHandle,
+    repo_id: RepoId,
+}
+
+#[async_trait]
+impl PortSlotAssigner for RouterSlots {
+    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
+        let workspace = WorkspaceName::new(workspace)
+            .map_err(|error| CowshedError::usage(error.to_string(), "name a workspace"))?;
+        self.router
+            .call::<CoordinatorAssignSlot>(
+                ConnectionAuthority::Coordinator {
+                    repo_id: self.repo_id.clone(),
+                },
+                SlotRequest {
+                    repo_id: self.repo_id.clone(),
+                    workspace,
+                    slot,
+                },
+            )
+            .await
+            .map(|EmptyResult {}| ())
+    }
+}
+
+/// Whether `operation` retires workspaces when it succeeds: a destroy, and a land that retires its
+/// unit (and the peers it folds). A preflight retires nothing.
+fn retires_a_workspace(operation: &OperationRequest) -> bool {
+    match operation {
+        OperationRequest::CoordinatorDestroy(_) => true,
+        OperationRequest::CoordinatorLand(land) => land.options.retire && !land.options.preflight,
+        _ => false,
+    }
+}
+
 /// Forward calls independently so a job wait never holds the calls behind it. Core owns
 /// admission and gateway preparation for both decoded execution routes.
-async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle) {
+async fn relay(
+    mut calls: mpsc::Receiver<RouterCommand>,
+    router: RouterHandle,
+    gateway: Arc<ProjectGateway>,
+) {
     let mut open = JoinSet::new();
     loop {
         tokio::select! {
             call = calls.recv() => match call {
                 Some(call) => {
-                    open.spawn(answer(call, router.clone()));
+                    open.spawn(answer(call, router.clone(), Arc::clone(&gateway)));
                 }
                 None => return,
             },
@@ -130,10 +224,22 @@ async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle) {
     }
 }
 
-async fn answer(call: RouterCommand, router: RouterHandle) {
+async fn answer(call: RouterCommand, router: RouterHandle, gateway: Arc<ProjectGateway>) {
     let (request, reply) = call.into_parts();
     let (authority, operation, upload, steps) = request.into_parts();
+    let retires = retires_a_workspace(&operation);
     let response = router.route(authority, operation, upload, steps).await;
+    // The retire is done: a gateway that refuses the reconcile is said, and the retire answers as
+    // done, since the project's next reconcile removes the session it left.
+    if retires
+        && response.is_ok()
+        && let Err(error) = gateway.reconcile().await
+    {
+        cowshed_os::eprintln!(
+            "cowshed: the gateway's view of {} is stale after a retire: {error}",
+            gateway.repo_id
+        );
+    }
     // A peer that has gone away no longer wants the answer; its connection already dropped it.
     let _ = reply.send(response);
 }

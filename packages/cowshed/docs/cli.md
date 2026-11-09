@@ -1556,7 +1556,8 @@ cowshed build, and the daemon starts workspace supervisors only for its own, so 
 this command of the host's `cowshed` and speaks the controller protocol on its end of the socket
 ([integrations](integrations.md#embedding-the-controller)). Nothing is written to stdout; the command exits 0 when the
 embedding process closes its end. A terminal or a pipe on standard input is refused with exit 2 before the project is
-resolved. The project's gateway sessions are reconciled before each exec, shell and checked land.
+resolved. The project's gateway sessions are reconciled before each exec, shell and checked land, and after each retire
+(`coordinator.destroy`, a `coordinator.land` that retires).
 
 ### `cowshed disk-command <diskutil|hdiutil> -- <args...>`
 

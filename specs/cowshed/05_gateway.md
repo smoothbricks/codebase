@@ -841,6 +841,18 @@ session or grants record, evict no foreign session, and never allocate a replace
 logs and status do not prepare gateway sessions. Project-wide reconciliation and port repair belong to lifecycle and
 maintenance verbs.
 
+<a id="smoo/cowshed!n/controller-retire-reconcile"></a>**A retire reconciles the project's sessions on every path that
+serves it.** `rm`, and a land that retires with the workspaces it folds, are lifecycle verbs: once the retire has
+answered its own work, the project's gateway sessions are reconciled against its inventory, which removes the retired
+workspaces' sessions, as every CLI verb that changes the project's mounts does. The embedding process's
+`cowshed controller` serves the same two operations (`coordinator.destroy`, and `coordinator.land` that retires) and
+runs the same reconcile, through the one function the CLI runs, before it answers: a retire it served leaves the gateway
+no session for the retired workspace, so a run that forks and retires workspaces through the controller does not
+accumulate sessions until some CLI verb reconciles the project. The retire is done by then, so a reconcile the gateway
+refuses is said on the controller's stderr and the retire answers as done; the session it left is removed by the
+project's next reconcile, and the CLI verb exits with the refusal. A preflight and a retire that refused or failed
+reconcile nothing.
+
 The runtime owns one control client constructed from its validated host storage through the existing `GatewayControl`
 trait. The CLI supplies the transport at construction; core does not link the daemon or select an ambient control
 socket, and no default or no-op client can silently bypass preparation. Workspace operations borrow that client.

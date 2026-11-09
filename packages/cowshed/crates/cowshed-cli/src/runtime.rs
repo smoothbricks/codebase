@@ -1114,22 +1114,14 @@ impl CliService for ActorBridge {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })?
             .descriptor();
-        match self.backend {
-            GatewayStoreBackend::Native => gateway_service::reconcile_native_project(
-                &descriptor.repo_id,
-                &descriptor.storage,
-                self.coordinator()?,
-            )
-            .await
-            .map(|_| ()),
-            GatewayStoreBackend::Directory => gateway_service::reconcile_directory_project(
-                &descriptor.repo_id,
-                &descriptor.storage,
-                self.coordinator()?,
-            )
-            .await
-            .map(|_| ()),
-        }
+        gateway_service::reconcile_project_for_backend(
+            &descriptor.repo_id,
+            &descriptor.storage,
+            self.coordinator()?,
+            self.backend,
+        )
+        .await
+        .map(|_| ())
     }
     async fn shutdown(self) -> Result<()> {
         ActorBridge::shutdown(self).await

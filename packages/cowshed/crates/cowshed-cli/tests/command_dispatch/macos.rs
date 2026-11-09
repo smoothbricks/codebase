@@ -5,26 +5,27 @@ use cowshed_apfs::{
     SystemCommandRunner,
 };
 use cowshed_cli::args::parse_args;
+use cowshed_cli::controller_service;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
-use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
-    Adoption, AdoptionSkip, DatabaseHolder, ExpectedRefHead, GcReport, GitOid, LandReport,
-    LandSeed, LandedReport, RebaseReport,
+    Adoption, AdoptionSkip, DatabaseHolder, ExpectedRefHead, GcReport, GitOid, LandOptions,
+    LandReport, LandSeed, LandedReport, RebaseReport, RemoveOptions,
 };
+use cowshed_core::api::{Coordinator, JsonEnvelope};
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
 };
 use cowshed_core::metadata::{PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
-use cowshed_core::runtime::RecoveryScope;
 use cowshed_core::runtime::land_lease::{self, Holding};
+use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
-use cowshed_core::{ErrorCode, Result};
+use cowshed_core::{Cowshed, ErrorCode, GatewayStoreBackend, Result};
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, CredentialError, CredentialProvider, CredentialQuery,
     CredentialRecord, Gateway, GatewayConfig, MirrorCacheConfig, SystemConnector,
@@ -39,7 +40,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::PipeReader;
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -2092,6 +2095,160 @@ async fn directory_unadopt_collects_only_its_project_and_runs_no_shared_temp_swe
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
+
+//#region smoo/cowshed!n/controller-retire-reconcile
+
+/// A `cowshed controller` served over a directory fixture's store, as an embedding process meets
+/// it: the embedder's coordinator on one end of a socketpair, the relay serving the other end in
+/// this process.
+struct ServedController {
+    coordinator: Coordinator,
+    served: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl ServedController {
+    async fn open(fixture: &Fixture) -> Self {
+        let runtime = ProjectRuntime::open_directory_existing_at(
+            &fixture.checkout,
+            RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            fixture.storage.clone(),
+            cowshed_cli::gateway_service::runtime_control,
+        )
+        .await
+        .expect("open the controller's project runtime");
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let served = tokio::spawn(controller_service::serve_runtime(
+            runtime,
+            GatewayStoreBackend::Directory,
+            OwnedFd::from(theirs),
+        ));
+        let (cowshed, token) = Cowshed::connect(OwnedFd::from(ours))
+            .await
+            .expect("coordinator handshake over the socketpair");
+        let project = cowshed
+            .open(&fixture.checkout)
+            .await
+            .expect("open the served project");
+        let coordinator = cowshed
+            .coordinator(&project, token)
+            .expect("the embedder's coordinator");
+        Self {
+            coordinator,
+            served,
+        }
+    }
+
+    /// The embedder closes its end: the controller ends and shuts its project down.
+    async fn close(self) {
+        let Self {
+            coordinator,
+            served,
+        } = self;
+        drop(coordinator);
+        served
+            .await
+            .expect("the controller task")
+            .expect("the controller serves until its peer closes");
+    }
+}
+
+/// How many sessions the fixture's gateway holds for `workspace` of the fixture's project.
+async fn gateway_sessions_of(fixture: &Fixture, workspace: &str) -> usize {
+    let repo = RepoId::parse("fixture/dispatch").expect("repository identity");
+    let prefix = cowshed_core::gateway_sessions::workspace_session_prefix(&repo, workspace);
+    fixture
+        .gateway
+        .as_ref()
+        .expect("running real gateway")
+        .handle()
+        .status()
+        .await
+        .expect("gateway status")
+        .sessions
+        .iter()
+        .filter(|session| session.workspace_id.starts_with(&prefix))
+        .count()
+}
+
+/// A workspace destroyed through `cowshed controller` leaves the gateway no session for it, as `cowshed
+/// rm` does, and leaves the sessions of every other workspace (05_gateway.md "Control plane").
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_workspace_destroyed_through_the_controller_leaves_the_gateway_no_session() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    new_workspace(&mut service, "retired").await;
+    assert_eq!(gateway_sessions_of(&fixture, "retired").await, 1);
+    service.shutdown().await.expect("stop the CLI runtime");
+
+    let controller = ServedController::open(&fixture).await;
+    controller
+        .coordinator
+        // Seconds old, so past the age floor only by force.
+        .destroy(
+            "retired",
+            RemoveOptions {
+                force: true,
+                ..RemoveOptions::default()
+            },
+        )
+        .await
+        .expect("destroy through the controller");
+    assert_eq!(
+        gateway_sessions_of(&fixture, "retired").await,
+        0,
+        "the retired workspace's session outlived its retire"
+    );
+    assert_eq!(
+        gateway_sessions_of(&fixture, "main").await,
+        1,
+        "main's session stands"
+    );
+    controller.close().await;
+    fixture.stop_gateway().await;
+}
+
+/// A workspace landed and retired through `cowshed controller` leaves the gateway no session for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_workspace_landed_through_the_controller_leaves_the_gateway_no_session() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").unwrap();
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    assert_eq!(gateway_sessions_of(&fixture, "topic").await, 1);
+    service.shutdown().await.expect("stop the CLI runtime");
+
+    let controller = ServedController::open(&fixture).await;
+    let landed = controller
+        .coordinator
+        .land(
+            "topic",
+            None,
+            LandOptions {
+                check: Some(vec!["/usr/bin/true".to_owned()]),
+                ..LandOptions::default()
+            },
+        )
+        .await
+        .expect("land through the controller");
+    assert!(matches!(landed, LandReport::Landed(_)), "{landed:?}");
+    assert_eq!(
+        gateway_sessions_of(&fixture, "topic").await,
+        0,
+        "the landed workspace's session outlived its retire"
+    );
+    assert_eq!(
+        gateway_sessions_of(&fixture, "main").await,
+        1,
+        "main's session stands"
+    );
+    controller.close().await;
+    fixture.stop_gateway().await;
+}
+
+//#endregion smoo/cowshed!n/controller-retire-reconcile
+
 /// Removing a detached workspace's gateway session unbinds its block's base until its next attach,
 /// and every fixture store and test gateway on the host shares the fixture partition: the store
 /// claims the block's first service port before the removal, so no claimant that binds it before

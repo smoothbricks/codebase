@@ -196,10 +196,11 @@ The program runs its controller as the host's own `cowshed` instead. It makes a 
 `Cowshed::connect(descriptor)` yields the same `Cowshed` and `CoordinatorToken` an in-process controller would, and
 every call it makes runs in the child. Dropping every handle closes the socket, and the child shuts the project down and
 exits 0. The child reconciles the project's gateway sessions before each exec, shell and checked land, as `cowshed exec`
-and `cowshed land --check` do, and records controller commitments into the host's default sink
-(`COWSHED_CONTINUITY_AUDIT`, [telemetry](telemetry.md)); the embedder keeps neither. A child that cannot open the
-project exits with the typed error on its stderr and closes the socket, so the embedder's handshake fails instead of
-waiting.
+and `cowshed land --check` do, and after each retire (`destroy`, a `land` that retires), as `cowshed rm` and
+`cowshed land` do, so a retired workspace leaves no session behind, and records controller commitments into the host's
+default sink (`COWSHED_CONTINUITY_AUDIT`, [telemetry](telemetry.md)); the embedder keeps neither. A child that cannot
+open the project exits with the typed error on its stderr and closes the socket, so the embedder's handshake fails
+instead of waiting.
 
 An install that starts the daemon of a new build leaves a running controller on the old one. The new daemon drains the
 old build's supervisors — each finishes its running jobs and retires — and refuses every ensure the old controller sends
