@@ -198,7 +198,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 shared_daemons: Vec::new(),
                 grants: Default::default(),
                 envrc_directory: None,
-                activation: Arc::new(tokio::sync::Mutex::new(())),
+                activation: Arc::new(ActivationGate::system()),
             }),
             ShellPoolConfig {
                 prewarm: false,

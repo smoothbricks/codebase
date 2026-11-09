@@ -129,6 +129,14 @@ serves every Cargo project, which reaches it through the Cargo shim that `cowshe
 capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or
 a host path where a command is spawned; its store path is only what the link resolves to.
 
+**A pin moves only once its mbx is built in the host's store, so no shell entry compiles it.** A project shell that
+names the pinned revision realizes it when it is evaluated, and the Nix daemon builds what no substituter serves. The
+daemon built mbx 14 times from 2026-11-03 to 2026-11-10, once per pin: whoever evaluated first after a pin paid a Cargo
+build of mbx inside the daemon (40+ min at load 146 on 2026-11-10), and every shed evaluating that pin waited on its
+store lock. The change that moves the pin therefore builds the new revision into the host's store, as `cowshed setup`
+builds `nix/mbx`, before it lands. A shell evaluation that stalls behind a build anyway is bounded by 11_shell.md, "Cold
+activation is single-flight per workspace".
+
 Managed-target seeding installs a profile's build-script shim pins before publishing a copied unit and rejects damaged
 donors, so cancellation cannot leave a fresh launcher without its executable. For unmeasured Cargo test binaries, the
 scheduler estimates at most half its CPU budget, rounded up, separately from one default memory share per binary. These

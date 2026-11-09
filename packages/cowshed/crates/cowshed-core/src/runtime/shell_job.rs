@@ -55,6 +55,10 @@ use crate::exec::{
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Spawn as _;
 
+#[path = "shell_evaluation.rs"]
+mod evaluation;
+use evaluation::{ActivationGate, Tee};
+
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
 /// and grants) bound to the same build volume, the same sandbox environment, the same `.envrc`
 /// or none, the same host program.
@@ -96,8 +100,9 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
-    /// Cold hosts share publication, not command execution or mutable shell state.
-    activation: Arc<tokio::sync::Mutex<()>>,
+    /// Cold hosts share publication, not command execution or mutable shell state; waiters see
+    /// the holder's evaluation, and one that stalls is ended.
+    activation: Arc<ActivationGate>,
     /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
     /// whose idle hosts end with it and whose executing hosts are not returned.
     pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
@@ -143,7 +148,7 @@ impl WorkspaceShells {
         Self {
             program,
             config,
-            activation: Arc::new(tokio::sync::Mutex::new(())),
+            activation: Arc::new(ActivationGate::system()),
             pools: BTreeMap::new(),
             retired: PoolCounts::default(),
         }
@@ -1230,7 +1235,7 @@ pub(super) struct HostActivator {
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
-    activation: Arc<tokio::sync::Mutex<()>>,
+    activation: Arc<ActivationGate>,
 }
 
 /// The inherited baseline of a host: its environment, the grants it runs under and the
@@ -1355,26 +1360,20 @@ impl HostActivator {
         };
         // The first cold host publishes the existing activation record. Other hosts then
         // verify and adopt that record instead of evaluating the same inputs concurrently.
-        let _activation = match self.activation.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                report_on(
-                    &stderr,
-                    "cowshed: waiting for this workspace's shell evaluation",
-                );
-                tokio::select! {
-                    guard = self.activation.lock() => guard,
-                    ended = host.fence.exited() => {
-                        return HostActivation::Broken(match ended {
-                            Ok(_) => CowshedError::conflict(
-                                "the exec host ended while waiting for the workspace shell evaluation",
-                                "retry the command",
-                            ),
-                            Err(error) => error,
-                        });
-                    }
+        let claim = match self.activation.try_claim() {
+            Some(claim) => claim,
+            None => tokio::select! {
+                claim = self.activation.claim(&stderr) => claim,
+                ended = host.fence.exited() => {
+                    return HostActivation::Broken(match ended {
+                        Ok(_) => CowshedError::conflict(
+                            "the exec host ended while waiting for the workspace shell evaluation",
+                            "retry the command",
+                        ),
+                        Err(error) => error,
+                    });
                 }
-            }
+            },
         };
         // A clone carries its origin's verified export (11_shell.md, "Shell activation and
         // process reuse"). Proving it for this checkout reads every recorded input once; a miss
@@ -1422,8 +1421,9 @@ impl HostActivator {
             Ok(request) => request,
             Err(error) => return HostActivation::Broken(protocol_error("request", error)),
         };
-        let evaluation_stderr = match stderr.try_clone() {
-            Ok(stderr) => stderr,
+        // The evaluation writes to the job's stderr through a tee that keeps its last line.
+        let (evaluation_stderr, mut tee) = match Tee::new(&stderr) {
+            Ok(tee) => tee,
             Err(error) => return HostActivation::Broken(pipe_error(error)),
         };
         if let Err(error) = host
@@ -1460,13 +1460,28 @@ impl HostActivator {
             Ok(request) => request,
             Err(error) => return HostActivation::Broken(protocol_error("request", error)),
         };
+        // Shared before the request, so the evaluation's start precedes anything its host does.
+        let evaluation = claim.evaluating(host.fence.pid());
         if let Err(error) = host.send(request, &[evaluation_stderr.as_raw_fd()]).await {
             return HostActivation::Broken(error);
         }
         drop(evaluation_stderr);
-        let payload = match host.receive().await {
-            Ok(payload) => payload,
-            Err(error) => return HostActivation::Broken(error),
+        let payload = match claim.watch(&evaluation, &mut tee, host.receive()).await {
+            Ok(received) => {
+                tee.finish();
+                match received {
+                    Ok(payload) => payload,
+                    Err(error) => return HostActivation::Broken(error),
+                }
+            }
+            Err(stall) => {
+                let ended = match host.end().await {
+                    HostEnd::Killed => "was ended".to_owned(),
+                    HostEnd::Own(status) => format!("had already exited with wait status {status}"),
+                };
+                tee.finish();
+                return HostActivation::Broken(stall.into_error(&ended));
+            }
         };
         let parsed = FrameReader::new(&payload).and_then(|(tag, mut fields)| {
             let reply = match tag {
@@ -2075,3 +2090,7 @@ mod identity_tests {
 #[cfg(test)]
 #[path = "shell_job_diagnostics_tests.rs"]
 mod diagnostics_tests;
+
+#[cfg(test)]
+#[path = "shell_job_stall_tests.rs"]
+mod stall_tests;

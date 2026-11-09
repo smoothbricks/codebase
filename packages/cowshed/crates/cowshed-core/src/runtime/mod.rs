@@ -26,6 +26,7 @@ pub mod land_lease;
 pub mod live_membership;
 #[cfg(target_os = "macos")]
 pub(crate) mod mount_activity;
+mod nix_builds;
 pub(crate) mod nx_daemon;
 pub mod placement;
 #[cfg(target_os = "macos")]
