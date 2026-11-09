@@ -5903,6 +5903,123 @@ fn recovering_an_unmounted_attachment_mounts_its_pinned_volume_without_reattachi
     assert_eq!(held.source_device(), attachment.volume_device());
 }
 
+//#region smoo/cowshed!n/unmounted-attachment-survivor
+/// Each disk tool the fake kernel ran, as `<program> <verb>`, in order.
+fn tool_calls(runner: &RecordingRunner) -> Vec<String> {
+    runner
+        .requests()
+        .iter()
+        .map(|request| {
+            let program = request
+                .program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let verb = request
+                .args
+                .first()
+                .map(|verb| verb.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("{program} {verb}")
+        })
+        .collect()
+}
+
+/// A release that stopped after it unmounted the volume leaves the image attached with no mount.
+/// The kernel then holds ONE attachment for the image (its physical device `/dev/disk9` and the
+/// container `/dev/disk10` synthesized from it are two devices of that one attachment), and a mount
+/// of the workspace refused it as already attached: every verb that reaches the workspace, and the
+/// retirement that was to finish it, stayed wedged until someone detached the device by hand.
+#[test]
+fn mounting_an_image_an_interrupted_release_left_attached_releases_it_and_attaches_afresh() {
+    let fixture = Fixture::new("survivor-mount");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image().expect("image");
+    create_image(image.image());
+    let runner = RecordingRunner::default();
+    attach(&runner, image.image());
+    let host = native_host(&fixture, runner.clone());
+    let mount = fixture.root.join("survivor-mount");
+
+    let attachment = host
+        .attach_mounted(image.image(), &mount, MountAccess::ReadWrite, false)
+        .expect("an unmounted survivor is released, never refused");
+
+    assert_eq!(attachment.volume_device(), "/dev/disk10s1");
+    let calls = tool_calls(&runner);
+    let released = calls
+        .iter()
+        .position(|call| call == "hdiutil detach")
+        .expect("the survivor is released");
+    let attached = calls
+        .iter()
+        .position(|call| call == "hdiutil attach")
+        .expect("the image is then attached afresh");
+    assert!(released < attached, "{calls:?}");
+    assert_eq!(
+        runner.inventory.images().len(),
+        1,
+        "one attachment holds the image"
+    );
+}
+
+/// A volume some mount still lists is no survivor of an interrupted release: it is in use, so
+/// nothing is released for the attach, which refuses as it always did.
+#[test]
+fn mounting_an_image_whose_volume_is_mounted_releases_nothing_and_refuses() {
+    let fixture = Fixture::new("survivor-mounted");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image().expect("image");
+    create_image(image.image());
+    let runner = RecordingRunner::default();
+    attach(&runner, image.image());
+    runner
+        .mounted
+        .lock()
+        .expect("mounts")
+        .insert(fixture.root.join("elsewhere"), "/dev/disk10s1".to_owned());
+    let host = native_host(&fixture, runner.clone());
+
+    let refused = host
+        .attach_mounted(
+            image.image(),
+            &fixture.root.join("survivor-mounted"),
+            MountAccess::ReadWrite,
+            false,
+        )
+        .err()
+        .expect("a mounted attachment is never released to attach again");
+
+    assert!(
+        refused
+            .to_string()
+            .contains("refusing to attach it a second time"),
+        "{refused}"
+    );
+    assert_eq!(tool_calls(&runner), Vec::<String>::new());
+    assert_eq!(runner.inventory.images().len(), 1);
+}
+
+/// Detaching a workspace whose volume no mount lists still ends its attachment: the release that
+/// leaves one behind is finished by the detach that finds it, not skipped because nothing is mounted.
+#[test]
+fn detaching_a_workspace_whose_image_an_interrupted_release_left_attached_releases_it() {
+    let fixture = Fixture::new("survivor-detach");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image().expect("image");
+    create_image(image.image());
+    let runner = RecordingRunner::default();
+    attach(&runner, image.image());
+    let host = native_host(&fixture, runner.clone());
+
+    host.detach_mounted(&workspace(), DetachIntent::Release)
+        .expect("the survivor is released");
+
+    assert_eq!(tool_calls(&runner), ["hdiutil detach"]);
+    assert!(runner.inventory.images().is_empty());
+}
+//#endregion smoo/cowshed!n/unmounted-attachment-survivor
+
 mod build_mount_races {
     use super::*;
     use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};

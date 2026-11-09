@@ -3971,6 +3971,10 @@ where
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_attachable_image(image)?;
         self.verify_controller_path(mount_point)?;
+        // An interrupted release leaves the image attached with no mount; that survivor is released here,
+        // never refused as already attached (02_workspaces.md, `smoo/cowshed!n/unmounted-attachment-survivor`).
+        self.backend
+            .release_unmounted_attachments(image, DetachIntent::Release)?;
         self.backend
             .attach_mounted(image, mount_point, access, browse)
             .map(|(attachment, _)| attachment)
@@ -4365,6 +4369,8 @@ where
                 .into_iter()
                 .find(|mount| mount.mount_point == mount_point)
             else {
+                // No mount, but an interrupted release may have left the image attached: finish it.
+                self.backend.release_unmounted_attachments(&image, intent)?;
                 return Ok(());
             };
             if !self.mount_carries_marker(

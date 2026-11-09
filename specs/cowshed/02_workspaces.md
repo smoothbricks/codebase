@@ -1637,6 +1637,18 @@ attaches it; Linux uses its platform service/controller lifecycle. An explicit `
 fork, never waits for gate-class work (05_gateway.md, "Host scheduling"); an attach of a mounted workspace attaches
 nothing.
 
+<a id="smoo/cowshed!n/unmounted-attachment-survivor"></a>**An unmounted attachment is a survivor, not a second attach's
+obstacle.** A release that stopped after it unmounted the workspace's volume and before the image driver detached leaves
+the image attached with no mount. The kernel holds one attachment for it (its physical device and the container
+synthesized from it are two devices of that one attachment, not two attachments), and no mount lists its volume. A mount
+of the workspace releases it first, under the image's lease (every attachment the kernel holds for the image, each by
+its physical device), then attaches the image afresh through the verified path; a detach of a workspace that finds no
+mount finishes the release the same way. So `rm` and every verb that reaches a detached session proceed where they once
+refused `already attached`, and an unfinished retirement completes. A volume some mount lists is in use, not a survivor:
+nothing is released for it, and the attach refuses naming the attachments the kernel holds. An attachment of a pending
+clone gets the same settlement (the table above, "After attach, before mount"); an image the kernel holds twice is
+released twice, each by its own device.
+
 ### Making room for an attach
 
 IOKit queues at most 1024 matches on one unfiltered IOMedia notification and drops the rest (01a_apfs.md, "The IOMedia

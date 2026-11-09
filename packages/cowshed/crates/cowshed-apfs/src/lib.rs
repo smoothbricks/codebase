@@ -3736,8 +3736,52 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let _lease = self.image_lease(image)?;
-        let devices = self
-            .release_views(image)?
+        let views = self.release_views(image)?;
+        self.detach_views_unlocked(image, views, intent)
+    }
+
+    /// End what an interrupted release left of `image`: the image attached with no mount of its
+    /// volume. The kernel holds one attachment for it (its physical device and the container
+    /// synthesized from it are two devices of that attachment, not two attachments), which a later
+    /// attach of the path refuses as already held. Under the image's lease, when no volume of any
+    /// attachment the kernel holds for `image` is mounted, every attachment is detached by its
+    /// physical device exactly as [`Self::release_every_attachment`] does, and `true` answers that
+    /// one was. A volume some mount lists is in use, not a survivor: nothing is released and
+    /// `false` answers, as it does for an image nothing holds.
+    pub fn release_unmounted_attachments(
+        &self,
+        image: &Path,
+        intent: DetachIntent,
+    ) -> Result<bool, ApfsError> {
+        let _lease = self.image_lease(image)?;
+        let views = self.release_views(image)?;
+        for volume in views.iter().flat_map(|view| &view.volumes) {
+            let mounted =
+                self.runner
+                    .volume_mount(volume)
+                    .map_err(|source| ApfsError::FileOperation {
+                        operation: "read the kernel mount of an attached volume",
+                        path: image.to_owned(),
+                        source,
+                    })?;
+            if mounted.is_some() {
+                return Ok(false);
+            }
+        }
+        let held = !views.is_empty();
+        self.detach_views_unlocked(image, views, intent)?;
+        Ok(held)
+    }
+
+    /// Detach each of `views` by its physical whole device once, under the image lease the caller
+    /// holds, re-reading the image's own mapping before each.
+    fn detach_views_unlocked(
+        &self,
+        image: &Path,
+        views: Vec<ReleaseView>,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsError> {
+        let devices = views
             .into_iter()
             .map(|view| view.whole_device)
             .collect::<BTreeSet<_>>();
@@ -3779,14 +3823,25 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// a second attach of one file, but not of a new file at the same path: once the file a live
     /// attachment registered is replaced, attaching the path again gives it two attachments, and
     /// every later lookup of that path (`matching image has multiple inventory entries`) refuses
-    /// until both are detached by hand. A path already held is refused before anything attaches.
+    /// until both are detached by hand. A path already held is refused before anything attaches,
+    /// naming how many attachments hold it: one attachment lists its physical device and the
+    /// container synthesized from it, so the devices alone read as two.
     fn refuse_second_attach(&self, image: &Path) -> Result<BTreeSet<String>, ApfsError> {
-        let held = self.attached_whole_devices(image)?;
-        if held.is_empty() {
-            Ok(held)
+        let AttachmentInventory {
+            devices,
+            attachments,
+            ..
+        } = self.attachment_inventory(image)?;
+        if devices.is_empty() {
+            Ok(devices)
         } else {
+            let noun = if attachments == 1 {
+                "attachment"
+            } else {
+                "attachments"
+            };
             Err(ApfsError::InvalidAttachmentInventory(format!(
-                "{} is already attached as {held:?}; refusing to attach it a second time",
+                "{} is already attached as {devices:?} ({attachments} {noun}); refusing to attach it a second time",
                 image.display()
             )))
         }
@@ -4497,6 +4552,9 @@ struct AttachmentInventory {
     devices: BTreeSet<String>,
     capacity: Option<ImageCapacity>,
     matched: bool,
+    /// How many attachments the kernel holds for the image: each lists its physical device and the
+    /// container synthesized from it, so `devices` holds two per attachment.
+    attachments: usize,
 }
 
 fn image_inventory(
@@ -4506,11 +4564,13 @@ fn image_inventory(
     let mut devices = BTreeSet::new();
     let mut capacity = None;
     let mut matched = false;
+    let mut attachments = 0usize;
     for attached in images
         .iter()
         .filter(|attached| attached.is_backed_by(image))
     {
         matched = true;
+        attachments += 1;
         let mut roots = 0usize;
         for media in &attached.media {
             let device = device_path(&media.device).ok_or_else(|| {
@@ -4542,6 +4602,7 @@ fn image_inventory(
         devices,
         capacity,
         matched,
+        attachments,
     })
 }
 
@@ -9102,7 +9163,7 @@ mod tests {
                 error,
                 ApfsError::InvalidAttachmentInventory(message)
                     if message == "/tmp/cowshed-preexisting.dmg is already attached as \
-                                   {\"/dev/disk5\"}; refusing to attach it a second time"
+                                   {\"/dev/disk5\"} (1 attachment); refusing to attach it a second time"
             )
         };
 
