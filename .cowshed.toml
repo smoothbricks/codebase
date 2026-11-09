@@ -35,7 +35,7 @@ after = [
   ["bun", "nx", "run-many", "-t", "build", "--outputStyle=static-failures-only"],
   ["bun", "tooling/rebuild-linked.ts"],
   ["smoo", "monorepo", "record-sibling-projects"],
-  ["sh", "tooling/land-install.sh", "smoothbricks", "{before}", "{head}"],
+  ["sh", "tooling/land-install.sh", "{before}", "{head}"],
 ]
 
 [doc]

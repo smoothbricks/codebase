@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   cpSync,
@@ -23,6 +23,7 @@ import {
   landStatusLine,
   promptLine,
   readinessLine,
+  rerunCommand,
   setupCommand,
   setupOutcome,
   setupPrompt,
@@ -32,12 +33,13 @@ import {
 } from './land-install.ts';
 
 // The decisions of the post-land install are plain calls, one table each. land-install.sh then runs for real over a
-// real git repository for main, with four stand-ins on PATH because they are this machine's tooling and the build:
-// 'uname' (the host), 'bun nx' (the Nx calls: the affected set, the cache server bundle, the production build, which
-// writes the staged binary below), 'cowshed land-turn' (a file that says whether the turn is held while a command
-// runs) and the production CLI itself, whose doctor, gateway status and setup answer what a scenario sets. Each
-// stand-in logs the turn state it ran under, so the tests prove the build ran holding the turn and every cowshed
-// call after it ran without one.
+// real git repository for main, with stand-ins on PATH because they are this machine's tooling, the build and the
+// cowshed it drives: 'uname' (the host), 'bun nx' (the Nx calls: the affected set in main, the cache server bundle and
+// the production build in the shed, which write the staged binary below), 'cowshed' (fork, path, exec, rebase, lock
+// and the installed gateway status over a directory of sheds, each logged in cowshed.log, and land-turn, which records
+// a land that has to wait for a turn another holds) and the production CLI itself, whose doctor, gateway status and
+// setup answer what a scenario sets. The install holds no land turn, so a land that asks for its turn while the build
+// runs takes it at once.
 
 const HEAD = 'a1'.repeat(20);
 
@@ -118,6 +120,32 @@ describe('stage names', () => {
       "direnv exec '/my repo' '/my repo/it'\\''s/cowshed' setup",
     );
   });
+});
+
+describe('rerunCommand', () => {
+  const before = 'b'.repeat(40);
+  const cases: readonly (readonly [string, string, string])[] = [
+    [
+      "runs the install script in main's devenv for the two commits",
+      '/repo',
+      `direnv exec /repo sh /repo/tooling/land-install.sh ${before} ${HEAD}`,
+    ],
+    [
+      'quotes a checkout path a shell would split',
+      '/my repo',
+      `direnv exec '/my repo' sh '/my repo/tooling/land-install.sh' ${before} ${HEAD}`,
+    ],
+    [
+      'quotes a quote in the path',
+      "/it's",
+      `direnv exec '/it'\\''s' sh '/it'\\''s/tooling/land-install.sh' ${before} ${HEAD}`,
+    ],
+  ];
+  for (const [name, main, expected] of cases) {
+    it(name, () => {
+      expect(rerunCommand(main, before, HEAD)).toBe(expected);
+    });
+  }
 });
 
 interface Finding {
@@ -407,22 +435,117 @@ nx) shift; exec "$FIX_NX" "$@" ;;
 *) exec "$FIX_BUN" "$@" ;;
 esac
 `,
+  // The installed cowshed. Its sheds are directories of the state directory, cloned from the project main names, and
+  // every shed verb logs to cowshed.log. A rebase fetches its revision, refuses a shed with uncommitted work by name,
+  // and fast-forwards a shed that stands behind the revision: onto a commit the shed is already past it moves nothing.
   cowshed: `#!/bin/sh
-[ "$1" = land-turn ] && [ "$3" = --workspace ] && [ "$5" = -- ] || exit 64
-echo "$2 $4" >>"$FIX_STATE/turns.log"
-shift 5
-touch "$FIX_STATE/turn-held"
-status=0
-"$@" || status=$?
-rm -f "$FIX_STATE/turn-held"
-exit $status
+project=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+  --project) project=$2; shift 2 ;;
+  -q | --quiet | --json) shift ;;
+  *) break ;;
+  esac
+done
+verb=$1
+shift
+sheds=$FIX_STATE/sheds
+case $verb in
+land-turn)
+  [ "$2" = --workspace ] && [ "$4" = -- ] || exit 64
+  echo "$1 $3" >>"$FIX_STATE/turns.log"
+  workspace=$3
+  shift 4
+  # A land that asks while another holds the turn queues behind it: the stub records the wait and runs it at once.
+  if [ -f "$FIX_STATE/turn-held" ]; then
+    echo "$workspace waited" >>"$FIX_STATE/waits.log"
+    exec "$@"
+  fi
+  echo "$workspace" >"$FIX_STATE/turn-held"
+  status=0
+  "$@" || status=$?
+  rm -f "$FIX_STATE/turn-held"
+  exit $status
+  ;;
+fork)
+  [ -n "$project" ] && [ "$2" = --ref ] || exit 64
+  echo "fork $1 --ref $3" >>"$FIX_STATE/cowshed.log"
+  if [ -f "$FIX_STATE/fork-fails" ]; then
+    echo "cowshed: the fork is refused" >&2
+    exit 5
+  fi
+  [ ! -e "$sheds/$1" ] || { echo "cowshed: workspace $1 exists" >&2; exit 4; }
+  git clone -q "$project" "$sheds/$1" && git -C "$sheds/$1" checkout -q "$3" || exit 1
+  echo "$sheds/$1"
+  ;;
+path)
+  [ -n "$project" ] || exit 64
+  echo "path $1" >>"$FIX_STATE/cowshed.log"
+  [ -d "$sheds/$1" ] || { echo "cowshed: workspace $1 does not exist" >&2; exit 3; }
+  echo "$sheds/$1"
+  ;;
+exec)
+  [ -n "$project" ] && [ "$2" = --host ] && [ "$3" = -- ] || exit 64
+  echo "exec $*" >>"$FIX_STATE/cowshed.log"
+  workspace=$1
+  shift 3
+  [ -d "$sheds/$workspace" ] || { echo "cowshed: workspace $workspace does not exist" >&2; exit 3; }
+  cd "$sheds/$workspace" && exec "$@"
+  ;;
+rebase)
+  [ -n "$project" ] && [ "$2" = --onto ] || exit 64
+  echo "rebase $1 --onto $3" >>"$FIX_STATE/cowshed.log"
+  [ -d "$sheds/$1" ] || { echo "cowshed: workspace $1 does not exist" >&2; exit 3; }
+  if [ -f "$FIX_STATE/rebase-refuses" ]; then
+    echo "cowshed: the replay onto $3 conflicts" >&2
+    exit 4
+  fi
+  named=$(git -C "$sheds/$1" status --porcelain | cut -c4-)
+  if [ -n "$named" ]; then
+    echo "cowshed: workspace $1 has uncommitted work: $(echo $named)" >&2
+    exit 4
+  fi
+  git -C "$sheds/$1" fetch -q "$project" "$3" || exit 1
+  if git -C "$sheds/$1" merge-base --is-ancestor HEAD "$3"; then git -C "$sheds/$1" checkout -q "$3"; fi
+  git -C "$sheds/$1" rev-parse HEAD
+  ;;
+lock)
+  [ "$2" = -- ] || exit 64
+  lock=$1
+  shift 2
+  [ -d "$(dirname "$lock")" ] || { echo "cowshed: $(dirname "$lock") does not exist" >&2; exit 1; }
+  # The real lock queues a second holder behind the first, and says so; the stub does the same with a directory.
+  queued=
+  until mkdir "$lock.held" 2>/dev/null; do
+    [ -n "$queued" ] || echo "lock $lock queued" >>"$FIX_STATE/cowshed.log"
+    queued=1
+    sleep 0.05
+  done
+  echo "lock $lock held" >>"$FIX_STATE/cowshed.log"
+  stages=$(dirname "$lock")/cowshed-release
+  before=$(ls -A "$stages" 2>/dev/null | wc -l | tr -d ' ')
+  status=0
+  "$@" || status=$?
+  after=$(ls -A "$stages" 2>/dev/null | wc -l | tr -d ' ')
+  echo "lock $lock [stages $before -> $after]" >>"$FIX_STATE/cowshed.log"
+  rmdir "$lock.held"
+  exit $status
+  ;;
+gateway)
+  [ "$1" = status ] || exit 64
+  cwd=elsewhere
+  [ "$(pwd)" = / ] && cwd=/
+  echo "gateway status [cwd $cwd]" >>"$FIX_STATE/cowshed.log"
+  if [ -f "$FIX_STATE/installed-status.json" ]; then cat "$FIX_STATE/installed-status.json"; else cat "$FIX_STATE/status.json"; fi
+  ;;
+*) exit 64 ;;
+esac
 `,
 };
 
+// The Nx calls write into their working directory, so the build is in the shed and the affected set in main.
 const NX_STUB = `#!/bin/sh
-turn=free
-[ -f "$FIX_STATE/turn-held" ] && turn=held
-echo "$* [turn $turn]" >>"$FIX_STATE/nx.log"
+echo "$* [cwd $(basename "$PWD")]" >>"$FIX_STATE/nx.log"
 case $1 in
 show) cat "$FIX_STATE/affected.json" ;;
 run)
@@ -434,6 +557,12 @@ run)
     ;;
   cowshed:cli-record-*-macos:production)
     [ ! -f "$FIX_STATE/build-fails" ] || exit 1
+    # A land that asks for its turn while the build runs.
+    [ ! -f "$FIX_STATE/race" ] || cowshed land-turn smoothbricks --workspace racing-land -- true
+    # A build that runs until the test says so, which keeps the release lock held while another install asks for it.
+    if [ -f "$FIX_STATE/hold-build" ]; then
+      while [ ! -f "$FIX_STATE/release" ]; do sleep 0.05; done
+    fi
     arch=$(echo "$2" | cut -d- -f3)
     mkdir -p "packages/cowshed/dist/bin/darwin-$arch"
     cp "$FIX_STATE/staged.sh" "packages/cowshed/dist/bin/darwin-$arch/cowshed"
@@ -448,11 +577,9 @@ esac
 `;
 
 const STAGED_STUB = `#!/bin/sh
-turn=free
-[ -f "$FIX_STATE/turn-held" ] && turn=held
 cwd=elsewhere
 [ "$(pwd)" = / ] && cwd=/
-echo "$* [turn $turn] [cwd $cwd]" >>"$FIX_STATE/staged.log"
+echo "$* [cwd $cwd]" >>"$FIX_STATE/staged.log"
 [ "$1" = --json ] && shift
 case $1 in
 doctor) cat "$FIX_STATE/doctor.json"; exit "$(cat "$FIX_STATE/doctor.exit")" ;;
@@ -502,11 +629,17 @@ interface Install {
   readonly head: string;
   /** The stage directory of this land. */
   readonly stage: string;
+  /** The name of the stable build shed. */
+  readonly shed: string;
+  /** The directory holding the sheds the cowshed stand-in forked. */
+  readonly sheds: string;
   /** Replaces what a stand-in answers: a file of the state directory. */
   set(name: string, text: string): void;
   /** What a stand-in logged, one entry per call. */
   log(name: string): readonly string[];
   run(options?: { readonly machine?: string; readonly args?: readonly string[] }): Run;
+  /** The same run, started and not waited for, so another install can be started while it works. */
+  start(options?: { readonly machine?: string; readonly args?: readonly string[] }): Promise<Run>;
 }
 
 const roots: string[] = [];
@@ -524,9 +657,10 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
   roots.push(root);
   const main = join(root, 'main');
   const state = join(root, 'state');
+  const sheds = join(state, 'sheds');
   const bin = join(root, 'bin');
   mkdirSync(join(main, 'tooling'), { recursive: true });
-  mkdirSync(state);
+  mkdirSync(sheds, { recursive: true });
   mkdirSync(bin);
   for (const file of ['land-install.sh', 'land-install.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
@@ -561,43 +695,90 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
   set('status.json', status({}));
   set('setup.json', JSON.stringify({ ok: true, result: {} }));
   set('setup.exit', '0');
+  const script = join(main, 'tooling/land-install.sh');
+  const environment = (machine: string | undefined): NodeJS.ProcessEnv => ({
+    ...process.env,
+    ...GIT_ENV,
+    PATH: `${bin}:${process.env.PATH}`,
+    FIX_BUN: bun,
+    FIX_NX: nx,
+    FIX_STATE: state,
+    FIX_MACHINE: machine ?? 'arm64',
+  });
   return {
     main,
     before,
     head,
     stage: join(main, '.cache', 'cowshed-release', head),
+    shed: 'land-install',
+    sheds,
     set,
     log(name) {
       const path = join(state, name);
       return existsSync(path) ? readFileSync(path, 'utf8').trimEnd().split('\n') : [];
     },
     run(options = {}) {
-      const run = spawnSync(
-        'sh',
-        [join(main, 'tooling/land-install.sh'), ...(options.args ?? ['smoothbricks', before, head])],
-        {
-          cwd: main,
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            ...GIT_ENV,
-            PATH: `${bin}:${process.env.PATH}`,
-            FIX_BUN: bun,
-            FIX_NX: nx,
-            FIX_STATE: state,
-            FIX_MACHINE: options.machine ?? 'arm64',
-          },
-        },
-      );
+      const run = spawnSync('sh', [script, ...(options.args ?? [before, head])], {
+        cwd: main,
+        encoding: 'utf8',
+        env: environment(options.machine),
+      });
       return { status: run.status ?? -1, stdout: run.stdout, stderr: run.stderr };
+    },
+    start(options = {}) {
+      const { promise, resolve } = Promise.withResolvers<Run>();
+      const child = spawn('sh', [script, ...(options.args ?? [before, head])], {
+        cwd: main,
+        env: environment(options.machine),
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on('close', (code) => resolve({ status: code ?? -1, stdout, stderr }));
+      return promise;
     },
   };
 }
 
 const NX_SHOW = (install: Install): string =>
-  `show projects --affected --base=${install.before} --head=${install.head} --json [turn free]`;
-const NX_BUNDLE = 'run nx-cache-server:bundle --outputStyle=static-failures-only [turn held]';
-const NX_PRODUCTION = 'run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only [turn held]';
+  `show projects --affected --base=${install.before} --head=${install.head} --json [cwd main]`;
+const NX_BUNDLE = (install: Install): string =>
+  `run nx-cache-server:bundle --outputStyle=static-failures-only [cwd ${install.shed}]`;
+
+/** What the install asks the installed cowshed, in the order a build in the shed asks it. */
+function cowshedCalls(install: Install) {
+  const hostExec = `exec ${install.shed} --host -- direnv exec . bun nx run`;
+  const lock = join(install.main, '.cache', 'cowshed-release.lock');
+  return {
+    status: 'gateway status [cwd /]',
+    probe: `path ${install.shed}`,
+    fork: `fork ${install.shed} --ref ${install.head}`,
+    repoint: (head: string) => `rebase ${install.shed} --onto ${head}`,
+    path: `path ${install.shed}`,
+    bundle: `${hostExec} nx-cache-server:bundle --outputStyle=static-failures-only`,
+    production: `${hostExec} cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only`,
+    held: `lock ${lock} held`,
+    queued: `lock ${lock} queued`,
+    lock: (stages: string) => `lock ${lock} [stages ${stages}]`,
+  };
+}
+
+/** Lands one more commit on main and returns it: the head of a later install. */
+function landAnother(install: Install): string {
+  writeFileSync(join(install.main, 'later.txt'), 'later\n');
+  git(install.main, 'add', '.');
+  git(install.main, 'commit', '-q', '-m', 'feat(cowshed): a later change');
+  return git(install.main, 'rev-parse', 'HEAD');
+}
+
+/** The command that reruns this land's install, as a deferral names it. */
+const RERUN = (install: Install): string =>
+  `direnv exec ${install.main} sh ${install.main}/tooling/land-install.sh ${install.before} ${install.head}`;
 
 /** The one status line a run wrote, split into its timestamp, commit and the outcome text. */
 function onlyLine(stdout: string): { readonly timestamp: string; readonly commit: string; readonly text: string } {
@@ -608,6 +789,9 @@ function onlyLine(stdout: string): { readonly timestamp: string; readonly commit
   return { timestamp: match?.[1] ?? '', commit: match?.[2] ?? '', text: match?.[3] ?? '' };
 }
 
+const BUSY_STATUS = status({ landTurns: [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }] });
+const BUSY_TEXT = 'the land of gadget-land holds the gadgets land turn (ticket 4, pid 99)';
+
 describe('land-install.sh', () => {
   it('does nothing for a land that changed neither cowshed nor a project it depends on', () => {
     const install = fixture(['tooling/change.ts']);
@@ -616,23 +800,46 @@ describe('land-install.sh', () => {
     expect(run.status, run.stderr).toBe(0);
     expect(run.stdout).toBe('');
     expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
+    expect(install.log('cowshed.log')).toEqual([]);
     expect(install.log('turns.log')).toEqual([]);
     expect(existsSync(join(install.main, '.cache'))).toBe(false);
   });
 
-  it('builds holding a land turn, stages the distribution, then runs the staged setup once with none held', () => {
+  it('the first install creates the shed, builds holding no turn, stages, then runs the staged setup once', () => {
     const install = fixture();
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     const line = onlyLine(run.stdout);
     expect(line.commit).toBe(install.head);
     expect(line.text).toBe('installed');
-    expect(install.log('turns.log')).toEqual(['smoothbricks post-land-install']);
-    expect(install.log('nx.log')).toEqual([NX_SHOW(install), NX_BUNDLE, NX_PRODUCTION]);
+    // No land turn is taken for any of it, so no land waits for it.
+    expect(install.log('turns.log')).toEqual([]);
+    expect(install.log('waits.log')).toEqual([]);
+    // The build is the shed's: main stands still, and the shed stays for the next install.
+    expect(install.log('nx.log')).toEqual([
+      NX_SHOW(install),
+      NX_BUNDLE(install),
+      `run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only [cwd ${install.shed}]`,
+    ]);
+    expect(existsSync(join(install.main, 'packages/cowshed/dist'))).toBe(false);
+    expect(readdirSync(install.sheds)).toEqual([install.shed]);
+    expect(git(join(install.sheds, install.shed), 'rev-parse', 'HEAD')).toBe(install.head);
+    // Readiness is read before the build; the stage is assembled inside the lock, which found it empty.
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log')).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.fork,
+      calls.path,
+      calls.bundle,
+      calls.production,
+      calls.lock('0 -> 1'),
+    ]);
     expect(install.log('staged.log')).toEqual([
-      '--json doctor [turn free] [cwd /]',
-      '--json gateway status [turn free] [cwd /]',
-      '--json setup [turn free] [cwd elsewhere]',
+      '--json doctor [cwd /]',
+      '--json gateway status [cwd /]',
+      '--json setup [cwd elsewhere]',
     ]);
     // The stage is a distribution, so setup finds the Nx cache server where it looks for a package's dependency.
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
@@ -648,13 +855,25 @@ describe('land-install.sh', () => {
     // And setup finds the mbx flake it pins where a package ships it, above its binary.
     expect(readFileSync(join(install.stage, 'nix/mbx/flake.nix'), 'utf8')).toBe('{ outputs = _: { }; }\n');
     expect(readdirSync(dirname(install.stage))).toEqual([install.head]);
-    // Nx and setup run in main's devenv, whatever environment started the script; the doctor and status reads need none.
+    // Nx and setup run in main's devenv, whatever environment started the script, and the build in the shed's; the
+    // doctor and status reads need none.
     expect(install.log('direnv.log')).toEqual([
       `exec ${install.main} bun nx show projects --affected --base=${install.before} --head=${install.head} --json`,
-      `exec ${install.main} bun nx run nx-cache-server:bundle --outputStyle=static-failures-only`,
-      `exec ${install.main} bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only`,
+      'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
+      'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
       `exec ${install.main} ${binary} --json setup`,
     ]);
+  });
+
+  it('a land that asks for its turn during the install build takes it at once', () => {
+    const install = fixture();
+    // The production build asks for the repository's land turn, as a land queued behind main would.
+    install.set('race', '');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(install.log('waits.log')).toEqual([]);
+    expect(onlyLine(run.stdout).text).toBe('installed');
+    expect(install.log('turns.log')).toEqual(['smoothbricks racing-land']);
   });
 
   it('builds the x64 CLI on an Intel host', () => {
@@ -663,7 +882,10 @@ describe('land-install.sh', () => {
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('installed');
     expect(install.log('nx.log')[2]).toBe(
-      'run cowshed:cli-record-x64-macos:production --outputStyle=static-failures-only [turn held]',
+      `run cowshed:cli-record-x64-macos:production --outputStyle=static-failures-only [cwd ${install.shed}]`,
+    );
+    expect(install.log('cowshed.log')).toContain(
+      `exec ${install.shed} --host -- direnv exec . bun nx run cowshed:cli-record-x64-macos:production --outputStyle=static-failures-only`,
     );
     expect(existsSync(join(install.stage, 'dist/bin/darwin-x64/cowshed'))).toBe(true);
   });
@@ -701,27 +923,54 @@ describe('land-install.sh', () => {
     expect(onlyLine(run.stdout).text).toBe(
       `attended: host-mount-service: host-mount-service message; run direnv exec ${install.main} ${binary} setup`,
     );
-    expect(install.log('staged.log')).toEqual(['--json doctor [turn free] [cwd /]']);
+    expect(install.log('staged.log')).toEqual(['--json doctor [cwd /]']);
   });
 
-  it('defers with the work that holds the host and the command to rerun, and runs no setup', () => {
+  it('defers before building when a land holds its turn, builds nothing and names the command to rerun', () => {
     const install = fixture();
-    install.set(
-      'status.json',
-      status({
-        landTurns: [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }],
-      }),
+    install.set('installed-status.json', BUSY_STATUS);
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(`deferred: ${BUSY_TEXT}; rerun ${RERUN(install)}`);
+    expect(install.log('cowshed.log')).toEqual([cowshedCalls(install).status]);
+    expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
+    expect(install.log('staged.log')).toEqual([]);
+    expect(readdirSync(install.sheds)).toEqual([]);
+    expect(existsSync(join(install.main, '.cache'))).toBe(false);
+  });
+
+  it('defers before building while another install holds the install slot', () => {
+    const install = fixture();
+    install.set('installed-status.json', status({ pendingInstall: true }));
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(`deferred: another install holds the install slot; rerun ${RERUN(install)}`);
+    expect(install.log('cowshed.log')).toEqual([cowshedCalls(install).status]);
+  });
+
+  it('is unverified, and builds nothing, when the installed gateway status cannot be read', () => {
+    const install = fixture();
+    install.set('installed-status.json', '');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(
+      `unverified: cowshed gateway status printed no JSON envelope (gateway status exited 0); run ${RERUN(install)}`,
     );
+    expect(install.log('cowshed.log')).toEqual([cowshedCalls(install).status]);
+    expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
+    expect(install.log('staged.log')).toEqual([]);
+  });
+
+  it('defers work that began during the build, with the command to run, and runs no setup', () => {
+    const install = fixture();
+    // Ready before the build; a land holds its turn by the time setup would run.
+    install.set('installed-status.json', status({}));
+    install.set('status.json', BUSY_STATUS);
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
-    expect(onlyLine(run.stdout).text).toBe(
-      `deferred: the land of gadget-land holds the gadgets land turn (ticket 4, pid 99); rerun direnv exec ${install.main} ${binary} setup`,
-    );
-    expect(install.log('staged.log')).toEqual([
-      '--json doctor [turn free] [cwd /]',
-      '--json gateway status [turn free] [cwd /]',
-    ]);
+    expect(onlyLine(run.stdout).text).toBe(`deferred: ${BUSY_TEXT}; rerun direnv exec ${install.main} ${binary} setup`);
+    expect(install.log('staged.log')).toEqual(['--json doctor [cwd /]', '--json gateway status [cwd /]']);
   });
 
   it('runs nothing unattended when doctor cannot be read', () => {
@@ -734,11 +983,12 @@ describe('land-install.sh', () => {
     expect(onlyLine(run.stdout).text).toBe(
       `unverified: cowshed doctor printed no JSON envelope (doctor exited 70); run direnv exec ${install.main} ${binary} setup`,
     );
-    expect(install.log('staged.log')).toEqual(['--json doctor [turn free] [cwd /]']);
+    expect(install.log('staged.log')).toEqual(['--json doctor [cwd /]']);
   });
 
-  it('runs nothing when gateway status cannot be read', () => {
+  it("runs nothing when the staged build's gateway status cannot be read", () => {
     const install = fixture();
+    install.set('installed-status.json', status({}));
     install.set('status.json', '');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
@@ -784,12 +1034,7 @@ describe('land-install.sh', () => {
 
   it('defers a refusal that a fresh status explains by work that began after the first read', () => {
     const install = fixture();
-    install.set(
-      'status.1.json',
-      status({
-        landTurns: [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }],
-      }),
-    );
+    install.set('status.1.json', BUSY_STATUS);
     install.set(
       'setup.json',
       JSON.stringify({
@@ -801,9 +1046,7 @@ describe('land-install.sh', () => {
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
-    expect(onlyLine(run.stdout).text).toBe(
-      `deferred: the land of gadget-land holds the gadgets land turn (ticket 4, pid 99); rerun direnv exec ${install.main} ${binary} setup`,
-    );
+    expect(onlyLine(run.stdout).text).toBe(`deferred: ${BUSY_TEXT}; rerun direnv exec ${install.main} ${binary} setup`);
     expect(install.log('staged.log').map((entry) => entry.split(' ').slice(0, 2).join(' '))).toEqual([
       '--json doctor',
       '--json gateway',
@@ -812,8 +1055,9 @@ describe('land-install.sh', () => {
     ]);
   });
 
-  it('defers while another install holds the install slot and runs no setup', () => {
+  it('defers before setup while another install holds the install slot, and runs no setup', () => {
     const install = fixture();
+    install.set('installed-status.json', status({}));
     install.set('status.json', status({ pendingInstall: true }));
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
@@ -824,7 +1068,7 @@ describe('land-install.sh', () => {
     expect(install.log('staged.log')).toHaveLength(2);
   });
 
-  it('removes the partial stages a crashed run left, whatever land they were for', () => {
+  it('removes the partial stages a crashed run left, whatever land they were for, under the stage lock', () => {
     const install = fixture();
     const root = dirname(install.stage);
     for (const name of [`${install.head}.partial`, `${'9'.repeat(40)}.partial`]) {
@@ -835,28 +1079,230 @@ describe('land-install.sh', () => {
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('installed');
     expect(readdirSync(root)).toEqual([install.head]);
+    // The lock found the two partials and left the one stage: they were removed while it was held.
+    expect(install.log('cowshed.log')).toContain(cowshedCalls(install).lock('2 -> 1'));
   });
 
-  it('records a failed production build, stages nothing and runs no cowshed', () => {
+  it('records a failed production build, stages nothing, runs no setup and keeps the shed', () => {
     const install = fixture();
     install.set('build-fails', '');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
-    expect(existsSync(join(install.main, '.cache'))).toBe(false);
+    expect(existsSync(join(install.main, '.cache', 'cowshed-release'))).toBe(false);
     expect(install.log('staged.log')).toEqual([]);
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log')).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.fork,
+      calls.path,
+      calls.bundle,
+      calls.production,
+      calls.lock('0 -> 0'),
+    ]);
+    expect(readdirSync(install.sheds)).toEqual([install.shed]);
   });
 
-  it('records a failed cache server bundle before building the CLI', () => {
+  it('records a failed cache server bundle before building the CLI, and keeps the shed', () => {
     const install = fixture();
     install.set('bundle-fails', '');
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
-    expect(install.log('nx.log')).toEqual([NX_SHOW(install), NX_BUNDLE]);
+    expect(install.log('nx.log')).toEqual([NX_SHOW(install), NX_BUNDLE(install)]);
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log')).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.fork,
+      calls.path,
+      calls.bundle,
+      calls.lock('0 -> 0'),
+    ]);
+    expect(readdirSync(install.sheds)).toEqual([install.shed]);
   });
 
-  it('reuses a stage that is already whole, taking the turn but building nothing', () => {
+  it('records a failed fork, builds nothing and leaves no shed', () => {
+    const install = fixture();
+    install.set('fork-fails', '');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(`failed: cowshed fork ${install.shed} --ref ${install.head} exited 5`);
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log')).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.fork,
+      calls.lock('0 -> 0'),
+    ]);
+    expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
+    expect(readdirSync(install.sheds)).toEqual([]);
+  });
+
+  it('re-points the shed to the next head and builds in the same warm tree, forking and removing nothing', () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    expect(onlyLine(first.stdout).text).toBe('installed');
+    const shed = join(install.sheds, install.shed);
+    // A file of the shed's ignored build state, which only the same tree still holds.
+    mkdirSync(join(shed, '.cache'), { recursive: true });
+    writeFileSync(join(shed, '.cache', 'warm'), 'the first build\n');
+    const asked = install.log('cowshed.log').length;
+    const second = landAnother(install);
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    const line = onlyLine(run.stdout);
+    expect(line.commit).toBe(second);
+    expect(line.text).toBe('installed');
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log').slice(asked)).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.repoint(second),
+      calls.path,
+      calls.bundle,
+      calls.production,
+      calls.lock('1 -> 2'),
+    ]);
+    expect(git(shed, 'rev-parse', 'HEAD')).toBe(second);
+    expect(readFileSync(join(shed, '.cache', 'warm'), 'utf8')).toBe('the first build\n');
+    expect(readdirSync(install.sheds)).toEqual([install.shed]);
+    expect(readdirSync(dirname(install.stage)).sort()).toEqual([install.head, second].sort());
+  });
+
+  it('refuses a shed with uncommitted work by name, records failed and builds nothing', () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    const shed = join(install.sheds, install.shed);
+    writeFileSync(join(shed, 'stray.txt'), 'left by hand\n');
+    const asked = install.log('cowshed.log').length;
+    const built = install.log('nx.log').length;
+    const second = landAnother(install);
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: the shed ${install.shed} cannot be re-pointed to ${second} (cowshed rebase exited 4): ` +
+        `cowshed: workspace ${install.shed} has uncommitted work: stray.txt`,
+    );
+    const calls = cowshedCalls(install);
+    expect(install.log('cowshed.log').slice(asked)).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.repoint(second),
+      calls.lock('1 -> 1'),
+    ]);
+    expect(install.log('nx.log').slice(built)).toEqual([
+      `show projects --affected --base=${install.head} --head=${second} --json [cwd main]`,
+    ]);
+    expect(git(shed, 'rev-parse', 'HEAD')).toBe(install.head);
+    expect(existsSync(join(shed, 'stray.txt'))).toBe(true);
+  });
+
+  it('records failed, with the refusal, when the re-point is refused, and builds nothing', () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    install.set('rebase-refuses', '');
+    const built = install.log('nx.log').length;
+    const second = landAnother(install);
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: the shed ${install.shed} cannot be re-pointed to ${second} (cowshed rebase exited 4): ` +
+        `cowshed: the replay onto ${second} conflicts`,
+    );
+    expect(install.log('nx.log')).toHaveLength(built + 1);
+    expect(existsSync(join(install.main, '.cache', 'cowshed-release', second))).toBe(false);
+  });
+
+  it('records failed for a head older than the commit the shed stands at, which a rebase never moves back to', () => {
+    const install = fixture();
+    const second = landAnother(install);
+    // The newer land's install ran first.
+    const newer = install.run({ args: [install.head, second] });
+    expect(newer.status, newer.stderr).toBe(0);
+    const run = install.run();
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: the shed ${install.shed} stands at ${second} after cowshed rebase --onto ${install.head}: ` +
+        'it is never moved back to an older commit',
+    );
+    expect(existsSync(install.stage)).toBe(false);
+  });
+
+  /** Polls a stand-in's log until a state shows in it; a state that never comes fails the test rather than hanging it. */
+  async function until(condition: () => boolean): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error('the awaited state never came');
+      await Bun.sleep(25);
+    }
+  }
+
+  it('two overlapping installs never move the shed under a build: the second waits in the release lock', async () => {
+    const install = fixture();
+    const second = landAnother(install);
+    // Both production builds wait for 'release', so the first still builds when the second asks for the lock.
+    install.set('hold-build', '');
+    const first = install.start();
+    await until(() => install.log('nx.log').some((entry) => entry.includes(':production')));
+    const later = install.start({ args: [install.head, second] });
+    const calls = cowshedCalls(install);
+    await until(() => install.log('cowshed.log').includes(calls.queued));
+    expect(install.log('cowshed.log').some((entry) => entry.startsWith('rebase'))).toBe(false);
+    install.set('release', '');
+    const [a, b] = await Promise.all([first, later]);
+    expect(a.status, a.stderr).toBe(0);
+    expect(b.status, b.stderr).toBe(0);
+    expect(onlyLine(a.stdout).text).toBe('installed');
+    expect(onlyLine(b.stdout).text).toBe('installed');
+    // The second re-points the shed only after the first has staged and let go of the lock.
+    expect(install.log('cowshed.log')).toEqual([
+      calls.status,
+      calls.held,
+      calls.probe,
+      calls.fork,
+      calls.path,
+      calls.bundle,
+      calls.production,
+      calls.status,
+      calls.queued,
+      calls.lock('0 -> 1'),
+      calls.held,
+      calls.probe,
+      calls.repoint(second),
+      calls.path,
+      calls.bundle,
+      calls.production,
+      calls.lock('1 -> 2'),
+    ]);
+    expect(git(join(install.sheds, install.shed), 'rev-parse', 'HEAD')).toBe(second);
+  });
+
+  it('an install that waited in the lock for the same head finds its stage whole and builds nothing', async () => {
+    const install = fixture();
+    install.set('hold-build', '');
+    const first = install.start();
+    await until(() => install.log('nx.log').some((entry) => entry.includes(':production')));
+    const again = install.start();
+    const calls = cowshedCalls(install);
+    await until(() => install.log('cowshed.log').includes(calls.queued));
+    install.set('release', '');
+    const [a, b] = await Promise.all([first, again]);
+    expect(onlyLine(a.stdout).text).toBe('installed');
+    expect(onlyLine(b.stdout).text).toBe('installed');
+    expect(install.log('cowshed.log').slice(-3)).toEqual([calls.lock('0 -> 1'), calls.held, calls.lock('1 -> 1')]);
+    expect(install.log('nx.log').filter((entry) => entry.includes(':production'))).toHaveLength(1);
+  });
+
+  it('reuses a stage that is already whole, forking and building nothing', () => {
     const install = fixture();
     const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
     mkdirSync(dirname(binary), { recursive: true });
@@ -874,7 +1320,8 @@ describe('land-install.sh', () => {
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('installed');
     expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
-    expect(install.log('turns.log')).toEqual(['smoothbricks post-land-install']);
+    expect(install.log('cowshed.log')).toEqual([]);
+    expect(install.log('turns.log')).toEqual([]);
   });
 
   it('keeps the newest three stages and nothing else of its own, and never touches a foreign entry', () => {
@@ -897,15 +1344,25 @@ describe('land-install.sh', () => {
     const run = install.run({ machine: 'riscv64' });
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('skipped: no release CLI of cowshed installs on Darwin riscv64');
+    expect(install.log('cowshed.log')).toEqual([]);
     expect(install.log('turns.log')).toEqual([]);
   });
 
   it('refuses arguments that are not commits before doing anything', () => {
     const install = fixture();
-    const run = install.run({ args: ['smoothbricks', 'main', install.head] });
+    const run = install.run({ args: ['main', install.head] });
     expect(run.status).toBe(64);
     expect(run.stdout).toBe('');
     expect(run.stderr).toContain('is not a full commit id');
+    expect(install.log('nx.log')).toEqual([]);
+  });
+
+  it('takes no repository name: the old three arguments are a usage error', () => {
+    const install = fixture();
+    const run = install.run({ args: ['smoothbricks', install.before, install.head] });
+    expect(run.status).toBe(64);
+    expect(run.stdout).toBe('');
+    expect(run.stderr).toContain('usage: land-install.sh <before> <head>');
     expect(install.log('nx.log')).toEqual([]);
   });
 });

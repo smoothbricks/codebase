@@ -4,8 +4,9 @@
 //
 // The gateway daemon and the cowshed an operator types are one installed artifact, and only 'cowshed setup' replaces
 // it (specs/cowshed/05_gateway.md, "The installed cowshed"): a land that changed cowshed leaves the host on the build
-// before it. The script builds the land's release CLI, then does what setup can do with nobody present, and says in
-// one land-status line on stdout what it did and the exact command for what it did not.
+// before it. The script builds the land's release CLI in the stable build shed, pointed at the land's head, holding no
+// land turn but the release lock that orders installs, then does what setup can do with nobody present, and says in one
+// land-status line on stdout what it did and the exact command for what it did not.
 
 import { join } from 'node:path';
 
@@ -76,6 +77,14 @@ export function staleStages(names: readonly string[], keep: number): readonly st
  */
 export function setupCommand(main: string, binary: string): string {
   return `direnv exec ${shellWord(main)} ${shellWord(binary)} setup`;
+}
+
+/**
+ * The command line that reruns the install of a land whose build was not started because the host was busy or could not
+ * be read, for a person to run: the script in main's devenv, quoted for a shell like the setup command.
+ */
+export function rerunCommand(main: string, before: string, head: string): string {
+  return `direnv exec ${shellWord(main)} sh ${shellWord(join(main, 'tooling', 'land-install.sh'))} ${shellWord(before)} ${shellWord(head)}`;
 }
 
 function shellWord(word: string): string {
@@ -345,8 +354,8 @@ function fail(message: string): never {
 if (import.meta.main) {
   const USAGE =
     'usage: land-install.ts target SYSTEM MACHINE | wanted AFFECTED_JSON CHANGED_FILES | commit COMMIT... | ' +
-    'stage-dir MAIN COMMIT | stale KEEP <NAMES | command MAIN BINARY | prompt DOCTOR_JSON | readiness STATUS_JSON | ' +
-    'setup STATUS STDOUT | record TIMESTAMP COMMIT KIND [WHY [COMMAND]]\n';
+    'stage-dir MAIN COMMIT | stale KEEP <NAMES | command MAIN BINARY | rerun MAIN BEFORE HEAD | prompt DOCTOR_JSON | ' +
+    'readiness STATUS_JSON | setup STATUS STDOUT | record TIMESTAMP COMMIT KIND [WHY [COMMAND]]\n';
   const [verb, ...args] = process.argv.slice(2);
   const [first, second, third, fourth, fifth] = args;
   if (verb === 'target' && args.length === 2 && first !== undefined && second !== undefined) {
@@ -366,6 +375,14 @@ if (import.meta.main) {
     for (const stale of staleStages(names, Number(first))) process.stdout.write(`${stale}\n`);
   } else if (verb === 'command' && args.length === 2 && first !== undefined && second !== undefined) {
     process.stdout.write(`${setupCommand(first, second)}\n`);
+  } else if (
+    verb === 'rerun' &&
+    args.length === 3 &&
+    first !== undefined &&
+    second !== undefined &&
+    third !== undefined
+  ) {
+    process.stdout.write(`${rerunCommand(first, second, third)}\n`);
   } else if (verb === 'prompt' && args.length === 1 && first !== undefined) {
     process.stdout.write(`${promptLine(setupPrompt(first))}\n`);
   } else if (verb === 'readiness' && args.length === 1 && first !== undefined) {
