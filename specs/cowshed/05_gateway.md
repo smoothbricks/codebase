@@ -436,6 +436,24 @@ session three times, twice while queued and once mid-gate. So a caller that may 
 session of its own (`setsid`, output to a file, not its child) and waits on the land's pid; `land-turn` itself never
 detaches, since the caller that stays reads its output and its exit status.
 
+**Land-turn laws.** `Turns`, the pure core of the gateway's queues, is the Bend model `laws/land_turn.bend`, and its
+laws are this section's contract, proven for every sequence of asks, binds, exits and departures (`--verdict`):
+
+- **One holder** (`one_holder`): the first ticket of a queue holds its turn and every other ticket waits with no command
+  bound to it. No command runs outside its turn, and a queue that holds a ticket is never idle: the turn passes on in
+  the input that ends its last holder.
+- **First asked, first served** (`fifo`): ticket numbers rise strictly from the holder to the last waiter. Every ticket
+  ahead of a land asked before it, so a land's turn wait is the sum of the holds of the lands asked before it and still
+  queued; nothing asked after it lengthens that wait.
+- **A waiting ticket binds nothing** (`waiting_bind_refused`): a bind of a ticket that does not hold its turn is refused
+  and changes no queue.
+- **Definedness** (`ask_enters`): an ask enters its queue last, numbered one past the last number given.
+
+The gateway's `land_turn::laws` runs the model, emitted to Rust, and `Turns` on the same inputs: the model's enumerated
+corpus, its seeded draws and the six repositories' queues recorded from 2026-10-21 to 2026-10-27. After every input it
+compares the two queues ticket by ticket and every bind's answer, and checks `one_holder` and `fifo` on `Turns`' own
+queue. A change to `Turns` that breaks a law fails there; changing a law is changing this paragraph.
+
 **A ref turn.** A repository whose main also moves outside its lands (an operator's Markdown commit straight into main)
 keeps a second queue beside its land turn, by convention `<repo>.ref`: every writer that moves main's ref outside
 cowshed takes it for that move alone (`cowshed land-turn <repo>.ref --workspace <label> -- <commit>`), and a land names

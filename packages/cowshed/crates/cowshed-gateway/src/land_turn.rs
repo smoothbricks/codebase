@@ -689,6 +689,9 @@ async fn write<W: AsyncWrite + Unpin>(writer: &mut W, answer: &TurnAnswer) -> st
 }
 
 #[cfg(test)]
+mod laws;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
