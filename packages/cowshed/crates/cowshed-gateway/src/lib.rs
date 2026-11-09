@@ -37,7 +37,9 @@ pub use config::{
     CONTROL_TCP_ADDR, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
     MirrorCacheConfig, StartupProbe,
 };
-pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
+pub use control::{
+    ControlError, ControlFailureCode, FencedLandTurns, GatewayControlClient, TurnFence,
+};
 /// The control-plane data model is re-exported at this root so `cowshed_gateway::WorkspaceSession`
 /// and friends name the same items whether a caller links the daemon or only the types crate.
 pub use cowshed_gateway_types::{

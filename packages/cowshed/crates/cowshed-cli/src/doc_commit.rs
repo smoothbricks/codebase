@@ -99,7 +99,8 @@ where
         .gateway_socket
         .clone()
         .unwrap_or_else(|| CanonicalRoots::global().control_socket());
-    let mut turn = RefTurn::acquire_in(&socket, land.ref_turn(), RefWriter::DocCommit).await?;
+    let gateway = cowshed_core::land_turn::TurnGateway::host(socket)?;
+    let mut turn = RefTurn::acquire_in(&gateway, land.ref_turn(), RefWriter::DocCommit).await?;
     let mut hold = Hold {
         main: &main,
         environment: &environment,

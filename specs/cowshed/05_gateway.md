@@ -263,12 +263,34 @@ It never waits for them. The refused install copies, moves and restarts nothing,
 running gateway stay as they were; `setup`'s storage repair, which runs before its install (setup_service order:
 volumes, owner markers, mains, git identity, then the service refresh), stays done. The hint is to rerun once the land
 has ended, and `cowshed gateway status` lists the turns. A land queued behind the turn's holder runs nothing yet and is
-not a blocker: its first command waits for the slot. The land turns are that gateway's own state, gone with it: one that
-does not answer `land-turns`, a build from before them, names no land turn, and the install says so. A gate job that is
-no land's — a train's proof, an operator's run — is no blocker: it lives in its workspace supervisor, which a gateway
-restart leaves running. An install that restarts nothing (no daemon answers, or the refresh finds the agent current)
-checks nothing. This replaces a wait with no deadline for the gates in flight: measured 2026-10-21, it held an install
-behind a gate of 2 h 26 min until the gate was killed, and operators took to granting installs a window by hand.
+not named: its holder already refuses the install. A land that asks after the read is fenced ("The read fences the
+turns", below). The land turns are that gateway's own state, gone with it: one that does not answer `land-turns`, a
+build from before them, names no land turn, and the install says so. A gate job that is no land's — a train's proof, an
+operator's run — is no blocker: it lives in its workspace supervisor, which a gateway restart leaves running. An install
+that restarts nothing (no daemon answers, or the refresh finds the agent current) checks nothing. This replaces a wait
+with no deadline for the gates in flight: measured 2026-10-21, it held an install behind a gate of 2 h 26 min until the
+gate was killed, and operators took to granting installs a window by hand.
+
+**The read fences the turns.** The install's read of the land turns and its restart are two steps, and a land's ask
+between them is a turn the restart cuts. Recorded 2026-10-28 13:52:39Z (`lands/8e24efb3….after2.log:77`): a land passed
+its slot check before an install took the slot, the install read no turn holder, the land asked its turn and bound its
+gate, and the install restarted the gateway, whose drain closed the turn's connection; the land had lost its turn, and
+sent its gate SIGTERM. A land asks its turn without waiting for the slot, so no check before the ask closes the gap. So
+the install reads the turns with the fence, `{"op":"land-turns","abandonedSinceUnixMs","fence":true}`, over a connection
+it keeps open, and the gateway's one land-turn actor answers it in one step: every queue, and, when no queue has a
+ticket, `"fenced":true`, every queue then fenced until that connection closes. A read that finds a holder sets no fence
+(`"fenced":false`), and the install refuses. An ask under the fence is answered `{"turn":"fenced"}` and never numbered;
+its asker — `land-turn`, a declared land, a ref-turn writer — waits for the install slot, as a land step does, and asks
+again of the gateway the install leaves. An ask whose connection is refused while an install holds the slot waits the
+same way. The install holds the read's connection until the restart's drain closes it, which lifts the fence with the
+gateway that held it. An install that restarts nothing after its read lifts the fence before it lets the slot go: it
+ends the read and waits for the gateway's end of file, which the gateway writes once the fence is lifted, so no ask made
+after the slot is free meets it. A land fenced again after a slot wait that found no install has met a fence no install
+holds, and its ask fails saying so. `cowshed gateway status` reads the turns without the fence. The model is
+`laws/install_restart.bend` with `fenced` set, where no restart cuts a turn (`fenced_restart_never_cuts_a_turn`), kills
+an admitted gate (`fenced_restart_never_kills_an_admitted_gate`) or refuses an ask
+(`fenced_restart_never_refuses_an_ask`) in any interleaving, and its unfenced counterexamples
+(`laws/install_restart_open.bend`) are this schedule; the queue's side is in "Land-turn laws".
 
 **A land step waits for an install in progress.** A land is several cowshed commands with none running between them:
 measured 2026-10-20, an install found no gate running as a land's first gate ended and restarted the gateway as its host
@@ -290,8 +312,9 @@ and it is not draining, the wait `gateway start` reports. Releasing the slot at 
 the daemon's socket refusing the connection, failing a land whose gate had passed. A land step never holds the slot for
 its run: it did once, and an install then waited on every land step in flight, between its gates as well as during them.
 A job in flight lives in its workspace supervisor, which a gateway restart leaves running; what a restart breaks is a
-new connection to the daemon, and that is what waits, and the guard against a restart between two of a land's commands
-is the land's turn. Status reads the slot without taking it.
+new connection to the daemon, and that is what waits. The guard against a restart between two of a land's commands is
+the land's turn, and the guard against a restart between an install's read of the turns and a land's ask is the read's
+fence ("The read fences the turns"). Status reads the slot without taking it.
 
 `land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
 requires no matching daemon build and never re-execs the installed cowshed.
@@ -392,8 +415,9 @@ So a land asks the gateway over a connection of its own to the control socket,
 kernel's identity of the connection's peer, and numbers each ticket itself as the ask reaches it, so a ticket's number
 is its place and no ask that arrived later takes the turn ahead of one that arrived first. The first ticket of a
 repository holds its turn. A waiting land is answered `{"turn":"queued","ticket","holder","ahead"}` when it asks and
-whenever its queue changes, and `{"turn":"held","ticket"}` once the turn is its own. A turn is held by processes, never
-by descriptors: by its asker until the asker ends its hold (`{"step":"end","outcome"}`), closes the connection or exits,
+whenever its queue changes, and `{"turn":"held","ticket"}` once the turn is its own; an ask under an install's fence is
+answered `{"turn":"fenced"}` and never numbered ("The read fences the turns"). A turn is held by processes, never by
+descriptors: by its asker until the asker ends its hold (`{"step":"end","outcome"}`), closes the connection or exits,
 and by each command bound to it (`{"step":"bind","pid"}`, answered `{"turn":"bound","pid"}`) until that command exits. A
 command binds itself: its asker arms it so that, between its fork and its exec, the child writes the bind step naming
 its own pid on the asker's connection, which it shares until its exec closes it, and the asker reads the answer once the
@@ -451,7 +475,7 @@ session of its own (`setsid`, output to a file, not its child) and waits on the 
 detaches, since the caller that stays reads its output and its exit status.
 
 **Land-turn laws.** `Turns`, the pure core of the gateway's queues, is the Bend model `laws/land_turn.bend`, and its
-laws are this section's contract, proven for every sequence of asks, binds, exits and departures (`--verdict`):
+laws are this section's contract, proven for every sequence of asks, binds, exits, departures and fences (`--verdict`):
 
 - **One holder** (`one_holder`): the first ticket of a queue holds its turn and every other ticket waits with no command
   bound to it. No command runs outside its turn, and a queue that holds a ticket is never idle: the turn passes on in
@@ -461,12 +485,17 @@ laws are this section's contract, proven for every sequence of asks, binds, exit
   queued; nothing asked after it lengthens that wait.
 - **A waiting ticket binds nothing** (`waiting_bind_refused`): a bind of a ticket that does not hold its turn is refused
   and changes no queue.
-- **Definedness** (`ask_enters`): an ask enters its queue last, numbered one past the last number given.
+- **A fenced ask is refused** (`fenced_ask_refused`): an ask while an install's read fences the queues changes no queue,
+  numbers nothing and keeps the fence.
+- **A fence only on a free queue** (`fence_only_when_free`): a fenced read that finds a ticket sets no fence and changes
+  nothing; one that finds none fences (`free_read_fences`).
+- **Definedness** (`ask_enters`): an unfenced ask enters its queue last, numbered one past the last number given.
 
 The gateway's `land_turn::laws` runs the model, emitted to Rust, and `Turns` on the same inputs: the model's enumerated
 corpus, its seeded draws and the six repositories' queues recorded from 2026-10-21 to 2026-10-27. After every input it
-compares the two queues ticket by ticket and every bind's answer, and checks `one_holder` and `fifo` on `Turns`' own
-queue. A change to `Turns` that breaks a law fails there; changing a law is changing this paragraph.
+compares the two queues ticket by ticket, every bind's answer, the last number given and the fences, and checks
+`one_holder` and `fifo` on `Turns`' own queue. A change to `Turns` that breaks a law fails there; changing a law is
+changing this paragraph.
 
 **A ref turn.** A repository whose main also moves outside its lands (an operator's Markdown commit straight into main)
 keeps a second queue beside its land turn, by convention `<repo>.ref`: every writer that moves main's ref outside

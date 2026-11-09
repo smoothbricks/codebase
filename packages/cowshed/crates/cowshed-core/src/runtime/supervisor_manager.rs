@@ -1068,17 +1068,22 @@ async fn connect_manager(path: &Path) -> io::Result<UnixStream> {
     Ok(cowshed_os::deadline::connect_unix(&budget, &peer, path).await?)
 }
 
-/// Connect to the daemon socket at `path`. A refused connection while an install holds the slot
-/// in `support` is that install restarting the daemon: a positive signal, so the connection waits
-/// for the install and is made once more against the daemon it installed. Any other refusal is
-/// returned as it is (05_gateway.md, "A land step waits for an install in progress"). Measured
-/// 2026-10-20: a land step's connection made mid-restart was refused and failed the land.
-pub(crate) async fn connect_across_install(
+/// Connect to a daemon socket through `connect`. A refused connection while an install holds the
+/// slot in `support` is that install restarting the daemon: a positive signal, so the connection
+/// waits for the install and is made once more against the daemon it installed. Any other refusal
+/// is returned as it is (05_gateway.md, "A land step waits for an install in progress"). Measured
+/// 2026-10-20: a land step's connection made mid-restart was refused and failed the land. A land's
+/// turn ask connects to the gateway the same way (05_gateway.md "The read fences the turns").
+pub(crate) async fn connect_across_install<C, F>(
     census: &crate::census::CensusScope,
-    path: &Path,
     support: &Path,
-) -> io::Result<UnixStream> {
-    let refused = match connect_manager(path).await {
+    connect: C,
+) -> io::Result<UnixStream>
+where
+    C: Fn() -> F,
+    F: std::future::Future<Output = io::Result<UnixStream>>,
+{
+    let refused = match connect().await {
         Ok(stream) => return Ok(stream),
         Err(error) => error,
     };
@@ -1089,7 +1094,7 @@ pub(crate) async fn connect_across_install(
     .await
     .map_err(io::Error::other)?;
     match waited {
-        Ok(true) => connect_manager(path).await,
+        Ok(true) => connect().await,
         Ok(false) => Err(refused),
         Err(error) => Err(io::Error::other(format!(
             "{refused}; and the install slot could not be read: {error}"
@@ -1106,7 +1111,7 @@ pub async fn ensure(
 ) -> Result<Ensured> {
     let path = manager_socket_path(store_root);
     let support = crate::host_dirs::support_directory(&crate::gateway_sessions::canonical_home()?);
-    let mut stream = connect_across_install(census, &path, &support)
+    let mut stream = connect_across_install(census, &support, || connect_manager(&path))
         .await
         .map_err(|error| {
             CowshedError::environment_missing(
@@ -2096,9 +2101,11 @@ mod tests {
         let support = root.join("support");
         std::fs::create_dir(&support).expect("support");
 
-        let refused = connect_across_install(&crate::census::this_test(), &socket, &support)
-            .await
-            .expect_err("nothing serves and no install runs");
+        let refused = connect_across_install(&crate::census::this_test(), &support, || {
+            connect_manager(&socket)
+        })
+        .await
+        .expect_err("nothing serves and no install runs");
         assert_eq!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
 
         let install = std::fs::File::create(support.join(crate::host_dirs::INSTALL_LOCK_NAME))
@@ -2106,7 +2113,12 @@ mod tests {
         install.try_lock().expect("take the free install slot");
         let connecting = tokio::spawn({
             let (socket, support) = (socket.clone(), support.clone());
-            async move { connect_across_install(&crate::census::this_test(), &socket, &support).await }
+            async move {
+                connect_across_install(&crate::census::this_test(), &support, || {
+                    connect_manager(&socket)
+                })
+                .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(

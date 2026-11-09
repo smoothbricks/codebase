@@ -16802,7 +16802,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     "land",
                     "ref-turn-wait",
                     super::ref_turn::RefTurn::acquire_in(
-                        &self.descriptor.storage.control_socket(),
+                        &self.descriptor.storage.turn_gateway(),
                         queue,
                         super::ref_turn::RefWriter::Land {
                             workspace: workspace.as_str(),

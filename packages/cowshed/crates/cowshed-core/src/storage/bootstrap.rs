@@ -1472,6 +1472,15 @@ impl ValidatedHostStorage {
         self.roots.control_socket()
     }
 
+    /// The store's gateway as a land asks it for a turn: its control socket, and the install slot
+    /// in this home's support directory (05_gateway.md "The read fences the turns").
+    pub fn turn_gateway(&self) -> crate::land_turn::TurnGateway {
+        crate::land_turn::TurnGateway {
+            socket: self.control_socket(),
+            support: crate::host_dirs::support_directory(&self.home),
+            census: self.census(),
+        }
+    }
     pub fn port_allocation(&self) -> crate::metadata::PortAllocation {
         self.roots.port_allocation()
     }

@@ -183,13 +183,15 @@ where
     // A report that cannot be written is kept, not returned: the turn is ended unstarted once the
     // wait is over, never left queued with nothing to report to.
     let mut written: Result<(), CowshedError> = Ok(());
-    let census = cowshed_core::storage::bootstrap::CanonicalRoots::global().census();
+    // The host's install slot: an ask an install's fence meets waits for it (05_gateway.md "The
+    // read fences the turns").
+    let gateway = queue::TurnGateway::host(socket.to_path_buf())?;
     let taken = queue::take(
-        socket,
+        &gateway,
         &ask,
         outside.as_deref().map(|path| queue::OutsideLock {
             path,
-            census: &census,
+            census: &gateway.census,
         }),
         LAND_TURN_REPORT_EVERY,
         |wait| {
@@ -395,6 +397,10 @@ fn report<W: Write, E: Write>(
                 lock.display(),
             )
         }
+        Wait::Install { lock } => format!(
+            "land turn {repo}: an install holding {} fenced the ask; asking again of the gateway it leaves",
+            lock.display(),
+        ),
     };
     output.guidance(&line).map_err(write_failed)
 }

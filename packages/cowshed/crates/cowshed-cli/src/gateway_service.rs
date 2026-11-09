@@ -37,7 +37,7 @@ use cowshed_core::{
 use cowshed_gateway::{
     ArrowAuditConfig, ControlError, ControlFailureCode, DaemonStatus, Gateway, GatewayConfig,
     GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
-    StartupProbe, SupervisorRecovery, WorkspaceSession,
+    StartupProbe, SupervisorRecovery, TurnFence, WorkspaceSession,
 };
 use cowshed_gateway_types::host_status::{LoadReading, MemoryPressureReading, SwapReading};
 use cowshed_os::deadline::WaitError;
@@ -854,49 +854,56 @@ where
     let bun = invoking_bun()?;
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
-    // land runs, before the install changes anything.
-    if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?;
+    // land runs, before the install changes anything, and its turns are fenced until the restart.
+    let fence = if client.status().await.is_ok() {
+        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?
+    } else {
+        None
+    };
+    let started = async {
+        install_nx_cache_server(&mut executor, &home, &candidate.source)?;
+        let spec = LaunchAgentSpec::gateway(storage.namespace(), &executable, &bun)
+            .map_err(launchd_error)?;
+        let observed = inspect_install_state(spec.target())?;
+        let plan = plan_install(
+            &spec,
+            InstallState {
+                launch_agents_directory_mode: observed.directory_mode,
+                plist: observed.plist.as_ref().map(|plist| ExistingPlist {
+                    bytes: &plist.bytes,
+                    mode: plist.mode,
+                }),
+            },
+        );
+        // Held until the restarted gateway serves: it took the listeners before it bound anything.
+        let _carrying = carry_listeners(&paths.control_socket, downgrade);
+        let written = executor.execute_install(&plan).map_err(launchd_error)?;
+        install_and_activate_gateway(
+            &mut executor,
+            &home,
+            &candidate,
+            spec.target(),
+            written,
+            identity,
+        )?;
+        let reported = await_healthy(
+            output,
+            slot,
+            &client,
+            &paths.control_socket,
+            &candidate.digest.to_string(),
+            &mut executor,
+            spec.target(),
+        )
+        .await?;
+        Ok(CliGatewayStatus {
+            scheduling: Some(read_scheduling(storage.store()).await),
+            ..reported
+        })
     }
-    install_nx_cache_server(&mut executor, &home, &candidate.source)?;
-    let spec =
-        LaunchAgentSpec::gateway(storage.namespace(), &executable, &bun).map_err(launchd_error)?;
-    let observed = inspect_install_state(spec.target())?;
-    let plan = plan_install(
-        &spec,
-        InstallState {
-            launch_agents_directory_mode: observed.directory_mode,
-            plist: observed.plist.as_ref().map(|plist| ExistingPlist {
-                bytes: &plist.bytes,
-                mode: plist.mode,
-            }),
-        },
-    );
-    // Held until the restarted gateway serves: it took the listeners before it bound anything.
-    let _carrying = carry_listeners(&paths.control_socket, downgrade);
-    let written = executor.execute_install(&plan).map_err(launchd_error)?;
-    install_and_activate_gateway(
-        &mut executor,
-        &home,
-        &candidate,
-        spec.target(),
-        written,
-        identity,
-    )?;
-    let reported = await_healthy(
-        output,
-        slot,
-        &client,
-        &paths.control_socket,
-        &candidate.digest.to_string(),
-        &mut executor,
-        spec.target(),
-    )
-    .await?;
-    Ok(CliGatewayStatus {
-        scheduling: Some(read_scheduling(storage.store()).await),
-        ..reported
-    })
+    .await;
+    lift_fence(fence).await;
+    started
 }
 
 /// The install's side of the listener handoff (05_gateway.md "An install never refuses a client
@@ -1268,13 +1275,17 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 
 /// Stop the gateway while setup moves its mirrors; the installed binary stays. A gateway that
 /// answers is refused the stop while a land runs ([`refuse_restart_while_busy`]): stopping it
-/// cuts the land off as a restart does.
+/// cuts the land off as a restart does. Its turns stay fenced until the stop has closed them.
 pub(crate) async fn stop_for_host_move(slot: &InstallSlot, roots: &CanonicalRoots) -> Result<()> {
     let client = GatewayControlClient::new(roots.control_socket()).map_err(control_error)?;
-    if client.status().await.is_ok() {
-        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?;
-    }
-    stop_service(roots.namespace(), false).map(|_| ())
+    let fence = if client.status().await.is_ok() {
+        refuse_restart_while_busy(slot, &client, &mut Blocking::new(io::stderr())).await?
+    } else {
+        None
+    };
+    let stopped = stop_service(roots.namespace(), false).map(|_| ());
+    lift_fence(fence).await;
+    stopped
 }
 
 /// Start the gateway again after setup moved its mirrors, saying nothing: setup reports the
@@ -1591,22 +1602,48 @@ fn read_image_cleanup(store: &Path) -> ImageCleanup {
 }
 
 /// Refuse an install about to restart the running gateway while a land holds its repository's
-/// turn (05_gateway.md "An install refuses while a land runs"); the decision is
-/// [`agent_cycle::restart_blockers`]. It never waits for a land, and it runs before the install
+/// turn (05_gateway.md "An install refuses while a land runs"), and otherwise fence the turns
+/// until the restart (05_gateway.md "The read fences the turns"); the decision is
+/// [`agent_cycle::read_judged`]. It never waits for a land, and it runs before the install
 /// copies, moves or restarts anything, so a refused install leaves the installed cowshed and the
 /// running gateway as they were. `setup`'s storage repair, which runs before its install, is not
 /// undone.
 ///
-/// A restart between a land's steps refused its next step's connection. Checked under the install
-/// slot, which every later land step waits for, so nothing this check did not see starts before
-/// the restart. The land turns are the gateway's own state, read without taking a turn. A gateway
-/// that does not answer `land-turns`, a build from before them, names no land turn, and that is
-/// said.
+/// A restart between a land's steps refused its next step's connection, and one between this read
+/// and a land's ask cut the turn the land then held: recorded 2026-10-28 13:52:39Z. Read under the
+/// install slot, and with the fence, which holds every ask back until the returned [`TurnFence`]
+/// is gone: the install keeps it until the restart's drain closes it, and lifts it before it lets
+/// the slot go ([`lift_fence`]). A gateway from before the fence refuses it, and its turns are
+/// read unfenced; one that does not answer `land-turns`, a build from before them, names no land
+/// turn. Each is said.
 async fn refuse_restart_while_busy(
     _slot: &InstallSlot,
     client: &GatewayControlClient,
     stderr: &mut impl Write,
-) -> Result<()> {
+) -> Result<Option<TurnFence>> {
+    let unfenced = match client.fence_land_turns(u64::MAX).await {
+        Ok(read) => {
+            agent_cycle::read_judged(&read.queues, read.fence.is_some())?;
+            return Ok(read.fence);
+        }
+        Err(ControlError::Rejected {
+            code: ControlFailureCode::InvalidRequest,
+            message,
+        }) => message,
+        Err(error) => {
+            writeln!(
+                stderr,
+                "cowshed: the running gateway does not answer land-turns, so no land turn of it is known: {error}"
+            )
+            .map_err(output_error)?;
+            return Ok(None);
+        }
+    };
+    writeln!(
+        stderr,
+        "cowshed: the running gateway cannot fence its land turns ({unfenced}), so a land that asks before its restart is not held back"
+    )
+    .map_err(output_error)?;
     let lands = match client.land_turns(u64::MAX).await {
         Ok(lands) => lands,
         Err(error) => {
@@ -1620,7 +1657,21 @@ async fn refuse_restart_while_busy(
     };
     match agent_cycle::refusal(&agent_cycle::restart_blockers(&lands)) {
         Some(refusal) => Err(refusal),
-        None => Ok(()),
+        None => Ok(None),
+    }
+}
+
+/// Lift the install's fence on the land turns once its restart is over or abandoned, before the
+/// slot is let go (05_gateway.md "The read fences the turns"): a restarted gateway's drain closed
+/// the read already, and one that was not restarted lifts it now. A fence that cannot be lifted
+/// is said; its connection closes as this install exits, and the gateway lifts it then.
+async fn lift_fence(fence: Option<TurnFence>) {
+    if let Some(fence) = fence
+        && let Err(error) = fence.lift().await
+    {
+        cowshed_os::eprintln!(
+            "cowshed: the install's fence on the land turns was not lifted ({error}); the gateway lifts it as this install exits"
+        );
     }
 }
 
@@ -3203,48 +3254,59 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     }
     let restarts = binary_is_stale || daemon_is_stale || !plan.is_noop();
     // Before anything is installed: a refusal leaves the installed cowshed and the gateway as
-    // they were.
-    if restarts && let Some((slot, client)) = answering {
-        refuse_restart_while_busy(slot, client, &mut Blocking::new(io::stderr())).await?;
+    // they were, and a read that refuses nothing fences the turns until the restart.
+    let fence = match answering {
+        Some((slot, client)) if restarts => {
+            refuse_restart_while_busy(slot, client, &mut Blocking::new(io::stderr())).await?
+        }
+        _ => None,
+    };
+    let refreshed = async {
+        // The packaged Nx cache server is part of this build's install. A current agent is still
+        // repaired, so this runs before the no-op return and before any activation: a missing
+        // companion fails here rather than after the host has changed.
+        install_nx_cache_server(executor, home, &candidate.source)?;
+        // The gateway host is repaired like the companion, before the no-op return and without a
+        // restart: a missing or foreign-signed host is rewritten, and launchd runs the rewritten
+        // file at the next start. An install that moves the stable name rewrites it below.
+        let identity = identity()?;
+        if !binary_is_stale {
+            install_gateway_host(executor, &executable, &candidate.source, identity, false)?;
+        }
+        if !restarts {
+            return Ok(None);
+        }
+        let plist = executor.execute_install(&plan).map_err(launchd_error)?;
+        if binary_is_stale {
+            // Binary drift requires a restart even when the agent definition itself did not
+            // change.
+            install_and_activate_gateway(
+                executor,
+                home,
+                candidate,
+                spec.target(),
+                InstallOutcome::Changed,
+                identity,
+            )?;
+        } else if daemon_is_stale {
+            activate_launch_agent(
+                executor,
+                effective_uid(),
+                spec.target(),
+                InstallOutcome::Changed,
+            )?;
+        } else {
+            activate_launch_agent(executor, effective_uid(), spec.target(), plist)?;
+        }
+        Ok(Some(ServiceBinaryRefresh::Refreshed {
+            service: spec.label().to_owned(),
+        }))
     }
-    // The packaged Nx cache server is part of this build's install. A current agent is still
-    // repaired, so this runs before the no-op return and before any activation: a missing
-    // companion fails here rather than after the host has changed.
-    install_nx_cache_server(executor, home, &candidate.source)?;
-    // The gateway host is repaired like the companion, before the no-op return and without a
-    // restart: a missing or foreign-signed host is rewritten, and launchd runs the rewritten file
-    // at the next start. An install that moves the stable name rewrites it below.
-    let identity = identity()?;
-    if !binary_is_stale {
-        install_gateway_host(executor, &executable, &candidate.source, identity, false)?;
-    }
-    if !restarts {
-        return Ok(None);
-    }
-    let plist = executor.execute_install(&plan).map_err(launchd_error)?;
-    if binary_is_stale {
-        // Binary drift requires a restart even when the agent definition itself did not change.
-        install_and_activate_gateway(
-            executor,
-            home,
-            candidate,
-            spec.target(),
-            InstallOutcome::Changed,
-            identity,
-        )?;
-    } else if daemon_is_stale {
-        activate_launch_agent(
-            executor,
-            effective_uid(),
-            spec.target(),
-            InstallOutcome::Changed,
-        )?;
-    } else {
-        activate_launch_agent(executor, effective_uid(), spec.target(), plist)?;
-    }
-    Ok(Some(ServiceBinaryRefresh::Refreshed {
-        service: spec.label().to_owned(),
-    }))
+    .await;
+    // The activation waited for the old gateway's exit, so its drain closed the read already; a
+    // refresh that restarted nothing lifts the fence here, before the caller lets the slot go.
+    lift_fence(fence).await;
+    refreshed
 }
 
 /// What `setup` did about the `cowshed` the operator types.
@@ -5494,7 +5556,8 @@ mod tests {
 
         /// The measured failure: an install restarted the gateway between a land's steps, and the
         /// next step's connection was refused. An install now refuses at once, before it changes
-        /// anything, while a land holds its turn, naming it; with none it goes on. It never waits.
+        /// anything, while a land holds its turn, naming it; with none it goes on, the turns
+        /// fenced until it lifts the fence. It never waits.
         #[tokio::test]
         async fn an_install_refuses_while_a_land_turn_runs() {
             let heal = Arc::new(StartupHealState::mounting(0));
@@ -5506,13 +5569,20 @@ mod tests {
             fs::create_dir_all(&support).expect("support directory");
             let slot = InstallSlot::take(&support).await.expect("the slot");
             let mut said = Vec::new();
-            refuse_restart_while_busy(&slot, &client, &mut said)
+            let fence = refuse_restart_while_busy(&slot, &client, &mut said)
                 .await
-                .expect("nothing runs");
+                .expect("nothing runs")
+                .expect("a read that finds no holder fences the turns");
             assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
+            fence.lift().await.expect("the install lifts its fence");
 
+            let gateway = turns::TurnGateway {
+                socket: daemon.socket.clone(),
+                support: support.clone(),
+                census: cowshed_core::storage::bootstrap::CanonicalRoots::global().census(),
+            };
             let turn = turns::take(
-                &daemon.socket,
+                &gateway,
                 &turns::TurnAsk {
                     repo: cowshed_core::api::dto::LandTurnName::new("acme-widget")
                         .expect("a queue name"),
@@ -5552,7 +5622,11 @@ mod tests {
             .expect("the gateway ended the turn before the no-progress backstop");
             refuse_restart_while_busy(&slot, &client, &mut said)
                 .await
-                .expect("nothing runs any more");
+                .expect("nothing runs any more")
+                .expect("the turns are fenced again")
+                .lift()
+                .await
+                .expect("the install lifts its fence");
             assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
             daemon.gateway.drain().await.expect("drain the gateway");

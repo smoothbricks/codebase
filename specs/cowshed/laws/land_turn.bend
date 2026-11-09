@@ -7,6 +7,11 @@
 # Repositories' queues are independent (tickets are numbered globally and found
 # by number), so one queue is the model.
 #
+# An install's read of the turns asked with the fence (05_gateway.md "The read
+# fences the turns") fences every queue when it finds no ticket: `TFence` is
+# that read, `TUnfence` its connection's close, and `fences` how many such
+# reads are open. An ask under a fence is refused and never numbered.
+#
 # Check: bun bend2/main.ts land_turn.bend --verdict
 # Bound to the code by cowshed-gateway src/land_turn/laws.rs, which runs the
 # emitted model (src/land_turn/laws/model.rs) and `Turns` on the same inputs.
@@ -20,6 +25,8 @@ type Op is Data:
   TBind{num: Nat, pid: Nat}
   TExit{num: Nat, pid: Nat}
   TLeave{num: Nat}
+  TFence{}
+  TUnfence{}
 
 type Bound is Data:
   BGranted{}
@@ -27,7 +34,7 @@ type Bound is Data:
   BWaiting{}
 
 type St is Data:
-  St{q: +List<E>, numbered: Nat}
+  St{q: +List<E>, numbered: Nat, fences: Nat}
 
 # --- Nat and list helpers ---------------------------------------------------
 
@@ -217,13 +224,17 @@ def find(+n: Nat, q: +List<E>) -> Bound:
 # what a bind is answered (land_turn.rs `bind`)
 def verdict(o: Op, s: St) -> Bound:
   match o s:
-    case TBind{n, p} St{+q, c}:
+    case TBind{n, p} St{+q, c, f}:
       find(n, q)
-    case TAsk{} St{q, c}:
+    case TAsk{} St{q, c, f}:
       BGranted{}
-    case TExit{n, p} St{q, c}:
+    case TExit{n, p} St{q, c, f}:
       BGranted{}
-    case TLeave{n} St{q, c}:
+    case TLeave{n} St{q, c, f}:
+      BGranted{}
+    case TFence{} St{q, c, f}:
+      BGranted{}
+    case TUnfence{} St{q, c, f}:
       BGranted{}
 
 def bind.if(+n: Nat, +p: Nat, +q: +List<E>, v: Bound) -> +List<E>:
@@ -235,16 +246,44 @@ def bind.if(+n: Nat, +p: Nat, +q: +List<E>, v: Bound) -> +List<E>:
     case BWaiting{}:
       q
 
+# an ask under a fence is refused and changes nothing (land_turn.rs `ask`)
+def ask(+q: +List<E>, +c: Nat, f: Nat) -> St:
+  match f:
+    case 0n:
+      St{tell(snoc(q, E{1n+c, True{}, [], False{}})), 1n+c, 0n}
+    case 1n+g:
+      St{q, c, 1n+g}
+
+# a read fences only an empty queue (land_turn.rs `fence`)
+def fence(q: +List<E>, f: Nat) -> Nat:
+  match q:
+    case Nil{}:
+      1n+f
+    case Con{e, t}:
+      f
+
+# a fencing read's connection closed (land_turn.rs `unfence`)
+def unfence(f: Nat) -> Nat:
+  match f:
+    case 0n:
+      0n
+    case 1n+g:
+      g
+
 def step(o: Op, s: St) -> St:
   match o s:
-    case TAsk{} St{+q, +c}:
-      St{tell(snoc(q, E{1n+c, True{}, [], False{}})), 1n+c}
-    case TBind{+n, +p} St{+q, c}:
-      St{bind.if(n, p, q, find(n, q)), c}
-    case TExit{+n, +p} St{+q, c}:
-      St{settle(n, edit(n, DropPid{p}, q)), c}
-    case TLeave{+n} St{+q, c}:
-      St{settle(n, edit(n, Depart{}, q)), c}
+    case TAsk{} St{+q, +c, f}:
+      ask(q, c, f)
+    case TBind{+n, +p} St{+q, c, f}:
+      St{bind.if(n, p, q, find(n, q)), c, f}
+    case TExit{+n, +p} St{+q, c, f}:
+      St{settle(n, edit(n, DropPid{p}, q)), c, f}
+    case TLeave{+n} St{+q, c, f}:
+      St{settle(n, edit(n, Depart{}, q)), c, f}
+    case TFence{} St{+q, c, f}:
+      St{q, c, fence(q, f)}
+    case TUnfence{} St{q, c, f}:
+      St{q, c, unfence(f)}
 
 def run(os: +List<Op>, s: St) -> St:
   match os:
@@ -254,18 +293,22 @@ def run(os: +List<Op>, s: St) -> St:
       run(t, step(o, s))
 
 def empty() -> St:
-  St{[], 0n}
+  St{[], 0n, 0n}
 
 def queue(s: St) -> +List<E>:
   match s:
-    case St{q, c}:
+    case St{q, c, f}:
       q
 
 def counter(s: St) -> Nat:
   match s:
-    case St{q, c}:
+    case St{q, c, f}:
       c
 
+def fences(s: St) -> Nat:
+  match s:
+    case St{q, c, f}:
+      f
 # --- order facts --------------------------------------------------------------
 
 def LE(a: Nat, b: Nat) -> Data:
@@ -368,9 +411,8 @@ def Pre(q: +List<E>) -> Data:
 
 def Inv(s: St) -> Data:
   match s:
-    case St{+q, +c}:
+    case St{+q, +c, f}:
       Sigma<&2, &2, TurnOk(q), u => Chain(0n, q, c)>
-
 # --- FIFO is kept ---------------------------------------------------------------
 
 def chain_weaken(+lo: Nat, +n: Nat, +t: +List<E>, +top: Nat, le: LE(lo, n), ch: Chain(n, t, top)) -> Chain(lo, t, top):
@@ -668,23 +710,37 @@ def bind_chain(+q: +List<E>, +n: Nat, +p: Nat, +v: Bound, +top: Nat, ch: Chain(0
 
 # --- every input keeps both invariants -------------------------------------------
 
-def inv_step(+o: Op, +s: St, i: Inv(s)) -> Inv(step(o, s)):
-  match o s:
-    case TAsk{} St{q, c}:
+# an ask keeps them whether it is numbered or fenced
+def inv_ask(+q: +List<E>, +c: Nat, +f: Nat, i: Inv(St{q, c, f})) -> Inv(ask(q, c, f)):
+  match f:
+    case 0n:
       (ok, ch) = i
       (pre_tell(snoc(q, E{1n+c, True{}, [], False{}}), pre_snoc(q, E{1n+c, True{}, [], False{}}, ok, (Unit{}, Unit{}))),
        chain_tell(0n, snoc(q, E{1n+c, True{}, [], False{}}), 1n+c, chain_snoc(q, 0n, c, True{}, [], False{}, ch)))
-    case TBind{n, p} St{q, c}:
+    case 1n+g:
+      i
+
+def inv_step(+o: Op, +s: St, i: Inv(s)) -> Inv(step(o, s)):
+  match o s:
+    case TAsk{} St{q, c, f}:
+      inv_ask(q, c, f, i)
+    case TBind{n, p} St{q, c, f}:
       (ok, ch) = i
       (bind_ok(q, n, p, find(n, q), ok, {==}), bind_chain(q, n, p, find(n, q), c, ch))
-    case TExit{n, p} St{q, c}:
+    case TExit{n, p} St{q, c, f}:
       (ok, ch) = i
       (pre_tell(sweep(n, edit(n, DropPid{p}, q)), pre_sweep(edit(n, DropPid{p}, q), n, pre_edit(q, n, DropPid{p}, Unit{}, ok))),
        chain_tell(0n, sweep(n, edit(n, DropPid{p}, q)), c, chain_sweep(edit(n, DropPid{p}, q), 0n, n, c, chain_edit(q, 0n, n, DropPid{p}, c, ch))))
-    case TLeave{n} St{q, c}:
+    case TLeave{n} St{q, c, f}:
       (ok, ch) = i
       (pre_tell(sweep(n, edit(n, Depart{}, q)), pre_sweep(edit(n, Depart{}, q), n, pre_edit(q, n, Depart{}, Unit{}, ok))),
        chain_tell(0n, sweep(n, edit(n, Depart{}, q)), c, chain_sweep(edit(n, Depart{}, q), 0n, n, c, chain_edit(q, 0n, n, Depart{}, c, ch))))
+    case TFence{} St{q, c, f}:
+      (ok, ch) = i
+      (ok, ch)
+    case TUnfence{} St{q, c, f}:
+      (ok, ch) = i
+      (ok, ch)
 
 def inv_run(+os: +List<Op>, +s: St, i: Inv(s)) -> Inv(run(os, s)):
   match os:
@@ -698,16 +754,15 @@ def inv_empty() -> Inv(empty()):
 
 def turn_of(+s: St, i: Inv(s)) -> TurnOk(queue(s)):
   match s:
-    case St{q, c}:
+    case St{q, c, f}:
       (ok, ch) = i
       ok
 
 def chain_of(+s: St, i: Inv(s)) -> Chain(0n, queue(s), counter(s)):
   match s:
-    case St{q, c}:
+    case St{q, c, f}:
       (ok, ch) = i
       ch
-
 def nums(q: +List<E>) -> +List<Nat>:
   match q:
     case Nil{}:
@@ -757,16 +812,41 @@ law fifo:
 law waiting_bind_refused:
   for +q: +List<E>
   for +c: Nat
+  for +f: Nat
   for +n: Nat
   for +p: Nat
   for g: {find(n, q) == BWaiting{} : Bound}
-  {step(TBind{n, p}, St{q, c}) == St{q, c} : St}
+  {step(TBind{n, p}, St{q, c, f}) == St{q, c, f} : St}
 
-# Definedness: an ask enters its queue last, numbered one past the last number.
+# Definedness: an unfenced ask enters its queue last, numbered one past the last
+# number.
 law ask_enters:
   for +q: +List<E>
   for +c: Nat
-  {nums(queue(step(TAsk{}, St{q, c}))) == snocn(nums(q), 1n+c) : +List<Nat>}
+  {nums(queue(step(TAsk{}, St{q, c, 0n}))) == snocn(nums(q), 1n+c) : +List<Nat>}
+
+# A fenced ask is refused: it changes no queue, numbers nothing and keeps the
+# fence (05_gateway.md "The read fences the turns").
+law fenced_ask_refused:
+  for +q: +List<E>
+  for +c: Nat
+  for +f: Nat
+  {step(TAsk{}, St{q, c, 1n+f}) == St{q, c, 1n+f} : St}
+
+# A fence is set only on an empty queue: a read that finds a ticket, whose
+# install refuses, changes nothing.
+law fence_only_when_free:
+  for +e: E
+  for +t: +List<E>
+  for +c: Nat
+  for +f: Nat
+  {step(TFence{}, St{e <> t, c, f}) == St{e <> t, c, f} : St}
+
+# Definedness: a read that finds no ticket fences the queue.
+law free_read_fences:
+  for +c: Nat
+  for +f: Nat
+  {fences(step(TFence{}, St{[], c, f})) == 1n+f : Nat}
 
 def one_holder(os):
   turn_of(run(os, empty()), inv_run(os, empty(), inv_empty()))
@@ -774,14 +854,22 @@ def one_holder(os):
 def fifo(os):
   chain_of(run(os, empty()), inv_run(os, empty(), inv_empty()))
 
-def waiting_bind_refused(q, c, n, p, g):
-  %Equal.sym(Bound, find(n, q), BWaiting{}, g) : {St{bind.if(n, p, q, _), c} == St{q, c} : St}
+def waiting_bind_refused(q, c, f, n, p, g):
+  %Equal.sym(Bound, find(n, q), BWaiting{}, g) : {St{bind.if(n, p, q, _), c, f} == St{q, c, f} : St}
   {==}
 
 def ask_enters(q, c):
   %nums_snoc(q, E{1n+c, True{}, [], False{}}) : {nums(tell(snoc(q, E{1n+c, True{}, [], False{}}))) == _ : +List<Nat>}
   nums_tell(snoc(q, E{1n+c, True{}, [], False{}}))
 
+def fenced_ask_refused(q, c, f):
+  {==}
+
+def fence_only_when_free(e, t, c, f):
+  {==}
+
+def free_read_fences(c, f):
+  {==}
 # --- the laws as checks a driver evaluates on the code's own state ----------------
 
 def and(a: Bool, b: Bool) -> Bool:

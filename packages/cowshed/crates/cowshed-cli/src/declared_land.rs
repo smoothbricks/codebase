@@ -704,9 +704,9 @@ where
             format!("reconcile main with {remote}'s {branch}, then cowshed land {workspace}"),
         ));
     }
-    let socket = service.control_socket()?;
+    let gateway = cowshed_core::land_turn::TurnGateway::host(service.control_socket()?)?;
     let mut turn = RefTurn::acquire_in(
-        &socket,
+        &gateway,
         declaration.ref_turn(),
         RefWriter::Land { workspace },
     )

@@ -1,6 +1,7 @@
-# The restart laws the code refutes (specs/cowshed/05_gateway.md "An install
+# The restart laws the unfenced code refutes (specs/cowshed/05_gateway.md "An install
 # refuses while a land runs", "A land step waits for an install in progress"),
-# over the model in install_restart.bend with fenced=False, the code as it is,
+# over the model in install_restart.bend with fenced=False, the code before the
+# read's fence (05_gateway.md "The read fences the turns"),
 # and the old land-install whose build asked a land turn of its own (05_gateway.md
 # "A land installs its own cowshed after its turn"). They have no proof: each is a
 # red. install_restart.bend proves their twins for the repairs (fenced_*,

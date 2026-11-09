@@ -232,6 +232,22 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
     ))
 }
 
+/// The install's judgement of its fenced read of the land turns (05_gateway.md "An install refuses
+/// while a land runs", "The read fences the turns"): the gateway answered `turns` and whether it
+/// fenced them. A held turn refuses the install, which the gateway fenced nothing for; a read that
+/// found none restarts under the fence it set. A gateway that answers otherwise contradicts its
+/// own rule, and the install refuses rather than restart under an unfenced queue.
+pub fn read_judged(turns: &[LandTurnQueue], fenced: bool) -> Result<(), CowshedError> {
+    let busy = restart_blockers(turns);
+    match (refusal(&busy), fenced) {
+        (Some(refused), _) => Err(refused),
+        (None, true) => Ok(()),
+        (None, false) => Err(CowshedError::internal(
+            "the gateway read no land turn holder but set no fence on the turns, so a land asking \
+             now would hold a turn this install's restart cuts; it installed and restarted nothing",
+        )),
+    }
+}
 #[cfg(test)]
 mod laws;
 

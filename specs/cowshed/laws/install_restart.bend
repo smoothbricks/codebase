@@ -13,8 +13,9 @@
 #                 The old design (turn=True): the build asks a land turn of
 #                 its own, holds it, then ends it  IRUnbuilt -> IRBuilding -> IRFree
 #   TakeSlot      exclusive flock on install.lock     IRFree -> IRHeld
-#   ReadBlockers  agent_cycle `restart_blockers` and `refusal` over the
-#                 gateway's `land-turns`: refused while a queue has a holder
+#   ReadBlockers  agent_cycle `read_judged` over the gateway's fenced
+#                 `land-turns` read: refused while a queue has a holder, and
+#                 with `fenced` the read fences the turns otherwise
 #                                                     IRHeld -> IRRefused | IRClear
 #   Restart       activation: the old gateway drains, its control socket and
 #                 every land-turn connection close    IRClear -> IRRestarted
@@ -30,15 +31,17 @@
 #   a land whose turn's connection closed fails; one with a bound gate sends
 #   it SIGTERM (declared_land.rs `gate`)            LRDropped|LROrphan -> LRLost
 #
-# `fenced` is the proposed repair: the read of the blockers fences the
-# gateway's turns, and an ask the fence meets waits for the install slot and
-# asks again (the land goes back to WaitSlot). The code today is fenced=False.
-# One repository's queue is the model: an install is refused by any queue's
-# holder, so other queues only add refusals.
+# `fenced` is the repair the code implements (05_gateway.md "The read fences
+# the turns"): the read of the blockers fences the gateway's turns, and an ask
+# the fence meets waits for the install slot and asks again (the land goes back
+# to WaitSlot). fenced=False is the code before it, whose races
+# install_restart_open.bend states. One repository's queue is the model: an
+# install is refused by any queue's holder, so other queues only add refusals.
 #
 # Check: bun bend2/main.ts install_restart.bend --verdict
 # Bound to the code by cowshed-cli src/agent_cycle/laws.rs (`restart_blockers`,
-# `refusal` against `blockers`, `refuses`).
+# `refusal` against `blockers`, `refuses`; `read_judged` against
+# `read_fences`).
 import Base
 
 type IR is Data:
@@ -1470,10 +1473,10 @@ law a_shed_build_goes_on_to_install:
   for +f: Bool
   {phase(istep(empty(f, False{}))) == IRFree{} : IR}
 
-# The open laws' counterexamples, computed by the checker on the code's model
-# (fenced=False): a land passes its slot check, the install judges no turn held,
-# builds, takes the slot and reads no blocker, the land asks its turn, and the
-# install restarts the gateway under it.
+# The open laws' counterexamples, computed by the checker on the model before the
+# fence (fenced=False): a land passes its slot check, the install judges no turn
+# held, builds, takes the slot and reads no blocker, the land asks its turn, and
+# the install restarts the gateway under it.
 law the_race_cuts_a_turn:
   for +f: Bool
   {n_cuts(run([ROLand{0n}, ROInstall{}, ROInstall{}, ROInstall{}, ROLand{0n}, ROInstall{}], empty(False{}, False{}))) == 1n : Nat}
@@ -1562,3 +1565,39 @@ def the_race_refuses_an_ask(f):
 
 def a_land_queues_behind_a_turn_build(f):
   {==}
+
+# --- the install's fenced read, as the code judges it ------------------------------
+
+# the phase a read of the blockers leaves the install in (ReadBlockers)
+def read.of(b: Bool) -> IR:
+  match b:
+    case True{}:
+      IRRefused{}
+    case False{}:
+      IRClear{}
+
+# whether the turns are fenced after the install's read of `qs` (05_gateway.md
+# "The read fences the turns"); cowshed-cli agent_cycle `read_judged` is bound
+# to it
+def read_fences(+qs: +List<RQ>) -> Bool:
+  fenced_now(read.of(refuses(qs)), True{})
+
+def read_step(+b: Bool, +q: +List<Tk>, +ls: +List<Ld>, +js: +List<Nat>, +y: Ty) -> {fenced_now(phase(read.if(b, q, ls, js, y, True{})), True{}) == fenced_now(read.of(b), True{}) : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      {==}
+
+# The install's fenced read is the model's ReadBlockers step: after it the turns
+# are fenced exactly when `read_fences` says, the decision the code's judgement
+# of the read is bound to.
+law the_fenced_read_is_the_read_step:
+  for +q: +List<Tk>
+  for +ls: +List<Ld>
+  for +js: +List<Nat>
+  for +y: Ty
+  {fenced_now(phase(istep(RS{IRHeld{}, q, ls, js, y, True{}})), True{}) == read_fences([RQ{0n, ids(q)}]) : Bool}
+
+def the_fenced_read_is_the_read_step(q, ls, js, y):
+  read_step(refuses([RQ{0n, ids(q)}]), q, ls, js, y)

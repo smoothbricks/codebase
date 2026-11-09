@@ -1,15 +1,18 @@
-//! `restart_blockers` and `refusal` bound to their proven model, `specs/cowshed/laws/install_restart.bend`
-//! (05_gateway.md "An install refuses while a land runs"). The model's restart laws are stated
-//! over every interleaving of one install and any number of lands, and the install's read of the
-//! blockers is the model's `blockers` and `refuses`. This driver shows the code is that judgement:
-//! it runs the emitted model and the code on the same queues — the model's corpus and seeded
-//! draws, the queues the land-turn model (`specs/cowshed/laws/land_turn.bend`) reaches on its own
-//! corpus and draws, and the installs refused from 2026-10-27 to 2026-11-06 — and compares the
-//! holders named, whether the install refuses, and the words it refuses with.
+//! `restart_blockers`, `refusal` and `read_judged` bound to their proven model,
+//! `specs/cowshed/laws/install_restart.bend` (05_gateway.md "An install refuses while a land runs",
+//! "The read fences the turns"). The model's restart laws are stated over every interleaving of
+//! one install and any number of lands, and the install's read of the blockers is the model's
+//! `blockers` and `refuses`; with the fence, whether the install goes on under a fenced queue is
+//! its `read_fences`, the ReadBlockers step (`the_fenced_read_is_the_read_step`). This driver
+//! shows the code is that judgement: it runs the emitted model and the code on the same queues —
+//! the model's corpus and seeded draws, the queues the land-turn model
+//! (`specs/cowshed/laws/land_turn.bend`) reaches on its own corpus and draws, and the installs
+//! refused from 2026-10-27 to 2026-11-06 — and compares the holders named, whether the install
+//! refuses, the words it refuses with, and whether it goes on fenced.
 
 use std::rc::Rc;
 
-use super::{Busy, refusal, restart_blockers};
+use super::{Busy, read_judged, refusal, restart_blockers};
 use cowshed_core::api::dto::{LandTurnName, LandTurnQueue};
 use cowshed_core::land_turn::Ticket;
 
@@ -91,10 +94,12 @@ fn holders(busy: &[Busy]) -> Vec<u64> {
 }
 
 /// Hold the code to the model on `queues`: the same holders in the same order, a refusal exactly
-/// when the model refuses, naming every holder.
+/// when the model refuses, naming every holder, and the install going on under the fence exactly
+/// when the model's read fences.
 fn judged_alike(queues: &Rc<List<RQ>>) -> Result<Vec<Busy>, String> {
     let shown = model::show_ListRQ(queues);
-    let busy = restart_blockers(&code_queues(queues));
+    let code = code_queues(queues);
+    let busy = restart_blockers(&code);
     let model_holders = items(&model::blockers(queues.clone()));
     if holders(&busy) != model_holders {
         return Err(format!(
@@ -135,6 +140,21 @@ fn judged_alike(queues: &Rc<List<RQ>>) -> Result<Vec<Busy>, String> {
                 error.message
             ));
         }
+    }
+    // The gateway fences exactly when no queue has a ticket (cowshed-gateway `Turns::fence`, bound
+    // to `land_turn.bend`'s `fence_only_when_free`); the install goes on only under that fence.
+    let gateway_fenced = code.iter().all(|queue| queue.tickets.is_empty());
+    let goes_on = read_judged(&code, gateway_fenced).is_ok();
+    if goes_on != model::read_fences(queues.clone()) {
+        return Err(format!(
+            "on {shown} the code {} and the model's read {}",
+            if goes_on { "goes on fenced" } else { "refuses" },
+            if model::read_fences(queues.clone()) {
+                "fences"
+            } else {
+                "fences nothing"
+            }
+        ));
     }
     Ok(busy)
 }

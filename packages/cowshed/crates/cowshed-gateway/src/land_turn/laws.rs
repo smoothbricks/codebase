@@ -3,11 +3,12 @@
 //! sequence; this driver shows the code is the model: it runs the emitted model and `Turns` on the
 //! same inputs, the model's enumerated corpus, its seeded draws and the recorded queues of
 //! 2026-10-21 to 2026-10-27, and after every input compares the two queues ticket by ticket,
-//! the answer to every bind, and evaluates the laws' checks on the code's own queue.
+//! the answer to every bind and every ask under a fence, the last number given and the fences,
+//! and evaluates the laws' checks on the code's own queue.
 
 use std::rc::Rc;
 
-use super::{BindRefusal, Turns};
+use super::{BindRefusal, Fenced, Turns};
 use cowshed_core::api::dto::LandTurnName;
 use cowshed_core::land_turn::TurnAsk;
 
@@ -97,7 +98,8 @@ impl Pair {
     }
 
     /// Feed `op` to both, `outcome` being how a departing asker ended its hold; then hold them
-    /// to the same queue, the same bind answer and the laws.
+    /// to the same queue, the same bind and ask answers, the same numbering and fences, and the
+    /// laws.
     fn input(&mut self, op: &Op, outcome: Option<&str>) -> Result<(), String> {
         self.now_unix_ms += 1;
         self.inputs.push(model::show_Op(op));
@@ -105,7 +107,7 @@ impl Pair {
         let answers = match op {
             Op::TAsk => {
                 let workspace = format!("ws{}", self.inputs.len());
-                self.turns.ask(
+                let asked = self.turns.ask(
                     TurnAsk {
                         repo: self.repo.clone(),
                         command: format!("land {workspace}"),
@@ -114,6 +116,26 @@ impl Pair {
                     4242,
                     self.now_unix_ms,
                 );
+                let (code, model) = (
+                    matches!(asked, Err(Fenced)),
+                    model::fences(self.model.clone()) > 0,
+                );
+                if code != model {
+                    let said = |fenced: bool| if fenced { "fenced" } else { "numbered" };
+                    return Err(self.refused(&format!(
+                        "the ask is {} by Turns and {} by the model",
+                        said(code),
+                        said(model)
+                    )));
+                }
+                None
+            }
+            Op::TFence => {
+                self.turns.fence();
+                None
+            }
+            Op::TUnfence => {
+                self.turns.unfence();
                 None
             }
             Op::TBind(number, p) => {
@@ -150,6 +172,16 @@ impl Pair {
                 "the queues differ: model {}, Turns {}",
                 shown(&model_queue),
                 shown(&code_queue)
+            )));
+        }
+        let model_numbering = (
+            model::counter(self.model.clone()),
+            model::fences(self.model.clone()),
+        );
+        if model_numbering != (self.turns.numbered, self.turns.fences) {
+            return Err(self.refused(&format!(
+                "the model's last number and fences are {model_numbering:?}, Turns' ({}, {})",
+                self.turns.numbered, self.turns.fences
             )));
         }
         if !model::turn_ok_b(code_queue.clone()) {
@@ -206,6 +238,36 @@ fn turns_are_the_model_on_seeded_inputs() {
     }
 }
 
+/// The recorded schedule of 2026-10-28 13:52:39Z (05_gateway.md "The read fences the turns") as
+/// the queue sees it under the fence: the install's read finds no ticket and fences, the land's ask
+/// is refused and numbered nothing, the restart lifts the fence, the land asks again and holds the
+/// turn and binds its gate; a later install's read finds that holder and sets no fence, so the next
+/// land queues behind it.
+#[test]
+fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
+    let mut pair = Pair::new("acme");
+    for op in [
+        Op::TFence,
+        Op::TAsk,
+        Op::TUnfence,
+        Op::TAsk,
+        Op::TBind(1, 7),
+        Op::TFence,
+        Op::TAsk,
+        Op::TExit(1, 7),
+    ] {
+        pair.input(&op, None).unwrap();
+    }
+    pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
+    assert_eq!(
+        (pair.turns.numbered, pair.turns.fences),
+        (2, 0),
+        "the fenced ask was never numbered, and the read that found a holder fenced nothing"
+    );
+    assert_eq!(shown(&pair.code_queue()), shown(&pair.model_queue()));
+    let E::E(holder, _, _, held) = items(&pair.code_queue())[0].clone();
+    assert_eq!((holder, held), (2, true), "the next land holds the turn");
+}
 /// The recorded queues, 2026-10-21 to 2026-10-27 (the land-turn records of six repositories'
 /// `turns.log`, before the queues moved into the gateway): every `taken` is the ticket the model
 /// and `Turns` both hand the turn to.

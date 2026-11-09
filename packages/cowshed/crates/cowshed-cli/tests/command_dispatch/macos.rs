@@ -4009,7 +4009,7 @@ async fn directory_a_land_fences_the_target_head_under_the_writers_ref_turn_subs
     let checked = topic.join(".git/ref-fence-checked");
 
     let writer = cowshed_core::land_turn::take(
-        &socket,
+        &fixture.storage.turn_gateway(),
         &cowshed_core::land_turn::TurnAsk {
             repo: cowshed_core::api::dto::LandTurnName::new(queue.clone()).expect("a queue name"),
             workspace: "doc-commit".to_owned(),
@@ -8855,7 +8855,8 @@ async fn settled_land_turn(socket: &Path, turn: &str) -> Vec<cowshed_core::land_
     let probe = tokio::time::timeout(
         cowshed_os::test_backstop::NO_PROGRESS,
         cowshed_core::land_turn::take(
-            socket,
+            &cowshed_core::land_turn::TurnGateway::host(socket.to_path_buf())
+                .expect("the host's turn gateway"),
             &cowshed_core::land_turn::TurnAsk {
                 repo: cowshed_core::api::dto::LandTurnName::new(turn).expect("a land turn name"),
                 workspace: "probe".to_owned(),

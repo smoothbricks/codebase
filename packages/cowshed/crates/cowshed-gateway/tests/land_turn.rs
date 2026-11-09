@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_core::api::dto::{LandTurnName, LandTurnQueue};
-use cowshed_core::land_turn::{self, Turn, TurnAnswer, TurnAsk, Wait};
+use cowshed_core::land_turn::{self, Turn, TurnAnswer, TurnAsk, TurnGateway, Wait};
 use cowshed_core::runtime::ref_turn::{RefTurn, RefWriter};
 use cowshed_gateway::{
     AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CredentialError,
@@ -25,7 +25,7 @@ use cowshed_gateway::{
 use cowshed_os::test_backstop::{
     AsyncChildBackstop as _, AsyncUnixStreamBackstop as _, ChildBackstop as _,
 };
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
@@ -78,11 +78,17 @@ async fn gateway() -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
     std::fs::create_dir(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
     let socket = root.path().join("gateway.sock");
-    let gateway = Gateway::start(
+    (gateway_at(&socket, &cache).await, root, socket)
+}
+
+/// A gateway serving `socket`, its mirror cache in `cache`: a restart starts one where another
+/// served.
+async fn gateway_at(socket: &Path, cache: &Path) -> Gateway {
+    Gateway::start(
         GatewayConfig {
-            control_socket: Some(socket.clone()),
-            listener_handoff: Some(cowshed_gateway::handoff_path(&socket)),
-            mirror_cache: MirrorCacheConfig::new(cache),
+            control_socket: Some(socket.to_path_buf()),
+            listener_handoff: Some(cowshed_gateway::handoff_path(socket)),
+            mirror_cache: MirrorCacheConfig::new(cache.to_path_buf()),
             ..GatewayConfig::default()
         },
         Arc::new(NoCredentials),
@@ -90,8 +96,7 @@ async fn gateway() -> (Gateway, fixture_dir::FixtureDir, PathBuf) {
         Arc::new(DiscardAudit),
     )
     .await
-    .expect("start gateway");
-    (gateway, root, socket)
+    .expect("start gateway")
 }
 
 const REPO: &str = "acme";
@@ -112,6 +117,23 @@ async fn awaiting<T>(what: &str, step: impl std::future::Future<Output = T>) -> 
         .unwrap_or_else(|_| panic!("{what} did not happen before the no-progress backstop"))
 }
 
+/// The gateway at `socket` as a land asks it, its install slot in a `support` directory beside it.
+fn turn_gateway(socket: &Path) -> TurnGateway {
+    let namespace = cowshed_os::namespace::TestNamespace::of(std::process::id(), 0)
+        .expect("this process's namespace");
+    TurnGateway {
+        socket: socket.to_path_buf(),
+        support: socket
+            .parent()
+            .expect("the socket's directory")
+            .join("support"),
+        census: cowshed_core::census::CensusScope::new(
+            cowshed_os::namespace::HostNamespace::Test(namespace),
+            Arc::from(Path::new("/var/empty")),
+        ),
+    }
+}
+
 /// Take `workspace`'s turn, failing if it has to wait.
 async fn take_free(socket: &Path, workspace: &str) -> Turn {
     take_asked(socket, &ask(workspace)).await
@@ -122,9 +144,13 @@ async fn take_asked(socket: &Path, ask: &TurnAsk) -> Turn {
     let workspace = ask.workspace.clone();
     awaiting(
         "a free turn",
-        land_turn::take(socket, ask, None, Duration::from_secs(90), |wait| {
-            panic!("{workspace} waited for a free turn: {wait:?}")
-        }),
+        land_turn::take(
+            &turn_gateway(socket),
+            ask,
+            None,
+            Duration::from_secs(90),
+            |wait| panic!("{workspace} waited for a free turn: {wait:?}"),
+        ),
     )
     .await
     .expect("take a free turn")
@@ -162,7 +188,7 @@ async fn take_after(socket: &Path, workspace: &str) -> Turn {
     awaiting(
         &format!("{workspace}'s turn"),
         land_turn::take(
-            socket,
+            &turn_gateway(socket),
             &ask(workspace),
             None,
             Duration::from_secs(90),
@@ -194,10 +220,16 @@ fn waiting(
     let socket = socket.to_path_buf();
     let ask = ask(workspace);
     let taking = tokio::spawn(async move {
-        land_turn::take(&socket, &ask, None, Duration::from_secs(90), move |wait| {
-            // A test that has stopped reading the waits has what it needed of them.
-            let _ = told.send(wait.clone());
-        })
+        land_turn::take(
+            &turn_gateway(&socket),
+            &ask,
+            None,
+            Duration::from_secs(90),
+            move |wait| {
+                // A test that has stopped reading the waits has what it needed of them.
+                let _ = told.send(wait.clone());
+            },
+        )
         .await
         .expect("take a turn")
     });
@@ -355,7 +387,9 @@ async fn a_command_holds_the_turn_from_its_start_whatever_its_asker_does_next() 
                 {
                     Wait::Queued { holder, .. } if holder.bound == [pid] => break,
                     Wait::Queued { .. } => {}
-                    Wait::Outside { .. } => panic!("second waits for the queue"),
+                    other @ (Wait::Outside { .. } | Wait::Install { .. }) => {
+                        panic!("second waits for the queue, not {other:?}")
+                    }
                 }
             }
         },
@@ -417,7 +451,7 @@ async fn a_land_that_asks_for_a_held_ref_turn_holds_it_once_the_writer_ends() {
     let queue_name = LandTurnName::new("acme.ref").unwrap();
     let writer = awaiting(
         "the writer's ref turn",
-        RefTurn::acquire_in(&socket, &queue_name, RefWriter::DocCommit),
+        RefTurn::acquire_in(&turn_gateway(&socket), &queue_name, RefWriter::DocCommit),
     )
     .await
     .expect("the writer takes a free ref turn");
@@ -444,7 +478,12 @@ async fn a_land_that_asks_for_a_held_ref_turn_holds_it_once_the_writer_ends() {
         let socket = socket.clone();
         let queue_name = queue_name.clone();
         async move {
-            RefTurn::acquire_in(&socket, &queue_name, RefWriter::Land { workspace: "topic" }).await
+            RefTurn::acquire_in(
+                &turn_gateway(&socket),
+                &queue_name,
+                RefWriter::Land { workspace: "topic" },
+            )
+            .await
         }
     });
     // The probe's next answer is the land's ask, queued behind it.
@@ -486,7 +525,7 @@ async fn a_gateway_that_does_not_answer_refuses_the_turn() {
     let (_gateway, root, _socket) = gateway().await;
     let absent = root.path().join("absent.sock");
     let refused = land_turn::take(
-        &absent,
+        &turn_gateway(&absent),
         &ask("first"),
         None,
         Duration::from_secs(90),
@@ -498,4 +537,185 @@ async fn a_gateway_that_does_not_answer_refuses_the_turn() {
         refused.to_string().contains("cannot reach the gateway"),
         "{refused}"
     );
+}
+
+/// The install's read of the land turns as `start_service` asks it, with the fence, and the
+/// connection that holds the fence for as long as it is open (05_gateway.md "The read fences the
+/// turns").
+async fn fenced_read(socket: &Path) -> (serde_json::Value, UnixStream) {
+    let mut install = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect the install's read");
+    let read = serde_json::json!({
+        "op": land_turn::LAND_TURNS_OP,
+        "abandonedSinceUnixMs": u64::MAX,
+        "fence": true,
+    });
+    install
+        .write_all(format!("{read}\n").as_bytes())
+        .await
+        .expect("send the install's read");
+    let mut answer = String::new();
+    awaiting(
+        "the install's read",
+        BufReader::new(&mut install).read_line(&mut answer),
+    )
+    .await
+    .expect("read the install's answer");
+    (
+        serde_json::from_str(&answer).expect("a control answer"),
+        install,
+    )
+}
+
+/// A land's ask written raw, and the connection its answers come on.
+async fn ask_raw(socket: &Path, workspace: &str) -> Lines<BufReader<UnixStream>> {
+    let mut land = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect the land");
+    let asked = serde_json::json!({
+        "op": land_turn::LAND_TURN_OP,
+        "repo": REPO,
+        "workspace": workspace,
+        "command": format!("land {workspace}"),
+    });
+    land.write_all(format!("{asked}\n").as_bytes())
+        .await
+        .expect("ask the turn");
+    BufReader::new(land).lines()
+}
+
+/// The next answer on a raw land-turn connection, as JSON.
+async fn raw_answer(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json::Value {
+    let line = awaiting("the gateway's next answer", answers.next_line())
+        .await
+        .expect("read the gateway's answer")
+        .expect("the gateway answers");
+    serde_json::from_str(&line).expect("a land-turn answer")
+}
+
+/// The install's fenced read finds no holder and fences every queue: an ask meanwhile is answered
+/// `fenced` and never numbered. Once the install's connection has closed, the next ask is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ask_under_the_installs_fenced_read_is_fenced_and_never_numbered() {
+    let (_gateway, _root, socket) = gateway().await;
+    let (read, mut install) = fenced_read(&socket).await;
+    let mut land = ask_raw(&socket, "land").await;
+    let answer = raw_answer(&mut land).await;
+    let listed = tickets(&socket).await;
+    assert_eq!(
+        (read, answer, listed),
+        (
+            serde_json::json!({"ok": true, "landTurns": [], "fenced": true}),
+            serde_json::json!({"turn": "fenced"}),
+            Vec::<String>::new(),
+        ),
+        "the install's read, the land's answer and the tickets listed under the fence"
+    );
+    // The install's release: its end of file, then the gateway's once the fence is lifted.
+    install.shutdown().await.expect("end the install's read");
+    let mut rest = Vec::new();
+    awaiting("the fence's release", install.read_to_end(&mut rest))
+        .await
+        .expect("read to the gateway's end of file");
+    assert!(
+        rest.is_empty(),
+        "the gateway sent more after its answer: {rest:?}"
+    );
+    take_free(&socket, "land").await.end("exited 0".to_owned());
+}
+
+/// A fenced read that finds a holder sets no fence: the install refuses, and a land asking after
+/// it queues as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_read_that_finds_a_holder_sets_no_fence() {
+    let (_gateway, _root, socket) = gateway().await;
+    let first = take_free(&socket, "first").await;
+    let (read, _install) = fenced_read(&socket).await;
+    assert_eq!(read["fenced"], serde_json::json!(false), "{read}");
+    let mut second = ask_raw(&socket, "second").await;
+    assert_eq!(raw_answer(&mut second).await["turn"], "queued");
+    first.end("exited 0".to_owned());
+    assert_eq!(raw_answer(&mut second).await["turn"], "held");
+}
+
+/// Recorded 2026-10-28 13:52:39Z (`lands/8e24efb3….after2.log:77`): a land passed its slot check,
+/// an install took the slot and read no turn holder, the land asked its turn and bound its gate,
+/// and the install restarted the gateway, whose drain closed the turn's connection: the land lost
+/// its turn and sent its gate SIGTERM. The install's read fences the turns, so the land's ask is
+/// answered `fenced` and waits for the slot; the install restarts the gateway and lets the slot go
+/// once the new one serves, and the land takes its turn of the new gateway and binds its gate,
+/// which no restart reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_recorded_install_restart_never_cuts_a_turn_asked_after_its_read() {
+    let (old, root, socket) = gateway().await;
+    let gateway = turn_gateway(&socket);
+    std::fs::create_dir(&gateway.support).expect("support");
+    let slot = std::fs::File::create(gateway.slot()).expect("the install slot");
+    slot.try_lock().expect("the install takes the free slot");
+    let (read, install) = fenced_read(&socket).await;
+    assert_eq!(
+        read["fenced"],
+        serde_json::json!(true),
+        "no holder, so the read fences: {read}"
+    );
+    let (told, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    let land = tokio::spawn({
+        let gateway = gateway.clone();
+        async move {
+            land_turn::take(
+                &gateway,
+                &ask("land"),
+                None,
+                Duration::from_secs(90),
+                move |wait| {
+                    // A test that has stopped reading the waits has what it needed of them.
+                    let _ = told.send(wait.clone());
+                },
+            )
+            .await
+            .expect("the land's turn")
+        }
+    });
+    assert_eq!(
+        awaiting("the land told the install's fence holds it", waits.recv()).await,
+        Some(Wait::Install {
+            lock: gateway.slot()
+        })
+    );
+    assert_eq!(
+        tickets(&socket).await,
+        Vec::<String>::new(),
+        "a fenced ask is never numbered"
+    );
+    // The install restarts the gateway: the old one drains, closing the read's connection, and
+    // the install lets the slot go once the new one serves.
+    old.drain().await.expect("the old gateway drains");
+    drop(install);
+    let _new = gateway_at(&socket, &root.path().join("cache")).await;
+    drop(slot);
+    let mut turn = awaiting("the land's turn of the new gateway", land)
+        .await
+        .expect("the land task");
+    let mut gate = tokio::process::Command::new("sh");
+    gate.args(["-c", "exec cat >/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    turn.bind_at_exec(gate.as_std_mut());
+    let mut gate = gate.spawn().expect("spawn the gate");
+    awaiting(
+        "the gate's bind",
+        turn.bound(gate.id().expect("a running gate has a pid")),
+    )
+    .await
+    .expect("bind the gate");
+    drop(gate.stdin.take());
+    tokio::select! {
+        biased;
+        lost = turn.lost() => panic!(
+            "the restart cut the land's turn under its gate, which the land then sends SIGTERM: {lost}"
+        ),
+        ended = gate.wait_bounded() => assert!(ended.expect("the gate ends").success()),
+    }
+    turn.end("exited 0".to_owned());
 }

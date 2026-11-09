@@ -5,11 +5,10 @@
 //! else, so a writer queued behind it waits for that fence alone, in the order the writers asked,
 //! and is told who holds the turn.
 
-use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::dto::LandTurnName;
-use crate::land_turn::{self, OutsideHolders, Turn, TurnAsk, Wait};
+use crate::land_turn::{self, OutsideHolders, Turn, TurnAsk, TurnGateway, Wait};
 use crate::{CowshedError, Result};
 
 /// Who takes a ref turn: a land's ref fence, for its workspace, or a doc commit. It names the
@@ -53,14 +52,14 @@ pub struct RefTurn {
 }
 
 impl RefTurn {
-    /// Take the ref turn `queue` for `writer` from the gateway at `socket`, where
-    /// `cowshed land-turn <queue>` and `cowshed doc-commit` take it too. Nothing bounds the wait:
-    /// the holder is a writer moving the same branch, which a land follows, never overtakes. The
-    /// wait reports every [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how many are
-    /// ahead. A land dropped while it waits closes its connection, and the gateway takes its place
-    /// out of the queue.
+    /// Take the ref turn `queue` for `writer` from `gateway`, where `cowshed land-turn <queue>`
+    /// and `cowshed doc-commit` take it too. Nothing bounds the wait: the holder is a writer
+    /// moving the same branch, which a land follows, never overtakes. The wait reports every
+    /// [`cowshed_os::flock::HOLDER_REPORT`] who holds the turn and how many are ahead. A land
+    /// dropped while it waits closes its connection, and the gateway takes its place out of the
+    /// queue.
     pub async fn acquire_in(
-        socket: &Path,
+        gateway: &TurnGateway,
         queue: &LandTurnName,
         writer: RefWriter<'_>,
     ) -> Result<Self> {
@@ -73,7 +72,7 @@ impl RefTurn {
         let started = Instant::now();
         let mut waited = false;
         let turn = land_turn::take(
-            socket,
+            gateway,
             &ask,
             None,
             cowshed_os::flock::HOLDER_REPORT,
@@ -144,6 +143,11 @@ fn report(queue: &LandTurnName, verb: &str, wait: &Wait) {
                 OutsideHolders::NoneOpen => String::new(),
                 OutsideHolders::Unknown(reason) => format!(", holders unknown: {reason}"),
             },
+        ),
+        Wait::Install { lock } => cowshed_os::eprintln!(
+            "cowshed: {verb} waits for the ref turn {queue}: an install holding {} fenced it; \
+             asking again of the gateway it leaves",
+            lock.display(),
         ),
     }
 }
