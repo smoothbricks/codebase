@@ -150,7 +150,6 @@
     "src/executors/bounded-exec/ram-temp-held.test.ts": 8,
     "src/executors/bounded-exec/bounds.test.ts": 7,
     "src/executors/bounded-exec/owned-subtree.test.ts": 7,
-    "src/executors/bounded-exec/host-memory.linux.test.ts": 6,
-    "src/nx-project-config-hash.test.ts": 2
+    "src/executors/bounded-exec/host-memory.linux.test.ts": 6
   }
 }
