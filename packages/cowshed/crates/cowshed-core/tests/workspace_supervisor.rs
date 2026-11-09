@@ -1961,6 +1961,26 @@ impl TestMbx {
     }
 }
 
+/// A test that lets go of its mbx -- at its end, or as a panic unwinds -- leaves no stand-in
+/// waiting on it (08_testing.md, "Fixtures"). A stand-in its supervisor starts later would wait
+/// forever to open `answers`, a FIFO no writer opens again, so a regular empty file takes its
+/// place: a later stand-in reads no answer and exits at once. One already reading the FIFO reads
+/// its end when this mbx's writer closes, just after.
+impl Drop for TestMbx {
+    fn drop(&mut self) {
+        let answers = self.home.join("answers");
+        let closed = self.home.join("answers.closed");
+        if let Err(error) =
+            std::fs::write(&closed, b"").and_then(|()| std::fs::rename(&closed, &answers))
+        {
+            cowshed_os::eprintln!(
+                "the test mbx could not close {}: {error}; a stand-in started later waits on it",
+                answers.display()
+            );
+        }
+    }
+}
+
 /// What `job`, which has ended, wrote on its stderr.
 async fn stderr_of(handle: &WorkspaceSupervisorHandle, job: JobId) -> String {
     String::from_utf8_lossy(&read_all(handle, job, StreamKind::Stderr).await).into_owned()
@@ -2170,6 +2190,43 @@ async fn a_held_exec_waits_for_its_grant() {
         mbx.heard,
         "the program logged exactly what the test heard"
     );
+}
+
+/// A stand-in mbx its supervisor starts after the test let go of its `TestMbx` -- a panic drops
+/// the test's locals while the supervisor, being dropped, still promotes a pending hold -- ends at
+/// once instead of waiting forever to open `answers`, a FIFO no writer will ever open again
+/// (08_testing.md, "Fixtures"). On 2026-11-10 one such stand-in ran on for an hour, parented by
+/// init, after a held-declaration test failed.
+#[tokio::test]
+async fn a_stand_in_mbx_started_after_its_test_let_go_ends_at_once() {
+    let (mut supervisor_config, _root) =
+        isolated_config(&temp_parent::scratch_parent(), "held-abandoned");
+    let mbx = TestMbx::install(&mut supervisor_config);
+    let log = supervisor_config.sandbox.home.join("mbx.log");
+    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    drop(mbx);
+    let job = h
+        .handle
+        .exec(None, None, held(2), AdmissionSource::Worker)
+        .await
+        .unwrap();
+    let Ok(ended) = tokio::time::timeout(Duration::from_secs(10), h.handle.ended(job)).await else {
+        // Leave nothing behind: end the stand-in this test started, which leads its own group.
+        for pid in std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.rsplit_once(" pid=")?.1.parse::<i32>().ok())
+        {
+            // SAFETY: plain signal calls naming a group the test's own hold started.
+            if unsafe { libc::getpgid(pid) } == pid {
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
+        }
+        panic!("a stand-in mbx started after its test let go waits for an answer forever");
+    };
+    assert_eq!(ended.expect("the job's outcome").state, JobState::Failed);
+    let stderr = stderr_of(&h.handle, job).await;
+    assert!(stderr.contains("no answer arrived"), "{stderr}");
 }
 
 /// Only an exec that declares a hold waits for a grant (05_gateway.md "Held jobs", "Declaration"):
