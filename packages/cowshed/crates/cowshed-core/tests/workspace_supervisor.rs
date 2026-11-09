@@ -7252,8 +7252,9 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         "the sealed sample keeps the peak"
     );
 }
-
 /// Interactive work decays (05_gateway.md "Classes"): past 30 s its whole group runs at the gate's
+/// nice, past 120 s at background's. The job's stderr is its command's alone: an agent reads it as
+/// the command's output, so the decay writes nothing there.
 /// nice, past 120 s at background's, and its stderr says each step once.
 #[cfg(target_os = "macos")]
 #[tokio::test(start_paused = true)]
@@ -7337,16 +7338,10 @@ async fn interactive_work_decays_to_the_gate_s_nice_then_background_s() {
     assert_eq!(handle.wait(job_id).await.unwrap().state, JobState::Exited);
     reap(leader);
     let stderr = stderr_of(&handle, job_id).await;
-    for line in [
-        "cowshed: interactive job decayed to gate after 30s\n",
-        "cowshed: interactive job decayed to background after 120s\n",
-    ] {
-        assert_eq!(
-            stderr.matches(line).count(),
-            1,
-            "{line:?} once in {stderr:?}"
-        );
-    }
+    assert!(
+        !stderr.contains("decay"),
+        "the job's stderr is its command's alone: {stderr:?}"
+    );
 }
 
 #[tokio::test]

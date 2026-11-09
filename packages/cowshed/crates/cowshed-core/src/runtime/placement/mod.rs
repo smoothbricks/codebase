@@ -34,13 +34,35 @@ pub const fn class_nice(class: ExecClass) -> i32 {
 pub const INTERACTIVE_TO_GATE: Duration = Duration::from_secs(30);
 /// When interactive work runs at background's nice: work this long is no edit's quick feedback.
 pub const INTERACTIVE_TO_BACKGROUND: Duration = Duration::from_secs(120);
-/// Interactive work's decay, in order: how long after its start each step comes, and the class
-/// whose nice the job's group runs at from then. mbx decays the job's asks in its pool from the
-/// start the job names (`MBX_SCHEDULER_JOB_STARTED_MS`).
-pub const INTERACTIVE_DECAY: [(Duration, ExecClass); 2] = [
-    (INTERACTIVE_TO_GATE, ExecClass::Gate),
-    (INTERACTIVE_TO_BACKGROUND, ExecClass::Background),
-];
+/// A step of interactive work's decay (05_gateway.md "Classes"): when after the job's start it
+/// comes, and the class whose nice the job's group runs at from then. mbx decays the job's asks in
+/// its pool from the start the job names (`MBX_SCHEDULER_JOB_STARTED_MS`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecayStep {
+    ToGate,
+    ToBackground,
+}
+
+impl DecayStep {
+    /// Every step, in order.
+    pub const ALL: [Self; 2] = [Self::ToGate, Self::ToBackground];
+
+    /// How long after the job's start the step comes.
+    pub const fn after(self) -> Duration {
+        match self {
+            Self::ToGate => INTERACTIVE_TO_GATE,
+            Self::ToBackground => INTERACTIVE_TO_BACKGROUND,
+        }
+    }
+
+    /// The class whose nice the job's group runs at from this step.
+    pub const fn class(self) -> ExecClass {
+        match self {
+            Self::ToGate => ExecClass::Gate,
+            Self::ToBackground => ExecClass::Background,
+        }
+    }
+}
 
 /// Whether a job of `class` decays: interactive work alone. An interactive resident serves many
 /// short requests over a long life, and its age says nothing of any one request's.

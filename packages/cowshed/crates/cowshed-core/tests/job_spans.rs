@@ -24,6 +24,7 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_spans::{
     JobSpanEdge, JobSpanPublisher, SEAL_INTERVAL, job_fields, job_span_thread,
 };
+use cowshed_core::runtime::placement::DecayStep;
 
 #[path = "support/accounting_fixture.rs"]
 mod accounting_fixture;
@@ -327,6 +328,42 @@ async fn job_rows_seal_when_their_interval_ends_with_no_reader_asking() {
         "the interval sealed the job's rows as one segment"
     );
     assert_eq!(segments[0].1.num_rows(), 2);
+}
+
+/// Interactive work's decay reaches its span as one info row per step, naming the class whose nice
+/// the job runs at from then, with no host, volume or state of its own (05_gateway.md "Classes").
+#[tokio::test(start_paused = true)]
+async fn each_step_of_a_job_s_decay_is_one_info_row_of_its_span() {
+    let telemetry = TempRoot::new("cowshed-job-span-decay");
+    let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
+    let only = job(1);
+    publisher.record(&only, JobSpanEdge::Start { host: None });
+    for step in DecayStep::ALL {
+        publisher.record_decay(&only, step);
+    }
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(SEAL_INTERVAL).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while sealed_segments_among_kinds(&telemetry, "job-").is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let segments = sealed_segments(&telemetry, "job-");
+    assert_eq!(
+        kinds(&segments),
+        [
+            "span-start cowshed.job",
+            "info job.decayed.gate",
+            "info job.decayed.background"
+        ]
+    );
+    for (batch, row) in sealed_rows(&segments).into_iter().skip(1) {
+        assert_eq!(Facts::of((batch, row)), Facts::NONE);
+        assert_eq!(text_cell(batch, "job_state", row), None);
+    }
 }
 
 /// `info`'s job, running as job `job_id`.

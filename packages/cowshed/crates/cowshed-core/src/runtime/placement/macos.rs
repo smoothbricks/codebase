@@ -76,7 +76,7 @@ pub fn place_nice(pid: u32, nice: i32) -> Result<i32, PriorityFailure> {
 }
 
 /// Set every process of the group `pgid` leads to `nice` -- interactive work decaying
-/// ([`super::INTERACTIVE_DECAY`]) -- and read back the group's nice, its highest-priority
+/// ([`super::DecayStep`]) -- and read back the group's nice, its highest-priority
 /// member's. Only lowering: a member a command already placed below `nice` is refused, never
 /// raised. The caller holds the leader unreaped, so `pgid` names the job's group alone.
 pub fn place_group_nice(pgid: i32, nice: i32) -> io::Result<i32> {

@@ -55,6 +55,7 @@ use crate::runtime::job_span_facts::{HostColumnError, HostColumns, SpanFacts};
 use crate::runtime::job_unattributed::{
     AccountingSource, CoverageKind, JOB_UNATTRIBUTED_MESSAGE, UnattributedUsage,
 };
+use crate::runtime::placement::DecayStep;
 use crate::runtime::process_spans::{ProcessSpanError, ProcessSpanRow, seal_process_batch};
 use crate::storage::job_artifact::state_name;
 use crate::storage::trace_columns::{
@@ -70,6 +71,11 @@ pub const JOB_SPAN_MESSAGE: &str = "cowshed.job";
 /// A job span is the first span of its job's lmao thread ([`job_span_thread`]); its process spans
 /// follow it.
 pub const JOB_SPAN_ID: u32 = 1;
+
+/// The messages of a job span's decay rows: interactive work that reached a step of its decay, by
+/// the class whose nice its group runs at from then (05_gateway.md "Classes").
+pub const JOB_DECAYED_TO_GATE_MESSAGE: &str = "job.decayed.gate";
+pub const JOB_DECAYED_TO_BACKGROUND_MESSAGE: &str = "job.decayed.background";
 /// Requests waiting for the writer: one job row or one fold batch each. A job queues up to three
 /// rows, so this covers a burst of concurrent admissions and terminals far beyond what a
 /// workspace's actor queue admits at once. A full queue refuses rows rather than delaying the
@@ -202,20 +208,21 @@ impl JobSpanEdge {
     }
 }
 
-/// What one sealed row of a job's span records: one of its edges, or the unattributed usage its
+/// What one sealed row of a job's span records: one of its edges; the unattributed usage its
 /// terminal sample states, which its end edge brings with it so that no caller records the one
-/// beside the other.
+/// beside the other; or a step of interactive work's decay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowKind {
     Edge(JobSpanEdge),
     Unattributed(UnattributedUsage),
+    Decayed(DecayStep),
 }
 
 impl RowKind {
     fn entry_type(self) -> EntryType {
         match self {
             Self::Edge(edge) => edge.entry_type(),
-            Self::Unattributed(_) => EntryType::Info,
+            Self::Unattributed(_) | Self::Decayed(_) => EntryType::Info,
         }
     }
 
@@ -223,19 +230,21 @@ impl RowKind {
         match self {
             Self::Edge(_) => JOB_SPAN_MESSAGE,
             Self::Unattributed(_) => JOB_UNATTRIBUTED_MESSAGE,
+            Self::Decayed(DecayStep::ToGate) => JOB_DECAYED_TO_GATE_MESSAGE,
+            Self::Decayed(DecayStep::ToBackground) => JOB_DECAYED_TO_BACKGROUND_MESSAGE,
         }
     }
 
     fn state(self) -> Option<JobState> {
         match self {
             Self::Edge(edge) => edge.state(),
-            Self::Unattributed(_) => None,
+            Self::Unattributed(_) | Self::Decayed(_) => None,
         }
     }
 
     fn unattributed(self) -> Option<UnattributedUsage> {
         match self {
-            Self::Edge(_) => None,
+            Self::Edge(_) | Self::Decayed(_) => None,
             Self::Unattributed(usage) => Some(usage),
         }
     }
@@ -266,7 +275,9 @@ fn charged_memory_at(kind: RowKind, info: &JobInfo) -> Option<ChargedMemoryUsage
             .resources
             .as_ref()
             .and_then(|sample| sample.accounting.charged_memory().copied()),
-        RowKind::Edge(JobSpanEdge::Start { .. }) | RowKind::Unattributed(_) => None,
+        RowKind::Edge(JobSpanEdge::Start { .. })
+        | RowKind::Unattributed(_)
+        | RowKind::Decayed(_) => None,
     }
 }
 
@@ -357,6 +368,12 @@ impl JobSpanPublisher {
         self.enqueue(info, RowKind::Edge(edge));
     }
 
+    /// Queue the row of `info`'s job reaching `step` of its decay, without waiting. It states no
+    /// host or volume fact: the step is a moment of the job's life, not a boundary of its span.
+    pub fn record_decay(&self, info: &JobInfo, step: DecayStep) {
+        self.enqueue(info, RowKind::Decayed(step));
+    }
+
     fn enqueue(&self, info: &JobInfo, kind: RowKind) {
         let Some(permit) = self.reserve() else {
             return;
@@ -364,7 +381,7 @@ impl JobSpanPublisher {
         let facts = match kind {
             RowKind::Edge(JobSpanEdge::Start { host }) => SpanFacts::start(host),
             RowKind::Edge(JobSpanEdge::End { .. }) => SpanFacts::end(info.resources.as_ref()),
-            RowKind::Unattributed(_) => SpanFacts::default(),
+            RowKind::Unattributed(_) | RowKind::Decayed(_) => SpanFacts::default(),
         };
         permit.send(Request::Job(Box::new(JobSpanRow {
             at: SystemTime::now(),

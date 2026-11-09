@@ -653,7 +653,7 @@ pub struct CpuPlacement {
     /// so its own mbx work takes no permits of its own.
     pub held: bool,
     /// When the job was admitted, in milliseconds since 1970: interactive work names it to mbx,
-    /// whose pool decays the job's later asks as it ages ([`super::placement::INTERACTIVE_DECAY`]).
+    /// whose pool decays the job's later asks as it ages ([`super::placement::DecayStep`]).
     pub started_ms: u64,
     #[cfg(target_os = "macos")]
     pub nice: i32,
@@ -1004,12 +1004,10 @@ pub enum ProcessEvent {
     Escalate {
         job_id: JobId,
     },
-    /// Interactive work reached a step of its decay ([`super::placement::INTERACTIVE_DECAY`]):
-    /// `after` its start it runs on at `to`'s nice.
+    /// Interactive work reached `step` of its decay: it runs on at the step's class's nice.
     Decay {
         job_id: JobId,
-        after: std::time::Duration,
-        to: ExecClass,
+        step: super::placement::DecayStep,
     },
     /// A cold exec host spawned to activate for a job: the job's first process, which it owns
     /// until its command starts.
@@ -8287,10 +8285,10 @@ impl SupervisorActor {
             let events = self.events.clone();
             let started = tokio::time::Instant::now();
             tokio::spawn(async move {
-                for (after, to) in super::placement::INTERACTIVE_DECAY {
-                    tokio::time::sleep_until(started + after).await;
+                for step in super::placement::DecayStep::ALL {
+                    tokio::time::sleep_until(started + step.after()).await;
                     if events
-                        .send(ProcessEvent::Decay { job_id, after, to })
+                        .send(ProcessEvent::Decay { job_id, step })
                         .await
                         .is_err()
                     {
@@ -9232,7 +9230,7 @@ impl SupervisorActor {
                     let _ = process.signal_process_tree(ProcessSignal::Kill);
                 }
             }
-            ProcessEvent::Decay { job_id, after, to } => self.decay(job_id, after, to).await,
+            ProcessEvent::Decay { job_id, step } => self.decay(job_id, step),
             ProcessEvent::SignalFailed { job_id, error } => {
                 let Some(job) = self.jobs.get_mut(&job_id) else {
                     return;
@@ -9251,10 +9249,11 @@ impl SupervisorActor {
         }
     }
 
-    /// Interactive work at a step of its decay ([`super::placement::INTERACTIVE_DECAY`]) runs on
-    /// at `to`'s nice, said once on its stderr. A job that ended before the step, or whose
-    /// command has not started, takes nothing.
-    async fn decay(&mut self, job_id: JobId, after: std::time::Duration, to: ExecClass) {
+    /// Interactive work at `step` of its decay runs on at the step's class's nice, recorded once as
+    /// a row of its job span. The job's stderr is its command's alone: an agent reads it as the
+    /// command's output. A job that ended before the step, or whose command has not started, takes
+    /// nothing.
+    fn decay(&mut self, job_id: JobId, step: super::placement::DecayStep) {
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
@@ -9266,31 +9265,31 @@ impl SupervisorActor {
         let Some(leader) = job.birth.as_ref().and_then(Birth::leader) else {
             return;
         };
-        let (to_name, seconds) = (to.as_str(), after.as_secs());
         #[cfg(target_os = "macos")]
-        let note = {
-            let nice = super::placement::macos::nice_from(super::placement::macos::own_nice(), to);
-            match super::placement::macos::place_group_nice(leader.pgid(), nice) {
-                Ok(_) => {
-                    format!("cowshed: interactive job decayed to {to_name} after {seconds}s\n")
-                }
-                Err(error) => format!(
-                    "cowshed: interactive job did not decay to {to_name} after {seconds}s: {error}\n"
-                ),
+        {
+            let nice = super::placement::macos::nice_from(
+                super::placement::macos::own_nice(),
+                step.class(),
+            );
+            if let Err(error) = super::placement::macos::place_group_nice(leader.pgid(), nice) {
+                cowshed_os::eprintln!(
+                    "cowshed: job {} did not decay to the {} nice {nice}: {error}",
+                    job_id.get(),
+                    step.class().as_str()
+                );
+                return;
             }
-        };
+        }
         // WHY: a Linux job's class is its class cgroup, and cgroup v2 cannot move a job cgroup
         // across class cgroups without migrating its pids, which would break the job cgroup's
         // accounting. Only mbx's pool decays the job's asks; its kernel weight stays interactive's.
         #[cfg(target_os = "linux")]
-        let note = {
-            let _ = leader;
-            format!(
-                "cowshed: interactive job decayed to {to_name} after {seconds}s in mbx's pool; its kernel weight stays interactive's, since a job cgroup cannot leave its class cgroup\n"
-            )
-        };
-        self.process_output(job_id, StreamKind::Stderr, Bytes::from(note))
-            .await;
+        let _ = leader;
+        if let Some(job_spans) = &self.job_spans
+            && job.caller.is_none()
+        {
+            job_spans.record_decay(&job.info, step);
+        }
     }
 
     async fn process_output(&mut self, job_id: JobId, stream: StreamKind, bytes: Bytes) {
