@@ -578,8 +578,7 @@ mod tests {
     use super::*;
     use arrow_array::types::UInt8Type;
     use arrow_array::{Array, DictionaryArray, Int64Array, StringArray, UInt64Array};
-    use arrow_ipc::reader::StreamReader;
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{self, OpenOptions};
     use std::os::unix::fs::FileExt;
 
     struct Fixture(PathBuf);
@@ -592,15 +591,17 @@ mod tests {
         }
 
         fn batches(&self) -> Vec<RecordBatch> {
-            fs::read_dir(self.0.join("telemetry"))
-                .unwrap()
-                .flat_map(|partition| fs::read_dir(partition.unwrap().path()).unwrap())
-                .flat_map(|entry| {
-                    StreamReader::try_new(File::open(entry.unwrap().path()).unwrap(), None)
-                        .unwrap()
-                        .map(Result::unwrap)
-                        .collect::<Vec<_>>()
-                })
+            let sealed =
+                crate::storage::trace_segment::read_sealed(&self.0.join("telemetry")).unwrap();
+            assert!(
+                sealed.skipped.is_empty(),
+                "torn segments: {:?}",
+                sealed.skipped
+            );
+            sealed
+                .segments
+                .into_iter()
+                .flat_map(|segment| segment.batches)
                 .collect()
         }
     }

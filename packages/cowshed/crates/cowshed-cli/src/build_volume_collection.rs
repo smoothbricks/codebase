@@ -105,20 +105,18 @@ mod tests {
         )
         .await;
         assert_ne!(code, 0);
-        let segments: Vec<_> = std::fs::read_dir(&*root)
-            .expect("telemetry root")
-            .flat_map(|partition| {
-                std::fs::read_dir(partition.expect("partition").path()).expect("partition")
-            })
-            .map(|entry| entry.expect("segment").path())
-            .collect();
-        assert_eq!(segments.len(), 1, "{segments:?}");
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(
-            std::fs::File::open(&segments[0]).expect("open segment"),
-            None,
-        )
-        .expect("an Arrow stream");
-        let batch = reader.next().expect("one batch").expect("a readable batch");
+
+        let sealed =
+            cowshed_core::storage::trace_segment::read_sealed(&root).expect("telemetry root");
+        assert!(
+            sealed.skipped.is_empty(),
+            "torn segments: {:?}",
+            sealed.skipped
+        );
+        let [segment] = &sealed.segments[..] else {
+            panic!("one segment: {:?}", sealed.segments);
+        };
+        let batch = segment.batches.first().expect("one batch");
         let column = |name: &str| {
             batch
                 .column_by_name(name)

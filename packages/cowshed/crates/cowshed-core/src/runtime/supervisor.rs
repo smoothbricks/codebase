@@ -7229,9 +7229,9 @@ impl SupervisorActor {
     /// a selectable event, never an actor-side wait on filesystem IO or a worker join.
     ///
     /// These are the retiring supervisor's last writes: the group ledger's last cut and, beside
-    /// it, the span writer's seal of what it gathered (a retired supervisor's process exits
-    /// waiting for nothing else, 13_telemetry.md, "Job span segments"). Retirement is answered
-    /// once both are done.
+    /// it, the span writer's seal of what it gathered and its one sync of the partitions it
+    /// wrote (a retired supervisor's process exits waiting for nothing else, 13_telemetry.md,
+    /// "Job span segments", "Unsynced seals"). Retirement is answered once both are done.
     fn begin_group_ledger_finish(&mut self) {
         if !matches!(self.group_ledger_finish, GroupLedgerFinish::Idle) {
             return;
@@ -7247,7 +7247,7 @@ impl SupervisorActor {
         tokio::spawn(async move {
             // A writer that already stopped counted what it refused; nothing is left to seal.
             if let Some(spans) = spans {
-                let _ = spans.health().await;
+                let _ = spans.retire().await;
             }
             let recorded = match ledger {
                 Some(receiver) => receiver.await.unwrap_or_else(|error| {

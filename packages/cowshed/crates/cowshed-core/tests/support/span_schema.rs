@@ -6,11 +6,10 @@
 //! names, never derived from the declaration under test: an oracle that passes shows the
 //! declaration says what the spec says, and a segment that gains or loses a column is named.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use arrow_array::cast::AsArray as _;
 use arrow_array::{Array as _, ArrowPrimitiveType, RecordBatch};
-use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
 /// One custom column as the spec declares it: its name, its spec type and whether it may hold
@@ -109,16 +108,17 @@ pub(crate) fn exact_schema(schema: &Schema, custom: &[Column]) -> Result<(), Str
 /// writer sealed them: its name and its one batch. A segment under another prefix is a failure,
 /// so a test reads exactly the kind of segment it names.
 pub(crate) fn sealed_segments(telemetry: &Path, prefix: &str) -> Vec<(String, RecordBatch)> {
-    let strangers = segment_paths(telemetry)
-        .into_iter()
+    let segments = sealed(telemetry);
+    let strangers = segments
+        .iter()
         .map(|(name, _)| name)
-        .filter(|name| !is_sealed(name, prefix))
+        .filter(|name| !name.starts_with(prefix))
         .collect::<Vec<_>>();
     assert!(
         strangers.is_empty(),
         "only sealed `{prefix}` segments: {strangers:?}"
     );
-    sealed_segments_among_kinds(telemetry, prefix)
+    segments
 }
 
 /// [`sealed_segments`] for a root that holds other kinds of segment too: a job's span and its
@@ -127,42 +127,33 @@ pub(crate) fn sealed_segments_among_kinds(
     telemetry: &Path,
     prefix: &str,
 ) -> Vec<(String, RecordBatch)> {
-    let mut segments = segment_paths(telemetry);
-    segments.retain(|(name, _)| is_sealed(name, prefix));
-    segments.sort();
+    let mut segments = sealed(telemetry);
+    segments.retain(|(name, _)| name.starts_with(prefix));
     segments
+}
+
+/// Every segment sealed under `telemetry` (`trace_segment::read_sealed`), by name, which is its
+/// writer's seal order: its name and its one batch. A torn or empty segment fails here, since no
+/// test cuts the power.
+fn sealed(telemetry: &Path) -> Vec<(String, RecordBatch)> {
+    let sealed =
+        cowshed_core::storage::trace_segment::read_sealed(telemetry).expect("read telemetry root");
+    assert!(
+        sealed.skipped.is_empty(),
+        "torn segments: {:?}",
+        sealed.skipped
+    );
+    let mut segments: Vec<(String, RecordBatch)> = sealed
+        .segments
         .into_iter()
-        .map(|(name, path)| {
-            let mut reader = StreamReader::try_new(
-                std::fs::File::open(&path).expect("open sealed segment"),
-                None,
-            )
-            .expect("an Arrow stream");
-            let batch = reader.next().expect("one batch").expect("a valid batch");
-            assert!(reader.next().is_none(), "{name} holds one batch");
+        .map(|segment| {
+            let name = segment.name().to_owned();
+            let [batch] = <[RecordBatch; 1]>::try_from(segment.batches)
+                .unwrap_or_else(|batches| panic!("{name} holds one batch, not {}", batches.len()));
             (name, batch)
         })
-        .collect()
-}
-
-fn is_sealed(name: &str, prefix: &str) -> bool {
-    name.starts_with(prefix) && name.ends_with(".arrow")
-}
-
-/// Every file in `telemetry`'s date partitions: its name and its path.
-fn segment_paths(telemetry: &Path) -> Vec<(String, PathBuf)> {
-    let mut segments = Vec::new();
-    for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
-        for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
-            let path = entry.expect("segment").path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("a UTF-8 segment name")
-                .to_owned();
-            segments.push((name, path));
-        }
-    }
+        .collect();
+    segments.sort_by(|left, right| left.0.cmp(&right.0));
     segments
 }
 

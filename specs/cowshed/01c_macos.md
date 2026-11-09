@@ -303,13 +303,16 @@ Find the symptom in the left column and follow the link.
   Rust's `File::sync_all` is `F_FULLFSYNC` on Apple (code comment), on a disk image it flushes every dirty block of the
   whole image (_owner text_), and `F_BARRIERFSYNC` orders writes and makes no durability promise (`fcntl(2)`;
   `<sys/fcntl.h>`: “fsync + issue barrier to drive”).
-- **Rule.** A job's own records take no sync: they must survive the death of their writer, which the page cache gives,
-  not power loss, while `F_FULLFSYNC` (through `sync_all`) is spent on lifecycle and authority state and on sealed
-  telemetry segments (job and process spans one per writer interval).
+- **Rule.** A job's own records and sealed telemetry segments take no sync: they must survive the death of their writer,
+  which the page cache gives, not power loss, so a power cut may leave a segment torn or empty, which every reader skips
+  and counts. `F_FULLFSYNC` (through `sync_all`) is spent on lifecycle and authority state, and once per telemetry date
+  directory a supervisor wrote when it retires and the gateway wrote when it stops.
 - **Owners.** [11_shell.md §Job control](./11_shell.md#job-control), “Durability of a job's own records”;
   [13_telemetry.md §Storage: one authority tier, one audit trail, one Arrow substrate](./13_telemetry.md#storage-one-authority-tier-one-audit-trail-one-arrow-substrate);
-  [13_telemetry.md §Process-tree spans](./13_telemetry.md#process-tree-spans) (sealed segments). Code:
-  [`cowshed-os/src/fsio.rs`] `Durability`, `full_sync`.
+  [13_telemetry.md §Process-tree spans](./13_telemetry.md#process-tree-spans) (sealed segments),
+  [13_telemetry.md §Why lmao, not text logs](./13_telemetry.md#why-lmao-not-text-logs), “Unsynced seals”. Code:
+  [`cowshed-os/src/fsio.rs`] `Durability`, `full_sync`; [`cowshed-core/src/storage/trace_segment.rs`] `seal_segment`,
+  `sync_partitions`, `read_sealed`.
 
 ### Freeing an image is bounded by runs, not by time
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs, io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -10,7 +10,8 @@ use std::{
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt16Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use cowshed_core::storage::trace_segment::{
-    EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, seal_segment, trace_batch,
+    EntryType, SpanAddress, SystemColumns, SystemRow, TelemetryDate, seal_segment, sync_partitions,
+    trace_batch,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -100,11 +101,12 @@ impl AuditTailHandle {
     }
 }
 
-/// Durable production audit sink writing mode-0600 immutable Arrow IPC segments.
+/// Production audit sink writing mode-0600 immutable Arrow IPC segments.
 ///
 /// The writer has one bounded command queue, one bounded in-memory batch, and a
-/// bounded durable tail. Records are acknowledged only after their containing
-/// segment has been fsynced and atomically published. Denial/failure decisions
+/// bounded tail. Records are acknowledged only after their containing segment has been
+/// atomically published, unsynced; the stopping gateway flushes each date partition it wrote once
+/// (13_telemetry.md, "Unsynced seals"). Denial/failure decisions
 /// force an immediate batch boundary; ordinary completions share a short timer.
 pub struct ArrowAuditSink {
     commands: mpsc::Sender<WriterCommand>,
@@ -144,6 +146,7 @@ impl ArrowAuditSink {
             tail_capacity: config.tail_capacity.get(),
             subscribers: Vec::with_capacity(config.max_subscribers.get()),
             max_subscribers: config.max_subscribers.get(),
+            partitions: BTreeSet::new(),
         };
         tokio::spawn(writer.run());
         Ok(Self { commands, tail })
@@ -221,6 +224,9 @@ struct AuditWriter {
     tail_capacity: usize,
     subscribers: Vec<TailSubscriber>,
     max_subscribers: usize,
+    /// Each date partition a seal of this writer published into, flushed once when the gateway
+    /// stops (13_telemetry.md, "Unsynced seals").
+    partitions: BTreeSet<PathBuf>,
 }
 
 impl AuditWriter {
@@ -279,7 +285,7 @@ impl AuditWriter {
                 let result = self
                     .flush_pending()
                     .await
-                    .and_then(|()| sync_directory(&self.root));
+                    .and_then(|()| self.sync_partitions());
                 let success = result.is_ok();
                 let _ = reply.send(result);
                 success
@@ -324,12 +330,18 @@ impl AuditWriter {
                 .map_err(|error| AuditError(format!("Arrow audit writer task failed: {error}")))
                 .and_then(|result| result);
 
-        if let Err(error) = result {
-            let message = error.to_string();
-            for record in self.pending.drain(..) {
-                let _ = record.reply.send(Err(AuditError(message.clone())));
+        let sealed = match result {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                let message = error.to_string();
+                for record in self.pending.drain(..) {
+                    let _ = record.reply.send(Err(AuditError(message.clone())));
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        if let Some(partition) = sealed.parent() {
+            self.partitions.insert(partition.to_path_buf());
         }
 
         self.last_sequence = events
@@ -341,6 +353,14 @@ impl AuditWriter {
             let _ = record.reply.send(Ok(()));
         }
         Ok(())
+    }
+
+    /// One `F_FULLFSYNC` of each date partition this writer sealed into, the stopping gateway's
+    /// one barrier for the segments it sealed without a sync (13_telemetry.md, "Unsynced seals").
+    fn sync_partitions(&mut self) -> Result<(), AuditError> {
+        let partitions = std::mem::take(&mut self.partitions);
+        sync_partitions(partitions.iter().map(PathBuf::as_path))
+            .map_err(|error| AuditError(error.to_string()))
     }
 
     fn query_tail(&self, query: &AuditTailQuery) -> Result<Vec<AuditEvent>, AuditError> {
@@ -519,7 +539,11 @@ fn prepare_root(root: &Path) -> Result<(), AuditError> {
     Ok(())
 }
 
-fn write_segment(root: &Path, writer_id: Uuid, events: &[AuditEvent]) -> Result<(), AuditError> {
+fn write_segment(
+    root: &Path,
+    writer_id: Uuid,
+    events: &[AuditEvent],
+) -> Result<PathBuf, AuditError> {
     let first = events
         .first()
         .ok_or_else(|| AuditError("cannot write an empty audit batch".to_owned()))?;
@@ -535,8 +559,7 @@ fn write_segment(root: &Path, writer_id: Uuid, events: &[AuditEvent]) -> Result<
         &stem,
         &batch,
     )
-    .map_err(|error| AuditError(error.to_string()))?;
-    Ok(())
+    .map_err(|error| AuditError(error.to_string()))
 }
 
 fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
@@ -773,12 +796,6 @@ fn end_entry_type(status: AuditStatus) -> EntryType {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), AuditError> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io_error("syncing telemetry directory"))
-}
-
 fn io_error(operation: &'static str) -> impl FnOnce(io::Error) -> AuditError {
     move |error| AuditError(format!("{operation}: {error}"))
 }
@@ -815,21 +832,18 @@ mod tests {
         }
 
         fn segments(&self) -> Vec<PathBuf> {
-            let mut segments = Vec::new();
-            for partition in fs::read_dir(&self.0).expect("list audit root") {
-                let partition = partition.expect("valid partition entry").path();
-                if !partition.is_dir() {
-                    continue;
-                }
-                for entry in fs::read_dir(partition).expect("list audit partition") {
-                    let path = entry.expect("valid segment entry").path();
-                    if path.extension().and_then(|value| value.to_str()) == Some("arrow") {
-                        segments.push(path);
-                    }
-                }
-            }
-            segments.sort();
-            segments
+            let sealed = cowshed_core::storage::trace_segment::read_sealed(&self.0)
+                .expect("read audit root");
+            assert!(
+                sealed.skipped.is_empty(),
+                "torn segments: {:?}",
+                sealed.skipped
+            );
+            sealed
+                .segments
+                .into_iter()
+                .map(|segment| segment.path)
+                .collect()
         }
     }
 
@@ -904,7 +918,7 @@ mod tests {
         third.expect("third trace committed");
 
         let segments = root.segments();
-        assert_eq!(segments.len(), 1, "one fsync segment per batch");
+        assert_eq!(segments.len(), 1, "one segment per batch");
         let batch = read_batch(&segments[0]);
         assert_eq!(
             batch.num_rows(),

@@ -29,23 +29,36 @@ interactive job's decay (05_gateway.md, "Classes"), and a `span-ok`/`span-err` r
 supervisor's writer gathers these rows and seals them on the same interval as process rows ("Process segments"): the
 first row of either kind it gathers arms the interval, and when the interval ends, the job rows of every job gathered in
 it seal as one segment `job-<order:020>-<writer>.arrow`, in queue order, under `<host-telemetry-root>/<yyyy-mm-dd>/`
-(the date of its first row), sealed like the gateway's (create-new `0600` temporary, fsync, rename, directory fsync);
-the writer also seals them before answering a trace-health read, and a retiring supervisor has them sealed before it is
-answered. One segment per interval, not one per row: a job row is telemetry, not a durability event (11_shell.md,
-"Durability of a job's own records"), and sealing each row as its own segment, each a full flush of the segment and of
-its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203 back-to-back execs on 2026-10-30 (load
-about 10), competing with the job's own record writes. Rows still gathered when the writer's process dies are lost, as
-process rows are. No count of rows seals early: rows past the writer's bound in one interval (16,384 job rows,
-`JOB_GATHER_ROWS`) are refused and counted in the trace health. A row no column can state is refused and counted alone;
-the rest of its interval still seals. The trace health's `recorded` counts segments sealed, not rows. The rows carry
-`repo_id`, `workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its
-state. The span's lmao address is span 1 of the thread derived from the durable key
+(the date of its first row), sealed like the gateway's (create-new `0600` temporary, rename, no sync: "Unsynced seals");
+the writer also seals them before answering a trace-health read, and a retiring supervisor has them sealed, and each
+partition its writer wrote flushed once, before it is answered. One segment per interval, not one per row: a job row is
+telemetry, not a durability event (11_shell.md, "Durability of a job's own records"), and sealing each row as its own
+segment, each a full flush of the segment and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample
+of 203 back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. Rows still gathered
+when the writer's process dies are lost, as process rows are. No count of rows seals early: rows past the writer's bound
+in one interval (16,384 job rows, `JOB_GATHER_ROWS`) are refused and counted in the trace health. A row no column can
+state is refused and counted alone; the rest of its interval still seals. The trace health's `recorded` counts segments
+sealed, not rows. The rows carry `repo_id`, `workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id
+and, on the terminal row, its state. The span's lmao address is span 1 of the thread derived from the durable key
 `(repo_id, workspace_incarnation, job_id)` (the first eight bytes of a domain-separated BLAKE3), never the
 workspace-local `job_id` alone: jobs of two workspaces under one adopted trace context stay distinct spans. The writes
 run off the supervisor's actor; a refused write is counted in the supervisor's trace health, which every supervisor
 handle reads, in process or over its socket, and never fails or delays the job. This job span is the anchor
 `process.run` spans parent from. The terminal row carries the job's `env_hash` (the same environment identity as the job
 record's `envHash`, 11_shell.md).
+
+**Unsynced seals.** Every segment this module seals (job, process, wait, verb, native image and gateway segments) is a
+create-new `0600` temporary renamed without replace to its sealed name, with no sync. Telemetry, like a job's own
+records (11_shell.md, "Durability of a job's own records"), must survive its writer's death, which the page cache gives,
+not a power cut. A power cut can therefore leave a sealed name torn (a truncated Arrow stream) or empty, and every
+reader of a telemetry directory (`trace_segment::read_sealed`, and `lmao-inspect tail -f` once it is built,
+specs/lmao/04_inspect_cli.md) skips and counts such a segment and never fails on it. A supervisor that retires, after
+its last seal, and the gateway when it stops each issue one `F_FULLFSYNC` per date directory they sealed into. Measured
+2026-11-10: synced seals were two `F_FULLFSYNC`s each (the segment and its directory), 40 in a 12 s window from 18
+supervisors, about 3.6 drive flushes a second host-wide, each holding the drive 164 ms p50 and 456 ms p95. In an
+interleaved experiment (6 rounds per arm, load 80-126), 18 emulated supervisors sealing with `F_FULLFSYNC` raised a
+gate's own `F_FULLFSYNC` mean by about 6 % (median ratio 1.06, range 0.69-2.21), inside noise. `F_BARRIERFSYNC` seals
+cost the same as full ones on a shed image (169 ms p50), so a barrier-only seal saves nothing.
 
 ## Trace context propagation
 
@@ -155,15 +168,15 @@ row/vector storage and every string's reserved capacity, without serializing a s
 bookkeeping and temporary Arrow encoding storage are outside this payload bound. Admission refuses and increments a
 failure count rather than waiting for capacity; the diagnostic names the operation or byte limit that refused it.
 Draining the channel does not make the interval buffer unbounded. Sealing runs on the ten-second shared `SEAL_INTERVAL`
-alone, regardless of operation count, with a final flush on host drop. A full queue drops detail with a counted refusal;
-it never triggers an early seal. A count-triggered seal would make full-drive flush rate grow with activity, recreating
-the defect telemetry coalescing fixes.
+alone, regardless of operation count, with a final seal on host drop. A full queue drops detail with a counted refusal;
+it never triggers an early seal. A count-triggered seal would make the seal rate grow with activity, recreating the
+defect telemetry coalescing fixes.
 
-This is **per writer**, not per partition: a fork's observations share a seal, not one `F_FULLFSYNC` per observation.
-Host drop closes the queue and joins the final flush, preserving the last accepted operation. Queue refusal, spawn
-failure and seal failure report a cumulative failed-observation count on stderr. A crash may lose the unsealed window,
-as with process telemetry. Before/after rows are published together after the operation; live waits remain visible in
-the existing lifecycle start diagnostics.
+This is **per writer**, not per partition: a fork's observations share a seal, not one segment per observation. Host
+drop closes the queue and joins the final flush, preserving the last accepted operation. Queue refusal, spawn failure
+and seal failure report a cumulative failed-observation count on stderr. A crash may lose the unsealed window, as with
+process telemetry. Before/after rows are published together after the operation; live waits remain visible in the
+existing lifecycle start diagnostics.
 
 Use the ordinary reader to inspect a trace (the date is the batch's first operation's UTC date):
 
@@ -226,7 +239,7 @@ Spans) lists them and the expiries that write no span. `lmao-q --dir "$STORE/tel
 sentence.
 
 A CLI supervisor SILENT, or a SILENT call on a process-external controller connection, on macOS also retains
-wait-<uuid>.sample.txt of the silent process beside that segment, using the same private, no-replace durable
+wait-<uuid>.sample.txt of the silent process beside that segment, using the same private, no-replace unsynced
 publication. Its unprivileged 2-second sample runs before a foreground relay drops its job hold; the final error
 boundary reuses the local receipt rather than sampling or sealing twice. Capture failure is stated in the original error
 and wait_stack_error, never as a successful empty report. Diagnostic work does not move the span's start or expiry
@@ -294,15 +307,15 @@ and a retiring supervisor has it sealed before it is answered. Process rows a mo
 sends after that seal are lost with the process, as a dying writer's are. No count of rows seals early: the interval is
 the seal rate and the gathered rows are the buffer, and the two are not interchangeable. Rows past 16,384 gathered in
 one interval are refused and counted in the trace health, so a burst loses rows rather than flushing the drive more
-often because a lot happened. A process fold batch is not a durability event: each seal is a full-drive flush of the
-segment and of its directory, and one seal per batch made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s
-of flushing per wall second at 0.10-0.16 s each, saturating the drive under every other process on it (measured
-2026-10-21; the same 0.7 s p99 metadata-read latency then showed on the store disk and on a build-volume image alike).
-Each seal keeps its durability; rows still gathered when the writer's process dies are lost, as the gateway's one-batch
-audit window is ("Batched audit flush accepted"). An event the projection cannot place is counted in the trace health
-and adds no row. A row's kind is its lmao entry type and a fixed message: `span-start` and `span-ok`/`span-err` named
-`process.run` at the observed birth and exit (`span-ok` only for a clean exit with status 0; an exit whose status the
-kernel withheld ends `span-err` with both exit columns null), and `info` rows `process.exec`, `process.busy`,
+often because a lot happened. A process fold batch is not a durability event, and neither is a seal ("Unsynced seals"):
+one seal per batch, each then a full-drive flush of the segment and of its directory, made 26 seals and about 52
+`F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall second at 0.10-0.16 s each, saturating the drive under
+every other process on it (measured 2026-10-21; the same 0.7 s p99 metadata-read latency then showed on the store disk
+and on a build-volume image alike). Rows still gathered when the writer's process dies are lost, as the gateway's
+one-batch audit window is ("Batched audit flush accepted"). An event the projection cannot place is counted in the trace
+health and adds no row. A row's kind is its lmao entry type and a fixed message: `span-start` and `span-ok`/`span-err`
+named `process.run` at the observed birth and exit (`span-ok` only for a clean exit with status 0; an exit whose status
+the kernel withheld ends `span-err` with both exit columns null), and `info` rows `process.exec`, `process.busy`,
 `process.idle`, `process.usage` (a first read or an RSS step), `process.heartbeat`, `process.blocked` and
 `process.blocker-cleared`. A `process.blocked` row is a SET that states `blocked_on`, `blocked_path` and
 `blocked_holder_pid` whole, so a null path or holder there is absent, never unchanged; `process.blocker-cleared` is a

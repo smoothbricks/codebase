@@ -8,12 +8,15 @@
 //! CLI's wait spans and the background verbs' run spans are all written here; none keeps a copy.
 //!
 //! A segment is one Arrow IPC stream holding one record batch, at
-//! `<telemetry root>/<yyyy-mm-dd>/<stem>.arrow`: written to a create-new 0600 temporary,
-//! synced, renamed without replace to its sealed name, and the partition directory synced. A
-//! segment that exists is complete; a crash leaves at most a temporary in the shared temp grammar.
+//! `<telemetry root>/<yyyy-mm-dd>/<stem>.arrow`: written to a create-new 0600 temporary and
+//! renamed without replace to its sealed name, with no sync (13_telemetry.md, "Unsynced seals"). A
+//! crash of the writer leaves at most a temporary in the shared temp grammar; a power cut can leave
+//! a sealed name torn or empty, which [`read_sealed`] skips and counts. A supervisor that retires
+//! and the gateway when it stops sync each date partition they wrote once ([`sync_partitions`]).
 
 use std::ffi::{CString, OsStr};
 use std::fmt;
+use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -25,6 +28,7 @@ use arrow_array::{
     builder::StringDictionaryBuilder,
     types::{UInt8Type, UInt32Type},
 };
+use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
 use thiserror::Error;
@@ -314,7 +318,6 @@ pub enum SealStep {
     CreatingPartition,
     SyncingDirectory,
     CreatingSegment,
-    SyncingSegment,
     PublishingSegment,
 }
 
@@ -324,7 +327,6 @@ impl fmt::Display for SealStep {
             Self::CreatingPartition => "creating telemetry partition",
             Self::SyncingDirectory => "syncing telemetry directory",
             Self::CreatingSegment => "creating trace segment",
-            Self::SyncingSegment => "syncing trace segment",
             Self::PublishingSegment => "publishing trace segment",
         })
     }
@@ -349,8 +351,8 @@ fn at(step: SealStep) -> impl FnOnce(io::Error) -> TraceSegmentError {
 }
 
 /// Seal `batch` as `<root>/<date>/<stem>.arrow`; the sealed path on success. The partition is
-/// created 0700 when absent and the root synced for its new entry; a link at the root's last
-/// component, at the partition or at either segment name is refused, never followed.
+/// created 0700 when absent; a link at the root's last component, at the partition or at either
+/// segment name is refused, never followed. Nothing is synced (13_telemetry.md, "Unsynced seals").
 pub fn seal_segment(
     root: &Path,
     date: TelemetryDate,
@@ -365,7 +367,7 @@ pub fn seal_segment(
     })
 }
 
-/// Publish diagnostic bytes with the same private, durable, no-replace custody as trace segments.
+/// Publish diagnostic bytes with the same private, no-replace, unsynced custody as trace segments.
 pub fn seal_bytes(
     root: &Path,
     date: TelemetryDate,
@@ -398,21 +400,13 @@ fn seal_file(
         CString::new(partition_name.as_str()).expect("a formatted date contains no NUL");
 
     let root_directory = open_directory_nofollow(root).map_err(at(SealStep::CreatingPartition))?;
-    let (directory, created) = open_or_create_child_directory(&root_directory, &partition)
+    let (directory, _) = open_or_create_child_directory(&root_directory, &partition)
         .map_err(at(SealStep::CreatingPartition))?;
-    if created {
-        Durability::PowerLoss
-            .sync_new_entry_at(&root_directory)
-            .map_err(at(SealStep::SyncingDirectory))?;
-    }
 
     let mut file =
         create_private_file_at(&directory, &temporary).map_err(at(SealStep::CreatingSegment))?;
     let cleanup = TemporaryAt::new(&directory, &temporary);
     write(&mut file)?;
-    Durability::PowerLoss
-        .sync_file(&file)
-        .map_err(at(SealStep::SyncingSegment))?;
     drop(file);
     rename_noreplace(
         directory.as_raw_fd(),
@@ -422,10 +416,107 @@ fn seal_file(
     )
     .map_err(at(SealStep::PublishingSegment))?;
     cleanup.disarm();
-    Durability::PowerLoss
-        .sync_new_entry_at(&directory)
-        .map_err(at(SealStep::SyncingDirectory))?;
     Ok(root.join(partition_name).join(sealed_name))
+}
+
+/// One `F_FULLFSYNC` of each date partition in `partitions`, the directories a writer's sealed
+/// paths name as their parents: what a supervisor that retires, and the gateway when it stops,
+/// issue once for every segment they sealed without a sync (13_telemetry.md, "Unsynced seals"). A
+/// link at a partition is refused, never followed.
+pub fn sync_partitions<'a>(
+    partitions: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), TraceSegmentError> {
+    for partition in partitions {
+        let directory =
+            open_directory_nofollow(partition).map_err(at(SealStep::SyncingDirectory))?;
+        Durability::PowerLoss
+            .sync_new_entry_at(&directory)
+            .map_err(at(SealStep::SyncingDirectory))?;
+    }
+    Ok(())
+}
+
+/// One readable segment under a telemetry root: its path and every batch it holds.
+#[derive(Debug)]
+pub struct SealedSegment {
+    pub path: PathBuf,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl SealedSegment {
+    /// The segment's file name: `<stem>.arrow`, whose stem leads with its kind and its writer's
+    /// order.
+    pub fn name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("read_sealed keeps only UTF-8 segment names")
+    }
+}
+
+/// What [`read_sealed`] found under a telemetry root.
+#[derive(Debug, Default)]
+pub struct Sealed {
+    /// Every readable segment, by path: date partition, then name.
+    pub segments: Vec<SealedSegment>,
+    /// Every segment a power cut left torn or empty: skipped and counted, never an error.
+    pub skipped: Vec<PathBuf>,
+}
+
+/// Every sealed segment in `root`'s date partitions. Seals take no sync (13_telemetry.md,
+/// "Unsynced seals"), so a sealed name a power cut left torn (a truncated Arrow stream) or empty
+/// (no bytes, or no batch) is skipped and named in [`Sealed::skipped`]. A temporary (a name led by
+/// `.`), a file that is not `*.arrow` and anything not a directory at the root are not segments.
+/// Listing a directory, opening a segment or a device read failing is an error.
+pub fn read_sealed(root: &Path) -> io::Result<Sealed> {
+    let mut paths = Vec::new();
+    for partition in fs::read_dir(root)? {
+        let partition = partition?;
+        if !partition.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(partition.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let segment = name
+                .to_str()
+                .is_some_and(|name| !name.starts_with('.') && name.ends_with(".arrow"));
+            if segment && entry.file_type()?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+    let mut sealed = Sealed::default();
+    for path in paths {
+        match read_batches(&path)? {
+            Some(batches) => sealed.segments.push(SealedSegment { path, batches }),
+            None => sealed.skipped.push(path),
+        }
+    }
+    Ok(sealed)
+}
+
+/// The batches of the segment at `path`, or `None` when it is torn or holds no batch. A read the
+/// device failed is an error, never a torn segment.
+fn read_batches(path: &Path) -> io::Result<Option<Vec<RecordBatch>>> {
+    let file = io::BufReader::new(fs::File::open(path)?);
+    let torn = |error: ArrowError| match error {
+        ArrowError::IoError(_, error) if error.kind() != io::ErrorKind::UnexpectedEof => Err(error),
+        _ => Ok(None),
+    };
+    let reader = match StreamReader::try_new(file, None) {
+        Ok(reader) => reader,
+        Err(error) => return torn(error),
+    };
+    let mut batches = Vec::new();
+    for batch in reader {
+        match batch {
+            Ok(batch) => batches.push(batch),
+            Err(error) => return torn(error),
+        }
+    }
+    Ok((!batches.is_empty()).then_some(batches))
 }
 
 #[cfg(test)]
@@ -495,5 +586,51 @@ mod tests {
                 Err(TraceSegmentError::InvalidStem(_))
             ));
         }
+    }
+
+    /// No seal syncs; the one flush is the retiring writer's, once per partition it sealed into
+    /// (13_telemetry.md, "Unsynced seals").
+    #[test]
+    fn a_seal_takes_no_sync_and_its_partition_takes_one() {
+        use cowshed_os::fsio::{Syncs, take_syncs};
+        let root = crate::temp_root::TempRoot::new("trace-seal-sync");
+        let batch = trace_batch(SystemColumns::with_capacity(0), Vec::new()).unwrap();
+        let date = TelemetryDate::from_unix_seconds(0);
+        take_syncs();
+        let sealed = seal_segment(&root, date, "job-1", &batch).unwrap();
+        seal_segment(&root, date, "job-2", &batch).unwrap();
+        assert_eq!(take_syncs(), Syncs::default(), "a seal syncs nothing");
+        sync_partitions([sealed.parent().unwrap()]).unwrap();
+        assert_eq!(take_syncs(), Syncs { full: 1 }, "one flush per partition");
+    }
+
+    /// A power cut can leave a sealed name torn or empty, since no seal syncs: the reader of a
+    /// telemetry directory skips and names each and reads the rest (13_telemetry.md, "Unsynced
+    /// seals").
+    #[test]
+    fn read_sealed_skips_a_torn_and_an_empty_segment() {
+        let root = crate::temp_root::TempRoot::new("trace-read-sealed");
+        let batch = trace_batch(SystemColumns::with_capacity(0), Vec::new()).unwrap();
+        let date = TelemetryDate::from_unix_seconds(0);
+        let good = seal_segment(&root, date, "job-1", &batch).unwrap();
+        let torn = seal_segment(&root, date, "job-2", &batch).unwrap();
+        let length = std::fs::metadata(&torn).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&torn)
+            .unwrap()
+            .set_len(length / 2)
+            .unwrap();
+        let empty = good.with_file_name("job-3.arrow");
+        std::fs::File::create(&empty).unwrap();
+        let sealed = read_sealed(&root).unwrap();
+        let read: Vec<&Path> = sealed
+            .segments
+            .iter()
+            .map(|segment| segment.path.as_path())
+            .collect();
+        assert_eq!(read, [good.as_path()]);
+        assert_eq!(sealed.segments[0].batches, [batch]);
+        assert_eq!(sealed.skipped, [torn, empty]);
     }
 }

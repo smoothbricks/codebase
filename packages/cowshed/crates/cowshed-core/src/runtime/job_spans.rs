@@ -23,12 +23,14 @@
 //! One writer gathers both kinds of row and seals what it gathered once per [`SEAL_INTERVAL`]
 //! ([`write_rows`]): the job rows as one `job-<order:020>-<writer>.arrow` segment, then the
 //! process rows as one `process-<order:020>-<writer>.arrow` segment, each holding its rows in
-//! queue order, under `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`]. A row
-//! is telemetry, not a durability event: sealing one segment per job row, each a full flush of the
-//! segment and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
-//! back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. A
-//! retiring supervisor seals what was gathered before it is answered; rows still gathered when the
-//! writer's process dies are lost, as process rows are.
+//! queue order, under `<telemetry root>/<yyyy-mm-dd>/` by [`crate::storage::trace_segment`], with
+//! no sync (13_telemetry.md, "Unsynced seals"). A row is telemetry, not a durability event:
+//! sealing one segment per job row, each then a full flush of the segment and of its directory,
+//! cost 22.9 ms of flushing per exec in a supervisor sample of 203 back-to-back execs on
+//! 2026-10-30 (load about 10), competing with the job's own record writes. A retiring supervisor
+//! seals what was gathered and syncs each partition its writer wrote once before it is answered
+//! ([`JobSpanPublisher::retire`]); rows still gathered when the writer's process dies are lost, as
+//! process rows are.
 //!
 //! Telemetry never gates a job. The actor hands a row to [`JobSpanPublisher::record`], which
 //! queues it without waiting; the writer task gathers and seals in order, off the actor and off
@@ -36,6 +38,7 @@
 //! a segment the writer fails to seal, and an event the projection cannot place, are counted in
 //! [`TraceHealth`], never dropped silently.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,14 +87,14 @@ const QUEUE_CAPACITY: usize = 256;
 
 /// How long a writer gathers rows before it seals them: the first row of either kind it gathers
 /// arms one deadline this far away, and when it passes the gathered job rows seal as one segment
-/// and the gathered process rows as another. A row is not a durability event, and sealing a
-/// segment is a full-drive flush of it and of its directory (`Durability::PowerLoss`). One seal
-/// per process fold batch made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s of
-/// flushing per wall second at 0.10-0.16 s each, which saturated the drive under every other
-/// process on it (measured 2026-10-21). One seal per job row, each a full flush of the segment
-/// and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample of 203
-/// back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes.
-/// So the writer seals on this interval, and the durability of each seal is unchanged. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
+/// and the gathered process rows as another. A row is not a durability event, and neither is a
+/// seal: a temporary renamed to its sealed name with no sync (13_telemetry.md, "Unsynced seals").
+/// One seal per process fold batch, each then a full flush of the segment and of its directory,
+/// made 26 seals and about 52 `F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall
+/// second at 0.10-0.16 s each, which saturated the drive under every other process on it
+/// (measured 2026-10-21). One seal per job row cost 22.9 ms of flushing per exec in a supervisor
+/// sample of 203 back-to-back execs on 2026-10-30 (load about 10). So the writer seals on this
+/// interval. Rows still gathered when the process dies are lost, as the gateway's one-batch audit
 /// window is (13_telemetry.md, "Job span segments", "Process segments").
 pub const SEAL_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -298,11 +301,13 @@ impl Segment {
     }
 }
 
-/// What the writer's queue carries: one job row, the rows of one fold batch, or a health read.
+/// What the writer's queue carries: one job row, the rows of one fold batch, a health read, or
+/// the retiring supervisor's last read.
 enum Request {
     Job(Box<JobSpanRow>),
     Processes(Vec<ProcessSpanRow>),
     Health { reply: oneshot::Sender<TraceHealth> },
+    Retire { reply: oneshot::Sender<TraceHealth> },
 }
 
 #[derive(Debug, Error)]
@@ -446,6 +451,18 @@ impl JobSpanPublisher {
             .map_err(|_| writer_stopped())?;
         receive.await.map_err(|_| writer_stopped())
     }
+
+    /// [`Self::health`] for a supervisor that retires: the writer seals what it gathered, then
+    /// issues one `F_FULLFSYNC` of each date partition it sealed into since it started, since no
+    /// seal synced (13_telemetry.md, "Unsynced seals"). A failed partition sync is one refusal.
+    pub async fn retire(&self) -> crate::error::Result<TraceHealth> {
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .send(Request::Retire { reply })
+            .await
+            .map_err(|_| writer_stopped())?;
+        receive.await.map_err(|_| writer_stopped())
+    }
 }
 
 fn writer_stopped() -> CowshedError {
@@ -476,7 +493,7 @@ fn refuse_rows(health: &Mutex<TraceHealth>, rows: usize, reason: String) {
 /// is left behind by a writer that ends in order. No count seals early: rows past
 /// [`JOB_GATHER_ROWS`] or [`PROCESS_GATHER_ROWS`] in one interval are refused. A job row is
 /// encoded as it is gathered ([`JobCells::of`]), so a row no column can state is refused alone.
-/// Sealing syncs files and directories, so it runs on the blocking pool; the order advances on
+/// Sealing writes files, so it runs on the blocking pool; the order advances on
 /// every attempt, so a name a failed attempt may have published is never reused.
 async fn write_rows(
     root: PathBuf,
@@ -489,6 +506,7 @@ async fn write_rows(
         writer,
         order: 1,
         health,
+        partitions: BTreeSet::new(),
     };
     let mut gathered = Gathered::default();
     loop {
@@ -526,6 +544,12 @@ async fn write_rows(
             }
             Some(Request::Health { reply }) => {
                 sealer.seal_gathered(&mut gathered).await;
+                // A caller that stopped waiting has nothing left to tell.
+                let _ = reply.send(lock(&sealer.health).clone());
+            }
+            Some(Request::Retire { reply }) => {
+                sealer.seal_gathered(&mut gathered).await;
+                sealer.sync_partitions().await;
                 // A caller that stopped waiting has nothing left to tell.
                 let _ = reply.send(lock(&sealer.health).clone());
             }
@@ -581,6 +605,9 @@ struct Sealer {
     writer: Uuid,
     order: u64,
     health: Arc<Mutex<TraceHealth>>,
+    /// Each partition directory a seal of this writer published into: what
+    /// [`Self::sync_partitions`] flushes when the supervisor retires.
+    partitions: BTreeSet<PathBuf>,
 }
 
 impl Sealer {
@@ -606,7 +633,10 @@ impl Sealer {
             tokio::task::spawn_blocking(move || seal(&root, writer, order, &segment)).await;
         self.order = self.order.saturating_add(1);
         match sealed {
-            Ok(Ok(())) => {
+            Ok(Ok(sealed)) => {
+                if let Some(partition) = sealed.parent() {
+                    self.partitions.insert(partition.to_path_buf());
+                }
                 let mut health = lock(&self.health);
                 health.recorded = health.recorded.saturating_add(1);
             }
@@ -618,26 +648,44 @@ impl Sealer {
             ),
         }
     }
+
+    /// One `F_FULLFSYNC` of each partition this writer sealed into, on the blocking pool. A
+    /// failure is one refusal, named in the trace health.
+    async fn sync_partitions(&mut self) {
+        let partitions = std::mem::take(&mut self.partitions);
+        if partitions.is_empty() {
+            return;
+        }
+        let synced = tokio::task::spawn_blocking(move || {
+            crate::storage::trace_segment::sync_partitions(partitions.iter().map(PathBuf::as_path))
+        })
+        .await;
+        match synced {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => refuse(&self.health, error.to_string()),
+            Err(error) => refuse(
+                &self.health,
+                format!("the job span partition sync task failed: {error}"),
+            ),
+        }
+    }
 }
 
-/// Seal `segment` as `order` of `writer` under `root`: a job segment's telemetry partition is the
-/// UTC date of its first row, as a process segment's is.
-fn seal(root: &Path, writer: Uuid, order: u64, segment: &Segment) -> Result<(), JobSpanError> {
+/// Seal `segment` as `order` of `writer` under `root`; the sealed path. A job segment's telemetry
+/// partition is the UTC date of its first row, as a process segment's is.
+fn seal(root: &Path, writer: Uuid, order: u64, segment: &Segment) -> Result<PathBuf, JobSpanError> {
     match segment {
         Segment::Jobs(rows) => {
             let first = rows.first().ok_or(JobSpanError::NoRows)?;
-            seal_segment(
+            Ok(seal_segment(
                 root,
                 first.date,
                 &format!("job-{order:020}-{writer}"),
                 &job_span_batch(rows)?,
-            )?;
+            )?)
         }
-        Segment::Processes(rows) => {
-            seal_process_batch(root, writer, order, rows)?;
-        }
+        Segment::Processes(rows) => Ok(seal_process_batch(root, writer, order, rows)?),
     }
-    Ok(())
 }
 
 trace_columns! {

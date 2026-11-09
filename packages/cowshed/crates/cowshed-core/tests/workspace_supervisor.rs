@@ -9685,31 +9685,27 @@ struct JobSpanRow {
 /// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
 /// one batch, of one row or more.
 fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)> {
-    let mut segments = Vec::new();
-    for partition in std::fs::read_dir(telemetry).expect("list telemetry root") {
-        for entry in std::fs::read_dir(partition.expect("partition").path()).expect("list date") {
-            let path = entry.expect("segment").path();
-            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-            if name.starts_with("job-") && name.ends_with(".arrow") {
-                segments.push((name, path));
-            }
-        }
-    }
-    segments.sort();
-    segments
+    let sealed =
+        cowshed_core::storage::trace_segment::read_sealed(telemetry).expect("read telemetry root");
+    assert!(
+        sealed.skipped.is_empty(),
+        "torn segments: {:?}",
+        sealed.skipped
+    );
+    let mut segments: Vec<_> = sealed
+        .segments
         .into_iter()
-        .map(|(name, path)| {
-            let mut reader = arrow_ipc::reader::StreamReader::try_new(
-                std::fs::File::open(&path).expect("open job span segment"),
-                None,
-            )
-            .expect("Arrow stream");
-            let batch = reader.next().expect("one batch").expect("valid batch");
-            assert!(reader.next().is_none(), "{name} holds one batch");
+        .filter(|segment| segment.name().starts_with("job-"))
+        .map(|segment| {
+            let name = segment.name().to_owned();
+            let [batch] = <[arrow_array::RecordBatch; 1]>::try_from(segment.batches)
+                .unwrap_or_else(|batches| panic!("{name} holds one batch, not {}", batches.len()));
             assert!(batch.num_rows() > 0, "{name} holds rows");
             (name, batch)
         })
-        .collect()
+        .collect();
+    segments.sort_by(|left, right| left.0.cmp(&right.0));
+    segments
 }
 
 /// Every row of the job-span segments under `telemetry`, read across them in the order their
