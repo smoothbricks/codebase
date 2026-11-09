@@ -610,6 +610,24 @@ removed file changes the set, and each of those restores.
 left, a third keeps them again, an edited output restores and the restore is kept next, and a removed output restores.
 Drop the hunk, and keep the test, once the Nx in use verifies on-disk outputs without a daemon.
 
+## Bun's runtime modules are builtins in every runtime
+
+Nx tells a runtime module from a package with `node:module`'s `isBuiltin` (`isBuiltinModuleImport`,
+`plugins/js/project-graph/build-dependencies/target-project-locator.js`). Under Bun that is true for `bun` and `bun:*`;
+under Node, the runtime of an Nx daemon an editor's Nx language server starts, it is false. Such a daemon took every
+`bun:test` import of every test file for a package and resolved it from the importing directory through the external
+package lookup, TypeScript resolution and `require.resolve`: one large Bun workspace's daemon's graph recompute looked
+up `bun:test`, `bun:test.js`, `bun:test.json` and `bun:test.node` 3,738 times each and probed 41,382 missing
+`node_modules` directories in 11 s. The patched `isBuiltinModuleImport` also answers true for `bun` and `bun:*`, as it
+already did for `node:sqlite`. Measured under Node with the installed Nx, one `bun:test` import from a file in
+`packages/nx-plugin/src` took 10 file-system calls and 10 `require.resolve` attempts (90–218 ms) before and none (0.1
+ms) after.
+
+`nx-bun-builtin-imports.test.ts` asks the installed Nx in Node: `bun` and `bun:*` are builtins, resolve to no project
+and take no package lookup, and `bunyan`, `bun-types`, `@types/bun` and `bun/x` stay packages. Upstream:
+[nrwl/nx#37809](https://github.com/nrwl/nx/issues/37809). Drop the hunk, and keep the test, once the Nx in use knows
+Bun's modules.
+
 ## The longest chain starts first, past a full slot count
 
 Stock Nx orders ready tasks by how many tasks depend on them directly, then by project dependencies and history, and

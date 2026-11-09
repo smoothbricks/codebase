@@ -3232,6 +3232,32 @@ index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dce
                  workspaceNames.add(name);
              }
              // Check if this is a workspace-specific variant (e.g., "@quz/pkg1/lodash")
+diff --git a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js b/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
+index 5c2bcfaa11caef956fc906f2693586cb647b1382..1eeccd1ba61ce8391596f06aafeb0452cb49cf2a 100644
+--- a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
++++ b/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
+@@ -21,7 +21,20 @@ const defaultPackageJsonResolutionCache = new Map();
+ const experimentalNodeModules = new Set(['node:sqlite']);
+ function isBuiltinModuleImport(importExpr) {
+     const packageName = (0, get_package_name_from_import_path_1.getPackageNameFromImportPath)(importExpr);
+-    return (0, node_module_1.isBuiltin)(packageName) || experimentalNodeModules.has(packageName);
++    return ((0, node_module_1.isBuiltin)(packageName) ||
++        experimentalNodeModules.has(packageName) ||
++        isBunModuleImport(importExpr));
++}
++/**
++ * Bun's runtime modules: `bun` and `bun:*` (`bun:test`, `bun:sqlite`, ...).
++ * `isBuiltin` knows them only when Nx itself runs under Bun. A daemon under
++ * Node (one an editor's Nx language server starts) took each `bun:test`
++ * import for a package and looked it up through npm, TypeScript and
++ * `require.resolve` from the importing directory: thousands of failed
++ * `node_modules` probes per graph recompute. Upstream: nrwl/nx#37809.
++ */
++function isBunModuleImport(importExpr) {
++    return importExpr === 'bun' || importExpr.startsWith('bun:');
+ }
+ // TypeScript matches the `${configDir}` template case-insensitively and only as a
+ // prefix (commandLineParser.ts `startsWithConfigDirTemplate`).
 diff --git a/dist/src/project-graph/affected/affected-tasks.js b/dist/src/project-graph/affected/affected-tasks.js
 index 63d31ac684db1ae64d396771733f07fb2e562eb7..b79292b2b642e07f0092f2eb26c104bcb0fc8fb6 100644
 --- a/dist/src/project-graph/affected/affected-tasks.js

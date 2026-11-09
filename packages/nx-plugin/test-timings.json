@@ -67,6 +67,7 @@
     "src/executors/all-verdicts/executor.test.ts": 957,
     "src/nextest-code-bound.test.ts": 957,
     "src/nx-files-archive-racy.test.ts": 869,
+    "src/nx-bun-builtin-imports.test.ts": 728,
     "src/nx-local-plugin-hook-env.test.ts": 657,
     "src/nx-raw-inputs.test.ts": 622,
     "src/nx-daemon-root-normalization.test.ts": 561,
@@ -146,6 +147,7 @@
     "src/executors/bounded-exec/ram-temp-held.test.ts": 8,
     "src/executors/bounded-exec/bounds.test.ts": 7,
     "src/executors/bounded-exec/owned-subtree.test.ts": 7,
-    "src/executors/bounded-exec/host-memory.linux.test.ts": 6
+    "src/executors/bounded-exec/host-memory.linux.test.ts": 6,
+    "src/nx-project-config-hash.test.ts": 2
   }
 }
