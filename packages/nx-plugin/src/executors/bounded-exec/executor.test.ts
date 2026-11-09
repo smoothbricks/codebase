@@ -54,6 +54,32 @@ const ownedProcessGroups = new Set<number>();
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
 
+/**
+ * The first line of a long-lived fixture: its process group, which the test owns from then on. afterEach kills every
+ * owned group, so a test that fails or is aborted mid-run leaves none of its fixture behind.
+ */
+const OWNED_GROUP_LINE =
+  "console.log('owned-pgid=' + require('node:child_process').execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim());";
+/** A fixture's lifeline: bounded-exec holds the write end of its stdin, so a test runner that dies ends it too. */
+const LIFELINE = "process.stdin.on('end', () => process.exit(0));\nprocess.stdin.resume();";
+
+/** A run's stdout reader that owns the group its fixture names on its first line ({@link OWNED_GROUP_LINE}). */
+function ownFixtureGroup(owned: { group?: number }): (chunk: string) => void {
+  return (chunk) => {
+    const named = /owned-pgid=(\d+)/.exec(chunk)?.[1];
+    if (named === undefined || owned.group !== undefined) return;
+    owned.group = Number(named);
+    ownedProcessGroups.add(owned.group);
+  };
+}
+
+/** The run is over: its fixture's group is empty, and the test gives up its claim before the pgid can be reused. */
+function releaseFixtureGroup(owned: { group?: number }): void {
+  if (owned.group === undefined) throw new Error('the fixture never named its process group');
+  expect(processGroupHasMembers(owned.group)).toBe(false);
+  ownedProcessGroups.delete(owned.group);
+}
+
 /** What the nextest cases declare as `parallelism`, and so what they ask: the suite runs under no inherited ceiling. */
 const nextestWant = 8;
 
@@ -828,21 +854,24 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('fails a run whose test writes something other than a progress record on its channel, and reads it as no progress', async () => {
     const workspace = await createWorkspace();
-    // The reporter is broken: it writes a line that is not the record, then waits forever. Only the refusal ends it.
+    // The reporter is broken: it writes a line that is not the record, then waits on its lifeline. Only the refusal ends
+    // it, or the test runner's death.
     await workspace.write(
       'broken-reporter.js',
       [
+        OWNED_GROUP_LINE,
+        LIFELINE,
         "const { connect } = require('node:net');",
         `const socket = connect(process.env.${PROGRESS_SOCKET_ENV}, () => socket.write('progress: 50%\\n'));`,
         "socket.on('error', () => {});",
-        'setInterval(() => {}, 1000);',
         '',
       ].join('\n'),
     );
+    const owned: { group?: number } = {};
 
     const result = await runBoundedExec(
       { command: 'node broken-reporter.js', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
-      workspace.context,
+      { ...workspace.context, stdout: ownFixtureGroup(owned) },
       createProcessTreeKiller(),
       null,
     );
@@ -852,18 +881,35 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       'bounded-exec: progress channel: a progress record is the line moved, not "progress: 50%"',
     );
     expect(result.terminalOutput).not.toContain('made no progress');
+    releaseFixtureGroup(owned);
   });
+
   it('ends a test that only gains CPU and reports no progress at its bound, and names it a build inside the test', async () => {
     if (process.platform === 'win32') return;
     const workspace = await createWorkspace();
     const record = { task: { id: 'app:test', hash: null }, directory: join(workspace.root, 'compile') };
     // A compile inside a test: its tree gains CPU and reports nothing. Real timers: the capture's two censuses fall
-    // inside its window before the bound, and the bound expires on its own schedule; CPU never restarts it.
-    await workspace.write('compile.js', "console.log('compiling');\nfor (;;) {}\n");
+    // inside its window before the bound, and the bound expires on its own schedule; CPU never restarts it. The burn
+    // yields between 50ms slices, so its lifeline still ends it when the runner dies.
+    await workspace.write(
+      'compile.js',
+      [
+        OWNED_GROUP_LINE,
+        LIFELINE,
+        'const burn = () => {',
+        '  const until = Date.now() + 50;',
+        '  while (Date.now() < until) {}',
+        '  setImmediate(burn);',
+        '};',
+        'burn();',
+        '',
+      ].join('\n'),
+    );
+    const owned: { group?: number } = {};
 
     const result = await runBoundedExec(
       { command: 'node compile.js', idleTimeoutMs: HANG_CAPTURE_MS + 5_000, killAfterMs: 0 },
-      { ...workspace.context, record },
+      { ...workspace.context, record, stdout: ownFixtureGroup(owned) },
       createProcessTreeKiller(),
       null,
     );
@@ -878,6 +924,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       verdict.cpuRising.some((rise) => rise.command.includes('compile.js')),
       output,
     ).toBe(true);
+    releaseFixtureGroup(owned);
   });
 
   it("counts bun's dots on stderr as finished tests", async () => {
