@@ -31,9 +31,10 @@ use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, ProgramInvalidCause,
     SizingRefusal, SlotRoom, calculate_grown_state_size, calculate_state_size, init_state,
+    validate_state,
 };
 use columine_vm::struct_map::StructMapSlot;
-use columine_vm::vm::{UNDO_POSITION_OVERFLOWED, Vm, u32s_as_bytes};
+use columine_vm::vm::{CheckedMap, UNDO_POSITION_OVERFLOWED, Vm, u32s_as_bytes};
 use proptest::prelude::*;
 
 // Wire bytes of the program and descriptor contract.
@@ -1246,6 +1247,39 @@ fn a_key_past_the_admission_bound_doubles_the_rows_and_keeps_the_arena() {
     assert_eq!(4 * (key - 1), arena_used(&next));
 }
 
+/// A grown struct map that is not the image's last slot: every later slot moves
+/// by the struct map's grown size, its arena included. An arena compacted at its
+/// capacity places the next slot exactly where the sized image ends it, and that
+/// slot's contents survive.
+#[test]
+fn a_compacted_arena_ahead_of_another_slot_keeps_that_slot_in_the_sized_image() {
+    const SLOT_DEF: u8 = 0x10;
+    const MAP_UPSERT_LAST: u8 = 0x22;
+    const HASH_MAP: u8 = 0;
+    let mut slots = struct_map_init(&[UINT32, VO]);
+    slots.extend([SLOT_DEF, 1, HASH_MAP, 4, 0]);
+    let mut reduce = csr_upsert(UPSERT_LAST).to_vec();
+    reduce.extend([MAP_UPSERT_LAST, 1, 0, 1]);
+    let prog = program_with_slots(2, 4, &slots, &reduce);
+    let mut state = init(&prog);
+    let capacity = arena_capacity(&state);
+    let mut round = 0u8;
+    while arena_used(&state) + 100 <= capacity {
+        round += 1;
+        run_ok(&mut state, &prog, &Rows::of([(1, &[round; 100][..])]));
+    }
+
+    let next = grown_after_overflow(&prog, &mut state, &[9; 100]);
+    assert_eq!(capacity, arena_capacity(&next), "compacted at its capacity");
+    assert_eq!(
+        Ok(()),
+        validate_state(&next),
+        "the sized image holds every slot"
+    );
+    let map = CheckedMap::bind(&next, 1).expect("the map slot binds");
+    assert_eq!(Some(10), map.get(1), "the later slot's row survives");
+    assert_eq!(Ok(Some(&[round; 100][..])), vo(&next, 1));
+}
 /// A growth gives its slot room when it raises its capacity; or keeps it and
 /// frees occupied cells, raises the arena, or keeps the arena and frees used
 /// bytes. Anything else would replay the batch into the refusal it grew for.

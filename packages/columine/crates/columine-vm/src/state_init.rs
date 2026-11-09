@@ -2566,7 +2566,7 @@ pub fn grow_state_in<I: KeyIndex>(
             if arena_hdr_off != 0 {
                 let old_arena_cap = bytes::read_u32(old_state, arena_hdr_off);
                 let new_arena_cap = if slot_i == grown_slot_idx {
-                    old_arena_cap * 2
+                    grown.arena.ok_or(ErrorCode::InvalidState)?
                 } else {
                     old_arena_cap
                 };
@@ -2587,7 +2587,16 @@ pub fn grow_state_in<I: KeyIndex>(
         }
     }
 
-    Ok(())
+    // Every growth gives its slot room, so a replay ends at a fitting batch or at the ceiling's refusal: a layout that
+    // gave none would replay the batch into the refusal it grew for.
+    match (
+        SlotRoom::read(old_state, grown_slot_idx),
+        SlotRoom::read(new_state, grown_slot_idx),
+    ) {
+        (Some(old), Some(new)) if new.exceeds(old) => Ok(()),
+        (Some(_), Some(_)) => Err(ErrorCode::CapacityExceeded),
+        _ => Err(ErrorCode::InvalidState),
+    }
 }
 
 /// One slot's declaration in a program's init section, as admission compares
