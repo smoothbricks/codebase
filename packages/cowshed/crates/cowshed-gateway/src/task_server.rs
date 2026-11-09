@@ -935,6 +935,9 @@ async fn wake_at(deadline: Option<Instant>) {
 }
 
 #[cfg(test)]
+mod laws;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cowshed_gateway_types::host_status::DarwinPressureLevel;

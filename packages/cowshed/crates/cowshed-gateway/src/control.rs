@@ -1465,6 +1465,16 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         .map_err(encoding)
 }
 
+/// The class a `task-admit` line is admitted with, read the way the control socket reads it: the
+/// seam `task_server::laws` binds `TaskAdmitIn`'s default through.
+#[cfg(test)]
+pub(crate) fn admitted_class(line: &[u8]) -> Option<TaskClass> {
+    match parse_control_request(line) {
+        Ok(Incoming::TaskAdmit { class, .. }) => Some(class),
+        _ => None,
+    }
+}
+
 async fn serve_request<W>(
     mut writer: W,
     request: Result<ControlRequest, ControlError>,
