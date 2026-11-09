@@ -2329,3 +2329,13 @@ law gate_behind_gate_is_no_violation:
 
 def gate_behind_gate_is_no_violation(c0, b0):
   {==}
+
+# Refuted, proven: the phase handed over goes to the other class, so a gate's older lease waits behind a
+# younger background lease of that class (tickets 1 and 2 are gates', ticket 3 is a background lease; the
+# holder, ticket 1, leaves).
+law gate_older_waits_behind_younger_background:
+  for +b0: Nat
+  {gate_ok_b(lg(run([DAsk{CNamespace{}, SAlone{}}, DAsk{CNamespace{}, SShared{}}, DAsk{CStorage{}, SAlone{}}, DLeave{2n}], empty(1n, b0))), [1n, 2n]) == False{} : Bool}
+
+def gate_older_waits_behind_younger_background(b0):
+  {==}

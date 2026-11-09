@@ -769,6 +769,27 @@ fn a_gates_lease_waits_behind_a_background_lease() {
         pair.gate_ok(&[1, 2]),
         "behind a gate's own lease it is no violation"
     );
+    // across classes the next phase goes to the other class, ahead of an older waiter: tickets 1 and
+    // 2 are gates' leases and 3 a background one, and when the first holder leaves the older gate's
+    // lease, ticket 2, waits behind the younger background lease, ticket 3
+    let ops = list(vec![
+        Op::DAsk(Cls::CNamespace, Shr::SAlone),
+        Op::DAsk(Cls::CNamespace, Shr::SShared),
+        Op::DAsk(Cls::CStorage, Shr::SAlone),
+        Op::DLeave(2),
+    ]);
+    let pair = Pair::run(1, 0, &ops).unwrap();
+    assert!(
+        !pair.gate_ok(&[1, 2]),
+        "the older gate's lease waits behind a younger background one"
+    );
+    assert!(
+        pair.ledger
+            .phase
+            .as_ref()
+            .is_some_and(|phase| phase.holders.iter().any(|holder| holder.ticket == 3)),
+        "the younger background lease, ticket 3, holds"
+    );
 }
 
 /// The seeded draws that refute `gate_io_priority` shrink, one input dropped at a time, to the two
