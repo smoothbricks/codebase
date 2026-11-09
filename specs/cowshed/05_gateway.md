@@ -1281,6 +1281,45 @@ interchangeable tokens.
   every disk command as `<class> <argv>` before it runs, leased or not, so a test run counts the images it attached and
   the volumes it mounted (08_testing.md, "Integration tests (real substrate)").
 
+**Disk-lease laws.** `Ledger`, the pure core of the lease scheduler (`cowshed-gateway` `src/disk_lease.rs`: `ask`,
+`leave`, `expire`, `settle`, `Phase::admit_waiting`), is the Bend model `laws/disk_lease.bend` over explicit ticks, and
+its laws are this section's contract, proven for every sequence of asks, leaves and expires (`--verdict`):
+
+- **Exclusion** (`exclusion`): every holder is of the running phase's class, and the places the holders take (one for a
+  shared lease, the cap for an `alone` one) are at most the cap.
+- **No phase, no waiters** (`no_phase_no_wait`, `phase_has_holder`): with no phase running nobody waits, and a running
+  phase has a holder, so a drained phase hands over or ends in the input that drains it.
+- **Arrival order, no overtaking** (`fifo`, `no_overtaking`): the queue is in arrival order, and every holder is older
+  than every waiter of its class, so a waiter is granted only when no older waiter of its class still waits. The head of
+  a class's queue that has no room, an `alone` lease behind shared holders or a full phase, holds back every waiter
+  behind it.
+- **No starvation** (`no_starvation`): whatever the next input, if the same phase still runs and a waiter of the other
+  class waits, the input admitted nobody into it.
+- **Bounded hold** (`bounded_hold`): after an expire at any instant, while the other class waits no holder remains that
+  has been held the bound.
+- **Definedness**: an ask to an idle ledger is granted at once; the last holder leaving idles the ledger; asks that
+  cannot enter wait in arrival order; the running class enters at once with room; a drained full phase grants the oldest
+  waiter of its class and only it; a drained phase goes to the waiting class; a waiter of the other class holds the
+  running phase shut though it has room; a holder held the bound is evicted at the bound and not a tick before.
+
+The gateway's `disk_lease::laws` runs the model, emitted to Rust, and `Ledger` on the same inputs: the model's
+enumerated corpus, its seeded draws and the 1,194 evictions recorded in the gateway's stderr (each
+`disk-lease evicted a <class> holder after <held> while <class> waited` line replays as the holder, the waiter and the
+clock it names). After every input it compares the two ledgers, the effects and the deadline, and checks every law on
+`Ledger`'s own ledger. The `disk-lease <class> wait|phase start|done` lines carry no ticket, share or time, so which
+`phase done` ends which grant cannot be recovered from them and they are not replayed. A change to `Ledger` that breaks
+a law fails there; changing a law is changing this paragraph.
+
+**Open: a gate's lease never waits behind a background lease** (`gate_io_priority`, `laws/disk_lease_open.bend`). A
+proposal for the owner, GATEWAY-IO-PRIORITY, stated and not adopted: it conflicts with "Gates and lands" ("Nothing else
+yields to gates": no fork, attach, rebase or removal waits for a gate) and with the I/O-throttle prohibition under
+"Classes", and it stays open until the owner rules on GATEWAY-IO-PRIORITY. The kernel refutes it today. `Ledger::ask`
+takes a class, a share and a claim and no job class, so a background lease holding the ledger makes a gate's lease of
+the other class wait (`gate_io_priority_refuted`), and a drained phase goes to the other class even when an older gate's
+lease waits (`gate_older_waits_behind_younger_background`). The law records the measured cost: in the gateway's stderr,
+2026-08-17 to 2026-11-09, 483 storage holders and 711 namespace holders (692 of them `mount_apfs`) held a phase 10 s or
+more while the other class waited, and each hold cost the waiting class the full bound.
+
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real
 gateway's lease and then unleased: leased attaches stay fast, unleased ones stall behind the mount churn.
