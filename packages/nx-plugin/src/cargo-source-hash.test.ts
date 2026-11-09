@@ -21,6 +21,7 @@ import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
+import { indexedCargoSources } from './cargo-closure-input.js';
 import { compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
@@ -673,15 +674,23 @@ it('keeps literal discovery exact and refuses unreadable sources', async () => {
         'include_str!("unterminated',
       ].join('\n'),
     );
-    expect(compiledInFiles(root, new Map())).toEqual([
+    expect(compiledInFiles(root, await indexedCargoSources(root), new Map())).toEqual([
       { file: join(root, 'src/data'), source, literal: 'data' },
       { file: join(root, 'src', unicode), source, literal: unicode },
     ]);
     execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(root, 'Cargo.toml')], {
       stdio: 'pipe',
     });
+    // A source text no scan has seen is read, so a read the operating system refuses is a refusal, never a skip.
+    // Nx indexes only a file it can read: the new text is hashed first, then the scan's own read is denied.
+    // Dated past the old mtime, as Nx reuses a file's hash within the second it was last hashed.
+    const { mtimeMs } = await stat(source);
+    await writeFile(source, `${await readFile(source, 'utf8')}\n// unread\n`);
+    const edited = new Date(mtimeMs + 2000);
+    await utimes(source, edited, edited);
+    const unread = await indexedCargoSources(root);
     await chmod(source, 0);
-    expect(() => compiledInFiles(root, new Map())).toThrow();
+    expect(() => compiledInFiles(root, unread, new Map())).toThrow('EACCES');
     // A cold native Cargo census can report the denial before the source read;
     // both paths must preserve the operational refusal rather than skip the file.
     await expect(hashCargoPathInputs(join(root, 'Cargo.toml'), root, { includeWorkspace: true })).rejects.toThrow(

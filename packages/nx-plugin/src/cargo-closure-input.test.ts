@@ -1,5 +1,6 @@
-import { afterAll, expect, it } from 'bun:test';
+import { afterAll, expect, it, spyOn } from 'bun:test';
 import { execFile, execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -22,7 +23,7 @@ import {
 } from './__tests__/counted-cargo.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { CARGO_CLOSURE_INPUT, cargoLockNodeName, indexedCargoManifests } from './cargo-closure-input.js';
+import { CARGO_CLOSURE_INPUT, cargoLockNodeName, indexedCargoSources } from './cargo-closure-input.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
@@ -45,7 +46,7 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
       typeof input === 'object' && 'runtime' in input ? [input.runtime] : [],
     );
     // What the closure's filesets reach, as Nx's own file index matches them: `!` entries exclude. In
-    // process, as the plugin reads a root no daemon serves (`indexedCargoManifests`).
+    // process, as the plugin reads a root no daemon serves (`indexedCargoSources`).
     const anchored = (inputs: string[]) =>
       inputs.map((input) => {
         expect(input).toStartWith('{workspaceRoot}/');
@@ -420,7 +421,7 @@ it("indexes a source tree's Cargo manifests and none of the runtime state a cows
         '[package]\nname="cached"\nversion="0.1.0"\nedition="2021"\n',
     });
     resetWorkspaceContext();
-    expect([...(await indexedCargoManifests(workspace))].sort()).toEqual([
+    expect([...(await indexedCargoSources(workspace)).manifests].sort()).toEqual([
       'Cargo.toml',
       'crates/bridge/Cargo.toml',
       'crates/leaf/Cargo.toml',
@@ -433,6 +434,65 @@ it("indexes a source tree's Cargo manifests and none of the runtime state a cows
 });
 
 const SOURCE_FILE = 'src/lib.rs';
+
+it('reads a Rust source only when Nx hashed new bytes for it, and lists no crate directory', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-reads-')));
+  const reads = spyOn(fs, 'readFileSync');
+  const listings = spyOn(fs, 'readdirSync');
+  try {
+    const { workspace, edit } = await closureFixture(installation, root, undefined, {
+      'workspace/crates/leaf/src/data.txt': 'data\n',
+      'workspace/crates/leaf/src/other.txt': 'other\n',
+      'workspace/crates/leaf/src/lib.rs':
+        'pub const DATA: &str = include_str!("data.txt");\npub fn answer() -> u8 { 1 }\n',
+    });
+    resetWorkspaceContext();
+    const compute = graphComputation(workspace);
+    const under = (path: unknown): string | null => {
+      const text = String(path);
+      return text.startsWith(`${workspace}/`) ? text.slice(workspace.length + 1) : null;
+    };
+    /** One computation's closure of app, with the Rust sources it read and the crate directories it listed. */
+    const observed = async () => {
+      reads.mockClear();
+      listings.mockClear();
+      const closure = closureOf(byFile(await compute()), 'packages/app');
+      return {
+        closure,
+        read: reads.mock.calls
+          .map(([path]) => under(path))
+          .filter((path): path is string => path?.endsWith('.rs') === true)
+          .sort(),
+        listed: listings.mock.calls
+          .map(([path]) => under(path))
+          .filter((path): path is string => path !== null && /^(?:crates|packages)\//.test(path))
+          .sort(),
+      };
+    };
+    const first = await observed();
+    expect(first.closure).toContain('{workspaceRoot}/crates/leaf/src/data.txt');
+    expect(first.listed).toEqual([]);
+
+    // An unchanged tree: Nx's hashes say every source is as it was scanned, so none is read again.
+    const second = await observed();
+    expect(second).toEqual({ closure: first.closure, read: [], listed: [] });
+
+    // One edited source: it alone is read, and what it now compiles in keys the closure.
+    await edit(
+      'workspace/crates/leaf/src/lib.rs',
+      'pub const DATA: &str = include_str!("other.txt");\npub fn answer() -> u8 { 1 }\n',
+    );
+    const third = await observed();
+    expect(third.read).toEqual(['crates/leaf/src/lib.rs']);
+    expect(third.listed).toEqual([]);
+    expect(third.closure).toContain('{workspaceRoot}/crates/leaf/src/other.txt');
+    expect(third.closure).not.toContain('{workspaceRoot}/crates/leaf/src/data.txt');
+  } finally {
+    reads.mockRestore();
+    listings.mockRestore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 /** Every path a change batch names: created, updated and deleted. */
 function batchPaths(batch: ChangeBatch): string[] {

@@ -34,7 +34,7 @@ import {
   cargoClosureInputs,
   cargoLockNode,
   cargoLockNodeName,
-  indexedCargoManifests,
+  indexedCargoSources,
   isCargoLockInput,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
@@ -1922,6 +1922,7 @@ async function createProjectTargets(
                 memberDir: plan.package.dir,
                 cache: cargoWorkspace.inputsCache,
                 cargo: cargoWorkspace.closureSource.cargo,
+                sources: cargoWorkspace.closureSource.sources,
               }),
             ),
           )
@@ -3294,14 +3295,14 @@ async function resolveCargoWorkspaces(
   if (found.length === 0) return [];
   // Started only once every workspace listed cleanly, so a listing that throws
   // leaves no Cargo process behind.
-  const indexedManifests = indexedCargoManifests(workspaceRoot);
+  const indexedSources = indexedCargoSources(workspaceRoot);
   return Promise.all(
     found.map(async (workspace) => ({
       ...workspace,
       closureSource: await resolveCargoClosureSource(
         posix.join(workspace.projectRoot, 'Cargo.toml'),
         workspaceRoot,
-        indexedManifests,
+        indexedSources,
         workspace.inputsCache.compiledInFiles,
       ),
     })),
@@ -3451,6 +3452,7 @@ async function cargoTestRunnerInputs(
         memberDir,
         cache: workspace.inputsCache,
         cargo: workspace.closureSource.cargo,
+        sources: workspace.closureSource.sources,
       }),
     ),
   );

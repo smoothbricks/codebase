@@ -1,6 +1,10 @@
-import native from 'nx/src/native/index.js';
+import native, { type FileData } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
-import { globWithWorkspaceContext, globWithWorkspaceContextSync } from 'nx/src/utils/workspace-context.js';
+import {
+  getAllFileDataInContext,
+  globWithWorkspaceContext,
+  globWithWorkspaceContextSync,
+} from 'nx/src/utils/workspace-context.js';
 import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 
 /**
@@ -27,4 +31,21 @@ export async function globIndexedFiles(workspaceRoot: string, globs: string[]): 
  */
 export function freshIndexedFiles(workspaceRoot: string, globs: string[]): string[] {
   return new native.WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot)).glob(globs);
+}
+
+/**
+ * Every file of Nx's workspace file index with Nx's content hash of it, workspace-relative: the hashes Nx's task
+ * hasher keys every fileset on, kept current by its watcher, so a caller can tell an unchanged file without reading
+ * it. The daemon serves its own workspace; any other root, such as a test fixture, is read from the filesystem now
+ * ({@link freshIndexedFileData}), since the daemon's answer would be about another tree.
+ */
+export async function indexedFileData(workspaceRoot: string): Promise<FileData[]> {
+  return workspaceRoot === daemonWorkspaceRoot
+    ? getAllFileDataInContext(workspaceRoot)
+    : freshIndexedFileData(workspaceRoot);
+}
+
+/** Like {@link indexedFileData}, read from the filesystem now, as {@link freshIndexedFiles} lists it. */
+export function freshIndexedFileData(workspaceRoot: string): FileData[] {
+  return new native.WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot)).allFileData();
 }

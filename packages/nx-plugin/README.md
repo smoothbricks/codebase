@@ -735,9 +735,11 @@ computed paths and arbitrary build-script reads still need explicit inputs. A co
 file index holds both it and the source including it: an ignored one is a build output, whose bytes no fileset can hash
 and which reaches consumers through its producer's dependency outputs. Naming it would only key the project graph on the
 names the last producer run left on disk, so a run regenerating content-named files would move every key it was hashed
-under. External path-package digests include the same literal data bytes. Inferred `napi-*` and repository-root
-`cargo-wasm` builds use this resolved closure rather than every Rust file in the workspace, while retaining their
-toolchain pins, wrapper scripts, N-API configuration and CLI version.
+under. The scan reads a package's Rust sources and nested packages from that same index, and reads a source's text only
+when Nx's content hash of it is one no earlier scan saw: an unchanged tree's recomputation reads no Rust source and
+lists no directory. External path-package digests include the same literal data bytes. Inferred `napi-*` and
+repository-root `cargo-wasm` builds use this resolved closure rather than every Rust file in the workspace, while
+retaining their toolchain pins, wrapper scripts, N-API configuration and CLI version.
 
 Runtime file identities are rooted in Cargo package name/version and the declared input role, not in the consuming
 checkout's absolute path or depth. Source paths are package-relative; compiled-in data keeps its declaring source and

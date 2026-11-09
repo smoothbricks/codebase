@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { Glob } from 'bun';
 import { prepareCargoFixture } from './__tests__/cargo-fixture.js';
+import { indexedCargoSources } from './cargo-closure-input.js';
 import { readCargoResolve } from './cargo-source-hash.js';
 
 import {
@@ -385,7 +386,13 @@ async function testInputs(root: string, memberDir: string, cargoRoot = root): Pr
     ),
   );
   const cargo = await readCargoResolve(join(cargoRoot, 'Cargo.toml'), root, indexed);
-  return cargoPackageTestInputs({ workspaceRoot: root, absoluteProjectRoot: cargoRoot, memberDir, cargo });
+  return cargoPackageTestInputs({
+    workspaceRoot: root,
+    absoluteProjectRoot: cargoRoot,
+    memberDir,
+    cargo,
+    sources: await indexedCargoSources(root),
+  });
 }
 
 async function write(root: string, path: string, contents: string): Promise<void> {

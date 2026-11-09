@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { BUN_ROOT_LOCK_NODE, bunLockNodeName } from './bun-lock-scope.js';
 import { type CargoClosureSource, cargoLockNode } from './cargo-closure-input.js';
-import type { CargoResolve, LocalCargoPackage } from './cargo-source-hash.js';
+import { type CargoResolve, cargoSourceIndex, type LocalCargoPackage } from './cargo-source-hash.js';
 
 const temporary: string[] = [];
 afterAll(() => Promise.all(temporary.map((path) => rm(path, { recursive: true, force: true }))));
@@ -58,6 +58,7 @@ async function cargoSource(root: string, randVersion: string): Promise<CargoClos
     root,
     cargo,
     indexed: new Set(),
+    sources: cargoSourceIndex(root, []),
     compiledFilesCache: new Map(),
   };
 }
@@ -130,6 +131,7 @@ it("keys a crate's Cargo lock-scope node on what its dependencies link, never on
       root,
       cargo,
       indexed: new Set(),
+      sources: cargoSourceIndex(root, []),
       compiledFilesCache: new Map(),
     };
   };

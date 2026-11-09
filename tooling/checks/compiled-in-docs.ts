@@ -20,7 +20,12 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { posix, relative, resolve } from 'node:path';
-import { type CompiledCargoInput, compiledInFiles } from '../../packages/nx-plugin/src/cargo-source-hash.ts';
+import {
+  type CompiledCargoInput,
+  cargoSourceIndex,
+  compiledInFiles,
+} from '../../packages/nx-plugin/src/cargo-source-hash.ts';
+import { freshIndexedFileData } from '../../packages/nx-plugin/src/workspace-index.ts';
 import { repoRelative } from './spec-links.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
@@ -66,8 +71,10 @@ function crateDirectories(root: string): string[] {
 /** Every file the Rust sources of the repository's crates compile in, as the plugin finds them for its Cargo inputs. */
 export function compiledIn(root: string): CompiledIn[] {
   const cache = new Map<string, CompiledCargoInput[]>();
+  // The files as they are now, through Nx's ignore rules: the sources the plugin scans for its Cargo inputs.
+  const index = cargoSourceIndex(root, freshIndexedFileData(root));
   return crateDirectories(root).flatMap((crate) =>
-    compiledInFiles(resolve(root, crate), cache).map((input) => ({
+    compiledInFiles(resolve(root, crate), index, cache).map((input) => ({
       path: relative(root, input.file),
       crate,
       source: relative(root, input.source),

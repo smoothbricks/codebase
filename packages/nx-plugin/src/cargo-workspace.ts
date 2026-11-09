@@ -1,10 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml, type TomlTable } from 'smol-toml';
 
-import { buildClosure, type CargoResolve, type CompiledCargoInput, compiledInFiles } from './cargo-source-hash.js';
+import {
+  buildClosure,
+  type CargoResolve,
+  type CargoSourceIndex,
+  type CompiledCargoInput,
+  compiledInFiles,
+} from './cargo-source-hash.js';
 
 export interface CargoWorkspacePackage {
   name: string;
@@ -225,6 +231,8 @@ export interface CargoPackageTestInputsOptions {
   memberDir: string;
   /** Cargo's locked resolve of that workspace, which decides the crates the member's tests build. */
   cargo: CargoResolve;
+  /** Nx's indexed Cargo sources, where the crates' Rust sources and nested packages are found. */
+  sources: CargoSourceIndex;
   /** Shared across every call of one graph computation; see {@link createCargoInputsCache}. */
   cache?: CargoInputsCache;
 }
@@ -236,7 +244,9 @@ export interface CargoPackageTestInputsOptions {
  * three targets over ~45 crates that was ~135 derivations and the dominant
  * cost of loading the graph. The cache lives exactly as long as one
  * `createNodes` call — Nx recomputes the graph when a manifest changes, so
- * nothing here can go stale across runs.
+ * nothing here can go stale across runs. What outlives the call is keyed by
+ * content, not by time: a Rust source's include scan by Nx's hash of it
+ * (`compiledInFiles`), so a recomputation reads only the sources that changed.
  */
 export interface CargoInputsCache {
   readonly manifests: Map<string, Promise<TomlTable>>;
@@ -287,7 +297,7 @@ export function cargoPackageTestInputs(options: CargoPackageTestInputsOptions): 
 }
 
 async function deriveCargoPackageTestInputs(
-  { workspaceRoot, absoluteProjectRoot, memberDir, cargo }: CargoPackageTestInputsOptions,
+  { workspaceRoot, absoluteProjectRoot, memberDir, cargo, sources }: CargoPackageTestInputsOptions,
   cache: CargoInputsCache,
 ): Promise<string[]> {
   // Every fileset is anchored at `{workspaceRoot}`, never `{projectRoot}`: Nx
@@ -355,14 +365,14 @@ async function deriveCargoPackageTestInputs(
     // Cargo packages can compile include_bytes!, headers, schemas and build.rs,
     // not only Rust sources. Nested packages are separate source owners.
     inputs.add(`${inputPath(absoluteDir)}/**/*`);
-    for (const child of nestedCrateDirs(absoluteDir, cache)) {
+    for (const child of nestedCrateDirs(absoluteDir, sources, cache)) {
       const childDir = relative(cargoRoot, child).split(sep).join('/');
       if (!dirs.has(childDir)) exclusions.add(`!${inputPath(child)}/**`);
     }
     // `include_str!("../../../skills/SKILL.md")` compiles a file the package's own
     // fileset does not reach; a target that does not hash it serves a binary
     // built from the file's old bytes.
-    for (const { file } of compiledInFiles(absoluteDir, cache.compiledInFiles)) {
+    for (const { file } of compiledInFiles(absoluteDir, sources, cache.compiledInFiles)) {
       if (isOutsideRoot(relative(absoluteDir, file))) declaredSources.add(file);
     }
   }
@@ -442,25 +452,27 @@ export function requireExternalRustCratesInput(
 }
 
 /** Every directory beneath `root` that holds its own `Cargo.toml`, the walk stopping at each. */
-function nestedCrateDirs(root: string, cache: CargoInputsCache): string[] {
+/** Directories whose packages are never nested crates of a package: build output, VCS and Nx state, installed packages. */
+const NESTED_CRATE_SKIPPED: ReadonlySet<string> = new Set(['target', '.git', 'node_modules', '.nx']);
+
+/**
+ * The packages nested in the package at `root`: the indexed package directories beneath it with no other package,
+ * and no skipped directory, in between. Read from Nx's file index, so no directory is listed and no path probed.
+ */
+function nestedCrateDirs(root: string, sources: CargoSourceIndex, cache: CargoInputsCache): string[] {
   const cached = cache.nestedCrateDirs.get(root);
   if (cached !== undefined) return cached;
+  const prefix = `${root}${sep}`;
   const found: string[] = [];
-  const scan = [root];
-  while (scan.length > 0) {
-    const current = scan.pop();
-    if (current === undefined || !existsSync(current)) continue;
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const child = join(current, entry.name);
-      if (['target', '.git', 'node_modules', '.nx'].includes(entry.name)) {
-      } else if (existsSync(join(child, 'Cargo.toml'))) {
-        found.push(child);
-      } else {
-        scan.push(child);
-      }
+  nested: for (const directory of sources.packageDirectories) {
+    if (!directory.startsWith(prefix)) continue;
+    if (NESTED_CRATE_SKIPPED.has(basename(directory))) continue;
+    for (let parent = dirname(directory); parent !== root; parent = dirname(parent)) {
+      if (sources.packageDirectories.has(parent) || NESTED_CRATE_SKIPPED.has(basename(parent))) continue nested;
     }
+    found.push(directory);
   }
+  found.sort();
   cache.nestedCrateDirs.set(root, found);
   return found;
 }

@@ -1,7 +1,7 @@
 import { join, posix } from 'node:path';
 import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import type { CargoClosureSource } from '../cargo-closure-input.js';
-import { HASH_SKIPPED_DIRECTORIES } from '../cargo-source-hash.js';
+import { cargoSourceIndex, HASH_SKIPPED_DIRECTORIES } from '../cargo-source-hash.js';
 
 /** Resolved metadata with the per-graph source scans already cached, as on later project visits. */
 export function filesetSource(
@@ -30,6 +30,7 @@ export function filesetSource(
       edges: new Map(local.map(({ id }) => [id, []])),
     },
     indexed: new Set(directories.map((directory) => posix.join(directory, 'Cargo.toml'))),
+    sources: cargoSourceIndex(root, []),
     compiledFilesCache: new Map(local.map(({ directory }) => [directory, []])),
   };
 }

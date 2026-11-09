@@ -14,16 +14,16 @@ import {
 import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
 import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
-import native from 'nx/src/native/index.js';
+import native, { type FileData } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from './process-group.js';
 import { rustTokens } from './rust-tokens.js';
 
-const { IS_WASM, WorkspaceContext } = native;
+const { IS_WASM, WorkspaceContext, hashArray } = native;
 
 const cargoResolveEvents = channel('@smoothbricks/nx-plugin:cargo-resolve');
 
@@ -1025,7 +1025,7 @@ export async function hashCargoPathInputs(
     const scan = scans.get(input.file);
     if (scan !== undefined) {
       scans.delete(input.file);
-      collectCompiledInputs(input.file, bytes.toString('utf8'), scan.found);
+      collectCompiledInputs(input.file, includeSpellings(bytes.toString('utf8')), scan.found);
     }
     hash.update(input.key);
     hash.update('\0');
@@ -1046,7 +1046,7 @@ export async function hashCargoPathInputs(
         if (!scans.delete(source)) continue;
         // Discovery also visits ignored sources. They have no scheduled identity;
         // if an include alias later names one, preserve the old read-then-hash path.
-        collectCompiledInputs(source, readFileSync(source, 'utf8'), scan.found);
+        collectCompiledInputs(source, includeSpellings(readFileSync(source, 'utf8')), scan.found);
       }
       for (const input of [...scan.found.values()].sort((left, right) =>
         left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
@@ -1231,8 +1231,13 @@ function* compiledSourceFiles(root: string): Generator<string> {
   }
 }
 
-function collectCompiledInputs(source: string, text: string, found: Map<string, CompiledCargoInput>): void {
-  if (!text.includes('include_')) return;
+/** What a source with no include spells. */
+const NO_SPELLINGS: readonly string[] = [];
+
+/** The paths a Rust source's text spells as literal include_str!/include_bytes! arguments. */
+function includeSpellings(text: string): readonly string[] {
+  if (!text.includes('include_')) return NO_SPELLINGS;
+  const spellings: string[] = [];
   const tokens = rustTokens(text);
   for (let index = 0; index < tokens.length; index += 1) {
     if (tokens[index]?.text !== 'include_str' && tokens[index]?.text !== 'include_bytes') continue;
@@ -1244,7 +1249,18 @@ function collectCompiledInputs(source: string, text: string, found: Map<string, 
     // must reference path-sized storage, not a view into the decoded source.
     const literal = Buffer.from(tokens[index + 3]?.text ?? '', 'utf8').toString('utf8');
     const path = INCLUDE_STRING.exec(literal)?.[1] ?? INCLUDE_RAW_STRING.exec(literal)?.[2];
-    if (path === undefined || path === '') continue;
+    if (path !== undefined && path !== '') spellings.push(path);
+  }
+  return spellings;
+}
+
+/** Records each existing file `source` spells, keeping the smallest declaring source and spelling per file. */
+function collectCompiledInputs(
+  source: string,
+  spellings: readonly string[],
+  found: Map<string, CompiledCargoInput>,
+): void {
+  for (const path of spellings) {
     const file = resolve(dirname(source), path);
     if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
       const prior = found.get(file);
@@ -1256,15 +1272,89 @@ function collectCompiledInputs(source: string, text: string, found: Map<string, 
 }
 
 /**
- * Existing literal include_str!/include_bytes! files read by this package's Rust sources.
- * One graph owns the memo; runtime hashing consumes the same discovery alongside source
- * bytes. Nested packages own their sources separately. Computed paths remain explicit inputs.
+ * The Rust sources and Cargo packages of Nx's workspace file index (.gitignore and .nxignore applied, as for every
+ * fileset input), canonical and absolute. A graph computation takes a package's sources and nested packages from
+ * here, so it lists no directory and probes no path for a manifest.
  */
-export function compiledInFiles(root: string, cache: Map<string, CompiledCargoInput[]>): CompiledCargoInput[] {
+export interface CargoSourceIndex {
+  /** Every `Cargo.toml` in the index, relative to the workspace root. */
+  readonly manifests: ReadonlySet<string>;
+  /** Every directory holding an indexed `Cargo.toml`. */
+  readonly packageDirectories: ReadonlySet<string>;
+  /** Nx's content hash of every indexed `.rs` file. */
+  readonly rustSources: ReadonlyMap<string, string>;
+}
+
+/** {@link CargoSourceIndex} of Nx's file data (workspace-relative paths and content hashes) under the canonical `root`. */
+export function cargoSourceIndex(root: string, files: Iterable<FileData>): CargoSourceIndex {
+  const manifests = new Set<string>();
+  const packageDirectories = new Set<string>();
+  const rustSources = new Map<string, string>();
+  for (const { file, hash } of files) {
+    if (file === 'Cargo.toml' || file.endsWith('/Cargo.toml')) {
+      manifests.add(file);
+      packageDirectories.add(dirname(join(root, file)));
+    } else if (file.endsWith('.rs')) {
+      rustSources.set(join(root, file), hash);
+    }
+  }
+  return { manifests, packageDirectories, rustSources };
+}
+
+/**
+ * The include spellings of every Rust source text scanned, by Nx's content hash of that text: a source whose hash is
+ * unchanged is not read again. An entry is kept only when the text read hashes to that hash, so a write Nx's index has
+ * not seen yet is scanned but never remembered under the hash of the bytes it replaced. Entries leave when no index
+ * holds their hash any longer ({@link retainIncludeScans}); nothing expires by time.
+ */
+const includeScans = new Map<string, readonly string[]>();
+
+/** Forgets the scan of every source text `index` no longer holds. */
+export function retainIncludeScans(index: CargoSourceIndex): void {
+  const held = new Set(index.rustSources.values());
+  for (const hash of includeScans.keys()) if (!held.has(hash)) includeScans.delete(hash);
+}
+
+function includeSpellingsOf(source: string, hash: string): readonly string[] {
+  const known = includeScans.get(hash);
+  if (known !== undefined) return known;
+  const text = readFileSync(source, 'utf8');
+  const spellings = includeSpellings(text);
+  if (hashArray([text]) === hash) includeScans.set(hash, spellings);
+  return spellings;
+}
+
+const SCAN_SKIPPED: ReadonlySet<string> = new Set(HASH_SKIPPED_DIRECTORIES);
+
+/** The indexed Rust sources of the package at `root`, with their hashes: none beneath a nested package or a skipped directory. */
+function* packageRustSources(root: string, index: CargoSourceIndex): Generator<readonly [string, string]> {
+  const prefix = `${root}${sep}`;
+  sources: for (const [source, hash] of index.rustSources) {
+    if (!source.startsWith(prefix)) continue;
+    for (let directory = dirname(source); directory !== root; directory = dirname(directory)) {
+      if (index.packageDirectories.has(directory) || SCAN_SKIPPED.has(basename(directory))) continue sources;
+    }
+    yield [source, hash];
+  }
+}
+
+/**
+ * Existing literal include_str!/include_bytes! files read by this package's Rust sources, as Nx's file index holds
+ * them: a generated (ignored) source is its producer's output and keys a consumer through its dependency outputs.
+ * One graph owns the memo; runtime hashing consumes the same discovery alongside source bytes. Nested packages own
+ * their sources separately. Computed paths remain explicit inputs.
+ */
+export function compiledInFiles(
+  root: string,
+  index: CargoSourceIndex,
+  cache: Map<string, CompiledCargoInput[]>,
+): CompiledCargoInput[] {
   const cached = cache.get(root);
   if (cached !== undefined) return cached;
   const found = new Map<string, CompiledCargoInput>();
-  for (const source of compiledSourceFiles(root)) collectCompiledInputs(source, readFileSync(source, 'utf8'), found);
+  for (const [source, hash] of packageRustSources(root, index)) {
+    collectCompiledInputs(source, includeSpellingsOf(source, hash), found);
+  }
   const files = [...found.values()].sort((left, right) =>
     left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
   );

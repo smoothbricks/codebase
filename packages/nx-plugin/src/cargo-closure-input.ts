@@ -7,14 +7,17 @@ import type { ProjectGraphExternalNode, TargetConfiguration } from 'nx/src/devki
 
 import {
   type CargoResolve,
+  type CargoSourceIndex,
   type CompiledCargoInput,
+  cargoSourceIndex,
   compiledInFiles,
   dependencyClosure,
   HASH_SKIPPED_DIRECTORIES,
   readCargoResolve,
+  retainIncludeScans,
 } from './cargo-source-hash.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
-import { globIndexedFiles } from './workspace-index.js';
+import { globIndexedFiles, indexedFileData } from './workspace-index.js';
 
 /**
  * The named input the plugin infers for every project with crates of a Cargo
@@ -88,16 +91,21 @@ export interface CargoClosureSource {
   readonly cargo: CargoResolve;
   /** Every `Cargo.toml` in Nx's file index, relative to the workspace root. */
   readonly indexed: ReadonlySet<string>;
+  /** The Rust sources and packages of Nx's file index the compiled-in scan reads. */
+  readonly sources: CargoSourceIndex;
   readonly compiledFilesCache: Map<string, CompiledCargoInput[]>;
 }
 
 /**
- * Every `Cargo.toml` Nx's workspace file index holds: .gitignore and .nxignore
- * applied, `node_modules` never entered. A package whose manifest is missing
- * here has no files a fileset input can hash.
+ * The Cargo manifests and Rust sources of Nx's workspace file index, with Nx's content hash of each source:
+ * .gitignore and .nxignore applied, `node_modules` never entered. A package whose manifest is missing here has no
+ * files a fileset input can hash. Scans of source texts no longer indexed are forgotten here.
  */
-export async function indexedCargoManifests(workspaceRoot: string): Promise<ReadonlySet<string>> {
-  return new Set(await globIndexedFiles(workspaceRoot, ['**/Cargo.toml']));
+export async function indexedCargoSources(workspaceRoot: string): Promise<CargoSourceIndex> {
+  const [root, files] = await Promise.all([realpath(workspaceRoot), indexedFileData(workspaceRoot)]);
+  const index = cargoSourceIndex(root, files);
+  retainIncludeScans(index);
+  return index;
 }
 
 /**
@@ -108,12 +116,12 @@ export async function indexedCargoManifests(workspaceRoot: string): Promise<Read
 export async function resolveCargoClosureSource(
   manifest: string,
   workspaceRoot: string,
-  indexed: Promise<ReadonlySet<string>>,
+  indexed: Promise<CargoSourceIndex>,
   compiledFilesCache: Map<string, CompiledCargoInput[]>,
 ): Promise<CargoClosureSource> {
-  const [root, index] = await Promise.all([realpath(workspaceRoot), indexed]);
-  const cargo = await readCargoResolve(join(root, manifest), root, index);
-  return { manifest, workspaceRoot, root, cargo, indexed: index, compiledFilesCache };
+  const [root, sources] = await Promise.all([realpath(workspaceRoot), indexed]);
+  const cargo = await readCargoResolve(join(root, manifest), root, sources.manifests);
+  return { manifest, workspaceRoot, root, cargo, indexed: sources.manifests, sources, compiledFilesCache };
 }
 
 /**
@@ -188,7 +196,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
       if (!indexed.has(posix.join(directory, 'Cargo.toml'))) {
         throw new Error(`the Cargo package ${directory} is not in Nx's file index (an ignored directory)`);
       }
-      for (const compiled of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
+      for (const compiled of compiledInFiles(pkg.directory, source.sources, source.compiledFilesCache)) {
         const file = indexablePath(root, compiled.file);
         if (file === null) throw new Error(`${directory} compiles ${compiled.file}, which Nx's file index cannot hold`);
         // The scan starts inside this package's indexable directory, so its sources can always be named.

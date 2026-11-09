@@ -7,6 +7,7 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { parse as parseToml } from 'smol-toml';
 import typia from 'typia';
 import { REPOSITORY, runInRepositoryNx } from './__tests__/repository-nx.js';
+import { indexedCargoSources } from './cargo-closure-input.js';
 import { readCargoResolve } from './cargo-source-hash.js';
 import {
   type CargoWorkspacePackage,
@@ -45,6 +46,7 @@ describe('the real-APFS serial groups of this repository', () => {
     const groups = serialTestGroups(join(REPOSITORY, NEXTEST_REPO_CONFIG_PATH));
     const members = listCargoWorkspacePackages(REPOSITORY);
     const cargo = await readCargoResolve(join(REPOSITORY, 'Cargo.toml'), REPOSITORY);
+    const sources = await indexedCargoSources(REPOSITORY);
     // The inputs Nx hashes for a group's runner: the closure of every package its filter names, as the plugin derives it.
     const inputsOf = async (group: string): Promise<string[]> => {
       const scope = groups.find((candidate) => candidate.group === group)?.scope;
@@ -58,6 +60,7 @@ describe('the real-APFS serial groups of this repository', () => {
             absoluteProjectRoot: REPOSITORY,
             memberDir: member.dir,
             cargo,
+            sources,
           });
         }),
       );
