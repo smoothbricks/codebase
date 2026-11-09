@@ -1726,7 +1726,11 @@ host's load.
   one for their jobserver, never wait in the pool. A nested exec, one that names its requester's jobserver, is never
   held: its tokens are its requester's, and a held requester's hold covers it, so it runs with what the hold gives its
   own job ("Inside the hold"). A resident is never held: it idles between requests, and a hold would keep its cores
-  while it does. Without mbx a hold declares nothing, and a named want keeps its meaning, the jobserver count alone.
+  while it does. A gate is never held: its leaves are admitted one by one at its class's priority on the host's cores
+  ("Gates and lands"), and `cowshed exec --class gate` takes no `COWSHED_EXEC_WANT` and refuses a `--want` by name.
+  Measured 2026-11-09: a land's proof run from an agent shell that sets `COWSHED_EXEC_WANT=4` was held and granted one
+  core, and its whole tree ran on that core for 1.5 h. Without mbx a hold declares nothing, and a named want keeps its
+  meaning, the jobserver count alone.
 - **What an agent declares.** Every build, test suite, Nx run or gate task an agent starts names `--want n`, `n` being
   the cores it should hold: 4 for a focused suite or one project's targets, up to the host's cores for a run across the
   repository. A brief command (a git query, one file's lint, a status read) names none. `cowshed exec` takes
@@ -1779,10 +1783,10 @@ host's load.
   checkout's background job. An admitted hold is never preempted, and its count never grows: a job granted fewer cores
   than it asked runs on those to its end.
 
-- **The fence is admission.** A gate's priority in the pool replaces the fence. The land gate itself is unheld and its
-  leaves are admitted at `normal` ("A land is a gate job"); a held gate, such as a train's proof that names `--want`,
-  holds at `normal`. Either passes every waiting background hold, and nothing waits for a gate to finish ("Nothing else
-  yields to gates"): background work keeps running on what the gate leaves free.
+- **The fence is admission.** A gate's priority in the pool replaces the fence. A gate, the land gate and a train's
+  proof alike, is never held ("Declaration"): its leaves are admitted at `normal` ("A land is a gate job") and pass
+  every waiting background hold, and nothing waits for a gate to finish ("Landing gets priority, never exclusivity"):
+  background work keeps running on what the gate leaves free.
 - **What the caller sees.** A held job's status is `queued` until its grant (11_shell.md, "Job admission and class
   placement"). Its stderr says `cowshed: host admission wait start cpus=<g> priority=<p> ahead=<k>`, `k` being its own
   checkout's held jobs ahead of it in its lane; once its hold has waited a second in the pool,

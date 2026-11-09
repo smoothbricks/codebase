@@ -2241,6 +2241,24 @@ async fn an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing() {
     let idle = spawned_at_once(&mut h, resident).await;
     assert!(!idle.request.cpu.held, "a resident runs under no hold");
 
+    // A gate is admitted leaf by leaf at its class's priority: it is never held, whatever it
+    // declares, so a hold granted one core never runs a land's gate serially.
+    let gate = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Gate,
+                ..held(4)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let landing = spawned_at_once(&mut h, gate).await;
+    assert!(!landing.request.cpu.held, "a gate runs under no hold");
+
     // A nested exec is covered by its requester's hold: it reads its requester's jobserver, runs
     // under that hold, and takes no place in the pool of its own.
     let requester = InheritedJobserver {
@@ -2310,7 +2328,7 @@ async fn an_exec_that_is_not_a_held_job_starts_at_once_and_reserves_nothing() {
     assert_eq!(held_job.request.job_id, waiting);
     assert_eq!(held_job.request.cpu.tokens.get(), 1);
     assert!(held_job.request.cpu.held);
-    for spawned in [&brief, &idle, &covered, &sized, &held_job] {
+    for spawned in [&brief, &idle, &landing, &covered, &sized, &held_job] {
         finish(&h, spawned).await;
     }
     mbx.hear("released 1").await;

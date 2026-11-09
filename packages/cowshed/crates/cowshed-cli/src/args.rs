@@ -3036,7 +3036,20 @@ fn parse_exec(matches: &ArgMatches, environment: Environment<'_>) -> Result<Comm
             }
         },
     };
-    let want = exec_want(matches, environment, USAGE)?;
+    // A gate runs on its class's parallelism, admitted leaf by leaf at its priority on the host's
+    // cores ("Gates and lands"): an agent shell's COWSHED_EXEC_WANT never sizes it, and a line
+    // that names a want for one is refused by name rather than run on fewer cores.
+    let want = if class == ExecClass::Gate {
+        if matches.contains_id("want") {
+            return Err(UsageError::new(
+                "--want is not valid with --class gate: a gate runs on the host's cores at its class's priority",
+                USAGE,
+            ));
+        }
+        None
+    } else {
+        exec_want(matches, environment, USAGE)?
+    };
     let host = flagged(matches, "host");
     if host && session.is_some() {
         return Err(UsageError::new(
@@ -5084,6 +5097,32 @@ mod tests {
 
         // Only exec reads the variable: a bad value there never keeps another command from parsing.
         parse_args_in(["ls"], |_| Some(OsString::from("lots"))).expect("ls reads no environment");
+    }
+
+    #[test]
+    fn a_gate_takes_no_want_from_the_environment_and_refuses_one_on_its_line() {
+        let gate = ["exec", "raven", "--class", "gate", "--", "gate"];
+        let parsed = parse_args_in(gate, |_| Some(OsString::from("4"))).expect("a gate parses");
+        let Command::Exec(exec) = parsed.command else {
+            panic!("exec parses as exec");
+        };
+        assert_eq!(exec.class, ExecClass::Gate);
+        assert_eq!(exec.want, None, "COWSHED_EXEC_WANT never sizes a gate");
+        let error = parse_args_in(
+            [
+                "exec", "raven", "--class", "gate", "--want", "4", "--", "gate",
+            ],
+            |_| None,
+        )
+        .expect_err("a gate's --want is refused");
+        assert!(
+            error
+                .message
+                .contains("--want is not valid with --class gate"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

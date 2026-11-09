@@ -7992,10 +7992,12 @@ impl SupervisorActor {
         // A held job (05_gateway.md "Held jobs") declares its hold in an mbx project. A nested exec,
         // one that names its requester's jobserver, is never held: its tokens are its requester's,
         // and a held requester's hold covers it. A resident is never held: it idles between
-        // requests, and a hold would keep its cores while it does.
+        // requests, and a hold would keep its cores while it does. A gate is never held: it is
+        // admitted leaf by leaf at its class's priority on the host's cores ("Gates and lands");
+        // held, it would run on the cores one hold was granted.
         let resident = matches!(
             scheduling.class(),
-            ExecClass::Resident | ExecClass::InteractiveResident
+            ExecClass::Resident | ExecClass::InteractiveResident | ExecClass::Gate
         );
         let ledger = if self
             .policy
