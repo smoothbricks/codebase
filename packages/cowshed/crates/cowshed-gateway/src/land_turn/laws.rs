@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use super::{BindRefusal, NotWaiting, Parked, Turns};
+use super::{BindRefusal, Parked, Turns};
 use cowshed_core::api::dto::LandTurnName;
 use cowshed_core::land_turn::TurnAsk;
 
@@ -157,9 +157,7 @@ impl Pair {
             }
             Op::TWaitLeave => {
                 if let Some(install) = self.waiting.pop_front() {
-                    self.turns
-                        .wait_left(install)
-                        .map_err(|NotWaiting| self.refused("a waiting install was not waiting"))?;
+                    self.turns.wait_left(install);
                 }
                 None
             }

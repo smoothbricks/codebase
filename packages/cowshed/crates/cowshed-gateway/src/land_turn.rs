@@ -115,10 +115,6 @@ impl std::fmt::Display for BindRefusal {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Parked;
 
-/// An install that does not wait (any more): it was fenced, or it left.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct NotWaiting;
-
 /// An ask parked behind an install, the key the actor names its connection by, its asker and when
 /// it arrived.
 #[derive(Debug)]
@@ -141,6 +137,8 @@ pub(crate) struct Turns {
     /// The installs waiting for every queue to empty, by the key the actor gave each: while any
     /// waits, an ask is parked, so the queues only shrink until it is fenced.
     waiting: Vec<u64>,
+    /// The waiting installs that were fenced and hold that fence until they leave, by key.
+    fenced_installs: Vec<u64>,
     /// The asks parked behind a waiting install or a fence, in arrival order.
     parked: VecDeque<ParkedAsk>,
 }
@@ -220,26 +218,34 @@ impl Turns {
     /// in the step that ends the last ticket ([`Settled::fenced`]). Answers whether it fenced now.
     pub(crate) fn wait_fence(&mut self, install: u64) -> bool {
         if self.fence() {
+            self.fenced_installs.push(install);
             return true;
         }
         self.waiting.push(install);
         false
     }
 
-    /// The waiting install `install` left before it was fenced: once no install waits and no fence
-    /// holds, the parked asks are numbered. [`NotWaiting`] when it does not wait.
-    pub(crate) fn wait_left(&mut self, install: u64) -> Result<Settled, NotWaiting> {
-        let index = self
-            .waiting
+    /// The install `install` that waited for the turns leaves: it no longer waits, or the fence
+    /// its wait was given is lifted; once no install waits and no fence holds, the parked asks are
+    /// numbered. An install that has already left changes nothing: leaving is ensuring it is gone.
+    pub(crate) fn wait_left(&mut self, install: u64) -> Settled {
+        if let Some(index) = self.waiting.iter().position(|waiting| *waiting == install) {
+            self.waiting.remove(index);
+        } else if let Some(index) = self
+            .fenced_installs
             .iter()
-            .position(|waiting| *waiting == install)
-            .ok_or(NotWaiting)?;
-        self.waiting.remove(index);
-        Ok(self.release())
+            .position(|fenced| *fenced == install)
+        {
+            self.fenced_installs.remove(index);
+            self.fences = self.fences.saturating_sub(1);
+        } else {
+            return Settled::default();
+        }
+        self.release()
     }
 
-    /// A fence's connection closed: its fence is lifted, and once no install waits and no fence
-    /// holds, the parked asks are numbered.
+    /// A fenced read's connection closed: its fence is lifted, and once no install waits and no
+    /// fence holds, the parked asks are numbered.
     pub(crate) fn unfence(&mut self) -> Settled {
         self.fences = self.fences.saturating_sub(1);
         self.release()
@@ -421,6 +427,7 @@ impl Turns {
         // The step that ends the last ticket fences every waiting install.
         if self.queues.is_empty() && !self.waiting.is_empty() {
             self.fences += u64::try_from(self.waiting.len()).unwrap_or(u64::MAX);
+            self.fenced_installs.extend_from_slice(&self.waiting);
             settled.fenced = std::mem::take(&mut self.waiting);
         }
         settled
@@ -505,13 +512,11 @@ enum Message {
         reply: oneshot::Sender<(Vec<LandTurnQueue>, bool)>,
         fenced: oneshot::Sender<Vec<LandTurnQueue>>,
     },
-    /// A waiting install's connection closed before it took its fence: it leaves the wait, or
-    /// lifts the fence it was given.
-    WaitLeft {
-        install: u64,
-    },
-    /// A fence's connection closed; `lifted` is told once its fence is gone.
+    /// A fence's connection closed, or a waiting install's: a fenced read's fence is lifted, and an
+    /// install that waited, `install`, leaves its wait or lifts the fence it was given. `lifted`
+    /// is told once that is done.
     Unfence {
+        install: Option<u64>,
         lifted: Option<oneshot::Sender<()>>,
     },
 }
@@ -565,6 +570,7 @@ impl LandTurns {
             queues,
             fenced.then(|| Fence {
                 turns: Some(self.clone()),
+                install: None,
             }),
         ))
     }
@@ -604,11 +610,13 @@ impl LandTurns {
     }
 }
 
-/// The fence an install's read set on every queue, held for as long as the read's connection is
-/// served: dropped on any end of that service, a drain's included, it lifts the fence.
+/// The fence an install set on every queue, held for as long as its connection is served: dropped
+/// on any end of that service, a drain's included, it lifts the fence.
 pub(crate) struct Fence {
     /// The turns it fences, until it is lifted.
     turns: Option<LandTurns>,
+    /// The install whose wait was given it; `None` for a fenced read's.
+    install: Option<u64>,
 }
 
 impl Fence {
@@ -619,6 +627,7 @@ impl Fence {
         };
         let (lifted, done) = oneshot::channel();
         turns.send(Message::Unfence {
+            install: self.install,
             lifted: Some(lifted),
         });
         // The actor stops only with the gateway, and no fence outlives it.
@@ -629,7 +638,10 @@ impl Fence {
 impl Drop for Fence {
     fn drop(&mut self) {
         if let Some(turns) = self.turns.take() {
-            turns.send(Message::Unfence { lifted: None });
+            turns.send(Message::Unfence {
+                install: self.install,
+                lifted: None,
+            });
         }
     }
 }
@@ -653,6 +665,7 @@ impl Waiting {
             queues,
             Fence {
                 turns: self.turns.take(),
+                install: Some(self.install),
             },
         ))
     }
@@ -661,8 +674,9 @@ impl Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         if let Some(turns) = self.turns.take() {
-            turns.send(Message::WaitLeft {
-                install: self.install,
+            turns.send(Message::Unfence {
+                install: Some(self.install),
+                lifted: None,
             });
         }
     }
@@ -788,27 +802,21 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 let _ = reply.send((queues, now));
                 Settled::default()
             }
-            Message::WaitLeft { install } => {
-                installs.remove(&install);
-                match turns.wait_left(install) {
-                    Ok(settled) => {
+            Message::Unfence { install, lifted } => {
+                let settled = match install {
+                    Some(install) => {
+                        installs.remove(&install);
                         cowshed_os::eprintln!(
-                            "cowshed: land turns: a waiting install left before it was fenced"
+                            "cowshed: land turns: an install that waited has left; its wait or \
+                             its fence is gone"
                         );
-                        settled
+                        turns.wait_left(install)
                     }
-                    // Fenced as it left, before it took its fence: the fence goes with it.
-                    Err(NotWaiting) => {
-                        cowshed_os::eprintln!(
-                            "cowshed: land turns: an install left as it was fenced; its fence is lifted"
-                        );
+                    None => {
+                        cowshed_os::eprintln!("cowshed: land turns: an install's fence is lifted");
                         turns.unfence()
                     }
-                }
-            }
-            Message::Unfence { lifted } => {
-                let settled = turns.unfence();
-                cowshed_os::eprintln!("cowshed: land turns: an install's fence is lifted");
+                };
                 if let Some(lifted) = lifted {
                     let _ = lifted.send(());
                 }
@@ -1452,9 +1460,7 @@ mod tests {
         assert_eq!(turns.ask(2, ask("repo", "b"), 20, 1), Err(Parked));
         assert_eq!(turns.ask(3, ask("repo", "c"), 30, 2), Err(Parked));
         turns.unpark(2);
-        let left = turns
-            .wait_left(INSTALL)
-            .expect("the install was still waiting");
+        let left = turns.wait_left(INSTALL);
         assert_eq!(
             left.numbered,
             [(3, 2)],
@@ -1463,8 +1469,13 @@ mod tests {
         assert_eq!(holders(&turns, "repo"), [first, 2]);
         assert_eq!(
             turns.wait_left(INSTALL),
-            Err(NotWaiting),
-            "an install no longer waits once it has left"
+            Settled::default(),
+            "an install that has left leaves again as a no-op"
+        );
+        assert_eq!(
+            (holders(&turns, "repo"), turns.fences, turns.numbered),
+            (vec![first, 2], 0, 2),
+            "and changes nothing"
         );
         turns.left(first, Some("exited 0".to_owned()), 3);
         turns.left(2, Some("exited 0".to_owned()), 4);
@@ -1473,7 +1484,12 @@ mod tests {
             "no ticket: the install is fenced at once"
         );
         assert_eq!(turns.ask(4, ask("repo", "d"), 40, 5), Err(Parked));
-        assert_eq!(turns.unfence().numbered, [(4, 3)]);
+        assert_eq!(turns.wait_left(INSTALL + 1).numbered, [(4, 3)]);
+        assert_eq!(
+            turns.wait_left(INSTALL + 1),
+            Settled::default(),
+            "a fence lifted once is lifted"
+        );
     }
     //#endregion smoo/cowshed!n/read-fences-turns
 }
