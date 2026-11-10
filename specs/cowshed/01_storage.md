@@ -57,7 +57,8 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     <repo>.json                      # version, operationId, repoId, authorization, phase, registrationSha256
     <repo>.lock                      # serializes record publication and phase transitions
     <repo>.lease                     # shared by project actors/healers; exclusive for archival; removed by an unbinding
-                                     #   that upgrades to exclusive with no record beside it (02_workspaces.md)
+                                     #   that upgrades to exclusive, or by the gateway's startup once no one holds it,
+                                     #   with no record beside it and no binding at its project path (02_workspaces.md)
     <repo>.run                       # one retirement execution, fenced to the exact recorded generation
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
     <operation-id>/                  # the complete former project store tree, renamed without copying or deleting; the gateway's cleanup lists the released images waiting in it at every pass and frees them

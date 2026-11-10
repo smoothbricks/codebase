@@ -20,8 +20,10 @@
 //!   following a link, that the path still names what it locked, and reopens it when not. That is
 //!   what lets an unbinding remove the lease ([`ProjectReadLease::remove_unbound`]): only once its
 //!   own shared hold upgrades to exclusive without waiting, so no one else holds it, and only
-//!   while no record stands beside it. An opener that reached the removed inode finds its path
-//!   gone or naming a new one and takes that instead, so every holder still meets on one inode;
+//!   while no record stands beside it and no binding at its project path. A lease another holder
+//!   kept through its unbinding goes later by the same rule ([`reclaim_unbound_leases`]). An
+//!   opener that reached the removed inode finds its path gone or naming a new one and takes that
+//!   instead, so every holder still meets on one inode;
 //! - `<repo>.run` admits one execution of the retirement at a time, from before the drain
 //!   through the archive commit, and only for the exact record it was given
 //!   ([`acquire_retirement_run`]).
@@ -151,7 +153,8 @@ pub struct ProjectReadLease {
     lease: Fenced<File>,
 }
 
-/// What an unbinding's [`ProjectReadLease::remove_unbound`] did with the project lease.
+/// What a removal of an unbound identity's project lease did with it
+/// ([`ProjectReadLease::remove_unbound`], [`reclaim_unbound_leases`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnboundLease {
     /// It is gone, and with it the owner directory it left empty.
@@ -161,6 +164,9 @@ pub enum UnboundLease {
     /// A retirement record stands beside it, which it fences, so it stays; the caller keeps its
     /// shared hold.
     Recorded { lease: PathBuf },
+    /// A binding stands at its project path, so the identity is bound and it stays; the caller
+    /// keeps its shared hold.
+    Bound { lease: PathBuf },
 }
 
 impl ProjectReadLease {
@@ -172,8 +178,9 @@ impl ProjectReadLease {
     /// identity leaves nothing under `.retirements`. Only this holder may: its shared hold
     /// upgrades to exclusive without waiting, or another holder shares it and it stays
     /// ([`UnboundLease::Held`]). With the lease exclusive, a record beside it keeps it too
-    /// ([`UnboundLease::Recorded`]); otherwise the lease and an owner directory it leaves empty
-    /// are removed. Whenever it stays, the hold goes back to shared. Once removed, this hold is on
+    /// ([`UnboundLease::Recorded`]), as does a binding at its project path
+    /// ([`UnboundLease::Bound`]); otherwise the lease and an owner directory it leaves empty are
+    /// removed. Whenever it stays, the hold goes back to shared. Once removed, this hold is on
     /// an unlinked inode and fences nothing: an opener that reached that inode sees its path no
     /// longer names it and opens the one there now. A record published after the check is fenced
     /// all the same: the collector takes the new inode, which no one holding the old one ever
@@ -192,42 +199,7 @@ impl ProjectReadLease {
                 return Err(io_failure("upgrade project lease", &lease, error));
             }
         }
-        let removed = (|| {
-            let owner = store
-                .existing_retirement_owner(&names)?
-                .ok_or_else(|| replaced(&lease))?;
-            if !names_file(&owner, &names.lease, &self.lease)
-                .map_err(|error| io_failure("inspect project lease", &lease, error))?
-            {
-                return Err(replaced(&lease));
-            }
-            if store.load_at(&owner, &names, &self.repo_id)?.is_some() {
-                return Ok(UnboundLease::Recorded {
-                    lease: lease.clone(),
-                });
-            }
-            unlink_at(&owner, &names.lease, 0)
-                .map_err(|error| io_failure("remove project lease", &lease, error))?;
-            let Some(retirements) = store.retirements()? else {
-                return Ok(UnboundLease::Removed);
-            };
-            let owner_path = store
-                .path
-                .join(RETIREMENTS_NAMESPACE)
-                .join(component(&names.owner));
-            match unlink_at(&retirements, &names.owner, libc::AT_REMOVEDIR) {
-                Ok(()) => Ok(UnboundLease::Removed),
-                // Another identity of the owner keeps it, or a run removed it already.
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ENOTEMPTY)
-                        || error.raw_os_error() == Some(libc::EEXIST)
-                        || error.kind() == io::ErrorKind::NotFound =>
-                {
-                    Ok(UnboundLease::Removed)
-                }
-                Err(error) => Err(io_failure("remove", &owner_path, error)),
-            }
-        })();
+        let removed = store.remove_exclusive_unbound(&names, &self.lease);
         if !matches!(removed, Ok(UnboundLease::Removed)) {
             self.keep_shared(&lease)?;
         }
@@ -812,6 +784,57 @@ pub fn outstanding_retirements(store: &Path) -> Result<Vec<RetirementIntent>> {
     Ok(outstanding)
 }
 
+/// Remove every project lease an unbinding had to leave because another process shared it then
+/// (02_workspaces.md). Each `.retirements/<owner>/<repo>.lease` is taken exclusive without
+/// waiting through the named lease protocol, as a collector takes it, and removed by the
+/// unbinding's own rule, so one that anyone holds, a record fences or a binding claims stays.
+/// The encoding is one-way, so the pass works on the encoded names it lists and never on a
+/// [`RepoId`]. Returns the leases it removed, sorted.
+pub fn reclaim_unbound_leases(store: &Path) -> Result<Vec<PathBuf>> {
+    let store = Store::open(store)?;
+    let Some(retirements) = store.retirements()? else {
+        return Ok(Vec::new());
+    };
+    let retirements_path = store.path.join(RETIREMENTS_NAMESPACE);
+    let mut removed = Vec::new();
+    for owner_name in directory_entries(&retirements)
+        .map_err(|error| io_failure("list", &retirements_path, error))?
+    {
+        let owner_path = retirements_path.join(component(&owner_name));
+        let Some(owner) = existing_directory(&retirements, &owner_name)
+            .map_err(|error| io_failure("open", &owner_path, error))?
+        else {
+            continue;
+        };
+        for leaf in
+            directory_entries(&owner).map_err(|error| io_failure("list", &owner_path, error))?
+        {
+            let Some(project) = leaf
+                .to_bytes()
+                .strip_suffix(LEASE_SUFFIX.as_bytes())
+                .filter(|project| !project.is_empty())
+            else {
+                continue;
+            };
+            let names = Names::encoded(owner_name.clone(), project);
+            let Some((_, lease)) = store.lock_lease(
+                &names,
+                LeaseMode::Exclusive,
+                || store.retirement_owner(&names),
+                open_lock,
+            )?
+            else {
+                continue;
+            };
+            if store.remove_exclusive_unbound(&names, &lease)? == UnboundLease::Removed {
+                removed.push(store.retirement_path(&names, &names.lease));
+            }
+        }
+    }
+    removed.sort();
+    Ok(removed)
+}
+
 fn forget_hint(repo: &RepoId) -> String {
     format!("cowshed forget {repo} --abandon")
 }
@@ -967,15 +990,25 @@ impl Names {
         let owner = encode_layout_owner(repo.owner()).expect("a parsed RepoId owner is non-empty");
         let project = encode_component(repo.repo()).expect("a parsed RepoId repo is non-empty");
         // Encoded components are ASCII from `[a-z0-9._%-]`, never NUL.
-        let leaf =
-            |suffix: &str| CString::new(format!("{project}{suffix}")).expect("encoded, no NUL");
+        Self::encoded(
+            CString::new(owner).expect("encoded, no NUL"),
+            project.as_bytes(),
+        )
+    }
+
+    /// The names filed under the encoded owner directory `owner` for the encoded project leaf
+    /// `project`, as a store listing gives them.
+    fn encoded(owner: CString, project: &[u8]) -> Self {
+        let leaf = |suffix: &str| {
+            CString::new([project, suffix.as_bytes()].concat()).expect("a listed name, no NUL")
+        };
         Self {
             record: leaf(RECORD_SUFFIX),
             serialization: leaf(SERIALIZATION_SUFFIX),
             lease: leaf(LEASE_SUFFIX),
             run: leaf(RUN_SUFFIX),
-            owner: CString::new(owner).expect("encoded, no NUL"),
-            repo: CString::new(project).expect("encoded, no NUL"),
+            owner,
+            repo: CString::new(project).expect("a listed name, no NUL"),
         }
     }
 }
@@ -1096,6 +1129,59 @@ impl<'a> Store<'a> {
         let project = existing_directory(&parent, &names.repo)
             .map_err(|error| io_failure("open", &self.project_path(names), error))?;
         Ok(project.map(|project| (parent, project)))
+    }
+
+    /// With `held` locking `names`' project lease exclusive, remove it and an owner directory it
+    /// leaves empty, unless a record stands beside it ([`UnboundLease::Recorded`]) or a binding
+    /// at its project path ([`UnboundLease::Bound`]). The holder decides what becomes of its hold
+    /// when the lease stays.
+    fn remove_exclusive_unbound(&self, names: &Names, held: &Fenced<File>) -> Result<UnboundLease> {
+        let lease = self.retirement_path(names, &names.lease);
+        let owner = self
+            .existing_retirement_owner(names)?
+            .ok_or_else(|| replaced(&lease))?;
+        if !names_file(&owner, &names.lease, held)
+            .map_err(|error| io_failure("inspect project lease", &lease, error))?
+        {
+            return Err(replaced(&lease));
+        }
+        if read_regular(&owner, &names.record)
+            .map_err(|error| io_failure("read retirement record", &self.record_path(names), error))?
+            .is_some()
+        {
+            return Ok(UnboundLease::Recorded { lease });
+        }
+        if let Some((_, project)) = self.project(names)?
+            && read_regular(&project, &namespace(REPOSITORY_BINDING_FILE))
+                .map_err(|error| {
+                    let binding = self.project_path(names).join(REPOSITORY_BINDING_FILE);
+                    io_failure("read registration", &binding, error)
+                })?
+                .is_some()
+        {
+            return Ok(UnboundLease::Bound { lease });
+        }
+        unlink_at(&owner, &names.lease, 0)
+            .map_err(|error| io_failure("remove project lease", &lease, error))?;
+        let Some(retirements) = self.retirements()? else {
+            return Ok(UnboundLease::Removed);
+        };
+        let owner_path = self
+            .path
+            .join(RETIREMENTS_NAMESPACE)
+            .join(component(&names.owner));
+        match unlink_at(&retirements, &names.owner, libc::AT_REMOVEDIR) {
+            Ok(()) => Ok(UnboundLease::Removed),
+            // Another identity of the owner keeps it, or a run removed it already.
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOTEMPTY)
+                    || error.raw_os_error() == Some(libc::EEXIST)
+                    || error.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(UnboundLease::Removed)
+            }
+            Err(error) => Err(io_failure("remove", &owner_path, error)),
+        }
     }
 
     // WHY unbounded: queued, not silent: a retirement of the same project holds the lock across its
@@ -1755,6 +1841,49 @@ mod tests {
         assert!(!held(&lease));
     }
 
+    /// The leases unbindings left because another holder shared them then: a reclaim removes each
+    /// one no one holds, beside no record and with no binding at its project path, and the owner
+    /// directory it leaves empty; it keeps every other lease.
+    #[test]
+    fn a_reclaim_removes_only_the_leases_no_holder_record_or_binding_keeps() {
+        let root = TempRoot::new("reclaim-unbound-leases");
+        let store = store(&root);
+        drop(acquire_project_reader(&store, &repo("acme/widget")).expect("left by an unbinding"));
+        let holder = acquire_project_reader(&store, &repo("acme/gadget")).expect("a live actor");
+        plant_project(&store, "acme/bound", &registration("acme/bound"));
+        drop(acquire_project_reader(&store, &repo("acme/bound")).expect("a bound project"));
+        plant_project(&store, "beta/archived", &registration("beta/archived"));
+        retire(&store, &repo("beta/archived"));
+        drop(acquire_project_reader(&store, &repo("gamma/gone")).expect("an owner's only lease"));
+
+        assert_eq!(
+            reclaim_unbound_leases(&store).expect("reclaim"),
+            vec![
+                lease_path(&store, "acme/widget"),
+                lease_path(&store, "gamma/gone")
+            ]
+        );
+        assert!(!lease_path(&store, "acme/widget").exists());
+        assert!(!store.join(RETIREMENTS_NAMESPACE).join("gamma").exists());
+        for kept in ["acme/gadget", "acme/bound", "beta/archived"] {
+            assert!(
+                lease_path(&store, kept).is_file(),
+                "{kept}'s lease was removed"
+            );
+        }
+        assert!(
+            held(&lease_path(&store, "acme/gadget")),
+            "the reclaim took the holder's lease"
+        );
+
+        // Once its last holder lets go, the next reclaim removes it.
+        drop(holder);
+        assert_eq!(
+            reclaim_unbound_leases(&store).expect("reclaim"),
+            vec![lease_path(&store, "acme/gadget")]
+        );
+        assert!(store.join(RETIREMENTS_NAMESPACE).join("acme").is_dir());
+    }
     /// The unbinding holds the lease exclusive, a reader has already opened that inode, and the
     /// unbinding removes it before the reader locks: the reader must hold the lease at the path,
     /// which is the one a collector meets, never the removed inode. Whether the unbinding still

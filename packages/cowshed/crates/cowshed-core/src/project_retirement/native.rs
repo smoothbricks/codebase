@@ -618,3 +618,15 @@ pub async fn resume_retirements(
     }
     Ok(outcomes)
 }
+
+/// [`super::reclaim_unbound_leases`] off the async runtime: the leases it removed.
+pub async fn reclaim_unbound_leases(
+    storage: crate::storage::bootstrap::ValidatedHostStorage,
+) -> crate::Result<Vec<std::path::PathBuf>> {
+    let store = storage.store().to_owned();
+    crate::storage::lifecycle::dispatch_blocking(move || super::reclaim_unbound_leases(&store))
+        .await
+        .map_err(|error| {
+            crate::CowshedError::internal(format!("reclaiming unbound project leases: {error}"))
+        })?
+}

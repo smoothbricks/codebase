@@ -1818,6 +1818,7 @@ async fn run_daemon() -> Result<()> {
         // Only pre-existing positive authorizations resume; a refusal leaves that project
         // fenced and cannot prevent unrelated projects from healing.
         resume_project_retirements(&storage).await;
+        reclaim_unbound_leases(&storage).await;
         let inventory = NativeSessionInventory::new(storage);
         heal_recorded_projects(&heal_inventory, repositories, &heal).await;
         report_session_restore(&install_all_sessions(&inventory, &handle).await?);
@@ -1945,6 +1946,28 @@ async fn resume_project_retirements(storage: &ValidatedHostStorage) {
         cowshed_core::project_retirement::native::resume_retirements(storage.clone()).await;
     for line in retirement_resume_lines(&resumed) {
         cowshed_os::eprintln!("{line}");
+    }
+}
+
+/// Remove the project leases unbindings left while another process shared them (02_workspaces.md),
+/// reporting rather than raising: a lease that stays fences nothing, so it never keeps the gateway
+/// from healing and serving.
+async fn reclaim_unbound_leases(storage: &ValidatedHostStorage) {
+    match cowshed_core::project_retirement::native::reclaim_unbound_leases(storage.clone()).await {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => cowshed_os::eprintln!(
+            "cowshed: removed {} project leases their unbindings left at gateway startup",
+            removed.len()
+        ),
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: could not reclaim the project leases unbindings left: {}",
+                error.message
+            );
+            if !error.hint.is_empty() {
+                cowshed_os::eprintln!("next: {}", error.hint);
+            }
+        }
     }
 }
 

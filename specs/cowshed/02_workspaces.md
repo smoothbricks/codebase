@@ -364,12 +364,15 @@ releasing controller metadata. What the user wrote stays: `policy.json`, `waiver
 directory. Once the project is unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes too, and
 with it an owner directory it leaves empty, but only under the lease itself: the unbinding's own shared hold must
 upgrade to exclusive without waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the
-gateway, a command still open on the project) or a record keeps it, said on stderr, and the unbinding keeps its shared
-hold. Because every holder rechecks the lease's inode after locking (`forget`, below), removing it cannot split them.
-Unadopt checks terminal storage before it retires main, by the same inventory, so its refusal leaves main in place: it
-refuses user work and anything cowshed does not write, every one named, and lets cowshed's derived state and the build
-volumes the unbinding releases stand. Binding removal becomes completion only after its parent sync; a retry finishes
-controller cleanup before removing the lease, without recreating project directories. A fresh controller can discover an
+gateway, a command still open on the project), a record or a binding at its project path keeps it, said on stderr, and
+the unbinding keeps its shared hold. Because every holder rechecks the lease's inode after locking (`forget`, below),
+removing it cannot split them. A lease another holder kept goes later by the same rule: at its startup the gateway takes
+each `.retirements/<owner>/<repo>.lease` exclusive without waiting and removes it when no record stands beside it and no
+binding at its project path, so one a live process holds stays until a later start finds it free. Unadopt checks
+terminal storage before it retires main, by the same inventory, so its refusal leaves main in place: it refuses user
+work and anything cowshed does not write, every one named, and lets cowshed's derived state and the build volumes the
+unbinding releases stand. Binding removal becomes completion only after its parent sync; a retry finishes controller
+cleanup before removing the lease, without recreating project directories. A fresh controller can discover an
 interrupted unbinding from the exact canonical checkout-root record and a typed, unfinished
 `Mutating Retire(main, restore=true)` in the source journal, even for a checkout with no remote. This is read-only
 recovery admission, never active inventory or registration. Live bindings retain precedence; ambiguous matching

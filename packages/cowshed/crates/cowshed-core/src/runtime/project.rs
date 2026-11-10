@@ -2629,6 +2629,10 @@ fn report_unbound_lease(
             "cowshed: project lease {} stays beside the retirement record it fences",
             lease.display()
         ),
+        UnboundLease::Bound { lease } => cowshed_os::eprintln!(
+            "cowshed: project lease {} stays: {repo_id} is bound again at its project path",
+            lease.display()
+        ),
     }
     Ok(())
 }
