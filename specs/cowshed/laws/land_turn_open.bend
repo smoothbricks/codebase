@@ -1,9 +1,11 @@
-# The land-turn law today's queue refutes (specs/cowshed/05_gateway.md "The read
-# fences the turns", "A land installs its own cowshed after its turn"), over the
-# model in land_turn.bend. An install that finds a land queued is held back only by
-# its own read of the turns, which fences a free queue and changes nothing else:
-# the land that asks after that read is numbered and queued ahead of the install's
-# next read, and so is every land after it. It has no proof: it is a red.
+# The land-turn law the install's read alone refutes (specs/cowshed/05_gateway.md
+# "The read fences the turns", "A land installs its own cowshed after its turn"),
+# over the model in land_turn.bend: today's install, held back only by its own read
+# of the turns, which fences a free queue and changes nothing else. The land that
+# asks after that read is numbered and queued ahead of the install's next read, and
+# so is every land after it. It has no proof: it is a red. land_turn.bend proves
+# its twin for the waiting install (waiting_install_numbers_no_ask) and computes
+# the recorded schedule (a_reading_install_is_overtaken_by_every_later_ask).
 #   install_read_holds_back_later_asks
 #     e = E{0n, False{}, [], False{}}, t = [], c = 0n
 # The read finds a ticket and sets no fence, and the next ask is numbered 1n and
@@ -16,10 +18,10 @@
 import Base
 import ./land_turn.bend as L
 
-# Open, refuted by the queue: while an install that found tickets waits, an ask
-# changes no queue.
+# Open, refuted by the queue: while an install that read the turns and found
+# tickets waits to read again, an ask changes no queue.
 law install_read_holds_back_later_asks:
   for +e: L.E
   for +t: +List<L.E>
   for +c: Nat
-  {L.queue(L.step(L.TAsk{}, L.step(L.TFence{}, L.St{e <> t, c, 0n}))) == e <> t : +List<L.E>}
+  {L.queue(L.step(L.TAsk{}, L.step(L.TFence{}, L.St{e <> t, c, 0n, 0n, 0n}))) == e <> t : +List<L.E>}

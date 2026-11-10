@@ -11,9 +11,9 @@
 # 1. Ask whether the land changed cowshed or a project it depends on (land-install.ts wanted). Nothing else happens
 #    when it did not; when Nx cannot say, the install goes on.
 # 2. When the stage for <head> is not already whole, judge readiness before building anything: the installed cowshed's
-#    gateway status says whether a land holds its repository's turn or another install holds the install slot. When it
-#    does, the install is deferred, and when the status cannot be read it is unverified; each names the command that
-#    reruns this script, and nothing is built.
+#    gateway status says whether another install holds the install slot. When it does, the install is deferred, and
+#    when the status cannot be read it is unverified; each names the command that reruns this script, and nothing is
+#    built. A land turn held or queued defers nothing: setup waits for it in order (step 6).
 # 3. Under the release lock ('cowshed lock .cache/cowshed-release.lock'), build the release CLI in the stable build shed
 #    'land-install' at <head>, through 'cowshed exec --host': the shed is the build's own tree, so main stands still, no
 #    land's fast-forward races it and no land turn is held. It is forked once ('cowshed fork --ref') and re-pointed to
@@ -31,17 +31,22 @@
 #    'land-install.sh --under-lock <before> <head>', which is not a command to run by hand.
 # 4. Ask the staged build's own doctor whether setup would raise an administrator dialog: its host storage findings
 #    come from the plan setup executes. When it would, or when doctor cannot say, nothing is run unattended.
-# 5. Judge readiness again, over the staged build's gateway status: work that began during the build defers the
-#    install.
-# 6. Run the staged build's setup once. A refusal it answers is told apart from a build it will not install by a fresh
-#    status: work that began after the second read defers the install too.
+# 5. Judge readiness again, over the staged build's gateway status: an install that took the slot during the build
+#    defers this one.
+# 6. Run the staged build's setup once, under 'cowshed gateway await-turns' (specs/cowshed/05_gateway.md "The read
+#    fences the turns"): every land queued now ends its turn first, a land that asks meanwhile waits behind this install,
+#    and setup runs once the gateway has fenced the turns for it; its own read under the slot then finds no ticket. The
+#    wait happens before the slot, never under it. A refusal setup still answers is an install that took the slot first:
+#    this one waits in order once more, and a second refusal is told apart from a build setup will not install by a
+#    fresh status.
 #
 # stdout carries only land-status lines, one per outcome: '<UTC time> <head> install attended|unverified|deferred|
 # installed|failed|skipped ...' (land-install.ts, landStatusLine). Run as the declared after-land command, they are kept
 # with every other word (stderr) in the land's records, lands/<head>.after<n>.log beside lands.log (specs/cowshed/
-# 02_workspaces.md "A declared land", step 6): there whoever watches the install reads them. Nothing here waits for the
-# host: an install it cannot take now is deferred with the command to rerun, and whoever sees the named work end
-# reruns it. The one wait is the release lock, which orders installs as the install slot does.
+# 02_workspaces.md "A declared land", step 6): there whoever watches the install reads them. The install waits in order
+# for the land turns, which a busy land queue cannot starve: no land that asks after it is numbered before it is fenced.
+# An install it cannot take now, another install holding the slot, is deferred with the command to rerun, and whoever
+# sees that install end reruns it. The other wait is the release lock, which orders installs as the install slot does.
 # Nx and setup run through 'direnv exec <main>', whatever environment started the script: setup installs the PATH of the
 # shell it runs in and its build-state discovery runs cargo, neither of which a pure environment has.
 set -eu
@@ -79,6 +84,14 @@ gateway_readiness() {
   status_status=0
   status=$(cd / && "$1" --json gateway status </dev/null) || status_status=$?
   readiness=$(bun "$here/land-install.ts" readiness "$status")
+}
+
+# The verdict of land-install.ts blockers over a fresh gateway status of the cowshed $1 names, in $readiness: what a
+# refused setup refused under, another install holding the slot or a land holding its turn.
+gateway_blockers() {
+  status_status=0
+  status=$(cd / && "$1" --json gateway status </dev/null) || status_status=$?
+  readiness=$(bun "$here/land-install.ts" blockers "$status")
 }
 
 # A stage is whole with its binary, the release record setup judges the binary by, the cache server bundle and the mbx
@@ -244,8 +257,8 @@ fi
 if stage_whole; then
   say "the production build for $head is already staged in $stage"
 else
-  # A build the install would then be refused for is not started: what an install refuses under, a land holding its
-  # repository's turn or an install holding the slot, is read before the build and again before setup.
+  # A build the install would then be refused for is not started: another install holding the slot is read before the
+  # build and again before setup. A land turn is no reason: setup waits for the turns in order.
   gateway_readiness cowshed
   case $readiness in
   ready) ;;
@@ -299,7 +312,7 @@ needed\ *)
   ;;
 esac
 
-# What an install would refuse under: a land holding its repository's turn, an install holding the slot.
+# What an install would wait for with no deadline: another install holding the slot.
 gateway_readiness "$binary"
 case $readiness in
 ready) ;;
@@ -313,14 +326,25 @@ busy\ *)
   ;;
 esac
 
-setup_status=0
-setup_output=$(devenv "$binary" --json setup </dev/null) || setup_status=$?
-outcome=$(bun "$here/land-install.ts" setup "$setup_status" "$setup_output")
+# Setup runs under the land turns' fence, taken in this install's order: every land queued now ends its turn first, and
+# a land that asks meanwhile waits behind the install. A refusal setup still answers is an install that took the slot
+# first; this one waits in order once more before it is deferred.
+attempt=1
+while :; do
+  setup_status=0
+  setup_output=$(devenv "$binary" gateway await-turns -- "$binary" --json setup </dev/null) || setup_status=$?
+  outcome=$(bun "$here/land-install.ts" setup "$setup_status" "$setup_output")
+  case $outcome in
+  refused\ *) [ "$attempt" -eq 1 ] || break ;;
+  *) break ;;
+  esac
+  attempt=2
+done
 case $outcome in
 installed) record installed ;;
 refused\ *)
   # Work that began after the status was read: name it from a fresh status, never from the words of the refusal.
-  gateway_readiness "$binary"
+  gateway_blockers "$binary"
   case $readiness in
   busy\ *) record deferred "${readiness#busy }" "$command" ;;
   *) record failed "${outcome#refused }" ;;

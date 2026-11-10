@@ -3,12 +3,13 @@
 //! sequence; this driver shows the code is the model: it runs the emitted model and `Turns` on the
 //! same inputs, the model's enumerated corpus, its seeded draws and the recorded queues of
 //! 2026-10-21 to 2026-10-27, and after every input compares the two queues ticket by ticket,
-//! the answer to every bind and every ask under a fence, the last number given and the fences,
-//! and evaluates the laws' checks on the code's own queue.
+//! the answer to every bind, whether every ask is numbered or parked, the last number given, the
+//! fences, the waiting installs and the parked asks, and evaluates the laws' checks on the code's
+//! own queue.
 
 use std::rc::Rc;
 
-use super::{BindRefusal, Fenced, Turns};
+use super::{BindRefusal, NotWaiting, Parked, Turns};
 use cowshed_core::api::dto::LandTurnName;
 use cowshed_core::land_turn::TurnAsk;
 
@@ -49,6 +50,11 @@ struct Pair {
     turns: Turns,
     now_unix_ms: u64,
     inputs: Vec<String>,
+    /// The keys of the installs that wait, in the order they asked: a `TWaitLeave` is the first
+    /// of them leaving, since the model counts waiting installs and names none.
+    waiting: std::collections::VecDeque<u64>,
+    /// The key the next waiting install is given.
+    installs: u64,
 }
 
 impl Pair {
@@ -59,6 +65,8 @@ impl Pair {
             turns: Turns::default(),
             now_unix_ms: 1,
             inputs: Vec::new(),
+            waiting: std::collections::VecDeque::new(),
+            installs: 0,
         }
     }
 
@@ -98,8 +106,8 @@ impl Pair {
     }
 
     /// Feed `op` to both, `outcome` being how a departing asker ended its hold; then hold them
-    /// to the same queue, the same bind and ask answers, the same numbering and fences, and the
-    /// laws.
+    /// to the same queue, the same bind and ask answers, the same numbering, fences, waiting
+    /// installs and parked asks, and the laws.
     fn input(&mut self, op: &Op, outcome: Option<&str>) -> Result<(), String> {
         self.now_unix_ms += 1;
         self.inputs.push(model::show_Op(op));
@@ -108,6 +116,7 @@ impl Pair {
             Op::TAsk => {
                 let workspace = format!("ws{}", self.inputs.len());
                 let asked = self.turns.ask(
+                    u64::try_from(self.inputs.len()).expect("an input count fits a key"),
                     TurnAsk {
                         repo: self.repo.clone(),
                         command: format!("land {workspace}"),
@@ -117,11 +126,11 @@ impl Pair {
                     self.now_unix_ms,
                 );
                 let (code, model) = (
-                    matches!(asked, Err(Fenced)),
-                    model::fences(self.model.clone()) > 0,
+                    matches!(asked, Err(Parked)),
+                    model::fences(self.model.clone()) > 0 || model::waiting(self.model.clone()) > 0,
                 );
                 if code != model {
-                    let said = |fenced: bool| if fenced { "fenced" } else { "numbered" };
+                    let said = |parked: bool| if parked { "parked" } else { "numbered" };
                     return Err(self.refused(&format!(
                         "the ask is {} by Turns and {} by the model",
                         said(code),
@@ -138,6 +147,22 @@ impl Pair {
                 self.turns.unfence();
                 None
             }
+            Op::TWait => {
+                let install = self.installs;
+                self.installs += 1;
+                if !self.turns.wait_fence(install) {
+                    self.waiting.push_back(install);
+                }
+                None
+            }
+            Op::TWaitLeave => {
+                if let Some(install) = self.waiting.pop_front() {
+                    self.turns
+                        .wait_left(install)
+                        .map_err(|NotWaiting| self.refused("a waiting install was not waiting"))?;
+                }
+                None
+            }
             Op::TBind(number, p) => {
                 let code = match self.turns.bind(*number, pid(*p)) {
                     Ok(_) => Bound::BGranted,
@@ -147,12 +172,17 @@ impl Pair {
                 Some((model::find(*number, self.model_queue()), code))
             }
             Op::TExit(number, p) => {
-                self.turns.exited(*number, pid(*p), self.now_unix_ms);
+                let settled = self.turns.exited(*number, pid(*p), self.now_unix_ms);
+                self.waiting
+                    .retain(|install| !settled.fenced.contains(install));
                 None
             }
             Op::TLeave(number) => {
-                self.turns
-                    .left(*number, outcome.map(str::to_owned), self.now_unix_ms);
+                let settled =
+                    self.turns
+                        .left(*number, outcome.map(str::to_owned), self.now_unix_ms);
+                self.waiting
+                    .retain(|install| !settled.fenced.contains(install));
                 None
             }
         };
@@ -177,11 +207,19 @@ impl Pair {
         let model_numbering = (
             model::counter(self.model.clone()),
             model::fences(self.model.clone()),
+            model::waiting(self.model.clone()),
+            model::parked(self.model.clone()),
         );
-        if model_numbering != (self.turns.numbered, self.turns.fences) {
+        let code_numbering = (
+            self.turns.numbered,
+            self.turns.fences,
+            u64::try_from(self.turns.waiting.len()).expect("a count fits u64"),
+            u64::try_from(self.turns.parked.len()).expect("a count fits u64"),
+        );
+        if model_numbering != code_numbering {
             return Err(self.refused(&format!(
-                "the model's last number and fences are {model_numbering:?}, Turns' ({}, {})",
-                self.turns.numbered, self.turns.fences
+                "the model's last number, fences, waiting installs and parked asks are \
+                 {model_numbering:?}, Turns' {code_numbering:?}"
             )));
         }
         if !model::turn_ok_b(code_queue.clone()) {
@@ -240,9 +278,9 @@ fn turns_are_the_model_on_seeded_inputs() {
 
 /// The recorded schedule of 2026-10-28 13:52:39Z (05_gateway.md "The read fences the turns") as
 /// the queue sees it under the fence: the install's read finds no ticket and fences, the land's ask
-/// is refused and numbered nothing, the restart lifts the fence, the land asks again and holds the
-/// turn and binds its gate; a later install's read finds that holder and sets no fence, so the next
-/// land queues behind it.
+/// is parked and numbered nothing, the lift numbers it on its own connection, and the land holds
+/// the turn and binds its gate; a later install's read finds that holder and sets no fence, so the
+/// next land queues behind it.
 #[test]
 fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
     let mut pair = Pair::new("acme");
@@ -250,7 +288,6 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
         Op::TFence,
         Op::TAsk,
         Op::TUnfence,
-        Op::TAsk,
         Op::TBind(1, 7),
         Op::TFence,
         Op::TAsk,
@@ -262,11 +299,48 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
     assert_eq!(
         (pair.turns.numbered, pair.turns.fences),
         (2, 0),
-        "the fenced ask was never numbered, and the read that found a holder fenced nothing"
+        "the parked ask was numbered once, on the lift, and the read that found a holder fenced \
+         nothing"
     );
     assert_eq!(shown(&pair.code_queue()), shown(&pair.model_queue()));
     let E::E(holder, _, _, held) = items(&pair.code_queue())[0].clone();
     assert_eq!((holder, held), (2, true), "the next land holds the turn");
+}
+
+/// The install of land 124380eca9, 2026-11-10, as the waiting install meets it: a land holds the
+/// turn, the install waits, the lands that ask after it are parked, the install is fenced the step
+/// the ticket before it ends, and its lift numbers the parked lands in arrival order. Before the
+/// wait it deferred three times, each rerun losing the gap to the next land's ask.
+#[test]
+fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
+    let mut pair = Pair::new("smoothbricks");
+    for op in [Op::TAsk, Op::TWait, Op::TAsk] {
+        pair.input(&op, None).unwrap();
+    }
+    pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
+    pair.input(&Op::TAsk, None).unwrap();
+    assert_eq!(
+        (
+            pair.turns.fences,
+            pair.turns.waiting.len(),
+            pair.turns.parked.len()
+        ),
+        (1, 0, 2),
+        "the install is fenced and both later lands are parked behind it"
+    );
+    assert!(
+        items(&pair.code_queue()).is_empty(),
+        "no land holds the turn"
+    );
+    pair.input(&Op::TUnfence, None).unwrap();
+    assert_eq!(
+        items(&pair.code_queue())
+            .into_iter()
+            .map(|E::E(number, _, _, held)| (number, held))
+            .collect::<Vec<_>>(),
+        [(2, true), (3, false)],
+        "the parked lands are numbered in arrival order once the install's fence lifts"
+    );
 }
 /// The recorded queues, 2026-10-21 to 2026-10-27 (the land-turn records of six repositories'
 /// `turns.log`, before the queues moved into the gateway): every `taken` is the ticket the model

@@ -261,6 +261,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::AwaitTurns(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -332,6 +333,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::AwaitTurns(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -448,6 +450,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::AwaitTurns(_)
         | Command::DocCommit(_)
         | Command::SubtreeRoot(_)
         | Command::RetireDescendants(_)
@@ -2273,6 +2276,9 @@ where
         )),
         Command::LandTurn(_) => Err(CowshedError::internal(
             "land-turn names no project and is dispatched before the runtime bridge",
+        )),
+        Command::AwaitTurns(_) => Err(CowshedError::internal(
+            "gateway await-turns names no project and is dispatched before the runtime bridge",
         )),
         Command::DocCommit(_) => Err(CowshedError::internal(
             "doc-commit opens no project and is dispatched before the runtime bridge",

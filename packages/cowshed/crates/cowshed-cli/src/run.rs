@@ -321,6 +321,11 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::LandTurn(land) = &parsed.command {
         return Ok(crate::land_turn::dispatch(land, &mut output, interrupts).await);
     }
+    // An install's wait for the land turns queues it behind the lands asked before it and may wait
+    // a long time, so like land-turn it is answered before anything asks the daemon.
+    if let args::Command::AwaitTurns(wait) = &parsed.command {
+        return Ok(crate::await_turns::dispatch(wait, &mut output, interrupts).await);
+    }
     // A doc commit edits main under its ref turn alone: no daemon, no gateway, no project open,
     // so a hung gateway never holds it (02_workspaces.md "`cowshed doc-commit`").
     if let args::Command::DocCommit(doc) = &parsed.command {

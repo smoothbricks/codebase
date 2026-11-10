@@ -119,9 +119,10 @@ pub enum TurnAnswer {
     Bound { pid: u32 },
     /// The gateway refuses the ask or the step, and why.
     Refused { error: String },
-    /// An install's read of the turns fenced every queue: the ask is never numbered. The asker
-    /// waits for the install slot and asks again of the gateway the install leaves (05_gateway.md
-    /// "The read fences the turns").
+    /// An install waits for the turns or fences them: the ask is parked, never numbered yet. The
+    /// asker keeps reading the same connection, which tells it its turn once the gateway numbers it,
+    /// or closes as the install's restart drains the gateway; then the asker waits for the install
+    /// slot and asks the gateway the install leaves (05_gateway.md "The read fences the turns").
     Fenced,
 }
 
@@ -136,15 +137,16 @@ pub enum Wait {
         lock: PathBuf,
         holders: OutsideHolders,
     },
-    /// The ask met an install's fence: it waits for the install holding the slot `lock`, then asks
-    /// the gateway that install leaves.
+    /// The ask met an install that waits for the turns or fences them: it is parked until that
+    /// install's fence lifts, or waits for the install holding the slot `lock` when the install's
+    /// restart closes the connection, and then asks the gateway that install leaves.
     Install { lock: PathBuf },
 }
 
 /// The gateway a land asks for its turn, and the install slot whose installs restart it
-/// (05_gateway.md "The read fences the turns"): an ask whose connection is refused, or that is
-/// answered `fenced`, while an install holds the slot waits for that install and asks again of the
-/// gateway it leaves.
+/// (05_gateway.md "The read fences the turns"): an ask whose connection is refused, or closed after
+/// it was answered `fenced`, while an install holds the slot waits for that install and asks again
+/// of the gateway it leaves.
 #[derive(Clone, Debug)]
 pub struct TurnGateway {
     /// The gateway's control socket.
@@ -470,8 +472,10 @@ async fn asked(
 }
 
 /// Read the gateway's answers to `ask` on `connection` until its turn is held, telling `waiting`
-/// who holds it whenever that changes and every `report_every` while it does not: the ticket,
-/// or `None` when the ask was fenced.
+/// who holds it whenever that changes and every `report_every` while it does not: the ticket, or
+/// `None` when the gateway closed the connection after it answered `fenced`. A parked ask is
+/// numbered on its own connection; one the install's restart drains is asked again. A close with
+/// no `fenced` before it is an error.
 async fn queued(
     connection: &mut Lines<BufReader<Fenced<UnixStream>>>,
     gateway: &TurnGateway,
@@ -484,25 +488,37 @@ async fn queued(
     let mut cadence = tokio::time::interval_at(start, report_every);
     loop {
         tokio::select! {
-            answered = answer(connection) => match answered? {
-                TurnAnswer::Held { ticket } => return Ok(Some(ticket)),
-                TurnAnswer::Fenced => return Ok(None),
-                TurnAnswer::Queued { holder, ahead, .. } => {
-                    let wait = Wait::Queued { holder, ahead };
-                    if told.as_ref() != Some(&wait) {
-                        waiting(&wait);
-                        cadence.reset();
+            line = connection.next_line() => {
+                let line = match line? {
+                    Some(line) => line,
+                    None if matches!(told, Some(Wait::Install { .. })) => return Ok(None),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "the gateway closed the land turn's connection",
+                        ));
                     }
-                    told = Some(wait);
+                };
+                let wait = match decode(&line)? {
+                    TurnAnswer::Held { ticket } => return Ok(Some(ticket)),
+                    TurnAnswer::Fenced => Wait::Install {
+                        lock: gateway.slot(),
+                    },
+                    TurnAnswer::Queued { holder, ahead, .. } => Wait::Queued { holder, ahead },
+                    TurnAnswer::Refused { error } => {
+                        return Err(io::Error::other(format!(
+                            "the gateway at {} refused the land turn {}: {error}",
+                            gateway.socket.display(),
+                            ask.repo,
+                        )));
+                    }
+                    other @ TurnAnswer::Bound { .. } => return Err(unexpected(&other, "an ask")),
+                };
+                if told.as_ref() != Some(&wait) {
+                    waiting(&wait);
+                    cadence.reset();
                 }
-                TurnAnswer::Refused { error } => {
-                    return Err(io::Error::other(format!(
-                        "the gateway at {} refused the land turn {}: {error}",
-                        gateway.socket.display(),
-                        ask.repo,
-                    )));
-                }
-                other @ TurnAnswer::Bound { .. } => return Err(unexpected(&other, "an ask")),
+                told = Some(wait);
             },
             _ = cadence.tick() => {
                 if let Some(wait) = &told {
@@ -513,14 +529,16 @@ async fn queued(
     }
 }
 /// Ask `gateway` for `ask`'s turn and wait for it, then take `outside` exclusively too when given.
-/// `waiting` is told who holds the turn and how many are ahead, that an install's fence holds the
-/// ask back, or which processes have the outside lock open, whenever that changes and every
-/// `report_every` while it does not.
+/// `waiting` is told who holds the turn and how many are ahead, that an install holds the ask back,
+/// or which processes have the outside lock open, whenever that changes and every `report_every`
+/// while it does not.
 ///
-/// An ask whose connection is refused while an install holds the slot, or that the gateway answers
-/// `fenced`, waits for that install and asks again of the gateway it leaves (05_gateway.md "The
-/// read fences the turns"). An install lifts its fence before it lets the slot go, so a fence met
-/// again after a slot wait that found no install is one no install holds: the ask fails naming it.
+/// An ask parked behind an install is numbered on its own connection once the install's fence
+/// lifts. One whose connection is refused while an install holds the slot, or that the gateway
+/// closes after it answered `fenced`, as the install's restart drains it, waits for that install
+/// and asks again of the gateway it leaves (05_gateway.md "The read fences the turns"). A fence is
+/// held only by an install's open connection, which the gateway lifts when it closes, so a fence
+/// met again is waited for the same way.
 pub async fn take(
     gateway: &TurnGateway,
     ask: &TurnAsk,
@@ -528,33 +546,19 @@ pub async fn take(
     report_every: Duration,
     mut waiting: impl FnMut(&Wait),
 ) -> io::Result<Turn> {
-    // Whether the last fence this ask met had an install holding the slot to wait for.
-    let mut install_waited = true;
     let (ticket, connection, descriptor) = loop {
         let (mut connection, descriptor) = asked(gateway, ask).await?;
-        match queued(&mut connection, gateway, ask, report_every, &mut waiting).await? {
-            Some(ticket) => break (ticket, connection, descriptor),
-            None if !install_waited => {
-                return Err(io::Error::other(format!(
-                    "the gateway at {} fenced the land turn {} again, and no install held the slot \
-                     {} after it did before: the fence is held outside an install",
-                    gateway.socket.display(),
-                    ask.repo,
-                    gateway.slot().display(),
-                )));
-            }
-            None => {
-                waiting(&Wait::Install {
-                    lock: gateway.slot(),
-                });
-                let (census, support) = (gateway.census.clone(), gateway.support.clone());
-                install_waited = tokio::task::spawn_blocking(move || {
-                    crate::host_dirs::wait_for_running_install(&census, &support)
-                })
-                .await
-                .map_err(io::Error::other)??;
-            }
+        if let Some(ticket) =
+            queued(&mut connection, gateway, ask, report_every, &mut waiting).await?
+        {
+            break (ticket, connection, descriptor);
         }
+        let (census, support) = (gateway.census.clone(), gateway.support.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::host_dirs::wait_for_running_install(&census, &support)
+        })
+        .await
+        .map_err(io::Error::other)??;
     };
     // The outside lock is the held lock every other holder of it takes, recorded on its inode.
     // Its wait runs on a thread of its own before the first census, so no census delays it.

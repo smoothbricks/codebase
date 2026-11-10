@@ -136,7 +136,8 @@ impl GatewayControlClient {
     /// The install's read of the land turns with the fence (05_gateway.md "The read fences the
     /// turns"): every queue, as [`Self::land_turns`] lists them, and, when no queue had a ticket,
     /// the [`TurnFence`] the gateway set on every queue in the same step. The fence holds while the
-    /// returned connection is open: an ask meanwhile is answered `fenced` and never numbered.
+    /// returned connection is open: an ask meanwhile is answered `fenced` and parked, never numbered
+    /// until the fence lifts.
     pub async fn fence_land_turns(
         &self,
         abandoned_since_unix_ms: u64,
@@ -169,6 +170,53 @@ impl GatewayControlClient {
             queues,
             fence: fenced.then_some(TurnFence { connection }),
         })
+    }
+
+    /// An install's wait for the land turns (05_gateway.md "The read fences the turns"): the
+    /// gateway parks every ask while the install waits, and fences every queue once each ticket
+    /// queued when it asked has ended. `waiting` is told the queues the install waits behind, when
+    /// it waits at all. The returned [`TurnFence`] holds while its connection is open, as the
+    /// fenced read's does; a gateway that drains closes it. A gateway from before the wait refuses
+    /// it as an invalid request.
+    pub async fn wait_land_turns(
+        &self,
+        abandoned_since_unix_ms: u64,
+        waiting: impl FnOnce(&[cowshed_core::api::dto::LandTurnQueue]),
+    ) -> Result<TurnFence, ControlError> {
+        #[derive(Serialize)]
+        struct WaitingRead {
+            op: &'static str,
+            #[serde(rename = "abandonedSinceUnixMs")]
+            abandoned_since_unix_ms: u64,
+            fence: &'static str,
+        }
+        let op = cowshed_core::land_turn::LAND_TURNS_OP;
+        let read = WaitingRead {
+            op,
+            abandoned_since_unix_ms,
+            fence: "wait",
+        };
+        let (mut stream, encoded) = self.connect_and_encode(&read, op).await?;
+        // Never half-closed: the open connection is what holds the install's place, then its
+        // fence.
+        if let Err(error) = stream.write_all(&encoded).await {
+            return Err(ControlError::Wait(stream.fail(error)));
+        }
+        stream.hold(deadline::idle(op, UNPROVEN_SILENCE));
+        let mut connection = BufReader::new(stream);
+        let mut waiting = Some(waiting);
+        loop {
+            // The gateway heartbeats while the install waits, so a wait of any length is read.
+            let response: ControlResponse = read_answer_line(&mut connection).await?;
+            check_response(&response)?;
+            let queues = response.land_turns.ok_or(ControlError::InvalidResponse)?;
+            if response.fenced.ok_or(ControlError::InvalidResponse)? {
+                return Ok(TurnFence { connection });
+            }
+            // Told once, when the install begins to wait.
+            let told = waiting.take().ok_or(ControlError::InvalidResponse)?;
+            told(&queues);
+        }
     }
     /// Clear the project's Nx accepted-task store (03_caches.md, "Nx accepted-task artifact
     /// service"). A refusal while the project's Nx work is in flight is [`ControlFailureCode::Busy`]
@@ -593,6 +641,12 @@ enum Incoming {
     /// An install's read of the land turns with the fence, held for as long as its connection is
     /// open (05_gateway.md "The read fences the turns").
     FencedLandTurns {
+        abandoned_since_unix_ms: u64,
+    },
+    /// An install's wait for the land turns: its place after every ticket queued when it asked,
+    /// then its fence, held for as long as its connection is open (05_gateway.md "The read fences
+    /// the turns").
+    WaitingLandTurns {
         abandoned_since_unix_ms: u64,
     },
     TaskAdmit {
@@ -1190,6 +1244,11 @@ async fn serve<R, W>(
             )
             .await;
         }
+        Ok(Incoming::WaitingLandTurns {
+            abandoned_since_unix_ms,
+        }) => {
+            serve_waiting_fence(reader, writer, abandoned_since_unix_ms, &services).await;
+        }
         Ok(Incoming::Request(request)) => {
             let request = expect_eof(&mut reader).await.map(|()| request);
             serve_request(writer, request, services).await;
@@ -1203,7 +1262,7 @@ async fn serve<R, W>(
 /// connection ends, and close it only once the fence is lifted, so the install that reads that end
 /// knows no later ask meets the fence. A connection that is aborted, a drain's, lifts it as it goes.
 async fn serve_fenced_read<R, W>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
     abandoned_since_unix_ms: u64,
     turns: &crate::land_turn::LandTurns,
@@ -1229,16 +1288,88 @@ async fn serve_fenced_read<R, W>(
         let _ = writer.shutdown().await;
         return;
     };
-    if answered.is_ok() {
+    hold_fence(reader, writer, fence, answered.is_ok()).await;
+}
+
+/// Serve an install's wait for the land turns (05_gateway.md "The read fences the turns"): when a
+/// queue holds a ticket, answer every queue with `"fenced":false` and wait, heartbeating, until
+/// every ticket queued when the install asked has ended, each ask meanwhile parked; then answer
+/// every queue with `"fenced":true` and hold the fence as [`serve_fenced_read`] does. An install
+/// whose connection ends while it waits leaves the wait, and the asks parked behind it go on.
+async fn serve_waiting_fence<R, W>(
+    mut reader: R,
+    mut writer: W,
+    abandoned_since_unix_ms: u64,
+    services: &ControlServices,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let stopped = || {
+        failure(
+            ControlFailureCode::Rejected,
+            "the gateway's land turns have stopped".to_owned(),
+        )
+    };
+    let Some((queues, now, waiting)) = services.land_turns.wait(abandoned_since_unix_ms).await
+    else {
+        let _ = write_response(&mut writer, &stopped()).await;
+        return;
+    };
+    if !now {
+        let answer = ControlResponse {
+            land_turns: Some(queues),
+            fenced: Some(false),
+            ..success()
+        };
+        if write_response(&mut writer, &answer).await.is_err() {
+            return;
+        }
+    }
+    let mut more = [0_u8; 1];
+    let fenced = tokio::select! {
+        fenced = answered(&mut writer, &services.handle, waiting.fenced()) => fenced,
+        // End of file, a broken socket or bytes an install never sends: it is gone or confused,
+        // and either way it leaves the wait.
+        _ = reader.read(&mut more) => return,
+    };
+    let Some((queues, fence)) = fenced else {
+        let _ = write_response(&mut writer, &stopped()).await;
+        return;
+    };
+    let answer = ControlResponse {
+        land_turns: Some(queues),
+        fenced: Some(true),
+        ..success()
+    };
+    let answered = write_response(&mut writer, &answer).await;
+    hold_fence(reader, writer, fence, answered.is_ok()).await;
+}
+
+/// Hold an install's `fence` until its connection ends, then lift it and close the connection only
+/// once it is lifted, so the install that reads that end knows no later ask meets the fence. An
+/// install whose answer was not `answered` is gone. A connection that is aborted, a drain's, lifts
+/// it as it goes.
+async fn hold_fence<R, W>(
+    mut reader: R,
+    mut writer: W,
+    fence: crate::land_turn::Fence,
+    answered: bool,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if answered {
         let mut more = [0_u8; 1];
         match reader.read(&mut more).await {
             Ok(0) => {}
             Ok(_) => cowshed_os::eprintln!(
-                "cowshed: an install's fenced land-turns read sent more than its request; its \
-                 fence is lifted"
+                "cowshed: an install's fenced land-turns connection sent more than its request; \
+                 its fence is lifted"
             ),
             Err(error) => cowshed_os::eprintln!(
-                "cowshed: an install's fenced land-turns read failed ({error}); its fence is lifted"
+                "cowshed: an install's fenced land-turns connection failed ({error}); its fence \
+                 is lifted"
             ),
         }
     }
@@ -1359,25 +1490,40 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
     }
     let encoding = |error: serde_json::Error| ControlError::Encoding(error.to_string());
     if op == cowshed_core::land_turn::LAND_TURNS_OP {
+        /// `fence`: absent or `false` for a plain listing, `true` for an install's fenced read,
+        /// `"wait"` for an install's wait (05_gateway.md "The read fences the turns").
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum FenceIn {
+            Read(bool),
+            Wait(WaitIn),
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum WaitIn {
+            Wait,
+        }
         #[derive(Deserialize)]
         struct LandTurnsIn {
             #[serde(rename = "abandonedSinceUnixMs")]
             abandoned_since_unix_ms: u64,
             #[serde(default)]
-            fence: bool,
+            fence: Option<FenceIn>,
         }
         let LandTurnsIn {
             abandoned_since_unix_ms,
             fence,
         } = serde_json::from_value(value).map_err(encoding)?;
-        return Ok(if fence {
-            Incoming::FencedLandTurns {
+        return Ok(match fence {
+            None | Some(FenceIn::Read(false)) => Incoming::Request(ControlRequest::LandTurns {
                 abandoned_since_unix_ms,
-            }
-        } else {
-            Incoming::Request(ControlRequest::LandTurns {
+            }),
+            Some(FenceIn::Read(true)) => Incoming::FencedLandTurns {
                 abandoned_since_unix_ms,
-            })
+            },
+            Some(FenceIn::Wait(WaitIn::Wait)) => Incoming::WaitingLandTurns {
+                abandoned_since_unix_ms,
+            },
         });
     }
     if op == cowshed_core::land_turn::LAND_TURN_OP {

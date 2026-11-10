@@ -145,8 +145,9 @@ fn report(queue: &LandTurnName, verb: &str, wait: &Wait) {
             },
         ),
         Wait::Install { lock } => cowshed_os::eprintln!(
-            "cowshed: {verb} waits for the ref turn {queue}: an install holding {} fenced it; \
-             asking again of the gateway it leaves",
+            "cowshed: {verb} waits for the ref turn {queue}: parked behind an install that waits for \
+             the turns or fences them; numbered once its fence lifts, or asked again once the \
+             install holding {} restarts the gateway",
             lock.display(),
         ),
     }

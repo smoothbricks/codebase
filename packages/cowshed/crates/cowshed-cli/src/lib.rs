@@ -1,5 +1,6 @@
 pub mod agent_cycle;
 pub mod args;
+pub mod await_turns;
 pub mod build_record;
 pub mod build_state;
 pub mod build_volume_collection;

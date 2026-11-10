@@ -161,15 +161,29 @@ export type Readiness =
   | { readonly kind: 'unknown'; readonly why: string };
 
 /**
- * statusJson is the stdout of 'cowshed --json gateway status'. An install refuses, and restarts nothing, while a land
- * holds its repository's turn (05_gateway.md, "An install refuses while a land runs"; cowshed-cli agent_cycle.rs
- * restart_blockers): the holder of each repository's turn is the first
- * ticket of its queue, a queued land behind it is not a blocker. This is that decision over the status the CLI prints,
- * so a refusal is named before the install is tried; the install still checks under its own slot. No daemon answering
- * means nothing to restart and nothing to cut off. A held install slot defers too: an install takes the slot first and
- * waits for it with no deadline, daemon or none.
+ * statusJson is the stdout of 'cowshed --json gateway status'. Whether an install may go on to setup: no other install
+ * holds the install slot, which setup would wait for with no deadline, daemon or none. A land turn held or queued is no
+ * reason to defer: setup runs under 'cowshed gateway await-turns', which waits for every land queued before the install
+ * in order, parks every land that asks meanwhile behind it and runs setup once the gateway has fenced the turns for it
+ * (05_gateway.md, "The read fences the turns"; "A land installs its own cowshed after its turn"). A status that cannot be
+ * read is unknown, never ready.
  */
 export function installReadiness(statusJson: string): Readiness {
+  return readiness(statusJson, false);
+}
+
+/**
+ * statusJson is the stdout of 'cowshed --json gateway status', read after setup refused. What the install refuses under
+ * (05_gateway.md, "An install refuses while a land runs"; cowshed-cli agent_cycle.rs restart_blockers): another install
+ * holding the slot, or a land holding its repository's turn, the first ticket of its queue; a queued land behind it is
+ * not a blocker. A refusal is named from this fresh status, never from the words of the refusal. No daemon answering
+ * means nothing to restart and nothing to cut off.
+ */
+export function setupBlockers(statusJson: string): Readiness {
+  return readiness(statusJson, true);
+}
+
+function readiness(statusJson: string, landTurns: boolean): Readiness {
   const envelope = successResult(statusJson, 'gateway status');
   if (envelope.kind === 'refused') return { kind: 'unknown', why: envelope.why };
   const status = envelope.result;
@@ -179,7 +193,7 @@ export function installReadiness(statusJson: string): Readiness {
     return { kind: 'unknown', why: 'cowshed gateway status named a pending install that is not a boolean' };
   const blockers: string[] = [];
   if (status.pendingInstall === true) blockers.push('another install holds the install slot');
-  if (status.running) {
+  if (landTurns && status.running) {
     if (typeof status.landTurnsError === 'string') blockers.push(`land turns unreadable: ${status.landTurnsError}`);
     const lands = landTurnHolders(status.landTurns);
     if (lands === undefined) {
@@ -355,7 +369,7 @@ if (import.meta.main) {
   const USAGE =
     'usage: land-install.ts target SYSTEM MACHINE | wanted AFFECTED_JSON CHANGED_FILES | commit COMMIT... | ' +
     'stage-dir MAIN COMMIT | stale KEEP <NAMES | command MAIN BINARY | rerun MAIN BEFORE HEAD | prompt DOCTOR_JSON | ' +
-    'readiness STATUS_JSON | setup STATUS STDOUT | record TIMESTAMP COMMIT KIND [WHY [COMMAND]]\n';
+    'readiness STATUS_JSON | blockers STATUS_JSON | setup STATUS STDOUT | record TIMESTAMP COMMIT KIND [WHY [COMMAND]]\n';
   const [verb, ...args] = process.argv.slice(2);
   const [first, second, third, fourth, fifth] = args;
   if (verb === 'target' && args.length === 2 && first !== undefined && second !== undefined) {
@@ -387,6 +401,8 @@ if (import.meta.main) {
     process.stdout.write(`${promptLine(setupPrompt(first))}\n`);
   } else if (verb === 'readiness' && args.length === 1 && first !== undefined) {
     process.stdout.write(`${readinessLine(installReadiness(first))}\n`);
+  } else if (verb === 'blockers' && args.length === 1 && first !== undefined) {
+    process.stdout.write(`${readinessLine(setupBlockers(first))}\n`);
   } else if (
     verb === 'setup' &&
     args.length === 2 &&

@@ -9,16 +9,20 @@
 //! among them, and listed tickets whose processes had exited.
 //!
 //! An install's read of the turns, asked with the fence, fences every queue when it finds no
-//! holder, the read and the fence one step: an ask under the fence is answered `fenced`, never
-//! numbered, and its asker waits for the install slot and asks the gateway the install leaves
-//! (05_gateway.md "The read fences the turns"). Recorded 2026-10-28 13:52:39Z: an install read no
-//! holder, a land asked its turn and bound its gate, and the install's restart closed the turn's
-//! connection, so the land sent its gate SIGTERM.
+//! holder, the read and the fence one step. An install that finds tickets may wait for them
+//! instead: it takes its place after every ticket queued when it asked, and is fenced in the step
+//! that ends the last of them. An ask while any install waits or any fence holds is answered
+//! `fenced` and parked, never numbered, on the connection it asked on; once no install waits and
+//! no fence holds, the parked asks are numbered in the order they arrived (05_gateway.md "The read
+//! fences the turns"). Recorded 2026-10-28 13:52:39Z: an install read no holder, a land asked its
+//! turn and bound its gate, and the install's restart closed the turn's connection, so the land
+//! sent its gate SIGTERM. Recorded 2026-11-10: an install that deferred whenever it found a turn
+//! held or queued deferred three times, each rerun losing the gap to the next land's ask.
 //!
-//! [`Turns`] is the pure core: it is fed asks, binds, exits, departures and fences with the time
-//! they happened and answers what each land is told. [`LandTurns`] is its shell, one task that
-//! owns it; [`hold`] maps one land-turn connection, and the exits the kernel reports, into its
-//! inputs.
+//! [`Turns`] is the pure core: it is fed asks, binds, exits, departures, fences and waits with the
+//! time they happened and answers what each land and install is told. [`LandTurns`] is its shell,
+//! one task that owns it; [`hold`] maps one land-turn connection, and the exits the kernel reports,
+//! into its inputs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
@@ -73,11 +77,17 @@ pub(crate) enum Ended {
     },
 }
 
-/// What one input changed: what its lands are told, and the ticket it ended, if any.
+/// What one input changed: what its lands are told, the ticket it ended, if any, the waiting
+/// installs it fenced and the parked asks it numbered.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct Settled {
     pub notices: Vec<Notice>,
     pub ended: Option<Ended>,
+    /// The waiting installs fenced in this step, by their keys: it ended the last ticket.
+    pub fenced: Vec<u64>,
+    /// The parked asks numbered in this step, `(key, number)` in arrival order: no install waits
+    /// and no fence holds any more.
+    pub numbered: Vec<(u64, u64)>,
 }
 
 /// Why a bind is refused.
@@ -100,9 +110,24 @@ impl std::fmt::Display for BindRefusal {
     }
 }
 
-/// An ask under an install's fence: answered `fenced`, never numbered.
+/// An ask while an install waits for the turns or fences them: parked, never numbered, until no
+/// install waits and no fence holds.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Fenced;
+pub(crate) struct Parked;
+
+/// An install that does not wait (any more): it was fenced, or it left.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct NotWaiting;
+
+/// An ask parked behind an install, the key the actor names its connection by, its asker and when
+/// it arrived.
+#[derive(Debug)]
+struct ParkedAsk {
+    key: u64,
+    ask: TurnAsk,
+    pid: u32,
+    asked_unix_ms: u64,
+}
 
 /// Every repository's queue: the pure core of land turns.
 #[derive(Debug, Default)]
@@ -111,24 +136,50 @@ pub(crate) struct Turns {
     abandoned: VecDeque<(LandTurnName, Abandonment)>,
     /// The last ticket number given; the next ask is given the one after it.
     numbered: u64,
-    /// How many install reads fence every queue now: while any does, an ask is fenced.
+    /// How many installs fence every queue now: while any does, an ask is parked.
     fences: u64,
+    /// The installs waiting for every queue to empty, by the key the actor gave each: while any
+    /// waits, an ask is parked, so the queues only shrink until it is fenced.
+    waiting: Vec<u64>,
+    /// The asks parked behind a waiting install or a fence, in arrival order.
+    parked: VecDeque<ParkedAsk>,
 }
 
 impl Turns {
-    /// `ask` takes its place at the end of its queue, asked by `pid` at `asked_unix_ms`, and is
-    /// numbered here, as it arrives: first asked, first served, and no ask that arrived later ever
-    /// takes a place ahead of it. Answers its number, or [`Fenced`] while an install's read fences
-    /// the queues: then nothing changes.
+    /// `ask`, whose connection the actor keys `key`, takes its place at the end of its queue, asked
+    /// by `pid` at `asked_unix_ms`, and is numbered here, as it arrives: first asked, first served,
+    /// and no ask that arrived later ever takes a place ahead of it. Answers its number, or
+    /// [`Parked`] while an install waits for the queues or fences them: then no queue changes, and
+    /// the ask is numbered once no install waits and no fence holds ([`Settled::numbered`]).
     pub(crate) fn ask(
         &mut self,
+        key: u64,
         ask: TurnAsk,
         pid: u32,
         asked_unix_ms: u64,
-    ) -> Result<(u64, Settled), Fenced> {
-        if self.fences > 0 {
-            return Err(Fenced);
+    ) -> Result<(u64, Settled), Parked> {
+        if self.fences > 0 || !self.waiting.is_empty() {
+            self.parked.push_back(ParkedAsk {
+                key,
+                ask,
+                pid,
+                asked_unix_ms,
+            });
+            return Err(Parked);
         }
+        let (number, notices) = self.number(ask, pid, asked_unix_ms);
+        Ok((
+            number,
+            Settled {
+                notices,
+                ..Settled::default()
+            },
+        ))
+    }
+
+    /// Number `ask` one past the last number given and put it at the end of its queue: its number
+    /// and what its queue is told.
+    fn number(&mut self, ask: TurnAsk, pid: u32, asked_unix_ms: u64) -> (u64, Vec<Notice>) {
         self.numbered += 1;
         let number = self.numbered;
         let TurnAsk {
@@ -150,18 +201,12 @@ impl Turns {
             held: false,
             outcome: None,
         });
-        Ok((
-            number,
-            Settled {
-                notices: tell(queue),
-                ended: None,
-            },
-        ))
+        (number, tell(queue))
     }
 
     /// An install's read of the turns asked with the fence: with no ticket in any queue, so no
     /// holder, every queue is fenced until [`Self::unfence`]; with one, nothing is set, since the
-    /// install refuses. Answers whether it fenced.
+    /// install refuses. A parked ask is no ticket. Answers whether it fenced.
     pub(crate) fn fence(&mut self) -> bool {
         let free = self.queues.is_empty();
         if free {
@@ -170,9 +215,59 @@ impl Turns {
         free
     }
 
-    /// A fencing read's connection closed: its fence is lifted.
-    pub(crate) fn unfence(&mut self) {
+    /// An install, keyed `install`, waits for the turns: with no ticket in any queue it is fenced
+    /// now, as [`Self::fence`]; otherwise it waits, every ask meanwhile is parked, and it is fenced
+    /// in the step that ends the last ticket ([`Settled::fenced`]). Answers whether it fenced now.
+    pub(crate) fn wait_fence(&mut self, install: u64) -> bool {
+        if self.fence() {
+            return true;
+        }
+        self.waiting.push(install);
+        false
+    }
+
+    /// The waiting install `install` left before it was fenced: once no install waits and no fence
+    /// holds, the parked asks are numbered. [`NotWaiting`] when it does not wait.
+    pub(crate) fn wait_left(&mut self, install: u64) -> Result<Settled, NotWaiting> {
+        let index = self
+            .waiting
+            .iter()
+            .position(|waiting| *waiting == install)
+            .ok_or(NotWaiting)?;
+        self.waiting.remove(index);
+        Ok(self.release())
+    }
+
+    /// A fence's connection closed: its fence is lifted, and once no install waits and no fence
+    /// holds, the parked asks are numbered.
+    pub(crate) fn unfence(&mut self) -> Settled {
         self.fences = self.fences.saturating_sub(1);
+        self.release()
+    }
+
+    /// The parked asker keyed `key` left: it is never numbered.
+    pub(crate) fn unpark(&mut self, key: u64) {
+        self.parked.retain(|parked| parked.key != key);
+    }
+
+    /// Number every parked ask in arrival order once no install waits and no fence holds.
+    fn release(&mut self) -> Settled {
+        let mut settled = Settled::default();
+        if self.fences > 0 || !self.waiting.is_empty() {
+            return settled;
+        }
+        while let Some(ParkedAsk {
+            key,
+            ask,
+            pid,
+            asked_unix_ms,
+        }) = self.parked.pop_front()
+        {
+            let (number, notices) = self.number(ask, pid, asked_unix_ms);
+            settled.numbered.push((key, number));
+            settled.notices.extend(notices);
+        }
+        settled
     }
 
     /// Bind the command `pid` to the held ticket `number`: it holds the turn until it exits.
@@ -187,7 +282,7 @@ impl Turns {
         }
         Ok(Settled {
             notices: tell(queue),
-            ended: None,
+            ..Settled::default()
         })
     }
 
@@ -318,7 +413,17 @@ impl Turns {
         if queue.is_empty() {
             self.queues.remove(&repo);
         }
-        Settled { notices, ended }
+        let mut settled = Settled {
+            notices,
+            ended,
+            ..Settled::default()
+        };
+        // The step that ends the last ticket fences every waiting install.
+        if self.queues.is_empty() && !self.waiting.is_empty() {
+            self.fences += u64::try_from(self.waiting.len()).unwrap_or(u64::MAX);
+            settled.fenced = std::mem::take(&mut self.waiting);
+        }
+        settled
     }
 }
 
@@ -366,8 +471,9 @@ enum Message {
         ask: TurnAsk,
         pid: u32,
         answers: mpsc::UnboundedSender<TurnAnswer>,
-        /// Told the ticket's number once the actor has given it, or that the ask was fenced.
-        number: oneshot::Sender<Result<u64, Fenced>>,
+        /// Told the ticket's number once the actor has given it: at once, or once the ask, parked
+        /// behind an install, is numbered.
+        number: oneshot::Sender<u64>,
     },
     Bind {
         number: u64,
@@ -391,7 +497,20 @@ enum Message {
         abandoned_since_unix_ms: u64,
         reply: oneshot::Sender<(Vec<LandTurnQueue>, bool)>,
     },
-    /// A fencing read's connection closed; `lifted` is told once its fence is gone.
+    /// An install's wait: the queues it waits behind and whether it is fenced at once, and
+    /// `fenced` told the queues once it is fenced.
+    Wait {
+        install: u64,
+        abandoned_since_unix_ms: u64,
+        reply: oneshot::Sender<(Vec<LandTurnQueue>, bool)>,
+        fenced: oneshot::Sender<Vec<LandTurnQueue>>,
+    },
+    /// A waiting install's connection closed before it took its fence: it leaves the wait, or
+    /// lifts the fence it was given.
+    WaitLeft {
+        install: u64,
+    },
+    /// A fence's connection closed; `lifted` is told once its fence is gone.
     Unfence {
         lifted: Option<oneshot::Sender<()>>,
     },
@@ -450,6 +569,35 @@ impl LandTurns {
         ))
     }
 
+    /// An install's wait for the turns (05_gateway.md "The read fences the turns"): every queue as
+    /// it begins, whether it is fenced at once, and the [`Waiting`] that becomes its fence once
+    /// every ticket queued before it has ended; every ask meanwhile is parked. `None` once the
+    /// task has stopped.
+    pub(crate) async fn wait(
+        &self,
+        abandoned_since_unix_ms: u64,
+    ) -> Option<(Vec<LandTurnQueue>, bool, Waiting)> {
+        let install = self.connections.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        let (fenced, fence) = oneshot::channel();
+        self.messages
+            .send(Message::Wait {
+                install,
+                abandoned_since_unix_ms,
+                reply,
+                fenced,
+            })
+            .ok()?;
+        // Made before the answer is awaited, so a wait whose service ends meanwhile still leaves.
+        let waiting = Waiting {
+            turns: Some(self.clone()),
+            install,
+            fence,
+        };
+        let (queues, now) = answer.await.ok()?;
+        Some((queues, now, waiting))
+    }
+
     fn send(&self, message: Message) {
         // A send fails only once the task has stopped, with the gateway: nothing is held then.
         let _ = self.messages.send(message);
@@ -485,11 +633,50 @@ impl Drop for Fence {
         }
     }
 }
+
+/// An install waiting for the turns, for as long as its connection is served: dropped before it
+/// becomes its fence, on any end of that service, a drain's included, it leaves the wait, or lifts
+/// the fence it was given and never took.
+pub(crate) struct Waiting {
+    /// The turns it waits for, until it becomes its fence.
+    turns: Option<LandTurns>,
+    install: u64,
+    fence: oneshot::Receiver<Vec<LandTurnQueue>>,
+}
+
+impl Waiting {
+    /// Resolves once the install is fenced: every queue then, and the [`Fence`], held until it is
+    /// lifted or dropped. `None` once the task has stopped.
+    pub(crate) async fn fenced(mut self) -> Option<(Vec<LandTurnQueue>, Fence)> {
+        let queues = (&mut self.fence).await.ok()?;
+        Some((
+            queues,
+            Fence {
+                turns: self.turns.take(),
+            },
+        ))
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(turns) = self.turns.take() {
+            turns.send(Message::WaitLeft {
+                install: self.install,
+            });
+        }
+    }
+}
 async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
     let mut turns = Turns::default();
     let mut answers: HashMap<u64, mpsc::UnboundedSender<TurnAnswer>> = HashMap::new();
     // Each asking connection's ticket number, which its departure names.
     let mut numbers: HashMap<u64, u64> = HashMap::new();
+    // Each parked asking connection's answers, and where its number is told once it is given.
+    let mut parked: HashMap<u64, (mpsc::UnboundedSender<TurnAnswer>, oneshot::Sender<u64>)> =
+        HashMap::new();
+    // Each waiting install's listing bound, and where it is told the queues once it is fenced.
+    let mut installs: HashMap<u64, (u64, oneshot::Sender<Vec<LandTurnQueue>>)> = HashMap::new();
     while let Some(message) = receiver.recv().await {
         let settled = match message {
             Message::Ask {
@@ -501,23 +688,24 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
             } => {
                 let repo = ask.repo.clone();
                 let asked = format!("{} (pid {pid}) for `{}`", ask.workspace, ask.command);
-                match turns.ask(ask, pid, now_unix_ms()) {
+                match turns.ask(connection, ask, pid, now_unix_ms()) {
                     Ok((given, settled)) => {
                         cowshed_os::eprintln!(
                             "cowshed: land turn {repo}: ticket {given} asked by {asked}"
                         );
                         // A connection that has gone hears nothing; its departure is on its way.
-                        let _ = number.send(Ok(given));
+                        let _ = number.send(given);
                         numbers.insert(connection, given);
                         answers.insert(given, sender);
                         settled
                     }
-                    Err(Fenced) => {
+                    Err(Parked) => {
                         cowshed_os::eprintln!(
-                            "cowshed: land turn {repo}: the ask by {asked} is fenced: an install \
-                             read the turns and holds the install slot"
+                            "cowshed: land turn {repo}: the ask by {asked} is parked: an install \
+                             waits for the turns or fences them, and it is numbered once none does"
                         );
-                        let _ = number.send(Err(Fenced));
+                        let _ = sender.send(TurnAnswer::Fenced);
+                        parked.insert(connection, (sender, number));
                         Settled::default()
                     }
                 }
@@ -540,10 +728,16 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
             Message::Left {
                 connection,
                 outcome,
-            } => match numbers.remove(&connection) {
-                Some(number) => turns.left(number, outcome, now_unix_ms()),
-                None => Settled::default(),
-            },
+            } => {
+                if let Some(number) = numbers.remove(&connection) {
+                    turns.left(number, outcome, now_unix_ms())
+                } else {
+                    if parked.remove(&connection).is_some() {
+                        turns.unpark(connection);
+                    }
+                    Settled::default()
+                }
+            }
             Message::Queues {
                 abandoned_since_unix_ms,
                 reply,
@@ -560,21 +754,88 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                 if fenced {
                     cowshed_os::eprintln!(
                         "cowshed: land turns fenced: an install read no holder, and every ask \
-                         waits for it until its read's connection closes"
+                         is parked until its read's connection closes"
                     );
                 }
                 let _ = reply.send((queues, fenced));
                 Settled::default()
             }
+            Message::Wait {
+                install,
+                abandoned_since_unix_ms,
+                reply,
+                fenced,
+            } => {
+                let queues = turns.queues(abandoned_since_unix_ms);
+                let now = turns.wait_fence(install);
+                if now {
+                    cowshed_os::eprintln!(
+                        "cowshed: land turns fenced: an install waited for no ticket, and every \
+                         ask is parked until its connection closes"
+                    );
+                    let _ = fenced.send(turns.queues(abandoned_since_unix_ms));
+                } else {
+                    cowshed_os::eprintln!(
+                        "cowshed: land turns: an install waits for the {} ticket(s) queued now, \
+                         and every ask is parked until it is fenced and lifts its fence",
+                        queues
+                            .iter()
+                            .map(|queue| queue.tickets.len())
+                            .sum::<usize>()
+                    );
+                    installs.insert(install, (abandoned_since_unix_ms, fenced));
+                }
+                let _ = reply.send((queues, now));
+                Settled::default()
+            }
+            Message::WaitLeft { install } => {
+                installs.remove(&install);
+                match turns.wait_left(install) {
+                    Ok(settled) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: land turns: a waiting install left before it was fenced"
+                        );
+                        settled
+                    }
+                    // Fenced as it left, before it took its fence: the fence goes with it.
+                    Err(NotWaiting) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: land turns: an install left as it was fenced; its fence is lifted"
+                        );
+                        turns.unfence()
+                    }
+                }
+            }
             Message::Unfence { lifted } => {
-                turns.unfence();
+                let settled = turns.unfence();
                 cowshed_os::eprintln!("cowshed: land turns: an install's fence is lifted");
                 if let Some(lifted) = lifted {
                     let _ = lifted.send(());
                 }
-                Settled::default()
+                settled
             }
         };
+        for install in &settled.fenced {
+            if let Some((abandoned_since_unix_ms, fenced)) = installs.remove(install) {
+                cowshed_os::eprintln!(
+                    "cowshed: land turns fenced: the last ticket queued before a waiting install \
+                     has ended, and every ask is parked until its connection closes"
+                );
+                // An install that has gone hears nothing; its departure lifts the fence.
+                let _ = fenced.send(turns.queues(abandoned_since_unix_ms));
+            }
+        }
+        for &(connection, number) in &settled.numbered {
+            if let Some((sender, told)) = parked.remove(&connection) {
+                cowshed_os::eprintln!(
+                    "cowshed: land turn: a parked ask is numbered ticket {number}"
+                );
+                // A connection that has gone hears nothing; its departure is on its way.
+                let _ = told.send(number);
+                numbers.insert(connection, number);
+                answers.insert(number, sender);
+            }
+        }
         for Notice { number, answer } in settled.notices {
             if let TurnAnswer::Held { ticket } = &answer {
                 cowshed_os::eprintln!(
@@ -671,7 +932,7 @@ pub(crate) async fn hold<R, W>(
     };
     let connection = turns.connections.fetch_add(1, Ordering::Relaxed);
     let (sender, mut answers) = mpsc::unbounded_channel();
-    let (numbered, number) = oneshot::channel();
+    let (numbered, mut number) = oneshot::channel();
     turns.send(Message::Ask {
         connection,
         ask,
@@ -679,32 +940,48 @@ pub(crate) async fn hold<R, W>(
         answers: sender,
         number: numbered,
     });
-    // Placed before its number is awaited, so a hold that ends meanwhile still leaves its queue.
+    // Placed before its number is awaited, so a hold that ends meanwhile still leaves its queue,
+    // or its place among the parked asks.
     let mut place = Place {
         turns: turns.clone(),
         connection,
         outcome: None,
     };
-    let number = match number.await {
-        Ok(Ok(number)) => number,
-        Ok(Err(Fenced)) => {
-            // Never numbered: the asker waits for the install slot and asks again.
-            let _ = write(&mut writer, &TurnAnswer::Fenced).await;
-            return;
-        }
-        Err(_) => return,
-    };
     let asker_gone = async {
         if let Err(error) = exit.observed().await {
             cowshed_os::eprintln!(
-                "cowshed: land turn ticket {number}: its asker's exit watch failed ({error}); its \
-                 connection alone holds its place"
+                "cowshed: land turn connection {connection}: its asker's exit watch failed \
+                 ({error}); its connection alone holds its place"
             );
             std::future::pending::<()>().await;
         }
     };
     tokio::pin!(asker_gone);
     let mut steps = BufReader::new(reader).lines();
+    // An ask parked behind an install is told `fenced` and waits on this connection for its
+    // number, given once no install waits and no fence holds (05_gateway.md "The read fences the
+    // turns"). A parked asker sends nothing: its end of file, a broken connection, any step or
+    // its exit ends its ask. An ask not parked is numbered at once, and what its asker sent or did
+    // meanwhile is read once it is: an end already sent finishes its ticket, never abandons it.
+    let mut parked = false;
+    let number = loop {
+        tokio::select! {
+            biased;
+            given = &mut number => match given {
+                Ok(number) => break number,
+                Err(_) => return,
+            },
+            answer = answers.recv() => {
+                let Some(answer) = answer else { return };
+                parked |= matches!(answer, TurnAnswer::Fenced);
+                if write(&mut writer, &answer).await.is_err() {
+                    return;
+                }
+            }
+            _ = steps.next_line(), if parked => return,
+            () = &mut asker_gone, if parked => return,
+        }
+    };
     let mut held = false;
     loop {
         // Biased, in this order: an asker that sends its end and exits leaves both ready, and its

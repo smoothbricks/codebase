@@ -398,7 +398,7 @@ fn report<W: Write, E: Write>(
             )
         }
         Wait::Install { lock } => format!(
-            "land turn {repo}: an install holding {} fenced the ask; asking again of the gateway it leaves",
+            "land turn {repo}: parked behind an install that waits for the turns or fences them; numbered once its fence lifts, or asked again once the install holding {} restarts the gateway",
             lock.display(),
         ),
     };

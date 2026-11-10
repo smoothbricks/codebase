@@ -25,6 +25,7 @@ import {
   promptLine,
   readinessLine,
   rerunCommand,
+  setupBlockers,
   setupCommand,
   setupOutcome,
   setupPrompt,
@@ -38,9 +39,9 @@ import {
 // cowshed it drives: 'uname' (the host), 'bun nx' (the Nx calls: the affected set in main, the cache server bundle and
 // the production build in the shed, which write the staged binary below), 'cowshed' (fork, path, exec, rebase, lock
 // and the installed gateway status over a directory of sheds, each logged in cowshed.log, and land-turn, which records
-// a land that has to wait for a turn another holds) and the production CLI itself, whose doctor, gateway status and
-// setup answer what a scenario sets. The install holds no land turn, so a land that asks for its turn while the build
-// runs takes it at once.
+// a land that has to wait for a turn another holds) and the production CLI itself, whose doctor, gateway status,
+// 'gateway await-turns' (which takes the fence at once and runs its command) and setup answer what a scenario sets. The
+// install holds no land turn, so a land that asks for its turn while the build runs takes it at once.
 // 'direnv' (exec, allow, status) trusts an .envrc by its path and content, as the real one does: a fork approves the
 // new shed's .envrc and a re-point that changes it does not, so the shed's own commands are blocked until approved.
 
@@ -262,13 +263,14 @@ const ticket = (number: number, workspace: string, pid: number) => ({
 });
 
 describe('installReadiness', () => {
-  it('is ready when nothing holds a land turn', () => {
+  it('is ready when nothing holds the install slot', () => {
     expect(installReadiness(status({}))).toEqual({ kind: 'ready' });
   });
 
-  it('is ready when no daemon answers: an install that restarts nothing checks nothing', () => {
-    const turns = [{ repo: 'gadgets', tickets: [ticket(1, 'ws', 5)] }];
-    expect(installReadiness(status({ running: false, landTurns: turns }))).toEqual({ kind: 'ready' });
+  it('is ready while a land holds or queues a turn: setup waits for the turns in order under await-turns', () => {
+    const turns = [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99), ticket(5, 'queued', 100)] }];
+    expect(installReadiness(status({ landTurns: turns }))).toEqual({ kind: 'ready' });
+    expect(installReadiness(status({ landTurnsError: 'permission denied' }))).toEqual({ kind: 'ready' });
   });
 
   it('is busy while an install holds the install slot, which setup would wait for with no deadline', () => {
@@ -285,44 +287,10 @@ describe('installReadiness', () => {
     });
   });
 
-  it('names the install slot beside the work of a running gateway', () => {
-    const turns = [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }];
-    expect(installReadiness(status({ pendingInstall: true, landTurns: turns }))).toEqual({
-      kind: 'busy',
-      blockers: [
-        'another install holds the install slot',
-        'the land of gadget-land holds the gadgets land turn (ticket 4, pid 99)',
-      ],
-    });
-  });
-  it('names the holder of each repository land turn and not a land queued behind it', () => {
-    const turns = [
-      { repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99), ticket(5, 'queued', 100)] },
-      { repo: 'smoothbricks', tickets: [], abandoned: [] },
-      { repo: 'widgets', tickets: [ticket(2, 'wg', 7)] },
-    ];
-    expect(installReadiness(status({ landTurns: turns }))).toEqual({
-      kind: 'busy',
-      blockers: [
-        'the land of gadget-land holds the gadgets land turn (ticket 4, pid 99)',
-        'the land of wg holds the widgets land turn (ticket 2, pid 7)',
-      ],
-    });
-  });
-
-  it('refuses to guess when the land turns could not be read', () => {
-    expect(installReadiness(status({ landTurnsError: 'permission denied' }))).toEqual({
-      kind: 'busy',
-      blockers: ['land turns unreadable: permission denied'],
-    });
-  });
-
   const unreadable: readonly (readonly [string, string])[] = [
     ['empty output', ''],
     ['an error envelope', JSON.stringify({ ok: false, error: { code: 'internal', message: 'boom' } })],
     ['a status without a running state', JSON.stringify({ ok: true, result: { installed: true } })],
-    ['a land queue without tickets', status({ landTurns: [{ repo: 'gadgets' }] })],
-    ['a ticket without a pid', status({ landTurns: [{ repo: 'gadgets', tickets: [{ number: 1, workspace: 'w' }] }] })],
     ['a pending install that is not a boolean', status({ pendingInstall: 'yes' })],
   ];
   for (const [name, text] of unreadable) {
@@ -338,6 +306,61 @@ describe('installReadiness', () => {
     );
     expect(readinessLine({ kind: 'unknown', why: 'no status' })).toBe('unknown no status');
   });
+});
+
+describe('setupBlockers', () => {
+  it('names nothing when nothing holds a land turn or the slot', () => {
+    expect(setupBlockers(status({}))).toEqual({ kind: 'ready' });
+  });
+
+  it('names nothing when no daemon answers: an install that restarts nothing checks nothing', () => {
+    const turns = [{ repo: 'gadgets', tickets: [ticket(1, 'ws', 5)] }];
+    expect(setupBlockers(status({ running: false, landTurns: turns }))).toEqual({ kind: 'ready' });
+  });
+
+  it('names the install slot beside the work of a running gateway', () => {
+    const turns = [{ repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99)] }];
+    expect(setupBlockers(status({ pendingInstall: true, landTurns: turns }))).toEqual({
+      kind: 'busy',
+      blockers: [
+        'another install holds the install slot',
+        'the land of gadget-land holds the gadgets land turn (ticket 4, pid 99)',
+      ],
+    });
+  });
+
+  it('names the holder of each repository land turn and not a land queued behind it', () => {
+    const turns = [
+      { repo: 'gadgets', tickets: [ticket(4, 'gadget-land', 99), ticket(5, 'queued', 100)] },
+      { repo: 'smoothbricks', tickets: [], abandoned: [] },
+      { repo: 'widgets', tickets: [ticket(2, 'wg', 7)] },
+    ];
+    expect(setupBlockers(status({ landTurns: turns }))).toEqual({
+      kind: 'busy',
+      blockers: [
+        'the land of gadget-land holds the gadgets land turn (ticket 4, pid 99)',
+        'the land of wg holds the widgets land turn (ticket 2, pid 7)',
+      ],
+    });
+  });
+
+  it('refuses to guess when the land turns could not be read', () => {
+    expect(setupBlockers(status({ landTurnsError: 'permission denied' }))).toEqual({
+      kind: 'busy',
+      blockers: ['land turns unreadable: permission denied'],
+    });
+  });
+
+  const unreadable: readonly (readonly [string, string])[] = [
+    ['empty output', ''],
+    ['a land queue without tickets', status({ landTurns: [{ repo: 'gadgets' }] })],
+    ['a ticket without a pid', status({ landTurns: [{ repo: 'gadgets', tickets: [{ number: 1, workspace: 'w' }] }] })],
+  ];
+  for (const [name, text] of unreadable) {
+    it(`is unknown for ${name}, never ready`, () => {
+      expect(setupBlockers(text).kind).toBe('unknown');
+    });
+  }
 });
 
 describe('setupOutcome', () => {
@@ -610,12 +633,28 @@ echo "$* [cwd $cwd]" >>"$FIX_STATE/staged.log"
 case $1 in
 doctor) cat "$FIX_STATE/doctor.json"; exit "$(cat "$FIX_STATE/doctor.exit")" ;;
 gateway)
+  # The install's waited fence: the stand-in takes it at once and runs the command under it.
+  if [ "$2" = await-turns ]; then
+    [ "$3" = -- ] || exit 64
+    shift 3
+    exec "$@"
+  fi
   n=0
   [ ! -f "$FIX_STATE/status.count" ] || n=$(cat "$FIX_STATE/status.count")
   echo $((n + 1)) >"$FIX_STATE/status.count"
   if [ -f "$FIX_STATE/status.$n.json" ]; then cat "$FIX_STATE/status.$n.json"; else cat "$FIX_STATE/status.json"; fi
   ;;
-setup) cat "$FIX_STATE/setup.json"; exit "$(cat "$FIX_STATE/setup.exit")" ;;
+setup)
+  n=0
+  [ ! -f "$FIX_STATE/setup.count" ] || n=$(cat "$FIX_STATE/setup.count")
+  echo $((n + 1)) >"$FIX_STATE/setup.count"
+  if [ -f "$FIX_STATE/setup.$n.json" ]; then
+    cat "$FIX_STATE/setup.$n.json"
+    exit "$(cat "$FIX_STATE/setup.$n.exit")"
+  fi
+  cat "$FIX_STATE/setup.json"
+  exit "$(cat "$FIX_STATE/setup.exit")"
+  ;;
 *) exit 64 ;;
 esac
 `;
@@ -883,13 +922,15 @@ describe('land-install.sh', () => {
       calls.production,
       calls.lock('0 -> 1'),
     ]);
+    // Setup runs under the land turns' fence, which the staged build waits for in the install's order.
+    const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
     expect(install.log('staged.log')).toEqual([
       '--json doctor [cwd /]',
       '--json gateway status [cwd /]',
+      `gateway await-turns -- ${binary} --json setup [cwd elsewhere]`,
       '--json setup [cwd elsewhere]',
     ]);
     // The stage is a distribution, so setup finds the Nx cache server where it looks for a package's dependency.
-    const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
     expect(statSync(binary).mode & 0o111).not.toBe(0);
     // Setup judges the install by the release record beside the binary, so the stage carries it.
     expect(readFileSync(`${binary}.build`, 'utf8')).toBe('release record\n');
@@ -909,7 +950,7 @@ describe('land-install.sh', () => {
       `allow ${join(install.sheds, install.shed)}`,
       'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
       'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
-      `exec ${install.main} ${binary} --json setup`,
+      `exec ${install.main} ${binary} gateway await-turns -- ${binary} --json setup`,
     ]);
   });
 
@@ -974,17 +1015,20 @@ describe('land-install.sh', () => {
     expect(install.log('staged.log')).toEqual(['--json doctor [cwd /]']);
   });
 
-  it('defers before building when a land holds its turn, builds nothing and names the command to rerun', () => {
+  it('builds and installs while a land holds its turn: setup waits for the turns in order, never deferred', () => {
     const install = fixture();
     install.set('installed-status.json', BUSY_STATUS);
+    install.set('status.json', BUSY_STATUS);
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
-    expect(onlyLine(run.stdout).text).toBe(`deferred: ${BUSY_TEXT}; rerun ${RERUN(install)}`);
-    expect(install.log('cowshed.log')).toEqual([cowshedCalls(install).status]);
-    expect(install.log('nx.log')).toEqual([NX_SHOW(install)]);
-    expect(install.log('staged.log')).toEqual([]);
-    expect(readdirSync(install.sheds)).toEqual([]);
-    expect(existsSync(join(install.main, '.cache'))).toBe(false);
+    expect(onlyLine(run.stdout).text).toBe('installed');
+    const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
+    expect(install.log('staged.log')).toEqual([
+      '--json doctor [cwd /]',
+      '--json gateway status [cwd /]',
+      `gateway await-turns -- ${binary} --json setup [cwd elsewhere]`,
+      '--json setup [cwd elsewhere]',
+    ]);
   });
 
   it('defers before building while another install holds the install slot', () => {
@@ -1009,16 +1053,43 @@ describe('land-install.sh', () => {
     expect(install.log('staged.log')).toEqual([]);
   });
 
-  it('defers work that began during the build, with the command to run, and runs no setup', () => {
+  it('a land turn that began during the build is waited for in order, not deferred', () => {
     const install = fixture();
-    // Ready before the build; a land holds its turn by the time setup would run.
+    // Free before the build; a land holds its turn by the time setup would run.
     install.set('installed-status.json', status({}));
     install.set('status.json', BUSY_STATUS);
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
-    const binary = join(install.stage, 'dist/bin/darwin-arm64/cowshed');
-    expect(onlyLine(run.stdout).text).toBe(`deferred: ${BUSY_TEXT}; rerun direnv exec ${install.main} ${binary} setup`);
-    expect(install.log('staged.log')).toEqual(['--json doctor [cwd /]', '--json gateway status [cwd /]']);
+    expect(onlyLine(run.stdout).text).toBe('installed');
+    expect(install.log('staged.log').map((entry) => entry.split(' ').slice(0, 2).join(' '))).toEqual([
+      '--json doctor',
+      '--json gateway',
+      'gateway await-turns',
+      '--json setup',
+    ]);
+  });
+
+  it('waits in order once more when setup is refused, and installs on the second wait', () => {
+    const install = fixture();
+    install.set(
+      'setup.0.json',
+      JSON.stringify({
+        ok: false,
+        error: { code: 'conflict', message: 'another install restarted the gateway first', hint: 'rerun' },
+      }),
+    );
+    install.set('setup.0.exit', '4');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe('installed');
+    expect(install.log('staged.log').map((entry) => entry.split(' ').slice(0, 2).join(' '))).toEqual([
+      '--json doctor',
+      '--json gateway',
+      'gateway await-turns',
+      '--json setup',
+      'gateway await-turns',
+      '--json setup',
+    ]);
   });
 
   it('runs nothing unattended when doctor cannot be read', () => {
@@ -1059,7 +1130,8 @@ describe('land-install.sh', () => {
     const run = install.run();
     expect(run.status, run.stderr).toBe(0);
     expect(onlyLine(run.stdout).text).toBe('failed: setup exited 4: conflict: the build lacks an installed commit');
-    expect(install.log('staged.log')).toHaveLength(4);
+    // Refused twice, each after its own wait in order, then classified by a fresh status.
+    expect(install.log('staged.log')).toHaveLength(7);
   });
 
   it('records a failure that is not a refusal as failed, and reads no second status', () => {
@@ -1077,7 +1149,7 @@ describe('land-install.sh', () => {
     expect(onlyLine(run.stdout).text).toBe(
       'failed: setup exited 6: sandbox-denied: administrator authorization was declined',
     );
-    expect(install.log('staged.log')).toHaveLength(3);
+    expect(install.log('staged.log')).toHaveLength(4);
   });
 
   it('defers a refusal that a fresh status explains by work that began after the first read', () => {
@@ -1098,6 +1170,9 @@ describe('land-install.sh', () => {
     expect(install.log('staged.log').map((entry) => entry.split(' ').slice(0, 2).join(' '))).toEqual([
       '--json doctor',
       '--json gateway',
+      'gateway await-turns',
+      '--json setup',
+      'gateway await-turns',
       '--json setup',
       '--json gateway',
     ]);
@@ -1308,7 +1383,7 @@ describe('land-install.sh', () => {
       `allow ${shed}`,
       'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
       'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
-      `exec ${install.main} ${binary} --json setup`,
+      `exec ${install.main} ${binary} gateway await-turns -- ${binary} --json setup`,
     ]);
   });
 
@@ -1361,7 +1436,7 @@ describe('land-install.sh', () => {
       'status',
       'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
       'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
-      `exec ${install.main} ${binary} --json setup`,
+      `exec ${install.main} ${binary} gateway await-turns -- ${binary} --json setup`,
     ]);
   });
 

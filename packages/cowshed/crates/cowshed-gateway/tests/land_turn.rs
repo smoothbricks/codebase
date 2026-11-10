@@ -772,7 +772,9 @@ fn stand_in(
     let (accepted, told) = tokio::sync::mpsc::unbounded_channel();
     let serving = tokio::spawn(async move {
         let mut open = Vec::new();
-        for order in 1.. {
+        let mut order = 0;
+        loop {
+            order += 1;
             let (stream, _) = listener.accept().await.expect("accept a land");
             let (read, mut write) = stream.into_split();
             let mut asks = BufReader::new(read).lines();
