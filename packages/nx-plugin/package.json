@@ -505,6 +505,41 @@
           "cwd": "{projectRoot}"
         }
       },
+      "ttsc-plugin-hosts": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "smooTaskKind": "test"
+        },
+        "inputs": [
+          "{projectRoot}/src/__tests__/prepare-ttsc-plugin-hosts.ts",
+          "{projectRoot}/src/__tests__/ttsc-cache-dir.ts",
+          "{projectRoot}/package.json",
+          "{projectRoot}/tsconfig.lib.json",
+          "{projectRoot}/tsconfig.test.json",
+          "{workspaceRoot}/tsconfig.base.json",
+          "{projectRoot}/src/__tests__/typescript-emit-fixtures.ts",
+          "{projectRoot}/src/__tests__/dialect-plugin/**/*",
+          "{projectRoot}/src/__tests__/side-output-plugin/**/*",
+          "{workspaceRoot}/packages/lmao-ttsc/package.json",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin.cjs",
+          "{workspaceRoot}/packages/lmao-ttsc/plugin/**/*",
+          "bunToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh go version"
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/ttsc-plugin-hosts/plugins/*/plugin"
+        ],
+        "options": {
+          "command": "bun src/__tests__/prepare-ttsc-plugin-hosts.ts",
+          "cwd": "{projectRoot}",
+          "env": {
+            "TTSC_CACHE_DIR": ".cache/ttsc-plugin-hosts"
+          }
+        }
+      },
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
@@ -524,11 +559,15 @@
           "...",
           "^build",
           "build",
-          "cargo-stream-archive"
+          "cargo-stream-archive",
+          "ttsc-plugin-hosts"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
+          "env": {
+            "TTSC_CACHE_DIR": ".cache/ttsc-plugin-hosts"
+          },
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
@@ -552,11 +591,15 @@
           "...",
           "^build",
           "build",
-          "cargo-stream-archive"
+          "cargo-stream-archive",
+          "ttsc-plugin-hosts"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
+          "env": {
+            "TTSC_CACHE_DIR": ".cache/ttsc-plugin-hosts"
+          },
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
@@ -580,11 +623,15 @@
           "...",
           "^build",
           "build",
-          "cargo-stream-archive"
+          "cargo-stream-archive",
+          "ttsc-plugin-hosts"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
+          "env": {
+            "TTSC_CACHE_DIR": ".cache/ttsc-plugin-hosts"
+          },
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
@@ -608,11 +655,15 @@
           "...",
           "^build",
           "build",
-          "cargo-stream-archive"
+          "cargo-stream-archive",
+          "ttsc-plugin-hosts"
         ],
         "options": {
           "command": "bun test --timeout=0 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
+          "env": {
+            "TTSC_CACHE_DIR": ".cache/ttsc-plugin-hosts"
+          },
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }

@@ -2814,8 +2814,17 @@ output, reads the referenced UTF-8 cause before releasing the held test, then ch
 JUnit and verdict. `nx-plugin:cargo-stream-archive` produces the smoke's nextest archive before any Bun shard starts;
 the smoke executes that archive and never compiles inside the test progress interval. The reporter smoke likewise
 executes the transformed `dist/bin/smoo-nx-bound-failures.js` supplied by the shards' `build` dependency, not raw
-TypeScript whose imports may require schema generation. Test ownership and readiness follow
-[`specs/cowshed/08_testing.md`](../../specs/cowshed/08_testing.md), “Unit tests” and “Fixtures”.
+TypeScript whose imports may require schema generation. `nx-plugin:ttsc-plugin-hosts` builds, through `ttsc prepare`,
+every ttsc plugin host the Bun shards load: this package's own (`tsconfig.test.json` and `tsconfig.lib.json`, which the
+Bun preload transforms the suite through) and those of the TypeScript emit executor's fixtures (`PLUGIN_HOST_FIXTURES`
+in `src/__tests__/typescript-emit-fixtures.ts`: typia alone, `@smoothbricks/lmao-ttsc` on the utility host, and the
+side-output and dialect fixture plugins on the utility and typia hosts). It builds them into its own `TTSC_CACHE_DIR`,
+`.cache/ttsc-plugin-hosts`, whose host binaries (`plugins/*/plugin`) are its Nx output. The shards depend on it and name
+the same directory, which the `src/__tests__/ttsc-cache-dir.ts` preload resolves against the package before any ttsc the
+suite runs in a fixture reads it, so those tests load built hosts and never compile one inside the progress interval.
+The checkout's shared `.cache/ttsc-plugins` cannot be that output: it is cowshed build state, which no Nx output may
+cover (`src/build-state-output-policy.ts`), and every plugin build of the checkout writes into it. Test ownership and
+readiness follow [`specs/cowshed/08_testing.md`](../../specs/cowshed/08_testing.md), “Unit tests” and “Fixtures”.
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
 `StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those
 records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for

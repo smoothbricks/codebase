@@ -1,6 +1,7 @@
 [test]
 preload = [
   "./src/__tests__/isolate-nx-state.ts",
+  "./src/__tests__/ttsc-cache-dir.ts",
   "@smoothbricks/validation/bun/preload",
   "@smoothbricks/lmao/bun/trace-preload",
 ]
