@@ -210,6 +210,17 @@ impl HostStableExecutable {
         format!("{}-{digest}", self.name)
     }
 
+    /// The stable executable `path` is, when [`Self::new`] derives it from some home; `None` for
+    /// any other path.
+    pub fn at(path: &Path) -> Option<Self> {
+        let name = path.file_name()?.to_str()?;
+        // `<home>/Library/Application Support/dev.cowshed/bin/<name>`
+        let home = path.ancestors().nth(5)?;
+        Self::new(home, name)
+            .ok()
+            .filter(|derived| derived.path == path)
+    }
+
     /// The build a file name in [`Self::directory`] is the stored copy of, or `None` for any
     /// other name: the stable name itself, a retained or temporary file, another service's
     /// binary.

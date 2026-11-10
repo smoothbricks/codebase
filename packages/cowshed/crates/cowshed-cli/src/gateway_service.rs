@@ -2760,14 +2760,14 @@ fn record_installed_build(executable: &HostStableExecutable, candidate: &Candida
 }
 
 /// The build the stable name runs, and what it recorded of itself.
-struct InstalledBuild {
-    digest: ExecutableDigest,
-    record: Option<BuildRecord>,
+pub(crate) struct InstalledBuild {
+    pub(crate) digest: ExecutableDigest,
+    pub(crate) record: Option<BuildRecord>,
 }
 
 /// What the stable name runs now. `None` when nothing is installed, or the install is one from
 /// before copies were content-addressed, which records nothing.
-fn installed_build(executable: &HostStableExecutable) -> Result<Option<InstalledBuild>> {
+pub(crate) fn installed_build(executable: &HostStableExecutable) -> Result<Option<InstalledBuild>> {
     let Some(metadata) = inspect_existing(executable.path())? else {
         return Ok(None);
     };

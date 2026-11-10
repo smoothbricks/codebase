@@ -501,7 +501,7 @@ pub fn paths(entries: &[StatusEntry]) -> BTreeSet<String> {
 }
 
 /// `lands.log`, beside the turn's tickets: one JSON line per land event, appended, never
-/// rewritten (02_workspaces.md "A declared land" step 5).
+/// rewritten (02_workspaces.md "A declared land" step 6).
 pub const LANDS_LOG: &str = "lands.log";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -512,6 +512,8 @@ pub enum LandEvent {
     Pushed,
     PushFailed,
     AfterExited,
+    /// The installed cowshed changed while an after-land command ran: that command installed it.
+    Installed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

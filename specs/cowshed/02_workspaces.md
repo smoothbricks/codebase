@@ -1283,28 +1283,31 @@ unchanged.
    for a land turn, so the two never deadlock.
 6. **After the turn.** The turn ends once the fast-forward's retire has. Then, outside it: the landed head is recorded
    in `lands.log` in the turn's records directory (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
-   `unpushed`, `pushed`, `push-failed`, `after-exited`; appended, never rewritten), and the land submits `__land-after`,
-   run as the store's installed cowshed (05_gateway.md "The installed cowshed", the gateway's own program), to main's
-   workspace supervisor as a background job at the host boundary, with the declared commands' environment, and returns
-   without waiting, naming the job. That job runs each `[land] after` command in order, `{before}` and `{head}` replaced
-   by main's head before and after the land, and then pushes the landed branch to `[land] push`. The after commands go
-   first because they rebuild main's outputs for the sources the fast-forward just checked out: until they end, a
-   developer link to main serves a build older than its sources and is refused, and no local consumer needs the remote.
-   Its membership, CPU and end are a job's like any other (its cgroup on Linux, its process tree on Darwin). The push is
-   keyed on main having moved (a land of a workspace main already held pushes nothing), never on the retire: a land
-   whose retire was refused records `landed` and submits the job before it reports that refusal, so no landed main is
-   left unpushed. A job that is not admitted is recorded as `push-failed` (`after-exited` when nothing was to be pushed)
-   with why, and said. Each outcome is one more `lands.log` line, and each command's output is kept in
-   `lands/<head>.*.log` beside it, as it comes. The push (`git push --progress`) and each after command have a silence
-   bound of 180 s, not a total, over their output and the CPU of what they run. That "output and CPU" bound is these
-   commands' own: it is not bounded-exec's idle bound, which counts finished tests and the progress records running
-   tests report, and which CPU never restarts (08_testing.md, "Integration tests (real substrate)"), and not the bound a
-   land step watchdog puts on a step of the land it watches, which belongs to the repository that runs that land. On
-   Linux each runs in a cgroup leaf of its own inside the job's cgroup, retired once it ends, and on Darwin in a process
-   group of its own. One that shows neither for 180 s is sent `SIGTERM` and its outcome is `SILENT` (05_gateway.md
-   "Deadlines"). The land never waits for the job: a remote is never needed to land, and a slow push or install holds up
-   neither this land nor the next. `--no-push` records `unpushed` and pushes nothing; the after commands still run. The
-   report is the primitive's `landed` report.
+   `unpushed`, `pushed`, `push-failed`, `after-exited`, `installed`; appended, never rewritten), and the land submits
+   `__land-after`, run as the store's installed cowshed (05_gateway.md "The installed cowshed", the gateway's own
+   program), to main's workspace supervisor as a background job at the host boundary, with the declared commands'
+   environment, and returns without waiting, naming the job. That job runs each `[land] after` command in order,
+   `{before}` and `{head}` replaced by main's head before and after the land, and then pushes the landed branch to
+   `[land] push`. The after commands go first because they rebuild main's outputs for the sources the fast-forward just
+   checked out: until they end, a developer link to main serves a build older than its sources and is refused, and no
+   local consumer needs the remote. Its membership, CPU and end are a job's like any other (its cgroup on Linux, its
+   process tree on Darwin). The push is keyed on main having moved (a land of a workspace main already held pushes
+   nothing), never on the retire: a land whose retire was refused records `landed` and submits the job before it reports
+   that refusal, so no landed main is left unpushed. A job that is not admitted is recorded as `push-failed`
+   (`after-exited` when nothing was to be pushed) with why, and said. Each outcome is one more `lands.log` line, and
+   each command's output is kept in `lands/<head>.*.log` beside it, as it comes. An after command that installs cowshed
+   is followed by an `installed` line: the job reads the stable name it runs as before and after each command, and one
+   after which that name runs another stored copy records `detail` `sha256 <digest> commit <commit>; …`, the copy's
+   SHA-256 and the commit its build record names (`unrecorded` for a build that records none). The push
+   (`git push --progress`) and each after command have a silence bound of 180 s, not a total, over their output and the
+   CPU of what they run. That "output and CPU" bound is these commands' own: it is not bounded-exec's idle bound, which
+   counts finished tests and the progress records running tests report, and which CPU never restarts (08_testing.md,
+   "Integration tests (real substrate)"), and not the bound a land step watchdog puts on a step of the land it watches,
+   which belongs to the repository that runs that land. On Linux each runs in a cgroup leaf of its own inside the job's
+   cgroup, retired once it ends, and on Darwin in a process group of its own. One that shows neither for 180 s is sent
+   `SIGTERM` and its outcome is `SILENT` (05_gateway.md "Deadlines"). The land never waits for the job: a remote is
+   never needed to land, and a slow push or install holds up neither this land nor the next. `--no-push` records
+   `unpushed` and pushes nothing; the after commands still run. The report is the primitive's `landed` report.
 
 **The declared commands' environment.** Every command a declared land or a doc commit runs (gate, edit, check, commit,
 push, after) runs with nothing of the caller's shell. The environment is cleared; `HOME`, `USER`, `LOGNAME`, `TERM`,

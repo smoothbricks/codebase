@@ -2778,6 +2778,312 @@ async fn host_controller_a_drain_ends_a_resident_whose_requester_exited() {
     fixture.retired().await;
 }
 
+/// Names the store whose manager socket the gateway process of the restart proof serves
+/// ([`survivor_gateway_process`]) and whose `run` directory holds main's supervisor socket.
+#[cfg(target_os = "macos")]
+const SURVIVOR_STORE: &str = "COWSHED_TEST_SURVIVOR_STORE";
+/// Names the root of the supervisor that gateway starts ([`survivor_supervisor_process`]).
+#[cfg(target_os = "macos")]
+const SURVIVOR_ROOT: &str = "COWSHED_TEST_SURVIVOR_ROOT";
+
+/// Not a test of its own: the gateway of
+/// [`host_controller_an_exec_runs_across_a_gateway_restart_and_its_end_reaches_its_client`]. Run
+/// as this binary with [`SURVIVOR_STORE`] set, it runs the daemon's supervisor manager over that
+/// store as `cowshed gateway run` does: it lists the supervisors serving from before it, takes
+/// ensures on the manager socket, starts a workspace's supervisor in a session of its own (this
+/// binary as [`survivor_supervisor_process`], through the daemon's own spawner), and recovers the
+/// ones it listed. It says `serving` once it takes ensures and `recovered` once that recovery is
+/// over, and runs until it is killed. Run any other way it does nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn survivor_gateway_process() {
+    use cowshed_core::runtime::supervisor_manager::{
+        self, ProgramSpawner, SocketPeers, SupervisorManager,
+    };
+    use cowshed_core::runtime::supervisor_socket;
+    let Some(store) = std::env::var_os(SURVIVOR_STORE).map(PathBuf::from) else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the gateway's runtime");
+    runtime.block_on(async {
+        let manager = SupervisorManager::new(
+            &store,
+            Box::new(ProgramSpawner::new(
+                std::env::current_exe().expect("this binary"),
+                ["--exact", "survivor_supervisor_process", "--nocapture"]
+                    .map(OsString::from)
+                    .to_vec(),
+            )),
+            Arc::new(cowshed_core::StartupHealState::healed()),
+        );
+        let recovery = manager.recovery();
+        let listener = supervisor_socket::bind(&supervisor_manager::manager_socket_path(&store))
+            .await
+            .expect("bind the manager socket");
+        tokio::spawn(supervisor_manager::serve(listener, Arc::clone(&manager)));
+        println!("serving");
+        recovery
+            .start(Arc::new(SocketPeers))
+            .await
+            .expect("the recovery task");
+        println!("recovered");
+        std::future::pending::<()>().await;
+    });
+}
+
+/// Not a test of its own: the workspace supervisor the gateway of the restart proof starts. Run
+/// as this binary with [`SURVIVOR_ROOT`] and [`SURVIVOR_STORE`] set, in the session the manager
+/// gave it, it serves the production supervisor of main under that root on main's socket in that
+/// store, as `cowshed __workspace-supervisor` serves one, until it is drained. Run any other way
+/// it does nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn survivor_supervisor_process() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (Some(root), Some(store)) = (
+        std::env::var_os(SURVIVOR_ROOT).map(PathBuf::from),
+        std::env::var_os(SURVIVOR_STORE).map(PathBuf::from),
+    ) else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the supervisor's runtime");
+    runtime.block_on(async {
+        let supervisor = system_supervisor(&root);
+        let authority = supervisor.snapshot().clone();
+        let socket = supervisor_socket::bind(&supervisor_socket::socket_path(
+            &store,
+            &authority.repo_id,
+            &authority.workspace,
+        ))
+        .await
+        .expect("bind main's supervisor socket");
+        supervisor_socket::serve(socket, supervisor, None, None)
+            .await
+            .expect("the supervisor serves until it is drained");
+    });
+}
+
+/// One gateway process of the restart proof ([`survivor_gateway_process`]) and what it says.
+#[cfg(target_os = "macos")]
+struct SurvivorGateway {
+    child: tokio::process::Child,
+    said: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+#[cfg(target_os = "macos")]
+impl SurvivorGateway {
+    /// Start a gateway over `store` whose supervisors run under `root`, once it takes ensures.
+    async fn start(store: &Path, root: &Path) -> Self {
+        use cowshed_os::fork_lock::Spawn as _;
+        use tokio::io::AsyncBufReadExt as _;
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args(["--exact", "survivor_gateway_process", "--nocapture"])
+            .env(SURVIVOR_STORE, store)
+            .env(SURVIVOR_ROOT, root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn_locked()
+            .expect("start the gateway");
+        let said =
+            tokio::io::BufReader::new(child.stdout.take().expect("the gateway's stdout")).lines();
+        let mut gateway = Self { child, said };
+        gateway.says("serving").await;
+        gateway
+    }
+
+    /// Read what the gateway says until a line ends with `word`: the test harness may print the
+    /// test's name ahead of it on the same line.
+    async fn says(&mut self, word: &str) {
+        while let Some(line) = self.said.next_line().await.expect("read the gateway") {
+            if line.ends_with(word) {
+                return;
+            }
+        }
+        panic!(
+            "the gateway ended before it said {word}: {:?}",
+            self.child.wait_bounded().await
+        );
+    }
+
+    /// Stop the gateway as launchd stops it for an install, with SIGTERM, and wait until it is
+    /// gone: the first half of a restart.
+    async fn stop(mut self) {
+        let pid =
+            libc::pid_t::try_from(self.child.id().expect("a running gateway")).expect("a pid");
+        // SAFETY: `kill` reaches only this test's own unreaped child.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGTERM) },
+            0,
+            "signal the gateway"
+        );
+        self.child.wait_bounded().await.expect("the gateway exits");
+    }
+}
+
+/// The supervisor the manager started in a session of its own, which no gateway's end reaches:
+/// killed when the proof fails before it drained it, so no failed run leaves it serving.
+#[cfg(target_os = "macos")]
+struct SurvivorSupervisor {
+    pid: Option<libc::pid_t>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SurvivorSupervisor {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            // SAFETY: `kill` on the supervisor this proof started, not yet seen to exit.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Recorded 2026-11-10 03:14:20Z: a land's after-step installed cowshed and restarted the gateway
+/// with agents' execs in flight. A job lives in its workspace supervisor, which a gateway restart
+/// leaves running (05_gateway.md "A land step waits for an install in progress"): the manager
+/// starts the supervisor in a session of its own, and once a job is admitted its exec reaches it
+/// through the supervisor's socket alone. So an exec running across a restart ends with its output
+/// and its status delivered: the gateway whose manager started the supervisor is stopped while the
+/// job runs, the job runs on with no gateway, the next gateway recovers the supervisor that
+/// survived it and serves its next ensure from it, and the drain a gateway of the installed build
+/// sends a supervisor of the replaced build (11_shell.md "Draining a supervisor of another build")
+/// still serves the job's end to its client before the supervisor retires.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_an_exec_runs_across_a_gateway_restart_and_its_end_reaches_its_client() {
+    use cowshed_core::api::dto::ExitStatus;
+    use cowshed_core::runtime::{supervisor_manager, supervisor_socket};
+    use cowshed_os::test_backstop::AsyncUnixStreamBackstop as _;
+    let root = test_root();
+    let sockets = scratch_apfs::ScratchRoot::new("restart").expect("short socket root");
+    let store = sockets.path().to_path_buf();
+    std::fs::create_dir(store.join("run")).expect("the store's run directory");
+    let manager_socket = supervisor_manager::manager_socket_path(&store);
+    let needed = authority_of(WorkspaceName::new("main").expect("main"), incarnation(1));
+    let census = census();
+    let gateway = SurvivorGateway::start(&store, &root).await;
+
+    // The exec asks the gateway for its workspace's supervisor, which the manager starts.
+    let ensured = supervisor_manager::ensure(&store, &census, &root.join("checkout"), &needed)
+        .await
+        .expect("the manager starts main's supervisor");
+    let mut survivor = SurvivorSupervisor {
+        pid: Some(libc::pid_t::try_from(ensured.pid).expect("a pid")),
+    };
+    let remote = supervisor_socket::connect(ensured.socket.clone(), ensured.authority.clone());
+    let gate = root.join("workspace").join("restart-gate");
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&gate)
+            .status_bounded()
+            .expect("create the gate FIFO")
+            .success()
+    );
+    let job = remote
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        "printf 'before\\n'; read _ < restart-gate; printf 'after\\n'; exit 7",
+                    ]
+                    .into_iter()
+                    .map(CommandArg::from)
+                    .collect(),
+                ),
+                ..gated_request(ExecClass::Background)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("admit the job");
+    // Held as a foreground exec holds its job, for as long as the client lives.
+    let hold = supervisor_socket::hold(&ensured.socket, &needed.workspace_incarnation, job)
+        .await
+        .expect("hold the job");
+    let mut stdout = Vec::new();
+    let mut offset = 0;
+    while !stdout.ends_with(b"before\n") {
+        let chunk = remote
+            .log_read(job, StreamKind::Stdout, offset, true)
+            .await
+            .expect("read the job's stdout");
+        assert!(!chunk.eof, "the job ended before its gate opened");
+        stdout.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+    }
+
+    // The restart: the gateway goes, and nothing takes an ensure, while the job runs on.
+    gateway.stop().await;
+    assert!(
+        tokio::net::UnixStream::connect_bounded(&manager_socket)
+            .await
+            .is_err(),
+        "no gateway serves the manager socket"
+    );
+    assert_eq!(
+        remote.info(job).await.expect("the job's status").state,
+        JobState::Running,
+        "the job runs on with no gateway"
+    );
+    let mut gateway = SurvivorGateway::start(&store, &root).await;
+    gateway.says("recovered").await;
+    let again = supervisor_manager::ensure(&store, &census, &root.join("checkout"), &needed)
+        .await
+        .expect("the next gateway's ensure");
+    assert_eq!(
+        (&again.socket, again.pid),
+        (&ensured.socket, ensured.pid),
+        "the next gateway serves the supervisor that survived the restart, and starts no second one"
+    );
+
+    // An install's gateway drains the replaced build's supervisor: it admits nothing more, and
+    // its running job's end is still owed to the client.
+    let drained = supervisor_socket::drain(&ensured.socket)
+        .await
+        .expect("drain the surviving supervisor");
+    assert_eq!(drained.pid(), ensured.pid);
+    release(gate).await;
+    loop {
+        let chunk = remote
+            .log_read(job, StreamKind::Stdout, offset, true)
+            .await
+            .expect("read the job's stdout to its end");
+        stdout.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if chunk.eof {
+            break;
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&stdout), "before\nafter\n");
+    let ended = remote
+        .wait(job)
+        .await
+        .expect("the job's end reaches its client");
+    assert_eq!(
+        (ended.state, ended.exit),
+        (JobState::Exited, Some(ExitStatus::Exited { code: 7 }))
+    );
+    drop(hold);
+    // Its end read, the drained supervisor retires.
+    tokio::task::spawn_blocking(move || drained.exit.wait())
+        .await
+        .expect("the exit watch")
+        .expect("the drained supervisor retires");
+    survivor.pid = None;
+    drop(gateway);
+}
+
 /// Jobs of the main workspace, reached the way an embedder reaches them: the capability client,
 /// its controller connection, the project router and the host, down to a real supervisor.
 struct SupervisedJobs {

@@ -263,7 +263,10 @@ It never waits for them. The refused install copies, moves and restarts nothing,
 running gateway stay as they were; `setup`'s storage repair, which runs before its install (setup_service order:
 volumes, owner markers, mains, git identity, then the service refresh), stays done. The hint is to rerun once the land
 has ended, and `cowshed gateway status` lists the turns. A land queued behind the turn's holder runs nothing yet and is
-not named: its holder already refuses the install. A land that asks after the read is fenced ("The read fences the
+not named: its holder already refuses the install, since no queue holds a ticket without a holder (`one_holder`,
+"Land-turn laws"), so a queued turn refuses an install as surely as a held one, and the read fences only when no queue
+holds a ticket (`fence_only_when_free`). A land that has no ticket yet — between two of its invocations, or in its
+preflight — is in no queue, and nothing here sees it. A land that asks after the read is fenced ("The read fences the
 turns", below). The land turns are that gateway's own state, gone with it: one that does not answer `land-turns`, a
 build from before them, names no land turn, and the install says so. A gate job that is no land's — a train's proof, an
 operator's run — is no blocker: it lives in its workspace supervisor, which a gateway restart leaves running. An install
@@ -312,9 +315,13 @@ and it is not draining, the wait `gateway start` reports. Releasing the slot at 
 the daemon's socket refusing the connection, failing a land whose gate had passed. A land step never holds the slot for
 its run: it did once, and an install then waited on every land step in flight, between its gates as well as during them.
 A job in flight lives in its workspace supervisor, which a gateway restart leaves running; what a restart breaks is a
-new connection to the daemon, and that is what waits. The guard against a restart between two of a land's commands is
-the land's turn, and the guard against a restart between an install's read of the turns and a land's ask is the read's
-fence ("The read fences the turns"). Status reads the slot without taking it.
+new connection to the daemon, and that is what waits. An exec in flight reaches its job through the supervisor's socket
+alone once the job is admitted, and the manager starts the supervisor in a session of its own, so an exec running across
+a restart ends with its output and status delivered, and the next gateway recovers the supervisor and serves its next
+ensure from it (`host_controller_an_exec_runs_across_a_gateway_restart_and_its_end_reaches_its_client`, which also
+drains it as an install's gateway of another build does). The guard against a restart between two of a land's commands
+is the land's turn, and the guard against a restart between an install's read of the turns and a land's ask is the
+read's fence ("The read fences the turns"). Status reads the slot without taking it.
 
 `land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
 requires no matching daemon build and never re-execs the installed cowshed.
@@ -354,7 +361,11 @@ answers is classified by a fresh status. Every outcome is one line on stdout,
 `<UTC time> <commit> install attended|unverified|deferred|installed|failed|skipped`, and the first three carry the exact
 command, which enters that devenv too: to run by hand (`attended`, `unverified`) or to rerun once the named work has
 ended (`deferred`). An install that cannot be taken is deferred, never waited for; the operator's land-status record
-holds it for whoever watches that record.
+holds it for whoever watches that record. An install the after-step makes is said in the land's own `lands.log` as well:
+the after-land job reads the stable name it runs as before and after each after command, and records an `installed` line
+carrying the new copy's SHA-256 and its build record's commit (02_workspaces.md "A declared land", step 6), through the
+writer of the land's other events. Recorded 2026-11-10 03:14:20Z: a land's after-step installed cowshed and restarted
+the gateway, and only that after-step's own log said so.
 
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
