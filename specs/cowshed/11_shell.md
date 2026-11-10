@@ -915,6 +915,17 @@ inheritable and no protected inode may be hardlinked into a workspace-writable p
 and seals file artifacts (never synced: "Durability of a job's own records"), or writes bounded inline bytes into the
 terminal Job Arrow batch, before publishing `ControllerCommitment::Terminal(TerminalCommitment)`.
 
+**A write the store refuses.** A write to a job's stream that its file system refuses (a full volume, `ENOSPC`; a failed
+or lost device, `EIO` or `ENXIO`; a descriptor the kernel no longer honours) is a value, never a reason to strand the
+job. It stops that stream alone: the stream takes no more bytes, and it is put back at the bytes it committed before the
+refused write (a spill file truncated to its committed length, a buffer to its committed prefix, a promotion whose
+prefix write failed back to its buffer, the partial file removed), so it seals them. The other stream records on. The
+supervisor ends the job as any kill ends it, and the job fails `outputUnrecorded` (07_api.md). The refusal, with its
+errno, is said once: on the job's stderr when stdout was refused, and in the supervisor's log always. The job then seals
+like any failed job, each stream holding what it committed. Only a stream whose put-back is refused too cannot seal: the
+job ends unsealed with an error naming the stream, the write's refusal and the put-back's refusal. Neither is a token
+conflict, which names only a token that does not belong to a live job of the store.
+
 Allocation is exclusive and crash-safe without an eager job directory. One supervisor is the sole allocator for an
 attached workspace. Admission appends a complete `JobArtifactRecord` batch and publishes
 `ControllerCommitment::Admission(AdmissionCommitment)` before process creation, so spawn failure retains durable

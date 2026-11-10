@@ -899,6 +899,7 @@ const READERS: Readers<ReaderName> = {
       ['priority', 'LEAF'],
       ['memory', 'LEAF'],
       ['unlaunched', 'LEAF'],
+      ['outputUnrecorded', 'LEAF'],
     ],
   },
   JOB_INFO_REF: {

@@ -224,6 +224,8 @@ enum OrderObservation {
 /// store's committed copy or from a second copy the actor kept.
 struct FakeArtifactSink {
     sealed_stdout: Option<Vec<u8>>,
+    /// The stream every write of which this sink refuses, as a file system that lost the device refuses it.
+    refused: Option<StreamKind>,
     next: JobId,
     quota: u64,
     jobs: BTreeMap<JobId, FakeArtifactJob>,
@@ -289,6 +291,7 @@ impl ArtifactSink for FakeArtifactSink {
                     outlived_incomplete: false,
                 },
                 sealed_stdout: self.sealed_stdout.clone(),
+                refused: self.refused,
                 quota: self.quota,
                 accepted: 0,
                 stdout: Vec::new(),
@@ -343,6 +346,7 @@ impl ArtifactSink for FakeArtifactSink {
 struct FakeArtifactJob {
     record: JobArtifactRecord,
     sealed_stdout: Option<Vec<u8>>,
+    refused: Option<StreamKind>,
     quota: u64,
     accepted: u64,
     stdout: Vec<u8>,
@@ -354,6 +358,16 @@ struct FakeArtifactJob {
 
 impl FakeArtifactJob {
     fn write(&mut self, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite> {
+        if self.refused == Some(stream) {
+            // As the production sink maps the store's I/O refusal (`map_artifact_error`).
+            return Err(CowshedError::integrity(
+                format!(
+                    "artifact I/O failed for .cowshed/job/{}/out: Input/output error (os error 5)",
+                    self.record.job_id.get()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
         let remaining = self.quota.saturating_sub(self.accepted);
         let accepted = usize::try_from(remaining.min(u64::try_from(bytes.len()).unwrap())).unwrap();
         let admitted = &bytes[..accepted];
@@ -660,6 +674,7 @@ fn harness_with_artifacts(
         }),
         Box::new(FakeArtifactSink {
             sealed_stdout,
+            refused: None,
             next: JobId::new(start_id).unwrap(),
             quota,
             jobs: BTreeMap::new(),
@@ -2677,6 +2692,77 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
     assert_eq!(info.output_limit.unwrap().limit_bytes, 4);
 }
 
+/// A write the job's records refuse fails the job and never strands it (11_shell.md, "Job
+/// control"): the refusal is a value the job's end carries, not an error dropped on the floor. The
+/// job is ended as any kill ends it, fails with its typed failure, says the refusal and its errno
+/// on its stderr, and seals with the stream that still records.
+#[tokio::test]
+async fn a_refused_output_write_fails_the_job_naming_its_cause() {
+    let root = workspace_root(&temp_parent::scratch_parent(), "refused-output");
+    let supervisor_config = config(&root);
+    let (spawn_tx, mut spawns) = mpsc::unbounded_channel();
+    let (process_tx, _process) = mpsc::unbounded_channel();
+    let (artifact_tx, _artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, _commitments) = mpsc::unbounded_channel();
+    let (order_tx, _order) = mpsc::unbounded_channel();
+    let artifact_authority = supervisor_config.authority.clone();
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(FakeSpawner {
+            spawned: spawn_tx,
+            process_observations: process_tx,
+            next: NextSpawn::Spawns,
+            backpressure: false,
+            order: order_tx.clone(),
+        }),
+        Box::new(FakeArtifactSink {
+            sealed_stdout: None,
+            refused: Some(StreamKind::Stdout),
+            next: JobId::new(1).unwrap(),
+            quota: 1024,
+            jobs: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            authority: artifact_authority,
+            observations: artifact_tx,
+            order: order_tx.clone(),
+        }),
+        Box::new(FakeCommitments {
+            next_order: 1,
+            observations: commitment_tx,
+            order: order_tx,
+        }),
+    )
+    .unwrap();
+    let job = handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = spawns.recv().await.unwrap();
+    complete(
+        &spawned,
+        b"refused",
+        b"the job's own stderr\n",
+        ExitStatus::Exited { code: 0 },
+    )
+    .await;
+    let ended = handle.wait(job).await.unwrap();
+    assert_eq!(ended.state, JobState::Failed);
+    assert_eq!(ended.failure, Some(JobFailure::OutputUnrecorded));
+    let stderr = String::from_utf8(read_all(&handle, job, StreamKind::Stderr).await).unwrap();
+    assert_eq!(
+        stderr,
+        "cowshed: job 1's stdout could not be recorded, so the job ends: artifact I/O failed for \
+         .cowshed/job/1/out: Input/output error (os error 5)\nthe job's own stderr\n",
+        "the refusal and its errno are on the job's stderr, ahead of what it wrote after"
+    );
+    assert_eq!(ended.stdout.bytes, 0, "the refused stream recorded nothing");
+}
+
 /// A spawn that fails comes after the exec answered at admission: the job ends `failed` with the
 /// failure's wrapper exit code, the typed failure `unlaunched` (its command never ran: an absent
 /// program, a held child the observer refused, any spawn error but a nice placement) and one
@@ -3232,6 +3318,7 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         }),
         Box::new(FakeArtifactSink {
             sealed_stdout: None,
+            refused: None,
             next: JobId::new(1).unwrap(),
             quota: 1024,
             jobs: BTreeMap::new(),
@@ -3455,6 +3542,7 @@ async fn a_supervisor_retirement_waits_for_the_exit_of_a_member_sigkill_has_not_
         }),
         Box::new(FakeArtifactSink {
             sealed_stdout: None,
+            refused: None,
             next: JobId::new(1).unwrap(),
             quota: 1024,
             jobs: BTreeMap::new(),
@@ -6622,6 +6710,7 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         }),
         Box::new(FakeArtifactSink {
             sealed_stdout: None,
+            refused: None,
             next: JobId::new(1).unwrap(),
             quota: 1024,
             jobs: BTreeMap::new(),

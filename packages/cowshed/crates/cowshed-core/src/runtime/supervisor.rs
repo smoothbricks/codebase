@@ -5600,6 +5600,10 @@ struct JobStateRecord {
     volumes: VolumeBaseline<HostVolume>,
     output_limit: Option<OutputLimitInfo>,
     kill_reason: Option<KillReason>,
+    /// Whether the store refused a write to the job's stdout or stderr: that stream takes no more
+    /// bytes, its refusal was said once, and the job is ending (11_shell.md, "Job control").
+    stdout_unrecorded: bool,
+    stderr_unrecorded: bool,
     stdout_copy: Option<OutputPublication>,
     stderr_copy: Option<OutputPublication>,
     stdin_delivery: StdinDelivery,
@@ -8089,6 +8093,8 @@ impl SupervisorActor {
             volumes,
             output_limit: None,
             kill_reason: None,
+            stdout_unrecorded: false,
+            stderr_unrecorded: false,
             stdout_copy,
             stderr_copy,
             stdin_delivery: StdinDelivery::default(),
@@ -9346,43 +9352,81 @@ impl SupervisorActor {
             return;
         }
         // Past its first 64 KiB a stream spills to its protected file, so a write may block on
-        // the file system: on the blocking pool.
-        let written = {
-            let bytes = bytes.clone();
-            self.artifacts
-                .run(move |sink| sink.write(job_id, stream, &bytes))
-                .await
-        };
-        match written {
-            Ok(admission) => {
-                let job = self
-                    .jobs
-                    .get_mut(&job_id)
-                    .expect("artifact write job remains actor-owned");
-                if admission.accepted_bytes != 0 {
-                    let accepted = bytes.slice(..admission.accepted_bytes);
-                    match stream {
-                        StreamKind::Stdout => {
-                            job.stdout_tally.admit(&accepted);
-                            job.stdout.push_back(accepted);
-                        }
-                        StreamKind::Stderr => {
-                            job.stderr_tally.admit(&accepted);
-                            job.stderr.push_back(accepted);
+        // the file system: on the blocking pool. A write the store refuses stops that stream alone
+        // and fails the job, which ends as any kill ends it. The refusal is said once: on the
+        // job's stderr while stderr still records, and in the supervisor's log always
+        // (11_shell.md, "Job control").
+        let mut pending = Some((stream, bytes));
+        while let Some((stream, bytes)) = pending.take() {
+            let job = self
+                .jobs
+                .get(&job_id)
+                .expect("artifact write job remains actor-owned");
+            let unrecorded = match stream {
+                StreamKind::Stdout => job.stdout_unrecorded,
+                StreamKind::Stderr => job.stderr_unrecorded,
+            };
+            if unrecorded {
+                return;
+            }
+            let written = {
+                let bytes = bytes.clone();
+                self.artifacts
+                    .run(move |sink| sink.write(job_id, stream, &bytes))
+                    .await
+            };
+            let job = self
+                .jobs
+                .get_mut(&job_id)
+                .expect("artifact write job remains actor-owned");
+            match written {
+                Ok(admission) => {
+                    if admission.accepted_bytes != 0 {
+                        let accepted = bytes.slice(..admission.accepted_bytes);
+                        match stream {
+                            StreamKind::Stdout => {
+                                job.stdout_tally.admit(&accepted);
+                                job.stdout.push_back(accepted);
+                            }
+                            StreamKind::Stderr => {
+                                job.stderr_tally.admit(&accepted);
+                                job.stderr.push_back(accepted);
+                            }
                         }
                     }
+                    let crossed = admission.output_limit;
+                    if let Some(limit) = crossed.clone() {
+                        job.output_limit = Some(limit);
+                    }
+                    flush_log_waiters(job);
+                    if crossed.is_some() {
+                        let _ = self.begin_kill(job_id, KillReason::OutputLimit);
+                    }
                 }
-                let crossed = admission.output_limit;
-                if let Some(limit) = crossed.clone() {
-                    job.output_limit = Some(limit);
+                Err(error) => {
+                    let (unrecorded, name) = match stream {
+                        StreamKind::Stdout => (&mut job.stdout_unrecorded, "stdout"),
+                        StreamKind::Stderr => (&mut job.stderr_unrecorded, "stderr"),
+                    };
+                    *unrecorded = true;
+                    job.failure.get_or_insert(JobFailure::OutputUnrecorded);
+                    let line = format!(
+                        "cowshed: job {}'s {name} could not be recorded, so the job ends: {}\n",
+                        job_id.get(),
+                        error.message
+                    );
+                    cowshed_os::eprintln!("{}", line.trim_end());
+                    if stream == StreamKind::Stdout {
+                        pending = Some((StreamKind::Stderr, Bytes::from(line)));
+                    }
+                    if let Err(error) = self.begin_kill(job_id, KillReason::ArtifactFailure) {
+                        cowshed_os::eprintln!(
+                            "cowshed: cannot end job {} for its unrecorded {name}: {}",
+                            job_id.get(),
+                            error.message
+                        );
+                    }
                 }
-                flush_log_waiters(job);
-                if crossed.is_some() {
-                    let _ = self.begin_kill(job_id, KillReason::OutputLimit);
-                }
-            }
-            Err(_) => {
-                let _ = self.begin_kill(job_id, KillReason::ArtifactFailure);
             }
         }
     }

@@ -271,6 +271,29 @@ pub enum ArtifactError {
         job_id: JobId,
         message: &'static str,
     },
+    /// A live job's stream takes no more bytes after a write to it failed; `cause` is that
+    /// write's own refusal (11_shell.md, "Job control").
+    #[error(
+        "job {job_id:?}'s {stream:?} stream takes no more bytes after a write to it failed: {cause}"
+    )]
+    StreamFailed {
+        job_id: JobId,
+        stream: StreamKind,
+        cause: Box<ArtifactError>,
+    },
+    /// A write to a live job's stream failed and the stream could not be put back at the bytes it
+    /// committed before it, so it cannot seal: `cause` is the write's refusal, `restore` the
+    /// put-back's (11_shell.md, "Job control").
+    #[error(
+        "job {job_id:?}'s {stream:?} stream cannot seal: a write to it failed ({cause}) and it could not be put back at its {committed} committed bytes ({restore})"
+    )]
+    StreamUnsealable {
+        job_id: JobId,
+        stream: StreamKind,
+        committed: u64,
+        cause: Box<ArtifactError>,
+        restore: Box<ArtifactError>,
+    },
     /// The record would bind an admission key this incarnation already bound to another job.
     #[error("admission key already admitted job {admitted:?}, not job {job_id:?}")]
     AdmissionKeyTaken { job_id: JobId, admitted: JobId },
@@ -1687,7 +1710,6 @@ impl ArtifactStore {
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger::new(self.config.combined_output_quota_bytes),
-                failed: false,
             },
         );
         debug_assert!(replaced.is_none(), "validated job ids are unique");
@@ -2013,7 +2035,6 @@ struct LiveJobState {
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
-    failed: bool,
 }
 
 impl LiveJobState {
@@ -2083,28 +2104,29 @@ impl ArtifactStore {
                 job_id: token.job_id,
                 message: "token does not name a live job",
             })?;
-        if live.failed {
-            return Err(ArtifactError::TokenConflict {
+        let writer = match stream {
+            StreamKind::Stdout => &mut live.stdout,
+            StreamKind::Stderr => &mut live.stderr,
+        };
+        if let Some(failure) = &writer.failure {
+            return Err(ArtifactError::StreamFailed {
                 job_id: token.job_id,
-                message: "job artifact stream failed; abort is required",
+                stream,
+                cause: Box::new(failure.cause.clone()),
             });
         }
         let admission = live.quota.preview(bytes.len());
-        if admission.accepted != 0 {
-            let writer = match stream {
-                StreamKind::Stdout => &mut live.stdout,
-                StreamKind::Stderr => &mut live.stderr,
-            };
-            if let Err(error) = writer.append(
+        if admission.accepted != 0
+            && let Err(error) = writer.append(
                 workspace_root,
                 inline_cap_bytes,
                 budget,
                 token.job_id,
                 &bytes[..admission.accepted],
-            ) {
-                live.failed = true;
-                return Err(error);
-            }
+            )
+        {
+            writer.fail(workspace_root, token.job_id, error.clone());
+            return Err(error);
         }
         live.quota.commit(admission);
         Ok(AppendOutcome {
@@ -2140,12 +2162,8 @@ impl ArtifactStore {
                 job_id: token.job_id,
                 message: "token does not name a live job",
             })?;
-        if live.failed {
-            return Err(ArtifactError::TokenConflict {
-                job_id: token.job_id,
-                message: "job artifact stream failed; abort is required",
-            });
-        }
+        live.stdout.sealable(token.job_id)?;
+        live.stderr.sealable(token.job_id)?;
         live.stdout
             .durable_prefix(workspace_root, budget, token.job_id)?;
         live.stderr
@@ -2179,12 +2197,8 @@ impl ArtifactStore {
                 })?;
         let output_limit = live.quota.output_limit();
         let result = (|| {
-            if live.failed {
-                return Err(ArtifactError::TokenConflict {
-                    job_id: token.job_id,
-                    message: "job artifact stream failed; abort was required",
-                });
-            }
+            live.stdout.sealable(token.job_id)?;
+            live.stderr.sealable(token.job_id)?;
             if !state.is_terminal() {
                 return Err(ArtifactError::InvalidTerminalState(
                     "finish requires a terminal job state",
@@ -2308,6 +2322,16 @@ struct StreamWriterState {
     protected_file: Option<File>,
     bytes: u64,
     hasher: Sha256,
+    /// The first write this stream could not make: it takes no more bytes, and seals the bytes it
+    /// committed before it.
+    failure: Option<StreamFailure>,
+}
+
+/// Why a live stream stopped taking bytes (11_shell.md, "Job control").
+struct StreamFailure {
+    cause: ArtifactError,
+    /// Why the stream could not be put back at its committed bytes: such a stream cannot seal.
+    restore: Option<ArtifactError>,
 }
 
 impl StreamWriterState {
@@ -2320,6 +2344,57 @@ impl StreamWriterState {
             protected_file: None,
             bytes: 0,
             hasher: Sha256::new(),
+            failure: None,
+        }
+    }
+
+    /// A write to this stream failed: it takes no more bytes, and it is put back at the bytes it
+    /// committed before that write, so it seals them. The refused write may have left part of
+    /// itself in the buffer or the spill file, or all of itself when only the redirect's own
+    /// file refused it.
+    fn fail(&mut self, workspace_root: &Path, job_id: JobId, cause: ArtifactError) {
+        let restore = self.restore(workspace_root, job_id).err();
+        self.failure = Some(StreamFailure { cause, restore });
+    }
+
+    fn restore(&mut self, workspace_root: &Path, job_id: JobId) -> Result<(), ArtifactError> {
+        let path = protected_absolute(workspace_root, job_id, self.kind);
+        if self.buffer.is_some() {
+            // A promotion whose prefix write failed: the buffer still holds every committed byte,
+            // the file it created only part of them. The stream stays inline, and the file goes.
+            if self.protected_file.take().is_some() {
+                fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
+            }
+        } else if let Some(file) = &self.protected_file {
+            let length = file
+                .metadata()
+                .map_err(|error| io_error(&path, error))?
+                .len();
+            if length != self.bytes {
+                file.set_len(self.bytes)
+                    .map_err(|error| io_error(&path, error))?;
+            }
+        }
+        if let Some(buffer) = &mut self.buffer {
+            buffer.truncate(usize::try_from(self.bytes).unwrap_or(usize::MAX));
+        }
+        Ok(())
+    }
+
+    /// Refuses a stream that cannot seal: a write to it failed and it could not be put back.
+    fn sealable(&self, job_id: JobId) -> Result<(), ArtifactError> {
+        match &self.failure {
+            Some(StreamFailure {
+                cause,
+                restore: Some(restore),
+            }) => Err(ArtifactError::StreamUnsealable {
+                job_id,
+                stream: self.kind,
+                committed: self.bytes,
+                cause: Box::new(cause.clone()),
+                restore: Box::new(restore.clone()),
+            }),
+            _ => Ok(()),
         }
     }
 
@@ -4436,6 +4511,7 @@ fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
         crate::api::dto::JobFailure::Priority => "priority",
         crate::api::dto::JobFailure::Memory => "memory",
         crate::api::dto::JobFailure::Unlaunched => "unlaunched",
+        crate::api::dto::JobFailure::OutputUnrecorded => "outputUnrecorded",
     }
 }
 
@@ -4447,6 +4523,7 @@ fn parse_failure(name: &str) -> Result<crate::api::dto::JobFailure, ArtifactErro
         "priority" => Ok(crate::api::dto::JobFailure::Priority),
         "memory" => Ok(crate::api::dto::JobFailure::Memory),
         "unlaunched" => Ok(crate::api::dto::JobFailure::Unlaunched),
+        "outputUnrecorded" => Ok(crate::api::dto::JobFailure::OutputUnrecorded),
         other => Err(ArtifactError::Arrow(format!(
             "unknown job failure {other:?}"
         ))),
@@ -10296,6 +10373,91 @@ mod tests {
         assert_eq!(budget.used, 0);
         assert_eq!(fs::read(root.join(".cowshed/job/1/out")).unwrap(), b"abcde");
         drop(stream);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A write the file system refuses mid-job stops that stream and fails the job; it never
+    /// strands it (11_shell.md, "Job control"). The stream is put back at the bytes it committed,
+    /// the other stream records on, and the job seals with both intact. The refused write is a
+    /// real one: the live stream's spill descriptor is swapped for a read-only one of the same
+    /// file, so the kernel refuses the write as it refuses one to a lost device.
+    #[test]
+    fn a_refused_stream_write_seals_the_committed_prefix_and_never_strands_the_job() {
+        let root = temp_root("refused-write");
+        let mut store = store_at(
+            &root,
+            ArtifactConfig {
+                inline_cap_bytes: 4,
+                ..ArtifactConfig::default()
+            },
+        );
+        let job_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        store
+            .append(&token, StreamKind::Stdout, b"spilled ")
+            .unwrap();
+        let spill = protected_absolute(&root, job_id, StreamKind::Stdout);
+        store
+            .live_jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .stdout
+            .protected_file = Some(File::open(&spill).unwrap());
+        let refused = store
+            .append(&token, StreamKind::Stdout, b"lost")
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ArtifactError::Io { path, message }
+                if *path == spill && message.contains("(os error 9)")),
+            "the refusal names the file and the kernel's errno: {refused}"
+        );
+        assert!(
+            matches!(
+                store.append(&token, StreamKind::Stdout, b"later"),
+                Err(ArtifactError::StreamFailed { stream: StreamKind::Stdout, cause, .. })
+                    if *cause == refused
+            ),
+            "the refused stream takes no more bytes, and says why"
+        );
+        store
+            .append(&token, StreamKind::Stderr, b"cause\n")
+            .expect("the other stream records on");
+        let sealed = store
+            .finish(
+                token,
+                JobEnding {
+                    failure: Some(crate::api::dto::JobFailure::OutputUnrecorded),
+                    ..JobEnding::from(JobState::Failed)
+                },
+            )
+            .expect("the job seals what it committed");
+        assert_eq!(sealed.record.state, JobState::Failed);
+        assert_eq!(
+            sealed.record.failure,
+            Some(crate::api::dto::JobFailure::OutputUnrecorded)
+        );
+        assert_eq!(sealed.record.stdout.bytes, 8);
+        drop(store);
+        let mut reopened = store_at(&root, ArtifactConfig::default());
+        let reader = reopened.sealed(job_id).unwrap().expect("the job is sealed");
+        assert_eq!(
+            reader.read_range(StreamKind::Stdout, 0..8).unwrap(),
+            b"spilled "
+        );
+        assert_eq!(
+            reader.read_range(StreamKind::Stderr, 0..6).unwrap(),
+            b"cause\n"
+        );
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 

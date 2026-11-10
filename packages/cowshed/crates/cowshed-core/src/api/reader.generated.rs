@@ -362,6 +362,7 @@ static JOB_FAILURE: Reader = Reader::External(&[
     ("priority", &LEAF),
     ("memory", &LEAF),
     ("unlaunched", &LEAF),
+    ("outputUnrecorded", &LEAF),
 ]);
 static JOB_INFO_REF: Reader = Reader::Record(&[
     ("repoId", &LEAF),

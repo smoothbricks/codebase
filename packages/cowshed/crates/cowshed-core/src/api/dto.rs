@@ -3148,6 +3148,11 @@ pub enum JobFailure {
     /// command never ran. The cause is on stderr. A cold activation that itself fails is not
     /// this: the job ends with the activation's own status (11_shell.md).
     Unlaunched,
+    /// A write to the job's output was refused by the file system holding its protected record
+    /// (a full volume, a failed or lost device), so the job was ended. Each stream holds the bytes
+    /// it committed before its refusal. The refusal, with its errno, is on stderr when stdout was
+    /// refused, and in the supervisor's log always (11_shell.md, "Job control").
+    OutputUnrecorded,
 }
 
 #[derive(Debug)]
