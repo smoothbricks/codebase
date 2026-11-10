@@ -1,26 +1,42 @@
 import { describe, expect, it } from 'bun:test';
-import { CPU_RISE_MIN_MS, type CpuSample, cpuChange, describeCpuRises, parseCpuTimeMs } from './cpu-rise.js';
+import {
+  type CpuSample,
+  cpuChange,
+  cpuRiseThresholdsMs,
+  describeCpuRises,
+  describeCpuThresholds,
+  parseCpuTime,
+} from './cpu-rise.js';
 
 const STARTED = 'Thu Oct 15 12:34:56 2026';
 const sample = (pid: number, cpu: string, command = `proc ${pid}`, started = STARTED): CpuSample => ({
   pid,
   started,
   command,
-  cpuMs: parseCpuTimeMs(cpu),
+  cpu: parseCpuTime(cpu),
 });
 
-describe('parseCpuTimeMs', () => {
+describe('parseCpuTime', () => {
   it('reads the CPU time ps prints on Linux and macOS, with and without hours, days and a fraction', () => {
-    expect(parseCpuTimeMs('00:00')).toBe(0);
-    expect(parseCpuTimeMs('59:27')).toBe(3_567_000);
-    expect(parseCpuTimeMs('15:16:20')).toBe(54_980_000);
-    expect(parseCpuTimeMs('2-01:00:05')).toBe(176_405_000);
-    expect(parseCpuTimeMs('0:00.04')).toBe(40);
-    expect(parseCpuTimeMs('1:02:03.45')).toBe(3_723_450);
+    expect(parseCpuTime('00:00')?.ms).toBe(0);
+    expect(parseCpuTime('59:27')?.ms).toBe(3_567_000);
+    expect(parseCpuTime('15:16:20')?.ms).toBe(54_980_000);
+    expect(parseCpuTime('2-01:00:05')?.ms).toBe(176_405_000);
+    expect(parseCpuTime('0:00.04')?.ms).toBe(40);
+    expect(parseCpuTime('1:02:03.45')?.ms).toBe(3_723_450);
+  });
+
+  it('carries the resolution it was printed at: whole seconds, or the last digit of its fraction', () => {
+    expect(parseCpuTime('59:27')).toEqual({ ms: 3_567_000, resolutionMs: 1_000 });
+    expect(parseCpuTime('0:03.6')).toEqual({ ms: 3_600, resolutionMs: 100 });
+    expect(parseCpuTime('0:03.63')).toEqual({ ms: 3_630, resolutionMs: 10 });
+    expect(parseCpuTime('0:03.633')).toEqual({ ms: 3_633, resolutionMs: 1 });
+    // Finer than a millisecond is kept to the millisecond it is read in.
+    expect(parseCpuTime('0:03.6334')).toEqual({ ms: 3_633, resolutionMs: 1 });
   });
 
   it('reads nothing from what ps prints for a process it may not read', () => {
-    for (const text of ['-', '?', '', '12', '1:2:3:4', '00:00s']) expect(parseCpuTimeMs(text)).toBeNull();
+    for (const text of ['-', '?', '', '12', '1:2:3:4', '00:00s']) expect(parseCpuTime(text)).toBeNull();
   });
 });
 
@@ -31,7 +47,7 @@ describe('cpuChange', () => {
     expect(cpuChange(before, after)).toEqual({
       rising: [
         { pid: 2, command: 'proc 2', gainedMs: 5_000 },
-        { pid: 3, command: 'proc 3', gainedMs: CPU_RISE_MIN_MS },
+        { pid: 3, command: 'proc 3', gainedMs: 2_000 },
       ],
       unread: [],
     });
@@ -62,6 +78,55 @@ describe('cpuChange', () => {
     expect(rise?.command.startsWith('rustc --cfg x')).toBe(true);
     expect(rise?.command.endsWith('…')).toBe(true);
     expect(rise?.command.length).toBeLessThanOrEqual(161);
+  });
+
+  it('names a process that gained 1.2 s between two centisecond readings, as macOS ps prints them, and none under 0.5 s', () => {
+    const before = [sample(1, '0:03.63'), sample(2, '0:03.63'), sample(3, '0:03.63')];
+    const after = [sample(1, '0:04.83'), sample(2, '0:03.98'), sample(3, '0:04.13')];
+    expect(cpuChange(before, after)).toEqual({
+      rising: [
+        { pid: 1, command: 'proc 1', gainedMs: 1_200 },
+        { pid: 3, command: 'proc 3', gainedMs: 500 },
+      ],
+      unread: [],
+    });
+  });
+
+  it('does not name a process that gained one counted second between two whole-second readings', () => {
+    expect(cpuChange([sample(1, '00:10')], [sample(1, '00:11')])).toEqual({ rising: [], unread: [] });
+  });
+
+  it('holds a pair of readings to its coarser resolution: whole seconds against centiseconds is two counted seconds', () => {
+    const before = [sample(1, '00:10'), sample(2, '00:10')];
+    const after = [sample(1, '0:11.50'), sample(2, '0:12.00')];
+    expect(cpuChange(before, after).rising).toEqual([{ pid: 2, command: 'proc 2', gainedMs: 2_000 }]);
+  });
+});
+
+describe('cpuRiseThresholdsMs', () => {
+  it('is 2 s between whole-second readings and 0.5 s between centisecond ones', () => {
+    expect(cpuRiseThresholdsMs([sample(1, '00:10')], [sample(1, '00:11')])).toEqual([2_000]);
+    expect(cpuRiseThresholdsMs([sample(1, '0:03.63')], [sample(1, '0:04.83')])).toEqual([500]);
+  });
+
+  it('holds each pair of readings to its coarser resolution and says each bar once, smallest first', () => {
+    const before = [sample(1, '00:10'), sample(2, '0:03.63'), sample(3, '00:10'), sample(4, '0:03.63')];
+    const after = [sample(1, '00:11'), sample(2, '0:04.83'), sample(3, '0:11.50'), sample(4, '0:04.00')];
+    expect(cpuRiseThresholdsMs(before, after)).toEqual([500, 2_000]);
+  });
+
+  it('names no bar when no process has a readable CPU time in both censuses', () => {
+    expect(cpuRiseThresholdsMs([sample(1, '-'), sample(2, '00:10')], [sample(1, '00:11'), sample(3, '00:10')])).toEqual(
+      [],
+    );
+  });
+});
+
+describe('describeCpuThresholds', () => {
+  it('says each bar in seconds', () => {
+    expect(describeCpuThresholds([2_000])).toBe('2 s');
+    expect(describeCpuThresholds([500])).toBe('0.5 s');
+    expect(describeCpuThresholds([500, 2_000])).toBe('0.5 s or 2 s');
   });
 });
 

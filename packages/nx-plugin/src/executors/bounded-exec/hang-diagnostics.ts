@@ -2,12 +2,14 @@ import { spawn } from 'node:child_process';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { type ProcessEntry, withDescendants } from '../../testing.js';
 import {
-  CPU_RISE_MIN_MS,
   CPU_RISING_CLASS,
   type CpuRise,
+  type CpuTime,
   cpuChange,
+  cpuRiseThresholdsMs,
   describeCpuRise,
-  parseCpuTimeMs,
+  describeCpuThresholds,
+  parseCpuTime,
 } from './cpu-rise.js';
 import {
   describeHolders,
@@ -26,10 +28,11 @@ export const HANG_CAPTURE_MS = 10_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
 const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,cputime=,lstart=,command=';
 /**
- * The least time between the two process censuses, which are the snapshot's two CPU samples. ps counts CPU time in whole
- * seconds and a process is named after two counted seconds (CPU_RISE_MIN_MS), so five seconds show a process at 40% of a
- * core. On Darwin the stack samples have usually spent most of it; elsewhere, or when sudo refuses them, the snapshot
- * pauses, inside its window and early enough that the closing census keeps its own limit.
+ * The least time between the two process censuses, which are the snapshot's two CPU samples. A process is named
+ * after gaining 2 s where ps counts whole seconds and 0.5 s where it counts centiseconds (cpuRiseThresholdMs), so five
+ * seconds show a process at 40% or at 10% of a core. On Darwin the stack samples have usually spent most of it;
+ * elsewhere, or when sudo refuses them, the snapshot pauses, inside its window and early enough that the closing
+ * census keeps its own limit.
  */
 const CPU_INTERVAL_MS = 5_000;
 /**
@@ -104,7 +107,7 @@ export interface HangDiagnosticHost {
 interface ObservedProcess extends ProcessEntry {
   pgid: number;
   started: string;
-  cpuMs: number | null;
+  cpu: CpuTime | null;
   raw: string;
 }
 
@@ -234,7 +237,7 @@ export function captureHangDiagnostics(
           ppid: Number(ppid),
           pgid: Number(pgid),
           stat,
-          cpuMs: parseCpuTimeMs(cputime),
+          cpu: parseCpuTime(cputime),
           started,
           command,
           raw: row,
@@ -406,6 +409,7 @@ export function captureHangDiagnostics(
         lines.push('Process identities or membership changed during capture; open-file census raced.');
       }
       const change = cpuChange(before, after);
+      const thresholdsMs = cpuRiseThresholdsMs(before, after);
       rising = change.rising;
       const intervalMs = afterAtMs - beforeAtMs;
       if (change.unread.length > 0) {
@@ -415,13 +419,15 @@ export function captureHangDiagnostics(
       }
       if (rising.length > 0) {
         lines.push(
-          `CPU rose in the tree over about ${intervalMs}ms between the censuses (ps counts whole seconds):`,
+          `CPU rose in the tree over about ${intervalMs}ms between the censuses (a rise is named from ${describeCpuThresholds(thresholdsMs)} of CPU):`,
           ...rising.map((rise) => `  ${describeCpuRise(rise)}`),
           `Classification: ${CPU_RISING_CLASS}`,
         );
+      } else if (thresholdsMs.length === 0) {
+        lines.push('CPU: no process of the tree had a CPU time ps gave in both censuses, so none was compared.');
       } else {
         lines.push(
-          `CPU: no process of the tree gained ${CPU_RISE_MIN_MS / 1_000} s of CPU over about ${intervalMs}ms between the censuses (ps counts whole seconds).`,
+          `CPU: no process of the tree gained ${describeCpuThresholds(thresholdsMs)} of CPU over about ${intervalMs}ms between the censuses.`,
         );
       }
       if (!incomplete) {

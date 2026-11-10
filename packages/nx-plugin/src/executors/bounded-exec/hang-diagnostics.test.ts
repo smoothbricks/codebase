@@ -32,10 +32,13 @@ const request = (): HangCaptureRequest => ({
   deadlineMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
 });
 
-/** The tree of a run that compiles: its runner, an idle child, and a compiler (pid 303) at `compiler` CPU time. */
-const compileTree = (child: string, compiler: string): string =>
+/**
+ * The tree of a run that compiles: its runner at `runner` CPU time, an idle child, and a compiler (pid 303) at
+ * `compiler` CPU time. Whole seconds as Linux ps prints them, unless the times say otherwise.
+ */
+const compileTree = (child: string, compiler: string, runner = '00:00'): string =>
   [
-    `${ROOT} 1 ${ROOT} S 0.0 03:01 00:00 ${STARTED} runner --test selected`,
+    `${ROOT} 1 ${ROOT} S 0.0 03:01 ${runner} ${STARTED} runner --test selected`,
     `202 ${ROOT} ${ROOT} S 0.0 03:00 ${child} ${STARTED} child waiting`,
     `303 202 ${ROOT} R 97.5 02:59 ${compiler} ${STARTED} rustc --crate-name hang_fixture`,
   ].join('\n');
@@ -369,6 +372,31 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.cpuRising).toEqual([]);
     expect(capture.text).not.toContain(COMPILE_CLASS);
     expect(capture.text).toContain('no process of the tree gained 2 s of CPU');
+  });
+
+  it('names a process that gained 1.2 s between centisecond readings, as macOS ps prints them, and says the 0.5 s bar', async () => {
+    const { host } = scriptedHost([
+      exited(compileTree('0:00.04', '0:03.63', '0:00.20')),
+      exited('', 1),
+      exited(compileTree('0:00.04', '0:04.83', '0:00.20')),
+    ]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.cpuRising).toEqual([{ pid: 303, command: 'rustc --crate-name hang_fixture', gainedMs: 1_200 }]);
+    expect(capture.text).toContain(`Classification: ${COMPILE_CLASS}`);
+    expect(capture.text).toContain('a rise is named from 0.5 s of CPU');
+    expect(capture.text).not.toContain('whole seconds');
+  });
+
+  it('says the 0.5 s bar when no centisecond reading gained that much', async () => {
+    const { host } = scriptedHost([
+      exited(compileTree('0:00.04', '0:03.63', '0:00.20')),
+      exited('', 1),
+      exited(compileTree('0:00.04', '0:03.98', '0:00.20')),
+    ]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.cpuRising).toEqual([]);
+    expect(capture.text).toContain('no process of the tree gained 0.5 s of CPU');
+    expect(capture.text).not.toContain('whole seconds');
   });
 
   it('says a CPU time it could not read rather than counting that process idle', async () => {

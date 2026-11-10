@@ -985,8 +985,11 @@ emits the completed observation, or an explicit incomplete-capture result, and s
 awaiting a probe. Diagnostic capture does not extend the configured no-progress deadline. Capture timestamps, the offset
 from the scheduled expiry and the actual expiry-to-capture interval accompany the observation. Process rows retain PID,
 PPID, PGID, state, percent CPU, elapsed time, CPU time, start identity and command. The snapshot's two process censuses,
-at least five seconds apart inside that window, name each process of the tree whose CPU time rose by at least two
-counted seconds between them, with its PID, command and gain; a rise classifies the expiry as "a process in the test's
+at least five seconds apart inside that window, name each process of the tree whose CPU time rose between them by at
+least the larger of 0.5 s and twice the coarser resolution of its two readings: two counted seconds where ps counts
+whole seconds (Linux), 0.5 s where it counts centiseconds (macOS, `0:03.63`). A bar of two seconds alone missed a
+spinner that held 47 % of a core over 5.1 s on a loaded macOS host. The snapshot's CPU line says the bar it used, in
+seconds. A process is named with its PID, command and gain, and a rise classifies the expiry as "a process in the test's
 tree was using CPU: likely a build inside the test" (a compile inside a test is a defect, not a test), which the wedged
 verdict records, and CPU never restarts the no-progress interval. On macOS the snapshot also holds call stacks: the
 runner and up to four leaf processes of its tree (members with no live child; further leaves are named, not sampled) are

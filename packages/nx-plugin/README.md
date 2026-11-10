@@ -2253,9 +2253,10 @@ Failed fixtures retain their cleanup obligation rather than suppressing signal e
 
 The final-ten-second pre-signal snapshot attributes the runner's process tree, its leader and leaf call stacks and
 observed resources, with explicit incomplete/raced results and no delay to termination. Its two process censuses, at
-least five seconds apart inside that window, name each process whose CPU time rose by at least two counted seconds and
-classify the expiry as a build inside the test; CPU never restarts the idle bound. Its timing, visibility and evidence
-contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
+least five seconds apart inside that window, name each process whose CPU time rose by at least the larger of 0.5 s and
+twice the coarser resolution of its two readings (two counted seconds where ps counts whole seconds, 0.5 s where it
+counts centiseconds) and classify the expiry as a build inside the test; CPU never restarts the idle bound. Its timing,
+visibility and evidence contract is defined in `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
 
 The snapshot-reset regression orders capture, test completion, and expiry through IPC, not heartbeat cadence. It
 deliberately holds the first capture's progress publication while another heartbeat arrives; only the observed PASS
@@ -2678,10 +2679,11 @@ task id and the hash it ran at:
   Its `lockWaits` lists only regular files the run holds on numbered descriptors that processes outside the run also
   hold open, naming those holders' pids and commands. This is open-handle evidence, not kernel lock-owner proof. The
   open-file census runs only on macOS, so on every other platform `lockWaits` is always empty. An incomplete or raced
-  capture records none. Its `cpuRising` lists each process of the run's tree whose CPU time rose by at least two counted
-  seconds between the snapshot's two process censuses, with its pid, command and gain: a build inside the test, which is
-  a defect and not a hang. It is empty when no process rose or the closing census did not complete, and a record written
-  before it carries none.
+  capture records none. Its `cpuRising` lists each process of the run's tree whose CPU time rose between the snapshot's
+  two process censuses by at least the larger of 0.5 s and twice the coarser resolution of its two readings (2 s at
+  whole seconds, 0.5 s at centiseconds), with its pid, command and gain: a build inside the test, which is a defect and
+  not a hang. It is empty when no process rose or the closing census did not complete, and a record written before it
+  carries none.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the
