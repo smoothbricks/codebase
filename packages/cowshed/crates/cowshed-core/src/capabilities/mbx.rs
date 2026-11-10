@@ -21,6 +21,17 @@ pub const BINARY_NAME: &str = "mbx";
 /// The installed mbx's own Cargo shim directory, led ahead of the project toolchain.
 pub const CARGO_ROUTE_ENV: &str = "COWSHED_CARGO_ROUTE";
 
+/// Whether a build starts mbx's automatic store sweep: never, in a job or a host shell
+/// (11_shell.md, "Canonical mbx environment"); the gateway runs it (05_gateway.md, "The mbx store
+/// sweep").
+pub const GC_AUTO_ENV: &str = "MBX_GC_AUTO";
+
+/// The one store every job's mbx shares, `MBX_CACHE_DIR`: `mbx` on the build-cache volume whose
+/// root is `build_cache` (03_caches.md, "mbx").
+pub fn store(build_cache: &Path) -> PathBuf {
+    build_cache.join(BINARY_NAME)
+}
+
 fn host_settings_file(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     let directory = home.join("Library/Application Support");
@@ -333,7 +344,7 @@ pub fn checkout_verdict(
 
 /// Host shells source the same canonical mbx environment as supervisor children (11_shell.md,
 /// "Canonical mbx environment"). `RUSTC_WRAPPER` is Cargo's to withhold.
-pub const HOST_ENVIRONMENT: [&str; 16] = [
+pub const HOST_ENVIRONMENT: [&str; 17] = [
     CARGO_ROUTE_ENV,
     "MBX_CACHE_DIR",
     "MBX_SESSION_ROOT",
@@ -341,6 +352,7 @@ pub const HOST_ENVIRONMENT: [&str; 16] = [
     "MBX_TARGET_ROOT",
     "MBX_DISABLE",
     "MBX_INCREMENTAL",
+    GC_AUTO_ENV,
     "RUSTC_WORKSPACE_WRAPPER",
     "MBX_SCHEDULER",
     "MBX_SCHEDULER_PRESSURE",
@@ -408,7 +420,7 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         access: GrantAccess::Read,
     });
     if let Some(root) = context.build_cache {
-        let store = root.join(BINARY_NAME);
+        let store = store(root);
         contribution.env.insert(
             "MBX_CACHE_DIR",
             EnvAction::Own(store.clone().into_os_string()),
@@ -434,6 +446,12 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
     contribution
         .env
         .insert("MBX_TARGET_VIEWS", EnvAction::Own("1".into()));
+    // The store sweep serves every job's builds, a host-shared resource no job may own, so no
+    // build starts it: the gateway runs it outside every job (11_shell.md, "Canonical mbx
+    // environment"; 05_gateway.md, "The mbx store sweep").
+    contribution
+        .env
+        .insert(GC_AUTO_ENV, EnvAction::Own("0".into()));
     // The one pool (05_gateway.md, "Host scheduling"), at the host's own settings, which a
     // project's `.mbx.toml` or a caller cannot change; never freezing a process. A job's
     // priority is its class's, set at its spawn; outside a job it is the non-gate value.

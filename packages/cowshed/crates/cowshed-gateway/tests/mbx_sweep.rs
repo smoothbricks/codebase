@@ -185,10 +185,9 @@ fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, job_root) = monitor_one.spawn_root(job).expect("spawn the job's root");
-    let store = swept.root.clone();
     let timer = MbxSweep {
         home: home.clone(),
-        store: Box::new(move || Some(store.clone())),
+        store: swept.root.clone(),
         every: Duration::from_millis(10),
     }
     .start()

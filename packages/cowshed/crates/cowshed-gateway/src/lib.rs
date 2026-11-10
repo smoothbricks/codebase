@@ -16,6 +16,7 @@ mod interfaces;
 mod land_turn;
 #[cfg(target_os = "macos")]
 mod listener_handoff;
+mod mbx_sweep;
 mod mirror;
 mod npm_index;
 mod nx_cache;
@@ -61,6 +62,7 @@ pub use interfaces::{
 };
 #[cfg(target_os = "macos")]
 pub use listener_handoff::{HandoffServer, handoff_path};
+pub use mbx_sweep::{MBX_SWEEP_EVERY, MbxSweep, MbxSweepTimer};
 pub use mirror::{
     MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
     MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,

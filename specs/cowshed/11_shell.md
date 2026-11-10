@@ -500,6 +500,7 @@ The canonical environment carries these owned values when the capability is pres
 | `MBX_TARGET_ROOT`                                                          | Unset, retaining mbx's default managed root on the cache filesystem.                                                                                                         |
 | `MBX_DISABLE`                                                              | Unset; the canonical route does not bypass mbx.                                                                                                                              |
 | `MBX_INCREMENTAL`                                                          | Unset; Cargo incremental identity follows 16_build_volumes.md, "One Cargo environment on every path".                                                                        |
+| `MBX_GC_AUTO`                                                              | `0`: no build starts mbx's automatic store sweep; the gateway runs it (05_gateway.md, "The mbx store sweep").                                                                |
 | `CARGO_TARGET_DIR`                                                         | Caller value removed by the Cargo contribution (15_capabilities.md, "Detection inputs").                                                                                     |
 | `MBX_SCHEDULER`                                                            | `1`.                                                                                                                                                                         |
 | `MBX_SCHEDULER_CPUS`, `MBX_SCHEDULER_RESERVE_CPUS`, `MBX_SCHEDULER_MEMORY` | Values resolved from the installed mbx's host-global settings, without a project's workspace policy or caller overrides.                                                     |
@@ -507,6 +508,14 @@ The canonical environment carries these owned values when the capability is pres
 | `MBX_SCHEDULER_SUSPEND`                                                    | `0`; scheduling never freezes processes (AGENTS.md, rule 6).                                                                                                                 |
 | `MBX_SCHEDULER_TESTS`                                                      | `1`, enabling mbx's supported Cargo-test and nextest target runners.                                                                                                         |
 | `MBX_SCHEDULER_PRIORITY`                                                   | The class mapping owned by 05_gateway.md, "Classes"; outside a job, the non-gate value. A job's own value, carried in `COWSHED_MBX_SCHEDULER_PRIORITY`, is restored over it. |
+
+No build starts mbx's automatic store sweep, in a job, a gate or a host shell (`MBX_GC_AUTO=0`). The sweep serves every
+job's builds long after the build that started it ends, so it is a host-shared resource, never a job member ("Shell
+activation and process reuse"): a collector a build forked was that job's outliving member, the job's retirement ended
+it mid-walk, and since mbx stamps a sweep only once it completes, the next build started it again from the top. On
+2026-11-10 one sweep started three times in 23 minutes, about 2.0M distinct paths looked up per start. The value is
+owned like every one above, so neither a project's `.mbx.toml` nor a caller turns the sweep back on in a job; the
+gateway runs it outside every job (05_gateway.md, "The mbx store sweep"), and `mbx gc` by hand still collects.
 
 The session root is a capability-owned writable runtime leaf in every job mode, prepared before the host shell's
 `.cowshed/env` is published, initially and after a capability change. Host shells receive it too: their served `TMPDIR`

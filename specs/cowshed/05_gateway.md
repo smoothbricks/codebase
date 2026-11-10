@@ -1529,6 +1529,53 @@ disk gone once the gateway closes the connection; `the_next_gateway_detaches_a_l
 gateway holding a lease, finds the disk still registered, and starts the namespace's next gateway, whose startup scan
 detaches it.
 
+## The mbx store sweep
+
+mbx's automatic sweep (`mbx gc --automatic`) collects the one store every job's builds share (03_caches.md, "mbx"), so
+it is a host-shared resource, never a job member (11_shell.md, "Shell activation and process reuse"). A collector a
+build forks leaves the build's process group (`process_group(0)`) but not its job: the job's conclusion retires it with
+every member that outlives the leader, and mbx, which stamps a sweep only once it completes, starts the next build's
+sweep from the top. On 2026-11-10 one sweep started three times in 23 minutes this way, about 2.0M distinct paths looked
+up per start, the host's largest source of vnode churn. So no build in a job starts it: every job's canonical mbx
+environment carries `MBX_GC_AUTO=0` (11_shell.md, "Canonical mbx environment"). The gateway runs it instead, as it forks
+a RAM disk's helper (above), outside every job.
+
+The gateway's `mbx-sweep` thread runs the installed mbx, the realpath of the `bin/mbx` link setup pins (14_nix.md,
+"mbx"), as `mbx gc --automatic`: once when the gateway starts serving, then 5 minutes after each run ends. The run
+decides for itself whether a sweep is due. mbx takes its `collector.lock`, and a run that finds it held exits at once;
+it then compares its `last-sweep` stamp with `gc.interval`, one `stat` and at most four `statfs` when nothing is due.
+Five minutes is mbx's shortest interval, the one it keeps while a disk is short of `gc.min_free_size`
+(`LOW_DISK_INTERVAL`), so a sweep that comes due starts at most five minutes late, at the default one-hour interval or
+the low-disk one. The run gets nothing of the gateway's environment but `HOME`, so mbx reads the host's own settings,
+and an operator's `gc.auto = false` still turns collection off; and the store's spelling in the canonical environment:
+`MBX_CACHE_DIR` naming `<build cache>/mbx`, and `MBX_TARGET_VIEWS=1`. The store is named once, when the timer starts: a
+gateway that starts with no build-cache volume mounted starts no timer and says so, since without one no job has an mbx
+store (15_capabilities.md, "mbx detection"); its next start sweeps. While no mbx is installed, or its link does not
+resolve, no run starts; the gateway says why on its stderr once, and again only when the reason changes.
+
+Each run leads a process group of its own, so neither a job's retirement nor launchd's teardown of the gateway's group
+(launchd.plist(5), `AbandonProcessGroup`, which the agent leaves unset) reaches it. Its stdin and stdout are
+`/dev/null`, and its stderr is appended to mbx's own sweep log, `<store>/actions/gc/v1/sweep.log`, as mbx's own
+collector's is. The timer opens the log once, when it starts, and every run appends through it; a log that cannot be
+opened leaves every run's stderr discarded, said on the gateway's stderr, since a full disk is when the sweep matters
+most. The thread waits for each run's exit before it counts the next five minutes, so the gateway never starts a run
+beside a running one. That wait has no bound: the run's own end ends it, and a run started beside it would find
+`collector.lock` held and exit. The gateway's stderr names every run,
+`cowshed: mbx sweep pid <pid> started: <program> gc --automatic, MBX_CACHE_DIR=<store>`, and its exit status and wall
+time.
+
+A gateway restart or an install leaves a run in flight running: it is no member of the gateway's group, and launchd
+reaps it once it ends. The next gateway's first run finds `collector.lock` held and exits, and the timer runs again five
+minutes later. A run that ends without completing anyway, killed or cut by a reboot, costs only what mbx's phase resume
+leaves: the next run within the interval skips the phases the cut one completed (mbx's `gc --automatic`).
+
+The regressions are `cowshed-core`'s `a_build_never_starts_the_automatic_sweep`, the canonical environment's
+`MBX_GC_AUTO=0`, and `cowshed-gateway`'s `the_gateway_sweep_belongs_to_no_job_and_never_stacks`: a job runs while the
+timer starts a stand-in for the installed mbx behind a fixture home's link. When the job concludes, its retirement
+signals no sweep, the sweep runs on with `HOME`, the store and no `MBX_GC_AUTO` in its environment, and its stderr is in
+the store's sweep log; the same sweep forked inside a job is retired with it. Each sweep reports whether another of its
+store was running when it started, and the next one starts, alone, only once the first has ended.
+
 ## Host scheduling
 
 The kernel schedules runnable threads and their I/O. Resource admission has one authority: with mbx present on the host,

@@ -1685,6 +1685,32 @@ pub(crate) fn detach_stderr(daemon: &str) {
     }
 }
 
+/// Run the installed mbx's store sweep on the gateway's timer (05_gateway.md, "The mbx store
+/// sweep"). No job's build starts it, so a timer that cannot start leaves the store to `mbx gc`.
+fn sweep_mbx_store_from_now_on(home: &Path) -> Option<cowshed_gateway::MbxSweepTimer> {
+    let Some(build_cache) = cowshed_core::storage::bootstrap::native::provisioned_build_cache()
+    else {
+        cowshed_os::eprintln!(
+            "cowshed: mbx sweep: no build-cache volume is mounted, so no job has an mbx store; this gateway sweeps none, and its next start does"
+        );
+        return None;
+    };
+    let sweep = cowshed_gateway::MbxSweep {
+        home: home.to_path_buf(),
+        store: cowshed_core::capabilities::mbx::store(&build_cache),
+        every: cowshed_gateway::MBX_SWEEP_EVERY,
+    };
+    match sweep.start() {
+        Ok(timer) => Some(timer),
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: the mbx store sweep did not start: {error}; no build sweeps the store until the gateway starts again, and mbx gc sweeps it by hand"
+            );
+            None
+        }
+    }
+}
+
 fn reap_scratch_from_now_on(store: PathBuf) {
     let started = std::thread::Builder::new()
         .name("scratch-reaper".to_owned())
@@ -1804,6 +1830,9 @@ async fn run_daemon() -> Result<()> {
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
     reap_scratch_from_now_on(store_root.clone());
+    // The mbx store sweep is host-shared, so the gateway runs it, outside every job (05_gateway.md,
+    // "The mbx store sweep"). Held until the function returns, after the drain.
+    let _mbx_sweep = sweep_mbx_store_from_now_on(&home);
     let handle = OwnedGateway::new(gateway.handle());
     let started = async {
         serve_supervisors(&store_root, manager).await?;

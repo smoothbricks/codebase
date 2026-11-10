@@ -622,12 +622,12 @@ into one) is a different compilation.
 
 In a Cargo project on a host where `cowshed setup` has installed mbx and provisioned its Cargo shim, every workspace
 child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets `MBX_CACHE_DIR` naming the shared
-store, `MBX_TARGET_VIEWS=1` and mbx's scheduler settings, with the shim's directory leading its `PATH` so plain `cargo`
-is mbx's, and loses any `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` a caller exported: no wrapper sits between Cargo
-and rustc. The project opts in to nothing, and a project that pins its own mbx is built with the installed one, never
-refused or given a second store. A host without the install, with a link that no longer resolves, or with a link and no
-shim directory yet, builds plain Cargo into its build volume; `cowshed doctor` reports a broken link, and
-`cowshed setup` repairs it.
+store, `MBX_TARGET_VIEWS=1`, `MBX_GC_AUTO=0` (the gateway sweeps the store, outside every job) and mbx's scheduler
+settings, with the shim's directory leading its `PATH` so plain `cargo` is mbx's, and loses any `RUSTC_WRAPPER` or
+`RUSTC_WORKSPACE_WRAPPER` a caller exported: no wrapper sits between Cargo and rustc. The project opts in to nothing,
+and a project that pins its own mbx is built with the installed one, never refused or given a second store. A host
+without the install, with a link that no longer resolves, or with a link and no shim directory yet, builds plain Cargo
+into its build volume; `cowshed doctor` reports a broken link, and `cowshed setup` repairs it.
 
 Cowshed sets no incremental mode, at any mount and for any command, `cowshed land --check` included: incremental
 compilation is mbx's, and a land check builds the same units an interactive command builds.
