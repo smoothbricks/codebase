@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BuildInputRecord } from '@smoothbricks/build-inputs';
+import {
+  dialectFixture,
+  fixture,
+  sideOutputFixture,
+  utilityPluginFixture,
+} from '../../__tests__/typescript-emit-fixtures.js';
 import { EMIT_OVERRIDES } from './emit-overrides.js';
 import typescriptEmitExecutor, {
   type CompilerInvocation,
@@ -13,168 +18,6 @@ import typescriptEmitExecutor, {
   readVerboseEmit,
   runTypeScriptEmit,
 } from './executor.js';
-
-async function fixture(source: string) {
-  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
-  await mkdir(join(root, 'src'));
-  await mkdir(join(root, 'node_modules'));
-  await symlink(
-    dirname(createRequire(import.meta.url).resolve('typia/package.json')),
-    join(root, 'node_modules/typia'),
-    'dir',
-  );
-  await writeFile(join(root, 'package.json'), JSON.stringify({ type: 'module', dependencies: { typia: '*' } }));
-  await writeFile(
-    join(root, 'tsconfig.lib.json'),
-    JSON.stringify({
-      compilerOptions: {
-        target: 'ES2022',
-        module: 'NodeNext',
-        rootDir: 'src',
-        outDir: 'dist',
-        declaration: true,
-        declarationMap: true,
-        emitDeclarationOnly: true,
-        types: [],
-        skipLibCheck: true,
-      },
-      include: ['src/**/*.ts'],
-    }),
-  );
-  await writeFile(join(root, 'src/index.ts'), source);
-  return root;
-}
-
-/**
- * A project whose transform runs in ttsc's utility-plugin lane: lmao-ttsc's descriptor names a linked Go library, which
- * ttsc links into its utility host (a project with typia links it into typia's host instead). The lane is what this
- * fixture is for, not lmao's rewrite; the shards' inputs name that descriptor.
- */
-async function utilityPluginFixture(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-utility-'));
-  await mkdir(join(root, 'src'));
-  await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
-  await symlink(
-    join(import.meta.dir, '../../../../lmao-ttsc'),
-    join(root, 'node_modules/@smoothbricks/lmao-ttsc'),
-    'dir',
-  );
-  await writeFile(join(root, 'package.json'), JSON.stringify({ type: 'module' }));
-  await writeFile(
-    join(root, 'tsconfig.lib.json'),
-    JSON.stringify({
-      compilerOptions: {
-        target: 'ES2022',
-        module: 'NodeNext',
-        rootDir: 'src',
-        outDir: 'dist',
-        types: [],
-        skipLibCheck: true,
-        plugins: [{ transform: '@smoothbricks/lmao-ttsc/ttsc-plugin' }],
-      },
-      include: ['src/**/*.ts'],
-    }),
-  );
-  await writeFile(join(root, 'src/index.ts'), 'export const index = 1;\n');
-  return root;
-}
-
-/**
- * A project whose linked plugin (`src/__tests__/side-output-plugin`) writes `side-output.json` into outDir, beside the
- * compiler's outputs, as a census-writing lint plugin writes its census. ttsc links the plugin into its utility host,
- * or into typia's host when the project uses typia.
- */
-async function sideOutputFixture(host: 'utility' | 'typia'): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-side-output-'));
-  await mkdir(join(root, 'src'));
-  await mkdir(join(root, 'node_modules'));
-  await symlink(
-    join(import.meta.dir, '../../__tests__/side-output-plugin'),
-    join(root, 'node_modules/side-output-plugin'),
-    'dir',
-  );
-  await writeFile(
-    join(root, 'package.json'),
-    JSON.stringify(host === 'typia' ? { type: 'module', dependencies: { typia: '*' } } : { type: 'module' }),
-  );
-  if (host === 'typia') {
-    await symlink(
-      dirname(createRequire(import.meta.url).resolve('typia/package.json')),
-      join(root, 'node_modules/typia'),
-      'dir',
-    );
-  }
-  await writeFile(
-    join(root, 'tsconfig.lib.json'),
-    JSON.stringify({
-      compilerOptions: {
-        target: 'ES2022',
-        module: 'NodeNext',
-        rootDir: 'src',
-        outDir: 'dist',
-        types: [],
-        skipLibCheck: true,
-        plugins: [{ transform: 'side-output-plugin' }],
-      },
-      include: ['src/**/*.ts'],
-    }),
-  );
-  await writeFile(
-    join(root, 'src/index.ts'),
-    host === 'typia'
-      ? "import typia from 'typia';\nexport const validate = typia.createValidate<{ value: number }>();\n"
-      : 'export const index = 1;\n',
-  );
-  return root;
-}
-
-/**
- * A project whose linked plugin (`src/__tests__/dialect-plugin`) admits `for await (… of lowered)` in a generator and
- * lowers it to the sync loop. The checker refuses every `for await` in a generator (TS1103); the plugin withdraws the
- * refusal of its own dialect through the driver's DiagnosticPlugin seam (the managed ttsc patch), on ttsc's utility
- * host, or on typia's when the project uses typia.
- */
-async function dialectFixture(host: 'utility' | 'typia', iterated: 'lowered' | 'kept'): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-dialect-'));
-  await mkdir(join(root, 'src'));
-  await mkdir(join(root, 'node_modules'));
-  await symlink(
-    join(import.meta.dir, '../../__tests__/dialect-plugin'),
-    join(root, 'node_modules/dialect-plugin'),
-    'dir',
-  );
-  await writeFile(
-    join(root, 'package.json'),
-    JSON.stringify(host === 'typia' ? { type: 'module', dependencies: { typia: '*' } } : { type: 'module' }),
-  );
-  if (host === 'typia') {
-    await symlink(
-      dirname(createRequire(import.meta.url).resolve('typia/package.json')),
-      join(root, 'node_modules/typia'),
-      'dir',
-    );
-  }
-  await writeFile(
-    join(root, 'tsconfig.lib.json'),
-    JSON.stringify({
-      compilerOptions: {
-        target: 'ES2022',
-        module: 'NodeNext',
-        rootDir: 'src',
-        outDir: 'dist',
-        types: [],
-        skipLibCheck: true,
-        plugins: [{ transform: 'dialect-plugin' }],
-      },
-      include: ['src/**/*.ts'],
-    }),
-  );
-  await writeFile(
-    join(root, 'src/index.ts'),
-    `declare const ${iterated}: Iterable<number>;\nexport function* values() {\n  for await (const value of ${iterated}) yield value;\n}\n`,
-  );
-  return root;
-}
 
 /** Every file under `directory` with what a write changes: its inode, modification time and status-change time. */
 async function fileIdentities(directory: string): Promise<Record<string, readonly bigint[]>> {
