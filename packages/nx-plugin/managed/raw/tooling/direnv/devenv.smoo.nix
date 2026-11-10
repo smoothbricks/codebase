@@ -96,9 +96,9 @@
   '';
 
   # The Linux rust-std set every Linux Rust artifact ships for except
-  # x86_64-unknown-linux-gnu, which the base shell already carries; see
-  # `profiles.linux-cross` below for where it applies and why. zig and
-  # cargo-zigbuild are in the base shell (see `packages`).
+  # x86_64-unknown-linux-gnu. Every host's base shell carries it (see
+  # `languages.rust.targets` below and the note above `profiles.linux-cross`).
+  # zig and cargo-zigbuild are in the base shell (see `packages`).
   linuxToolchain = {
     languages.rust.targets = [
       "aarch64-unknown-linux-gnu"
@@ -265,7 +265,7 @@ in {
         "wasm32-unknown-unknown"
         "x86_64-unknown-linux-gnu"
       ]
-      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxToolchain.languages.rust.targets;
+      ++ linuxToolchain.languages.rust.targets;
   };
 
   # The Linux Rust toolchain is cargo-zigbuild driving zig, plus the Linux
@@ -277,26 +277,27 @@ in {
   # host's glibc floor. cargo-zigbuild supplies the `zig cc` shims and per-triple
   # compiler variables itself, so this module sets no environment.
   #
-  # Every host's base shell carries zig, cargo-zigbuild and the
-  # x86_64-unknown-linux-gnu rust-std, which is all the cross clippy needs, so
-  # `cargo-lint-cross` runs in any checkout's shell and in the land gate's one Nx
-  # graph beside every other gate task. A Linux host also carries the remaining
-  # Linux rust-std set in the base shell, because its ordinary `build` includes
-  # its own platform's artifacts. A macOS host opts into that set through the
-  # `linux-cross` profile, activated by `devenv -P linux-cross`: the three
-  # rust-std targets are about 0.5 GiB and only a Linux artifact built on Darwin
-  # needs them. devenv 2.2.3 has first-class profiles, so this is one gated
-  # module in the shared file rather than a second config directory that would
-  # re-import and re-pin everything here.
+  # Every host's base shell carries zig, cargo-zigbuild and the whole Linux
+  # rust-std set, so `cargo-lint-cross` and every Linux artifact build run in
+  # any checkout's shell and in the land gate's one Nx graph beside every other
+  # gate task. On macOS the three targets beyond x86_64-unknown-linux-gnu are
+  # about 0.5 GiB, fetched once per Nix store. They were a `linux-cross`
+  # profile, which no fork inherits: cowshed carries the base shell's activation
+  # to every fork (cowshed 11_shell.md, "Inherited shells"), while devenv keys a
+  # profile's evaluation and its shell on the checkout's path, so the first
+  # profile entry in a fresh fork evaluated from scratch (225 s, silent, inside
+  # a consumer's land-gate watchdog, 2026-11-11). Cargo keys no unit on rustc's path
+  # (cargo-toolchain-paths.ts), so the larger set moves no cargo task's key.
   #
   # Neither shell sets CARGO_BUILD_TARGET: the triple belongs to the Nx target
   # that asks for it (`cargo-lint-cross` passes `--target` explicitly), not to
   # the ambient environment. An ambient triple would make the check silently
   # host-local wherever it was missing, reporting green having compiled macOS,
   # and a host lint can never be mistaken for a cross one.
-  profiles.linux-cross.module = {
-    config = lib.mkIf (!pkgs.stdenv.hostPlatform.isLinux) linuxToolchain;
-  };
+  # `linux-cross` adds nothing: it stays declared because devenv refuses a
+  # profile the module does not define, and a caller that still passes
+  # `-P linux-cross` keeps entering the same shell.
+  profiles.linux-cross.module = {};
 
   # linux-cross is the only profile here, and the shape of the publish job is
   # why. A lean publish shell was measured and rejected, so the next reader does

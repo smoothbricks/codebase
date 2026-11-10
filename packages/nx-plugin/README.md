@@ -419,14 +419,14 @@ all three. The object moves when the toolchain moves, once, and nothing else in 
 sources are not hashed instead: the managed module alone changed 43 times in the 30 days to 2026-10-26, and each edit
 would have rekeyed every cargo verdict; evaluated at those commits on Linux x86_64, the observed store objects did not
 change. rustc and cargo are not in the list on purpose. Cargo keys units on the output of rustc's version command, which
-is hashed beside this input, never on rustc's path. On a non-Linux host the default shell and its linux-cross profile
-carry different rust-std sets, so that path would split one target's key between the two shells. Only a path in the Nix
-store counts; a path elsewhere is ignored. A linker named only by Cargo configuration is outside this environment probe:
-a target that runs one must name the script itself as an input. Workspace test runners additionally hash the manifest of
-every package the workspace build compiles inside the Nx workspace (a member's, and a path package's that reaches the
-build only as some crate's dev-dependency), because those affect unified features, and the nextest
-executable/configuration. While the build compiles a path package outside the Nx workspace, every runner also names
-externalRustCrates, which then must be declared: a runner's key does not follow the test build's outputs.
+is hashed beside this input, never on rustc's path. The shells of one host may carry different rust-std sets, so that
+path would split one target's key between them. Only a path in the Nix store counts; a path elsewhere is ignored. A
+linker named only by Cargo configuration is outside this environment probe: a target that runs one must name the script
+itself as an input. Workspace test runners additionally hash the manifest of every package the workspace build compiles
+inside the Nx workspace (a member's, and a path package's that reaches the build only as some crate's dev-dependency),
+because those affect unified features, and the nextest executable/configuration. While the build compiles a path package
+outside the Nx workspace, every runner also names externalRustCrates, which then must be declared: a runner's key does
+not follow the test build's outputs.
 
 Nothing machine-local takes part. The ambient cargo environment as a whole and the global `$CARGO_HOME/config.toml` are
 deliberately not hashed: their values carry per-checkout state directories (`CARGO_INSTALL_ROOT` moves under the active
@@ -1509,8 +1509,7 @@ Concrete targets come from concrete files:
   executor with `bin` set; a static CLI targets `<arch>-unknown-linux-musl`. The executor runs `cargo-zigbuild`
   directly, removes any compiler or linker the shell names for its triple (a Linux shell pins its host compiler for
   `x86_64-unknown-linux-gnu`), and reads the artifact path from cargo's JSON messages. zig and cargo-zigbuild come from
-  the managed devenv module, in every shell; the Linux rust-std set beyond `x86_64-unknown-linux-gnu` comes with a Linux
-  shell, and on macOS only inside the `linux-cross` profile (`tooling/devenv -P linux-cross shell -- …`).
+  the managed devenv module, and so does the whole Linux rust-std set, in every shell on every host.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.

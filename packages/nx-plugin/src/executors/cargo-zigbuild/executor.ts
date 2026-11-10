@@ -75,22 +75,21 @@ export function cargoTriple(target: string): string {
 }
 
 /**
- * The remedy for a failed build of `target` on this host, when rustc has no standard library for its triple: every
- * managed shell carries `x86_64-unknown-linux-gnu`'s, and on macOS the rest of the Linux set is the `linux-cross`
- * profile's. A build outside it fails in rustc, which names the missing target but not the profile. `libdir` is what
+ * The remedy for a failed build of `target`, when rustc has no standard library for its triple: every managed shell
+ * carries the whole Linux rust-std set, so that rustc is not the one the checkout's shell provides. A build outside it
+ * fails in rustc, which names the missing target but not the shell. `libdir` is what
  * `rustc --print target-libdir --target <triple>` printed, or null when rustc could not answer.
  */
 export function missingRustStdRemedy(
   command: string,
   target: string,
-  platform: NodeJS.Platform,
   libdir: { readonly path: string; readonly exists: boolean } | null,
 ): string | null {
-  if (platform !== 'darwin' || libdir === null || libdir.exists) return null;
+  if (libdir === null || libdir.exists) return null;
   return (
-    `${command}: rustc has no standard library for ${cargoTriple(target)} (${libdir.path} is absent). On macOS the ` +
-    "Linux rust-std set beyond x86_64-unknown-linux-gnu is the linux-cross profile's: tooling/devenv -P linux-cross " +
-    'shell -- nx run <project>:<target>'
+    `${command}: rustc has no standard library for ${cargoTriple(target)} (${libdir.path} is absent). Every managed ` +
+    "shell carries the Linux rust-std set, so this rustc is not the checkout's shell's: enter it (direnv reload) and " +
+    'run nx run <project>:<target> again'
   );
 }
 
@@ -262,7 +261,7 @@ export default async function cargoZigbuildExecutor(
   }
   if (status.code !== 0) {
     console.error(`${command}: exited with ${status.signal ?? `status ${status.code}`}`);
-    const remedy = missingRustStdRemedy(command, options.target, process.platform, await rustLibdir(options.target));
+    const remedy = missingRustStdRemedy(command, options.target, await rustLibdir(options.target));
     if (remedy !== null) console.error(remedy);
     return { success: false };
   }
