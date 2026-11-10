@@ -113,15 +113,20 @@ impl Drop for Workspace {
 struct FakeHost {
     fence: Arc<ChildFence>,
     socket: StdUnixStream,
+    /// The write end of the stand-in's stdin: it reads until this closes.
+    _stdin: OwnedFd,
 }
 
 impl FakeHost {
     fn start() -> (ExecHost, Self) {
         let (ours, theirs) = StdUnixStream::pair().unwrap();
-        let mut command = std::process::Command::new("/bin/sleep");
+        // `/bin/sh`'s builtin `read` on a pipe this test holds stands for the host, as the fence's
+        // own tests run one: it needs no other program, which a runner may not have at any path.
+        let (read, stdin) = pipe().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
         command
-            .arg("600")
-            .stdin(Stdio::null())
+            .args(["-c", "read -r line"])
+            .stdin(Stdio::from(read))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let fence = Arc::new(ChildFence::spawn(command).unwrap());
@@ -141,6 +146,7 @@ impl FakeHost {
             Self {
                 fence,
                 socket: theirs,
+                _stdin: stdin,
             },
         )
     }
