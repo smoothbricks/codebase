@@ -410,6 +410,7 @@ describe('spawnLandTurn', () => {
   });
 });
 
+//#region smoo/cowshed!n/read-fences-turns
 describe('spawnAwaitTurns', () => {
   it('runs its command unfenced, with its status, when its gateway does not answer', async () => {
     const fixture = await Fixture.create('cowshed-launch-await-');
@@ -429,3 +430,4 @@ describe('spawnAwaitTurns', () => {
     }
   });
 });
+//#endregion smoo/cowshed!n/read-fences-turns

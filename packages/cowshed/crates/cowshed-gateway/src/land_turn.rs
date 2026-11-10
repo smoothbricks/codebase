@@ -1358,6 +1358,7 @@ mod tests {
         assert_eq!(kept.last(), Some(&total));
     }
 
+    //#region smoo/cowshed!n/read-fences-turns
     /// An install's read fences only when no queue has a ticket; an ask under the fence is parked,
     /// never numbered, and changes no queue; once the last fence is lifted the parked ask is
     /// numbered first, and a read that finds a holder sets no fence (05_gateway.md "The read
@@ -1474,4 +1475,5 @@ mod tests {
         assert_eq!(turns.ask(4, ask("repo", "d"), 40, 5), Err(Parked));
         assert_eq!(turns.unfence().numbered, [(4, 3)]);
     }
+    //#endregion smoo/cowshed!n/read-fences-turns
 }

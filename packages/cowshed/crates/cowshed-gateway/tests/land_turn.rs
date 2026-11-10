@@ -594,6 +594,7 @@ async fn raw_answer(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json::V
     serde_json::from_str(&line).expect("a land-turn answer")
 }
 
+//#region smoo/cowshed!n/read-fences-turns
 /// The install's fenced read finds no holder and fences every queue: an ask meanwhile is answered
 /// `fenced` and parked, never numbered, on a connection the gateway keeps open. Once the install's
 /// connection has closed and its fence is lifted, the parked ask is numbered on that same
@@ -962,6 +963,7 @@ async fn an_ask_closed_before_any_answer_fails() {
     );
     serving.abort();
 }
+//#endregion smoo/cowshed!n/read-fences-turns
 
 /// Recorded 2026-10-28 13:52:39Z (`lands/8e24efb3….after2.log:77`): a land passed its slot check,
 /// an install took the slot and read no turn holder, the land asked its turn and bound its gate,

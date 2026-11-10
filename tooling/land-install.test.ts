@@ -262,6 +262,7 @@ const ticket = (number: number, workspace: string, pid: number) => ({
   command: 'land',
 });
 
+//#region smoo/cowshed!n/land-installs-after-turn
 describe('installReadiness', () => {
   it('is ready when nothing holds the install slot', () => {
     expect(installReadiness(status({}))).toEqual({ kind: 'ready' });
@@ -362,6 +363,7 @@ describe('setupBlockers', () => {
     });
   }
 });
+//#endregion smoo/cowshed!n/land-installs-after-turn
 
 describe('setupOutcome', () => {
   it('is installed by exit status 0 alone', () => {
