@@ -287,7 +287,21 @@ mod tests {
     }
     #[test]
     fn the_probe_answers() {
-        super::running().unwrap();
+        match super::running() {
+            Ok(_) => {}
+            // A daemon systemd does not run leaves no cgroup record; the probe names the path it
+            // read rather than answering "no build" (any_process_of).
+            #[cfg(target_os = "linux")]
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !std::path::Path::new(super::super::job_cgroup::CGROUP_MOUNT)
+                        .join(super::DAEMON_CGROUP)
+                        .exists() =>
+            {
+                assert!(error.to_string().contains(super::DAEMON_CGROUP), "{error}");
+            }
+            Err(error) => panic!("the probe failed: {error}"),
+        }
         if let Some(members) = super::group_members(super::BUILD_GROUP).unwrap() {
             assert_eq!(super::build_users().unwrap().len(), members.len());
         }
