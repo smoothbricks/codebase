@@ -405,9 +405,10 @@ The monotonic phases are:
    blocking build/seed work, cancelled mint cleanup and background reclamation retain their own holds until they finish,
    even if their caller is gone. The project lease is the inode `.retirements/<owner>/<repo>.lease` names: every holder,
    shared or the collector's exclusive, checks after locking (and after a refused attempt) that the path still names the
-   inode it locked, by device and inode without following a link, and reopens it when not. So the one removal of it, an
-   unbinding's under its exclusive upgrade (above), leaves every holder meeting on the inode at the path. A separate run
-   lease excludes concurrent execution and rejects a stale operation generation.
+   inode it locked, by device and inode without following a link, and reopens it when not. So each removal of it, an
+   unbinding's under its exclusive upgrade or the gateway startup's reclaim under its exclusive lock (above), leaves
+   every holder meeting on the inode at the path. A separate run lease excludes concurrent execution and rejects a stale
+   operation generation.
 2. **`drained`**: the exact workspace supervisors answer the existing drain protocol, and kernel socket-peer exit
    watches prove they ended. Their socket leases and the existing lost-job-group reconciliation remain held. An unknown
    response, unresolved group, active controller, or held lifecycle intent refuses; a PID lookup cannot substitute for
