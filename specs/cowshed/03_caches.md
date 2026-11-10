@@ -582,8 +582,14 @@ its invoker's `PATH` finds `bun`, named as a devenv or nix profile and never as 
 `bun` is the one the gateway runs. One process exclusively owns each entries directory, and binds loopback only; its
 configuration is host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to
 the store. Every checkout reads its project's results. Only a land publishes: after its gate passes it stores every task
-result its gate attributed, local hits included, without rebuilding (05_gateway.md, "/nx/v1/cache/{hash}"). There is no
-scratch store, and a shed's read-only Nx client builds no archive and sends no `PUT`.
+result its gate attributed, local hits included, without rebuilding (05_gateway.md, "/nx/v1/cache/{hash}"). It asks the
+store for each key first, with a `GET` whose body it cancels at once: a stored key is counted and never archived. Only a
+missing key is archived, by the publisher itself, as the archive the pinned Nx's native `HttpRemoteCache.store` writes
+(`native/cache/http_remote_cache.rs`: tar 0.4.44 entries for `<cache>/<hash>/`, then `terminalOutput` and a four-byte
+big-endian `code`) byte for byte, but gzipped at level 1 rather than Nx's default 6. The store shares the land's disk,
+so compression time is the cost and archive bytes are not, and Nx's restore gunzips any level. One `PUT` with the
+archive's `Content-Length` sends it; a `409`, a key stored after the `GET`, counts as stored. There is no scratch store,
+and a shed's read-only Nx client builds no archive and sends no `PUT`.
 
 The installed gateway starts the backend as `bun <installed bundle> --exit-on-stdin-eof`, `bun` resolved on that
 recorded `PATH` at each start (none found is a start failure said as one), and retains the write end of its stdin pipe
