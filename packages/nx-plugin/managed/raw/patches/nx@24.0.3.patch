@@ -1443,10 +1443,10 @@ index 12c1507aec3cf894bc18c680818bf76ec1533cca..00000000000000000000000000000000
 -}
 diff --git a/dist/src/daemon/server/file-watching/watch-probe.d.ts b/dist/src/daemon/server/file-watching/watch-probe.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..30587ffc12d595af06589755d8455dab002218f0
+index 0000000000000000000000000000000000000000..2c6c035de438e7a25e5655216a53ac35c41f3385
 --- /dev/null
 +++ b/dist/src/daemon/server/file-watching/watch-probe.d.ts
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,15 @@
 +import type { WatchEvent } from '../../../native';
 +/**
 + * The paths the daemon's watch must admit for its probes (`alwaysWatch`), to
@@ -1458,17 +1458,16 @@ index 0000000000000000000000000000000000000000..30587ffc12d595af06589755d8455dab
 +export declare function takeProbeEvents(events: WatchEvent[]): WatchEvent[];
 +/**
 + * Resolves `undefined` once everything written before the call has reached
-+ * the daemon, or the reason the watch's stream cannot be proven current. The
-+ * first call to resolve `undefined` also walks the files the daemon booted
-+ * with again.
++ * the daemon, or the reason the watch's stream cannot be proven current. A
++ * call that resolves `undefined` has also walked the files again.
 + */
 +export declare function proveWatcherCurrent(): Promise<string | undefined>;
 diff --git a/dist/src/daemon/server/file-watching/watch-probe.js b/dist/src/daemon/server/file-watching/watch-probe.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..ca20d04762ecef4b49f9ab1ade15b1a5d1023739
+index 0000000000000000000000000000000000000000..a3020e12bc219b7cbedb441a0a049ca8173d8c60
 --- /dev/null
 +++ b/dist/src/daemon/server/file-watching/watch-probe.js
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,167 @@
 +'use strict';
 +Object.defineProperty(exports, '__esModule', { value: true });
 +exports.watchProbeAdmissions = watchProbeAdmissions;
@@ -1504,12 +1503,6 @@ index 0000000000000000000000000000000000000000..ca20d04762ecef4b49f9ab1ade15b1a5
 +let probeDirectory;
 +let streamStoppedReason;
 +let probeSequence = 0;
-+// No event vouches for the daemon's boot walk: a write the walk read past
-+// before the stream delivered it (a shed's first check writing an output while
-+// the daemon its keeper started boots) reaches neither. The first probe that
-+// comes back proves the stream from then on, so right after it the daemon
-+// walks the files once more and routes what that walk finds changed.
-+let bootWalkProven = false;
 +const probesAwaited = new Map();
 +function probeDirectoryInsideWorkspace() {
 +  const root = (0, node_fs_1.realpathSync)(workspace_root_1.workspaceRoot);
@@ -1628,11 +1621,14 @@ index 0000000000000000000000000000000000000000..ca20d04762ecef4b49f9ab1ade15b1a5
 +    logger_1.serverLogger.watcherLog(
 +      `watcher current: probe came back in ${(node_perf_hooks_1.performance.now() - writtenAt).toFixed(1)} ms`,
 +    );
-+    if (!bootWalkProven) {
-+      const changed = (0, project_graph_incremental_recomputation_1.rewalkWorkspaceChanges)();
-+      bootWalkProven = true;
-+      logger_1.serverLogger.watcherLog(`boot walk proven: the walk after the first probe found ${changed} files changed`);
-+    }
++    // A probe proves the stream only from its own write on. The files the
++    // daemon holds can still lack a write the stream never delivered: one its
++    // boot walk read past before the stream delivered it, or one fseventsd
++    // dropped, whose rescan flag can arrive after a later probe came back. So
++    // every probe that comes back is followed by one walk of the files, and what
++    // that walk finds changed is routed before the request is answered.
++    const changed = (0, project_graph_incremental_recomputation_1.rewalkWorkspaceChanges)();
++    logger_1.serverLogger.watcherLog(`files walked after the probe: ${changed} changed`);
 +    return undefined;
 +  } finally {
 +    probesAwaited.delete(probe);
@@ -1778,7 +1774,7 @@ index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba990
          logger_1.serverLogger.log('[LATEST-NX]: Reusing cached Nx installation from', latestNxTmpPath);
          return latestNxTmpPath;
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts b/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
-index 63638e921d68af659ca03f65e82a98c1e2e3f853..2e4f5cc7fb378f752a2539101659c36de509a84f 100644
+index 63638e921d68af659ca03f65e82a98c1e2e3f853..b329afc3da3053a3460c44c6ae67130459e820f6 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
 +++ b/dist/src/daemon/server/project-graph-incremental-recomputation.d.ts
 @@ -32,6 +32,12 @@ export declare function routeAppliedChanges(batch: ChangeBatch): void;
@@ -1787,15 +1783,15 @@ index 63638e921d68af659ca03f65e82a98c1e2e3f853..2e4f5cc7fb378f752a2539101659c36d
  export declare function flushPendingWorkspaceChanges(): Promise<void>;
 +/**
 + * Walks the workspace's files again and routes what changed against the files
-+ * the context held: for files no watch event vouches for, as the daemon's boot
-+ * walk. Answers how many files changed.
++ * the context held, for files no watch event vouches for. Answers how many
++ * files changed.
 + */
 +export declare function rewalkWorkspaceChanges(): number;
  /**
   * Applies changes a caller learned of on its own to the workspace context,
   * then schedules the recomputation as for a batch the context applied.
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..a5a73e9d199a037493d91c9c16c85a06f9a697a9 100644
+index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..8e3192fef166f49c246aef0ff87b4084683cb840 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
 +++ b/dist/src/daemon/server/project-graph-incremental-recomputation.js
 @@ -4,6 +4,7 @@ exports.currentSourceMaps = exports.currentProjectGraph = exports.currentProject
@@ -1866,8 +1862,8 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..a5a73e9d199a037493d91c9c16c85a06
  }
 +/**
 + * Walks the workspace's files again and routes what changed against the files
-+ * the context held: for files no watch event vouches for, as the daemon's boot
-+ * walk. Answers how many files changed.
++ * the context held, for files no watch event vouches for. Answers how many
++ * files changed.
 + */
 +function rewalkWorkspaceChanges() {
 +    if (!(0, workspace_context_1.isWatchingWorkspaceContext)())

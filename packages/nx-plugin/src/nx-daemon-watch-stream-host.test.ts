@@ -21,10 +21,11 @@ import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fix
  * started. A plugin worker is no command and makes none. Linux inotify has no such failure mode (no fseventsd between
  * the kernel and the watcher), so there the daemon only settles its watch before answering.
  *
- * The daemon's first probe also proves the files it booted with. Its boot walk can predate a write its stream never
- * reports: a daemon a shed's keeper starts while that shed's first check is writing an output booted without
- * `a/generated.txt`, and no event for it came before the probe of the next check came back, so `a:test` was keyed on
- * files that were not on disk. So the first probe of a daemon's life re-walks the files once it is back.
+ * A probe proves the stream only from its own write on; the files the daemon already holds can still lack a write the
+ * stream dropped without a word. A daemon a shed's keeper starts while that shed's first check is writing an output
+ * booted without `a/generated.txt`, and no event for it came before the probe of the next check came back, so `a:test`
+ * was keyed on files that were not on disk; a write dropped while one command runs is lost the same way to the next.
+ * So every probe that comes back is followed by one walk of the files before the request is answered.
  *
  * A host test: the dead stream is a daemon started under a Seatbelt profile that denies FSEvents, which `sandbox_apply`
  * refuses inside another sandbox, such as a cowshed job's.
@@ -154,6 +155,26 @@ describe('the daemon answers from the files as they are when a request arrives',
         expect(first.output, 'the stream is live').not.toContain('watcher stream stopped');
         expect(first.output, 'no hit keyed on the boot walk').not.toContain('existing outputs match the cache');
         expect(first.output, 'no restore keyed on the boot walk').not.toContain('[local cache]');
+      });
+    });
+    it("walks the files after each command's probe, so a write the watch dropped meanwhile is in the next hash", async () => {
+      // The first command proves the stream and caches the target; a write the stream then never reports (a transient
+      // `_tmp_*_*` file, as above, standing in for an event fseventsd dropped) lands before the second command, whose
+      // daemon must not call the target cached on the bytes it last heard of.
+      await withNxFixture('nx-dropped-write-', async ({ workspace, socketDirectory }) => {
+        await fixtureWorkspace(workspace);
+        const unreported = join(workspace, 'p', '_tmp_input_1');
+        await writeFile(unreported, 'one\n');
+        const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_TUI: 'false' };
+        const started = nx(workspace, env, [], 'daemon', '--start');
+        expect(started.status, started.output).toBe(0);
+        const first = await copy(workspace, env);
+        expect(first.output, 'the first command runs the target').not.toContain('existing outputs match the cache');
+        await writeFile(unreported, 'two\n');
+        const second = await copy(workspace, env);
+        expect(second.output, 'the stream is live').not.toContain('watcher stream stopped');
+        expect(second.output, 'no hit keyed on the dropped write').not.toContain('existing outputs match the cache');
+        expect(second.output, 'no restore keyed on the dropped write').not.toContain('[local cache]');
       });
     });
   }

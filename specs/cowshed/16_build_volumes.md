@@ -1556,15 +1556,16 @@ map, and the probe's bookkeeping must not reach either candidate image.
   nothing from a stopped stream) and called a changed input's target "[existing outputs match the cache, left as is]".
   Nx 24's workspace context watches the checkout with one stream, and on macOS the carried Nx patch has an nx command's
   first request answered from file state write a probe the daemon must see come back through that stream; the stream
-  delivers in order, so every write made before the command reached the daemon. The daemon's boot walk is proven by no
-  event: the first probe that comes back is followed by one more walk of the files, so a write made while the daemon
-  booted is in its first answer. A plugin worker's request is no command and makes no probe: it nests in a daemon
-  operation already current. A probe lost for `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` tells the client "watcher stream
-  stopped", which continues without a daemon, and stops the daemon; the keeper (or the next host client) starts one with
-  a fresh stream. A checkout with no directory that takes a probe the watcher reports fails closed the same way. A write
-  another process makes while a command runs is as visible as Nx makes it. Linux inotify has no daemon between the
-  kernel and the watcher that can stop serving it, so there the daemon only settles its watch, and an overflow is Nx
-  24's own rescan. (`patches/README.md`, "A stopped watcher stream is never served from".)
+  delivers in order, so every write made before the command reached the daemon. A probe proves the stream only from its
+  own write on, so every probe that comes back is followed by one walk of the files: a write the daemon's boot walk read
+  past, or one fseventsd dropped without a timely rescan flag, is in the command's answer. A plugin worker's request is
+  no command and makes no probe: it nests in a daemon operation already current. A probe lost for
+  `DAEMON_VALIDITY_SAFETY_INTERVAL_MS` tells the client "watcher stream stopped", which continues without a daemon, and
+  stops the daemon; the keeper (or the next host client) starts one with a fresh stream. A checkout with no directory
+  that takes a probe the watcher reports fails closed the same way. A write another process makes while a command runs
+  is seen as the stream delivers it; one the stream drops is in the next command's walk. Linux inotify has no daemon
+  between the kernel and the watcher that can stop serving it, so there the daemon only settles its watch, and an
+  overflow is Nx 24's own rescan. (`patches/README.md`, "A stopped watcher stream is never served from".)
   - **Enforced by**: `packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts` (`nx-plugin:test-host`).
 - **Accepted property**: an Nx client sends its whole environment to the daemon in every message
   (`daemon/client/client.js` `getDaemonEnv`), and the daemon applies it to its own `process.env`
