@@ -9,6 +9,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::pin::Pin;
 use std::time::Duration;
 
+use super::super::nix_builds::Builds;
 use super::super::shell_host::read_frame;
 use super::evaluation::{BuildProbe, STALL_BOUND, StallClock};
 use super::*;
@@ -57,9 +58,13 @@ impl FakeProbe {
 }
 
 impl BuildProbe for FakeProbe {
-    fn running(&self) -> io::Result<bool> {
+    fn running(&self) -> io::Result<Builds> {
         self.asked.send_modify(|asked| *asked += 1);
-        Ok(self.building)
+        Ok(if self.building {
+            Builds::Running
+        } else {
+            Builds::Idle
+        })
     }
 }
 

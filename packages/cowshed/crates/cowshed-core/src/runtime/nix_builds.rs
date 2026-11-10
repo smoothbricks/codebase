@@ -5,7 +5,9 @@
 //! A build user's processes are read from what names them, never from a walk of every process:
 //! the kernel lists one uid's processes on macOS (`proc_listpids(PROC_UID_ONLY)`); on Linux the
 //! daemon's own systemd cgroup lists its processes, the builds it started among them. Nothing is
-//! spawned.
+//! spawned. A host that shows none of this (no build users, or on Linux no daemon service cgroup:
+//! a single-user install, or a daemon systemd does not run) answers that the daemon's builds are
+//! unwatched, and why, rather than failing or claiming none runs.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -17,14 +19,49 @@ const BUILD_GROUP: &CStr = c"nixbld";
 /// The most a group or user entry's strings may take before a lookup gives up.
 const MAX_ENTRY_BYTES: usize = 1 << 20;
 
-/// Whether a process of a Nix build user is alive now. A host without the build group runs no
-/// daemon builds, so none is.
-pub(super) fn running() -> io::Result<bool> {
+/// What the probe sees of the Nix daemon's builds.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Builds {
+    /// A build user runs a process.
+    Running,
+    /// The build users run nothing.
+    Idle,
+    /// Nothing on this host shows the daemon's builds, so one may run unseen.
+    Unwatched(Unwatched),
+}
+
+/// Why the daemon's builds cannot be seen.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Unwatched {
+    /// The `nixbld` group does not exist or lists no user with an account.
+    NoBuildUsers,
+    /// The daemon's systemd service cgroup does not exist: a single-user install, or a daemon
+    /// systemd does not run.
+    #[cfg(any(target_os = "linux", test))]
+    NoDaemonCgroup(std::path::PathBuf),
+}
+
+impl std::fmt::Display for Unwatched {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBuildUsers => formatter.write_str("the host has no nixbld build users"),
+            #[cfg(any(target_os = "linux", test))]
+            Self::NoDaemonCgroup(path) => write!(
+                formatter,
+                "{} does not exist, so systemd runs no Nix daemon here",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// What the Nix daemon's build users run now.
+pub(super) fn running() -> io::Result<Builds> {
     let users = build_users()?;
     if users.is_empty() {
-        return Ok(false);
+        return Ok(Builds::Unwatched(Unwatched::NoBuildUsers));
     }
-    any_process_of(&users)
+    builds_of(&users)
 }
 
 /// The uids of [`BUILD_GROUP`]'s members; none when the group does not exist. A member without
@@ -167,21 +204,28 @@ fn any_process_of(users: &[libc::uid_t]) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Whether a build user runs a process, as the kernel lists each one's.
+#[cfg(target_os = "macos")]
+fn builds_of(users: &[libc::uid_t]) -> io::Result<Builds> {
+    Ok(if any_process_of(users)? {
+        Builds::Running
+    } else {
+        Builds::Idle
+    })
+}
+
 /// The Nix daemon's systemd service cgroup, under the unified hierarchy. Every build the daemon
 /// starts is born inside it, in it or in a child cgroup (`use-cgroups`).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const DAEMON_CGROUP: &str = "system.slice/nix-daemon.service";
 
 /// Whether a process of one of `users` is in the Nix daemon's cgroup subtree: the daemon's own
-/// record names exactly its processes, and only those are read (AGENTS.md, "Proof"). A daemon
-/// systemd does not run leaves no such record, which is an error naming the path, never "no
-/// build".
+/// record names exactly its processes, and only those are read (AGENTS.md, "Proof").
 #[cfg(target_os = "linux")]
-fn any_process_of(users: &[libc::uid_t]) -> io::Result<bool> {
+fn builds_of(users: &[libc::uid_t]) -> io::Result<Builds> {
     use std::os::unix::fs::MetadataExt as _;
-    let daemon = std::path::Path::new(super::job_cgroup::CGROUP_MOUNT).join(DAEMON_CGROUP);
-    member_runs_as(
-        &daemon,
+    daemon_builds(
+        std::path::Path::new(super::job_cgroup::CGROUP_MOUNT),
         users,
         &|pid| match std::fs::metadata(format!("/proc/{pid}")) {
             Ok(metadata) => Ok(Some(metadata.uid())),
@@ -189,6 +233,28 @@ fn any_process_of(users: &[libc::uid_t]) -> io::Result<bool> {
             Err(error) => Err(error),
         },
     )
+}
+
+/// [`builds_of`] over the unified hierarchy mounted at `cgroups`. No daemon service cgroup there
+/// is an answer naming its path; any other failure to read it is an error.
+#[cfg(any(target_os = "linux", test))]
+fn daemon_builds(
+    cgroups: &std::path::Path,
+    users: &[libc::uid_t],
+    uid_of: &impl Fn(u32) -> io::Result<Option<libc::uid_t>>,
+) -> io::Result<Builds> {
+    let daemon = cgroups.join(DAEMON_CGROUP);
+    let present = daemon
+        .try_exists()
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", daemon.display())))?;
+    if !present {
+        return Ok(Builds::Unwatched(Unwatched::NoDaemonCgroup(daemon)));
+    }
+    Ok(if member_runs_as(&daemon, users, uid_of)? {
+        Builds::Running
+    } else {
+        Builds::Idle
+    })
 }
 
 /// Whether a member of `cgroup` or of a cgroup below it runs as one of `users`, as `uid_of`
@@ -232,7 +298,7 @@ fn member_runs_as(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn any_process_of(_users: &[libc::uid_t]) -> io::Result<bool> {
+fn builds_of(_users: &[libc::uid_t]) -> io::Result<Builds> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "listing a user's processes is implemented for macOS and Linux",
@@ -251,11 +317,8 @@ mod tests {
         assert!(!super::any_process_of(&[0x7fff_fff0]).unwrap());
     }
 
-    /// The probe answers on this macOS host, with or without a Nix daemon's build group. A Linux
-    /// host answers only where systemd runs the daemon, which the fake cgroup above covers.
-    #[cfg(target_os = "macos")]
-    /// A build user's process in the daemon's cgroup or a child cgroup is seen; the daemon's own
-    /// root process is not a build, and a missing daemon record is an error, never "no build".
+    /// A build user's process in a cgroup or a child cgroup is seen, the daemon's own root
+    /// process is not a build, and a cgroup missing where the walk reads it is an error.
     #[test]
     fn a_build_users_member_of_the_daemon_cgroup_is_seen() {
         let root = std::env::temp_dir().join(format!(
@@ -285,25 +348,43 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// A host whose Nix daemon systemd does not run (a single-user install, or a daemon started
+    /// another way) has no daemon service cgroup: the probe answers that the daemon's builds are
+    /// unwatched and names the path, instead of failing. With the cgroup, it answers what runs.
     #[test]
-    fn the_probe_answers() {
-        match super::running() {
-            Ok(_) => {}
-            // A daemon systemd does not run leaves no cgroup record; the probe names the path it
-            // read rather than answering "no build" (any_process_of).
-            #[cfg(target_os = "linux")]
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && !std::path::Path::new(super::super::job_cgroup::CGROUP_MOUNT)
-                        .join(super::DAEMON_CGROUP)
-                        .exists() =>
-            {
-                assert!(error.to_string().contains(super::DAEMON_CGROUP), "{error}");
-            }
-            Err(error) => panic!("the probe failed: {error}"),
+    fn a_host_without_the_daemon_service_cgroup_answers() -> std::io::Result<()> {
+        use super::{Builds, Unwatched};
+        let cgroups = std::env::temp_dir().join(format!(
+            "cowshed-nix-no-daemon-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(cgroups.join("system.slice"))?;
+        let unwatched = super::daemon_builds(&cgroups, &[351], &|_| Ok(None));
+        let daemon = cgroups.join(super::DAEMON_CGROUP);
+        std::fs::create_dir_all(&daemon)?;
+        std::fs::write(daemon.join("cgroup.procs"), "200\n")?;
+        let uid_of = |_| Ok(Some(351));
+        let running = super::daemon_builds(&cgroups, &[351], &uid_of);
+        let idle = super::daemon_builds(&cgroups, &[352], &uid_of);
+        std::fs::remove_dir_all(&cgroups)?;
+        assert_eq!(
+            unwatched?,
+            Builds::Unwatched(Unwatched::NoDaemonCgroup(daemon))
+        );
+        assert_eq!(running?, Builds::Running);
+        assert_eq!(idle?, Builds::Idle);
+        Ok(())
+    }
+
+    /// The probe answers on this host, whatever it is: a Linux host whose daemon systemd does not
+    /// run answers that the daemon's builds are unwatched.
+    #[test]
+    fn the_probe_answers() -> std::io::Result<()> {
+        super::running()?;
+        if let Some(members) = super::group_members(super::BUILD_GROUP)? {
+            assert_eq!(super::build_users()?.len(), members.len());
         }
-        if let Some(members) = super::group_members(super::BUILD_GROUP).unwrap() {
-            assert_eq!(super::build_users().unwrap().len(), members.len());
-        }
+        Ok(())
     }
 }

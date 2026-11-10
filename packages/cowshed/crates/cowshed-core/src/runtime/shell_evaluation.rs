@@ -21,6 +21,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Mutex, MutexGuard, Notify};
 
+use super::super::nix_builds::{Builds, Unwatched};
 use crate::error::CowshedError;
 
 /// How long an evaluation may write no line while no Nix build runs before it is ended.
@@ -54,16 +55,16 @@ impl StallClock for SystemClock {
     }
 }
 
-/// Whether a Nix build runs now. Tests answer their own.
+/// What the Nix daemon is building now. Tests answer their own.
 pub(super) trait BuildProbe: Send + Sync {
-    fn running(&self) -> io::Result<bool>;
+    fn running(&self) -> io::Result<Builds>;
 }
 
 /// The host's Nix daemon builds: live processes of its build users.
 pub(super) struct NixBuilds;
 
 impl BuildProbe for NixBuilds {
-    fn running(&self) -> io::Result<bool> {
+    fn running(&self) -> io::Result<Builds> {
         super::super::nix_builds::running()
     }
 }
@@ -246,19 +247,20 @@ impl Claim<'_> {
                 reply = &mut reply => return Ok(reply),
                 () = std::future::ready(()) => {}
             }
-            let unreadable = match probed {
-                Ok(true) => {
+            let unseen = match probed {
+                Ok(Builds::Running) => {
                     built = asked;
                     continue;
                 }
-                Ok(false) => None,
-                Err(error) => Some(error),
+                Ok(Builds::Idle) => Unseen::Idle,
+                Ok(Builds::Unwatched(why)) => Unseen::Unwatched(why),
+                Err(error) => Unseen::Unreadable(error),
             };
             return Err(Stall {
                 pid: evaluation.pid,
                 silent: gate.clock.now().saturating_duration_since(progress.at),
                 last: progress.line.clone(),
-                unreadable,
+                unseen,
             });
         }
     }
@@ -270,17 +272,30 @@ pub(super) struct Stall {
     /// Since its last line, or its start.
     silent: Duration,
     last: Option<Box<str>>,
-    /// Why the build probe could not answer, when it could not.
-    unreadable: Option<io::Error>,
+    /// Why no build was seen.
+    unseen: Unseen,
+}
+
+/// Why the stall watch saw no Nix build.
+enum Unseen {
+    /// The daemon's build users ran nothing.
+    Idle,
+    /// Nothing on this host shows the daemon's builds.
+    Unwatched(Unwatched),
+    /// The build probe failed.
+    Unreadable(io::Error),
 }
 
 impl Stall {
     /// The job's error, once the host was ended (`ended`, or what it had ended with).
     pub(super) fn into_error(self, ended: &str) -> CowshedError {
         let minutes = self.silent.as_secs() / 60;
-        let build = match &self.unreadable {
-            None => "no Nix build was running".to_owned(),
-            Some(error) => format!("whether a Nix build was running could not be read ({error})"),
+        let build = match &self.unseen {
+            Unseen::Idle => "no Nix build was running".to_owned(),
+            Unseen::Unwatched(why) => format!("no Nix build was seen running ({why})"),
+            Unseen::Unreadable(error) => {
+                format!("whether a Nix build was running could not be read ({error})")
+            }
         };
         let last = match &self.last {
             Some(line) => format!("{line:?}"),
@@ -437,7 +452,24 @@ impl Lines {
 
 #[cfg(test)]
 mod tests {
-    use super::Lines;
+    use super::{Lines, STALL_BOUND, Stall, Unseen, Unwatched};
+
+    /// A stall where nothing shows the daemon's builds says so, and why.
+    #[test]
+    fn a_stall_names_unwatched_builds() {
+        let error = Stall {
+            pid: 7,
+            silent: STALL_BOUND,
+            last: Some("building mbx".into()),
+            unseen: Unseen::Unwatched(Unwatched::NoBuildUsers),
+        }
+        .into_error("was ended");
+        assert_eq!(
+            error.message,
+            "the workspace shell evaluation wrote nothing for 5 min and no Nix build was seen \
+             running (the host has no nixbld build users): \"building mbx\""
+        );
+    }
 
     /// A line ends at a newline or a carriage return, may span chunks, and blank ones are not
     /// lines; an unfinished line is not one yet.
