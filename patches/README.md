@@ -205,9 +205,16 @@ and a generator beside it. Neither task reads that command, and both rebuilt byt
 `NativeTaskHasherImpl` (`hasher/native-task-hasher-impl.js`) replaces each such node after every native hash call
 (`hashPlans`, `hashPlansUpfront` and `hashPlansFor`):
 
-- **The task's own project** hashes its root, tags and named inputs and the task's own target's executor, outputs,
-  options, configurations and parallelism.
-- **A project its `^` inputs reach** hashes its root, tags and named inputs, through which those inputs resolve.
+- **The task's own project** hashes its root, tags, the task's own target's executor, outputs, options, configurations
+  and parallelism, and the named inputs its `inputs` reach.
+- **A project its `^` inputs reach** hashes its root, tags and the same named inputs, through which those inputs
+  resolve.
+
+A named input is reached when an input of the task names it (`name`, `^name` or `{ input: name }`), or when a reached
+named input, defined in `nx.json` or in any project, names it in turn. A named input no input of the task reaches moves
+no key of it: adding one to a project had re-keyed every task of the project, a Bun source build that reads none among
+them, and 130 of one workspace's 1,027 gate tasks. A task that declares no `inputs`, or one still holding `...`, keys
+every named input of its project, as before.
 
 Every other node keeps its native value. The task's value is `hashArray` of its details in key order, so every key
 changed once when the hunk landed. The hunk runs wherever hashing runs, in the daemon or in the client.
@@ -224,10 +231,12 @@ A test that reads its own package's targets keys that `package.json` as a file.
 
 `packages/nx-plugin/src/nx-project-config-hash.test.ts` drives the installed class over native stand-ins, faked at their
 published methods. A sibling target's edit and a reached project's target keep the key. The task's own command,
-executor, outputs, configurations and parallelism, and its project's named inputs and tags, each re-key it, and all
-three native calls key alike. Upstream: [nrwl/nx#37802](https://github.com/nrwl/nx/issues/37802) and
-[nrwl/nx#37803](https://github.com/nrwl/nx/pull/37803), which plans the task's own target into the instruction. Drop the
-hunk, and keep the test, once the installed Nx keys a task's own target only.
+executor, outputs, configurations and parallelism, and its project's tags, each re-key it, as does a named input its
+inputs reach, directly or through another named input (a named input no input of the task reaches keeps it, in the
+project and in a reached project), and all three native calls key alike. Upstream:
+[nrwl/nx#37802](https://github.com/nrwl/nx/issues/37802) and [nrwl/nx#37803](https://github.com/nrwl/nx/pull/37803),
+which plans the task's own target into the instruction. Drop the hunk, and keep the test, once the installed Nx keys a
+task's own target only.
 
 ## Cross-client task output ownership
 

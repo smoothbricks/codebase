@@ -470,10 +470,13 @@ the directory it runs in). An entry naming only `cargo-lock:` nodes does not cou
 No input declaration removes a task's own target from its key. Nx 24.0.3 adds a `ProjectConfiguration` node to every
 task for its own project and for each project its `^` inputs reach (`hash_planner.rs` `gather_self_inputs`). The
 project-configuration hunk of `nx@24.0.3.patch` (`patches/README.md`) hashes that node for the task's own project from
-the project's root, tags and named inputs and the task's own target: its executor, outputs, options, configurations and
-parallelism (not `inputs`, `dependsOn`, `cache` or `//`). For a project the task's `^` inputs reach, the node hashes
-that project's root, tags and named inputs. An edit to one target's command re-keys that target's tasks. Its sibling
-targets, each inferred `cargo-test-*` runner among them, keep their keys unless they read the edited file.
+the project's root, tags and the named inputs its `inputs` reach (a name, `^name` or `{ input }` entry, and the names
+those named inputs name in turn, in `nx.json` and in any project) and the task's own target: its executor, outputs,
+options, configurations and parallelism (not `inputs`, `dependsOn`, `cache` or `//`). For a project the task's `^`
+inputs reach, the node hashes that project's root, tags and the same named inputs. A named input no input of the task
+reaches moves none of its keys, so a project's inferred `cargoClosure` re-keys the tasks that name it and no other. An
+edit to one target's command re-keys that target's tasks. Its sibling targets, each inferred `cargo-test-*` runner among
+them, keep their keys unless they read the edited file.
 
 That keying is sound only while no executor reads another target's configuration at run time. An executor that does must
 have that target named in the project-configuration hunk, which then hashes it beside the reading task's own target, for

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
 import type { Task, TaskGraph } from 'nx/src/config/task-graph';
 import type { TargetConfiguration } from 'nx/src/config/workspace-json-project-json';
@@ -36,12 +37,23 @@ function workspace(): ProjectGraph {
             outputs: ['{projectRoot}/dist'],
             options: { command: 'bun build.ts' },
             configurations: { production: { command: 'bun build.ts --minify' } },
+            inputs: ['production', '^production', { input: 'declared' }, 'fromNx'],
           },
           refresh: { executor: 'nx:run-commands', options: { command: 'bash refresh.sh' } },
         },
-        { production: ['{projectRoot}/src/**/*'] },
+        {
+          production: ['{projectRoot}/src/**/*', 'sources'],
+          sources: ['{projectRoot}/gen/**/*'],
+          declared: ['{projectRoot}/declared/**/*'],
+          viaNx: ['{projectRoot}/via-nx/**/*'],
+          unreferenced: ['{projectRoot}/unreferenced/**/*'],
+        },
       ),
-      lib: project('lib', { build: { executor: 'nx:run-commands', options: { command: 'tsc' } } }),
+      lib: project(
+        'lib',
+        { build: { executor: 'nx:run-commands', options: { command: 'tsc' } } },
+        { production: ['{projectRoot}/lib/**/*'], unreferenced: ['{projectRoot}/unreferenced/**/*'] },
+      ),
     },
     dependencies: { app: [{ source: 'app', target: 'lib', type: 'static' }], lib: [] },
   };
@@ -75,12 +87,19 @@ function nativeDetails(): HashDetails {
   };
 }
 
+/** nx.json names `fromNx`, a named input of its own that reaches one of `app`'s. */
+const BASE_NX_JSON: NxJsonConfiguration = { namedInputs: { fromNx: ['viaNx'] } };
 type Path = 'hashPlans' | 'hashPlansUpfront' | 'hashPlansFor';
 
 /** `app:build`'s hash through one native hash call of the installed class, over `graph`. */
-async function hashed(graph: ProjectGraph, path: Path = 'hashPlans'): Promise<HashDetails> {
+async function hashed(
+  graph: ProjectGraph,
+  path: Path = 'hashPlans',
+  nxJson: NxJsonConfiguration = BASE_NX_JSON,
+): Promise<HashDetails> {
   const native = Object.assign(Object.create(NativeTaskHasherImpl.prototype), {
     projectGraph: graph,
+    nxJson,
     upfrontPlans: null,
     planner: { getPlansReference: () => 'plans', getPlans: () => ({}) },
     hasher: {
@@ -194,6 +213,41 @@ describe("a task's ProjectConfiguration node", () => {
         }),
         rekeys: true,
       },
+      {
+        edit: 'a named input none of its inputs reaches',
+        graph: edited((g) => {
+          app(g).namedInputs = { ...app(g).namedInputs, unreferenced: ['{projectRoot}/elsewhere/**/*'] };
+        }),
+        rekeys: false,
+      },
+      {
+        edit: 'a named input of a reached project that none of its `^` inputs reaches',
+        graph: edited((g) => {
+          lib(g).namedInputs = { ...lib(g).namedInputs, unreferenced: ['{projectRoot}/elsewhere/**/*'] };
+        }),
+        rekeys: false,
+      },
+      {
+        edit: 'a named input another named input of its project reaches',
+        graph: edited((g) => {
+          app(g).namedInputs = { ...app(g).namedInputs, sources: ['{projectRoot}/generated/**/*'] };
+        }),
+        rekeys: true,
+      },
+      {
+        edit: 'a named input an `{ input }` entry reaches',
+        graph: edited((g) => {
+          app(g).namedInputs = { ...app(g).namedInputs, declared: ['{projectRoot}/other/**/*'] };
+        }),
+        rekeys: true,
+      },
+      {
+        edit: 'a named input an input of nx.json reaches',
+        graph: edited((g) => {
+          app(g).namedInputs = { ...app(g).namedInputs, viaNx: ['{projectRoot}/other/**/*'] };
+        }),
+        rekeys: true,
+      },
     ];
     const verdicts = await Promise.all(
       rows.map(async ({ edit, graph }) => ({ edit, rekeys: (await hashed(graph)).value !== base })),
@@ -201,6 +255,16 @@ describe("a task's ProjectConfiguration node", () => {
     expect(verdicts).toEqual(rows.map(({ edit, rekeys }) => ({ edit, rekeys })));
   });
 
+  it('keys every named input of the project of a task that declares no inputs', async () => {
+    const keyed = async (unreferenced: string): Promise<string> => {
+      const graph = edited((g) => {
+        delete app(g).targets!.build.inputs;
+        app(g).namedInputs = { ...app(g).namedInputs, unreferenced: [unreferenced] };
+      });
+      return (await hashed(graph)).value;
+    };
+    expect(await keyed('{projectRoot}/a/**/*')).not.toBe(await keyed('{projectRoot}/b/**/*'));
+  });
   it('replaces only ProjectConfiguration nodes and folds the details in key order', async () => {
     const result = await hashed(workspace());
     const keys = Object.keys(result.details).sort();

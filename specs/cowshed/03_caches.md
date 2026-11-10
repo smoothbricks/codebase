@@ -666,7 +666,7 @@ landed commits (or a changed runtime or toolchain input) changed. Only an aggreg
 nothing and only depends on others) states `"cache": false`, and `smoo monorepo check` refuses it anywhere else; the one
 exception is the inferred wrangler `deploy`, until its key names the stage and compares the live tag. Host and remote
 state a task reads is a runtime input, so a re-gate of an unchanged tree runs nothing. unreachable entry runs its task
-again, as a cache degrade does (Nx accepted-task artifact service, above). Six rules keep the key no wider than what a
+again, as a cache degrade does (Nx accepted-task artifact service, above). Eight rules keep the key no wider than what a
 task observes, each learned from a measured miss (2026-10-22, the owner's report: twenty minutes of gate for a one-line
 change).
 
@@ -715,6 +715,14 @@ change).
   lockfile scope). A directory glob keys every file beside those modules: under `{workspaceRoot}/tooling/checks/**/*`,
   one fixture file (`tooling/checks/darwin-native-archive.fixtures.ts`) that no config loads re-keyed 44 lint targets of
   a downstream workspace, 464 task-seconds, in land icm-land-10.
+- **A task keys the named inputs its inputs reach.** Nx's `<project>:ProjectConfiguration` node carries a project's
+  named inputs, through which a task's `inputs` resolve. The node of a task's own project, and of a project its `^`
+  inputs reach, hashes the named inputs the task's `inputs` name, directly, as `^name` or as `{ input }`, and the ones
+  those name in turn (`patches/README.md`, "A task keys its own target's configuration"); a named input none of them
+  reaches moves no key of the task. A task that declares no `inputs` keys every named input of its project. A named
+  input that the plugin infers (`cargoClosure`) and no target references re-keyed every task of its project, a Bun
+  source build and its `runtime-bun-pin` among them: 130 of one downstream workspace's 1,027 gate tasks, which is why a
+  root lint run built the Bun runtime from source.
 
 Cargo's own reuse is not where the time goes: a TypeScript-only land compiled no Rust unit, and a cowshed-core change
 compiled exactly the seven cowshed crates downstream of it. For an mbx-capable project that reuse does not travel in the

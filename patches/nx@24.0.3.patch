@@ -3285,27 +3285,47 @@ index 1914a3eca8b47318a3aede3990836f5e757501ce..efc124fa0f23869852af305b5e77961a
          const plansReference = this.planner.getPlansReference(taskIds, taskGraph);
          return this.inspector.inspectInputs(plansReference);
      }
+diff --git a/dist/src/hasher/native-task-hasher-impl.d.ts b/dist/src/hasher/native-task-hasher-impl.d.ts
+index 57d1ce513dfb13aa98579dd4929aaef84a758bf6..2e40f2aa2cf7a01e1f0b31435526c486d80b5043 100644
+--- a/dist/src/hasher/native-task-hasher-impl.d.ts
++++ b/dist/src/hasher/native-task-hasher-impl.d.ts
+@@ -7,6 +7,7 @@ import type { TaskPlanningContext } from './task-planning-context';
+ import { PartialHash, TaskHasherImpl } from './task-hasher';
+ export declare class NativeTaskHasherImpl implements TaskHasherImpl {
+     private readonly projectGraph;
++    private readonly nxJson;
+     hasher: TaskHasher;
+     planner: HashPlanner;
+     projectGraphRef: ExternalObject<NativeProjectGraph>;
 diff --git a/dist/src/hasher/native-task-hasher-impl.js b/dist/src/hasher/native-task-hasher-impl.js
-index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f27fc7054 100644
+index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878ee1faac3 100644
 --- a/dist/src/hasher/native-task-hasher-impl.js
 +++ b/dist/src/hasher/native-task-hasher-impl.js
-@@ -50,12 +50,13 @@ class NativeTaskHasherImpl {
+@@ -10,6 +10,7 @@ const overrides_1 = require("../ultracache/overrides");
+ class NativeTaskHasherImpl {
+     constructor(workspaceRoot, nxJson, projectGraph, externals, options, planningContext) {
+         this.projectGraph = projectGraph;
++        this.nxJson = nxJson;
+         /**
+          * Plans of the last up-front batch and the task graph they were built for.
+          * The tasks that batch deferred hash from them later without planning again.
+@@ -50,12 +51,13 @@ class NativeTaskHasherImpl {
              unplanned.some((id) => this.upfrontPlans.taskIds.has(id)) &&
              this.upfrontPlans.fingerprint ===
                  taskGraphFingerprint(taskGraph, ultracacheConfigurations)) {
 -            Object.assign(hashes, this.hasher.hashPlansFor(this.upfrontPlans.plans, unplanned, envs, resolvedCwd, shouldCollectInputs));
 +            const { plans } = this.upfrontPlans;
-+            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlansFor(plans, unplanned, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph));
++            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlansFor(plans, unplanned, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph, this.nxJson));
              unplanned = unplanned.filter((id) => !(id in hashes));
          }
          if (unplanned.length > 0) {
              const plans = this.plan(unplanned, taskGraph, ultracacheConfigurations);
 -            Object.assign(hashes, this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs));
-+            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph));
++            Object.assign(hashes, keyOwnTargetConfiguration(nameHashFailure(unplanned, this.planner, taskGraph, () => this.hasher.hashPlans(plans, envs, resolvedCwd, shouldCollectInputs)), taskGraph, this.projectGraph, this.nxJson));
          }
          return tasks.map((t) => hashes[t.id]);
      }
-@@ -71,14 +72,15 @@ class NativeTaskHasherImpl {
+@@ -71,14 +73,15 @@ class NativeTaskHasherImpl {
          return this.planner.getPlansReference(taskIds, taskGraph, ultracacheConfigurations, (0, overrides_1.ultracacheEligibilityOptions)(this.projectGraph, taskGraph));
      }
      async hashTasksUpfront(tasks, taskGraph, perTaskEnvs, cwd, collectInputs, ultracacheConfigurations) {
@@ -3320,11 +3340,11 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f
          };
          const shouldCollectInputs = collectInputs ?? (0, task_io_service_1.getTaskIOService)().hasTaskInputSubscribers();
 -        return this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs);
-+        return keyOwnTargetConfiguration(nameHashFailure(taskIds, this.planner, taskGraph, () => this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs)), taskGraph, this.projectGraph);
++        return keyOwnTargetConfiguration(nameHashFailure(taskIds, this.planner, taskGraph, () => this.hasher.hashPlansUpfront(plans, perTaskEnvs, cwd ?? process.cwd(), shouldCollectInputs)), taskGraph, this.projectGraph, this.nxJson);
      }
  }
  exports.NativeTaskHasherImpl = NativeTaskHasherImpl;
-@@ -104,3 +106,135 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
+@@ -104,3 +107,202 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
      }
      return (0, native_1.hashArray)(parts);
  }
@@ -3335,20 +3355,26 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f
 + * of a project, so an edit to one target re-keyed every task of that project
 + * and every task whose `^` inputs reach it. A task's key holds the
 + * configuration it runs: the node of the task's own project hashes the
-+ * project's root, tags and named inputs and the task's own target; the node of
-+ * a project its `^` inputs reach hashes that project's root, tags and named
-+ * inputs, through which those inputs resolve. The task's value folds its
-+ * details again, their values in key order, as the native hasher does.
++ * project's root, tags and the task's own target, and the named inputs its
++ * `inputs` reach; the node of a project its `^` inputs reach hashes that
++ * project's root, tags and the same named inputs. A named input is reached when
++ * an input of the task names it, directly, as `^name` or as `{ input }`, or
++ * when a reached named input (in nx.json or in any project) names it in turn, so
++ * a named input no input of the task reaches moves no key of it: adding one to a
++ * project re-keyed every task of that project, including a source build that reads
++ * none. A task that declares no `inputs` keys every named input of its project.
++ * The task's value folds its details again, their values in key order, as the
++ * native hasher does.
 + * Upstream: https://github.com/nrwl/nx/issues/37802 and the pull request that
 + * fixes it; drop this once the installed Nx keys a task's own target only.
 + */
-+function keyOwnTargetConfiguration(hashes, taskGraph, projectGraph) {
++function keyOwnTargetConfiguration(hashes, taskGraph, projectGraph, nxJson) {
 +    const configurations = new Map();
-+    const configuration = (project, target) => {
-+        const id = JSON.stringify([project, target]);
++    const configuration = (project, target, reached) => {
++        const id = JSON.stringify([project, target, reached === null ? null : [...reached].sort()]);
 +        let hashed = configurations.get(id);
 +        if (hashed === undefined) {
-+            hashed = projectConfigurationHash(projectGraph, project, target);
++            hashed = projectConfigurationHash(projectGraph, project, target, reached);
 +            configurations.set(id, hashed);
 +        }
 +        return hashed;
@@ -3366,7 +3392,7 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f
 +                continue;
 +            }
 +            const project = key.slice(0, -PROJECT_CONFIGURATION.length);
-+            details[key] = configuration(project, project === task.target.project ? task.target.target : null);
++            details[key] = configuration(project, project === task.target.project ? task.target.target : null, reachedNamedInputs(task, projectGraph, nxJson));
 +        }
 +        hashes[taskId] = {
 +            ...hashed,
@@ -3376,8 +3402,11 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f
 +    }
 +    return hashes;
 +}
-+/** A project's root, tags and named inputs, and `target`'s executor, outputs, options, configurations and parallelism. */
-+function projectConfigurationHash(projectGraph, project, target) {
++/**
++ * A project's root, tags and the named inputs in `reached` (every one when it is null), and `target`'s executor,
++ * outputs, options, configurations and parallelism.
++ */
++function projectConfigurationHash(projectGraph, project, target, reached) {
 +    const node = projectGraph.nodes[project];
 +    if (node === undefined) {
 +        throw new Error(`Could not find project '${project}'`);
@@ -3399,9 +3428,67 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..ec4f0a1b2428936062ce2beb146ac92f
 +        ];
 +    }
 +    const inputs = Object.keys(namedInputs ?? {})
++        .filter((name) => reached === null || reached.has(name))
 +        .sort()
 +        .map((name) => [name, namedInputs[name]]);
 +    return (0, native_1.hashArray)([JSON.stringify([root, tags ?? [], inputs, own])]);
++}
++/** What an input entry can name: a string that is not a file set, a glob or a negation, or an `{ input }` object. */
++const NAMED_INPUT = /^[A-Za-z_][\w.-]*$/;
++function namedInputsOf(entry) {
++    if (typeof entry === 'string') {
++        const name = entry.startsWith('^') ? entry.slice(1) : entry;
++        return NAMED_INPUT.test(name) ? [name] : [];
++    }
++    return typeof entry?.input === 'string' ? [entry.input] : [];
++}
++/** Which named input names which, over nx.json and every project: a name's references are the union of its definitions. */
++const namedInputReferences = new WeakMap();
++function referencesOf(projectGraph, nxJson) {
++    const known = namedInputReferences.get(projectGraph);
++    if (known !== undefined && known.nxJson === nxJson) {
++        return known.references;
++    }
++    const references = new Map();
++    const add = (definitions) => {
++        for (const [name, entries] of Object.entries(definitions ?? {})) {
++            const named = references.get(name) ?? new Set();
++            for (const entry of Array.isArray(entries) ? entries : []) {
++                for (const reference of namedInputsOf(entry)) {
++                    named.add(reference);
++                }
++            }
++            references.set(name, named);
++        }
++    };
++    add(nxJson?.namedInputs);
++    for (const node of Object.values(projectGraph.nodes)) {
++        add(node.data.namedInputs);
++    }
++    namedInputReferences.set(projectGraph, { nxJson, references });
++    return references;
++}
++/**
++ * The named inputs a task's inputs reach, or null when it declares none to follow: no `inputs` (the planner then
++ * uses its project's defaults) or an unexpanded `...`.
++ */
++function reachedNamedInputs(task, projectGraph, nxJson) {
++    const inputs = projectGraph.nodes[task.target.project]?.data.targets?.[task.target.target]?.inputs;
++    if (!Array.isArray(inputs) || inputs.includes('...')) {
++        return null;
++    }
++    const references = referencesOf(projectGraph, nxJson);
++    const reached = new Set();
++    const pending = inputs.flatMap(namedInputsOf);
++    while (pending.length > 0) {
++        const name = pending.pop();
++        if (reached.has(name)) {
++            continue;
++        }
++        reached.add(name);
++        pending.push(...(references.get(name) ?? []));
++    }
++    return reached;
 +}
 +/** A refusal names this many task ids and counts the rest, as cowshed's refusals do. */
 +const NAMED_TASKS = 10;
