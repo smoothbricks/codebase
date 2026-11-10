@@ -847,11 +847,12 @@ mod tests {
         }
     }
 
-    /// An ask no fence meets: its number and what it settled.
+    /// An ask no fence and no waiting install meets, its connection keyed by its pid: its number
+    /// and what it settled.
     fn asked(turns: &mut Turns, ask: TurnAsk, pid: u32, asked_unix_ms: u64) -> (u64, Settled) {
         turns
-            .ask(ask, pid, asked_unix_ms)
-            .expect("no install's read fences the queues")
+            .ask(u64::from(pid), ask, pid, asked_unix_ms)
+            .expect("no install fences the queues or waits for them")
     }
     /// Who each notice tells what: `(number, "held")` or `(number, "queued <holder> <ahead>")`.
     fn told(settled: &Settled) -> Vec<(u64, String)> {
@@ -1080,20 +1081,120 @@ mod tests {
         assert_eq!(kept.last(), Some(&total));
     }
 
-    /// An install's read fences only when no queue has a ticket; an ask under the fence is never
-    /// numbered and changes nothing; once the read's connection closes, asks are numbered on, and a
-    /// read that finds a holder sets no fence (05_gateway.md "The read fences the turns").
+    /// An install's read fences only when no queue has a ticket; an ask under the fence is parked,
+    /// never numbered, and changes no queue; once the last fence is lifted the parked ask is
+    /// numbered first, and a read that finds a holder sets no fence (05_gateway.md "The read
+    /// fences the turns").
     #[test]
-    fn a_read_fences_only_free_queues_and_a_fenced_ask_changes_nothing() {
+    fn a_read_fences_only_free_queues_and_a_fenced_ask_is_parked() {
         let mut turns = Turns::default();
         assert!(turns.fence(), "no ticket: the read fences");
-        assert_eq!(turns.ask(ask("repo", "a"), 10, 0), Err(Fenced));
-        assert!(turns.queues(0).is_empty(), "a fenced ask is never queued");
-        turns.unfence();
-        let (first, settled) = asked(&mut turns, ask("repo", "a"), 10, 1);
-        assert_eq!(first, 1, "a fenced ask was never numbered");
-        assert_eq!(told(&settled), [(1, "held".to_owned())]);
+        assert_eq!(turns.ask(7, ask("repo", "a"), 10, 0), Err(Parked));
+        assert!(turns.queues(0).is_empty(), "a parked ask is never queued");
+        assert!(
+            turns.fence(),
+            "a parked ask is no ticket: a second read fences too"
+        );
+        assert_eq!(turns.unfence(), Settled::default(), "a fence still holds");
+        let lifted = turns.unfence();
+        assert_eq!(
+            lifted.numbered,
+            [(7, 1)],
+            "the parked ask is numbered first"
+        );
+        assert_eq!(told(&lifted), [(1, "held".to_owned())]);
         assert!(!turns.fence(), "a holder: the read sets no fence");
         assert_eq!(asked(&mut turns, ask("other", "b"), 20, 2).0, 2);
+    }
+
+    /// The install whose wait the actor keys.
+    const INSTALL: u64 = 900;
+
+    /// An install that finds tickets queued waits for them in order (05_gateway.md "The read
+    /// fences the turns"): lands keep asking while it waits, and each is parked, never numbered,
+    /// so the install is fenced in the very step the last ticket queued before it ends, however
+    /// many asks arrive meanwhile. Once its fence lifts, the parked asks are numbered in the order
+    /// they arrived and enter their queues.
+    #[test]
+    fn a_waiting_install_is_fenced_after_the_tickets_before_it_and_parked_asks_follow_it() {
+        let mut turns = Turns::default();
+        let (first, _) = asked(&mut turns, ask("repo", "a"), 10, 0);
+        let (second, _) = asked(&mut turns, ask("other", "b"), 20, 1);
+        assert!(
+            !turns.wait_fence(INSTALL),
+            "tickets are queued: the install waits"
+        );
+        for (key, workspace) in [(3, "c"), (4, "d"), (5, "e")] {
+            assert_eq!(
+                turns.ask(key, ask("repo", workspace), 30, 2),
+                Err(Parked),
+                "an ask while an install waits is parked"
+            );
+        }
+        assert_eq!(
+            holders(&turns, "repo"),
+            [first],
+            "no parked ask is numbered"
+        );
+        let ended = turns.left(first, Some("exited 0".to_owned()), 3);
+        assert!(
+            ended.fenced.is_empty(),
+            "a ticket queued before the install is left"
+        );
+        let ended = turns.left(second, Some("exited 0".to_owned()), 4);
+        assert_eq!(
+            ended.fenced,
+            [INSTALL],
+            "the step that ends the last ticket fences the install"
+        );
+        assert_eq!(turns.fences, 1);
+        assert!(
+            turns.queues(u64::MAX).is_empty(),
+            "the parked asks wait behind the install's fence"
+        );
+        let lifted = turns.unfence();
+        assert_eq!(
+            lifted.numbered,
+            [(3, 3), (4, 4), (5, 5)],
+            "the parked asks are numbered in arrival order"
+        );
+        assert_eq!(holders(&turns, "repo"), [3, 4, 5]);
+        assert_eq!(told(&lifted).first(), Some(&(3, "held".to_owned())));
+        assert_eq!(told(&lifted).last(), Some(&(5, "queued 3 2".to_owned())));
+    }
+
+    /// A waiting install that leaves before it is fenced admits the asks parked behind it, and a
+    /// parked asker that left is never numbered; on free queues a waiting install is fenced at
+    /// once, and its fence holds the asks after it back until it lifts.
+    #[test]
+    fn a_waiting_install_that_leaves_admits_the_asks_parked_behind_it() {
+        let mut turns = Turns::default();
+        let (first, _) = asked(&mut turns, ask("repo", "a"), 10, 0);
+        assert!(!turns.wait_fence(INSTALL));
+        assert_eq!(turns.ask(2, ask("repo", "b"), 20, 1), Err(Parked));
+        assert_eq!(turns.ask(3, ask("repo", "c"), 30, 2), Err(Parked));
+        turns.unpark(2);
+        let left = turns
+            .wait_left(INSTALL)
+            .expect("the install was still waiting");
+        assert_eq!(
+            left.numbered,
+            [(3, 2)],
+            "the parked asker that left is never numbered"
+        );
+        assert_eq!(holders(&turns, "repo"), [first, 2]);
+        assert_eq!(
+            turns.wait_left(INSTALL),
+            Err(NotWaiting),
+            "an install no longer waits once it has left"
+        );
+        turns.left(first, Some("exited 0".to_owned()), 3);
+        turns.left(2, Some("exited 0".to_owned()), 4);
+        assert!(
+            turns.wait_fence(INSTALL + 1),
+            "no ticket: the install is fenced at once"
+        );
+        assert_eq!(turns.ask(4, ask("repo", "d"), 40, 5), Err(Parked));
+        assert_eq!(turns.unfence().numbered, [(4, 3)]);
     }
 }

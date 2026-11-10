@@ -595,9 +595,12 @@ async fn raw_answer(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json::V
 }
 
 /// The install's fenced read finds no holder and fences every queue: an ask meanwhile is answered
-/// `fenced` and never numbered. Once the install's connection has closed, the next ask is held.
+/// `fenced` and parked, never numbered, on a connection the gateway keeps open. Once the install's
+/// connection has closed and its fence is lifted, the parked ask is numbered on that same
+/// connection and told it holds the turn: no restart, and no ask again (05_gateway.md "The read
+/// fences the turns").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ask_under_the_installs_fenced_read_is_fenced_and_never_numbered() {
+async fn a_parked_ask_holds_its_turn_once_the_fence_lifts_without_a_restart() {
     let (_gateway, _root, socket) = gateway().await;
     let (read, mut install) = fenced_read(&socket).await;
     let mut land = ask_raw(&socket, "land").await;
@@ -622,7 +625,20 @@ async fn an_ask_under_the_installs_fenced_read_is_fenced_and_never_numbered() {
         rest.is_empty(),
         "the gateway sent more after its answer: {rest:?}"
     );
-    take_free(&socket, "land").await.end("exited 0".to_owned());
+    let held = raw_answer(&mut land).await;
+    assert_eq!(
+        (
+            &held["turn"],
+            &held["ticket"]["number"],
+            &held["ticket"]["workspace"]
+        ),
+        (
+            &serde_json::json!("held"),
+            &serde_json::json!(1),
+            &serde_json::json!("land")
+        ),
+        "the parked ask is numbered first on its own connection: {held}"
+    );
 }
 
 /// A fenced read that finds a holder sets no fence: the install refuses, and a land asking after
@@ -637,6 +653,312 @@ async fn a_fenced_read_that_finds_a_holder_sets_no_fence() {
     assert_eq!(raw_answer(&mut second).await["turn"], "queued");
     first.end("exited 0".to_owned());
     assert_eq!(raw_answer(&mut second).await["turn"], "held");
+}
+
+/// An install's wait for the land turns, asked as `tooling/land-install.sh` runs `setup` under
+/// `cowshed gateway await-turns`: the connection that holds its place, and then its fence, for as
+/// long as it is open.
+async fn waiting_fence(socket: &Path) -> Lines<BufReader<UnixStream>> {
+    let mut install = UnixStream::connect_bounded(socket)
+        .await
+        .expect("connect the install's wait");
+    let wait = serde_json::json!({
+        "op": land_turn::LAND_TURNS_OP,
+        "abandonedSinceUnixMs": u64::MAX,
+        "fence": "wait",
+    });
+    install
+        .write_all(format!("{wait}\n").as_bytes())
+        .await
+        .expect("send the install's wait");
+    BufReader::new(install).lines()
+}
+
+/// The next control answer on an install's wait, past the heartbeats the gateway writes while the
+/// install waits.
+async fn control_line(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json::Value {
+    loop {
+        let line = awaiting("the gateway's next control answer", answers.next_line())
+            .await
+            .expect("read the gateway's control answer")
+            .expect("the gateway answers");
+        let answer: serde_json::Value = serde_json::from_str(&line).expect("a control answer");
+        if answer.get("progress").is_none() {
+            return answer;
+        }
+    }
+}
+
+/// An install that finds a land's turn held waits for it in order instead of deferring
+/// (05_gateway.md "The read fences the turns"): a land that asks while it waits is parked and never
+/// numbered, so the install is fenced the moment the ticket queued before it ends, and the parked
+/// land is numbered once the install's fence lifts. It runs after the install, never before it.
+/// Recorded 2026-11-10: land 124380eca9's after-land install deferred at 12:16, 12:48 and
+/// 13:17Z, each rerun losing the gap to the next land's ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
+    let (_gateway, _root, socket) = gateway().await;
+    let first = take_free(&socket, "first").await;
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(
+        (
+            &waiting["ok"],
+            &waiting["fenced"],
+            &waiting["landTurns"][0]["tickets"][0]["workspace"]
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(false),
+            &serde_json::json!("first")
+        ),
+        "the install is told it waits, and for whom: {waiting}"
+    );
+    let mut later = ask_raw(&socket, "later").await;
+    assert_eq!(
+        raw_answer(&mut later).await,
+        serde_json::json!({"turn": "fenced"})
+    );
+    assert_eq!(
+        tickets(&socket).await,
+        ["first"],
+        "an ask while an install waits is parked, never numbered"
+    );
+    first.end("exited 0".to_owned());
+    let fenced = control_line(&mut install).await;
+    assert_eq!(
+        (&fenced["ok"], &fenced["fenced"]),
+        (&serde_json::json!(true), &serde_json::json!(true)),
+        "the install is fenced once the ticket queued before it has ended: {fenced}"
+    );
+    assert_eq!(
+        tickets(&socket).await,
+        Vec::<String>::new(),
+        "the parked land is not numbered under the install's fence"
+    );
+    // The install's command ends: its connection closes, and the gateway lifts the fence.
+    let mut install = install.into_inner().into_inner();
+    install.shutdown().await.expect("end the install's wait");
+    let mut rest = Vec::new();
+    awaiting("the fence's release", install.read_to_end(&mut rest))
+        .await
+        .expect("read to the gateway's end of file");
+    assert!(
+        rest.is_empty(),
+        "the gateway sent more after the fence: {rest:?}"
+    );
+    let held = raw_answer(&mut later).await;
+    assert_eq!(
+        (&held["turn"], &held["ticket"]["workspace"]),
+        (&serde_json::json!("held"), &serde_json::json!("later")),
+        "the parked land holds the turn once the install's fence lifts: {held}"
+    );
+}
+
+/// A gateway stand-in at `socket`: each connection it accepts is said on the returned channel by
+/// its order, from 1, after the ask it carries has been read and the answers `script` gives for
+/// that order have been written. `script` answers `None` once the stand-in has nothing more to
+/// say: the connection is then held open until `close` gives the go for it, or the test ends.
+fn stand_in(
+    socket: &Path,
+    script: impl Fn(usize) -> Vec<serde_json::Value> + Send + 'static,
+    mut close: tokio::sync::mpsc::UnboundedReceiver<usize>,
+    closes: impl Fn(usize) -> bool + Send + 'static,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<usize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::UnixListener::bind(socket).expect("bind the stand-in gateway");
+    let (accepted, told) = tokio::sync::mpsc::unbounded_channel();
+    let serving = tokio::spawn(async move {
+        let mut open = Vec::new();
+        for order in 1.. {
+            let (stream, _) = listener.accept().await.expect("accept a land");
+            let (read, mut write) = stream.into_split();
+            let mut asks = BufReader::new(read).lines();
+            asks.next_line()
+                .await
+                .expect("read the land's ask")
+                .expect("the land asks");
+            for answer in script(order) {
+                write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .expect("answer the land");
+            }
+            // A test that has stopped reading has what it needed of the stand-in.
+            let _ = accepted.send(order);
+            if closes(order) {
+                while close.recv().await.is_some_and(|go| go != order) {}
+                continue;
+            }
+            open.push((asks, write));
+        }
+    });
+    (told, serving)
+}
+
+/// A ticket the stand-in gateway hands the turn to.
+fn held_by_stand_in(number: u64, workspace: &str) -> serde_json::Value {
+    serde_json::json!({
+        "turn": "held",
+        "ticket": {
+            "number": number,
+            "pid": 1,
+            "workspace": workspace,
+            "askedUnixMs": 0,
+            "command": format!("land {workspace}"),
+        },
+    })
+}
+
+/// A parked ask is answered on the connection it asked on (05_gateway.md "The read fences the
+/// turns"): the asker that hears `fenced` says it waits for the install and keeps reading, and
+/// hears its turn there once the gateway numbers it. It never asks again: the stand-in refuses a
+/// second ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_asker_hears_its_turn_on_the_connection_it_asked_on() {
+    let id = Uuid::new_v4().simple().to_string();
+    let root = fixture_dir::secure_fixture_dir(&format!("csturn-{}", &id[..8]));
+    let socket = root.path().join("gateway.sock");
+    let gateway = turn_gateway(&socket);
+    std::fs::create_dir(&gateway.support).expect("support");
+    let (_close, closing) = tokio::sync::mpsc::unbounded_channel();
+    let (mut accepted, serving) = stand_in(
+        &socket,
+        |order| match order {
+            1 => vec![
+                serde_json::json!({"turn": "fenced"}),
+                held_by_stand_in(7, "land"),
+            ],
+            _ => vec![serde_json::json!({
+                "turn": "refused",
+                "error": "asked again: a parked ask is answered on the connection it asked on",
+            })],
+        },
+        closing,
+        |_| false,
+    );
+    let (told, mut waits) = tokio::sync::mpsc::unbounded_channel();
+    let turn = awaiting(
+        "the parked land's turn",
+        land_turn::take(
+            &gateway,
+            &ask("land"),
+            None,
+            Duration::from_secs(90),
+            move |wait| {
+                // A test that has stopped reading the waits has what it needed of them.
+                let _ = told.send(wait.clone());
+            },
+        ),
+    )
+    .await
+    .expect("the parked ask is numbered on the connection it asked on");
+    assert_eq!(turn.ticket().number, 7);
+    assert_eq!(accepted.try_recv(), Ok(1));
+    assert_eq!(
+        accepted.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+        "the land asked again"
+    );
+    assert_eq!(
+        waits.try_recv(),
+        Ok(Wait::Install {
+            lock: gateway.slot()
+        })
+    );
+    serving.abort();
+}
+
+/// A parked ask whose connection the gateway closes, as a restart's drain does, waits for the
+/// install holding the slot and then asks the gateway again; a fence met again is waited for the
+/// same way, never refused, since only an install's open connection holds one (05_gateway.md "The
+/// read fences the turns").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_ask_closed_by_the_gateway_waits_for_the_install_and_asks_again() {
+    let id = Uuid::new_v4().simple().to_string();
+    let root = fixture_dir::secure_fixture_dir(&format!("csturn-{}", &id[..8]));
+    let socket = root.path().join("gateway.sock");
+    let gateway = turn_gateway(&socket);
+    std::fs::create_dir(&gateway.support).expect("support");
+    let (close, closing) = tokio::sync::mpsc::unbounded_channel();
+    let (mut accepted, serving) = stand_in(
+        &socket,
+        |order| match order {
+            1 | 2 => vec![serde_json::json!({"turn": "fenced"})],
+            _ => vec![held_by_stand_in(9, "land")],
+        },
+        closing,
+        |order| order <= 2,
+    );
+    let land = tokio::spawn({
+        let gateway = gateway.clone();
+        async move {
+            land_turn::take(
+                &gateway,
+                &ask("land"),
+                None,
+                Duration::from_secs(90),
+                |_| {},
+            )
+            .await
+        }
+    });
+    // Parked, then closed with no install holding the slot: the land asks again at once.
+    assert_eq!(awaiting("the first ask", accepted.recv()).await, Some(1));
+    close.send(1).expect("close the first ask");
+    assert_eq!(awaiting("the second ask", accepted.recv()).await, Some(2));
+    // Parked again; an install holds the slot as the gateway closes the ask.
+    let slot = std::fs::File::create(gateway.slot()).expect("the install slot");
+    slot.try_lock().expect("the install takes the free slot");
+    close.send(2).expect("close the second ask");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), accepted.recv())
+            .await
+            .is_err(),
+        "the land asked again while the install held the slot"
+    );
+    drop(slot);
+    assert_eq!(awaiting("the third ask", accepted.recv()).await, Some(3));
+    let turn = awaiting("the land's turn", land)
+        .await
+        .expect("the land task")
+        .expect("a fence met again is waited for, never refused");
+    assert_eq!(turn.ticket().number, 9);
+    serving.abort();
+}
+
+/// A connection the gateway closes before any answer is no fence: the ask fails, naming the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ask_closed_before_any_answer_fails() {
+    let id = Uuid::new_v4().simple().to_string();
+    let root = fixture_dir::secure_fixture_dir(&format!("csturn-{}", &id[..8]));
+    let socket = root.path().join("gateway.sock");
+    let gateway = turn_gateway(&socket);
+    std::fs::create_dir(&gateway.support).expect("support");
+    let (close, closing) = tokio::sync::mpsc::unbounded_channel();
+    let (_accepted, serving) = stand_in(&socket, |_| Vec::new(), closing, |_| true);
+    close.send(1).expect("close the ask unanswered");
+    let refused = awaiting(
+        "the land's refusal",
+        land_turn::take(
+            &gateway,
+            &ask("land"),
+            None,
+            Duration::from_secs(90),
+            |_| {},
+        ),
+    )
+    .await
+    .expect_err("an unanswered close is no turn");
+    assert!(
+        refused
+            .to_string()
+            .contains("closed the land turn's connection"),
+        "{refused}"
+    );
+    serving.abort();
 }
 
 /// Recorded 2026-10-28 13:52:39Z (`lands/8e24efb3….after2.log:77`): a land passed its slot check,
