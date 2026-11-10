@@ -581,10 +581,14 @@ interpreter (the owner's ruling, 2026-10-18). Setup installs a content-addressed
 its invoker's `PATH` finds `bun`, named as a devenv or nix profile and never as a store path (05_gateway.md), so that
 `bun` is the one the gateway runs. One process exclusively owns each entries directory, and binds loopback only; its
 configuration is host-owned, and no repository, workspace child environment, or sandbox receives a filesystem grant to
-the store. Every checkout reads its project's results. Only a land publishes: after its gate passes it stores every task
-result its gate attributed, local hits included, without rebuilding (05_gateway.md, "/nx/v1/cache/{hash}"). It asks the
-store for each key first, with a `GET` whose body it cancels at once: a stored key is counted and never archived. Only a
-missing key is archived, by the publisher itself, as the archive the pinned Nx's native `HttpRemoteCache.store` writes
+the store. Every checkout reads its project's results. Only a land publishes: its gate stores every task result that
+succeeded in it, local hits included, without rebuilding (05_gateway.md, "/nx/v1/cache/{hash}"). A declared land's gate
+stores them whether it passes or is red (the owner's ruling, 2026-11-10): a result is keyed on its task's hash, which
+names every input, so a sibling task's failure says nothing about it, and the next gate of the same tree replays it
+instead of running it again; a task that failed is never stored. `cowshed land`'s own `--check` stores its attributed
+results once every check has passed (16_build_volumes.md, "Land"). It asks the store for each key first, with a `GET`
+whose body it cancels at once: a stored key is counted and never archived. Only a missing key is archived, by the
+publisher itself, as the archive the pinned Nx's native `HttpRemoteCache.store` writes
 (`native/cache/http_remote_cache.rs`: tar 0.4.44 entries for `<cache>/<hash>/`, then `terminalOutput` and a four-byte
 big-endian `code`) byte for byte, but gzipped at level 1 rather than Nx's default 6. The store shares the land's disk,
 so compression time is the cost and archive bytes are not, and Nx's restore gunzips any level. One `PUT` with the

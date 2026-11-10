@@ -31,9 +31,9 @@
 #    and replay when their inputs did not move. After the gate, the shipping guard runs cowshed:release-check on those
 #    dist bytes. It is dependency-free, cached on a digest of the bytes it judges, reports its wall time and refuses a
 #    red land.
-#    Once the wiring preflight, gate and shipping guard all pass, each captured invocation's
-#    succeeded results are published through smoo-nx-publish to the accepted Nx store. Sheds stay read-only.
-#    Hashes are captured before the next invocation overwrites its summary; a red publishes nothing.
+#    Each invocation's succeeded results are published through smoo-nx-publish to the accepted Nx store before the
+#    gate states its verdict, red or green (05_gateway.md, "Publication"); a task that failed never is.
+#    Hashes are captured before the next invocation overwrites its summary. Sheds stay read-only.
 #    The cache never blocks a land: unreadable task hashes or a failed publish are said, and the land goes on.
 #
 # The gate builds on the workspace's own build volume. Choosing between it and a clone of main's latest seed
@@ -163,12 +163,14 @@ gate_workspace() {
   fi
   say "checking that $head wires what it adds since $base"
   wiring_began=$(date +%s)
-  gate_job bun nx run @smoothbricks/codebase:wiring "--args=--base $base" --outputStyle=static-failures-only >&2 || {
-    wiring_status=$?
-    say "the wiring check exited $wiring_status; the land stops: wire or delete each item it names"
-    exit "$wiring_status"
-  }
+  wiring_status=0
+  gate_job bun nx run @smoothbricks/codebase:wiring "--args=--base $base" --outputStyle=static-failures-only >&2 || wiring_status=$?
   capture_hashes 00-wiring.json "$wiring_began" "the wiring check's"
+  if [ "$wiring_status" -ne 0 ]; then
+    say "the wiring check exited $wiring_status; the land stops: wire or delete each item it names"
+    publish_hashes
+    exit "$wiring_status"
+  fi
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
   began=$(date +%s)
@@ -176,6 +178,10 @@ gate_workspace() {
   # outranks background execs. Its Nx run serves its own CPU pool, so its tasks' runners together stay within its
   # cores. Nothing here caps a width.
   gate_job bun nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
+  # The gate's task hashes are read now, straight after the gate, red or green, from the run summary the gate's own Nx
+  # began (one an earlier invocation began is refused). The cache never blocks a land (05_gateway.md, "Publication"):
+  # hashes that cannot be read are said, and the land goes on unpublished.
+  capture_hashes 01-gate.json "$began" "the gate's"
   if [ "$gate_status" -ne 0 ]; then
     "$failure_summary" "$output" >&2 || {
       say "failure summary unavailable; complete gate output: $output"
@@ -183,32 +189,34 @@ gate_workspace() {
     }
     attribute_failures
     say "gate exited $gate_status; the land stops; complete output: $output"
+    publish_hashes
     exit "$gate_status"
   fi
   replay_gate_output "$output"
   rm "$output"
-  # The gate's task hashes are read now, straight after the gate, from the run summary the gate's own Nx began (one an
-  # earlier invocation began is refused). The cache never blocks a land (05_gateway.md, "Publication"): hashes that
-  # cannot be read are said, and the land goes on unpublished.
-  capture_hashes 01-gate.json "$began" "the gate's"
   shipping_check_began=$(date +%s)
   say "checking the shipping CLI and addon bytes the gate built with cowshed:release-check"
-  gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || {
-    shipping_status=$?
-    say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_check_began))s; the land stops"
-    exit "$shipping_status"
-  }
+  shipping_status=0
+  gate_job bun nx run cowshed:release-check --outputStyle=static-failures-only >&2 || shipping_status=$?
   capture_hashes 02-shipping-check.json "$shipping_check_began" "the shipping guard's"
-  say "shipping verification: release-check $(($(date +%s) - shipping_check_began))s"
-  # All checks passed; publication is a loud, nonblocking cache optimization.
-  if [ -n "$hashes_dir" ]; then
-    for list in "$hashes_dir"/*.json; do
-      [ -f "$list" ] || continue
-      gate_job "$publisher" publish "$checkout" "$list" >&2 || say "publishing Nx results failed (status $?); the land goes on: the cache never blocks a land"
-    done
+  if [ "$shipping_status" -ne 0 ]; then
+    say "shipping release-check exited $shipping_status after $(($(date +%s) - shipping_check_began))s; the land stops"
+    publish_hashes
+    exit "$shipping_status"
   fi
+  say "shipping verification: release-check $(($(date +%s) - shipping_check_began))s"
+  publish_hashes
 }
 
+# Publishes every captured invocation's succeeded results, whatever the gate's verdict: a loud, nonblocking cache
+# optimization (05_gateway.md, "Publication").
+publish_hashes() {
+  [ -n "$hashes_dir" ] || return 0
+  for list in "$hashes_dir"/*.json; do
+    [ -f "$list" ] || continue
+    gate_job "$publisher" publish "$checkout" "$list" >&2 || say "publishing Nx results failed (status $?); the land goes on: the cache never blocks a land"
+  done
+}
 allow_envrc "$main" "$checkout" || {
   say "$envrc_refusal"
   exit 1

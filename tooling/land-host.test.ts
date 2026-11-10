@@ -449,7 +449,7 @@ describe('land-host.sh --gate', () => {
   });
 
   it.each([{ phase: 'shipping guard', calls: [{ args: SHIPPING_CHECK, exit: 19 }], status: 19 }])(
-    'stops before publishing when the $phase fails',
+    'publishes what succeeded and stops when the $phase fails',
     ({ calls, status }) => {
       const gate = fixture();
       const base = git(gate.main, 'rev-parse', 'HEAD');
@@ -462,12 +462,32 @@ describe('land-host.sh --gate', () => {
         GATE.join(' '),
         ...calls.map((call) => call.args.join(' ')),
       ]);
-      expect(existsSync(join(gate.state, 'publish.args'))).toBe(false);
+      expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
+        `-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash","cross-hash"]\n`,
+      );
       expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
     },
   );
 
-  it('publishes gate and shipping results only after every check passes', () => {
+  it('publishes the tasks that succeeded in a red gate, and never one that failed', () => {
+    const gate = fixture();
+    const run = gate.gate([
+      DAEMON_STOP,
+      passingRun(WIRING('*')),
+      {
+        ...failedRun('error: lib lint', 3),
+        run: [
+          { taskId: 'app:lint', hash: 'app-lint', status: 0 },
+          { taskId: 'lib:lint', hash: 'lib-lint', status: 1 },
+        ],
+      },
+    ]);
+    expect(run.status, run.log).toBe(3);
+    expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(`-\n${gate.ws}\n["app-lint"]\n`);
+    expect(run.log.indexOf('gate exited 3; the land stops')).toBeGreaterThan(-1);
+  });
+
+  it('publishes gate and shipping results once every check passes', () => {
     const gate = fixture();
     const run = gate.gate([
       DAEMON_STOP,
