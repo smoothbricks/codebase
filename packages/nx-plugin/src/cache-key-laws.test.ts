@@ -34,6 +34,8 @@ interface RuntimeRead {
   readonly producer: { readonly project: string; readonly target: string };
   readonly glob: string;
   readonly evidence: string;
+  /** The platform whose test build makes the read (its reading module's `cfg`), or `any`. */
+  readonly platform: NodeJS.Platform | 'any';
 }
 
 const RUNTIME_READS: readonly RuntimeRead[] = [
@@ -44,18 +46,22 @@ const RUNTIME_READS: readonly RuntimeRead[] = [
     glob: '**/*.node',
     evidence:
       'cowshed-core/tests/support/napi_client.rs:30-55 runs Node on the package, whose loadAddon loads the dev addon',
+    // project_runtime.rs:68 builds napi_client only under `cfg(target_os = "macos")`.
+    platform: 'darwin',
   },
   {
     crates: ['cowshed-core', 'cowshed-cli'],
     producer: { project: 'cowshed', target: 'tsc-js' },
     glob: 'packages/cowshed/dist/ts/**/*.js',
     evidence: 'cowshed-core/tests/support/napi_client.rs:30-37 canonicalizes packages/cowshed/dist/ts/index.js',
+    platform: 'darwin',
   },
   {
     crates: ['cowshed-core'],
     producer: { project: 'cowshed', target: 'capability-probe' },
     glob: '**/capability-probe/diagnostics.json',
     evidence: 'cowshed-core/tests/public_api_contracts.rs:1501 CAPABILITY_VERDICT_FILE',
+    platform: 'any',
   },
 ];
 
@@ -301,7 +307,12 @@ function judgedRunners(): Promise<readonly Judged[]> {
         graph,
         runner,
         named,
-        RUNTIME_READS.filter(({ crates }) => runner.crate !== null && crates.includes(runner.crate)),
+        RUNTIME_READS.filter(
+          ({ crates, platform }) =>
+            runner.crate !== null &&
+            crates.includes(runner.crate) &&
+            (platform === 'any' || platform === process.platform),
+        ),
       ),
     );
   })();
@@ -403,6 +414,7 @@ describe('the judge, on a graph that plants each violation', () => {
     producer: { project: 'owner', target: 'napi-native' },
     glob: '**/*.node',
     evidence: 'a test of the fixture loads the addon',
+    platform: 'any',
   };
 
   it('names the TypeScript output a Rust runner keys without reading it', () => {
