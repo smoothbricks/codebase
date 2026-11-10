@@ -899,7 +899,7 @@ fn a_cloned_log_answers_like_its_source_and_diverges_independently() {
     upsert(&mut source, &mut state, 0, 1, 10);
     let mut fork = Vm::default();
     let mut forked = state.clone();
-    fork.log_clone_from(&source);
+    fork.log_clone_from(&source).expect("clone");
     assert_eq!(net(&fork, &forked, 0, 0), net(&source, &state, 0, 0));
     upsert(&mut source, &mut state, 0, 2, 20);
     upsert(&mut fork, &mut forked, 0, 3, 30);
@@ -962,4 +962,126 @@ fn a_watched_slot_records_warm_passes_with_zero_allocations() {
     let since = seq(&state, 0) - 8;
     assert_eq!(net(&vm, &state, 0, since).unwrap().len(), 8);
     assert_eq!(net(&vm, &state, 1, seq(&state, 1) - 8).unwrap().len(), 8);
+}
+
+#[test]
+fn a_constant_cardinality_xor_marks_and_logs_its_whole_slot() {
+    let init = [slot_def(0, SlotType::Bitmap), slot_def(1, SlotType::Bitmap)].concat();
+    let code = program(2, &init, &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    assert_eq!(
+        vm.set_insert(false, &mut state, 0, &[1, 2], None),
+        ErrorCode::Ok
+    );
+    assert_eq!(
+        vm.set_insert(false, &mut state, 1, &[2, 3], None),
+        ErrorCode::Ok
+    );
+    assert_eq!(vm.watch(&state, 0, 64, 64), Ok(1));
+    // {1, 2} xor {2, 3} = {1, 3}: same size, different members.
+    assert_eq!(
+        vm.bitmap_algebra(
+            false,
+            BitmapAlgebraOp::Xor,
+            &mut state,
+            0,
+            BitmapSource::Slot(1)
+        ),
+        ErrorCode::Ok
+    );
+    assert_eq!(seq(&state, 0), 2, "a membership change is a write");
+    assert_eq!(
+        net(&vm, &state, 0, 1),
+        None,
+        "the keyless write logs a whole-slot entry"
+    );
+}
+
+#[test]
+fn an_eviction_call_advances_once_and_logs_every_removed_key() {
+    let code = program(1, &ttl_slot_def(0, SlotType::HashMap), &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    let stamps = f64s_as_bytes(&[1.0, 1.0]).to_vec();
+    assert_eq!(
+        vm.map_upsert(
+            Strategy::Last,
+            false,
+            &mut state,
+            0,
+            &[6, 7],
+            &[60, 70],
+            Some(stamps.as_slice()),
+            CmpType::F64
+        ),
+        ErrorCode::Ok
+    );
+    let before = seq(&state, 0);
+    vm.watch(&state, 0, 64, 1024).unwrap();
+    assert_eq!(vm.evict_all_expired(false, &mut state, 1_000.0), Ok(2));
+    assert_eq!(seq(&state, 0), before + 1, "one eviction call, one write");
+    let mut gone = net(&vm, &state, 0, before).unwrap();
+    gone.sort_unstable_by_key(|net| net.key1);
+    assert_eq!(
+        gone,
+        [delete(6, 0, Some(&le(60))), delete(7, 0, Some(&le(70)))]
+    );
+}
+
+#[test]
+fn an_equal_nested_value_marks_and_logs_nothing() {
+    let init = [
+        Opcode::SlotNested as u8,
+        0,
+        SlotType::Nested as u8,
+        8,
+        0,
+        SlotType::HashMap as u8,
+        4,
+        0,
+        0,
+    ];
+    let code = program(
+        1,
+        &init,
+        &for_each(&[Opcode::NestedMapUpsertLast as u8, 0, KEY, KEY2, VALUE]),
+    );
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    vm.watch(&state, 0, 64, 64).unwrap();
+    assert_eq!(OK, run(&mut vm, &mut state, &code, &[row(1, 2, 5)]));
+    let written = seq(&state, 0);
+    assert_eq!(written, 1);
+    let flags = (slot_meta_base(0) + SlotMetaOffset::CHANGE_FLAGS) as usize;
+    state[flags] = 0;
+    assert_eq!(OK, run(&mut vm, &mut state, &code, &[row(1, 2, 5)]));
+    assert_eq!(state[flags], 0, "an equal value sets no flag");
+    assert_eq!(seq(&state, 0), written, "an equal value advances nothing");
+    assert_eq!(
+        net(&vm, &state, 0, written).unwrap(),
+        [],
+        "and logs nothing"
+    );
+}
+
+#[test]
+fn a_log_clone_refuses_out_of_memory_and_keeps_its_log() {
+    let code = program(1, &slot_def(0, SlotType::HashMap), &[]);
+    let mut state = image(&code);
+    let mut source = Vm::default();
+    source.watch(&state, 0, 64, 1024).unwrap();
+    upsert(&mut source, &mut state, 0, 1, 10);
+    let mut fork = Vm::default();
+    assert_eq!(
+        with_allocations(0, || fork.log_clone_from(&source)),
+        Err(ErrorCode::OutOfMemory)
+    );
+    assert_eq!(
+        net(&fork, &state, 0, 0),
+        None,
+        "the refused clone changed nothing"
+    );
+    assert_eq!(fork.log_clone_from(&source), Ok(()));
+    assert_eq!(net(&fork, &state, 0, 0).unwrap(), [insert(1, 0)]);
 }

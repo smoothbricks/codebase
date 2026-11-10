@@ -1109,19 +1109,19 @@ pub fn batch_bitmap_algebra_in<I: KeyIndex>(
     // the retained kernel report is a consistency check, not new admission.
     debug_assert_eq!(report.len, u64::from(new_card));
     target_meta.set_size(state, new_card);
-    // One write: the size and expiry flags it sets mark the slot once.
+    // One write, marked once: it changed membership or expiry, or it
+    // returned above. A size it moved is SIZE_CHANGED; changed expiry, or
+    // members exchanged at a constant size, is UPDATED.
     let flag = if new_card == original_size {
         0
     } else {
         ChangeFlag::SIZE_CHANGED
-    } | if expiry_changed {
+    } | if expiry_changed || (membership_changed && new_card == original_size) {
         ChangeFlag::UPDATED
     } else {
         0
     };
-    if flag != 0 {
-        target_meta.mark(state, flag);
-    }
+    target_meta.mark(state, flag);
     finish_bitmap_mutations(
         env,
         hooks,

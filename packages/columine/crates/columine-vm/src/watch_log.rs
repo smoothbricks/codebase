@@ -118,6 +118,46 @@ impl SlotLog {
         self.coverage = oldest.stamp;
     }
 
+    /// An empty log with room to copy `other` into it.
+    fn room_for(other: &Self) -> Result<Self, ErrorCode> {
+        let mut log = Self {
+            coverage: 0,
+            u32_lane: false,
+            entries: Vec::new(),
+            head: 0,
+            len: 0,
+            images: Vec::new(),
+            image_head: 0,
+            image_len: 0,
+        };
+        log.reserve_for(other)?;
+        Ok(log)
+    }
+
+    /// Hold room to copy `other` into this log; its content is unchanged.
+    fn reserve_for(&mut self, other: &Self) -> Result<(), ErrorCode> {
+        reserve_total(&mut self.entries, other.entries.len())?;
+        reserve_total(&mut self.images, other.images.len())
+    }
+
+    /// Become a copy of `other` within room [`Self::reserve_for`] held.
+    fn copy_from(&mut self, other: &Self) {
+        debug_assert!(
+            self.entries.capacity() >= other.entries.len()
+                && self.images.capacity() >= other.images.len()
+        );
+        self.coverage = other.coverage;
+        self.u32_lane = other.u32_lane;
+        self.entries.clear();
+        self.entries.extend_from_slice(&other.entries);
+        self.head = other.head;
+        self.len = other.len;
+        self.images.clear();
+        self.images.extend_from_slice(&other.images);
+        self.image_head = other.image_head;
+        self.image_len = other.image_len;
+    }
+
     /// Drop the newest entry, for a settle.
     fn pop_newest(&mut self) {
         let newest = self.at(self.len - 1);
@@ -479,9 +519,26 @@ impl WatchLog {
     /// sequence in `state`. A write stamped at or below the slot's newest
     /// entry is a refold of a write the log holds and records nothing.
     pub(crate) fn record(&mut self, state: &[u8], slot: u32, key: Key, kind: u8, prior: Prior) {
-        if !self.watches(slot) {
-            return;
+        if self.admits(state, slot) {
+            self.append(state, slot, key, kind, prior);
         }
+    }
+
+    /// Whether a write of `slot` that `state` holds records: the slot is
+    /// watched and its sequence lies above the slot's newest entry, so the
+    /// write is no refold of one the log holds. A write that logs several
+    /// keys at its one stamp asks once, before its first key.
+    pub(crate) fn admits(&self, state: &[u8], slot: u32) -> bool {
+        self.watches(slot)
+            && matches!(
+                self.slots.get(slot as usize),
+                Some(Some(log)) if seq(state, slot) > log.newest()
+            )
+    }
+
+    /// Append one key of a write [`Self::admits`] admitted, at the slot's
+    /// sequence in `state`.
+    pub(crate) fn append(&mut self, state: &[u8], slot: u32, key: Key, kind: u8, prior: Prior) {
         let Self {
             slots,
             prior: image,
@@ -491,9 +548,6 @@ impl WatchLog {
             return;
         };
         let stamp = seq(state, slot);
-        if stamp <= log.newest() {
-            return;
-        }
         let (held, bytes): (bool, &[u8]) = match &prior {
             Prior::Absent => (false, &[]),
             Prior::Held => (true, &[]),
@@ -522,9 +576,13 @@ impl WatchLog {
     /// map, set or bitmap member, or a TTL eviction): a hash map's value lane
     /// is its prior, and the change kind says whether the key was held.
     pub(crate) fn record_change(&mut self, state: &[u8], slot: u32, key: Key, change: Change) {
-        if !self.watches(slot) {
-            return;
+        if self.admits(state, slot) {
+            self.append_change(state, slot, key, change);
         }
+    }
+
+    /// [`Self::append`] for a container change: its kind and prior.
+    pub(crate) fn append_change(&mut self, state: &[u8], slot: u32, key: Key, change: Change) {
         let prior = |old: Option<u64>| match old {
             Some(value) => Prior::value_u32(value as u32),
             None => Prior::Held,
@@ -535,7 +593,7 @@ impl WatchLog {
             Change::Removed(old) => (ChangeFlag::REMOVED, prior(old)),
             Change::Evicted(old) => (ChangeFlag::EVICTED, prior(old)),
         };
-        self.record(state, slot, key, kind, prior);
+        self.append(state, slot, key, kind, prior);
     }
     /// Record one landed write of `slot` that changed each of `members`
     /// (a bitmap patch): one write, so one replay decision for all.
@@ -624,14 +682,49 @@ impl WatchLog {
     }
 
     /// Replace this log with `other`'s rings, images and coverage, reusing
-    /// this log's storage where it fits. A cold path: it may allocate.
-    pub fn clone_from_log(&mut self, other: &Self) {
-        self.slots.clone_from(&other.slots);
-        self.watched.clone_from(&other.watched);
+    /// this log's storage where it fits. A cold path: it reserves every
+    /// buffer before it copies anything, so storage that cannot be had is
+    /// `OutOfMemory` and leaves this log as it was.
+    pub fn clone_from_log(&mut self, other: &Self) -> Result<(), ErrorCode> {
+        let words = other.watched.len();
+        reserve_total(&mut self.slots, other.slots.len())?;
+        reserve_total(&mut self.watched, words)?;
+        reserve_total(&mut self.suspended, words)?;
+        reserve_total(&mut self.prior, other.prior.capacity())?;
+        let held =
+            |index: usize, slots: &[Option<SlotLog>]| matches!(slots.get(index), Some(Some(_)));
+        let mut fresh = Vec::new();
+        let missing = (0..other.slots.len())
+            .filter(|&index| other.slots[index].is_some() && !held(index, &self.slots))
+            .count();
+        fresh
+            .try_reserve_exact(missing)
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        for (index, theirs) in other.slots.iter().enumerate() {
+            let Some(theirs) = theirs else { continue };
+            match self.slots.get_mut(index) {
+                Some(Some(mine)) => mine.reserve_for(theirs)?,
+                _ => fresh.push(SlotLog::room_for(theirs)?),
+            }
+        }
+        // Every buffer is held: nothing below allocates or fails.
+        let mut fresh = fresh.into_iter();
+        self.slots.resize(other.slots.len(), None);
+        for (mine, theirs) in self.slots.iter_mut().zip(&other.slots) {
+            match (mine.as_mut(), theirs) {
+                (_, None) => *mine = None,
+                (Some(log), Some(theirs)) => log.copy_from(theirs),
+                (None, Some(theirs)) => {
+                    let log = mine.insert(fresh.next().expect("room reserved for every new log"));
+                    log.copy_from(theirs);
+                }
+            }
+        }
+        self.watched.clear();
+        self.watched.extend_from_slice(&other.watched);
         self.suspended.clear();
-        self.suspended.resize(other.watched.len(), 0);
-        reserve_total(&mut self.prior, other.prior.capacity())
-            .unwrap_or_else(|_| self.prior = Vec::with_capacity(other.prior.capacity()));
+        self.suspended.resize(words, 0);
+        Ok(())
     }
 
     /// `slot`'s net change from `since` to its sequence in `state`; entries

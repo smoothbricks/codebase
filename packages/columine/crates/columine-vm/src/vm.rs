@@ -475,6 +475,9 @@ pub(crate) fn evict_expired(
     let mut processed = 0u32;
     let mut removed = 0u32;
     let mut error = None;
+    // Whether the watch log takes this call's keys: decided once, at the
+    // mark the first removal makes.
+    let mut logged = false;
     while processed < expired {
         let key = evict_key(state, base, processed);
         if !is_eviction_entry_current(state, base, initial, processed, key) {
@@ -487,10 +490,15 @@ pub(crate) fn evict_expired(
         }
         match remove_entry_by_key(delta_mode, undo, env, state, meta, key) {
             Ok(Some(change)) => {
-                meta.mark(state, ChangeFlag::EVICTED);
+                if removed == 0 {
+                    meta.mark(state, ChangeFlag::EVICTED);
+                    logged = rec.watch.admits(state, meta.slot());
+                }
                 rec.feed.record_slot(meta.slot(), Key::one(key), change);
-                rec.watch
-                    .record_change(state, meta.slot(), Key::one(key), change);
+                if logged {
+                    rec.watch
+                        .append_change(state, meta.slot(), Key::one(key), change);
+                }
                 if meta.has_evict_trigger() {
                     let buffer = meta.evicted_buffer_offset(state);
                     let timestamp = evict_ts(state, base, processed);
@@ -5018,9 +5026,10 @@ impl<I: KeyIndex> Vm<I> {
     /// Replace this VM's watch log with `other`'s rings, images and
     /// coverage: a host that continues `other`'s history in this VM (a
     /// replay fork) carries the log with the state. A cold path; it may
-    /// allocate.
-    pub fn log_clone_from(&mut self, other: &Self) {
-        self.rec.watch.clone_from_log(&other.rec.watch);
+    /// allocate, and storage that cannot be had is `OutOfMemory` with this
+    /// VM's log unchanged.
+    pub fn log_clone_from(&mut self, other: &Self) -> Result<(), ErrorCode> {
+        self.rec.watch.clone_from_log(&other.rec.watch)
     }
 
     /// Every `u32` lane prior `slot`'s ring holds, oldest first: a hash
@@ -8446,10 +8455,14 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
+                    let marks = plan.marks();
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
-                    // An inner container write names no key of the slot.
-                    self.rec.changed_whole(state, slot);
+                    // An inner container write names no key of the slot; one
+                    // that changed nothing marked and logs nothing.
+                    if marks {
+                        self.rec.changed_whole(state, slot);
+                    }
                 }
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
@@ -8477,10 +8490,14 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
+                    let marks = plan.marks();
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
-                    // An inner container write names no key of the slot.
-                    self.rec.changed_whole(state, slot);
+                    // An inner container write names no key of the slot; one
+                    // that changed nothing marked and logs nothing.
+                    if marks {
+                        self.rec.changed_whole(state, slot);
+                    }
                 }
 
                 // NESTED_AGG_UPDATE (0x95)
@@ -8506,10 +8523,14 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(capture) => capture,
                         Err(error) => return error as u32,
                     };
+                    let marks = plan.marks();
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
-                    // An inner container write names no key of the slot.
-                    self.rec.changed_whole(state, slot);
+                    // An inner container write names no key of the slot; one
+                    // that changed nothing marked and logs nothing.
+                    if marks {
+                        self.rec.changed_whole(state, slot);
+                    }
                 }
 
                 _ => return INVALID_PROGRAM,

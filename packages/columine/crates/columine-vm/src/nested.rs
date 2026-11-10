@@ -519,6 +519,12 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
         self.state
     }
 
+    /// Whether the planned write changes what a reader sees, so marks its
+    /// slot.
+    pub fn marks(&self) -> bool {
+        self.flags != 0
+    }
+
     pub fn ranges(&self) -> &[(u32, u32)] {
         &self.scratch.ranges
     }
@@ -831,7 +837,8 @@ fn prepare_table<'state, 'work>(
                 plan.push_range(table.size_off, 4);
             }
             plan.flags |= ChangeFlag::INSERTED;
-        } else if value.is_some() {
+        } else if value.is_some_and(|value| value != table.entry_u32_at(plan.state, probe.pos)) {
+            // An equal value rewrites nothing a reader sees.
             plan.flags |= ChangeFlag::UPDATED;
         }
         if value.is_some() {

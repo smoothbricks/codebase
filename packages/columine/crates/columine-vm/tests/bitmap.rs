@@ -4103,7 +4103,11 @@ mod ttl_algebra_properties {
         if expected.members.len() != target_model.members.len() {
             flags_expected |= ChangeFlag::SIZE_CHANGED;
         }
-        if expiry_changed {
+        // Changed expiry, or members exchanged at a constant size, is a
+        // write that moves no size: UPDATED.
+        if expiry_changed
+            || (membership_changed && expected.members.len() == target_model.members.len())
+        {
             flags_expected |= ChangeFlag::UPDATED;
         }
         assert_eq!(
