@@ -329,25 +329,28 @@ release CLI (`cli-arm64-macos` or `cli-x64-macos`, `production`) and the Nx cach
 `land-install`, through `cowshed exec --host`. The shed is forked once (`cowshed fork --ref`), and every later install
 re-points it to `<head>` with `cowshed rebase land-install --onto <head>`, which refuses a dirty tree by name; the
 install is then recorded `failed` naming why, and so is a head the shed already stands past, because a rebase never
-moves a shed back. The shed is never removed, so its build volume stays warm and every release build after the first is
-incremental, and an install needs neither a fork nor an `rm`. Building there, main stands still, no land's fast-forward
-or build races it, and no land waits for it. Readiness, which is no land holding its repository's turn and no other
-install holding the install slot, is judged before the build, by the installed cowshed's `gateway status`, and again
-before `setup`: an install that is not ready builds nothing, and is deferred (unverified, when the status cannot be
-read) with the command that reruns the script. It stages both from the shed's outputs in
-`.cache/cowshed-release/<head>/` laid out as a distribution (`<package>/dist/bin/<platform>/cowshed`, the server under
-`<package>/node_modules`, where setup looks for it): the debug build every land replays into `dist/bin` replaces the
-release binary there, and a stage is the copy whose path an operator is told to run until three newer stages exist, each
-newer install superseding it. The shed's re-point, build and stage run under the release lock
-(`.cache/cowshed-release.lock`), which orders installs as the install slot does: no land turn orders two after-jobs, so
-a second install waits in line for the first, never moves the shared shed under its build, and finds the stage already
-whole when the first built its head; only after-jobs take it, so no land waits on it, and removing the `*.partial` a
-crashed run left is safe only under that lock. It asks the staged build's `doctor` whether `setup` would raise the
-administrator authorization (its host-storage findings come from the plan setup executes, and it errs toward asking) and
-`gateway status` for what an install refuses under or waits for: a land turn's holder or another install holding the
-install slot. It runs the staged `setup` once, in main's devenv (setup installs the PATH it runs under, and its
-discovery runs cargo), only when neither says otherwise, and a refusal `setup` still answers is classified by a fresh
-status. Every outcome is one line on stdout,
+moves a shed back. A re-point can change the shed's `.envrc`, which direnv trusts by path and content, so before the
+build the install applies the rule the land gate applies to a workspace's (`tooling/land-envrc.sh`): an `.envrc`
+byte-identical to main's approved one is approved with `direnv allow`, one the operator already approved by hand runs as
+it is, and any other is recorded `failed` naming the file and the `direnv allow` that approves it, and nothing is built.
+The shed is never removed, so its build volume stays warm and every release build after the first is incremental, and an
+install needs neither a fork nor an `rm`. Building there, main stands still, no land's fast-forward or build races it,
+and no land waits for it. Readiness, which is no land holding its repository's turn and no other install holding the
+install slot, is judged before the build, by the installed cowshed's `gateway status`, and again before `setup`: an
+install that is not ready builds nothing, and is deferred (unverified, when the status cannot be read) with the command
+that reruns the script. It stages both from the shed's outputs in `.cache/cowshed-release/<head>/` laid out as a
+distribution (`<package>/dist/bin/<platform>/cowshed`, the server under `<package>/node_modules`, where setup looks for
+it): the debug build every land replays into `dist/bin` replaces the release binary there, and a stage is the copy whose
+path an operator is told to run until three newer stages exist, each newer install superseding it. The shed's re-point,
+build and stage run under the release lock (`.cache/cowshed-release.lock`), which orders installs as the install slot
+does: no land turn orders two after-jobs, so a second install waits in line for the first, never moves the shared shed
+under its build, and finds the stage already whole when the first built its head; only after-jobs take it, so no land
+waits on it, and removing the `*.partial` a crashed run left is safe only under that lock. It asks the staged build's
+`doctor` whether `setup` would raise the administrator authorization (its host-storage findings come from the plan setup
+executes, and it errs toward asking) and `gateway status` for what an install refuses under or waits for: a land turn's
+holder or another install holding the install slot. It runs the staged `setup` once, in main's devenv (setup installs
+the PATH it runs under, and its discovery runs cargo), only when neither says otherwise, and a refusal `setup` still
+answers is classified by a fresh status. Every outcome is one line on stdout,
 `<UTC time> <commit> install attended|unverified|deferred|installed|failed|skipped`, and the first three carry the exact
 command, which enters that devenv too: to run by hand (`attended`, `unverified`) or to rerun once the named work has
 ended (`deferred`). An install that cannot be taken is deferred, never waited for; the operator's land-status record

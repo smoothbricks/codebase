@@ -19,7 +19,11 @@
 #    land's fast-forward races it and no land turn is held. It is forked once ('cowshed fork --ref') and re-pointed to
 #    <head> by 'cowshed rebase --onto <head>' on every later install, which refuses a dirty tree by name; it is never
 #    removed, so its build volume stays warm and every release build after the first is incremental, with no fork and
-#    no rm per install. The CLI, the Nx cache server bundle it installs with and the mbx flake its setup pins are copied
+#    no rm per install. A re-point can change the shed's .envrc, which direnv trusts by path and content, so before
+#    anything is built there the .envrc is approved by the rule the land gate applies to a workspace's
+#    (tooling/land-envrc.sh): one byte-identical to main's is approved here, one the operator already approved runs, and
+#    any other is recorded 'failed', naming it and the 'direnv allow' that approves it, with nothing built.
+#    The CLI, the Nx cache server bundle it installs with and the mbx flake its setup pins are copied
 #    from the shed to .cache/cowshed-release/<head>/, laid out as a distribution (<package>/dist/bin/<platform>/cowshed,
 #    <package>/nix/mbx as the npm package ships it, the server under <package>/node_modules). The debug build every land
 #    replays into dist/bin replaces the release binary there; a stage no later build rewrites keeps the command this
@@ -44,6 +48,9 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 main=$(cd "$here/.." && pwd)
+# The rule that approves an .envrc for direnv, which land-host.sh applies to a workspace's.
+# shellcheck source=land-envrc.sh
+. "$here/land-envrc.sh"
 # Where setup looks for the Nx cache server bundle of a distribution's CLI (gateway_service.rs, NX_CACHE_SERVER_BUNDLE).
 server=node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js
 
@@ -110,6 +117,13 @@ prune_stages() {
 build_in_shed() {
   shed=$(cs -q path "$ws" </dev/null) || {
     record failed "cowshed path $ws exited $?"
+    return 3
+  }
+  # The re-point may have changed the shed's .envrc, which direnv trusts by path and content, and the build runs in the
+  # shed's devenv: it is approved first, by the rule the land gate applies to a workspace's.
+  allow_envrc "$main" "$shed" || {
+    say "$envrc_refusal"
+    record failed "$envrc_refusal, then rerun $rerun"
     return 3
   }
   say "building the production CLI ($target) and the Nx cache server bundle for $head in $shed"

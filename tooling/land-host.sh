@@ -6,7 +6,8 @@
 # and the after-land commands, main's build among them. This script checks the rebased tree and nothing else: it moves
 # neither main nor the workspace, and its exit status is the gate's verdict. The steps:
 #
-# 1. Approve <workspace>'s .envrc for direnv only when it is main's approved one, or the operator approved it by hand.
+# 1. Approve <workspace>'s .envrc for direnv only when it is main's approved one, or the operator approved it by hand
+#    (tooling/land-envrc.sh, the rule land-install.sh applies to its build shed as well).
 # 2. Stop <workspace>'s Nx daemon. Its file map can be stale across a rebase (fseventsd drops events), and a gate
 #    that hashes a tree other than the rebased one proves nothing about it. The gate job starts no daemon of its own
 #    (every job runs with NX_DAEMON_START=never, specs/cowshed/04_sandbox.md), so after the stop it has no stale map.
@@ -42,6 +43,8 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/.."
+# shellcheck source=land-envrc.sh
+. "$here/land-envrc.sh"
 
 # The only call is `--gate <workspace>`. land-decide.ts refuses anything else with the usage line, and main itself (a
 # tested call); a call without `--gate` reaches it with no arguments, which is usage.
@@ -72,28 +75,6 @@ publisher="$here/../packages/nx-plugin/dist/bin/smoo-nx-publish.js"
 
 say() {
   echo "land-host: $*" >&2
-}
-
-# direnv trusts an .envrc by its content. The operator approved main's; a workspace's is approved here only when it is
-# byte-identical. One that differs (a change to the .envrc) runs only when the operator has already approved it by
-# hand, so a gate never runs an environment nobody approved. direnv reports an approved .envrc as "Found RC allowed 0".
-allow_envrc() {
-  envrc_same=differs
-  envrc_status=
-  if cmp -s "$main/.envrc" "$checkout/.envrc"; then
-    envrc_same=same
-  else
-    envrc_status=$(cd "$checkout" && direnv status) || envrc_status=
-  fi
-  verdict=$(bun "$here/land-decide.ts" envrc "$envrc_same" "$envrc_status")
-  case $verdict in
-  allow) direnv allow "$checkout" ;;
-  approved) ;;
-  *)
-    say "$checkout/.envrc differs from main's approved .envrc; review it and run 'direnv allow $checkout', or rebase"
-    exit 1
-    ;;
-  esac
 }
 
 # `nx <args>` in <workspace>'s own devenv. A gate takes no input, and a task that reads stdin must not eat the caller's.
@@ -228,6 +209,9 @@ gate_workspace() {
   fi
 }
 
-allow_envrc
+allow_envrc "$main" "$checkout" || {
+  say "$envrc_refusal"
+  exit 1
+}
 gate_workspace
 say "gate passed for $head in $(($(date +%s) - started))s"

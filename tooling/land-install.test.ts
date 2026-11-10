@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   utimesSync,
@@ -40,6 +41,8 @@ import {
 // a land that has to wait for a turn another holds) and the production CLI itself, whose doctor, gateway status and
 // setup answer what a scenario sets. The install holds no land turn, so a land that asks for its turn while the build
 // runs takes it at once.
+// 'direnv' (exec, allow, status) trusts an .envrc by its path and content, as the real one does: a fork approves the
+// new shed's .envrc and a re-point that changes it does not, so the shed's own commands are blocked until approved.
 
 const HEAD = 'a1'.repeat(20);
 
@@ -417,10 +420,30 @@ const bun = process.execPath;
 
 const PATH_STUBS: Record<string, string> = {
   direnv: `#!/bin/sh
-[ "$1" = exec ] || exit 64
-echo "$*" >>"$FIX_STATE/direnv.log"
-shift 2
-exec "$@"
+# direnv trusts an .envrc by its path and its content, as the real one does: $FIX_STATE/direnv-allowed holds, for each
+# approved .envrc, the content it was approved with, in a file named by its path. An .envrc that was never approved at
+# its path, or was approved with other content, is blocked.
+key() { printf %s "$(cd "$1" && pwd -P)/.envrc" | tr / _; }
+approved() { [ ! -f "$1/.envrc" ] || cmp -s "$1/.envrc" "$FIX_STATE/direnv-allowed/$(key "$1")"; }
+log() { [ -n "$DIRENV_STUB_QUIET" ] || echo "$*" >>"$FIX_STATE/direnv.log"; }
+case $1 in
+exec)
+  log "$*"
+  approved "$2" || { echo "direnv: error $2/.envrc is blocked. Run 'direnv allow' to approve its content" >&2; exit 1; }
+  shift 2
+  exec "$@"
+  ;;
+allow)
+  log "$*"
+  mkdir -p "$FIX_STATE/direnv-allowed"
+  cp "$2/.envrc" "$FIX_STATE/direnv-allowed/$(key "$2")"
+  ;;
+status)
+  log "$*"
+  if approved .; then echo 'Found RC allowed 0'; else echo 'Found RC allowed 1'; fi
+  ;;
+*) exit 64 ;;
+esac
 `,
   uname: `#!/bin/sh
 case $1 in
@@ -476,6 +499,9 @@ fork)
   fi
   [ ! -e "$sheds/$1" ] || { echo "cowshed: workspace $1 exists" >&2; exit 4; }
   git clone -q "$project" "$sheds/$1" && git -C "$sheds/$1" checkout -q "$3" || exit 1
+  # A fork marks the new checkout's .envrc direnv-trusted (specs/cowshed/02_workspaces.md, "cowshed fork"); a re-point
+  # that changes the .envrc does not.
+  DIRENV_STUB_QUIET=1 direnv allow "$sheds/$1" || exit 1
   echo "$sheds/$1"
   ;;
 path)
@@ -635,6 +661,8 @@ interface Install {
   readonly sheds: string;
   /** Replaces what a stand-in answers: a file of the state directory. */
   set(name: string, text: string): void;
+  /** What direnv approves: `directory`'s .envrc with the content `envrc`, as `direnv allow` records it. */
+  approve(directory: string, envrc: string): void;
   /** What a stand-in logged, one entry per call. */
   log(name: string): readonly string[];
   run(options?: { readonly machine?: string; readonly args?: readonly string[] }): Run;
@@ -650,6 +678,8 @@ afterEach(() => {
 });
 
 const COWSHED_CHANGE = 'packages/cowshed/crates/cowshed-cli/src/main.rs';
+/** The .envrc of the main repository a fixture starts with. */
+const MAIN_ENVRC = '# approved\n';
 
 /** A main repository carrying the install tooling, one commit past the commit before it that touched the given files. */
 function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
@@ -662,10 +692,11 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
   mkdirSync(join(main, 'tooling'), { recursive: true });
   mkdirSync(sheds, { recursive: true });
   mkdirSync(bin);
-  for (const file of ['land-install.sh', 'land-install.ts']) {
+  for (const file of ['land-install.sh', 'land-install.ts', 'land-decide.ts', 'land-envrc.sh']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   writeFileSync(join(main, '.gitignore'), '.cache\npackages/*/dist\n');
+  writeFileSync(join(main, '.envrc'), MAIN_ENVRC);
   mkdirSync(join(main, 'packages/cowshed/nix/mbx'), { recursive: true });
   writeFileSync(join(main, 'packages/cowshed/nix/mbx/flake.nix'), '{ outputs = _: { }; }\n');
   writeFileSync(join(main, 'packages/cowshed/nix/mbx/flake.lock'), '{}\n');
@@ -695,6 +726,12 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
   set('status.json', status({}));
   set('setup.json', JSON.stringify({ ok: true, result: {} }));
   set('setup.exit', '0');
+  const approve = (directory: string, envrc: string): void => {
+    mkdirSync(join(state, 'direnv-allowed'), { recursive: true });
+    writeFileSync(join(state, 'direnv-allowed', `${realpathSync(directory)}/.envrc`.replaceAll('/', '_')), envrc);
+  };
+  // The operator approved main's .envrc.
+  approve(main, MAIN_ENVRC);
   const script = join(main, 'tooling/land-install.sh');
   const environment = (machine: string | undefined): NodeJS.ProcessEnv => ({
     ...process.env,
@@ -713,6 +750,7 @@ function fixture(changed: readonly string[] = [COWSHED_CHANGE]): Install {
     shed: 'land-install',
     sheds,
     set,
+    approve,
     log(name) {
       const path = join(state, name);
       return existsSync(path) ? readFileSync(path, 'utf8').trimEnd().split('\n') : [];
@@ -773,6 +811,15 @@ function landAnother(install: Install): string {
   writeFileSync(join(install.main, 'later.txt'), 'later\n');
   git(install.main, 'add', '.');
   git(install.main, 'commit', '-q', '-m', 'feat(cowshed): a later change');
+  return git(install.main, 'rev-parse', 'HEAD');
+}
+
+/** Lands one more commit on main that changes its .envrc to `envrc`, which the operator approves in main, and returns it. */
+function landEnvrc(install: Install, envrc: string): string {
+  writeFileSync(join(install.main, '.envrc'), envrc);
+  git(install.main, 'add', '.');
+  git(install.main, 'commit', '-q', '-m', 'chore(tooling): change the shell');
+  install.approve(install.main, envrc);
   return git(install.main, 'rev-parse', 'HEAD');
 }
 
@@ -859,6 +906,7 @@ describe('land-install.sh', () => {
     // doctor and status reads need none.
     expect(install.log('direnv.log')).toEqual([
       `exec ${install.main} bun nx show projects --affected --base=${install.before} --head=${install.head} --json`,
+      `allow ${join(install.sheds, install.shed)}`,
       'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
       'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
       `exec ${install.main} ${binary} --json setup`,
@@ -1235,6 +1283,86 @@ describe('land-install.sh', () => {
         'it is never moved back to an older commit',
     );
     expect(existsSync(install.stage)).toBe(false);
+  });
+
+  it("approves the re-pointed shed's .envrc when it is byte-identical to main's approved one, then builds in it", () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    expect(onlyLine(first.stdout).text).toBe('installed');
+    const shed = join(install.sheds, install.shed);
+    // A later land changes the shell and the operator approves main's new .envrc. The shed's path has never seen that
+    // content, so direnv blocks the re-pointed shed until something approves it.
+    const second = landEnvrc(install, 'use devenv\n');
+    const asked = install.log('direnv.log').length;
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    const line = onlyLine(run.stdout);
+    expect(line.commit).toBe(second);
+    expect(line.text).toBe('installed');
+    expect(readFileSync(join(shed, '.envrc'), 'utf8')).toBe('use devenv\n');
+    // The approval comes after the re-point and before the first command that runs in the shed's devenv.
+    const binary = join(install.main, '.cache', 'cowshed-release', second, 'dist/bin/darwin-arm64/cowshed');
+    expect(install.log('direnv.log').slice(asked)).toEqual([
+      `exec ${install.main} bun nx show projects --affected --base=${install.head} --head=${second} --json`,
+      `allow ${shed}`,
+      'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
+      'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
+      `exec ${install.main} ${binary} --json setup`,
+    ]);
+  });
+
+  it("refuses a shed's .envrc that differs from main's and is not approved by name, and builds nothing", () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    const shed = join(install.sheds, install.shed);
+    // The land this install is for changed the shell, and main has moved on since: main's approved .envrc is not the
+    // one the head holds, and nobody approved the head's at the shed's path.
+    const second = landEnvrc(install, 'use devenv\n');
+    landEnvrc(install, 'use devenv --impure\n');
+    const asked = install.log('direnv.log').length;
+    const built = install.log('nx.log').length;
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    const refusal = `${shed}/.envrc differs from main's approved .envrc; review it and run 'direnv allow ${shed}'`;
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: ${refusal}, then rerun direnv exec ${install.main} sh ${install.main}/tooling/land-install.sh ${install.head} ${second}`,
+    );
+    expect(run.stderr).toContain(`land-install: ${refusal}`);
+    // The shed was re-pointed and direnv's status was read; nothing ran in the shed's devenv and nothing was staged.
+    expect(git(shed, 'rev-parse', 'HEAD')).toBe(second);
+    expect(install.log('direnv.log').slice(asked)).toEqual([
+      `exec ${install.main} bun nx show projects --affected --base=${install.head} --head=${second} --json`,
+      'status',
+    ]);
+    expect(install.log('nx.log').slice(built)).toEqual([
+      `show projects --affected --base=${install.head} --head=${second} --json [cwd main]`,
+    ]);
+    expect(existsSync(join(install.main, '.cache', 'cowshed-release', second))).toBe(false);
+  });
+
+  it("builds in a shed whose .envrc differs from main's when the operator already approved it, approving nothing", () => {
+    const install = fixture();
+    const first = install.run();
+    expect(first.status, first.stderr).toBe(0);
+    const shed = join(install.sheds, install.shed);
+    const second = landEnvrc(install, 'use devenv\n');
+    landEnvrc(install, 'use devenv --impure\n');
+    // The operator reviewed the head's .envrc and ran 'direnv allow' on the shed by hand.
+    install.approve(shed, 'use devenv\n');
+    const asked = install.log('direnv.log').length;
+    const run = install.run({ args: [install.head, second] });
+    expect(run.status, run.stderr).toBe(0);
+    expect(onlyLine(run.stdout).text).toBe('installed');
+    const binary = join(install.main, '.cache', 'cowshed-release', second, 'dist/bin/darwin-arm64/cowshed');
+    expect(install.log('direnv.log').slice(asked)).toEqual([
+      `exec ${install.main} bun nx show projects --affected --base=${install.head} --head=${second} --json`,
+      'status',
+      'exec . bun nx run nx-cache-server:bundle --outputStyle=static-failures-only',
+      'exec . bun nx run cowshed:cli-record-arm64-macos:production --outputStyle=static-failures-only',
+      `exec ${install.main} ${binary} --json setup`,
+    ]);
   });
 
   /** Polls a stand-in's log until a state shows in it; a state that never comes fails the test rather than hanging it. */

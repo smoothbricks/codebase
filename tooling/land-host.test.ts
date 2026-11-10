@@ -119,7 +119,7 @@ echo '{"published":1,"existing":0,"skipped":0}'
   direnv: `#!/bin/sh
 case $1 in
 allow) exit 0 ;;
-status) echo 'Found RC allowed 0'; exit 0 ;;
+status) echo 'Found RC allowed 1'; exit 0 ;;
 exec) shift 2; exec "$@" ;;
 esac
 exit 64
@@ -232,7 +232,7 @@ function fixture({ replayFails = false, publishFails = false }: FixtureOptions =
   mkdirSync(bin);
   mkdirSync(join(state, 'tmp'));
   writeFileSync(join(state, 'inputs.json'), JSON.stringify(INPUTS));
-  for (const file of ['land-host.sh', 'land-attribution.ts', 'land-decide.ts', 'land-cargo-env.ts']) {
+  for (const file of ['land-host.sh', 'land-attribution.ts', 'land-decide.ts', 'land-envrc.sh', 'land-cargo-env.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
@@ -587,5 +587,17 @@ describe('land-host.sh --gate', () => {
       expect(run.log).toContain('usage: land-host.sh --gate <workspace>');
     }
     expect(main.nx).toEqual([]);
+  });
+
+  it("refuses a workspace .envrc that differs from main's and that the operator has not approved, running no gate", () => {
+    const gate = fixture();
+    writeFileSync(join(gate.ws, '.envrc'), '# changed\n');
+    git(gate.ws, 'commit', '-q', '-a', '-m', 'chore(tooling): change the shell');
+    const run = gate.gate([]);
+    expect(run.status, run.log).toBe(1);
+    expect(run.log).toContain(
+      `land-host: ${gate.ws}/.envrc differs from main's approved .envrc; review it and run 'direnv allow ${gate.ws}'`,
+    );
+    expect(run.nx).toEqual([]);
   });
 });
