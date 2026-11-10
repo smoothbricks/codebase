@@ -900,6 +900,37 @@ mod tests {
         );
     }
 
+    /// No build starts mbx's automatic store sweep, in a job or in a host shell (11_shell.md,
+    /// "Canonical mbx environment"): the sweep serves every job's builds, and a host-shared
+    /// resource is never a job member (11_shell.md, "Shell activation and process reuse"), so the
+    /// gateway runs it (05_gateway.md, "The mbx store sweep"). A collector a build forked was its
+    /// job's member, and the job's retirement ended it mid-walk: on 2026-11-10 one sweep started
+    /// three times in 23 minutes.
+    #[test]
+    fn a_build_never_starts_the_automatic_sweep() {
+        let fixture = super::super::test_support::Fixture::new();
+        fixture.files(&["Cargo.toml"]);
+        install_fixture_mbx(&fixture);
+        let build_cache = fixture.root.join("build-cache");
+        let context = DetectionContext {
+            build_cache: Some(&build_cache),
+            ..fixture.context()
+        };
+        let contribution = DETECTOR
+            .detect(&context)
+            .unwrap()
+            .expect("the installed mbx contributes the canonical environment");
+        assert_eq!(
+            contribution.env.get("MBX_GC_AUTO"),
+            Some(&EnvAction::Own("0".into())),
+            "a job's mbx never starts the store sweep, whatever a caller or project sets"
+        );
+        assert!(
+            HOST_ENVIRONMENT.contains(&"MBX_GC_AUTO"),
+            "a host shell sources the value a job gets"
+        );
+    }
+
     /// The host's scheduler settings come from the installed mbx's own settings interface, with
     /// none of this process's environment but HOME, and an unset one stays unset; `"none"` memory
     /// is the unscheduled finding.
