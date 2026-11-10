@@ -112,10 +112,10 @@ evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after 
 is the origin's evaluation, relocated.
 
 Main's record stays current at its source: initial adoption activates main once through its own supervisor, including
-projects without Cargo, and every target-changing land refreshes the chosen target once after delivery
-(02_workspaces.md, adopt and land). An ungated fold runs no check, but still refreshes its target shell. Each step
-requires a current activation record before completing. Ordinary host-side direnv entry writes no cowshed activation
-record, and a land never copies its unit's export into the target.
+projects without Cargo, and every gated land refreshes its target once after delivery (02_workspaces.md, adopt and
+land). An ungated fold runs no check and activates no shell of its lane base, whose own next activation refreshes the
+record the fold left stale. Each refresh requires a current activation record before completing. Ordinary host-side
+direnv entry writes no cowshed activation record, and a land never copies its unit's export into the target.
 
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)

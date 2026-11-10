@@ -1262,9 +1262,10 @@ when retirement is left at its default. Its text output is the preservation ref 
 `kind: delivered` with the existing push-report fields. An ordinary land returns `kind: landed` with its target,
 build-volume and retirement report.
 
-Every target-changing land refreshes the target's shell once through its own supervisor before retiring the unit,
-requiring a current activation record. It runs no check again and never copies the unit's export. A failed refresh names
-the head and target already landed, reports the shell failure and keeps the unit.
+Every gated land refreshes the target's shell once through its own supervisor before retiring the unit, requiring a
+current activation record. It runs no check again and never copies the unit's export. A failed refresh names the head
+and target already landed, reports the shell failure and keeps the unit. An ungated fold activates no shell of its lane
+base; the lane base's own next exec refreshes it.
 
 A land that retires its named source also retires idle peers whose own work it folded. A peer must have non-empty
 commits since its recorded fork base, touching a path the landed range changed, with all its work held by the result as

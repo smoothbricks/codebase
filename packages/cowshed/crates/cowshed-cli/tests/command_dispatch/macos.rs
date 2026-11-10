@@ -1163,9 +1163,9 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
     phase("done");
 }
 
-/// The source, not its next fork, owns activation after adoption and every target change.
+/// The source, not its next fork, owns activation after adoption and every gated land.
 #[tokio::test(flavor = "multi_thread")]
-async fn directory_source_shell_records_follow_adopt_and_every_land() {
+async fn directory_source_shell_records_follow_adopt_and_every_gated_land() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
@@ -1252,33 +1252,10 @@ async fn directory_source_shell_records_follow_adopt_and_every_land() {
         "the landed input bytes match"
     );
 
-    let lane = new_workspace(&mut service, "lane").await;
-    fs::write(topic.join("shell-input"), "three\n").expect("folded shell input");
+    fs::write(topic.join("shell-input"), "three\n").expect("next shell input");
     git(
         &topic,
         &["commit", "-q", "-a", "-m", "third shell generation"],
-    );
-    succeed(
-        &mut service,
-        [
-            "land",
-            "topic",
-            "--into",
-            "lane",
-            "--ungated",
-            "--no-retire",
-        ],
-    )
-    .await;
-    assert_eq!(
-        record(&lane)["environment"]["LAND_SHELL_VALUE"],
-        "three",
-        "an ungated fold refreshes its target without running a check"
-    );
-    assert_eq!(
-        record(&fixture.checkout)["environment"]["LAND_SHELL_VALUE"],
-        "two",
-        "the lane's refresh does not activate an unrelated target"
     );
 
     // A target-only tail fails after delivery, while the source's gate still succeeds.
@@ -1307,110 +1284,6 @@ async fn directory_source_shell_records_follow_adopt_and_every_land() {
         "{error}"
     );
     assert_eq!(
-        //#region smoo/cowshed!n/fold-activates-no-target-shell
-        /// A fold returns once the lane base's branch has moved and the unit retired, while the lane
-        /// base's shell would still be evaluating: the lane base's own next activation refreshes its
-        /// record. A monorepo's folds waited on that activation, a cold devenv evaluation under load,
-        /// for 240 s and more after their commit until they were killed (2026-11-11).
-        #[tokio::test(flavor = "multi_thread")]
-        async fn directory_an_ungated_fold_returns_without_activating_its_lane_base_shell() {
-            use std::os::unix::fs::OpenOptionsExt;
-            cowshed_core::runtime::shell_host::register(
-                cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
-                    cowshed(),
-                    vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-                ),
-            );
-            let mut fixture = Fixture::directory();
-            fs::write(fixture.checkout.join(".envrc"),
-        "watch_file shell-input\nread -r LAND_SHELL_VALUE < shell-input\nexport LAND_SHELL_VALUE\nsource_env_if_exists .envrc-local\n")
-        .expect("source shell");
-            fs::write(fixture.checkout.join("shell-input"), "one\n").expect("initial shell input");
-            fs::write(fixture.checkout.join(".gitignore"), ".envrc-local\n")
-                .expect("local tail ignore");
-            git(
-                &fixture.checkout,
-                &["add", ".envrc", "shell-input", ".gitignore"],
-            );
-            git(&fixture.checkout, &["commit", "-q", "-m", "source shell"]);
-            install_in_fixture_profile(&fixture, "direnv", &path_program("direnv"));
-            let mut service = serve_project(&mut fixture, &[]).await;
-            let lane = new_workspace(&mut service, "lane").await;
-            let unit = new_workspace(&mut service, "unit").await;
-            // Any evaluation of the lane's shell blocks on this pipe until the test writes to it.
-            let gate = fs::canonicalize(&lane)
-                .expect("lane root")
-                .join(".shell-gate");
-            let fifo =
-                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(gate.as_os_str()))
-                    .expect("gate path");
-            // SAFETY: a valid NUL-terminated path; mkfifo reads nothing else.
-            assert_eq!(
-                unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
-                0,
-                "mkfifo {}: {}",
-                gate.display(),
-                std::io::Error::last_os_error()
-            );
-            fs::write(
-                lane.join(".envrc-local"),
-                format!("read -r _ < '{}'\n", gate.display()),
-            )
-            .expect("blocking lane shell");
-            fs::write(unit.join("shell-input"), "two\n").expect("folded shell input");
-            git(
-                &unit,
-                &["commit", "-q", "-a", "-m", "second shell generation"],
-            );
-            let folded = tokio::time::timeout(
-                cowshed_os::test_backstop::NO_PROGRESS,
-                succeed(
-                    &mut service,
-                    ["land", "unit", "--into", "lane", "--ungated"],
-                ),
-            )
-            .await;
-            fs::remove_file(lane.join(".envrc-local")).expect("unblock the lane shell");
-            match fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&gate)
-            {
-                // An evaluation waits on the gate: it reads its line and goes on.
-                Ok(mut writer) => {
-                    std::io::Write::write_all(&mut writer, b"\n").expect("release the lane shell")
-                }
-                // Nothing waits on the gate, so there is nothing to release.
-                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
-                Err(error) => panic!("release the lane shell: {error}"),
-            }
-            assert!(
-                folded.is_ok(),
-                "the fold waited past {:?} on its lane base's shell activation",
-                cowshed_os::test_backstop::NO_PROGRESS
-            );
-            assert_eq!(
-                fs::read_to_string(lane.join("shell-input")).expect("lane shell input"),
-                "two\n",
-                "the fold moved the lane base's checkout"
-            );
-            assert!(!unit.exists(), "the fold retired its unit");
-            assert!(
-                sh(&mut service, "lane", "test \"$LAND_SHELL_VALUE\" = two")
-                    .await
-                    .is_empty(),
-                "the lane base's own next activation evaluates the folded shell"
-            );
-            let record: serde_json::Value = serde_json::from_slice(
-                &fs::read(cowshed_core::runtime::shell_inherit::record_path(&lane))
-                    .expect("the lane base's activation publishes its record"),
-            )
-            .expect("activation record");
-            assert_eq!(record["environment"]["LAND_SHELL_VALUE"], "two");
-            service.shutdown().await.expect("stop fold runtime");
-            fixture.stop_gateway().await;
-        },
-        //#endregion smoo/cowshed!n/fold-activates-no-target-shell
         git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]),
         source_head,
         "the failure reports the target that already moved"
@@ -1433,6 +1306,111 @@ async fn directory_source_shell_records_follow_adopt_and_every_land() {
         !bounded_tail
     );
 }
+
+//#region smoo/cowshed!n/fold-activates-no-target-shell
+
+/// A fold returns once the lane base's branch has moved and the unit retired, while the lane
+/// base's shell would still be evaluating: the lane base's own next activation refreshes its
+/// record. A monorepo's folds waited on that activation, a cold devenv evaluation under load,
+/// for 240 s and more after their commit until they were killed (2026-11-11).
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_an_ungated_fold_returns_without_activating_its_lane_base_shell() {
+    use std::os::unix::fs::OpenOptionsExt;
+    cowshed_core::runtime::shell_host::register(
+        cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
+            cowshed(),
+            vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
+        ),
+    );
+    let mut fixture = Fixture::directory();
+    fs::write(fixture.checkout.join(".envrc"),
+        "watch_file shell-input\nread -r LAND_SHELL_VALUE < shell-input\nexport LAND_SHELL_VALUE\nsource_env_if_exists .envrc-local\n")
+        .expect("source shell");
+    fs::write(fixture.checkout.join("shell-input"), "one\n").expect("initial shell input");
+    fs::write(fixture.checkout.join(".gitignore"), ".envrc-local\n").expect("local tail ignore");
+    git(
+        &fixture.checkout,
+        &["add", ".envrc", "shell-input", ".gitignore"],
+    );
+    git(&fixture.checkout, &["commit", "-q", "-m", "source shell"]);
+    install_in_fixture_profile(&fixture, "direnv", &path_program("direnv"));
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let lane = new_workspace(&mut service, "lane").await;
+    let unit = new_workspace(&mut service, "unit").await;
+    // Any evaluation of the lane's shell blocks on this pipe until the test writes to it.
+    let gate = fs::canonicalize(&lane)
+        .expect("lane root")
+        .join(".shell-gate");
+    let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(gate.as_os_str()))
+        .expect("gate path");
+    // SAFETY: a valid NUL-terminated path; mkfifo reads nothing else.
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        gate.display(),
+        std::io::Error::last_os_error()
+    );
+    fs::write(
+        lane.join(".envrc-local"),
+        format!("read -r _ < '{}'\n", gate.display()),
+    )
+    .expect("blocking lane shell");
+    fs::write(unit.join("shell-input"), "two\n").expect("folded shell input");
+    git(
+        &unit,
+        &["commit", "-q", "-a", "-m", "second shell generation"],
+    );
+    let folded = tokio::time::timeout(
+        cowshed_os::test_backstop::NO_PROGRESS,
+        succeed(
+            &mut service,
+            ["land", "unit", "--into", "lane", "--ungated"],
+        ),
+    )
+    .await;
+    fs::remove_file(lane.join(".envrc-local")).expect("unblock the lane shell");
+    match fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&gate)
+    {
+        // An evaluation waits on the gate: it reads its line and goes on.
+        Ok(mut writer) => {
+            std::io::Write::write_all(&mut writer, b"\n").expect("release the lane shell")
+        }
+        // Nothing waits on the gate, so there is nothing to release.
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+        Err(error) => panic!("release the lane shell: {error}"),
+    }
+    assert!(
+        folded.is_ok(),
+        "the fold waited past {:?} on its lane base's shell activation",
+        cowshed_os::test_backstop::NO_PROGRESS
+    );
+    assert_eq!(
+        fs::read_to_string(lane.join("shell-input")).expect("lane shell input"),
+        "two\n",
+        "the fold moved the lane base's checkout"
+    );
+    assert!(!unit.exists(), "the fold retired its unit");
+    assert!(
+        sh(&mut service, "lane", "test \"$LAND_SHELL_VALUE\" = two")
+            .await
+            .is_empty(),
+        "the lane base's own next activation evaluates the folded shell"
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(cowshed_core::runtime::shell_inherit::record_path(&lane))
+            .expect("the lane base's activation publishes its record"),
+    )
+    .expect("activation record");
+    assert_eq!(record["environment"]["LAND_SHELL_VALUE"], "two");
+    service.shutdown().await.expect("stop fold runtime");
+    fixture.stop_gateway().await;
+}
+
+//#endregion smoo/cowshed!n/fold-activates-no-target-shell
 
 /// A `--git-worktree` workspace's checkout holds a `.git` pointer file, not a repository: its
 /// excludes are main's, the common directory's. Its supervisor wrote cowshed's excludes into

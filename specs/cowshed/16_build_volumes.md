@@ -1174,12 +1174,12 @@ again at any level above it. A lane whose units fold ungated pays one build in a
 
 A lane unit's ungated fold into its lane base (`land --into <lane> --ungated`, 02_workspaces.md Lanes) moves Git state
 without a check or unit-volume adoption. Its rebase is the ordinary rebase, Git alone. Its land skips Land steps 4 to 7:
-it quiesces no landing volume, closes no target Nx state, freezes no seed, adopts nothing and restores no output. It
-then refreshes the target's shell through its canonical supervisor; ordinary entry tasks are not a gate or output
-restoration. No landing unit's volume replaces the lane base's own volume or seed. The unit's volume is still the
-unit's, as after a compare-and-swap at Land step 3, so step 8 retires it with the unit and collection releases it like
-any retired checkout's volume (Garbage collection): nothing is adopted and nothing is left behind. The land report's
-seed is `unchanged` and its adoption is `skipped` with `reason:{kind:"ungated"}`, which its `LandOutcome` records
+it quiesces no landing volume, closes no target Nx state, freezes no seed, adopts nothing and restores no output. Nor
+does it activate the target's shell (02_workspaces.md, land step 4): the lane base's own next activation refreshes it.
+No landing unit's volume replaces the lane base's own volume or seed. The unit's volume is still the unit's, as after a
+compare-and-swap at Land step 3, so step 8 retires it with the unit and collection releases it like any retired
+checkout's volume (Garbage collection): nothing is adopted and nothing is left behind. The land report's seed is
+`unchanged` and its adoption is `skipped` with `reason:{kind:"ungated"}`, which its `LandOutcome` records
 (13_telemetry.md).
 
 Main refuses `--ungated` by name: a land into main is where a tree is gated and its built volume adopted, so main and

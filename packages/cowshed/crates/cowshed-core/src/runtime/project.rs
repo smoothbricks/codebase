@@ -16924,8 +16924,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .await?;
             }
         }
-        timed_async("land", "target-shell", self.refresh_source_shell(&into.name, &into.root))
-            .await.map_err(|error| error.reworded(|message| format!("landed {source_head} on {target_branch}, but {} shell was not refreshed: {message}", into.name)))?;
+        // Only a gated land refreshes its target's shell. A fold leaves the lane base's record to
+        // the lane base's own next activation: refreshing it here put a cold evaluation, unbounded
+        // under load, after every fold's commit (02_workspaces.md, land step 4, "An ungated fold").
+        if plan == LandPlan::Gated {
+            timed_async("land", "target-shell", self.refresh_source_shell(&into.name, &into.root))
+                .await.map_err(|error| error.reworded(|message| format!("landed {source_head} on {target_branch}, but {} shell was not refreshed: {message}", into.name)))?;
+        }
         let mut folded = Vec::new();
         if retire {
             // The target has already moved, so a refused retire must not read as a refused land:
