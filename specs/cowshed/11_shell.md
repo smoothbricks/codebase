@@ -817,10 +817,16 @@ closing drops only that subscription, never the job. No public cursor or long-po
 `hold` holds its own connection too, and is the one call whose disconnection reaches a job (05_gateway.md, "A job lives
 with its requester"). The client reads the served authority from `hello` and refuses a supervisor serving another
 incarnation than its job's before anything is held, so a grant advance between admission and hold changes nothing. The
-supervisor validates the authority and the job and acknowledges with `null`. It then answers the job's terminal
-`JobInfo` when the job ends, or `null` again when the client sends the demand `release`, which lets the job outlive the
-connection. A connection that closes before either has left a running job with nobody waiting for it: the supervisor
-kills it under the authority it serves then, and says so on its stderr.
+supervisor validates the authority and the job and acknowledges with `null`. It reads both from what its actor last
+published, as `hello` does (05_gateway.md, "Deadlines"), so a turn waiting on the blocking pool, the job's own spawn
+included, never holds the acknowledgement past its control bound: an authority the actor does not publish is refused as
+stale, and only a job it does not publish is judged through the actor. Each call it makes about the held job (the wait,
+a read, the kill below) is made in one turn of its actor under the authority it serves then, so a grant advance during
+the hold changes nothing. Measured 2026-11-11: a land gate died when its hold, judged through the actor, waited out the
+5 s bound behind the spawn turn of the job it held, which sat 12 s in one `stat` of the store's main image at load 128
+on 18 cores. It then answers the job's terminal `JobInfo` when the job ends, or `null` again when the client sends the
+demand `release`, which lets the job outlive the connection. A connection that closes before either has left a running
+job with nobody waiting for it: the supervisor kills it under the authority it serves then, and says so on its stderr.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
   and lifecycle revisions) and its pid. The authority is the one its actor last published (05_gateway.md, "Deadlines"),

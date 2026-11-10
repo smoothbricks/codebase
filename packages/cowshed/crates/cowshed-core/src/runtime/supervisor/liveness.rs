@@ -1,11 +1,13 @@
 //! What the supervisor's actor publishes for the heartbeats of its calls (specs/cowshed/
 //! 05_gateway.md, "Deadlines"): the authority it serves, how many turns it has completed, the
 //! turn it is in and since when, and every job it has not concluded as a heartbeat reports it.
-//! The actor is the one writer: it swaps an immutable snapshot as each turn starts and ends, and
-//! a heartbeat loads the latest without a lock and without a round trip through the actor. A
-//! turn that waits on the blocking pool therefore keeps every heartbeat going and names itself
-//! in each of them; a turn that never ends is told apart from an idle actor by its rising age
-//! and a turn count that stays put.
+//! The actor is the one writer: it swaps an immutable snapshot as each turn starts and ends, as
+//! it admits a job, before the job's id is answered, and as it forgets one. A heartbeat loads the
+//! latest without a lock and without a round trip through the actor, and so does a `hold`'s
+//! acknowledgement (11_shell.md, "Protocol"). A turn that waits on the blocking pool therefore
+//! keeps every heartbeat going and names itself in each of them, and holds no acknowledgement of a
+//! job it admitted; a turn that never ends is told apart from an idle actor by its rising age and
+//! a turn count that stays put.
 
 use std::sync::Arc;
 
@@ -32,12 +34,13 @@ pub(crate) struct Liveness {
     pub(crate) turns: u64,
     /// The turn it is in, or `None` while it waits for its next command or event.
     pub(crate) turn: Option<Turn>,
-    /// Every job it has not concluded, by job id, as of its last completed turn.
+    /// Every job it has not concluded, by job id, as of its last completed turn, and each job the
+    /// turn it is in has admitted, less each it has forgotten.
     jobs: Arc<[JobPulse]>,
 }
 
 impl Liveness {
-    /// `job_id` as of the actor's last completed turn, if it has not concluded.
+    /// `job_id` as of the actor's last completed turn or its admission, if it has not concluded.
     pub(crate) fn job(&self, job_id: JobId) -> Option<JobPulse> {
         self.jobs
             .binary_search_by_key(&job_id, |pulse| pulse.job_id)
@@ -96,15 +99,31 @@ impl LivenessWriter {
         self.publish();
     }
 
-    /// The turn ended with `jobs` unconcluded, in job id order. The job list is replaced only
-    /// when it changed.
+    /// The turn holds `jobs` unconcluded now, in job id order: published before it answers an
+    /// admitted job's id or forgets a job, so a call about one reads it as the actor holds it while
+    /// the turn goes on.
+    pub(super) fn publish_jobs(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) {
+        if self.hold(jobs) {
+            self.publish();
+        }
+    }
+
+    /// The turn ended with `jobs` unconcluded, in job id order.
     pub(super) fn end(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) {
         self.turn = None;
         self.turns += 1;
-        if !self.jobs.iter().copied().eq(jobs.clone()) {
+        self.hold(jobs);
+        self.publish();
+    }
+
+    /// Hold `jobs` from now on; whether they differ from those held. An unchanged list is kept,
+    /// so publications share it until it changes.
+    fn hold(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) -> bool {
+        let changed = !self.jobs.iter().copied().eq(jobs.clone());
+        if changed {
             self.jobs = jobs.collect();
         }
-        self.publish();
+        changed
     }
 
     /// The actor serves `authority` from now on.

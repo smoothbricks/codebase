@@ -3990,6 +3990,34 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Wait for held job `job_id` under the authority the supervisor serves when it takes the call
+    /// ([`HeldCall`]).
+    pub(super) async fn held_wait(&self, job_id: JobId) -> Result<JobInfo> {
+        self.held(job_id, HeldCall::Wait).await
+    }
+
+    /// Read held job `job_id` under the authority the supervisor serves when it takes the call.
+    pub(super) async fn held_info(&self, job_id: JobId) -> Result<JobInfo> {
+        self.held(job_id, HeldCall::Info).await
+    }
+
+    /// Kill held job `job_id` under the authority the supervisor serves when it takes the call.
+    pub(super) async fn held_kill(&self, job_id: JobId) -> Result<()> {
+        self.held(job_id, HeldCall::Kill).await
+    }
+
+    async fn held<T>(
+        &self,
+        job_id: JobId,
+        call: impl FnOnce(oneshot::Sender<Result<T>>) -> HeldCall,
+    ) -> Result<T> {
+        self.call(|reply| Command::Held {
+            incarnation: self.authority.workspace_incarnation.clone(),
+            job_id,
+            call: call(reply),
+        })
+        .await
+    }
     /// Wake once `job_id` ended, as [`Self::wait`] does, acknowledging nothing of a
     /// caller-owned job's end: for a watcher of the job, never its caller.
     pub async fn ended(&self, job_id: JobId) -> Result<JobInfo> {
@@ -4330,6 +4358,13 @@ impl WorkspaceSupervisor {
     }
 }
 
+/// What a call about a held job asks, and where its answer goes ([`Command::Held`]).
+pub(super) enum HeldCall {
+    Wait(oneshot::Sender<Result<JobInfo>>),
+    Info(oneshot::Sender<Result<JobInfo>>),
+    Kill(oneshot::Sender<Result<()>>),
+}
+
 pub(super) enum Command {
     AdvanceAuthority {
         expected: WorkspaceAuthoritySnapshot,
@@ -4454,6 +4489,14 @@ pub(super) enum Command {
         job_id: JobId,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// A call about a held job (`hold`, 11_shell.md "Protocol"), made under the authority the
+    /// actor serves when it takes the call, in that one turn: a grant advance, before the call or
+    /// queued behind it, never refuses it, and another workspace incarnation always does.
+    Held {
+        incarnation: WorkspaceIncarnation,
+        job_id: JobId,
+        call: HeldCall,
+    },
     Wait {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
@@ -4544,6 +4587,7 @@ impl Command {
             Self::ListeningPorts { .. } => "listening-ports",
             Self::JobByKey { .. } => "job-by-key",
             Self::Progress { .. } => "progress",
+            Self::Held { .. } => "held",
             Self::List { .. } => "list",
             Self::Kill { .. } => "kill",
             Self::Wait { .. } => "wait",
@@ -5721,6 +5765,23 @@ fn report_unsignalled(job: JobId, signalled: Result<()>) {
     }
 }
 
+/// Every job of `jobs` not concluded, in job id order, as the actor publishes it.
+fn unconcluded(
+    jobs: &BTreeMap<JobId, JobStateRecord>,
+) -> impl Iterator<Item = super::supervisor_socket::JobPulse> + Clone + '_ {
+    jobs.values()
+        .filter(|job| !job.terminal())
+        .map(|job| super::supervisor_socket::JobPulse::of(&job.info))
+}
+
+/// The refusal of a call made under an authority the supervisor does not serve.
+pub(super) fn stale_authority() -> CowshedError {
+    CowshedError::conflict(
+        "workspace supervisor authority is stale",
+        "reattach the workspace and retry with its current incarnation and revisions",
+    )
+}
+
 impl SupervisorActor {
     /// The actor's loop. A turn starts when the actor takes the command or event that woke it
     /// and ends when it waits again, the admission effects and job conclusions it led to
@@ -5856,12 +5917,7 @@ impl SupervisorActor {
     /// The turn `span` times ended: published with every job it left unconcluded, as a
     /// heartbeat about one reports it.
     fn end_turn(&mut self, span: cowshed_os::timing::Span) {
-        self.liveness.end(
-            self.jobs
-                .values()
-                .filter(|job| !job.terminal())
-                .map(|job| super::supervisor_socket::JobPulse::of(&job.info)),
-        );
+        self.liveness.end(unconcluded(&self.jobs));
         drop(span);
     }
 
@@ -6174,6 +6230,12 @@ impl SupervisorActor {
                         }
                         admission.job_id()
                     });
+                // Published before its id is answered: this turn goes on to spawn the job, maybe
+                // waiting on the blocking pool, and its caller's `hold` is answered at once from
+                // what the actor published (11_shell.md, "Protocol").
+                if admitted.is_ok() {
+                    self.liveness.publish_jobs(unconcluded(&self.jobs));
+                }
                 let _ = reply.send(admitted);
             }
             Command::Detach {
@@ -6487,6 +6549,11 @@ impl SupervisorActor {
                 job_id,
                 reply,
             } => self.wait(&authority, job_id, reply, Answer::Caller),
+            Command::Held {
+                incarnation,
+                job_id,
+                call,
+            } => self.held(&incarnation, job_id, call),
             Command::Ended {
                 authority,
                 job_id,
@@ -6705,10 +6772,7 @@ impl SupervisorActor {
         if authority == &self.authority {
             Ok(())
         } else {
-            Err(CowshedError::conflict(
-                "workspace supervisor authority is stale",
-                "reattach the workspace and retry with its current incarnation and revisions",
-            ))
+            Err(stale_authority())
         }
     }
 
@@ -8259,6 +8323,34 @@ impl SupervisorActor {
         }
     }
 
+    /// Carry out `call` about held job `job_id` under the authority served now, refused only for
+    /// another workspace incarnation than its holder's.
+    fn held(&mut self, incarnation: &WorkspaceIncarnation, job_id: JobId, call: HeldCall) {
+        let authority = self.authority.clone();
+        let refusal = (authority.workspace_incarnation != *incarnation).then(|| {
+            CowshedError::conflict(
+                format!(
+                    "job {} belongs to workspace incarnation {incarnation}, but the supervisor now serves {}; refusing a call about the held job",
+                    job_id.get(),
+                    authority.workspace_incarnation
+                ),
+                "inspect the original workspace supervisor",
+            )
+        });
+        match (call, refusal) {
+            (HeldCall::Wait(reply) | HeldCall::Info(reply), Some(error)) => {
+                let _ = reply.send(Err(error));
+            }
+            (HeldCall::Kill(reply), Some(error)) => {
+                let _ = reply.send(Err(error));
+            }
+            (HeldCall::Wait(reply), None) => self.wait(&authority, job_id, reply, Answer::Caller),
+            (HeldCall::Info(reply), None) => {
+                let _ = reply.send(self.job(job_id).and_then(JobStateRecord::status));
+            }
+            (HeldCall::Kill(reply), None) => self.kill(&authority, job_id, reply),
+        }
+    }
     /// A reader was told how `job_id` ended: a caller-owned job whose caller has now read its
     /// end whole is forgotten.
     fn terminal_read(&mut self, job_id: JobId) {
@@ -8278,11 +8370,15 @@ impl SupervisorActor {
         {
             return;
         }
-        if let Some(job) = self.jobs.remove(&job_id)
-            && let Some(key) = job.caller.and_then(|caller| caller.key)
-        {
+        let Some(job) = self.jobs.remove(&job_id) else {
+            return;
+        };
+        if let Some(key) = job.caller.and_then(|caller| caller.key) {
             self.caller_keys.remove(&key);
         }
+        // Published before the turn goes on: a `hold` judged from what the actor published must
+        // not take a forgotten job for one it holds (11_shell.md, "Protocol").
+        self.liveness.publish_jobs(unconcluded(&self.jobs));
     }
     fn kill(
         &mut self,

@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::job_groups::{ExitObserved, Process};
 use super::process_stream::JobProcessStream;
 use super::supervisor::{
-    Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot, SessionToken,
+    Command, HeldCall, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot, SessionToken,
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use super::wait_spans::{WaitFailure, peer_pid};
@@ -2857,7 +2857,19 @@ async fn serve_hold(
     job_id: JobId,
     owed: &DrainReads,
 ) -> Result<()> {
-    if let Err(error) = caller.info(job_id).await {
+    // Validated from what the actor published, as a hello is answered: a hold is answered at once
+    // (05_gateway.md, "Deadlines"), while the turn that admitted the job may still wait on the
+    // blocking pool to spawn it. This task runs on the actor's thread only while the actor awaits,
+    // and the authority it published is then the one it serves, so another is refused as the actor
+    // would refuse it. Only a job it has not published is the actor's to judge.
+    let held = match supervisor.liveness() {
+        Ok(liveness) if *liveness.authority != *caller.snapshot() => {
+            Err(super::supervisor::stale_authority())
+        }
+        Ok(liveness) if liveness.job(job_id).is_some() => Ok(()),
+        _ => caller.info(job_id).await.map(drop),
+    };
+    if let Err(error) = held {
         return write_json(&mut stream, &Response::Err(error)).await;
     }
     write_json(
@@ -2874,7 +2886,9 @@ async fn serve_hold(
     tokio::pin!(read);
     let demand = tokio::select! {
         biased;
-        ended = caller.wait(job_id) => match ended {
+        // Waited for under the authority served when the actor takes the wait, so a grant advance
+        // since the acknowledgement, or during the turn it was acknowledged in, changes nothing.
+        ended = supervisor.held_wait(job_id) => match ended {
             Ok(info) => {
                 let written = write_json(
                     &mut writer,
@@ -2888,7 +2902,7 @@ async fn serve_hold(
             }
             // A refused retirement leaves the job running and held; its waiters have the error.
             // An ended job's error answers the hold, as its record would.
-            Err(error) => match caller.info(job_id).await {
+            Err(error) => match supervisor.held_info(job_id).await {
                 Ok(info) if !info.state.is_terminal() => None,
                 _ => return write_json(&mut writer, &Response::Err(error)).await,
             },
@@ -2920,27 +2934,14 @@ pub(super) async fn kill_unheld(
     supervisor: &WorkspaceSupervisorHandle,
     job_id: JobId,
 ) -> Result<()> {
-    let served = supervisor.current_authority().await?;
-    let expected = &supervisor.snapshot().workspace_incarnation;
-    if served.workspace_incarnation != *expected {
-        return Err(CowshedError::conflict(
-            format!(
-                "job {} belongs to workspace incarnation {expected}, but the supervisor now serves {}; refusing cancellation",
-                job_id.get(),
-                served.workspace_incarnation
-            ),
-            "inspect the original workspace supervisor",
-        ));
-    }
-    let current = supervisor.with_authority(served);
-    if current.info(job_id).await?.state.is_terminal() {
+    if supervisor.held_info(job_id).await?.state.is_terminal() {
         return Ok(());
     }
     cowshed_os::eprintln!(
         "cowshed: job {} lost its holder before it ended; killing it, since nothing waits for it",
         job_id.get()
     );
-    current.kill(job_id).await
+    supervisor.held_kill(job_id).await
 }
 
 /// Relay `events` one per demand. While a demand waits for its event, `probe` heartbeats the
@@ -3806,6 +3807,23 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 "an authenticated membership peer cannot be forwarded through coordinator authority",
                 "connect directly to the membership-only endpoint",
             )));
+        }
+        Command::Held { call, .. } => {
+            // Only the socket serving a hold calls about its job, on its own supervisor.
+            let refusal = || {
+                CowshedError::conflict(
+                    "a remote supervisor handle makes no call about a held job",
+                    "hold the job through the supervisor's socket",
+                )
+            };
+            match call {
+                HeldCall::Wait(reply) | HeldCall::Info(reply) => {
+                    let _ = reply.send(Err(refusal()));
+                }
+                HeldCall::Kill(reply) => {
+                    let _ = reply.send(Err(refusal()));
+                }
+            }
         }
         Command::AdvanceAuthority { reply, .. } => {
             // Only the serving runtime can rebuild the sandbox from controller-owned grants.
@@ -5802,6 +5820,118 @@ mod held_turn_tests {
         }
     }
 
+    /// An artifact store that admits every job and seals each with empty streams.
+    struct RecordingStore;
+
+    impl ArtifactIndex for RecordingStore {
+        fn next_job_id(&self) -> Result<JobId> {
+            Ok(JobId::new(1).expect("a job id"))
+        }
+
+        fn admitted(&self, _key: &crate::api::dto::AdmissionKey) -> AdmissionLookup<'_> {
+            AdmissionLookup::Absent
+        }
+    }
+
+    /// A captured stream that holds nothing.
+    fn empty_stream() -> crate::api::dto::StreamInfo {
+        use crate::api::dto::{
+            BinaryData, OutputStorage, OutputSummary, ProtectedOutput, StreamInfo,
+        };
+        StreamInfo {
+            storage: OutputStorage::Captured {
+                artifact: ProtectedOutput::Inline {
+                    data: BinaryData::new(Vec::<u8>::new()).expect("empty output"),
+                },
+            },
+            bytes: 0,
+            sha256: crate::api::dto::Sha256Digest::compute(&[]),
+            summary: OutputSummary {
+                version: 1,
+                text: String::new(),
+                truncated: false,
+            },
+        }
+    }
+
+    impl ArtifactSink for RecordingStore {
+        fn admit(
+            &mut self,
+            _job_id: JobId,
+            _grant_revision: u64,
+            _command: &ExecCommand,
+            _admission: Option<JobAdmission>,
+            _scheduling: JobScheduling,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn prepare_background(&mut self, _job_id: JobId) -> Result<()> {
+            Ok(())
+        }
+
+        fn write(
+            &mut self,
+            _job_id: JobId,
+            _stream: StreamKind,
+            bytes: &[u8],
+        ) -> Result<ArtifactWrite> {
+            Ok(ArtifactWrite {
+                accepted_bytes: bytes.len(),
+                output_limit: None,
+            })
+        }
+
+        fn seal(
+            &mut self,
+            _job_id: JobId,
+            _ending: JobEnding,
+            _stdout_copy: Option<OutputPublication>,
+            _stderr_copy: Option<OutputPublication>,
+        ) -> Result<ArtifactSeal> {
+            Ok(ArtifactSeal {
+                stdout: empty_stream(),
+                stderr: empty_stream(),
+                terminal_batch_sha256: crate::api::dto::Sha256Digest::compute(&[]),
+                output_limit: None,
+                publication_failure: None,
+            })
+        }
+
+        fn sealed(&mut self, _job_id: JobId) -> Result<Option<SealedJobReader>> {
+            Ok(None)
+        }
+    }
+
+    /// A spawn whose preparation holds its turn on the blocking pool until the test lets it go,
+    /// as a `stat` of the main image held gw-8's spawn turn for 12 s on 2026-11-11, and then
+    /// makes no process.
+    struct HeldSpawn {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnSink for HeldSpawn {
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            _events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                // Ends when the test lets it go, or when the test ends and drops its sender.
+                let _ = tokio::task::spawn_blocking(move || release.recv()).await;
+            }
+            Err(CowshedError::internal(format!(
+                "the held spawn of job {} made no process",
+                request.job_id.get()
+            )))
+        }
+    }
+
     struct NoCommitments;
 
     #[async_trait::async_trait]
@@ -5833,33 +5963,57 @@ mod held_turn_tests {
         (progress.seq, progress.actor)
     }
 
-    /// A turn held on the blocking pool keeps the supervisor's heartbeats going: the thread the
-    /// actor shares with every heartbeat writer is free while the turn waits, each heartbeat
-    /// reads what the actor published, names the held turn and shows no turn completed while it
-    /// is held, and the turn's end is published once it is let go.
-    #[tokio::test]
-    async fn a_turn_held_on_the_blocking_pool_is_named_in_every_heartbeat() {
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-held-turn-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+    /// A workspace a test supervisor serves, and its supervisor's configuration.
+    fn workspace(name: &str) -> (Workspace, WorkspaceSupervisorConfig) {
+        let root = std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::new_v4().simple()));
         // A minted workspace holds `.cowshed`, where its supervisor publishes the host environment.
         std::fs::create_dir_all(root.join(".cowshed")).expect("create the workspace");
         // Capability detection refuses a directory that resolves outside the workspace, and
         // `/var/folders` resolves into `/private/var`.
         let root = std::fs::canonicalize(&root).expect("the canonical workspace");
-        let _workspace = Workspace(root.clone());
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
             workspace_root: root.clone(),
             default_cwd: None,
             sandbox: crate::sandbox::SandboxConfig {
                 workspace_mount: root.clone(),
+                // The jobserver of a spawned job lives in the store: this one, never the host's.
+                store_root: root.join(".cowshed").join("store"),
                 ..defaults.sandbox
             },
             memory_pressure: crate::host_pressure::Source::calm(),
             ..defaults
         };
+        (Workspace(root), config)
+    }
+
+    /// A background job running `argv`, as a project tool's.
+    fn background(argv: &str) -> ExecRequest {
+        ExecRequest {
+            command: ExecCommand::Argv(vec![CommandArg::new(argv)]),
+            cwd: None,
+            mode: RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+            admission_key: None,
+            class: ExecClass::Background,
+            want: Some(std::num::NonZeroUsize::MIN),
+            hold: false,
+            scope: ExecScope::Workspace,
+            record: JobRecord::Cowshed,
+        }
+    }
+
+    /// A turn held on the blocking pool keeps the supervisor's heartbeats going: the thread the
+    /// actor shares with every heartbeat writer is free while the turn waits, each heartbeat
+    /// reads what the actor published, names the held turn and shows no turn completed while it
+    /// is held, and the turn's end is published once it is let go.
+    #[tokio::test]
+    async fn a_turn_held_on_the_blocking_pool_is_named_in_every_heartbeat() {
+        let (_workspace, config) = workspace("cowshed-held-turn");
         let (entered, held) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let supervisor = WorkspaceSupervisor::start_with_sinks(
@@ -5875,24 +6029,8 @@ mod held_turn_tests {
         let exec = tokio::spawn({
             let supervisor = supervisor.clone();
             async move {
-                let request = ExecRequest {
-                    command: ExecCommand::Argv(vec![CommandArg::new("held")]),
-                    cwd: None,
-                    mode: RunSandboxMode::ReadWrite,
-                    env: std::collections::HashMap::new(),
-                    trace: None,
-                    stdin: StdinSource::Empty,
-                    stdout_copy: None,
-                    stderr_copy: None,
-                    admission_key: None,
-                    class: ExecClass::Background,
-                    want: Some(std::num::NonZeroUsize::MIN),
-                    hold: false,
-                    scope: ExecScope::Workspace,
-                    record: JobRecord::Cowshed,
-                };
                 supervisor
-                    .exec(None, None, request, AdmissionSource::Worker)
+                    .exec(None, None, background("held"), AdmissionSource::Worker)
                     .await
             }
         });
@@ -5941,6 +6079,113 @@ mod held_turn_tests {
             "{after:?} after {held_at:?}"
         );
 
+        supervisor
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .expect("retire the supervisor");
+    }
+
+    /// A `hold` is answered at once (05_gateway.md, "Deadlines"), so it is acknowledged within
+    /// its control bound while the turn that admitted its job still waits on the blocking pool to
+    /// spawn it. Measured 2026-11-11: gw-8's land gate died when the hold of its build-state
+    /// discovery job waited out the 5 s bound behind that job's spawn, held 12 s in one `stat`.
+    #[tokio::test]
+    async fn a_hold_is_acknowledged_while_its_jobs_spawn_turn_waits_on_the_blocking_pool() {
+        let (_workspace, config) = workspace("cowshed-held-spawn");
+        let (entered, held) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let supervisor = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(HeldSpawn {
+                entered: Some(entered),
+                release: Some(released),
+            }),
+            Box::new(RecordingStore),
+            Box::new(NoCommitments),
+        )
+        .expect("start the supervisor");
+        let job = supervisor
+            .exec(None, None, background("held"), AdmissionSource::Worker)
+            .await
+            .expect("the job is admitted");
+        tokio::select! {
+            entered = held => entered.expect("the job's spawn reached the blocking pool"),
+            ended = supervisor.wait(job) => {
+                panic!("job {} ended before its spawn: {ended:?}", job.get())
+            }
+        }
+
+        let (server, mut client) = UnixStream::pair().expect("a socket pair");
+        let serving = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                serve_hold(
+                    server,
+                    &supervisor,
+                    &supervisor,
+                    job,
+                    &DrainReads::default(),
+                )
+                .await
+            }
+        });
+        let acknowledged = tokio::time::timeout(
+            deadline::CONTROL.within,
+            read_json::<Response>(&mut client),
+        )
+        .await
+        .expect("the hold is acknowledged within its control bound while the spawn turn is held")
+        .expect("an acknowledgement frame");
+        let Response::Ok { value, bytes: 0 } = acknowledged else {
+            panic!("the hold is acknowledged with null");
+        };
+        assert!(value.is_null(), "acknowledged with {value}");
+        write_json(&mut client, &HoldDemand::Release)
+            .await
+            .expect("release the hold");
+        let Response::Ok { value, .. } = read_json::<Response>(&mut client)
+            .await
+            .expect("the release's answer")
+        else {
+            panic!("the release is answered with null");
+        };
+        assert!(value.is_null(), "released with {value}");
+        serving
+            .await
+            .expect("the hold task")
+            .expect("the hold is served");
+
+        // A stale authority is refused from what the actor published, as the actor would refuse it,
+        // while the spawn turn still holds the actor.
+        let stale = crate::runtime::supervisor::WorkspaceAuthoritySnapshot {
+            grant_revision: supervisor.snapshot().grant_revision + 1,
+            ..supervisor.snapshot().clone()
+        };
+        let (server, mut client) = UnixStream::pair().expect("a socket pair");
+        let refusing = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                let caller = supervisor.with_authority(stale);
+                serve_hold(server, &supervisor, &caller, job, &DrainReads::default()).await
+            }
+        });
+        let refused =
+            tokio::time::timeout(deadline::CONTROL.within, read_json::<Response>(&mut client))
+                .await
+                .expect(
+                    "a stale hold is refused within its control bound while the spawn turn is held",
+                )
+                .expect("a refusal frame");
+        let Response::Err(error) = refused else {
+            panic!("a stale hold is refused");
+        };
+        assert_eq!(error.code, crate::ErrorCode::Conflict, "{error:?}");
+        refusing
+            .await
+            .expect("the refusing task")
+            .expect("the refusal is written");
+
+        release.send(()).expect("let the spawn go");
         supervisor
             .retire(NxDaemonRetirement::Recorded)
             .await
