@@ -161,9 +161,12 @@ it('lets a daemon that is its own client go of its connection after the reply', 
     await mkdir(join(workspace, 'p'));
     await writeFile(join(workspace, 'p/project.json'), JSON.stringify({ name: 'p' }));
     const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
-    // The daemon computes the graph once it is up and then runs every global sync generator itself.
     const started = spawnSync('node', [nxEntry, 'daemon', '--start'], { cwd: workspace, env, encoding: 'utf8' });
     expect(started.status, started.stdout + started.stderr).toBe(0);
+    // The daemon runs a sync generator only when a client asks for its changes (patches/README.md, "Sync generators
+    // run when a client asks"), so a client asks: the daemon runs the generator itself, and the generator asks it back.
+    const checked = spawnSync('node', [nxEntry, 'sync:check'], { cwd: workspace, env, encoding: 'utf8' });
+    expect(checked.status, checked.stdout + checked.stderr).toBe(0);
     const logPath = join(workspace, '.nx/workspace-data/d/daemon.log');
     // Each change the kernel reports on the log re-reads it whole: the generator's end, then the latest count, decides.
     await whenChanged(logPath, () => {
