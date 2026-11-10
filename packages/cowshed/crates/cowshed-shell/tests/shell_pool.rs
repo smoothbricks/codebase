@@ -34,7 +34,7 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceSupervisorHandle,
 };
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
-use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
+use cowshed_core::sandbox::{EgressGrant, SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
@@ -1117,7 +1117,7 @@ async fn host_controller_read_only_and_read_write_never_share_a_shell() {
 
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_a_grant_revision_retires_every_older_shell() {
+async fn host_controller_a_grant_revision_retires_every_older_shell_and_adopts_its_export() {
     let workspace = Workspace::new("shell-pool-grants", 41_200);
     workspace.envrc("");
     let handle = workspace.supervisor(false);
@@ -1125,8 +1125,9 @@ async fn host_controller_a_grant_revision_retires_every_older_shell() {
     run(&handle, sh("true")).await.ok();
     assert_eq!(workspace.activations(), 1);
     // A new revision never reuses a shell built under the old one: its pool starts fresh. With
-    // the same grants and inputs, the new host adopts the export its own checkout already
-    // evaluated (11_shell.md, "Inherited shells") instead of evaluating again.
+    // the same inputs, the new host adopts the export its own checkout already evaluated
+    // (11_shell.md, "Inherited shells") instead of evaluating again, whatever the grants: a
+    // grant can only make a read or a fetch fail, and a failed evaluation leaves no export.
     let advanced = handle
         .advance_authority(2, 1, workspace.sandbox.clone())
         .await
@@ -1139,30 +1140,44 @@ async fn host_controller_a_grant_revision_retires_every_older_shell() {
         1,
         "same grants, same inputs: adopted"
     );
-    // Other grants are another baseline: what the evaluation could read differs, so it runs.
+    // `cowshed grant <ws> --loopback-any` and an egress grant.
+    let mut networked = workspace.sandbox.clone();
+    networked.grants.loopback_any = true;
+    networked.grants.egress.push(EgressGrant {
+        host: "api.github.com".to_owned(),
+        ports: vec![443],
+    });
+    let advanced = advanced
+        .advance_authority(3, 1, networked.clone())
+        .await
+        .expect("advance to a network grant");
+    let ran = run(&advanced, sh("true")).await.ok();
+    assert_eq!(ran.info.grant_revision, 3);
+    assert!(!ran.stderr.contains("direnv: loading"), "{}", ran.stderr);
+    assert_eq!(
+        workspace.activations(),
+        1,
+        "a network grant, same inputs: adopted"
+    );
     let granted = workspace
         .root
         .parent()
         .expect("scratch parent")
         .join(format!("cowshed-granted-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&granted).expect("granted directory");
-    let mut widened = workspace.sandbox.clone();
+    let mut widened = networked;
     widened.grants.read.push(granted.clone());
     let advanced = advanced
-        .advance_authority(3, 1, widened)
+        .advance_authority(4, 1, widened)
         .await
-        .expect("advance the grant revision again");
+        .expect("advance to a filesystem grant");
     let ran = run(&advanced, sh("true")).await.ok();
-    assert_eq!(ran.info.grant_revision, 3);
-    assert!(
-        ran.stderr.contains("<grants> differs"),
-        "the miss names the grants: {}",
-        ran.stderr
-    );
+    assert_eq!(ran.info.grant_revision, 4);
+    assert!(!ran.stderr.contains("direnv: loading"), "{}", ran.stderr);
     assert_eq!(
         workspace.activations(),
-        2,
-        "no shell evaluated under other grants serves these"
+        1,
+        "a filesystem grant, same inputs: adopted"
     );
     std::fs::remove_dir_all(&granted).ok();
 }

@@ -36,21 +36,14 @@ use super::shell_watch::{
     ActivationEvidence, CertifyError, Content, Contents, Snapshot, WatchEntry, certify,
     encode_direnv_watches,
 };
-use crate::sandbox::{EgressGrant, SandboxGrants};
 
 /// The record's file in the workspace's host directory, which every job profile denies writes to.
 pub const RECORD_FILE: &str = "activation.json";
 
-/// The baseline entry under which an activator keys its pool's grants: what an evaluation could
-/// read or reach is part of what it was computed against. Angle brackets cannot begin an
-/// environment variable name, so no variable collides with it, and a baseline that differs on
-/// it reports the grants by this name.
-pub const GRANTS_KEY: &str = "<grants>";
-
 /// The selected shell directory, normalized by the baseline's existing checkout-place move.
 pub const SHELL_KEY: &str = "<shell>";
 
-const RECORD_VERSION: u32 = 3;
+const RECORD_VERSION: u32 = 4;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
 const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
@@ -233,47 +226,6 @@ impl ActivationRecord {
 /// Where a checkout's record lives.
 pub fn record_path(mount: &Path) -> PathBuf {
     mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE)
-}
-
-/// The grants as the baseline keys them under [`GRANTS_KEY`]: a byte encoding fixed here, so
-/// every cowshed build keys the same grants alike, which `Debug` output does not promise. Each
-/// list is its name, its length and its entries, every field NUL-terminated: no path, host or
-/// port holds a NUL. Paths stay text, so the baseline moves the checkout's places in them.
-/// The loopback grant follows the lists as its name and 0 or 1, both NUL-terminated.
-pub fn keyed_grants(grants: &SandboxGrants) -> OsString {
-    use std::fmt::Write as _;
-    const WRITE: &str = "writing to an OsString cannot fail";
-    // Destructured whole: a grant field added later does not compile until it is keyed here.
-    let SandboxGrants {
-        read,
-        write,
-        deny_write,
-        deny,
-        egress,
-        loopback_any,
-    } = grants;
-    let mut keyed = OsString::new();
-    for (name, paths) in [
-        ("read", read),
-        ("write", write),
-        ("deny-write", deny_write),
-        ("deny", deny),
-    ] {
-        write!(keyed, "{name}\0{}\0", paths.len()).expect(WRITE);
-        for path in paths {
-            keyed.push(path);
-            keyed.push("\0");
-        }
-    }
-    write!(keyed, "egress\0{}\0", egress.len()).expect(WRITE);
-    for EgressGrant { host, ports } in egress {
-        write!(keyed, "{host}\0{}\0", ports.len()).expect(WRITE);
-        for port in ports {
-            write!(keyed, "{port}\0").expect(WRITE);
-        }
-    }
-    write!(keyed, "loopback-any\0{}\0", u8::from(*loopback_any)).expect(WRITE);
-    keyed
 }
 
 /// How many per-workspace places a checkout has beside its root ([`Placement::beside`]).
@@ -1348,50 +1300,6 @@ mod tests {
             verify_at(&sites.clone),
             Err(AdoptionMiss::Malformed(_))
         ));
-    }
-
-    #[test]
-    fn the_grants_key_is_a_fixed_encoding() {
-        let mut grants = SandboxGrants {
-            read: vec!["/x/repo/a".into()],
-            write: Vec::new(),
-            deny_write: vec![".git".into()],
-            deny: Vec::new(),
-            egress: vec![EgressGrant {
-                host: "example.com".into(),
-                ports: vec![443, 80],
-            }],
-            loopback_any: true,
-        };
-        let mut fields = [
-            "read",
-            "1",
-            "/x/repo/a",
-            "write",
-            "0",
-            "deny-write",
-            "1",
-            ".git",
-            "deny",
-            "0",
-            "egress",
-            "1",
-            "example.com",
-            "2",
-            "443",
-            "80",
-            "loopback-any",
-            "1",
-        ];
-        let expected: String = fields.iter().map(|field| format!("{field}\0")).collect();
-        let with_loopback = keyed_grants(&grants);
-        assert_eq!(with_loopback, OsString::from(expected));
-        grants.loopback_any = false;
-        fields[17] = "0";
-        let expected: String = fields.iter().map(|field| format!("{field}\0")).collect();
-        let without_loopback = keyed_grants(&grants);
-        assert_eq!(without_loopback, OsString::from(expected));
-        assert_ne!(with_loopback, without_loopback);
     }
 
     /// A clone adopts under any parent: nothing measures the producer at a second root first.

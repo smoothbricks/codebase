@@ -3424,7 +3424,6 @@ impl SpawnSink for SystemSpawnSink {
                         environment,
                         caller: &request.env,
                         grant_revision: request.authority.grant_revision,
-                        grants: &sandbox.grants,
                         cpu: &request.cpu,
                         mbx: sandbox
                             .capabilities
@@ -11367,11 +11366,7 @@ mod workspace_toolchain_tests {
             let environment = sandbox_environment(sandbox, &BTreeMap::new())
                 .await
                 .expect("environment");
-            let baseline = super::super::shell_job::inherited_baseline(
-                &environment.base(),
-                &sandbox.grants,
-                shell,
-            );
+            let baseline = super::super::shell_job::inherited_baseline(&environment.base(), shell);
             (baseline, environment.shared_daemons)
         }
         let parent = std::fs::canonicalize(crate::temp_parent::scratch_parent())

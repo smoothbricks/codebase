@@ -132,8 +132,6 @@ pub(super) struct PooledSpawn<'a> {
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
-    /// The grants of that revision, which an evaluation's result can depend on.
-    pub grants: &'a crate::sandbox::SandboxGrants,
     /// The job's jobserver and, on macOS, its class nice, which the command alone runs under, never
     /// its host.
     pub cpu: &'a super::supervisor::CpuPlacement,
@@ -186,7 +184,6 @@ impl WorkspaceShells {
                         read_only: spawn.read_only,
                         environment: base,
                         shared_daemons: spawn.environment.shared_daemons.clone(),
-                        grants: spawn.grants.clone(),
                         envrc_directory: spawn.envrc_directory.clone(),
                         activation: Arc::clone(&self.activation),
                     }),
@@ -1229,28 +1226,21 @@ pub(super) struct HostActivator {
     read_only: bool,
     environment: BTreeMap<OsString, OsString>,
     shared_daemons: Vec<PathBuf>,
-    /// The grants this pool's hosts run under. What an evaluation can read or reach is part of
-    /// what it was computed against, so they join the inherited record's baseline key.
-    grants: crate::sandbox::SandboxGrants,
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
     activation: Arc<ActivationGate>,
 }
 
-/// The inherited baseline of a host: its environment, the grants it runs under and the
-/// directory its shell is selected from. Reserved names cannot collide with environment
-/// variables.
+/// The inherited baseline of a host: its environment and the directory its shell is selected from,
+/// under a reserved name that cannot collide with an environment variable. No grant is in it: a
+/// grant can only make an evaluation's read or fetch fail, and a failed evaluation leaves no export
+/// (11_shell.md, "Inherited shells").
 pub(super) fn inherited_baseline(
     environment: &BTreeMap<OsString, OsString>,
-    grants: &crate::sandbox::SandboxGrants,
     shell: &Path,
 ) -> BTreeMap<OsString, OsString> {
     let mut keyed = environment.clone();
-    keyed.insert(
-        shell_inherit::GRANTS_KEY.into(),
-        shell_inherit::keyed_grants(grants),
-    );
     keyed.insert(
         shell_inherit::SHELL_KEY.into(),
         shell.as_os_str().to_owned(),
@@ -1261,7 +1251,7 @@ pub(super) fn inherited_baseline(
 impl HostActivator {
     /// This host's inherited baseline ([`inherited_baseline`]).
     fn keyed_baseline(&self) -> BTreeMap<OsString, OsString> {
-        inherited_baseline(&self.environment, &self.grants, self.home())
+        inherited_baseline(&self.environment, self.home())
     }
 
     /// Where the host starts: the `.envrc`'s directory, or the workspace root.

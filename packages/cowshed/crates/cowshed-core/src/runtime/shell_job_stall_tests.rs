@@ -94,7 +94,6 @@ impl Workspace {
             read_only: false,
             environment: BTreeMap::new(),
             shared_daemons: Vec::new(),
-            grants: Default::default(),
             envrc_directory: Some(self.0.clone()),
             activation: Arc::new(gate),
         })

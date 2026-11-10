@@ -17,8 +17,9 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, HeldWorkspace, Result};
 use cowshed_gateway_types::{
-    CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, PolicyDenial, SessionStatus,
+    TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
+    WorkspaceToken,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -1407,6 +1408,64 @@ fn fresh_workspaces_have_anonymous_public_npm_reads_without_probe_grants() {
             .authorize(&other_port, &"CONNECT".parse().expect("tunnel method"), "/")
             .is_err()
     );
+}
+
+/// A loopback grant widens the sandbox profile alone (04_sandbox.md, "`--loopback-any`"): the
+/// gateway answers a GitHub fetch exactly as without it, refusing it while no egress grant names
+/// the host (05_gateway.md, "Egress modes": unmatched destinations are denied) and admitting it
+/// once one does.
+#[test]
+fn a_loopback_grant_leaves_a_github_fetch_answered_as_without_it() {
+    let github = CanonicalTarget::from_authority("api.github.com:443", TargetScheme::Https)
+        .expect("GitHub API");
+    // devenv's locked input as Nix fetches it: a tunnel, then the tarball through it.
+    let answer = |grants: &GrantSet| {
+        let policy = policy_from_grants(grants).expect("policy maps");
+        [
+            ("CONNECT", "/"),
+            (
+                "GET",
+                "/repos/cachix/devenv/tarball/0d6c556e5f862c14a75a543e2ee4fdb7acc005ad",
+            ),
+        ]
+        .map(|(method, path)| {
+            match policy.authorize(&github, &method.parse().expect("method"), path) {
+                Ok(grant) => Ok(grant.mode),
+                Err(PolicyDenial::NotGranted { hint }) => Err(hint),
+                Err(PolicyDenial::InvalidPath) => panic!("{method} {path} is a valid request"),
+            }
+        })
+    };
+    let looped = |grants: &GrantSet| GrantSet {
+        loopback_any: true,
+        ..grants.clone()
+    };
+
+    let ungranted = GrantSet::default();
+    let refused = answer(&ungranted);
+    assert!(
+        refused.iter().all(|answer| answer.is_err()),
+        "no egress grant names api.github.com: {refused:?}"
+    );
+    assert_eq!(answer(&looped(&ungranted)), refused);
+
+    let granted = GrantSet {
+        egress: vec![EgressRule {
+            host: "api.github.com".to_owned(),
+            ports: vec![443],
+            mode: EgressMode::Intercept,
+        }],
+        ..GrantSet::default()
+    };
+    let admitted = answer(&granted);
+    assert_eq!(
+        admitted,
+        [
+            Ok(GatewayEgressMode::Intercept),
+            Ok(GatewayEgressMode::Intercept)
+        ]
+    );
+    assert_eq!(answer(&looped(&granted)), admitted);
 }
 
 #[test]

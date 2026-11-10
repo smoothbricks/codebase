@@ -60,10 +60,13 @@ in needs no root relocation, but a change of exec mode still relocates its priva
   (or a removal) relative to the host's pre-activation environment, so it is valid only over an equivalent one. The
   record keeps the baseline's key: for each variable of that environment, SHA-256 of its value with the checkout's
   places (below) replaced by placeholders, every withheld name (below) and cowshed's per-workspace git identity
-  (`GIT_CONFIG_GLOBAL`) left out; and under the name `<grants>`, the workspace's grants, since what the evaluation could
-  read or reach is part of what it was computed against. A baseline that differs names the first variable that does
-  (`cowshed: evaluating the workspace shell: … PATH differs`). A new pool after a grant revision with the same grants
-  adopts its own checkout's export; other grants require read-write evaluation. Under the reserved name <shell>, the
+  (`GIT_CONFIG_GLOBAL`) left out. A baseline that differs names the first variable that does
+  (`cowshed: evaluating the workspace shell: … PATH differs`). No grant is in the key, filesystem or network: a
+  successful evaluation's export is fixed by its watched inputs' bytes (above) and its locked inputs (`flake.lock`,
+  fixed-output and content-addressed fetches). A grant can only make a read or a fetch fail, and a failed evaluation
+  leaves no record, so no grant can change what a successful evaluation exports, and a new pool after any grant revision
+  adopts its own checkout's export. An evaluation that reads a path outside its watch list, or fetches an input no lock
+  fixes, is a defect of that shell to refuse, never a reason to key on grants. Under the reserved name <shell>, the
   baseline also keys the selected .envrc directory with the same checkout-place normalization, so different selected
   shells never adopt each other's export while cloned paths still compare equal.
 
@@ -1348,7 +1351,7 @@ the same incarnation and tells it to advance; it re-reads the workspace's and th
 for them, and from then on:
 
 1. starts every new exec host and command under that profile; exec hosts, keyed by grant revision, are never reused
-   across revisions;
+   across revisions, and a new pool's host adopts its checkout's export (Inherited shells) instead of evaluating again;
 2. reports the new enforced `grant_revision` on subsequent jobs;
 3. leaves running jobs under the profile they started with until they end or are killed. A coordinator needing a hard
    cut kills them.
