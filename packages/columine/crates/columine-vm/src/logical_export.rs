@@ -444,6 +444,16 @@ pub trait InternLookup {
 /// The caller's interner: resolves ids to text on export and interns text
 /// back to ids on import. Passing the source image's own interner keeps
 /// every id stable — the interner moves without re-basing.
+///
+/// An interned lane holds an identity of at most 65,536 bytes, never content (specs/columine/09-row-interning.md §2), so
+/// an unbounded `&str` does not reach `intern`:
+///
+/// ```compile_fail,E0308
+/// use columine_vm::logical_export::Interner;
+/// fn intern_unbounded(interner: &mut dyn Interner, text: &str) {
+///     let _ = interner.intern(text);
+/// }
+/// ```
 pub trait Interner: InternLookup {
     fn intern(&mut self, text: &str) -> Result<u32, ErrorCode>;
 }
