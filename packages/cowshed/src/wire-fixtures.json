@@ -3173,6 +3173,29 @@
       "targetBranch": "main",
       "targetWasCheckedOut": true
     },
+    "seedUnread": {
+      "buildVolume": {
+        "adoption": {
+          "check": {
+            "failed": [],
+            "hits": 12,
+            "misses": [],
+            "unattributed": []
+          },
+          "elapsedMs": 2,
+          "kind": "adopted"
+        },
+        "seed": {
+          "kind": "unread"
+        }
+      },
+      "folded": [],
+      "kind": "landed",
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": true,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "ungated": {
       "buildVolume": {
         "adoption": {

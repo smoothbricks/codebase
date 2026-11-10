@@ -1067,6 +1067,23 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         folded: Vec::new(),
         ..land_first.clone()
     };
+    let land_unread = cowshed_core::api::dto::LandedReport {
+        retired: true,
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seed: cowshed_core::api::dto::LandSeed::Unread,
+            adoption: cowshed_core::api::dto::Adoption::Adopted {
+                elapsed_ms: 2,
+                check: cowshed_core::api::dto::AdoptionCheck {
+                    hits: 12,
+                    misses: Vec::new(),
+                    unattributed: Vec::new(),
+                    failed: Vec::new(),
+                },
+            },
+        },
+        folded: Vec::new(),
+        ..land_first.clone()
+    };
     let rebased = RebaseReport::Rebased {
         oid: oid("7777777777777777777777777777777777777777"),
         onto: oid("8888888888888888888888888888888888888888"),
@@ -1253,6 +1270,10 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 (
                     "ungated",
                     document("land report", &LandReport::Landed(land_ungated)),
+                ),
+                (
+                    "seedUnread",
+                    document("land report", &LandReport::Landed(land_unread)),
                 ),
                 (
                     "preflighted",
