@@ -337,16 +337,25 @@ deadline and then answered with a real native artifact leaves the task's own ent
 given the cache directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an
 unreachable cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
 
-## A shed reads the remote cache and never stores
+## A shed stores what is worth its bytes
 
-Stock Nx (23.2.1 through 24.0.3) has no read-only self-hosted cache: its `store` builds the gzip archive before the PUT.
-Every cowshed workspace's environment sets `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true` beside
-`NX_SELF_HOSTED_REMOTE_CACHE_SERVER` (`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`"; the owner's rulings,
-2026-10-10 and 2026-10-25). `getHttpCache` then wraps the guard in `ReadOnlyRemoteCache`
-(`tasks-runner/remote-cache-outage.js`), whose `store` answers false before building anything. Only a land publishes,
-with the native client directly. The test "a run that reads the remote cache and never stores" in
-`packages/nx-plugin/src/nx-remote-cache-outage.test.ts` runs a cacheable task against a server that answers 404 and
-requires only GETs, no PUT. Drop the hunk once upstream Nx has a read-only self-hosted option.
+Stock Nx (23.2.1 through 24.0.3) has no policy on what its self-hosted client stores: after every executed task its
+`store` builds the gzip archive in memory and sends the `PUT`, and `DbCache.put` awaits it before the task completes and
+its dependents are scheduled. Every cowshed workspace's environment sets
+`NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1` beside `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`
+(`specs/cowshed/05_gateway.md` "`/nx/v1/cache/{hash}`", "Every checkout reads and stores"; `specs/cowshed/03_caches.md`
+"Nx accepted-task artifact service", "What a checkout stores"; the owner's rulings, 2026-10-25 and 2026-11-10).
+`getHttpCache` then wraps the guard in `CostBoundRemoteCache` (`tasks-runner/remote-cache-outage.js`), and `DbCache.put`
+hands its `store` the milliseconds the task took. `store` sums the bytes of the entry directory and answers false,
+before building anything, unless `isWorthStoring` holds: the task took at least the bound's seconds per MiB of outputs,
+counting at least one MiB, and a build time that is not a number is never worth it. A client without the variable stores
+as stock Nx does, and a value that is not a number of seconds fails the run naming the variable and the value. An entry
+whose bytes cannot be measured is not stored, and the first is said. A result the bound leaves unstored is said as one
+verbose line (`NX_VERBOSE_LOGGING=true`) naming its hash, the milliseconds it took and the bytes of its outputs. The
+tests of `packages/nx-plugin/src/nx-remote-cache-outage.test.ts` ("the store bound", "a client with a store bound", "a
+run that stores what it executed") hold the decision, the measure and four real runs against a storing cache: a slow
+task stores once, a fast one sends only lookups, an unset variable stores as stock Nx, and an unreadable value fails the
+run. Drop the hunk once upstream Nx has a store policy of its own.
 
 ## Non-workspace file packages
 

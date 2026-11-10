@@ -4746,7 +4746,7 @@ index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a6
                  // Deliberately not disabled: unlike the inotify limit above, a socket
                  // owned by someone else stops being there when it is removed or the
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..dcf01c48e2ff13e8c61e91c4c1a5eea1e68c98f7 100644
+index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a22717d44f0c 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
 @@ -28,6 +28,7 @@ const workspace_root_1 = require("../utils/workspace-root");
@@ -4776,7 +4776,18 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..dcf01c48e2ff13e8c61e91c4c1a5eea1
      }
      async put(task, terminalOutput, outputs, code) {
          return tryAndRetry(async () => {
-@@ -198,7 +209,7 @@ class DbCache {
+@@ -183,7 +194,9 @@ class DbCache {
+             // Notify TaskIOService of actual output files
+             (0, task_io_service_1.getTaskIOService)().notifyTaskOutputs(task.id, expandedOutputs);
+             if (this.remoteCache) {
+-                await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code);
++                // A store policy (NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB) decides on how long the task
++                // ran, before any archive is built. The orchestrator sets both times before it calls put.
++                await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code, task.endTime - task.startTime);
+             }
+             return files;
+         });
+@@ -198,7 +211,7 @@ class DbCache {
          this.cache.recordTerminalOutputs(records);
      }
      copyFilesFromCache(_, cachedResult, outputs) {
@@ -4785,17 +4796,18 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..dcf01c48e2ff13e8c61e91c4c1a5eea1
      }
      removeOldCacheRecords() {
          return this.cache.removeOldCacheRecords();
-@@ -293,7 +304,8 @@ class DbCache {
+@@ -293,7 +306,9 @@ class DbCache {
              if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
                  process.emitWarning("Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.");
              }
 -            return new native_1.HttpRemoteCache();
 +            const guard = new remote_cache_outage_1.RemoteCacheOutageGuard(new native_1.HttpRemoteCache(), process.env.NX_SELF_HOSTED_REMOTE_CACHE_SERVER);
-+            return process.env.NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY === 'true' ? new remote_cache_outage_1.ReadOnlyRemoteCache(guard) : guard;
++            const secondsPerMiB = (0, remote_cache_outage_1.parseStoreSecondsPerMiB)(process.env.NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB);
++            return secondsPerMiB === null ? guard : new remote_cache_outage_1.CostBoundRemoteCache(guard, secondsPerMiB);
          }
          return null;
      }
-@@ -452,6 +464,7 @@ class Cache {
+@@ -452,6 +467,7 @@ class Cache {
                      await this.copy(cached, src);
                  }
              }));
@@ -4803,7 +4815,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..dcf01c48e2ff13e8c61e91c4c1a5eea1
          });
      }
      temporaryOutputPath(task) {
-@@ -557,6 +570,195 @@ class Cache {
+@@ -557,6 +573,195 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -5357,10 +5369,10 @@ index 0000000000000000000000000000000000000000..80e276f0681686cf4f47829bbdcfa705
 +}
 diff --git a/dist/src/tasks-runner/remote-cache-outage.d.ts b/dist/src/tasks-runner/remote-cache-outage.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..aecbe296f6bf80377fca38969c6efbf6d1b1a2b2
+index 0000000000000000000000000000000000000000..6a09eaddf12b558dbe78044e715e617f3ab1f2d5
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.d.ts
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,52 @@
 +import type { CachedResult } from '../native';
 +import type { RemoteCacheV2 } from './default-tasks-runner';
 +export declare const REMOTE_CACHE_ANSWER_WITHIN_MS = 90000;
@@ -5401,23 +5413,32 @@ index 0000000000000000000000000000000000000000..aecbe296f6bf80377fca38969c6efbf6
 +    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number): Promise<boolean>;
 +    private request;
 +}
-+export declare class ReadOnlyRemoteCache implements RemoteCacheV2 {
++export declare function parseStoreSecondsPerMiB(value: string | undefined): number | null;
++export declare function isWorthStoring(builtInMs: number | undefined, outputBytes: number, secondsPerMiB: number): boolean;
++export declare function outputBytesOf(directory: string): Promise<number>;
++export declare class CostBoundRemoteCache implements RemoteCacheV2 {
 +    private readonly remote;
-+    constructor(remote: RemoteCacheV2);
++    private readonly secondsPerMiB;
++    private readonly measure;
++    private measureFailureSaid;
++    constructor(remote: RemoteCacheV2, secondsPerMiB: number, measure?: (entryDirectory: string) => Promise<number>);
 +    retrieve(hash: string, cacheDirectory: string): Promise<CachedResult | null>;
-+    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number): Promise<boolean>;
++    store(hash: string, cacheDirectory: string, terminalOutput: string, code: number, builtInMs?: number): Promise<boolean>;
 +}
 diff --git a/dist/src/tasks-runner/remote-cache-outage.js b/dist/src/tasks-runner/remote-cache-outage.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8d00d0f94ed40dfc27b4ffaf001831125460cb0
+index 0000000000000000000000000000000000000000..85a6d257c34dd84bb2acc85b62f4e0e97aed9e69
 --- /dev/null
 +++ b/dist/src/tasks-runner/remote-cache-outage.js
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,264 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
-+exports.ReadOnlyRemoteCache = exports.RemoteCacheOutageGuard = exports.REMOTE_CACHE_ANSWER_WITHIN_MS = void 0;
++exports.CostBoundRemoteCache = exports.RemoteCacheOutageGuard = exports.REMOTE_CACHE_ANSWER_WITHIN_MS = void 0;
 +exports.settleRemoteCacheRequest = settleRemoteCacheRequest;
 +exports.describeRemoteCacheOutage = describeRemoteCacheOutage;
++exports.parseStoreSecondsPerMiB = parseStoreSecondsPerMiB;
++exports.isWorthStoring = isWorthStoring;
++exports.outputBytesOf = outputBytesOf;
 +const node_fs_1 = require("node:fs");
 +const promises_1 = require("node:fs/promises");
 +const path_1 = require("node:path");
@@ -5578,21 +5599,76 @@ index 0000000000000000000000000000000000000000..c8d00d0f94ed40dfc27b4ffaf0018311
 +}
 +exports.RemoteCacheOutageGuard = RemoteCacheOutageGuard;
 +/**
-+ * A shed reads the project cache and never stores to it: only a land publishes. store answers false before any
-+ * archive is built, so a read-only run spends nothing on uploads (NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true).
++ * The bytes of one task result's entry directory: the outputs and terminal output Nx's native `store` archives. A
++ * symbolic link counts nothing: the bytes of its own path are not an output's.
 + */
-+class ReadOnlyRemoteCache {
-+    constructor(remote) {
++async function outputBytesOf(directory) {
++    let bytes = 0;
++    for (const entry of await (0, promises_1.readdir)(directory, { recursive: true, withFileTypes: true })) {
++        if (entry.isFile()) {
++            bytes += (await (0, promises_1.stat)((0, path_1.join)(entry.parentPath ?? entry.path, entry.name))).size;
++        }
++    }
++    return bytes;
++}
++const BYTES_PER_MIB = 1024 * 1024;
++const STORE_BOUND_ENV = 'NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB';
++/**
++ * Reads NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB: null when it is unset, so the client stores as stock Nx
++ * does, else the seconds of build time a result must have per MiB of outputs. Any other value is misconfiguration and
++ * fails the run, naming the variable and the value.
++ */
++function parseStoreSecondsPerMiB(value) {
++    if (value === undefined || value === '') {
++        return null;
++    }
++    if (!/^\d+(\.\d+)?$/.test(value)) {
++        throw new Error(STORE_BOUND_ENV + ' must be a number of seconds, 0 or more: got ' + JSON.stringify(value));
++    }
++    return Number(value);
++}
++/**
++ * Whether a result that took `builtInMs` to build and holds `outputBytes` of outputs saves enough to be stored: at
++ * least `secondsPerMiB` seconds per MiB of outputs, counting at least one MiB. A build time that is not a number is
++ * never worth it.
++ */
++function isWorthStoring(builtInMs, outputBytes, secondsPerMiB) {
++    return builtInMs / 1000 >= secondsPerMiB * Math.max(1, outputBytes / BYTES_PER_MIB);
++}
++/**
++ * A checkout stores the tasks it executed that are worth their bytes and no other (specs/cowshed/03_caches.md "What a
++ * checkout stores"). `store` answers false, before any archive is built, for a result that took less than the bound asks.
++ */
++class CostBoundRemoteCache {
++    constructor(remote, secondsPerMiB, measure = outputBytesOf) {
 +        this.remote = remote;
++        this.secondsPerMiB = secondsPerMiB;
++        this.measure = measure;
++        this.measureFailureSaid = false;
 +    }
 +    retrieve(hash, cacheDirectory) {
 +        return this.remote.retrieve(hash, cacheDirectory);
 +    }
-+    async store() {
-+        return false;
++    async store(hash, cacheDirectory, terminalOutput, code, builtInMs) {
++        let bytes;
++        try {
++            bytes = await this.measure((0, path_1.join)(cacheDirectory, hash));
++        }
++        catch (error) {
++            if (!this.measureFailureSaid) {
++                this.measureFailureSaid = true;
++                logger_1.logger.warn('Remote cache store skipped: could not measure the outputs of ' + hash + ' (' + oneLine(String(error)) + ')');
++            }
++            return false;
++        }
++        if (!isWorthStoring(builtInMs, bytes, this.secondsPerMiB)) {
++            logger_1.logger.verbose('Remote cache: not storing ' + hash + ', built in ' + builtInMs + ' ms with ' + bytes + ' bytes of outputs (' + STORE_BOUND_ENV + '=' + this.secondsPerMiB + ')');
++            return false;
++        }
++        return this.remote.store(hash, cacheDirectory, terminalOutput, code);
 +    }
 +}
-+exports.ReadOnlyRemoteCache = ReadOnlyRemoteCache;
++exports.CostBoundRemoteCache = CostBoundRemoteCache;
 +/** Staging directories not yet removed; the process removes what is left as it exits. */
 +const unsettledStaging = new Set();
 +process.on('exit', () => {

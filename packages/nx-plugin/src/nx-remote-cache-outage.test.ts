@@ -5,8 +5,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fc from 'fast-check';
+import type { RemoteCacheV2 } from 'nx/src/tasks-runner/default-tasks-runner.js';
 import {
+  CostBoundRemoteCache,
   describeRemoteCacheOutage,
+  isWorthStoring,
+  outputBytesOf,
+  parseStoreSecondsPerMiB,
   REMOTE_CACHE_ANSWER_WITHIN_MS,
   type RemoteCacheDeadline,
   RemoteCacheOutageGuard,
@@ -131,7 +136,7 @@ interface Run {
 }
 
 /** A fixture workspace with one cached `app:build` that copies its input to `app/result.txt`. */
-async function buildFixture(workspace: string): Promise<void> {
+async function buildFixture(workspace: string, command = 'cp source.txt result.txt'): Promise<void> {
   await mkdir(join(workspace, 'app'), { recursive: true });
   const git = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
   expect(git.exitCode, git.stderr.toString()).toBe(0);
@@ -148,7 +153,7 @@ async function buildFixture(workspace: string): Promise<void> {
           cache: true,
           inputs: ['{projectRoot}/source.txt'],
           outputs: ['{projectRoot}/result.txt'],
-          options: { cwd: 'app', command: 'cp source.txt result.txt' },
+          options: { cwd: 'app', command },
         },
       },
     }),
@@ -359,31 +364,205 @@ describe('a run against an unreachable remote cache', () => {
   });
 });
 
-describe('a run that reads the remote cache and never stores', () => {
-  it('runs a task the cache misses, and sends the cache no store', async () => {
-    const sockets = new Set<Socket>();
-    const heads: string[] = [];
-    const record = requestHeads(sockets, heads);
-    const miss = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
-    // Every lookup is a miss. A store would reach the server as a PUT, recorded like any other request.
-    const { server, origin } = await listen((socket) => {
-      record(socket);
-      socket.once('data', () => socket.end(miss));
-    });
-    try {
-      await withNxFixture('nx-cache-read-only-', async ({ workspace, socketDirectory }) => {
-        await buildFixture(workspace);
-        const run = await build(workspace, socketDirectory, origin, { NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY: 'true' });
-        expect(run.exitCode, run.log).toBe(0);
-        expect(run.result, run.log).toBe('built');
-        expect(run.log.match(DIAGNOSTIC)).toBeNull();
-      });
-      // The lookups reached the server; the task's store never did.
-      expect(heads.length, JSON.stringify(heads)).toBeGreaterThan(0);
-      for (const head of heads) expect(head).toMatch(/^GET \/v1\/cache\/\S+ HTTP\/1\.1$/);
-    } finally {
-      await close(server);
+/**
+ * Guards the store-bound hunk of `patches/nx@24.0.3.patch` (`patches/README.md`, "A shed stores what is worth its
+ * bytes"). Cowshed's workspaces carry `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB`, so Nx's own client stores
+ * each result it executed whose task took at least that many seconds per MiB of outputs, counting at least one MiB.
+ * Every other client of the patched Nx, with the variable unset, stores as stock Nx does.
+ */
+const STORE_BOUND = 'NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB';
+const MIB = 1024 * 1024;
+
+describe('the store bound', () => {
+  it('reads an unset or empty bound as no bound and a number of seconds as itself', () => {
+    expect(parseStoreSecondsPerMiB(undefined)).toBeNull();
+    expect(parseStoreSecondsPerMiB('')).toBeNull();
+    expect(parseStoreSecondsPerMiB('0')).toBe(0);
+    expect(parseStoreSecondsPerMiB('1')).toBe(1);
+    expect(parseStoreSecondsPerMiB('0.25')).toBe(0.25);
+  });
+
+  it('refuses a bound that is not a number of seconds, naming the variable and the value', () => {
+    for (const refused of ['abc', '-1', 'NaN', 'Infinity', '1s', ' ']) {
+      expect(() => parseStoreSecondsPerMiB(refused), refused).toThrow(`${STORE_BOUND} must be`);
+      expect(() => parseStoreSecondsPerMiB(refused), refused).toThrow(JSON.stringify(refused));
     }
+  });
+
+  it('stores a result that took one second per MiB of outputs, counting at least one MiB', () => {
+    // Outputs under a MiB count as one: a result must have taken the bound's seconds whatever its size.
+    expect(isWorthStoring(999, 0, 1)).toBe(false);
+    expect(isWorthStoring(1000, 0, 1)).toBe(true);
+    expect(isWorthStoring(1000, MIB, 1)).toBe(true);
+    expect(isWorthStoring(1000, MIB + 1, 1)).toBe(false);
+    expect(isWorthStoring(5000, 5 * MIB, 1)).toBe(true);
+    expect(isWorthStoring(4999, 5 * MIB, 1)).toBe(false);
+    expect(isWorthStoring(0, 0, 0)).toBe(true);
+  });
+
+  it('never stores a result whose build time is unknown', () => {
+    expect(isWorthStoring(Number.NaN, 0, 0)).toBe(false);
+    expect(isWorthStoring(undefined, 0, 0)).toBe(false);
+  });
+
+  it('is monotone: a longer build or smaller output stays stored', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 600_000 }),
+        fc.integer({ min: 0, max: 512 * MIB }),
+        fc.double({ min: 0, max: 100, noNaN: true }),
+        fc.integer({ min: 0, max: 600_000 }),
+        fc.integer({ min: 0, max: 512 * MIB }),
+        (builtInMs, bytes, bound, moreMs, lessBytes) => {
+          if (isWorthStoring(builtInMs, bytes, bound)) {
+            expect(isWorthStoring(builtInMs + moreMs, bytes, bound)).toBe(true);
+            expect(isWorthStoring(builtInMs, Math.max(0, bytes - lessBytes), bound)).toBe(true);
+          }
+        },
+      ),
+    );
+  });
+});
+
+describe('a client with a store bound', () => {
+  /** A native stand-in that records each store it is asked for. */
+  function recordingRemote(): { remote: RemoteCacheV2; stores: string[]; retrievals: string[] } {
+    const stores: string[] = [];
+    const retrievals: string[] = [];
+    return {
+      stores,
+      retrievals,
+      remote: {
+        retrieve: async (hash: string) => {
+          retrievals.push(hash);
+          return null;
+        },
+        store: async (hash: string) => {
+          stores.push(hash);
+          return true;
+        },
+      },
+    };
+  }
+
+  it('stores only what the bound asks, builds no archive for the rest, and always looks up', async () => {
+    const { remote, stores, retrievals } = recordingRemote();
+    const sizes = new Map([
+      ['slow-small', 0],
+      ['fast-small', 0],
+      ['slow-bulky', 8 * MIB],
+    ]);
+    const client = new CostBoundRemoteCache(remote, 1, async (entry) => sizes.get(entry.split('/').pop() ?? '') ?? 0);
+    expect(await client.retrieve('fast-small', '/cache')).toBeNull();
+    expect(await client.store('slow-small', '/cache', '', 0, 1500)).toBe(true);
+    expect(await client.store('fast-small', '/cache', '', 0, 200)).toBe(false);
+    expect(await client.store('slow-bulky', '/cache', '', 0, 1500)).toBe(false);
+    expect(retrievals).toEqual(['fast-small']);
+    expect(stores).toEqual(['slow-small']);
+  });
+
+  it('measures the outputs it would archive: the bytes of the entry directory, symlinks not followed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-store-bound-'));
+    try {
+      await mkdir(join(root, 'outputs/nested'), { recursive: true });
+      await writeFile(join(root, 'outputs/a.bin'), new Uint8Array(1000));
+      await writeFile(join(root, 'outputs/nested/b.bin'), new Uint8Array(234));
+      await writeFile(join(root, 'terminalOutput'), 'ok');
+      await symlink(join(root, 'outputs/a.bin'), join(root, 'outputs/link'));
+      expect(await outputBytesOf(root)).toBe(1000 + 234 + 2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a store whose entry it cannot measure, and says why once', async () => {
+    const { remote, stores } = recordingRemote();
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const client = new CostBoundRemoteCache(remote, 1, async () => {
+        throw new Error('EIO: i/o error');
+      });
+      expect(await client.store('a', '/cache', '', 0, 60_000)).toBe(false);
+      expect(await client.store('b', '/cache', '', 0, 60_000)).toBe(false);
+      expect(stores).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain('EIO: i/o error');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+/** A cache that answers every lookup 404 and every store 200, recording each request. */
+function storingCache(): { origin: string; requests: string[]; stop: () => Promise<void> } {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(request) {
+      requests.push(`${request.method} ${new URL(request.url).pathname}`);
+      if (request.method === 'PUT') {
+        await request.arrayBuffer();
+        return new Response(null, { status: 200 });
+      }
+      return new Response('No cache entry for that key.\n', { status: 404 });
+    },
+  });
+  return { origin: server.url.origin, requests, stop: () => server.stop(true) };
+}
+
+/** One `app:build` against a storing cache, with `env` added to the run's environment and `command` as its task. */
+async function buildAgainstStoringCache(
+  env: Record<string, string>,
+  command?: string,
+): Promise<{ run: Run; requests: string[] }> {
+  const cache = storingCache();
+  try {
+    return await withNxFixture('nx-cache-store-bound-', async ({ workspace, socketDirectory }) => {
+      await buildFixture(workspace, command);
+      return { run: await build(workspace, socketDirectory, cache.origin, env), requests: cache.requests };
+    });
+  } finally {
+    await cache.stop();
+  }
+}
+
+const SLOW_BUILD = 'sleep 1.5 && cp source.txt result.txt';
+
+describe('a run that stores what it executed', () => {
+  it('sends the cache one store for a result worth its bytes', async () => {
+    const { run, requests } = await buildAgainstStoringCache({ [STORE_BOUND]: '1' }, SLOW_BUILD);
+    expect(run.exitCode, run.log).toBe(0);
+    expect(run.result, run.log).toBe('built');
+    expect(run.log.match(DIAGNOSTIC)).toBeNull();
+    expect(requests.filter((request) => request.startsWith('PUT '))).toHaveLength(1);
+  });
+
+  it('sends the cache no store for a result that cost less to build than its bound', async () => {
+    const { run, requests } = await buildAgainstStoringCache({ [STORE_BOUND]: '1', NX_VERBOSE_LOGGING: 'true' });
+    expect(run.exitCode, run.log).toBe(0);
+    expect(run.result, run.log).toBe('built');
+    expect(run.log.match(DIAGNOSTIC)).toBeNull();
+    // The lookups reached the cache; the task's store never did.
+    expect(requests.length, JSON.stringify(requests)).toBeGreaterThan(0);
+    for (const request of requests) expect(request).toMatch(/^GET \/v1\/cache\/\S+$/);
+    // Verbose logging says why: the task, how long it took and what its outputs hold.
+    expect(run.log).toMatch(
+      new RegExp(`Remote cache: not storing \\d+, built in \\d+ ms with \\d+ bytes of outputs \\(${STORE_BOUND}=1\\)`),
+    );
+  });
+
+  it('stores as stock Nx does when the bound is unset', async () => {
+    const { run, requests } = await buildAgainstStoringCache({});
+    expect(run.exitCode, run.log).toBe(0);
+    expect(requests.filter((request) => request.startsWith('PUT '))).toHaveLength(1);
+  });
+
+  it('fails the run that is configured with a bound it cannot read', async () => {
+    const { run, requests } = await buildAgainstStoringCache({ [STORE_BOUND]: 'soon' });
+    expect(run.exitCode, run.log).not.toBe(0);
+    expect(run.log).toContain(`${STORE_BOUND} must be`);
+    expect(requests).toEqual([]);
   });
 });
 
