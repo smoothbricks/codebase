@@ -2487,7 +2487,7 @@ pub(super) async fn sandbox_environment(
     }
     // Host-side preparation: adopted bindings are controller metadata, not child-readable
     // files. The Git directory probe runs under the narrower GitDiscovery child profile.
-    // Refresh each spawn so revoked grants and relocated checkouts cannot leave stale routes.
+    // Read again only when the store's routes or the grants moved (workspace_git_fetch).
     let git_fetch_config = crate::workspace_git_fetch::refresh_git_fetch_config(sandbox).await?;
     // Identity is the workspace's own published file or nothing at all. A workspace minted
     // before capture existed keeps the empty device and fails an authorless commit loudly,

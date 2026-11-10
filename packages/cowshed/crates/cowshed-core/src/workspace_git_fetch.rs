@@ -469,13 +469,45 @@ async fn probed_object_store(root: PathBuf, sandbox: &SandboxConfig) -> Result<O
 /// Called host-side immediately before child spawn. The registry, binding and main image
 /// sidecar are controller authority, read from the store the sandbox's launcher serves and from
 /// no other (04_sandbox.md, "Exec pipeline" step 4). A checkout's mutable remotes cannot invent
-/// routes.
+/// routes. They are read again only when a path they were read from has moved, or under other
+/// grants (11_shell.md, "Kept readings"): a project's binding, main image and main sidecar change
+/// only by entries of its project directory, a project comes and goes by its owner's entries, and
+/// an owner by the store root's. A spawn over an unchanged store stats those directories and reads,
+/// probes and writes nothing. Measured 2026-11-11: every spawn read every project's binding,
+/// sidecar and checkout again, and one spawn sat 12 s in a `stat` of a main image at load 128.
 pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
+    type Key = (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        Option<PathBuf>,
+    );
+    static KEPT: std::sync::LazyLock<crate::input_memo::InputMemo<Key, Option<PathBuf>>> =
+        std::sync::LazyLock::new(crate::input_memo::InputMemo::new);
+    let key = (
+        sandbox.workspace_mount.clone(),
+        sandbox.store_root.clone(),
+        sandbox.mount_root.clone(),
+        sandbox.grants.read.clone(),
+        sandbox.grants.write.clone(),
+        sandbox.git_worktree_repository.clone(),
+    );
+    KEPT.read_recorded_async(&key, || read_git_fetch_config(sandbox))
+        .await
+}
+
+/// [`refresh_git_fetch_config`] read from the store: the include it published, and every path
+/// whose identity decides it.
+async fn read_git_fetch_config(sandbox: &SandboxConfig) -> Result<(Option<PathBuf>, Vec<PathBuf>)> {
     let store = sandbox.store_root.as_path();
     crate::sandbox::validate_sandbox_config(sandbox).map_err(|error| failure(error.to_string()))?;
     let mut mappings = Vec::new();
+    let mut inputs = Vec::new();
     // No external read capability means no discovery and no dependency on store availability.
     if !sandbox.grants.read.is_empty() || !sandbox.grants.write.is_empty() {
+        inputs = store_directories(store)?;
         for repo in crate::gateway_inventory::discover_repositories(store)
             .map_err(|error| failure(error.to_string()))?
         {
@@ -488,9 +520,11 @@ pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<
             else {
                 continue;
             };
+            inputs.push(checkout.clone());
             let Some(root) = repository_object_store(&checkout, sandbox).await? else {
                 continue;
             };
+            inputs.extend(probed_inputs(&root).unwrap_or_else(|| vec![root.join(".git")]));
             crate::storage::verify_no_symlinks(store, &layout.project().project_root)
                 .map_err(|error| failure(error.to_string()))?;
             let binding: RepositoryBinding = crate::gateway_inventory::read_typed_json_nofollow(
@@ -518,9 +552,32 @@ pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<
             }
         }
     }
-    publish_git_fetch_config(&sandbox.workspace_mount, &mappings)
+    let published = publish_git_fetch_config(&sandbox.workspace_mount, &mappings)?;
+    inputs.extend(published.clone());
+    Ok((published, inputs))
 }
 
+/// The directories whose entries hold every route input of the store at `store`: the store root,
+/// each project owner, and each entry of an owner, as discovery lists them. Discovery skips an
+/// owner it cannot list, so the routes then hold none of its projects, and the owner's own identity
+/// decides when it is listed again.
+fn store_directories(store: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = vec![store.to_owned()];
+    for owner in crate::storage::bootstrap::project_owner_directories(store)
+        .map_err(|error| failure(error.to_string()))?
+    {
+        let listed = std::fs::read_dir(&owner).and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()
+        });
+        if let Ok(entries) = listed {
+            directories.extend(entries);
+        }
+        directories.push(owner);
+    }
+    Ok(directories)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,6 +796,136 @@ mod tests {
         );
     }
 
+    /// Bind `checkout` into the sandbox's store as `url`'s project, with an active main whose
+    /// checkout it is: what adoption leaves for route discovery to read.
+    #[cfg(target_os = "macos")]
+    fn adopt(config: &SandboxConfig, checkout: &Path, url: &str) -> crate::storage::StorageLayout {
+        use crate::metadata::{
+            DetachedWorkspaceMetadata, GrantSet, Platform, PublicationState, SIDECAR_VERSION,
+            WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, write_json,
+        };
+        use crate::repository::BoundIdentity;
+        let repo = crate::repository::normalize_remote_url(url).expect("repository identity");
+        let layout = crate::storage::StorageLayout::with_mount_root(
+            &config.store_root,
+            &config.mount_root,
+            &repo,
+        )
+        .expect("project paths");
+        std::fs::create_dir_all(&config.store_root).expect("store root");
+        layout.provision_project().expect("project root");
+        let binding = RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: repo.clone(),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some(url.to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        write_json(&layout.project().repository_binding, &binding).expect("binding file");
+        let image = layout.main_image().expect("main image paths");
+        std::fs::create_dir_all(image.image().parent().expect("image parent"))
+            .expect("image parent");
+        std::fs::write(image.image(), b"fixture").expect("main image");
+        DetachedWorkspaceMetadata {
+            version: SIDECAR_VERSION,
+            repo_id: repo,
+            workspace: WorkspaceName::main(),
+            workspace_incarnation: WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
+                .expect("incarnation"),
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-11-11T00:00:00Z".to_owned(),
+            grants: GrantSet::closed_baseline(Some(config.port_block)).expect("grants"),
+            info_snapshot: WorkspaceInfoSnapshot {
+                project_root: checkout.to_owned(),
+                role: WorkspaceRole::Main,
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                branch: Some("main".to_owned()),
+                created_at: "2026-11-11T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-11-11T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            },
+        }
+        .write_for_image(image.image())
+        .expect("main sidecar");
+        layout
+    }
+
+    /// A spawn whose store is as the last reading found it reads none of it again: its routes
+    /// stand while every directory they were read from does, so a main sidecar that can no longer
+    /// be read is never read (11_shell.md, "Kept readings"). Unbinding the project changes its
+    /// directory, and the next spawn has no route. Measured 2026-11-11: every spawn read every
+    /// project's binding, sidecar and checkout again, and one spawn sat 12 s in a `stat` of a main
+    /// image at load 128.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    async fn host_controller_routes_stand_while_the_store_does_and_go_with_the_binding() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = crate::temp_root::TempRoot::new("cowshed-git-fetch-kept");
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).expect("checkout");
+        git(&checkout, &["init", "-q"]);
+        git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let config = sandbox(&root, &checkout);
+        std::fs::create_dir_all(config.workspace_mount.join(".cowshed"))
+            .expect("workspace metadata");
+        let url = "https://github.com/acme/widget.git";
+        let layout = adopt(&config, &checkout, url);
+        let route = refresh_git_fetch_config(&config)
+            .await
+            .expect("routes")
+            .expect("the bound project's route");
+        let local = remote_head(&root, &route, checkout.to_str().expect("checkout path"))
+            .await
+            .expect("checkout HEAD");
+        assert_eq!(
+            remote_head(&root, &route, url).await.expect("routed HEAD"),
+            local
+        );
+
+        // Read once more over a settled store: that reading is the one kept.
+        crate::input_memo::settle(&route);
+        assert_eq!(
+            refresh_git_fetch_config(&config)
+                .await
+                .expect("settled routes"),
+            Some(route.clone())
+        );
+        let sidecar = crate::metadata::sidecar_path(layout.main_image().expect("main").image());
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000))
+            .expect("make the sidecar unreadable");
+        let kept = refresh_git_fetch_config(&config).await;
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+            .expect("make the sidecar readable");
+        assert_eq!(
+            kept.expect("an unchanged store is not read again"),
+            Some(route.clone())
+        );
+
+        std::fs::remove_file(&layout.project().repository_binding).expect("unbind the project");
+        assert_eq!(
+            refresh_git_fetch_config(&config)
+                .await
+                .expect("routes after unbinding"),
+            None
+        );
+        assert!(!route.exists(), "the unbound project's route is withdrawn");
+    }
     #[cfg(target_os = "macos")]
     fn sandbox(root: &Path, checkout: &Path) -> SandboxConfig {
         SandboxConfig {

@@ -948,14 +948,19 @@ There is no git endpoint on the gateway data plane and no credential helper insi
 
 Dependency fetches by URL (Cargo git dependencies, uv git sources, `git ls-remote`) resolve through **fetch routes**: a
 controller-generated, ignored `.cowshed/git-fetch.inc` that every child includes, rewriting each bound identity URL of
-an adopted project onto that project's local object store when the workspace can read it. Routes come only from
-repository bindings, never from a checkout's remotes, because a workspace can write its own `.git/config` and a remote
-it added must not redirect another repository's URL. A URL routes to exactly one clone; git matches rewrites as literal
-prefixes, so an SSH URL routes both as recorded (with its login) and without the login. Routing is not a grant — the
-fetch still runs under the workspace's own read boundary. A binding starts with the adopted remote;
-`cowshed identity add <remote>` (06_cli.md) binds another remote main's checkout configures, refused when another
-adopted project binds that URL. Every bound remote stays under its recorded name: an open refuses a binding whose remote
-was removed or now names another repository, and follows one that moved servers.
+an adopted project onto that project's local object store when the workspace can read it. A spawn's host-side
+preparation writes it, and reads the store for it again only when a path the routes were read from has moved or the
+workspace's grants have (11_shell.md, "Kept readings"): an adopt, `identity add`, unadopt or move of main changes a
+directory they were read from, so the next spawn reads them again, and a revoke reaches the next spawn through the
+grants it runs under (11_shell.md, "Grant-change propagation"). Measured 2026-11-11: when every spawn read every
+project's binding, main sidecar and checkout again, one spawn's preparation sat 12 s in a `stat` of a main image at
+load 128. Routes come only from repository bindings, never from a checkout's remotes, because a workspace can write its
+own `.git/config` and a remote it added must not redirect another repository's URL. A URL routes to exactly one clone;
+git matches rewrites as literal prefixes, so an SSH URL routes both as recorded (with its login) and without the login.
+Routing is not a grant — the fetch still runs under the workspace's own read boundary. A binding starts with the adopted
+remote; `cowshed identity add <remote>` (06_cli.md) binds another remote main's checkout configures, refused when
+another adopted project binds that URL. Every bound remote stays under its recorded name: an open refuses a binding
+whose remote was removed or now names another repository, and follows one that moved servers.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself

@@ -102,17 +102,44 @@ impl<K: Clone + Eq + Hash, V: Clone> InputMemo<K, V> {
         key: &K,
         read: impl FnOnce() -> Result<(V, Vec<PathBuf>), E>,
     ) -> Result<V, E> {
-        if let Some(kept) = self.kept.load().get(key) {
-            let (watched, identities) = observe(&kept.inputs);
-            if stands(&kept.watched, &kept.identities, &watched, &identities) {
-                return Ok(kept.value.clone());
-            }
+        if let Some(kept) = self.standing(key) {
+            return Ok(kept);
         }
         let started = now_ns();
         let (value, inputs) = read()?;
-        let (watched, identities) = observe(&inputs);
-        self.publish(key, inputs.into(), watched, identities, started, &value);
+        self.keep_recorded(key, started, inputs, &value);
         Ok(value)
+    }
+
+    /// [`Self::read_recorded`] for a reading that awaits.
+    pub(crate) async fn read_recorded_async<E, F>(
+        &self,
+        key: &K,
+        read: impl FnOnce() -> F,
+    ) -> Result<V, E>
+    where
+        F: Future<Output = Result<(V, Vec<PathBuf>), E>>,
+    {
+        if let Some(kept) = self.standing(key) {
+            return Ok(kept);
+        }
+        let started = now_ns();
+        let (value, inputs) = read().await?;
+        self.keep_recorded(key, started, inputs, &value);
+        Ok(value)
+    }
+
+    /// The answer kept for `key` by a recorded reading, while every path it recorded stands.
+    fn standing(&self, key: &K) -> Option<V> {
+        let kept = self.kept.load().get(key).cloned()?;
+        let (watched, identities) = observe(&kept.inputs);
+        stands(&kept.watched, &kept.identities, &watched, &identities).then(|| kept.value.clone())
+    }
+
+    /// Keep `value`, read from `inputs` by a reading that started at `started`.
+    fn keep_recorded(&self, key: &K, started: Option<i128>, inputs: Vec<PathBuf>, value: &V) {
+        let (watched, identities) = observe(&inputs);
+        self.publish(key, inputs.into(), watched, identities, started, value);
     }
 
     /// The kept answer for `key` when it stands for `inputs` now; else what an answer read from
