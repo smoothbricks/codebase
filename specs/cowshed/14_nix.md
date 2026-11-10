@@ -92,42 +92,42 @@ installed route, and one maps the selected compiler's physical default sysroot, 
 into, where rustc finds it, into portable keys, so naming a Nix toolchain directly, or reaching its join as `rustc`
 through a devenv profile, does not prevent action storage and restoration. That sysroot is keyed by the toolchain parts
 a compilation uses, by content, not by where it is installed: the compiler, its `rustc_driver` and what the sysroot
-holds for the compilation's own target. A unit built in a shed under the base shell therefore restores in a land gate
-under `devenv -P linux-cross`, whose added musl std only musl units use, while a different compiler, driver or standard
-library for the unit's target keys apart; arbitrary sysroot overrides gain no mapping. Clippy gets the bare name
-`clippy-driver` as its `RUSTC_WORKSPACE_WRAPPER` when the one on `PATH` is the driver `cargo-clippy` chose, so the name
-Cargo hashes into every workspace member's `-C metadata` is the same under every installation of a toolchain (a
-profile's link, that profile's next build, a second profile of it such as the land gate's `devenv -P linux-cross`) and a
-lint under one looks up the members another stored, each installation running its own driver, which mbx keys by its
-identity as before; a different driver, such as a rustup toolchain's behind a proxy, keeps the path `cargo-clippy`
-chose. Reservation and compiler-admission waits block on kqueue/inotify with domain-qualified, rate-limited shared
-rescue scans for crash recovery instead of per-waiter polling. The short session root is the canonical environment's
-(11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md, "Fixture roots under
-/tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). Further changes key a Nix cc-wrapper's
-environment flags through the same model as argv and its store path, key inputs in the Nix store by their store path,
-cache compilations that use a Clang precompiled header (every one a chain loads keyed by its bytes, the module file
-dependencies asked of Clang's driver so every Clang release lists them), model more compiler and rustc flags as written,
-identify a macOS SDK from its own files while refusing host links a Nix wrapper shapes, record why a compiled result was
-not stored, and share build-script output under `mbx exec`, and with it any generated-source directory whose variable
-`MBX_SHARE_ENV` names, copied by content and mapped as `OUT_DIR` is, so a compiler that reads one at a checkout-specific
-path still restores at another. The latest count a crate's edit against the commit HEAD it last compiled under
-(16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for hits a build exposed,
-predict build scripts per target, map a nested Cargo's own target, seed a managed target from one donor checkout only,
-so no target mixes two lineages of one crate, key a build script's declared dependency on a variable `MBX_SHARE_ENV`
-shares as the build gave it rather than as the stable copy the shim swaps in, identify a host link with no Nix wrapper
-in it (an unwrapped driver with an absolute unwrapped `-fuse-ld` linker or its own unwrapped `ld`) while a Nix shell's
-link variables are set, share every variable `MBX_SHARE_ENV` lists for each compilation it is set for, key a precompiled
-header's users by the build that produced it, record each use of a store object or result itself so eviction keeps what
-builds read on a `noatime` volume, count a result freed with its descriptor blob when a sweep evicts that blob, spell
-every target path a native link reads by the managed target's physical path so the one `-oso_prefix` it appends leaves
-no checkout or target digest in a macOS debug map (rustc canonicalizes `--extern` paths itself), key
-`-Zosx-rpath-install-name` as written rather than bypass every compilation that carries it, and place a managed target
-again when collection removed it from under a build that names its own directory at or below `target/` (03_caches.md,
-"mbx"). It is `smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its `flake.lock` locks; no Rust
-source restates it, and setup refuses a lock that disagrees with the flake. No project needs to pin it: the host's mbx
-serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from it, below (the
-capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix store path or
-a host path where a command is spawned; its store path is only what the link resolves to.
+holds for the compilation's own target. A unit built in a shed under the base shell therefore restores in a shell that
+also carries other targets' standard libraries, such as the musl std only musl units use, while a different compiler,
+driver or standard library for the unit's target keys apart; arbitrary sysroot overrides gain no mapping. Clippy gets
+the bare name `clippy-driver` as its `RUSTC_WORKSPACE_WRAPPER` when the one on `PATH` is the driver `cargo-clippy`
+chose, so the name Cargo hashes into every workspace member's `-C metadata` is the same under every installation of a
+toolchain (a profile's link, that profile's next build, a second profile of it such as the land gate's
+`devenv -P linux-cross`) and a lint under one looks up the members another stored, each installation running its own
+driver, which mbx keys by its identity as before; a different driver, such as a rustup toolchain's behind a proxy, keeps
+the path `cargo-clippy` chose. Reservation and compiler-admission waits block on kqueue/inotify with domain-qualified,
+rate-limited shared rescue scans for crash recovery instead of per-waiter polling. The short session root is the
+canonical environment's (11_shell.md, "Canonical mbx environment"), not a new namespace or sandbox grant (04_sandbox.md,
+"Fixture roots under /tmp"; 08_testing.md, "Fixtures"; 01c_macos.md, "sun_path is 104 bytes"). Further changes key a Nix
+cc-wrapper's environment flags through the same model as argv and its store path, key inputs in the Nix store by their
+store path, cache compilations that use a Clang precompiled header (every one a chain loads keyed by its bytes, the
+module file dependencies asked of Clang's driver so every Clang release lists them), model more compiler and rustc flags
+as written, identify a macOS SDK from its own files while refusing host links a Nix wrapper shapes, record why a
+compiled result was not stored, and share build-script output under `mbx exec`, and with it any generated-source
+directory whose variable `MBX_SHARE_ENV` names, copied by content and mapped as `OUT_DIR` is, so a compiler that reads
+one at a checkout-specific path still restores at another. The latest count a crate's edit against the commit HEAD it
+last compiled under (16_build_volumes.md, "One Cargo environment on every path"), refresh the store's recency only for
+hits a build exposed, predict build scripts per target, map a nested Cargo's own target, seed a managed target from one
+donor checkout only, so no target mixes two lineages of one crate, key a build script's declared dependency on a
+variable `MBX_SHARE_ENV` shares as the build gave it rather than as the stable copy the shim swaps in, identify a host
+link with no Nix wrapper in it (an unwrapped driver with an absolute unwrapped `-fuse-ld` linker or its own unwrapped
+`ld`) while a Nix shell's link variables are set, share every variable `MBX_SHARE_ENV` lists for each compilation it is
+set for, key a precompiled header's users by the build that produced it, record each use of a store object or result
+itself so eviction keeps what builds read on a `noatime` volume, count a result freed with its descriptor blob when a
+sweep evicts that blob, spell every target path a native link reads by the managed target's physical path so the one
+`-oso_prefix` it appends leaves no checkout or target digest in a macOS debug map (rustc canonicalizes `--extern` paths
+itself), key `-Zosx-rpath-install-name` as written rather than bypass every compilation that carries it, and place a
+managed target again when collection removed it from under a build that names its own directory at or below `target/`
+(03_caches.md, "mbx"). It is `smoothbricks/mr-boxington` at the revision `nix/mbx/flake.nix` names and its `flake.lock`
+locks; no Rust source restates it, and setup refuses a lock that disagrees with the flake. No project needs to pin it:
+the host's mbx serves every Cargo project, which reaches it through the Cargo shim that `cowshed setup` generates from
+it, below (the capability is 15_capabilities.md's, its route 11_shell.md's). The installed mbx is never spelled as a Nix
+store path or a host path where a command is spawned; its store path is only what the link resolves to.
 
 **A pin moves only once its mbx is built in the host's store, so no shell entry compiles it.** A project shell that
 names the pinned revision realizes it when it is evaluated, and the Nix daemon builds what no substituter serves. The
