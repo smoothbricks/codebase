@@ -333,6 +333,13 @@ install's gateway of another build does). The guard against a restart between tw
 turn, and the guard against a restart between an install's read of the turns and a land's ask is the read's fence ("The
 read fences the turns"). Status reads the slot without taking it.
 
+**An install needs no manual pause.** The fence keeps a restart out of every held or queued turn, an exec in flight
+survives a restart with its result delivered, and a land the install overtook before its turn ends its turn unmoved and
+goes on as the installed cowshed ("A land step waits for an install in progress"). So the after-land install runs when
+the fence admits it, with no announcement, and records itself as an `installed` event in the land's `lands.log`
+(02_workspaces.md, "A declared land", step 6). The one window left, between a land's turn and its after-land job, is
+named in that job's `push-failed` record with the command to run by hand.
+
 `land --preflight` only reads the pre-check fences (02_workspaces.md): it is not a land step, waits for no install,
 requires no matching daemon build and never re-execs the installed cowshed.
 
