@@ -2,8 +2,10 @@
 //! users, the members of the `nixbld` group (`_nixbld1`.. on macOS, `nixbld1`.. on Linux), so a
 //! live process of one of them is a build in progress. It is a proxy: it cannot say whose build
 //! it is, and a daemon set to `auto-allocate-uids` builds as uids no group lists, which it misses.
-//! Each user's processes are listed by the kernel (`proc_listpids(PROC_UID_ONLY)` on macOS, the
-//! owner of each `/proc/<pid>` on Linux); nothing is spawned.
+//! A build user's processes are read from what names them, never from a walk of every process:
+//! the kernel lists one uid's processes on macOS (`proc_listpids(PROC_UID_ONLY)`); on Linux the
+//! daemon's own systemd cgroup lists its processes, the builds it started among them. Nothing is
+//! spawned.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -165,25 +167,63 @@ fn any_process_of(users: &[libc::uid_t]) -> io::Result<bool> {
     Ok(false)
 }
 
-/// Whether any process runs as one of `users`: the owner of its `/proc/<pid>` directory, its
-/// effective uid (root for a process made non-dumpable, which a build user's is not). A process
-/// that exits during the walk is skipped.
+/// The Nix daemon's systemd service cgroup, under the unified hierarchy. Every build the daemon
+/// starts is born inside it, in it or in a child cgroup (`use-cgroups`).
+#[cfg(target_os = "linux")]
+const DAEMON_CGROUP: &str = "system.slice/nix-daemon.service";
+
+/// Whether a process of one of `users` is in the Nix daemon's cgroup subtree: the daemon's own
+/// record names exactly its processes, and only those are read (AGENTS.md, "Proof"). A daemon
+/// systemd does not run leaves no such record, which is an error naming the path, never "no
+/// build".
 #[cfg(target_os = "linux")]
 fn any_process_of(users: &[libc::uid_t]) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .iter()
-            .all(u8::is_ascii_digit)
-        {
+    let daemon = std::path::Path::new(super::job_cgroup::CGROUP_MOUNT).join(DAEMON_CGROUP);
+    member_runs_as(
+        &daemon,
+        users,
+        &|pid| match std::fs::metadata(format!("/proc/{pid}")) {
+            Ok(metadata) => Ok(Some(metadata.uid())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        },
+    )
+}
+
+/// Whether a member of `cgroup` or of a cgroup below it runs as one of `users`, as `uid_of`
+/// answers for a pid (`None` once it exited). A child cgroup removed during the walk held
+/// nothing; the root missing is an error.
+#[cfg(any(target_os = "linux", test))]
+fn member_runs_as(
+    cgroup: &std::path::Path,
+    users: &[libc::uid_t],
+    uid_of: &impl Fn(u32) -> io::Result<Option<libc::uid_t>>,
+) -> io::Result<bool> {
+    let named = |error: io::Error, path: &std::path::Path| {
+        io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+    };
+    let procs = cgroup.join("cgroup.procs");
+    let members = std::fs::read_to_string(&procs).map_err(|error| named(error, &procs))?;
+    for line in members.lines() {
+        let pid = line.parse::<u32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: invalid member pid {line:?}", procs.display()),
+            )
+        })?;
+        if uid_of(pid)?.is_some_and(|uid| users.contains(&uid)) {
+            return Ok(true);
+        }
+    }
+    for entry in std::fs::read_dir(cgroup).map_err(|error| named(error, cgroup))? {
+        let entry = entry.map_err(|error| named(error, cgroup))?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        match entry.metadata() {
-            Ok(metadata) if users.contains(&metadata.uid()) => return Ok(true),
-            Ok(_) => {}
+        match member_runs_as(&entry.path(), users, uid_of) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -202,6 +242,7 @@ fn any_process_of(_users: &[libc::uid_t]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     /// This test's own uid runs a process (this one); a uid no account uses runs none.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_users_live_process_is_seen_and_an_unused_uid_has_none() {
         // SAFETY: geteuid reads this process's credentials.
@@ -210,7 +251,40 @@ mod tests {
         assert!(!super::any_process_of(&[0x7fff_fff0]).unwrap());
     }
 
-    /// The probe answers on this host, with or without a Nix daemon's build group.
+    /// The probe answers on this macOS host, with or without a Nix daemon's build group. A Linux
+    /// host answers only where systemd runs the daemon, which the fake cgroup above covers.
+    #[cfg(target_os = "macos")]
+    /// A build user's process in the daemon's cgroup or a child cgroup is seen; the daemon's own
+    /// root process is not a build, and a missing daemon record is an error, never "no build".
+    #[test]
+    fn a_build_users_member_of_the_daemon_cgroup_is_seen() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-nix-cgroup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let child = root.join("nix-build-uid-351");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("cgroup.procs"), "100\n").unwrap();
+        std::fs::write(child.join("cgroup.procs"), "200\n").unwrap();
+        let uid_of = |pid: u32| -> std::io::Result<Option<libc::uid_t>> {
+            Ok(match pid {
+                100 => Some(0),
+                200 => Some(351),
+                _ => None,
+            })
+        };
+        assert!(super::member_runs_as(&root, &[351], &uid_of).unwrap());
+        assert!(!super::member_runs_as(&root, &[352], &uid_of).unwrap());
+        std::fs::write(child.join("cgroup.procs"), "").unwrap();
+        assert!(!super::member_runs_as(&root, &[351], &uid_of).unwrap());
+        let missing = super::member_runs_as(&root.join("absent"), &[351], &uid_of).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            missing.to_string().contains("absent/cgroup.procs"),
+            "{missing}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn the_probe_answers() {
         super::running().unwrap();

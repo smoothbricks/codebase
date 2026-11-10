@@ -416,17 +416,19 @@ the last line it ended. The holder shares its pid, start and last line as one at
 per chunk that ends a line and loaded once per waiting line; a waiter prints again only when the last line changes,
 never on a timer. Progress is output, not CPU: an evaluation that waits on the Nix daemon's socket sits near zero CPU
 while the daemon builds for it. An evaluation is idle while it writes no line and no Nix build runs. A live process of a
-Nix build user, a member of the `nixbld` group, is the sign a build runs; it cannot attribute a build to a requester, so
-another workspace's build keeps an idle evaluation alive, and a daemon set to `auto-allocate-uids` builds as users it
-does not see. When an evaluation has written no line for 5 min (`STALL_BOUND`), its holder asks whether a build runs; a
-build restarts the bound. Otherwise the holder ends the host's process group, as the host fence ends a host that broke
-its protocol, and fails the job with
+Nix build user, a member of the `nixbld` group, is the sign a build runs, read from what names those processes rather
+than a walk of every process: the kernel's list of one uid's processes on macOS, the daemon's own systemd cgroup on
+Linux, where a daemon systemd does not run leaves no record and the probe says so; it cannot attribute a build to a
+requester, so another workspace's build keeps an idle evaluation alive, and a daemon set to `auto-allocate-uids` builds
+as users it does not see. When an evaluation has written no line for 5 min (`STALL_BOUND`), its holder asks whether a
+build runs; a build restarts the bound. Otherwise the holder ends the host's process group, as the host fence ends a
+host that broke its protocol, and fails the job with
 `the workspace shell evaluation wrote nothing for 5 min and no Nix build was running: "<last line>"`, naming the host it
 ended; a probe that cannot list processes ends it too and says so. The claim opens once that host is reaped, and the
 next waiter takes it and evaluates afresh. Without the bound, five execs once printed only the bare waiting line for
 10–25 min behind a `devenv direnv-export` blocked reading the daemon's socket (13 min elapsed, 9 s CPU) while the daemon
 compiled a newly pinned mbx (14_nix.md, "mbx"). Enforced by `shell_job::stall_tests` with a fake host, clock and build
-probe, and by `nix_builds::tests` against the kernel.
+probe, and by `nix_builds::tests` against the kernel and a fake daemon cgroup.
 
 **Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the
