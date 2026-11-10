@@ -1,4 +1,4 @@
-# Changed-key feed
+# Changed-key feed, write sequence and watch log
 
 ## 1. Contract
 
@@ -7,6 +7,10 @@ for every tracked source whose overflow bit is clear, the pass's entries hold a 
 row changed since the source's change flags were last cleared. A source whose overflow bit is set changed as a whole.
 Nothing is ever overwritten. The RETE layer owns the tracked mask, the pass boundaries, recording its derived-fact
 writes and everything it seeds from the feed.
+
+Two facts outlive a pass. Each slot's write sequence (§6) says whether a slot was written between two of its states. The
+watch log (§7) keeps, for the slots a host watches, every write's change with the key's prior value across passes, so a
+host can name what changed in a slot between a past write sequence and the current state without copying the slot.
 
 ## 2. Sources and entries
 
@@ -55,7 +59,7 @@ A source overflows (counted once per pass in `FeedWork::overflowed`) when:
 
 The fourth rule needs every live writer of a slot to set its change flag. A bitmap import is the known exception: it
 sets no flag, so an import made between passes is invisible to the feed; one made while the feed is armed overflows its
-slot by the second rule.
+slot by the second rule. It does advance the slot's write sequence (§6) and overflows the slot's watch log (§7).
 
 ## 5. Lifecycle and memory
 
@@ -67,7 +71,81 @@ early return. The capacity dry run records nothing. A rolled-back attempt restor
 discards its entries. `feed()` reads the entries, chains and overflow; `feed_record_fact` records a derived-fact write;
 `feed_work` reports `recorded`, `dropped` and `overflowed` since the bind.
 
-## 6. Behavioral acceptance
+## 6. Write sequence
+
+Slot metadata bytes 48..56 hold `WRITE_SEQ`, a little-endian `u64` (`SlotMetaOffset::WRITE_SEQ`; `SLOT_META_SIZE` is
+56). Every site that sets a slot's change flag advances it by one in the same write, through
+`SlotMetaView::mark(state, flag)`, the one writer of both. It counts writes, not values: a slot whose sequence moved
+between two states of one history was written between them, and one whose sequence stayed was not. A write that changes
+nothing a reader can observe sets no flag and does not advance it: a hash-map upsert of an equal value, a TTL-only
+refresh of a held member, an eviction that finds only stale index entries, a seal. A bitmap import advances it without a
+flag (§4). Change flags clear at every RETE pass; the sequence never clears.
+
+Init writes 0 and growth copies it. A logical import starts the rebuilt slot at 0, so two sequences compare only along
+one history: a state and a later state folded from it.
+
+The sequence is journaled with the flag. The change-flag boundary saves every slot's sequence when it opens and journals
+each moved one, one 8-byte record, when it closes. A direct capture writer outside a boundary names
+`(meta + WRITE_SEQ, 8)` beside its flag byte, and a boundary that owns the flags owns those bytes too. A rolled-back
+write restores the sequence.
+
+## 7. Watch log
+
+The watch log keeps, for each slot a host watches, the change of every write since the slot's coverage began, across
+passes, in a ring per slot. It answers a slot's net change between a past write sequence and the current state.
+
+**Watching.** `watch(state, slot, entries, image_bytes)` starts logging a slot with a ring of `entries` entries and
+`image_bytes` bytes of prior images, reserved there and refused as `OutOfMemory`, or keeps an existing log. It answers
+the slot's coverage: the sequence above which the log is complete, the slot's current sequence when logging starts.
+`unwatch(slot)` releases a slot's log. Recording never allocates.
+
+**Entries.** Each write of a watched slot appends, after it lands, one entry per key it wrote:
+`key1 u32 · key2 u32 · stamp u64 · kind u8` and the key's prior value, stamped with the slot's sequence after the write.
+`kind` is the change-flag bit of what the write did to that key. The prior value is what a reader decodes the key to
+before the write:
+
+- a hash map's `u32` value;
+- an aggregate's or scalar's 8-byte value, in one keyless entry;
+- a struct-map or two-key row's image (below);
+- none for a set, bitmap or ordered-list member, whose `kind` says whether it was held.
+
+An insertion has no prior. The sites are §3's plus the aggregate, scalar and ordered-list writes. They record whether or
+not the feed is armed: the log does not depend on the feed's pass.
+
+**Row images** are self-contained. An image is the row's bytes as stored, then, in descriptor order, each set field that
+names text or an arena payload (an interned string, an arena array, a value-object payload), length-prefixed: a `u32`
+length, then the bytes. An interned-string array is written element by element. An image never holds an interner id or
+an arena offset that a later write, growth, seal or interner release could invalidate, so it decodes for as long as the
+log holds it.
+
+**Eviction and overflow.** An entry that does not fit the ring evicts the slot's oldest entries until it fits, and
+coverage moves to the last evicted entry's stamp. Which entries above a `since` survive therefore depends only on the
+writes made after it, so two engines that fold the same writes after `since` answer it alike. A write that names no key
+(bitmap algebra and import, nested containers) appends one whole-slot entry with no key and no prior. Images are
+self-contained, so growth and seal of a slot leave its log whole.
+
+**Replay and settling.** Stamps within a slot's ring only increase. A write stamped at or below the slot's newest entry
+records nothing: the state was rewound and is folding the same writes again, which the log already holds, so a host that
+rewinds to replay one history (a replay engine returning to a phase's basis) leaves the log as it is. A host that
+replaces the state with a different future (restoring a speculation basis whose attempt it abandons) calls
+`log_settle(state)`, which drops every entry stamped above its slot's current sequence and clamps coverage to it. An
+undo rollback settles by itself. A host that copies a state into another VM to continue its history there (a replay
+fork) copies the log with it: `log_clone_from(other)` replaces this VM's log with `other`'s rings, images and coverage.
+
+**Net changes.** `net_changes(state, slot, since, strings, out)` answers the slot's net change over the window from
+`since` to the slot's sequence in `state`; entries stamped above that sequence belong to a later state and are ignored.
+It answers `Overflowed` when `since` is below the slot's coverage or a whole-slot entry lies in the window. Otherwise,
+for each key whose first entry in the window is stamped above `since`, it takes that entry's prior and whether the key
+is present in `state`, and keeps the key only when they differ:
+
+- an insert: no prior, and the key is present;
+- a delete: a prior, and the key is absent;
+- an update: a prior, the key is present, and the current value's image differs from the prior's.
+
+A key written and written back nets to nothing. An aggregate or scalar answers at most one keyless change. `out` holds
+each change's key lanes, kind and prior image in record order; the host reads the current value from the state.
+
+## 8. Behavioral acceptance
 
 Tests write through each kind of site in §3 and require exactly its key, change and prior value; require that untracked
 sources and an unarmed feed record nothing; force a small capacity and require whole-source overflow with counted drops;
@@ -76,3 +154,13 @@ begin; that an unchained fact overflows bit 0; that a rolled-back attempt leaves
 same ones; that a counts fold and an upsert-last-if whose admission dry-runs them each record once; that a row an
 upsert-last-if's predicate refuses records nothing; that removal-cut-skipped rows record nothing; and that a bound feed
 records warm passes with zero allocations.
+
+The write sequence and the watch log: a test of each §3 site and of the aggregate, scalar and ordered-list writes
+requires that the slot's sequence advances by one per write call and the log records its key, kind and prior value; that
+an equal hash-map value, a TTL-only refresh and a seal advance nothing; that a rolled-back attempt restores the sequence
+and leaves no log entries; that a row image with an interned string, an array and a value-object payload decodes after
+the slot grows and after the string's id is released; that `net_changes` answers insert, update and delete, drops a key
+written and written back, and answers `Overflowed` for a `since` below coverage, after a keyless write and after the
+ring evicted an entry above `since`, and after a whole-slot entry in the window; that a rewound state refolding the same
+writes records nothing new and that `net_changes` ignores entries above the state's sequence; that `log_settle` drops
+entries above a restored sequence; and that a watched slot records warm passes with zero allocations.
