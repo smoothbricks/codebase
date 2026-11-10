@@ -6,7 +6,8 @@
 //
 // What the binding takes from Nx: a producer's `dependsOn` edges and outputs, its executor and command (which give its
 // language and the files its tool writes), and the `dependentTasksOutputFiles` selectors of the runner's key. What it
-// holds by hand is `RUNTIME_READS`: the producers a runner's run reads, each with the file that reads them.
+// holds by hand is `RUNTIME_READS`: the producers a runner's run reads, each with the file that reads them. A key is
+// one for every platform (nx.json's targetDefaults), so a read the tests of any platform make is a read on all of them.
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
@@ -22,6 +23,8 @@ import { isRecord } from './type-guards.js';
 
 const BOUNDED_EXEC = '@smoothbricks/nx-plugin:bounded-exec';
 const TYPESCRIPT_EMIT = '@smoothbricks/nx-plugin:typescript-emit';
+/** The Linux addon's producer on every host (index.ts, the napi targets): it writes the one `.node` file its `output` names. */
+const CARGO_ZIGBUILD = '@smoothbricks/nx-plugin:cargo-zigbuild';
 
 /**
  * A producer a Rust runner's run reads at run time and whose bytes reach its verdict (the model's `reads`): the target
@@ -34,8 +37,6 @@ interface RuntimeRead {
   readonly producer: { readonly project: string; readonly target: string };
   readonly glob: string;
   readonly evidence: string;
-  /** The platform whose test build makes the read (its reading module's `cfg`), or `any`. */
-  readonly platform: NodeJS.Platform | 'any';
 }
 
 const RUNTIME_READS: readonly RuntimeRead[] = [
@@ -46,22 +47,19 @@ const RUNTIME_READS: readonly RuntimeRead[] = [
     glob: '**/*.node',
     evidence:
       'cowshed-core/tests/support/napi_client.rs:30-55 runs Node on the package, whose loadAddon loads the dev addon',
-    // project_runtime.rs:68 builds napi_client only under `cfg(target_os = "macos")`.
-    platform: 'darwin',
+    // project_runtime.rs:68 builds napi_client only on macOS; the one key that serves Linux too still covers it.
   },
   {
     crates: ['cowshed-core', 'cowshed-cli'],
     producer: { project: 'cowshed', target: 'tsc-js' },
     glob: 'packages/cowshed/dist/ts/**/*.js',
     evidence: 'cowshed-core/tests/support/napi_client.rs:30-37 canonicalizes packages/cowshed/dist/ts/index.js',
-    platform: 'darwin',
   },
   {
     crates: ['cowshed-core'],
     producer: { project: 'cowshed', target: 'capability-probe' },
     glob: '**/capability-probe/diagnostics.json',
     evidence: 'cowshed-core/tests/public_api_contracts.rs:1501 CAPABILITY_VERDICT_FILE',
-    platform: 'any',
   },
 ];
 
@@ -79,7 +77,7 @@ function commandOf(target: TargetConfiguration): string {
 function languageOf(target: TargetConfiguration): model.Lang {
   const command = commandOf(target);
   if (target.executor === TYPESCRIPT_EMIT || /^(tsc|bun build)\b/.test(command)) return { $: 'Ts' };
-  if (/\b(cargo|napi build|just wasm)\b/.test(command)) return { $: 'Rust' };
+  if (target.executor === CARGO_ZIGBUILD || /\b(cargo|napi build|just wasm)\b/.test(command)) return { $: 'Rust' };
   return { $: 'Other' };
 }
 
@@ -87,9 +85,13 @@ function languageOf(target: TargetConfiguration): model.Lang {
  * The files a producer writes, enough for a glob to decide on. A declared output with an extension is a file. One
  * without is a directory holding what its tool emits there: JavaScript and declarations from a TypeScript compiler,
  * the addon from `napi build` (a `--bin` build writes an executable), one file without an extension from any other
- * tool, which only `**` matches.
+ * tool, which only `**` matches. A cargo-zigbuild producer writes the one file its `output` option names; Nx resolves
+ * its declared `{options.output}/../` to no output on a task graph, so the option is read directly.
  */
 function writtenFiles(task: Task, target: TargetConfiguration): string[] {
+  if (target.executor === CARGO_ZIGBUILD && isRecord(target.options) && typeof target.options.output === 'string') {
+    return [target.options.output.replaceAll('{projectRoot}', task.projectRoot ?? '')];
+  }
   const command = commandOf(target);
   let emitted = ['output'];
   if (target.executor === TYPESCRIPT_EMIT || /^tsc\b/.test(command)) emitted = ['index.js', 'index.d.ts'];
@@ -230,7 +232,7 @@ function judge(graph: ProjectGraph, runner: Runner, named: NamedInputs, reads: r
     $: 'Tgt',
     id: index,
     lang: languageOf(configurationOf(taskOf(id))),
-    out: taskOf(id).outputs.length === 0 ? { $: 'ONone' } : { $: 'OData' },
+    out: files[index]?.length ? { $: 'OData' } : { $: 'ONone' },
     srcs: model.NIL,
     runs: model.NIL,
     reads: id === runner.id ? list([...new Set(readNumbers)]) : model.NIL,
@@ -307,12 +309,7 @@ function judgedRunners(): Promise<readonly Judged[]> {
         graph,
         runner,
         named,
-        RUNTIME_READS.filter(
-          ({ crates, platform }) =>
-            runner.crate !== null &&
-            crates.includes(runner.crate) &&
-            (platform === 'any' || platform === process.platform),
-        ),
+        RUNTIME_READS.filter(({ crates }) => runner.crate !== null && crates.includes(runner.crate)),
       ),
     );
   })();
@@ -414,7 +411,6 @@ describe('the judge, on a graph that plants each violation', () => {
     producer: { project: 'owner', target: 'napi-native' },
     glob: '**/*.node',
     evidence: 'a test of the fixture loads the addon',
-    platform: 'any',
   };
 
   it('names the TypeScript output a Rust runner keys without reading it', () => {
@@ -435,6 +431,19 @@ describe('the judge, on a graph that plants each violation', () => {
   it('names an addon the runner reads and its key leaves out', () => {
     const judged = judge(owner([lineage]), runner, {}, [readsAddon]);
     expect(judged.unkeyed).toEqual(['owner:napi-native']);
+  });
+
+  it('finds the addon a cargo-zigbuild producer writes, as the Linux host builds it', () => {
+    const linux = owner([addon]);
+    const targets = linux.nodes.owner?.data.targets ?? {};
+    targets['napi-x64-linux'] = {
+      executor: CARGO_ZIGBUILD,
+      options: { output: '{projectRoot}/.cache/native-dev/owner.linux-x64-gnu.node' },
+      outputs: ['{options.output}/../'],
+    };
+    targets['napi-native'] = { executor: 'nx:noop', outputs: [], dependsOn: ['napi-x64-linux'] };
+    const judged = judge(linux, runner, {}, [readsAddon]);
+    expect([judged.keyedTs, judged.keyedOther, judged.unkeyed]).toEqual([[], [], []]);
   });
 });
 
