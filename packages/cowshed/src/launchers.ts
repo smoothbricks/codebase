@@ -526,6 +526,32 @@ export async function spawnLandTurn(options: SpawnLandTurnOptions): Promise<Land
   return { exit: ended(child, [], () => []) };
 }
 
+/** `gateway await-turns [--gateway-socket] -- <argv…>`: an install, run in its order among the lands. */
+export type SpawnAwaitTurnsOptions = {
+  /** The gateway whose land turns to wait for; absent waits for the host gateway's. */
+  readonly gatewaySocket?: string;
+  readonly argv: readonly [string, ...string[]];
+};
+
+/** A running `cowshed gateway await-turns`: the land turns stay fenced until its child ends. */
+export interface AwaitTurnsRun {
+  readonly exit: Promise<LauncherExit>;
+}
+
+export async function spawnAwaitTurns(options: SpawnAwaitTurnsOptions): Promise<AwaitTurnsRun> {
+  const child = await launch(
+    [
+      'gateway',
+      'await-turns',
+      ...(options.gatewaySocket === undefined ? [] : ['--gateway-socket', options.gatewaySocket]),
+      '--',
+      ...options.argv,
+    ],
+    'inherit',
+  );
+  return { exit: ended(child, [], () => []) };
+}
+
 /** The message of `doc-commit`: given (`-m`), or read from a file (`-F`, `-` for stdin). */
 export type DocCommitMessage =
   | { readonly message: string; readonly messageFile?: never }

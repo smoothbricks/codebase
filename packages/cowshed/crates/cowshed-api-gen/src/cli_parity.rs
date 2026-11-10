@@ -363,6 +363,9 @@ pub const PARITY: &[Row] = &[
     row("gateway stop", "purge", field(&[("host.gatewayStop", "purge")], &[argument("Host.gatewayStop", 0, "purge")])),
     row("gateway status", "", field(&[("host.gatewayStatus", "")], &[member("Host.gatewayStatus")])),
     row("gateway run", "", Counterpart::CliOnly { reason: "process entrypoint: the daemon launchd execs; a library call never becomes it and no host connection runs it (07_api.md, Host operations)" }),
+    row("gateway await-turns", "", input(member("spawnAwaitTurns"))),
+    row("gateway await-turns", "gateway-socket", input(argument("spawnAwaitTurns", 0, "gatewaySocket"))),
+    row("gateway await-turns", "argv", input(argument("spawnAwaitTurns", 0, "argv"))),
 
     row("controller", "", Counterpart::Composed { recipe: "an embedding process starts `cowshed controller` on one end of a socketpair and passes the other to coordinatorEndpoint (07_api.md, \"cowshed-napi\")", facade: &[member("coordinatorEndpoint")] }),
     row("host", "", Counterpart::Composed { recipe: "an embedding process calls openHost, which starts `cowshed host` through the package launcher on a socketpair and connects to it (07_api.md, Host operations)", facade: &[member("openHost")] }),

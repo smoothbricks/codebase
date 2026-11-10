@@ -1,6 +1,6 @@
-//! `cowshed gateway await-turns -- <cmd…>`: run one command, an install, once the host gateway
-//! has fenced its land turns for it, in its order among the lands (05_gateway.md "The read fences
-//! the turns", "A land installs its own cowshed after its turn").
+//! `cowshed gateway await-turns [--gateway-socket <path>] -- <cmd…>`: run one command, an install,
+//! once the gateway has fenced its land turns for it, in its order among the lands (05_gateway.md
+//! "The read fences the turns", "A land installs its own cowshed after its turn").
 //!
 //! The install asks the gateway to wait: every land queued when it asked ends its turn first,
 //! every land that asks meanwhile is parked behind it, and the gateway fences every queue in the
@@ -10,7 +10,8 @@
 //! Recorded 2026-11-10: an install that deferred whenever it found a land turn held or queued
 //! deferred three times in an hour, each rerun losing the gap to the next land's ask.
 //!
-//! Host-only like `land-turn`: no project, no workspace daemon, no runtime.
+//! Host-only like `land-turn`: no project, no workspace daemon, no runtime. `--gateway-socket`
+//! names another gateway's turns than the host's, as for `land-turn`.
 
 use std::io::Write;
 use std::time::Instant;
@@ -66,7 +67,11 @@ where
         ));
     };
     let command = PreparedCommand::prepare(program, rest)?;
-    let fence = fence(output).await?;
+    let socket = args
+        .gateway_socket
+        .clone()
+        .unwrap_or_else(|| CanonicalRoots::global().control_socket());
+    let fence = fence(socket, output).await?;
     // Armed once the fence is held and before the child starts, so a signal that arrives from here
     // on reaches the child, and the fence is held until the child ends.
     let mut interrupts = policy.arm_forwarding();
@@ -92,18 +97,20 @@ where
     exit_code(status)
 }
 
-/// The host gateway's fence on the land turns, taken in the install's order, saying on `output`
-/// who it waits behind and how long it waited. A gateway that cannot wait, a build from before
-/// the wait or one that does not answer, is said, and the command runs unfenced, as an install
-/// did before the wait: its `setup` reads the turns under the slot and refuses a held one.
-async fn fence<W, E>(output: &mut Output<W, E>) -> Result<Option<TurnFence>, CowshedError>
+/// The fence on the land turns of the gateway at `socket`, taken in the install's order, saying on
+/// `output` who it waits behind and how long it waited. A gateway that cannot wait, a build from
+/// before the wait or one that does not answer, is said, and the command runs unfenced, as an
+/// install did before the wait: its `setup` reads the turns under the slot and refuses a held one.
+async fn fence<W, E>(
+    socket: std::path::PathBuf,
+    output: &mut Output<W, E>,
+) -> Result<Option<TurnFence>, CowshedError>
 where
     W: Write + Send,
     E: Write + Send,
 {
-    let socket = CanonicalRoots::global().control_socket();
     let client = GatewayControlClient::new(socket).map_err(|error| {
-        CowshedError::internal(format!("cannot name the host gateway's socket: {error}"))
+        CowshedError::internal(format!("cannot name the gateway's socket: {error}"))
     })?;
     let started = Instant::now();
     // A report that cannot be written is kept, not returned, until the wait is over.

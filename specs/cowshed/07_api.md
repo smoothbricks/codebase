@@ -2303,6 +2303,7 @@ environment, working directory and standard streams, as the CLI verb does, and a
 | `spawnHold({ argv })`                                     | `hold --control-fd 3 --state-fd 4 -- argv`                | `HoldRun { control: HoldControl, state, exit }`        |
 | `spawnSubtreeRoot({ argv })`                              | `subtree-root --handle-fd 3 -- argv`                      | `SubtreeRootRun { admission, exit }`                   |
 | `spawnLandTurn({ repo, workspace?, outsideLock?, argv })` | `land-turn <repo> [--workspace] [--outside-lock] -- argv` | `LandTurnRun { exit }`                                 |
+| `spawnAwaitTurns({ gatewaySocket?, argv })`               | `gateway await-turns [--gateway-socket] -- argv`          | `AwaitTurnsRun { exit }`                               |
 
 No run exposes the process or a way to signal it freely; each holder is reached only through its verb's documented
 requests. `LockRun.forward` sends INT, HUP or TERM, which cowshed forwards to the command once it holds the lock (before

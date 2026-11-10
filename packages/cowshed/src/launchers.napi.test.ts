@@ -20,6 +20,7 @@ import {
   type LockRun,
   type LockWaiterEvent,
   openHost,
+  spawnAwaitTurns,
   spawnHold,
   spawnLandTurn,
   spawnLock,
@@ -403,6 +404,26 @@ describe('spawnLandTurn', () => {
         nothing,
       );
       expect(await run.exit).toEqual(exited(104));
+    } finally {
+      await fixture.dispose();
+    }
+  });
+});
+
+describe('spawnAwaitTurns', () => {
+  it('runs its command unfenced, with its status, when its gateway does not answer', async () => {
+    const fixture = await Fixture.create('cowshed-launch-await-');
+    try {
+      // Nothing listens at absent.sock, so no gateway fences the turns: the verb says so and
+      // runs the command anyway, as an install before the wait did, exiting with its status.
+      const run = fixture.own(
+        await spawnAwaitTurns({
+          gatewaySocket: join(fixture.root, 'absent.sock'),
+          argv: ['sh', '-c', 'exit 7'],
+        }),
+        nothing,
+      );
+      expect(await run.exit).toEqual(exited(7));
     } finally {
       await fixture.dispose();
     }

@@ -44,6 +44,7 @@ import { parseWorkspaceTarget } from './validators.generated.js';
 
 export {
   ADMISSION_LAST,
+  type AwaitTurnsRun,
   canCancelOwner,
   type Decoded,
   type DocCommitEdit,
@@ -58,6 +59,7 @@ export {
   LineDecoder,
   LOCK_LAST,
   type LockRun,
+  type SpawnAwaitTurnsOptions,
   type SpawnDocCommitOptions,
   type SpawnHoldOptions,
   type SpawnLandTurnOptions,
@@ -65,6 +67,7 @@ export {
   type SpawnSubtreeRootOptions,
   type SubtreeAdmissionOutcome,
   type SubtreeRootRun,
+  spawnAwaitTurns,
   spawnDocCommit,
   spawnHold,
   spawnLandTurn,

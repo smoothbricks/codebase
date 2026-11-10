@@ -280,9 +280,12 @@ pub struct LandTurnArgs {
     pub argv: Vec<OsString>,
 }
 
-/// `gateway await-turns -- <cmd...>`: the command run under the land turns' fence.
+/// `gateway await-turns [--gateway-socket <path>] -- <cmd...>`: the gateway whose land turns to
+/// wait for, and the command run under their fence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwaitTurnsArgs {
+    /// An explicitly selected gateway; absent waits for the host gateway's turns.
+    pub gateway_socket: Option<PathBuf>,
     pub argv: Vec<OsString>,
 }
 
@@ -1155,7 +1158,7 @@ pub fn cli_command() -> ClapCommand {
                 .subcommand(leaf("status"))
                 .subcommand(leaf("run"))
                 .subcommand(
-                    leaf("await-turns").arg(
+                    leaf("await-turns").arg(value("gateway-socket")).arg(
                         Arg::new("argv")
                             .value_parser(value_parser!(OsString))
                             .num_args(0..)
@@ -2259,10 +2262,16 @@ const GATEWAY: CommandSpec = CommandSpec {
         "An ordinary `stop` leaves the installed cowshed the agent ran — the content-addressed copies and the stable name linking to one of them: that is host state rather than agent state, and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes them, and the `cowshed` links on your `PATH` that name them, for a host that is done with the gateway rather than pausing it. `start` installs the running build as the installed cowshed the way `setup` does, and refuses a build that does not contain the installed one.",
         "`await-turns -- <cmd...>` runs one command, an install, once the gateway has fenced its land turns for it, in its order among the lands: every land queued when it asked ends its turn first, a land that asks meanwhile waits behind it, and the gateway fences every queue the moment the last ticket before it ends. It says on stderr how many turns it waits for and who holds them, runs the command under the fence, holds the fence until the command exits and exits with the command's status. A gateway that cannot wait, a build from before it, is said and the command runs unfenced. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
     ],
-    options: &[Opt {
-        spelling: "--purge",
-        meaning: "`stop` only: also delete the installed cowshed the agent ran and the PATH links that name it, not just the plist",
-    }],
+    options: &[
+        Opt {
+            spelling: "--purge",
+            meaning: "`stop` only: also delete the installed cowshed the agent ran and the PATH links that name it, not just the plist",
+        },
+        Opt {
+            spelling: "--gateway-socket <absolute path>",
+            meaning: "`await-turns` only, before --: the gateway whose land turns to wait for instead of the host gateway",
+        },
+    ],
 };
 
 fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
@@ -2278,7 +2287,18 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
                 USAGE,
             ));
         }
+        let gateway_socket = os(child, "gateway-socket").map(PathBuf::from);
+        if gateway_socket
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(UsageError::new(
+                "--gateway-socket must be an absolute path",
+                USAGE,
+            ));
+        }
         return Ok(Command::AwaitTurns(AwaitTurnsArgs {
+            gateway_socket,
             argv: command_argv(child, USAGE)?,
         }));
     }
@@ -5404,13 +5424,39 @@ mod tests {
                 .unwrap()
                 .command,
             Command::AwaitTurns(AwaitTurnsArgs {
+                gateway_socket: None,
                 argv: ["cowshed", "--json", "setup"].map(OsString::from).to_vec(),
+            })
+        );
+        assert_eq!(
+            parse_args([
+                "gateway",
+                "await-turns",
+                "--gateway-socket",
+                "/g.sock",
+                "--",
+                "true"
+            ])
+            .unwrap()
+            .command,
+            Command::AwaitTurns(AwaitTurnsArgs {
+                gateway_socket: Some(PathBuf::from("/g.sock")),
+                argv: vec![OsString::from("true")],
             })
         );
         for argv in [
             vec!["gateway", "await-turns"],
             vec!["gateway", "await-turns", "--"],
             vec!["--json", "gateway", "await-turns", "--", "true"],
+            vec![
+                "gateway",
+                "await-turns",
+                "--gateway-socket",
+                "g.sock",
+                "--",
+                "true",
+            ],
+            vec!["gateway", "status", "--gateway-socket", "/g.sock"],
         ] {
             assert!(parse_args(argv.clone()).is_err(), "accepted {argv:?}");
         }
