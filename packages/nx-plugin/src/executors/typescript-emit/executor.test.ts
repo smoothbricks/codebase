@@ -317,6 +317,26 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
       }
     },
   );
+  it.each(['utility', 'typia'] as const)(
+    "reports a failed build's type error without the dialect refusal its linked plugin withdrew, in the %s host",
+    async (host) => {
+      const root = await dialectFixture(host, 'lowered');
+      try {
+        await writeFile(join(root, 'src/wrong.ts'), "export const wrong: number = 'text';\n");
+        // The host fails on the type error, so ttsc runs its recovery pass: the stock compiler with no plugin, which
+        // refuses the dialect loop again. The host withdrew that refusal, so the failure reports only the type error.
+        for (const lane of [['--noEmit'], ['--emit', ...EMIT_OVERRIDES]]) {
+          const build = spawnSync('ttsc', ['-p', 'tsconfig.lib.json', ...lane], { cwd: root, encoding: 'utf8' });
+          const output = `${build.stdout}${build.stderr}`;
+          expect(build.status, output).not.toBe(0);
+          expect(output).toContain('TS2322');
+          expect(output).not.toContain('TS1103');
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
   it("reads the emitted files of ttsc's utility-plugin lane, keeps its unchanged outputs and prunes a deleted module's", async () => {
     const root = await utilityPluginFixture();
     try {

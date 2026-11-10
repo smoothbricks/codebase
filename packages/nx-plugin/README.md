@@ -1336,8 +1336,10 @@ Concrete targets come from concrete files:
   `ttsc -p tsconfig.lib.json --noEmit` instead. A dialect is a construct the stock checker refuses and the package's
   ttsc plugin lowers before emit; its refusal is withdrawn through the driver's `DiagnosticPlugin` seam (the managed
   ttsc patch: `LoweredDiagnostics` names the checker diagnostics whose cause the plugin's `ProgramPlugin` removes, and
-  every lane that gates on the program's diagnostics drops exactly those). The pinned compiler cannot judge such a
-  project. The declaring package says so in its manifest,
+  every lane that gates on the program's diagnostics drops exactly those). When the host fails, ttsc checks the project
+  again with the stock compiler, which loads no plugin and finds the withdrawn refusal again; the host records what it
+  withdrew in the file `TTSC_WITHDRAWN_DIAGNOSTICS_PATH` names, so that pass reports only what is still wrong. The
+  pinned compiler cannot judge such a project. The declaring package says so in its manifest,
   `"smoo": { "typecheck": { "compiler": "ttsc", "dependsOn": ["<project>:<target>"] } }`, where `dependsOn` names the
   targets that prepare the plugin binaries ttsc loads. The routed typecheck depends on them, so it loads built plugins
   and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the

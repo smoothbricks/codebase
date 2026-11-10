@@ -233,7 +233,7 @@ index 0000000000000000000000000000000000000000..97d1522f7979b488dc62b86cc1d78d72
 +	}
 +}
 diff --git a/driver/plugins.go b/driver/plugins.go
-index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa393fb9781a 100644
+index 1778e250d80d1316e108f1f36b6e1a38724922d5..bb217fc9ee0236bb1c700cf4c8c75211be41cc0e 100644
 --- a/driver/plugins.go
 +++ b/driver/plugins.go
 @@ -8,6 +8,8 @@ import (
@@ -421,19 +421,21 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa39
      tsconfig:     tsconfigPath,
    }, nil
  }
-@@ -896,6 +1022,42 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
+@@ -896,6 +1022,46 @@ func (state linkedPluginState) emitTransforms() ([]PluginTransform, error) {
    return out, nil
  }
  
-+// dropLoweredDiagnostics removes from in every diagnostic a registered
-+// DiagnosticPlugin names as lowered. Each plugin is asked, in registration
-+// order, about what the plugins before it kept; a diagnostic it names that it
-+// was not given is ignored, so a plugin can only withdraw a diagnostic, never
-+// add one. An entry with no registration is skipped here: apply reports it.
-+func (state linkedPluginState) dropLoweredDiagnostics(prog *Program, in []*ast.Diagnostic) []*ast.Diagnostic {
++// dropLoweredDiagnostics splits in into the diagnostics it keeps and the ones a
++// registered DiagnosticPlugin names as lowered, which it withdraws. Each plugin
++// is asked, in registration order, about what the plugins before it kept; a
++// diagnostic it names that it was not given is ignored, so a plugin can only
++// withdraw a diagnostic, never add one. An entry with no registration is
++// skipped here: apply reports it.
++func (state linkedPluginState) dropLoweredDiagnostics(prog *Program, in []*ast.Diagnostic) (kept, withdrawn []*ast.Diagnostic) {
++  kept = in
 +  for index, entry := range state.entries {
-+    if len(in) == 0 {
-+      return in
++    if len(kept) == 0 {
++      break
 +    }
 +    plugin, ok := registeredPlugin(index)
 +    if !ok {
@@ -444,27 +446,29 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa39
 +      continue
 +    }
 +    lowered := map[*ast.Diagnostic]struct{}{}
-+    for _, diagnostic := range judge.LoweredDiagnostics(prog, state.contextAt(index, entry), in) {
++    for _, diagnostic := range judge.LoweredDiagnostics(prog, state.contextAt(index, entry), kept) {
 +      lowered[diagnostic] = struct{}{}
 +    }
 +    if len(lowered) == 0 {
 +      continue
 +    }
-+    kept := make([]*ast.Diagnostic, 0, len(in))
-+    for _, diagnostic := range in {
-+      if _, drop := lowered[diagnostic]; !drop {
-+        kept = append(kept, diagnostic)
++    next := make([]*ast.Diagnostic, 0, len(kept))
++    for _, diagnostic := range kept {
++      if _, drop := lowered[diagnostic]; drop {
++        withdrawn = append(withdrawn, diagnostic)
++      } else {
++        next = append(next, diagnostic)
 +      }
 +    }
-+    in = kept
++    kept = next
 +  }
-+  return in
++  return kept, withdrawn
 +}
 +
  // registeredPlugin returns the plugin registered at position index, or
  // (nil, false) when the index is out of range. Registration order matches
  // the order of linked Go init() calls.
-@@ -913,7 +1075,8 @@ func registeredPlugin(index int) (any, bool) {
+@@ -913,7 +1079,8 @@ func registeredPlugin(index int) (any, bool) {
  // declarations are scoped per plugin instead: completeness is a claim about
  // everything one plugin contributes to a file, so the claims of its preamble
  // and program hooks are the same plugin's claim and must not be attributed
@@ -474,7 +478,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa39
  func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginContext {
    inputs := state.inputs.newScope()
    declaration := state.declarations.forPlugin(index)
-@@ -931,7 +1094,44 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
+@@ -931,7 +1098,44 @@ func (state linkedPluginState) contextAt(index int, entry PluginEntry) PluginCon
      reportFileDependencyRejected:   declaration.rejectDependency,
      reportFileComplete:             declaration.addComplete,
      reportEveryFileComplete:        declaration.completeEveryFile,
@@ -519,7 +523,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa39
  }
  
  // hostInputs returns the exact native configuration inputs reported in this
-@@ -947,3 +1147,7 @@ func (state linkedPluginState) hostInputHashes() map[string]*string {
+@@ -947,3 +1151,7 @@ func (state linkedPluginState) hostInputHashes() map[string]*string {
  func (state linkedPluginState) hostInputRealpaths() map[string]*string {
    return state.inputs.realpathList()
  }
@@ -528,7 +532,7 @@ index 1778e250d80d1316e108f1f36b6e1a38724922d5..f5997531e4142526bd8764c6db15aa39
 +  return state.inputs.environmentList()
 +}
 diff --git a/driver/program.go b/driver/program.go
-index 3a061b06bb7d1fa8ff5a8f7454634c158a6848a4..c5330185a700ac39c5ec87d7630d6cf4eb7ac953 100644
+index 3a061b06bb7d1fa8ff5a8f7454634c158a6848a4..d7f52037cc030dc8a25957e2de946e9172848cd7 100644
 --- a/driver/program.go
 +++ b/driver/program.go
 @@ -792,6 +792,12 @@ func forceEmit(parsed *tsoptions.ParsedCommandLine) {
@@ -573,14 +577,17 @@ index 3a061b06bb7d1fa8ff5a8f7454634c158a6848a4..c5330185a700ac39c5ec87d7630d6cf4
  // PluginObservationsIncomplete reports whether any linked hook explicitly
  // declared that its supported public API could not observe the input population
  // for this generation. False means no such declaration, not completeness proof.
-@@ -1181,6 +1209,10 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
+@@ -1181,6 +1209,13 @@ func (p *Program) diagnostics(files []*ast.SourceFile) []Diagnostic {
      }
    }
    raw = filterDiagnostics(raw)
 +  // A linked DiagnosticPlugin withdraws the checker's refusals of the dialect
 +  // its ProgramPlugin lowers. It asks about the tree the checker judged, which
 +  // the hooks have not mutated yet on every lane that gates on diagnostics.
-+  raw = p.plugins.dropLoweredDiagnostics(p, raw)
++  raw, withdrawn := p.plugins.dropLoweredDiagnostics(p, raw)
++  if err := p.recordWithdrawnDiagnostics(withdrawn); err != nil {
++    out = append(out, Diagnostic{Severity: SeverityError, Message: "driver: " + err.Error()})
++  }
    // filterDiagnostics runs first because it resolves a node from the position
    // tsgo recorded, which only makes sense against the tree tsgo parsed. The
    // preamble correction happens inside convertProgramDiagnostics, once the
@@ -689,6 +696,114 @@ index 79be74d24e879da216ad680d23ecfeb5f11a29db..6db9dddba05bd50e13ed92535ca442c3
  }
  
  func defaultWriteFile(fileName, text string) error {
+diff --git a/driver/withdrawn_diagnostics.go b/driver/withdrawn_diagnostics.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..cccf3d0b7243a7a0574e6f9aa1f6fa1a0bf03a80
+--- /dev/null
++++ b/driver/withdrawn_diagnostics.go
+@@ -0,0 +1,50 @@
++package driver
++
++import (
++  "bytes"
++  "errors"
++  "fmt"
++  "os"
++  "path/filepath"
++
++  "github.com/microsoft/typescript-go/shim/ast"
++  shimcompiler "github.com/microsoft/typescript-go/shim/compiler"
++)
++
++// WithdrawnDiagnosticsPathEnv names the file the driver records the
++// diagnostics its linked DiagnosticPlugins withdrew into. ttsc sets it for
++// every native plugin command it runs: when that command fails, ttsc checks the
++// project again with the stock compiler, which loads no plugin, and reports
++// only what the failed command did not print. A withdrawn diagnostic was never
++// printed, so without this record that pass would report it as an error.
++const WithdrawnDiagnosticsPathEnv = "TTSC_WITHDRAWN_DIAGNOSTICS_PATH"
++
++// recordWithdrawnDiagnostics appends withdrawn to the file
++// WithdrawnDiagnosticsPathEnv names, rendered as WritePrettyDiagnostics renders
++// the diagnostics a host prints, so ttsc reads both with one parser and compares
++// them by one identity. Every host computes its diagnostics through the
++// Program, so the record does not depend on how a host prints them. A pass
++// appends, so a host that asks for diagnostics more than once keeps every
++// withdrawal. It records nothing when the variable is unset or nothing was
++// withdrawn; an absent file records that nothing was. The path must be
++// absolute.
++func (p *Program) recordWithdrawnDiagnostics(withdrawn []*ast.Diagnostic) error {
++  path := os.Getenv(WithdrawnDiagnosticsPathEnv)
++  if path == "" || len(withdrawn) == 0 {
++    return nil
++  }
++  if !filepath.IsAbs(path) {
++    return fmt.Errorf("withdrawn diagnostics path must be absolute: %q", path)
++  }
++  var rendered bytes.Buffer
++  WritePrettyDiagnostics(&rendered, p.convertProgramDiagnostics(shimcompiler.SortAndDeduplicateDiagnostics(withdrawn)), p.TSProgram.GetCurrentDirectory())
++  file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
++  if err != nil {
++    return fmt.Errorf("withdrawn diagnostics: %w", err)
++  }
++  _, writeErr := file.Write(rendered.Bytes())
++  if err := errors.Join(writeErr, file.Close()); err != nil {
++    return fmt.Errorf("withdrawn diagnostics: %w", err)
++  }
++  return nil
++}
+diff --git a/lib/compiler/internal/build/BuildExecution.js b/lib/compiler/internal/build/BuildExecution.js
+index 7d6c3409d3213aec2d0e4b39414d2fa3fcb78128..d5b3ac075a065ef313eedc0d80dd5aaafa7fcb4c 100644
+--- a/lib/compiler/internal/build/BuildExecution.js
++++ b/lib/compiler/internal/build/BuildExecution.js
+@@ -1036,16 +1036,22 @@ var BuildExecution;
+             cwd: execution.projectRoot,
+             env,
+             encoding: "utf8",
++            reportWithdrawnDiagnostics: true,
+         });
+         BuildTiming_1.BuildTiming.recordTiming(timing, timingLabel, startedAt);
+         if (res.error) {
+             throw new Error(`${label}: failed to spawn ${plugin.binary}: ${res.error.message}`);
+         }
++        // The host renders what its linked DiagnosticPlugins withdrew as it
++        // renders what it prints, so one parser reads both and the recovery
++        // pass after a failure compares them by one identity.
++        const withdrawnDiagnostics = (0, normalizeBuildOutput_1.parseCompilerDiagnostics)({ stderr: "", stdout: res.withdrawn }, execution.projectRoot);
+         return (0, normalizeBuildOutput_1.normalizeBuildOutput)({
+             processCompletedNormally: res.status !== null && res.signal === null,
+             status: res.status ?? 1,
+             stdout: (0, outputText_1.outputText)(res.stdout),
+             stderr: (0, outputText_1.outputText)(res.stderr),
++            ...(withdrawnDiagnostics.length === 0 ? {} : { withdrawnDiagnostics }),
+         }, execution.projectRoot);
+     }
+     BuildExecution.runNativePluginCommand = runNativePluginCommand;
+diff --git a/lib/compiler/internal/build/CompilerDiagnostics.js b/lib/compiler/internal/build/CompilerDiagnostics.js
+index 41017580431084dd18ae9e555d4ef32082714b38..3ddaba4ddd0942baa6fdbfc47fdb398b9d05150a 100644
+--- a/lib/compiler/internal/build/CompilerDiagnostics.js
++++ b/lib/compiler/internal/build/CompilerDiagnostics.js
+@@ -28,6 +28,9 @@ var CompilerDiagnostics;
+ (function (CompilerDiagnostics) {
+     /**
+      * Return fallback diagnostics the failed plugin did not already report.
++     * A diagnostic the failed run's linked DiagnosticPlugins withdrew
++     * (`failure.withdrawnDiagnostics`) counts as reported: the fallback loads no
++     * plugin, so it finds that diagnostic again, and it is not an error.
+      * Matching offsets take precedence only when both reports carry offsets;
+      * otherwise rendered line and column determine the position. A completely
+      * redundant fallback returns null. Partial filtering retains selected report
+@@ -48,7 +51,9 @@ var CompilerDiagnostics;
+         if (typechecked.diagnostics.length === 0) {
+             return typechecked.status === 0 ? null : typechecked;
+         }
+-        const alreadyReported = indexCompilerDiagnostics(failure.diagnostics);
++        const alreadyReported = indexCompilerDiagnostics(failure.withdrawnDiagnostics === undefined
++            ? failure.diagnostics
++            : [...failure.diagnostics, ...failure.withdrawnDiagnostics]);
+         const diagnostics = typechecked.diagnostics.filter((diagnostic) => !alreadyReported(diagnostic));
+         if (diagnostics.length === 0)
+             return null;
 diff --git a/lib/compiler/internal/build/RuntimeBuildInputs.js b/lib/compiler/internal/build/RuntimeBuildInputs.js
 index 855c4b3fbcda8e55dac89e568405766864bf7139..858c6df808b105098372a8d46eea02ecdf8fa581 100644
 --- a/lib/compiler/internal/build/RuntimeBuildInputs.js
@@ -749,10 +864,10 @@ index b64e043c810ad0834e98a441d012208a06d8aa81..35d3fef74ad87ad06e9677e5d46ea936
              for (const file of result.hostInputs ?? []) {
                  const [currentPhysical, hash] = observeHostInput(file);
 diff --git a/lib/compiler/internal/build/appendBuildOutput.js b/lib/compiler/internal/build/appendBuildOutput.js
-index 17a19b74c4e7ba08c6cc77c31bcfff596ec9e30f..a9212bf6fc0d344d2ce068363faaa645eb74a76c 100644
+index 17a19b74c4e7ba08c6cc77c31bcfff596ec9e30f..e2a9166722e4e6411518d1748f2a0d21a2fa7ce1 100644
 --- a/lib/compiler/internal/build/appendBuildOutput.js
 +++ b/lib/compiler/internal/build/appendBuildOutput.js
-@@ -2,6 +2,7 @@
+@@ -2,12 +2,15 @@
  Object.defineProperty(exports, "__esModule", { value: true });
  exports.appendBuildOutput = appendBuildOutput;
  exports.mergeCheckGraphs = mergeCheckGraphs;
@@ -760,7 +875,15 @@ index 17a19b74c4e7ba08c6cc77c31bcfff596ec9e30f..a9212bf6fc0d344d2ce068363faaa645
  const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
  /**
   * Merge two `TtscBuildResult` values into one.
-@@ -15,6 +16,8 @@ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
+  *
+  * - `status`: the right status wins unless it is 0 (failure propagates).
+  * - `diagnostics`: concatenated left then right.
++ * - `withdrawnDiagnostics`: concatenated left then right, present when either
++ *   phase's host withdrew one.
+  * - `emittedFiles`: right wins when present, otherwise left is kept.
+  * - `emittedSources`: only the right phase's proof survives. An unknown later
+  *   producer must not inherit an earlier phase's source ownership.
+@@ -15,6 +18,8 @@ const normalizeBuildOutput_1 = require("./normalizeBuildOutput");
   * - Check inputs are unioned; independently compatible content and physical
   *   witnesses survive. A lost witness cannot be restored by a later phase.
   *   Explicit observation incompleteness is sticky.
@@ -769,7 +892,23 @@ index 17a19b74c4e7ba08c6cc77c31bcfff596ec9e30f..a9212bf6fc0d344d2ce068363faaa645
   *
   * The shared normalizer moves combined stdout to stderr when the merged result
   * failed and stderr is blank, preserving visibility for stderr-only consumers.
-@@ -47,6 +50,7 @@ function appendBuildOutput(left, right) {
+@@ -36,6 +41,15 @@ function appendBuildOutput(left, right) {
+     return (0, normalizeBuildOutput_1.normalizeBuildOutput)({
+         graph: mergeCheckGraphs(left.graph, right.graph),
+         diagnostics: [...left.diagnostics, ...right.diagnostics],
++        ...(left.withdrawnDiagnostics === undefined &&
++            right.withdrawnDiagnostics === undefined
++            ? {}
++            : {
++                withdrawnDiagnostics: [
++                    ...(left.withdrawnDiagnostics ?? []),
++                    ...(right.withdrawnDiagnostics ?? []),
++                ],
++            }),
+         emittedFiles: right.emittedFiles !== undefined ? right.emittedFiles : left.emittedFiles,
+         emittedSources: right.emittedSources,
+         emittedSourceProofFailures: right.emittedSourceProofFailures,
+@@ -47,6 +61,7 @@ function appendBuildOutput(left, right) {
                  hostInputHashes: mergeInputWitnesses(left, right, "hostInputHashes", hostInputs),
                  hostInputRealpaths: mergeInputWitnesses(left, right, "hostInputRealpaths", hostInputs),
              }),
@@ -831,6 +970,64 @@ index 0000000000000000000000000000000000000000..17010bfbaedc7a28e821d676af7a350f
 +}
 +//# sourceMappingURL=mergeEnvironmentInputs.js.map
 \ No newline at end of file
+diff --git a/lib/compiler/internal/build/normalizeBuildOutput.js b/lib/compiler/internal/build/normalizeBuildOutput.js
+index 889d79686b3b8a830e69695f8370e36d109e50b6..0fc1166d503630090b48ab54809d06d886d6a6c7 100644
+--- a/lib/compiler/internal/build/normalizeBuildOutput.js
++++ b/lib/compiler/internal/build/normalizeBuildOutput.js
+@@ -1,6 +1,7 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.normalizeBuildOutput = normalizeBuildOutput;
++exports.parseCompilerDiagnostics = parseCompilerDiagnostics;
+ const CompilerDiagnostics_1 = require("./CompilerDiagnostics");
+ /**
+  * Normalise a raw spawn result into a `TtscBuildResult`.
+diff --git a/lib/compiler/internal/captureProcessOutput.js b/lib/compiler/internal/captureProcessOutput.js
+index 06a4734a978facf210ffe4e5ce087d00a2b11412..b84d2a1ccde1ba107beebed987a477c42f9c4179 100644
+--- a/lib/compiler/internal/captureProcessOutput.js
++++ b/lib/compiler/internal/captureProcessOutput.js
+@@ -10,7 +10,9 @@ const createCanonicalTempDirectory_1 = require("../../internal/createCanonicalTe
+ const selectedRecordIdentityTempParent_1 = require("../../plugin/internal/source/selectedRecordIdentityTempParent");
+ const SidecarEnvironment_1 = require("./sharedHost/SidecarEnvironment");
+ /**
+- * Acquire two private files and descriptors for a child's output.
++ * Acquire two private files and descriptors for a child's output, and a path in
++ * the same private directory where a native plugin host may record the
++ * diagnostics it withdrew (`readWithdrawn`).
+  *
+  * File descriptors avoid spawnSync's piped maxBuffer ceiling. Reading after
+  * exit still allocates complete output and is subject to filesystem, Buffer and
+@@ -45,6 +47,7 @@ function captureProcessOutput(env = process.env) {
+     const directory = (0, createCanonicalTempDirectory_1.createCanonicalTempDirectory)("ttsc-spawn-", (0, selectedRecordIdentityTempParent_1.selectedRecordIdentityTempParent)(recordRoot));
+     const stdoutPath = node_path_1.default.join(directory, "stdout");
+     const stderrPath = node_path_1.default.join(directory, "stderr");
++    const withdrawnPath = node_path_1.default.join(directory, "withdrawn");
+     let stdoutFd;
+     try {
+         stdoutFd = node_fs_1.default.openSync(stdoutPath, "w+");
+@@ -80,10 +83,22 @@ function captureProcessOutput(env = process.env) {
+             const raw = node_fs_1.default.readFileSync(location);
+             return encoding === "buffer" ? raw : raw.toString(encoding ?? "utf8");
+         },
++        /** What the child wrote at withdrawnPath, or "" when it wrote nothing. */
++        readWithdrawn() {
++            try {
++                return node_fs_1.default.readFileSync(withdrawnPath, "utf8");
++            }
++            catch (error) {
++                if (error.code === "ENOENT")
++                    return "";
++                throw error;
++            }
++        },
+         stderrFd,
+         stderrPath,
+         stdoutFd,
+         stdoutPath,
++        withdrawnPath,
+     };
+ }
+ /** Attempt closure without replacing the acquisition or process outcome. */
 diff --git a/lib/compiler/internal/parseEnvironmentInputs.js b/lib/compiler/internal/parseEnvironmentInputs.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..cfba66dc36b5250461e07d0cddf1c0666541d4bb
@@ -942,6 +1139,76 @@ index 6fd2b52ccdb5f81fe3c2fb317a1713cd4db15f37..a5ddfe21a1bba502985c6cea16d7b063
          ...(graph === undefined ? {} : { graph }),
          ...(graphUnavailable ? { observationsComplete: false } : {}),
          hostInputs: [...inputs],
+diff --git a/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js b/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..557e3eaf1e05ff7f9cb4d231699b4f7a91fcc345
+--- /dev/null
++++ b/lib/compiler/internal/sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV.js
+@@ -0,0 +1,12 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.WITHDRAWN_DIAGNOSTICS_PATH_ENV = void 0;
++/**
++ * Environment channel naming the file a native plugin host writes the
++ * diagnostics its linked DiagnosticPlugins withdrew into. Mirrors
++ * `driver.WithdrawnDiagnosticsPathEnv` on the Go side. A failed host's
++ * recovery pass checks the project with no plugin and finds those diagnostics
++ * again; this record is how it knows they are not errors.
++ */
++exports.WITHDRAWN_DIAGNOSTICS_PATH_ENV = "TTSC_WITHDRAWN_DIAGNOSTICS_PATH";
++//# sourceMappingURL=WITHDRAWN_DIAGNOSTICS_PATH_ENV.js.map
+\ No newline at end of file
+diff --git a/lib/compiler/internal/spawnNative.js b/lib/compiler/internal/spawnNative.js
+index c311ef5af1e9f032634b17b6bdc871507daec638..85e5e35ca3a259ae34d2bfbbd4bf70a6388a9adb 100644
+--- a/lib/compiler/internal/spawnNative.js
++++ b/lib/compiler/internal/spawnNative.js
+@@ -4,6 +4,8 @@ exports.spawnNative = spawnNative;
+ const spawnSyncResilient_1 = require("../../internal/spawnSyncResilient");
+ const captureProcessOutput_1 = require("./captureProcessOutput");
+ const ensureExecutable_1 = require("./ensureExecutable");
++const SidecarEnvironment_1 = require("./sharedHost/SidecarEnvironment");
++const WITHDRAWN_DIAGNOSTICS_PATH_ENV_1 = require("./sharedHost/WITHDRAWN_DIAGNOSTICS_PATH_ENV");
+ /**
+  * Spawn a native binary (or a Node.js script when the path has a JS/TS
+  * extension) and return its result with decoded or raw-buffer output streams.
+@@ -15,6 +17,11 @@ const ensureExecutable_1 = require("./ensureExecutable");
+  * When `options.encoding` is omitted it defaults to `"utf8"`. Pass `"buffer"`
+  * when the caller needs raw bytes.
+  *
++ * With `options.reportWithdrawnDiagnostics`, the child's environment names a
++ * private file for the diagnostics its linked DiagnosticPlugins withdrew
++ * (`WITHDRAWN_DIAGNOSTICS_PATH_ENV`), and the result's `withdrawn` holds what
++ * it wrote there as UTF-8 text, "" when it wrote nothing.
++ *
+  * @evidence contracts/common.md#principled-implementation Executable plus argv are passed directly to Node spawning; script candidates instead pass their path to process.execPath, and file-backed output reconstructs the normal stdout/stderr/output result fields.
+  * @evidence contracts/common.md#clear-and-simple-design This operation owns synchronous execution and capture lifetime; permission preparation, low-descriptor recovery and byte decoding remain explicit delegated boundaries.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts No shell parses argv or foreign process API is replaced. Descriptor recovery is selected by the real resource-exhaustion contract in spawnSyncResilient rather than a fixture outcome.
+@@ -33,9 +40,14 @@ function spawnNative(binary, args, options) {
+     }
+     const capture = (0, captureProcessOutput_1.captureProcessOutput)();
+     try {
++        let env = options.env;
++        if (options.reportWithdrawnDiagnostics === true) {
++            env = SidecarEnvironment_1.SidecarEnvironment.merge(options.env ?? process.env);
++            SidecarEnvironment_1.SidecarEnvironment.write(env, WITHDRAWN_DIAGNOSTICS_PATH_ENV_1.WITHDRAWN_DIAGNOSTICS_PATH_ENV, capture.withdrawnPath);
++        }
+         const result = (0, spawnSyncResilient_1.spawnSyncResilient)(viaNode ? process.execPath : binary, viaNode ? [binary, ...args] : [...args], {
+             cwd: options.cwd,
+-            env: options.env,
++            env,
+             stdio: ["ignore", capture.stdoutFd, capture.stderrFd],
+             windowsHide: true,
+         }, { stderr: capture.stderrPath, stdout: capture.stdoutPath });
+@@ -46,6 +58,9 @@ function spawnNative(binary, args, options) {
+             output: [null, stdout, stderr],
+             stderr,
+             stdout,
++            ...(options.reportWithdrawnDiagnostics === true
++                ? { withdrawn: capture.readWithdrawn() }
++                : {}),
+         };
+     }
+     finally {
 diff --git a/lib/compiler/internal/transformProjectInMemory.js b/lib/compiler/internal/transformProjectInMemory.js
 index 999805a36b0a7f55bfcb421805ceba8fdd8da778..e1de410793dbefa35054f16308130423997eab2a 100644
 --- a/lib/compiler/internal/transformProjectInMemory.js
