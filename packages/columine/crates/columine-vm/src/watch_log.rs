@@ -16,8 +16,9 @@ use crate::struct_map::{StructMap2Slot, StructMapSlot, StructRows};
 use crate::vm::{CheckedMap, CheckedSet};
 use columine_types::types::{
     AggType, ChangeFlag, EMPTY_KEY, ErrorCode, NET_CHANGE_ALIGN, NET_CHANGE_HEADER_SIZE,
-    NetChangeKind, NetChangeOffset, SlotMetaOffset, SlotType, StructFieldType, is_arena_field_type,
-    state_num_slots, struct_field_size,
+    NetChangeKind, NetChangeOffset, SlotMetaOffset, SlotType, StructFieldType, WATCH_LOG_ALIGN,
+    WATCH_LOG_ENTRY_SIZE, WATCH_LOG_HEADER_SIZE, WatchLogEntryOffset, WatchLogOffset,
+    is_arena_field_type, state_num_slots, struct_field_size,
 };
 
 /// The kind of a whole-slot entry: no change-flag bit, no key, no prior.
@@ -379,6 +380,132 @@ fn checked_seq(state: &[u8], slot: u32) -> Result<u64, ErrorCode> {
     Ok(bytes::read_u64(state, at as u32))
 }
 
+/// Whether `slot`'s priors lead with a `u32` lane a host may intern: a hash
+/// map's value, a u32 scalar's value cell.
+fn u32_lane(state: &[u8], slot: u32) -> bool {
+    let meta = SlotMetaView::read(state, slot);
+    match meta.slot_type() {
+        SlotType::HashMap => true,
+        SlotType::Scalar => meta.agg_type_byte(state) == AggType::ScalarU32 as u8,
+        _ => false,
+    }
+}
+
+/// Write `value` at `offset` of `buf`.
+fn set_field(buf: &mut [u8], offset: u32, value: &[u8]) {
+    buf[offset as usize..offset as usize + value.len()].copy_from_slice(value);
+}
+
+/// A checkpoint record's ring sizes and coverage.
+struct RecordHeader {
+    entries: usize,
+    image_bytes: usize,
+    coverage: u64,
+}
+
+/// Read a checkpoint record against a slot whose sequence is `now`, calling
+/// `visit` with each entry and its prior in order. Every byte is checked:
+/// the sizes, the zero padding, each kind's key, held and prior shape,
+/// stamps above the coverage, in order and at most `now`, entries within the
+/// ring's count and prior bytes, and no byte past the last entry.
+fn read_record<'b>(
+    bytes: &'b [u8],
+    now: u64,
+    mut visit: impl FnMut(Entry, &'b [u8]),
+) -> Result<RecordHeader, ErrorCode> {
+    let malformed = ErrorCode::InvalidState;
+    let field = |at: usize, len: usize| -> Result<&'b [u8], ErrorCode> {
+        at.checked_add(len)
+            .and_then(|end| bytes.get(at..end))
+            .ok_or(malformed)
+    };
+    let word = |at: usize| -> Result<u32, ErrorCode> {
+        Ok(u32::from_le_bytes(
+            field(at, 4)?.try_into().map_err(|_| malformed)?,
+        ))
+    };
+    let wide = |at: usize| -> Result<u64, ErrorCode> {
+        Ok(u64::from_le_bytes(
+            field(at, 8)?.try_into().map_err(|_| malformed)?,
+        ))
+    };
+    let zero = |at: usize, len: usize| -> Result<(), ErrorCode> {
+        field(at, len)?
+            .iter()
+            .all(|&byte| byte == 0)
+            .then_some(())
+            .ok_or(malformed)
+    };
+    let entries = word(WatchLogOffset::ENTRIES as usize)? as usize;
+    let image_bytes = word(WatchLogOffset::IMAGE_BYTES as usize)? as usize;
+    let coverage = wide(WatchLogOffset::COVERAGE as usize)?;
+    let count = word(WatchLogOffset::COUNT as usize)? as usize;
+    let header_end = WatchLogOffset::COUNT as usize + 4;
+    zero(header_end, WATCH_LOG_HEADER_SIZE as usize - header_end)?;
+    if entries == 0 || count > entries || coverage > now {
+        return Err(malformed);
+    }
+    let align = WATCH_LOG_ALIGN as usize;
+    let mut at = WATCH_LOG_HEADER_SIZE as usize;
+    let mut stamp_floor = coverage;
+    let mut priors = 0usize;
+    for _ in 0..count {
+        let key1 = word(at + WatchLogEntryOffset::KEY1 as usize)?;
+        let key2 = word(at + WatchLogEntryOffset::KEY2 as usize)?;
+        let stamp = wide(at + WatchLogEntryOffset::STAMP as usize)?;
+        let kind = field(at + WatchLogEntryOffset::KIND as usize, 1)?[0];
+        let held = field(at + WatchLogEntryOffset::HELD as usize, 1)?[0];
+        let held_end = WatchLogEntryOffset::HELD as usize + 1;
+        zero(
+            at + held_end,
+            WatchLogEntryOffset::PRIOR_LEN as usize - held_end,
+        )?;
+        let prior_len = word(at + WatchLogEntryOffset::PRIOR_LEN as usize)?;
+        let shape = match kind {
+            WHOLE => key1 == 0 && key2 == 0 && held == 0 && prior_len == 0,
+            ChangeFlag::INSERTED => held == 0 && prior_len == 0,
+            ChangeFlag::UPDATED
+            | ChangeFlag::REMOVED
+            | ChangeFlag::EVICTED
+            | ChangeFlag::SIZE_CHANGED => held == 1,
+            _ => false,
+        };
+        let ordered = stamp > coverage && stamp >= stamp_floor && stamp <= now;
+        if !shape || !ordered {
+            return Err(malformed);
+        }
+        stamp_floor = stamp;
+        let body = at + WATCH_LOG_ENTRY_SIZE as usize;
+        let prior = field(body, prior_len as usize)?;
+        let end = body + prior.len();
+        let next = end.next_multiple_of(align);
+        zero(end, next - end)?;
+        priors = priors
+            .checked_add(prior.len())
+            .filter(|&total| total <= image_bytes)
+            .ok_or(malformed)?;
+        visit(
+            Entry {
+                key1,
+                key2,
+                stamp,
+                kind,
+                held: held == 1,
+                prior_len,
+            },
+            prior,
+        );
+        at = next;
+    }
+    if at != bytes.len() {
+        return Err(malformed);
+    }
+    Ok(RecordHeader {
+        entries,
+        image_bytes,
+        coverage,
+    })
+}
 /// The write sequence of a slot a kernel just wrote.
 fn seq(state: &[u8], slot: u32) -> u64 {
     bytes::read_u64(state, slot_meta_base(slot) + SlotMetaOffset::WRITE_SEQ)
@@ -406,17 +533,23 @@ impl WatchLog {
             return Err(ErrorCode::CapacityExceeded);
         }
         let (entries, image_bytes) = (entries as usize, image_bytes as usize);
+        self.reserve_slot(index, image_bytes)?;
+        let log = SlotLog::new(sequence, u32_lane(state, slot), entries, image_bytes)?;
+        self.install(index, log);
+        Ok(sequence)
+    }
+
+    /// Hold the VM-wide storage a log of slot `index` with `image_bytes`
+    /// of priors needs, before its ring is built.
+    fn reserve_slot(&mut self, index: usize, image_bytes: usize) -> Result<(), ErrorCode> {
         reserve_total(&mut self.slots, index + 1)?;
         reserve_total(&mut self.watched, index / 64 + 1)?;
         reserve_total(&mut self.suspended, index / 64 + 1)?;
-        reserve_total(&mut self.prior, image_bytes)?;
-        let meta = SlotMetaView::read(state, slot);
-        let u32_lane = match meta.slot_type() {
-            SlotType::HashMap => true,
-            SlotType::Scalar => meta.agg_type_byte(state) == AggType::ScalarU32 as u8,
-            _ => false,
-        };
-        let log = SlotLog::new(sequence, u32_lane, entries, image_bytes)?;
+        reserve_total(&mut self.prior, image_bytes)
+    }
+
+    /// Make `log` slot `index`'s, within room [`Self::reserve_slot`] held.
+    fn install(&mut self, index: usize, log: SlotLog) {
         if self.slots.len() <= index {
             self.slots.resize(index + 1, None);
         }
@@ -425,7 +558,129 @@ impl WatchLog {
         }
         self.slots[index] = Some(log);
         self.watched[index / 64] |= 1 << (index % 64);
-        Ok(sequence)
+    }
+
+    /// Append `slot`'s log as of `state` to `out` as one checkpoint
+    /// record ([`WatchLogOffset`], [`WatchLogEntryOffset`]): its ring sizes,
+    /// its coverage raised to `above`, and the entries stamped in
+    /// `(above, seq]`, `seq` the slot's sequence in `state`, each with its
+    /// prior. A slot this log does not watch is `InvalidSlot`; a log whose
+    /// coverage lies above `seq` (a state older than the log) is
+    /// `InvalidState`; `out` that cannot grow is `OutOfMemory` and keeps
+    /// its bytes.
+    pub fn export(
+        &self,
+        state: &[u8],
+        slot: u32,
+        above: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ErrorCode> {
+        let now = checked_seq(state, slot)?;
+        let Some(Some(log)) = self.slots.get(slot as usize) else {
+            return Err(ErrorCode::InvalidSlot);
+        };
+        if log.coverage > now {
+            return Err(ErrorCode::InvalidState);
+        }
+        let coverage = log.coverage.max(above.min(now));
+        let exported = |entry: &Entry| entry.stamp > coverage && entry.stamp <= now;
+        let align = WATCH_LOG_ALIGN as usize;
+        let mut len = WATCH_LOG_HEADER_SIZE as usize;
+        let mut count = 0u32;
+        for index in 0..log.len {
+            let entry = log.at(index);
+            if exported(&entry) {
+                count += 1;
+                len = (len + WATCH_LOG_ENTRY_SIZE as usize + entry.prior_len as usize)
+                    .next_multiple_of(align);
+            }
+        }
+        out.try_reserve(len).map_err(|_| ErrorCode::OutOfMemory)?;
+        let start = out.len();
+        let mut header = [0u8; WATCH_LOG_HEADER_SIZE as usize];
+        set_field(
+            &mut header,
+            WatchLogOffset::ENTRIES,
+            &(log.entries.len() as u32).to_le_bytes(),
+        );
+        set_field(
+            &mut header,
+            WatchLogOffset::IMAGE_BYTES,
+            &(log.images.len() as u32).to_le_bytes(),
+        );
+        set_field(
+            &mut header,
+            WatchLogOffset::COVERAGE,
+            &coverage.to_le_bytes(),
+        );
+        set_field(&mut header, WatchLogOffset::COUNT, &count.to_le_bytes());
+        out.extend_from_slice(&header);
+        let mut image_at = log.image_head;
+        for index in 0..log.len {
+            let entry = log.at(index);
+            let prior_at = image_at;
+            image_at = log.image_wrap(image_at + entry.prior_len as usize);
+            if !exported(&entry) {
+                continue;
+            }
+            let mut head = [0u8; WATCH_LOG_ENTRY_SIZE as usize];
+            set_field(
+                &mut head,
+                WatchLogEntryOffset::KEY1,
+                &entry.key1.to_le_bytes(),
+            );
+            set_field(
+                &mut head,
+                WatchLogEntryOffset::KEY2,
+                &entry.key2.to_le_bytes(),
+            );
+            set_field(
+                &mut head,
+                WatchLogEntryOffset::STAMP,
+                &entry.stamp.to_le_bytes(),
+            );
+            set_field(&mut head, WatchLogEntryOffset::KIND, &[entry.kind]);
+            set_field(
+                &mut head,
+                WatchLogEntryOffset::HELD,
+                &[u8::from(entry.held)],
+            );
+            set_field(
+                &mut head,
+                WatchLogEntryOffset::PRIOR_LEN,
+                &entry.prior_len.to_le_bytes(),
+            );
+            out.extend_from_slice(&head);
+            let (first, second) = log.prior(prior_at, entry.prior_len);
+            out.extend_from_slice(first);
+            out.extend_from_slice(second);
+            let padded = start + (out.len() - start).next_multiple_of(align);
+            out.resize(padded, 0);
+        }
+        debug_assert_eq!(out.len() - start, len);
+        Ok(())
+    }
+
+    /// Watch `slot` with the ring sizes a checkpoint record names, holding
+    /// its entries and coverage, in place of any log the slot had; answers
+    /// the coverage. A record that is malformed, or names a coverage or stamp
+    /// above the slot's sequence in `state`, is `InvalidState`; storage
+    /// that cannot be had is `OutOfMemory`. A refusal changes nothing.
+    pub fn import(&mut self, state: &[u8], slot: u32, bytes: &[u8]) -> Result<u64, ErrorCode> {
+        let now = checked_seq(state, slot)?;
+        let header = read_record(bytes, now, |_, _| {})?;
+        let index = slot as usize;
+        self.reserve_slot(index, header.image_bytes)?;
+        let mut log = SlotLog::new(
+            header.coverage,
+            u32_lane(state, slot),
+            header.entries,
+            header.image_bytes,
+        )?;
+        // Validated above: every entry fits the ring without an eviction.
+        read_record(bytes, now, |entry, prior| log.push(entry, prior))?;
+        self.install(index, log);
+        Ok(header.coverage)
     }
 
     /// Release `slot`'s log. A slot not watched is left as it is.

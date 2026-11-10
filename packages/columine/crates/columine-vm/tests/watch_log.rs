@@ -14,8 +14,9 @@ mod common;
 use columine_types::InternedStr;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
-    AggType, ErrorCode, NET_CHANGE_ALIGN, NET_CHANGE_HEADER_SIZE, NetChangeKind, NetChangeOffset,
-    Opcode, SlotMetaOffset, SlotType, StructFieldType,
+    AggType, ChangeFlag, ErrorCode, NET_CHANGE_ALIGN, NET_CHANGE_HEADER_SIZE, NetChangeKind,
+    NetChangeOffset, Opcode, SlotMetaOffset, SlotType, StructFieldType, WATCH_LOG_ENTRY_SIZE,
+    WATCH_LOG_HEADER_SIZE, WatchLogEntryOffset, WatchLogOffset,
 };
 use columine_vm::bitmap_ops::{BitmapAlgebraOp, BitmapSource};
 use columine_vm::hashmap_ops::{CmpType, Strategy};
@@ -1084,4 +1085,359 @@ fn a_log_clone_refuses_out_of_memory_and_keeps_its_log() {
     );
     assert_eq!(fork.log_clone_from(&source), Ok(()));
     assert_eq!(net(&fork, &state, 0, 0).unwrap(), [insert(1, 0)]);
+}
+
+/// `slot`'s net-change answer and records from `since`, as bytes.
+fn net_bytes(
+    vm: &Vm,
+    state: &[u8],
+    slot: u32,
+    since: u64,
+    strings: &(impl InternBytes + ?Sized),
+) -> (NetAnswer, Vec<u8>) {
+    let mut out = NetChanges::default();
+    let answer = vm
+        .net_changes(state, slot, since, strings, &mut out)
+        .expect("net_changes");
+    (answer, out.bytes().to_vec())
+}
+
+fn put_u32(record: &mut [u8], at: u32, value: u32) {
+    record[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(record: &mut [u8], at: u32, value: u64) {
+    record[at as usize..at as usize + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[test]
+fn an_exported_log_imports_over_its_image_and_answers_alike() {
+    let init = [
+        slot_def(0, SlotType::HashMap),
+        slot_def(1, SlotType::Bitmap),
+    ]
+    .concat();
+    let code = program(2, &init, &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    upsert(&mut vm, &mut state, 0, 9, 90);
+    assert_eq!(vm.watch(&state, 0, 16, 256), Ok(1));
+    upsert(&mut vm, &mut state, 0, 1, 10);
+    upsert(&mut vm, &mut state, 0, 9, 91);
+    upsert(&mut vm, &mut state, 0, 2, 20);
+    assert_eq!(vm.map_remove(false, &mut state, 0, &[1]), ErrorCode::Ok);
+    upsert(&mut vm, &mut state, 0, 3, 30);
+    assert_eq!(seq(&state, 0), 6);
+    // A bitmap slot with a keyless write in its log.
+    vm.watch(&state, 1, 16, 64).unwrap();
+    assert_eq!(
+        vm.set_insert(false, &mut state, 1, &[4, 5], None),
+        ErrorCode::Ok
+    );
+    assert_eq!(
+        vm.bitmap_algebra(
+            false,
+            BitmapAlgebraOp::Or,
+            &mut state,
+            1,
+            BitmapSource::Slot(1)
+        ),
+        ErrorCode::Ok
+    );
+    assert_eq!(
+        vm.set_insert(false, &mut state, 1, &[6], None),
+        ErrorCode::Ok
+    );
+
+    for above in [0, 3] {
+        let mut record = Vec::new();
+        vm.log_export(&state, 0, above, &mut record).unwrap();
+        vm.log_export(&state, 1, above.min(1), &mut record).unwrap();
+        let first = vm_record_len(&record);
+        let mut fresh = Vm::default();
+        let coverage = fresh.log_import(&state, 0, &record[..first]).unwrap();
+        assert_eq!(coverage, above.max(1));
+        assert_eq!(fresh.coverage(0), Some(coverage));
+        fresh.log_import(&state, 1, &record[first..]).unwrap();
+        for since in above.max(1)..=seq(&state, 0) {
+            assert_eq!(
+                net_bytes(&fresh, &state, 0, since, &NoStrings),
+                net_bytes(&vm, &state, 0, since, &NoStrings),
+                "since {since}, exported above {above}"
+            );
+        }
+        for since in 1..=seq(&state, 1) {
+            assert_eq!(
+                net_bytes(&fresh, &state, 1, since, &NoStrings),
+                net_bytes(&vm, &state, 1, since, &NoStrings),
+                "bitmap since {since}"
+            );
+        }
+        // The imported log keeps recording at the slot's next stamps.
+        let mut next = state.clone();
+        let mut warm = Vm::default();
+        warm.log_import(&next, 0, &record[..first]).unwrap();
+        upsert(&mut warm, &mut next, 0, 4, 40);
+        assert_eq!(
+            net_bytes(&warm, &next, 0, 6, &NoStrings).1.len(),
+            NET_CHANGE_HEADER_SIZE as usize
+        );
+    }
+}
+
+/// The length of the first slot's record in `record`: its header and
+/// entries.
+fn vm_record_len(record: &[u8]) -> usize {
+    let at = |offset: u32| u32::from_le_bytes(record[offset as usize..][..4].try_into().unwrap());
+    let mut end = WATCH_LOG_HEADER_SIZE as usize;
+    for _ in 0..at(WatchLogOffset::COUNT) {
+        let prior = at(end as u32 + WatchLogEntryOffset::PRIOR_LEN) as usize;
+        end = (end + WATCH_LOG_ENTRY_SIZE as usize + prior).next_multiple_of(8);
+    }
+    end
+}
+
+#[test]
+fn an_export_with_an_older_image_holds_only_that_image_s_history() {
+    let code = program(1, &slot_def(0, SlotType::HashMap), &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    vm.watch(&state, 0, 16, 256).unwrap();
+    upsert(&mut vm, &mut state, 0, 1, 10);
+    let basis = state.clone();
+    // The step's speculative write: past the basis image.
+    upsert(&mut vm, &mut state, 0, 2, 20);
+    let mut record = Vec::new();
+    vm.log_export(&basis, 0, 0, &mut record).unwrap();
+    let mut restored = Vm::default();
+    assert_eq!(restored.log_import(&basis, 0, &record), Ok(0));
+    assert_eq!(
+        net_bytes(&restored, &basis, 0, 0, &NoStrings),
+        net_bytes(&vm, &basis, 0, 0, &NoStrings)
+    );
+    // The full record names a stamp past the basis: refused.
+    let mut ahead = Vec::new();
+    vm.log_export(&state, 0, 0, &mut ahead).unwrap();
+    assert_eq!(
+        restored.log_import(&basis, 0, &ahead),
+        Err(ErrorCode::InvalidState)
+    );
+    assert_eq!(
+        net_bytes(&restored, &basis, 0, 0, &NoStrings),
+        net_bytes(&vm, &basis, 0, 0, &NoStrings),
+        "a refused import leaves the log as it was"
+    );
+}
+
+#[test]
+fn malformed_and_oversized_records_refuse() {
+    let code = program(1, &slot_def(0, SlotType::HashMap), &[]);
+    let mut state = image(&code);
+    let mut vm = Vm::default();
+    let mut none = Vec::new();
+    assert_eq!(
+        vm.log_export(&state, 0, 0, &mut none),
+        Err(ErrorCode::InvalidSlot),
+        "an unwatched slot has no log to export"
+    );
+    vm.watch(&state, 0, 4, 64).unwrap();
+    upsert(&mut vm, &mut state, 0, 1, 10);
+    upsert(&mut vm, &mut state, 0, 1, 11);
+    let mut record = Vec::new();
+    vm.log_export(&state, 0, 0, &mut record).unwrap();
+    // An insert with no prior, then an update with its 4-byte value padded
+    // to 8.
+    let first = WATCH_LOG_HEADER_SIZE;
+    let second = first + WATCH_LOG_ENTRY_SIZE;
+    assert_eq!(record.len(), (second + WATCH_LOG_ENTRY_SIZE + 8) as usize);
+    let refuse = |name: &str, edit: &dyn Fn(&mut Vec<u8>), code: ErrorCode| {
+        let mut bad = record.clone();
+        edit(&mut bad);
+        let mut fresh = Vm::default();
+        assert_eq!(fresh.log_import(&state, 0, &bad), Err(code), "{name}");
+        assert!(
+            !fresh.watched(0),
+            "{name}: a refused import watches nothing"
+        );
+    };
+    use ErrorCode::{InvalidSlot, InvalidState, OutOfMemory};
+    refuse("truncated header", &|r| r.truncate(10), InvalidState);
+    refuse(
+        "truncated entry",
+        &|r| r.truncate(r.len() - 1),
+        InvalidState,
+    );
+    refuse("trailing byte", &|r| r.push(0), InvalidState);
+    refuse(
+        "no ring entries",
+        &|r| put_u32(r, WatchLogOffset::ENTRIES, 0),
+        InvalidState,
+    );
+    refuse(
+        "count past the ring",
+        &|r| put_u32(r, WatchLogOffset::ENTRIES, 1),
+        InvalidState,
+    );
+    refuse(
+        "priors past the images",
+        &|r| put_u32(r, WatchLogOffset::IMAGE_BYTES, 3),
+        InvalidState,
+    );
+    refuse("header padding", &|r| r[20] = 1, InvalidState);
+    refuse(
+        "entry padding",
+        &|r| r[(first + 18) as usize] = 1,
+        InvalidState,
+    );
+    refuse(
+        "prior padding",
+        &|r| r[(second + WATCH_LOG_ENTRY_SIZE + 5) as usize] = 1,
+        InvalidState,
+    );
+    refuse(
+        "coverage past the state",
+        &|r| put_u64(r, WatchLogOffset::COVERAGE, 9),
+        InvalidState,
+    );
+    refuse(
+        "stamp past the state",
+        &|r| put_u64(r, second + WatchLogEntryOffset::STAMP, 3),
+        InvalidState,
+    );
+    refuse(
+        "stamps out of order",
+        &|r| {
+            put_u64(r, first + WatchLogEntryOffset::STAMP, 2);
+            put_u64(r, second + WatchLogEntryOffset::STAMP, 1);
+        },
+        InvalidState,
+    );
+    refuse(
+        "stamp at coverage",
+        &|r| put_u64(r, WatchLogOffset::COVERAGE, 1),
+        InvalidState,
+    );
+    refuse(
+        "unknown kind",
+        &|r| r[(first + WatchLogEntryOffset::KIND) as usize] = 0x40,
+        InvalidState,
+    );
+    refuse(
+        "an update with no held key",
+        &|r| r[(second + WatchLogEntryOffset::HELD) as usize] = 0,
+        InvalidState,
+    );
+    refuse(
+        "an insert with a prior",
+        &|r| r[(second + WatchLogEntryOffset::KIND) as usize] = ChangeFlag::INSERTED,
+        InvalidState,
+    );
+    refuse(
+        "prior length past the record",
+        &|r| put_u32(r, second + WatchLogEntryOffset::PRIOR_LEN, 64),
+        InvalidState,
+    );
+    let mut fresh = Vm::default();
+    assert_eq!(fresh.log_import(&state, 3, &record), Err(InvalidSlot));
+    let mut huge = record.clone();
+    put_u32(&mut huge, WatchLogOffset::ENTRIES, u32::MAX);
+    assert_eq!(
+        with_allocations(0, || fresh.log_import(&state, 0, &huge)),
+        Err(OutOfMemory),
+        "a ring the memory cannot back refuses before anything changes"
+    );
+    assert!(!fresh.watched(0));
+    // An import over a watched slot replaces its log.
+    fresh.watch(&state, 0, 1, 0).unwrap();
+    assert_eq!(fresh.log_import(&state, 0, &record), Ok(0));
+    assert_eq!(
+        net_bytes(&fresh, &state, 0, 0, &NoStrings),
+        net_bytes(&vm, &state, 0, 0, &NoStrings)
+    );
+    let mut empty = Vec::new();
+    assert_eq!(
+        with_allocations(0, || vm.log_export(&state, 0, 0, &mut empty)),
+        Err(OutOfMemory)
+    );
+}
+
+#[test]
+fn a_struct_row_image_with_text_array_and_value_object_round_trips() {
+    use StructFieldType::{ArrayString, ArrayU32, String as Text, UInt32, Vo};
+    let fields = [UInt32, Text, ArrayU32, ArrayString, Vo];
+    let init = struct_map_def(0, Opcode::SlotStructMap, SlotType::StructMap, &fields);
+    let remove = program(1, &init, &[Opcode::BatchStructMapRemove as u8, 0, KEY]);
+    let mut state = image(&remove);
+    let mut strings = Strings::default();
+    let logical = LogicalSlot {
+        slot: 0,
+        kind: SlotType::StructMap,
+        agg_type: 0,
+        field_types: fields.to_vec(),
+        rows: vec![LogicalRow {
+            key: LogicalValue::U32(10),
+            key2: None,
+            fields: vec![
+                Some(LogicalValue::U32(7)),
+                Some(LogicalValue::Text("tier".into())),
+                Some(LogicalValue::Array(vec![
+                    LogicalValue::U32(1),
+                    LogicalValue::U32(2),
+                ])),
+                Some(LogicalValue::Array(vec![
+                    LogicalValue::Text("a".into()),
+                    LogicalValue::Text("bc".into()),
+                ])),
+                Some(LogicalValue::Bytes(vec![9, 8, 7])),
+            ],
+            cmp_ts: None,
+        }],
+        aggregate: None,
+        scalar: None,
+        nested: Vec::new(),
+        eviction: Vec::new(),
+        evicted: Vec::new(),
+        condition: None,
+    };
+    import_slot(&mut state, &logical, &SlotEncoding::RAW, &mut strings).expect("import");
+    let mut vm = Vm::default();
+    vm.watch(&state, 0, 8, 4096).unwrap();
+    let rows = batch(&[row(10, 0, 0)]);
+    assert_eq!(
+        OK,
+        vm.execute_batch_in(&mut state, &remove, &rows.slices(), rows.rows, &strings)
+    );
+    let mut record = Vec::new();
+    vm.log_export(&state, 0, 0, &mut record).unwrap();
+    // The interner releases every id: the imported image still decodes.
+    strings.texts.iter_mut().for_each(|text| *text = None);
+    let mut restored = Vm::default();
+    restored.log_import(&state, 0, &record).unwrap();
+    let (answer, bytes) = net_bytes(&restored, &state, 0, 0, &strings);
+    assert_eq!(answer, NetAnswer::Changes);
+    assert_eq!(bytes, net_bytes(&vm, &state, 0, 0, &strings).1);
+    let mut out = NetChanges::default();
+    restored
+        .net_changes(&state, 0, 0, &strings, &mut out)
+        .unwrap();
+    let changes = decode(&out);
+    assert_eq!(
+        (changes[0].key1, changes[0].kind),
+        (10, NetChangeKind::DELETE)
+    );
+    let map = columine_vm::struct_map::StructMapSlot::bind(&state, 0);
+    let mut array_text = Vec::new();
+    for text in ["a", "bc"] {
+        array_text.extend((text.len() as u32).to_le_bytes());
+        array_text.extend(text.as_bytes());
+    }
+    assert_eq!(
+        image_payloads(changes[0].prior.as_ref().unwrap(), map.row_size as usize),
+        [
+            b"tier".as_slice(),
+            &[le(1), le(2)].concat(),
+            &array_text,
+            &[9, 8, 7]
+        ]
+    );
 }

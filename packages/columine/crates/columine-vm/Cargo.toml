@@ -114,6 +114,16 @@ item = "log_priors"
 consumer = "private"
 why = "a host whose interner releases ids keeps every id a watched slot's logged prior names"
 
+[[package.metadata.wiring.external]]
+item = "log_export"
+consumer = "private"
+why = "a host's checkpoint stores each watched slot's log beside the state image, so a restored engine answers a parked slot wait as the warm engine did"
+
+[[package.metadata.wiring.external]]
+item = "log_import"
+consumer = "private"
+why = "a host restoring a checkpoint rebuilds each watched slot's log from the record stored with the image"
+
 
 [dependencies]
 bitmosaic = { workspace = true }

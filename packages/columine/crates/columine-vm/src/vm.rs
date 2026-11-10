@@ -5032,6 +5032,32 @@ impl<I: KeyIndex> Vm<I> {
         self.rec.watch.clone_from_log(&other.rec.watch)
     }
 
+    /// Append \`slot\`'s watch log as of \`state\` to \`out\` as one checkpoint
+    /// record (\`specs/columine/07-change-feed.md\` §7 Checkpoints): its ring
+    /// sizes, its coverage raised to \`above\`, and its entries stamped in
+    /// \`(above, seq]\`, \`seq\` the slot's sequence in \`state\`. A slot this VM
+    /// does not watch is \`InvalidSlot\`; a log whose coverage lies above
+    /// \`seq\` is \`InvalidState\`; \`out\` that cannot grow is \`OutOfMemory\`.
+    pub fn log_export(
+        &self,
+        state: &[u8],
+        slot: u32,
+        above: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ErrorCode> {
+        self.rec.watch.export(state, slot, above, out)
+    }
+
+    /// Watch \`slot\` with a checkpoint record's ring sizes, entries and
+    /// coverage, in place of any log it had, and answer the coverage: over
+    /// the image the record was exported with, \`net_changes\` then answers as
+    /// the exporting VM did for every \`since\` at or above its \`above\`. A
+    /// malformed record, or one naming a coverage or stamp above the slot's
+    /// sequence in \`state\`, is \`InvalidState\`; storage that cannot be had is
+    /// \`OutOfMemory\`. A refusal changes nothing.
+    pub fn log_import(&mut self, state: &[u8], slot: u32, bytes: &[u8]) -> Result<u64, ErrorCode> {
+        self.rec.watch.import(state, slot, bytes)
+    }
     /// Every `u32` lane prior `slot`'s ring holds, oldest first: a hash
     /// map's values and a u32 scalar's value lanes. A host whose lanes hold
     /// interned ids counts them as references of those ids while the log

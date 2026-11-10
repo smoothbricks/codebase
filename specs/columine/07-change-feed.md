@@ -140,6 +140,19 @@ fork) copies the log with it: `log_clone_from(other)` replaces this VM's log wit
 A rollforward of a delta segment is a keyless write of every watched slot whose sequence it moves: it appends that
 slot's whole-slot entry at the new sequence. A rollback of one settles by itself, as an undo rollback does.
 
+**Checkpoints.** A host that stores a state image and later restores it in another VM stores its watched slots' logs
+with it, so a restored engine answers a slot change asked across the restore exactly as the engine that wrote the image
+would have. `log_export(state, slot, above, out)` appends one little-endian record of the slot's log as of `state`: its
+ring sizes, its coverage raised to `above`, and the entries stamped in `(above, seq]`, `seq` the slot's sequence in
+`state`, each with its prior (a 24-byte header `entries u32 · image_bytes u32 · coverage u64 · count u32 · zero u32`,
+then per entry a 24-byte header `key1 u32 · key2 u32 · stamp u64 · kind u8 · held u8 · zero u16 · prior_len u32` and its
+prior, zero-padded to 8; `WatchLogOffset`, `WatchLogEntryOffset`). The record has no version: the build that wrote it
+reads it, beside its image. `log_import(state, slot, bytes)` watches the slot with those sizes and holds those entries
+and coverage, replacing any log the slot had, and answers the coverage; over the same image, `net_changes` then answers
+as the exporting VM did for every `since` at or above `above`. It refuses a malformed record, and one naming a coverage
+or stamp above the slot's sequence in `state` (an image older than the log it is paired with), and a refusal changes
+nothing.
+
 **Net changes.** `net_changes(state, slot, since, strings, out)` answers the slot's net change over the window from
 `since` to the slot's sequence in `state`; entries stamped above that sequence belong to a later state and are ignored.
 It answers `Overflowed` when `since` is below the slot's coverage or a whole-slot entry lies in the window. Otherwise,

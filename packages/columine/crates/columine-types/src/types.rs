@@ -469,6 +469,57 @@ impl NetChangeKind {
     pub const DELETE: u8 = 3;
 }
 
+/// Bytes of a watch-log checkpoint record's header
+/// (`specs/columine/07-change-feed.md` §7, `Vm::log_export`): its fields
+/// sit at [`WatchLogOffset`], little-endian, bytes 20..24 are zero, and
+/// `count` entries follow. The record carries no version: it is read only by
+/// a VM of the build that wrote it, beside the state image it goes with.
+pub const WATCH_LOG_HEADER_SIZE: u32 = 24;
+
+/// Bytes of one watch-log checkpoint entry's header: its fields sit at
+/// [`WatchLogEntryOffset`], bytes 18..20 are zero, and `prior_len` prior
+/// bytes follow, zero-padded so the next entry starts at a multiple of
+/// [`WATCH_LOG_ALIGN`] from the record's start.
+pub const WATCH_LOG_ENTRY_SIZE: u32 = 24;
+
+/// The alignment of every watch-log checkpoint entry.
+pub const WATCH_LOG_ALIGN: u32 = 8;
+
+/// Field offsets in a watch-log checkpoint record's header.
+pub struct WatchLogOffset;
+
+impl WatchLogOffset {
+    /// The ring's entry capacity, `u32`, at least 1.
+    pub const ENTRIES: u32 = 0;
+    /// The ring's prior-image capacity in bytes, `u32`.
+    pub const IMAGE_BYTES: u32 = 4;
+    /// The sequence above which the recorded log is complete, `u64`.
+    pub const COVERAGE: u32 = 8;
+    /// How many entries follow, `u32`, at most `ENTRIES`.
+    pub const COUNT: u32 = 16;
+}
+
+/// Field offsets in a watch-log checkpoint entry's header.
+pub struct WatchLogEntryOffset;
+
+impl WatchLogEntryOffset {
+    /// The key's first lane, `u32`.
+    pub const KEY1: u32 = 0;
+    /// The key's second lane, `u32`.
+    pub const KEY2: u32 = 4;
+    /// The slot's write sequence after the write, `u64`: above the record's
+    /// coverage, entries in write order.
+    pub const STAMP: u32 = 8;
+    /// The change-flag bit of what the write did to the key, or 0 for a
+    /// whole-slot entry (no key, no prior).
+    pub const KIND: u32 = 16;
+    /// 1 when the key was present before the write, else 0: 0 exactly for
+    /// an insertion and a whole-slot entry.
+    pub const HELD: u32 = 17;
+    /// Bytes of the prior that follows, `u32`.
+    pub const PRIOR_LEN: u32 = 20;
+}
+
 /// VM slot category. This deliberately has a four-bit encoding in
 /// `SlotTypeFlags`; the Rust enum uses `u8` because Rust has no `u4` repr.
 #[repr(u8)]
