@@ -1900,11 +1900,41 @@ export class RamTempVolume {
   }
 
   /**
-   * Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. The
-   * detach comes before the bare mountpoint is judged: a kept disk whose mount was lost is debris whatever that
-   * directory holds, and tasks that held leases on it may have written there after the loss.
+   * Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. An
+   * unmounted mountpoint with contents is never mounted over and its files never touched: the volume is unavailable.
+   * Only the disk the ledger records as kept is still detached first, by that registry entry, since a lost mount
+   * strands it beside such a directory: tasks that held leases on it may have written there after the loss. With no
+   * kept record the refusal inspects nothing on the host.
    */
   private async provisionVolume(op: Operation): Promise<Result<void, RamTempError>> {
+    let unowned: boolean;
+    try {
+      const [mount, parent] = await Promise.all([stat(this.paths.mountpoint), stat(join(this.paths.mountpoint, '..'))]);
+      unowned = mount.dev === parent.dev && (await readdir(this.paths.mountpoint)).length !== 0;
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') return failed('provenance', errorText(error));
+      unowned = false;
+    }
+    if (unowned) {
+      const read = await this.readLedger();
+      if (!read.ok) {
+        return read;
+      }
+      if (read.value.ledger.kept !== null) {
+        const strays = await this.reclaimStrays(op, this.holdersPass());
+        if (!strays.ok) {
+          return strays;
+        }
+      }
+      return {
+        ok: false,
+        error: {
+          kind: 'ram-unavailable',
+          reason: 'unproven-owner',
+          detail: `${this.paths.mountpoint} is an unmounted directory with unowned contents; nothing removed or hidden by a new mount`,
+        },
+      };
+    }
     const root = await rootReadiness(this.paths);
     if (!root.ok) {
       return root;
@@ -1912,21 +1942,6 @@ export class RamTempVolume {
     const strays = await this.reclaimStrays(op, this.holdersPass());
     if (!strays.ok) {
       return strays;
-    }
-    try {
-      const [mount, parent] = await Promise.all([stat(this.paths.mountpoint), stat(join(this.paths.mountpoint, '..'))]);
-      if (mount.dev === parent.dev && (await readdir(this.paths.mountpoint)).length !== 0) {
-        return {
-          ok: false,
-          error: {
-            kind: 'ram-unavailable',
-            reason: 'unproven-owner',
-            detail: `${this.paths.mountpoint} is an unmounted directory with unowned contents; nothing removed or hidden by a new mount`,
-          },
-        };
-      }
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT') return failed('provenance', errorText(error));
     }
     const attached = await this.commands.attachRam(this.sectors);
     if (!attached.ok) {

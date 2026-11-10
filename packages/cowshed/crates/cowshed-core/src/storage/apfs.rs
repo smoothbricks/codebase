@@ -1979,6 +1979,7 @@ where
 
     /// [`ApfsExecutionHost::lost_mount`] for `workspace`, read without its lock: what `doctor`
     /// reports, never what a remount acts on.
+    #[cfg(target_os = "macos")]
     pub(crate) async fn lost_mount(
         &self,
         workspace: &LifecycleWorkspace,

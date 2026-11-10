@@ -1834,7 +1834,8 @@ async fn run_daemon() -> Result<()> {
         Ok::<_, CowshedError>(watch_lost_mounts(heal_inventory))
     }
     .await;
-    let lost_mounts = match started {
+    // Held until the function returns, after the drain: the watch ends with the gateway.
+    let _lost_mounts = match started {
         Ok(watch) => watch,
         Err(primary) => {
             return match gateway.drain().await {
@@ -1847,9 +1848,7 @@ async fn run_daemon() -> Result<()> {
         }
     };
 
-    let drained = drain_after_shutdown(gateway, wait_for_shutdown_signal()).await;
-    drop(lost_mounts);
-    drained
+    drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
 }
 
 /// Start the watch that remounts a volume the gateway holds once it loses its mount, saying

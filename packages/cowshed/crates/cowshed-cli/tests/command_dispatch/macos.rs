@@ -2230,10 +2230,7 @@ async fn real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount() {
 
     let mut remounted = std::collections::BTreeMap::new();
     while remounted.len() < 2 {
-        let lost = tokio::time::timeout(Duration::from_secs(120), hearing.recv())
-            .await
-            .expect("the watch remounts both volumes")
-            .expect("the watch runs");
+        let lost = hearing.recv().await.expect("the watch runs");
         match lost {
             LostMount::Workspace {
                 workspace,

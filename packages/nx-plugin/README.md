@@ -2328,9 +2328,10 @@ was there. When the volume itself went from the mountpoint, the disk the lease w
 mounted nowhere: its mount was lost (on 2026-11-10 a restart of `fseventsd` left the user's 8 GiB disk so, owned by no
 lease). No path reaches its files and no lease can be taken on it, so that release detaches it, by the registry entry
 the lease was taken on, through the gateway's `ram-detach` under a detach claim, and its message names the disk, the
-lost mount and what the detach did; a disk mounted anywhere is left attached and named. A creator detaches a kept disk a
-lost mount stranded before it judges the bare mountpoint, so what the lost tasks wrote there afterwards keeps a new
-volume from being mounted over it but never keeps the old disk resident.
+lost mount and what the detach did; a disk mounted anywhere is left attached and named. A creator that finds the bare
+mountpoint holding files still refuses to mount over them and touches none of them, but first detaches the disk its
+ledger records as kept, by that registry entry: what the lost tasks wrote there after the loss never keeps the old disk
+resident. With no kept record that refusal inspects nothing on the host.
 
 What a command leaves running is ended by its owner, never chosen by where it works (`specs/cowshed/11_shell.md`,
 "Process identity and signal ownership"; `specs/cowshed/07_api.md`, `JobSubtreeHandle`). When the job's supervisor
