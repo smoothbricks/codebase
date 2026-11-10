@@ -465,6 +465,7 @@ describe('land-host.sh --gate', () => {
       expect(readFileSync(join(gate.state, 'publish.args'), 'utf8')).toBe(
         `-\n${gate.ws}\n["gate-hash","shipping-producer-hash","shipping-addon-hash","cross-hash"]\n`,
       );
+      expect(run.log).toContain("the shipping guard's invocation wrote no run summary of its own");
       expect(readdirSync(join(gate.state, 'tmp')).filter((name) => name.startsWith('land-'))).toEqual([]);
     },
   );

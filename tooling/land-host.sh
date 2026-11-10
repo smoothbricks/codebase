@@ -124,19 +124,28 @@ attribute_failures() {
   return 0
 }
 
-# Retain only validated invocation lists in one gate-owned temporary namespace.
+# Retain only validated invocation lists in one gate-owned temporary namespace. An invocation that wrote no run summary
+# leaves the previous one in place, begun in the same second as `since` when it ran fast; a summary byte-equal to the
+# one the previous capture read is that one, never this invocation's, so it is said and nothing is captured.
 capture_hashes() {
   [ -n "$hashes_dir" ] || return 0
   capture_file=$hashes_dir/$1
   capture_since=$2
   capture_subject=$3
-  "$publisher" hashes "$checkout/.nx/cache/run.json" "$capture_since" >"$capture_file" || {
+  summary=$checkout/.nx/cache/run.json
+  if [ -f "$hashes_dir/.read-summary" ] && cmp -s "$summary" "$hashes_dir/.read-summary"; then
+    say "$capture_subject invocation wrote no run summary of its own; the land goes on without publishing it"
+    return 0
+  fi
+  "$publisher" hashes "$summary" "$capture_since" >"$capture_file" || {
     capture_status=$?
-    say "could not read $capture_subject task hashes from $checkout/.nx/cache/run.json (status $capture_status); the land goes on without publishing: the cache never blocks a land"
+    say "could not read $capture_subject task hashes from $summary (status $capture_status); the land goes on without publishing: the cache never blocks a land"
     if [ -f "$capture_file" ]; then
       rm "$capture_file" || say "could not release failed hash capture $capture_file"
     fi
+    return 0
   }
+  cp "$summary" "$hashes_dir/.read-summary" || say "could not keep the run summary $capture_subject capture read (status $?)"
 }
 # Gates exactly the rebased tree. Reporting never changes Nx's status or grants permission to land.
 gate_workspace() {
