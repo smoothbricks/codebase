@@ -886,7 +886,10 @@ change re-keys the tasks that can load what changed and no other.
   resolves a project's own package edges) and to the runtime node (`bun-lock-runtime:<projectRoot>`) of each workspace
   member it depends on: the closure of that member's `dependencies`, `optionalDependencies` and `peerDependencies`,
   which a dependent loads through it, so a member's devDependencies key only its own targets. Nx's lockfile parser links
-  every npm node to the packages it depends on and hashes each by the integrity bun.lock records, so the node keys a
+  every versioned npm node (`npm:<name>@<version>`) to the packages it depends on and hashes each by the integrity
+  bun.lock records. It also publishes a hoisted package as `npm:<name>` with no edges, and Nx's locator resolves a
+  declaration or an import to either name, so the plugin links each such alias to its versioned node: a key on either
+  holds the package's closure, and the undeclared-import check compares packages by name and version. The node keys a
   target on the closure its manifest reaches. A member's node has no edge to the root's. Bun's isolated linker links
   into a directory's `node_modules` exactly what its manifest declares, but Node's lookup from a member goes on into the
   root's, so a member can load anything the root declares. Two rules make the member's own closure the whole of what its

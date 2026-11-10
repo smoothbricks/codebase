@@ -12,6 +12,7 @@ import {
   bunLockNodeName,
   bunLockRuntimeNodeName,
   bunScopeInput,
+  bunVersionAliasDependencies,
   type ManifestDeclarations,
   manifestsAbove,
   specifierPackage,
@@ -352,4 +353,50 @@ it("refuses a member's source import of a package only the root declares, naming
     const findings = undeclaredImports(graph);
     if (findings.length > 0) throw new UndeclaredImportError(findings);
   }).toThrow('  a (packages/a): mitata\n  b (packages/b): nx');
+});
+
+/**
+ * Nx's bun lockfile parser publishes a hoisted package twice: `npm:<name>` and `npm:<name>@<version>`, with one
+ * integrity, and links only the versioned node to the package's dependencies. Nx's locator resolves an import or a
+ * declaration to either, by whether it can read the installed package.json from the importing directory.
+ */
+const versioned = (name: string, version: string) => ({
+  type: 'npm' as const,
+  name: `npm:${name}@${version}`,
+  data: { packageName: name, version },
+});
+const aliasGraph: ProjectGraph = {
+  nodes: { a: { name: 'a', type: 'lib', data: { root: 'packages/a' } } },
+  externalNodes: {
+    'npm:p': npm('p'),
+    'npm:p@1.0.0': versioned('p', '1.0.0'),
+    'npm:q@1.0.0': versioned('q', '1.0.0'),
+    [bunLockNodeName('packages/a')]: scopeNode('packages/a'),
+  },
+  dependencies: {
+    a: [
+      { source: 'a', target: 'npm:p@1.0.0', type: 'static' },
+      { source: 'a', target: 'npm:q@1.0.0', type: 'static' },
+    ],
+    'npm:p@1.0.0': [{ source: 'npm:p@1.0.0', target: 'npm:q@1.0.0', type: 'static' }],
+    [bunLockNodeName('packages/a')]: [{ source: bunLockNodeName('packages/a'), target: 'npm:p', type: 'static' }],
+  },
+};
+
+it("never refuses a member's import of a package its manifest declares, whichever alias Nx names either by", () => {
+  expect(undeclaredImports(aliasGraph)).toEqual([]);
+});
+
+it("links each unversioned alias to the versioned node of its package, so a key on either reaches the package's closure", () => {
+  expect(
+    bunVersionAliasDependencies({
+      'npm:p': npm('p'),
+      'npm:p@1.0.0': versioned('p', '1.0.0'),
+      // Another version of a package is another package: no alias edge.
+      'npm:r': npm('r'),
+      'npm:r@2.0.0': versioned('r', '2.0.0'),
+      'npm:q@1.0.0': versioned('q', '1.0.0'),
+      [bunLockNodeName('packages/a')]: scopeNode('packages/a'),
+    }).map(({ source, target }) => [source, target]),
+  ).toEqual([['npm:p', 'npm:p@1.0.0']]);
 });

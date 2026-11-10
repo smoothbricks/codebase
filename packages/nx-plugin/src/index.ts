@@ -35,6 +35,7 @@ import {
   bunLockNode,
   bunLockRuntimeNode,
   bunScopeInput,
+  bunVersionAliasDependencies,
   manifestsAbove,
   type PackageLoad,
   refuseUndeclaredImports,
@@ -1393,6 +1394,7 @@ export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = a
 export const createDependencies: CreateDependencies = (options, context) => [
   ...bunLockDependencies(context),
   ...builtOutputLockfileDependencies(options, context),
+  ...bunVersionAliasDependencies(context.externalNodes ?? {}),
 ];
 
 /** Nx invokes this only after merging inferred/declarative targets and every plugin's project dependencies. */

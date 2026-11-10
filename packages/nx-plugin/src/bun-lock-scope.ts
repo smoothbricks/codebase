@@ -19,8 +19,9 @@ import { TargetProjectLocator } from 'nx/src/plugins/js/project-graph/build-depe
  * A lock-scope node is the part of bun.lock one manifest reaches: what the
  * package can load. Its edges go to the npm nodes the manifest's dependencies
  * resolve to and to the node of each workspace member it depends on, the
- * root's manifest included. Nx's lockfile parser links each npm node to the
- * packages it depends on, so a target naming a node in its
+ * root's manifest included. Nx's lockfile parser links each versioned npm node
+ * to the packages it depends on, and the plugin links each unversioned alias
+ * to its versioned node ({@link bunVersionAliasDependencies}), so a target naming a node in its
  * `externalDependencies` is keyed on every package of that closure by the hash
  * bun.lock records for it, and on nothing else in the lockfile. That replaces
  * bun.lock as a file input: a lockfile edit re-keys the tasks that can load
@@ -276,10 +277,22 @@ export interface UndeclaredImport {
  * root's project is exempt: its node reaches everything its manifest declares.
  * So is a `@types` package: TypeScript loads it by ancestry, not Node, and
  * every TypeScript target keys the `@types` the manifests above it declare
- * ({@link typescriptLoads}).
+ * ({@link typescriptLoads}). A package is compared by name and version, never
+ * by node name: Nx publishes a hoisted package as both `npm:<name>` and
+ * `npm:<name>@<version>`, and its locator resolves a declaration and an
+ * import to either ({@link bunVersionAliasDependencies}).
  */
 export function undeclaredImports(graph: ProjectGraph): UndeclaredImport[] {
   const externalNodes = graph.externalNodes ?? {};
+  const identity = (name: string): string | null => {
+    const node = externalNodes[name];
+    return node?.type === 'npm' ? `${node.data.packageName}@${node.data.version}` : null;
+  };
+  const namesOf = new Map<string, string[]>();
+  for (const name of Object.keys(externalNodes)) {
+    const key = identity(name);
+    if (key !== null) namesOf.set(key, [...(namesOf.get(key) ?? []), name]);
+  }
   const findings: UndeclaredImport[] = [];
   for (const [project, node] of Object.entries(graph.nodes).sort(([left], [right]) => (left < right ? -1 : 1))) {
     const scope = bunLockNodeName(node.data.root);
@@ -291,6 +304,8 @@ export function undeclaredImports(graph: ProjectGraph): UndeclaredImport[] {
         if (reached.has(name)) continue;
         reached.add(name);
         for (const edge of graph.dependencies[name] ?? []) next.push(edge.target);
+        const key = identity(name);
+        if (key !== null) next.push(...(namesOf.get(key) ?? []));
       }
       pending = next;
     }
@@ -307,6 +322,28 @@ export function undeclaredImports(graph: ProjectGraph): UndeclaredImport[] {
   return findings;
 }
 
+/**
+ * An edge from each unversioned npm node to the versioned node of the same
+ * package and version. Nx's bun lockfile parser publishes a hoisted package as
+ * both `npm:<name>` and `npm:<name>@<version>`, with one integrity, and links
+ * only the versioned node to the package's dependencies. A key on the
+ * unversioned node (an `externalDependencies` entry naming a package, or a
+ * lock-scope edge the locator resolved to it) then held the package's own
+ * integrity and none of its closure; through this edge it holds both.
+ */
+export function bunVersionAliasDependencies(
+  externalNodes: Readonly<Record<string, ProjectGraphExternalNode>>,
+): RawProjectGraphDependency[] {
+  const dependencies: RawProjectGraphDependency[] = [];
+  for (const [name, node] of Object.entries(externalNodes)) {
+    if (node.type !== 'npm') continue;
+    const target = `npm:${node.data.packageName}@${node.data.version}`;
+    const versioned = externalNodes[target];
+    if (target === name || versioned?.type !== 'npm' || versioned.data.version !== node.data.version) continue;
+    dependencies.push({ source: name, target, type: DependencyType.static });
+  }
+  return dependencies.sort((left, right) => (left.source < right.source ? -1 : left.source > right.source ? 1 : 0));
+}
 export class UndeclaredImportError extends Error {
   constructor(readonly findings: readonly UndeclaredImport[]) {
     super(
