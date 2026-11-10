@@ -190,9 +190,9 @@ Fixtures the suite infers in its own process own their Nx state the same way. Th
 resolves its own `.nx`. Nx's native file index shares one walk among every context of one workspace-data directory: the
 walk holds `nx_files.lock` there, and a context that waits on it loads the archive that walk wrote instead of walking
 its own root. Resolved through the job's absolute directory, a fixture's context gets the files of whichever root walked
-there last. `freshIndexedFiles` and `freshIndexedFileData` (`src/workspace-index.ts`) close the same hole outside the
-suite's preload: a root other than this process's workspace is walked under Nx's default data directory inside that
-root, never under the inherited variable. The compiled-in Markdown check's fixtures
+there last. `globIndexedFiles`, `freshIndexedFiles` and `freshIndexedFileData` (`src/workspace-index.ts`) close the same
+hole outside the suite's preload: a root other than this process's workspace is walked under Nx's default data directory
+inside that root, never under the inherited variable. The compiled-in Markdown check's fixtures
 (`tooling/checks/compiled-in-docs.fixtures.ts`) run without the preload; under CI's absolute
 `NX_WORKSPACE_DATA_DIRECTORY` their fixture's walk wrote its archive into the repository's shared directory, and Linux
 CI found no planted crate (run 42738719423), as a walk that waits on the repository's walk and loads its archive would.

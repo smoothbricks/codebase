@@ -15,6 +15,7 @@
     "src/ensure-built-receipt.test.ts": 15880,
     "src/process-group.test.ts": 15352,
     "src/index.test.ts": 15133,
+    "src/workspace-index.test.ts": 14351,
     "src/cargo-source-hash.test.ts": 12215,
     "src/cache-key-laws.test.ts": 10728,
     "src/cargo-retention.test.ts": 10686,

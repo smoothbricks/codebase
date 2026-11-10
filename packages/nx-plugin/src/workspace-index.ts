@@ -1,11 +1,7 @@
 import { join } from 'node:path';
 import native, { type FileData } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
-import {
-  getAllFileDataInContext,
-  globWithWorkspaceContext,
-  globWithWorkspaceContextSync,
-} from 'nx/src/utils/workspace-context.js';
+import { getAllFileDataInContext, globWithWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 
 /**
@@ -16,12 +12,15 @@ import { workspaceRoot as daemonWorkspaceRoot } from 'nx/src/utils/workspace-roo
  * output happens to be on disk.
  *
  * The daemon serves only its own workspace's index. Any other root, such as a
- * test fixture or a foreign checkout, is indexed by this process's context.
+ * test fixture or a foreign checkout, is read from the filesystem now
+ * ({@link freshIndexedFiles}), under that root's own data directory: Nx's
+ * process context for it would resolve the inherited NX_WORKSPACE_DATA_DIRECTORY,
+ * this workspace's, and take its files lock and archive.
  */
 export async function globIndexedFiles(workspaceRoot: string, globs: string[]): Promise<string[]> {
   return workspaceRoot === daemonWorkspaceRoot
     ? globWithWorkspaceContext(workspaceRoot, globs)
-    : globWithWorkspaceContextSync(workspaceRoot, globs);
+    : freshIndexedFiles(workspaceRoot, globs);
 }
 
 /**
