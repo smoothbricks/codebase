@@ -4,7 +4,12 @@
 // A crate that includes a Markdown file beside its sources and one from outside itself, two crates that include the
 // same file, and the controls that must pass: a Markdown file beside the sources that nothing includes, a spec, and a
 // virtual workspace manifest that owns no sources.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+//
+// They run as CI runs them: NX_WORKSPACE_DATA_DIRECTORY names the repository's shared workspace data, which is not the
+// fixture's. A walk of the fixture under that directory takes the repository's files lock and, when another process
+// holds it, loads the archive that process writes: the repository's files, in which no planted crate exists (CI's
+// Lint, run 42738719423). The fixture's index must use the fixture's own data directory and leave the shared one alone.
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { compiledIn, compiledPending, gitEnvironment } from './compiled-in-docs.ts';
@@ -17,6 +22,8 @@ function fail(what: string, expected: unknown, actual: unknown): void {
 }
 
 const scratch = mkdtempSync(join(tmpdir(), 'compiled-in-docs-'));
+const shared = mkdtempSync(join(tmpdir(), 'compiled-in-docs-shared-data-'));
+const sharedBefore = process.env.NX_WORKSPACE_DATA_DIRECTORY;
 try {
   const put = (path: string, text: string): void => {
     mkdirSync(dirname(join(scratch, path)), { recursive: true });
@@ -47,6 +54,7 @@ try {
   put('ROOT.md', '# root\n');
   git('init', '-q');
   git('add', '-A');
+  process.env.NX_WORKSPACE_DATA_DIRECTORY = shared;
   const compiled = compiledIn(scratch);
   const said = (what: string, pending: readonly string[], expected: readonly string[]): void => {
     const actual = compiledPending(pending, compiled).map((input) => `${input.path} <- ${input.crate} ${input.source}`);
@@ -72,8 +80,13 @@ try {
     ['specs/a/01.md', 'crates/a/NOTE.md', 'crates/a/README.md'],
     ['crates/a/NOTE.md <- crates/a crates/a/src/lib.rs'],
   );
+  const touched = readdirSync(shared);
+  if (touched.length > 0) fail("the shared workspace data directory is not the fixture's", [], touched);
 } finally {
   rmSync(scratch, { recursive: true, force: true });
+  rmSync(shared, { recursive: true, force: true });
+  if (sharedBefore === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+  else process.env.NX_WORKSPACE_DATA_DIRECTORY = sharedBefore;
 }
 
 if (failures > 0) {

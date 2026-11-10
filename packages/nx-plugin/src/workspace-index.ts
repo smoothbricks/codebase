@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import native, { type FileData } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import {
@@ -30,7 +31,7 @@ export async function globIndexedFiles(workspaceRoot: string, globs: string[]): 
  * runs on the files as they are asks here; what describes a graph asks {@link globIndexedFiles}.
  */
 export function freshIndexedFiles(workspaceRoot: string, globs: string[]): string[] {
-  return new native.WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot)).glob(globs);
+  return new native.WorkspaceContext(workspaceRoot, indexDataDirectory(workspaceRoot)).glob(globs);
 }
 
 /**
@@ -47,5 +48,19 @@ export async function indexedFileData(workspaceRoot: string): Promise<FileData[]
 
 /** Like {@link indexedFileData}, read from the filesystem now, as {@link freshIndexedFiles} lists it. */
 export function freshIndexedFileData(workspaceRoot: string): FileData[] {
-  return new native.WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot)).allFileData();
+  return new native.WorkspaceContext(workspaceRoot, indexDataDirectory(workspaceRoot)).allFileData();
+}
+
+/**
+ * Where a fresh native context of `workspaceRoot` keeps its files lock and archive. Nx's
+ * `workspaceDataDirectoryForWorkspace` answers `NX_WORKSPACE_DATA_DIRECTORY` for every root, and that variable names
+ * this process's workspace's data (CI points it at a shared directory outside the checkout). A walk of another root
+ * there takes this workspace's files lock, and when another process holds it, loads the archive that process writes,
+ * this workspace's files, as the other root's (CI's Lint, run 42738719423: the compiled-in fixtures found no crate).
+ * Any other root walks under Nx's default for it, inside itself.
+ */
+function indexDataDirectory(workspaceRoot: string): string {
+  return workspaceRoot === daemonWorkspaceRoot
+    ? workspaceDataDirectoryForWorkspace(workspaceRoot)
+    : join(workspaceRoot, '.nx', 'workspace-data');
 }
