@@ -106,8 +106,7 @@ mod tests {
         .await;
         assert_ne!(code, 0);
 
-        let sealed =
-            cowshed_core::storage::trace_segment::read_sealed(&root).expect("telemetry root");
+        let sealed = crate::sealed_segments::read_sealed(&root).expect("telemetry root");
         assert!(
             sealed.skipped.is_empty(),
             "torn segments: {:?}",

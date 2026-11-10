@@ -40,6 +40,9 @@ pub mod volume_name;
 pub mod workspace_supervisor;
 
 #[cfg(test)]
+#[path = "../../cowshed-core/tests/support/sealed_segments.rs"]
+mod sealed_segments;
+#[cfg(test)]
 #[path = "../../cowshed-core/tests/support/temp_parent.rs"]
 mod temp_parent;
 #[cfg(test)]

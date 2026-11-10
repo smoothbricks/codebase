@@ -832,8 +832,7 @@ mod tests {
         }
 
         fn segments(&self) -> Vec<PathBuf> {
-            let sealed = cowshed_core::storage::trace_segment::read_sealed(&self.0)
-                .expect("read audit root");
+            let sealed = crate::sealed_segments::read_sealed(&self.0).expect("read audit root");
             assert!(
                 sealed.skipped.is_empty(),
                 "torn segments: {:?}",

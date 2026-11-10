@@ -75,6 +75,9 @@ mod scratch_directory;
 #[path = "../../cowshed-apfs/tests/support/scratch_namespace.rs"]
 mod scratch_namespace;
 #[cfg(test)]
+#[path = "../tests/support/sealed_segments.rs"]
+mod sealed_segments;
+#[cfg(test)]
 #[path = "../tests/support/temp_parent.rs"]
 mod temp_parent;
 #[cfg(test)]

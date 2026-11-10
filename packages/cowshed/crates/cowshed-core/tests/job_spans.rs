@@ -29,6 +29,8 @@ use cowshed_core::runtime::placement::DecayStep;
 #[path = "support/accounting_fixture.rs"]
 mod accounting_fixture;
 use accounting_fixture::terminal_sample;
+#[path = "support/sealed_segments.rs"]
+mod sealed_segments;
 #[path = "support/span_schema.rs"]
 mod span_schema;
 use span_schema::{

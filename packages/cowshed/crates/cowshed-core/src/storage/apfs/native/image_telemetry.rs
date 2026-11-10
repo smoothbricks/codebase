@@ -591,8 +591,7 @@ mod tests {
         }
 
         fn batches(&self) -> Vec<RecordBatch> {
-            let sealed =
-                crate::storage::trace_segment::read_sealed(&self.0.join("telemetry")).unwrap();
+            let sealed = crate::sealed_segments::read_sealed(&self.0.join("telemetry")).unwrap();
             assert!(
                 sealed.skipped.is_empty(),
                 "torn segments: {:?}",

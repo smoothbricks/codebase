@@ -312,7 +312,7 @@ Find the symptom in the left column and follow the link.
   [13_telemetry.md §Process-tree spans](./13_telemetry.md#process-tree-spans) (sealed segments),
   [13_telemetry.md §Why lmao, not text logs](./13_telemetry.md#why-lmao-not-text-logs), “Unsynced seals”. Code:
   [`cowshed-os/src/fsio.rs`] `Durability`, `full_sync`; [`cowshed-core/src/storage/trace_segment.rs`] `seal_segment`,
-  `sync_partitions`, `read_sealed`.
+  `sync_partitions`.
 
 ### Freeing an image is bounded by runs, not by time
 

@@ -52,6 +52,8 @@ mod calm_pressure;
 mod other_build_supervisor;
 #[path = "support/publication.rs"]
 mod publication;
+#[path = "support/sealed_segments.rs"]
+mod sealed_segments;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 #[path = "support/temp_root.rs"]
@@ -9685,8 +9687,7 @@ struct JobSpanRow {
 /// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
 /// one batch, of one row or more.
 fn job_span_batches(telemetry: &Path) -> Vec<(String, arrow_array::RecordBatch)> {
-    let sealed =
-        cowshed_core::storage::trace_segment::read_sealed(telemetry).expect("read telemetry root");
+    let sealed = sealed_segments::read_sealed(telemetry).expect("read telemetry root");
     assert!(
         sealed.skipped.is_empty(),
         "torn segments: {:?}",

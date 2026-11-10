@@ -23,6 +23,9 @@ mod platform;
 mod proxy;
 mod ram_lease;
 mod repo_mirror;
+#[cfg(test)]
+#[path = "../../cowshed-core/tests/support/sealed_segments.rs"]
+mod sealed_segments;
 mod sim_broker;
 mod task_server;
 mod telemetry;

@@ -132,12 +132,11 @@ pub(crate) fn sealed_segments_among_kinds(
     segments
 }
 
-/// Every segment sealed under `telemetry` (`trace_segment::read_sealed`), by name, which is its
+/// Every segment sealed under `telemetry` (`sealed_segments::read_sealed`), by name, which is its
 /// writer's seal order: its name and its one batch. A torn or empty segment fails here, since no
 /// test cuts the power.
 fn sealed(telemetry: &Path) -> Vec<(String, RecordBatch)> {
-    let sealed =
-        cowshed_core::storage::trace_segment::read_sealed(telemetry).expect("read telemetry root");
+    let sealed = crate::sealed_segments::read_sealed(telemetry).expect("read telemetry root");
     assert!(
         sealed.skipped.is_empty(),
         "torn segments: {:?}",

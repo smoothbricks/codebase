@@ -47,18 +47,19 @@ handle reads, in process or over its socket, and never fails or delays the job. 
 `process.run` spans parent from. The terminal row carries the job's `env_hash` (the same environment identity as the job
 record's `envHash`, 11_shell.md).
 
-**Unsynced seals.** Every segment this module seals (job, process, wait, verb, native image and gateway segments) is a
-create-new `0600` temporary renamed without replace to its sealed name, with no sync. Telemetry, like a job's own
-records (11_shell.md, "Durability of a job's own records"), must survive its writer's death, which the page cache gives,
-not a power cut. A power cut can therefore leave a sealed name torn (a truncated Arrow stream) or empty, and every
-reader of a telemetry directory (`trace_segment::read_sealed`, and `lmao-inspect tail -f` once it is built,
-specs/lmao/04_inspect_cli.md) skips and counts such a segment and never fails on it. A supervisor that retires, after
-its last seal, and the gateway when it stops each issue one `F_FULLFSYNC` per date directory they sealed into. Measured
-2026-11-10: synced seals were two `F_FULLFSYNC`s each (the segment and its directory), 40 in a 12 s window from 18
-supervisors, about 3.6 drive flushes a second host-wide, each holding the drive 164 ms p50 and 456 ms p95. In an
-interleaved experiment (6 rounds per arm, load 80-126), 18 emulated supervisors sealing with `F_FULLFSYNC` raised a
-gate's own `F_FULLFSYNC` mean by about 6 % (median ratio 1.06, range 0.69-2.21), inside noise. `F_BARRIERFSYNC` seals
-cost the same as full ones on a shed image (169 ms p50), so a barrier-only seal saves nothing.
+<a id="smoo/cowshed!n/unsynced-seals"></a>**Unsynced seals.** Every segment this module seals (job, process, wait, verb,
+native image and gateway segments) is a create-new `0600` temporary renamed without replace to its sealed name, with no
+sync. Telemetry, like a job's own records (11_shell.md, "Durability of a job's own records"), must survive its writer's
+death, which the page cache gives, not a power cut. A power cut can therefore leave a sealed name torn (a truncated
+Arrow stream) or empty, and every reader of a telemetry directory (`lmao-inspect tail -f` once it is built,
+specs/lmao/04_inspect_cli.md, and the tests' `tests/support/sealed_segments.rs`; no production code of this repository
+reads one) skips and counts such a segment and never fails on it. A supervisor that retires, after its last seal, and
+the gateway when it stops each issue one `F_FULLFSYNC` per date directory they sealed into. Measured 2026-11-10: synced
+seals were two `F_FULLFSYNC`s each (the segment and its directory), 40 in a 12 s window from 18 supervisors, about 3.6
+drive flushes a second host-wide, each holding the drive 164 ms p50 and 456 ms p95. In an interleaved experiment (6
+rounds per arm, load 80-126), 18 emulated supervisors sealing with `F_FULLFSYNC` raised a gate's own `F_FULLFSYNC` mean
+by about 6 % (median ratio 1.06, range 0.69-2.21), inside noise. `F_BARRIERFSYNC` seals cost the same as full ones on a
+shed image (169 ms p50), so a barrier-only seal saves nothing.
 
 ## Trace context propagation
 
