@@ -220,6 +220,9 @@ enum MembershipRequest {
 enum Request {
     /// The authority the supervisor serves, so a client can tell a stale socket from its own.
     Hello,
+    /// The jobs the supervisor has not concluded, by class and state, as its actor last published
+    /// them: answered at once, never through the actor, as `hello` is (05_gateway.md, "Status").
+    Jobs,
     /// Re-read the workspace's grants and serve under their revision from now on; answered
     /// with the authority served afterwards. Jobs already running keep the profile they
     /// started under.
@@ -243,6 +246,13 @@ enum Request {
     },
 }
 
+/// A job the supervisor has not concluded, as `gateway status` counts it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiveJobWire {
+    class: ExecClass,
+    state: JobState,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HelloWire {
@@ -2614,6 +2624,22 @@ async fn serve_call(
             write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
             return Ok(Retirement::Serving);
         }
+        Request::Jobs => {
+            // Read from what the actor published, never through it, as a hello is: a status read
+            // must not wait on a turn that waits on the blocking pool.
+            let liveness = supervisor.liveness()?;
+            let jobs = liveness
+                .jobs()
+                .iter()
+                .map(|job| LiveJobWire {
+                    class: job.class,
+                    state: job.pulse.state,
+                })
+                .collect::<Vec<_>>();
+            let value = to_value(&jobs)?;
+            write_json(&mut stream, &Response::Ok { value, bytes: 0 }).await?;
+            return Ok(Retirement::Serving);
+        }
         Request::Drain => {
             let value = to_value(&std::process::id())?;
             // The drain begins before it is answered, so a job that ran when it was asked is owed
@@ -3383,6 +3409,21 @@ pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
         }
     };
     decode_hello(path, value).map(Some)
+}
+
+/// The jobs the supervisor serving `path` has not concluded, by class and state, as
+/// `gateway status` counts them (05_gateway.md, "Status"); none when nothing serves it any more.
+/// Both requests are answered from what its actor published, so the whole read stays inside the
+/// handshake bound however long a turn of that actor takes.
+pub async fn jobs(path: &Path) -> Result<Vec<(ExecClass, JobState)>> {
+    if hello_if_present(path).await?.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut stream = open(path, "jobs", deadline::HANDSHAKE).await?;
+    send(&mut stream, &Request::Jobs, &[]).await?;
+    let (value, _) = answer_of(&mut stream).await?;
+    let jobs: Vec<LiveJobWire> = decode(value)?;
+    Ok(jobs.into_iter().map(|job| (job.class, job.state)).collect())
 }
 
 fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
@@ -6190,5 +6231,58 @@ mod held_turn_tests {
             .retire(NxDaemonRetirement::Recorded)
             .await
             .expect("retire the supervisor");
+    }
+
+    /// A supervisor's jobs are read for `gateway status` at once, while a turn of its actor waits
+    /// on the blocking pool. Measured 2026-11-11: a status read, normally 0.3-1 s, took 23 s at
+    /// load 58, listing each supervisor's jobs through its actor in turn.
+    #[tokio::test]
+    async fn a_supervisors_jobs_are_read_while_its_spawn_turn_waits_on_the_blocking_pool() {
+        let (_workspace, config) = workspace("cowshed-held-status");
+        let (entered, held) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let supervisor = WorkspaceSupervisor::start_with_sinks(
+            config,
+            Box::new(HeldSpawn {
+                entered: Some(entered),
+                release: Some(released),
+            }),
+            Box::new(RecordingStore),
+            Box::new(NoCommitments),
+        )
+        .expect("start the supervisor");
+        let path = crate::temp_parent::scratch_parent()
+            .join(format!(
+                "cowshed-status-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ))
+            .join("s.sock");
+        let socket = bind(&path).await.expect("bind the supervisor socket");
+        let server = tokio::spawn(serve(socket, supervisor.clone(), None, None));
+        let job = supervisor
+            .exec(None, None, background("held"), AdmissionSource::Worker)
+            .await
+            .expect("the job is admitted");
+        tokio::select! {
+            entered = held => entered.expect("the job's spawn reached the blocking pool"),
+            ended = supervisor.wait(job) => {
+                panic!("job {} ended before its spawn: {ended:?}", job.get())
+            }
+        }
+
+        let read = tokio::time::timeout(deadline::HANDSHAKE.within, jobs(&path))
+            .await
+            .expect("the jobs are read within the handshake bound while the spawn turn is held")
+            .expect("the supervisor's jobs");
+        assert_eq!(read, vec![(ExecClass::Background, JobState::Queued)]);
+
+        release.send(()).expect("let the spawn go");
+        server.abort();
+        supervisor
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .expect("retire the supervisor");
+        std::fs::remove_dir_all(path.parent().expect("the socket's directory"))
+            .expect("remove the test socket's directory");
     }
 }

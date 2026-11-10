@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use tokio::time::Instant;
 
 use super::WorkspaceAuthoritySnapshot;
-use crate::api::dto::JobId;
+use crate::api::dto::{ExecClass, JobId};
 use crate::runtime::supervisor_socket::JobPulse;
 
 /// The turn the actor is in: what woke it, and when it started.
@@ -25,6 +25,13 @@ pub(crate) struct Turn {
     pub(crate) since: Instant,
 }
 
+/// A job the actor has not concluded, as it publishes it: what a heartbeat about it reports, and
+/// the class `gateway status` counts it by.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LiveJob {
+    pub(crate) pulse: JobPulse,
+    pub(crate) class: ExecClass,
+}
 /// One published state of the actor.
 #[derive(Debug)]
 pub(crate) struct Liveness {
@@ -36,16 +43,21 @@ pub(crate) struct Liveness {
     pub(crate) turn: Option<Turn>,
     /// Every job it has not concluded, by job id, as of its last completed turn, and each job the
     /// turn it is in has admitted, less each it has forgotten.
-    jobs: Arc<[JobPulse]>,
+    jobs: Arc<[LiveJob]>,
 }
 
 impl Liveness {
     /// `job_id` as of the actor's last completed turn or its admission, if it has not concluded.
     pub(crate) fn job(&self, job_id: JobId) -> Option<JobPulse> {
         self.jobs
-            .binary_search_by_key(&job_id, |pulse| pulse.job_id)
+            .binary_search_by_key(&job_id, |job| job.pulse.job_id)
             .ok()
-            .map(|at| self.jobs[at])
+            .map(|at| self.jobs[at].pulse)
+    }
+
+    /// Every job it has not concluded, in job id order.
+    pub(crate) fn jobs(&self) -> &[LiveJob] {
+        &self.jobs
     }
 }
 
@@ -66,14 +78,14 @@ pub(super) struct LivenessWriter {
     authority: Arc<WorkspaceAuthoritySnapshot>,
     turns: u64,
     turn: Option<Turn>,
-    jobs: Arc<[JobPulse]>,
+    jobs: Arc<[LiveJob]>,
 }
 
 impl LivenessWriter {
     /// An actor that serves `authority`, has run no turn and holds no job.
     pub(super) fn new(authority: &WorkspaceAuthoritySnapshot) -> (Self, LivenessSlot) {
         let authority = Arc::new(authority.clone());
-        let jobs: Arc<[JobPulse]> = Arc::from(Vec::new());
+        let jobs: Arc<[LiveJob]> = Arc::from(Vec::new());
         let slot = LivenessSlot(Arc::new(ArcSwap::from_pointee(Liveness {
             authority: Arc::clone(&authority),
             turns: 0,
@@ -102,14 +114,14 @@ impl LivenessWriter {
     /// The turn holds `jobs` unconcluded now, in job id order: published before it answers an
     /// admitted job's id or forgets a job, so a call about one reads it as the actor holds it while
     /// the turn goes on.
-    pub(super) fn publish_jobs(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) {
+    pub(super) fn publish_jobs(&mut self, jobs: impl Iterator<Item = LiveJob> + Clone) {
         if self.hold(jobs) {
             self.publish();
         }
     }
 
     /// The turn ended with `jobs` unconcluded, in job id order.
-    pub(super) fn end(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) {
+    pub(super) fn end(&mut self, jobs: impl Iterator<Item = LiveJob> + Clone) {
         self.turn = None;
         self.turns += 1;
         self.hold(jobs);
@@ -118,7 +130,7 @@ impl LivenessWriter {
 
     /// Hold `jobs` from now on; whether they differ from those held. An unchanged list is kept,
     /// so publications share it until it changes.
-    fn hold(&mut self, jobs: impl Iterator<Item = JobPulse> + Clone) -> bool {
+    fn hold(&mut self, jobs: impl Iterator<Item = LiveJob> + Clone) -> bool {
         let changed = !self.jobs.iter().copied().eq(jobs.clone());
         if changed {
             self.jobs = jobs.collect();

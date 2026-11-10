@@ -1508,8 +1508,8 @@ async fn read_jobs(store: &Path) -> HostJobs {
         if !is_supervisor_socket(store, &path) {
             continue;
         }
-        match supervisor_jobs(&path).await {
-            Ok(jobs) => live.extend(jobs.into_iter().map(|job| (job.class, job.state))),
+        match supervisor_socket::jobs(&path).await {
+            Ok(jobs) => live.extend(jobs),
             Err(error) => unanswered.push(UnansweredSupervisor {
                 socket: path,
                 error: error.to_string(),
@@ -1532,16 +1532,6 @@ fn is_supervisor_socket(store: &Path, path: &Path) -> bool {
             .file_stem()
             .is_some_and(|stem| Path::new(stem).extension().is_some())
         && path != supervisor_manager::manager_socket_path(store)
-}
-
-/// The jobs the supervisor serving `socket` lists, or none when nothing serves it any more.
-async fn supervisor_jobs(socket: &Path) -> Result<Vec<cowshed_core::api::JobInfo>> {
-    let Some(hello) = supervisor_socket::hello_if_present(socket).await? else {
-        return Ok(Vec::new());
-    };
-    supervisor_socket::connect(socket.to_path_buf(), hello.authority)
-        .list()
-        .await
 }
 
 /// One row per class and state among `jobs` that are still live: queued, running or draining.

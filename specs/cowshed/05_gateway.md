@@ -2353,7 +2353,10 @@ through a fallback pool. Scheduler estimates and activity remain mbx-owned
 
 In either mode the host reports the 1-, 5- and 15-minute load averages (`getloadavg`), memory pressure (macOS
 `kern.memorystatus_vm_pressure_level`; Linux `/proc/pressure/memory` `some avg10`), swap in use against its total (macOS
-`vm.swapusage`; Linux `/proc/meminfo`), and jobs by class and state from each live supervisor. It also reports cleanup
+`vm.swapusage`; Linux `/proc/meminfo`), and jobs by class and state from each live supervisor, as its actor last
+published them (the supervisor's `jobs` request, 11_shell.md "Protocol"): never a round trip through that actor, so a
+supervisor whose turn waits on the blocking pool still answers at once. Measured 2026-11-11: a status read, normally
+0.3-1 s, took 23 s at load 58 while it listed each supervisor's jobs through its actor in turn. It also reports cleanup
 entries from their authoritative `.deleting` directories ("Deleting released images"; 16_build_volumes.md, "Garbage
 collection") and land turns ("Land turns"). A failed reading names its error, and a supervisor that does not answer is
 named with its jobs excluded from counts. `--json` carries the projection as `scheduling` beside `landTurns` (07_api.md,

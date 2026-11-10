@@ -5768,10 +5768,13 @@ fn report_unsignalled(job: JobId, signalled: Result<()>) {
 /// Every job of `jobs` not concluded, in job id order, as the actor publishes it.
 fn unconcluded(
     jobs: &BTreeMap<JobId, JobStateRecord>,
-) -> impl Iterator<Item = super::supervisor_socket::JobPulse> + Clone + '_ {
+) -> impl Iterator<Item = liveness::LiveJob> + Clone + '_ {
     jobs.values()
         .filter(|job| !job.terminal())
-        .map(|job| super::supervisor_socket::JobPulse::of(&job.info))
+        .map(|job| liveness::LiveJob {
+            pulse: super::supervisor_socket::JobPulse::of(&job.info),
+            class: job.info.class,
+        })
 }
 
 /// The refusal of a call made under an authority the supervisor does not serve.

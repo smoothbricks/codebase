@@ -863,6 +863,9 @@ job with nobody waiting for it: the supervisor kills it under the authority it s
   failed as "a supervisor or lifecycle operation owns" the socket, costing its caller a unit's time on a misleading
   sentence.
 
+- **jobs** — the jobs the supervisor has not concluded, by class and state, as its actor last published them
+  (05_gateway.md, "Deadlines"), read without a round trip through the actor and answered at once, as `hello` is;
+  `gateway status` counts them.
 - **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its
