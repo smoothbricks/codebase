@@ -450,8 +450,6 @@ impl NetChangeOffset {
     pub const KIND: u32 = 8;
     /// 1 when a prior follows, else 0.
     pub const HAS_PRIOR: u32 = 9;
-    /// Two zero bytes.
-    pub const PAD: u32 = 10;
     /// Bytes of the prior, `u32`: a hash map's 4-byte value, an
     /// aggregate's or scalar's 8-byte value cell, or a struct-map row's
     /// self-contained image.

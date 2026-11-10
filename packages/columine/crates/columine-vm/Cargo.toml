@@ -98,6 +98,22 @@ consumer = "private"
 why = "a host keeps a fact derived from the state image current from each pass's journal records instead of rescanning the image"
 
 
+# A private consumer's engines settle, fork and pin their watch logs (specs/columine/07-change-feed.md §7).
+[[package.metadata.wiring.external]]
+item = "log_settle"
+consumer = "private"
+why = "a host that restores a speculation basis or a checkpoint image settles each watched slot's log to the restored sequence"
+
+[[package.metadata.wiring.external]]
+item = "log_clone_from"
+consumer = "private"
+why = "a replay engine forked from a recovery walk's state carries the walk's watch log with it"
+
+[[package.metadata.wiring.external]]
+item = "log_priors"
+consumer = "private"
+why = "a host whose interner releases ids keeps every id a watched slot's logged prior names"
+
 
 [dependencies]
 bitmosaic = { workspace = true }
