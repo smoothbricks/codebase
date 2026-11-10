@@ -37,10 +37,18 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; ancestors, a detected capability's grant — follows this deny and carves back just
 ;; that path. Nothing under HOME is readable because it merely exists.
 (deny file-read* file-read-data (subpath "~"))
-(allow process-exec process-fork)
+;; Exec follows read: every rule that decides file-read-data decides process-exec for the
+;; same paths and is emitted beside it, so last-match-wins starts a program exactly where it
+;; reads one. The broad allow above carries (allow process-exec (subpath "/")), this deny
+;; (deny process-exec (subpath "~")), and every allow and deny below its exec twin. macOS
+;; checks only process-exec when it starts a file: with exec allowed everywhere, a 755
+;; `#!/usr/bin/env bun` entry the job could not read still started, and Bun's command fallback
+;; ran it again, one nested process per level (607 under one shed's supervisor, 2026-11-11).
+;; Git's executes-only-Git role names its programs instead and takes no exec twin.
+(allow process-fork)
 ;; macOS refuses a sandboxed exec of a set-user-ID program; /bin/ps is one ("Process inspection").
-;; The rule admits it on either side of the broad exec allow above (measured); its place after that
-;; allow is not what makes it win. Not in Git's executes-only-Git role.
+;; The rule admits it on either side of the /bin carve-back's exec twin (measured on the broad
+;; exec allow it replaced); its place is not what makes it win. Not in Git's executes-only-Git role.
 (allow process-exec (literal "/bin/ps") (with no-sandbox))
 (allow file-map-executable)
 (allow sysctl-read)
@@ -159,7 +167,6 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; Shell HOME remains the private workspace HOME. Nothing installed answers to
 ;; `cargo` (03_caches.md, "Cargo reads its budget from its holder").
 (allow file-read* file-read-data (literal "<actual installed cowshed binary>"))
-(allow process-exec (literal "<actual installed cowshed binary>"))
 (allow file-read-metadata … the stable name and ancestor literals …)
 ;; The workspace's CPU pool directory, <store>/run/cpu/<incarnation>: read and write
 ;; its jobs' make jobserver FIFOs (05_gateway.md, "Cargo reads its holder's
@@ -541,8 +548,8 @@ whatever the profile allows, `(allow default)` included, and `/bin/ps` is set-us
 fails with `EPERM` before it runs. The one Seatbelt form that admits such an exec is `(with no-sandbox)`, which runs the
 program outside every sandbox; no rule runs it sandboxed. Every role that runs workspace commands therefore carries
 exactly one such rule, for the literal `/bin/ps`. Its position does not decide it: the rule admits the exec on either
-side of the broad exec allow (measured), so its emission after that allow in the baseline profile carries no meaning.
-Git's executes-only-Git role does not. Every other set-user-ID program (`top`, `login`, `su`) stays refused.
+side of an exec allow that covers `/bin` (measured), so where the baseline profile emits it carries no meaning. Git's
+executes-only-Git role does not. Every other set-user-ID program (`top`, `login`, `su`) stays refused.
 
 Outside the sandbox `ps` sees what any local user's `ps` sees: the whole process table, every process's command line,
 and the start environment of this user's processes only (`ps -E` prints none for another user's). The kernel shows an

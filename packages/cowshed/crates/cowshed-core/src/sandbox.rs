@@ -706,6 +706,17 @@ pub struct SeatbeltProfile {
     build_volume: Option<PathBuf>,
 }
 
+/// The SBPL text one profile is built into, and whether its role starts only what it reads.
+struct ProfileText {
+    text: String,
+    /// Exec follows read: each rule that decides `file-read-data` is followed by the same rule for
+    /// `process-exec`, so last-match-wins starts a program exactly where it reads one. macOS checks
+    /// only `process-exec` when it starts a file, so with exec allowed everywhere a program the job
+    /// could not read still started: a 755 `#!/usr/bin/env bun` entry Bun then failed to read ran
+    /// again through Bun's command fallback, one nested process per level (04_sandbox.md,
+    /// "Baseline (closed) profile"). Git's executes-only-Git role names its programs instead.
+    exec_follows_read: bool,
+}
 impl SeatbeltProfile {
     /// A profile whose text names no parameter: a test's hand-written host profile.
     #[cfg(test)]
@@ -758,7 +769,7 @@ const FIXTURE_PREFIX: &str = "cx";
 /// and does not match `ab`), so the two random characters are two classes. The sweep reads
 /// `/tmp`'s names with the `file-read-data` the broad allow already grants; no other entry gains
 /// metadata.
-fn push_fixture_root_rules(profile: &mut String) {
+fn push_fixture_root_rules(profile: &mut ProfileText) {
     let root = format!("^{FIXTURE_PARENT}/{FIXTURE_PREFIX}[0-9]+-[A-Za-z0-9][A-Za-z0-9]");
     let lock = format!("{FIXTURE_PARENT}/{FIXTURE_PREFIX}sweep.lock");
     push_line(
@@ -790,7 +801,10 @@ pub fn seatbelt_profile(
     } = validated_sandbox_paths(config)?;
 
     let cowshed = cowshed_root();
-    let mut profile = String::new();
+    let mut profile = ProfileText {
+        text: String::new(),
+        exec_follows_read: role != SandboxProfileRole::GitDiscoveryGitOnly,
+    };
 
     push_line(&mut profile, "(version 1)");
     push_line(&mut profile, "(deny default)");
@@ -862,8 +876,10 @@ pub fn seatbelt_profile(
             )?;
         }
     } else {
-        push_line(&mut profile, "(allow process-exec process-fork)");
-        // After the broad allow, which would otherwise match `/bin/ps` last and keep it sandboxed.
+        // Exec comes from each read rule's exec twin (ProfileText::exec_follows_read).
+        push_line(&mut profile, "(allow process-fork)");
+        // After the `/bin` carve-back's exec twin, which would otherwise match `/bin/ps` last and
+        // keep it sandboxed.
         push_line(&mut profile, PROCESS_STATUS_EXEC);
     }
     push_line(&mut profile, "(allow file-map-executable)");
@@ -989,7 +1005,6 @@ pub fn seatbelt_profile(
                 }
             }
             push_literal_rule(&mut profile, "allow file-read*", &installed)?;
-            push_literal_rule(&mut profile, "allow process-exec", &installed)?;
         }
     }
 
@@ -1339,7 +1354,7 @@ pub fn seatbelt_profile(
         }
     }
     Ok(SeatbeltProfile {
-        text: profile,
+        text: profile.text,
         build_volume: config.build_volume_mount.clone(),
     })
 }
@@ -1466,7 +1481,7 @@ fn sbpl_path(path: &Path) -> Result<String, SandboxError> {
 /// `realpath` through it, never to list `~` or `~/Library/Application Support`, which the
 /// HOME-wide read deny keeps closed.
 fn push_capability_grant(
-    profile: &mut String,
+    profile: &mut ProfileText,
     home: &Path,
     grant: &CapabilityGrant,
 ) -> Result<(), SandboxError> {
@@ -1507,7 +1522,7 @@ fn is_build_volume_mount(mount_root: &Path, volume: &Path) -> bool {
 
 /// Read the one controller-named store, including its fixed build-volume link, never main's cache.
 fn push_main_snapshot_store(
-    profile: &mut String,
+    profile: &mut ProfileText,
     config: &SandboxConfig,
     main: &Path,
 ) -> Result<Option<String>, SandboxError> {
@@ -1563,7 +1578,7 @@ fn push_main_snapshot_store(
     Ok(None)
 }
 
-fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), SandboxError> {
+fn push_readable_ancestors(profile: &mut ProfileText, path: &Path) -> Result<(), SandboxError> {
     for ancestor in path.ancestors() {
         push_literal_rule(profile, "allow file-read*", ancestor)?;
     }
@@ -1575,7 +1590,7 @@ fn push_readable_ancestors(profile: &mut String, path: &Path) -> Result<(), Sand
 pub(crate) const GIT_DEVELOPER_DIR: &str = "/var/select/developer_dir";
 
 fn push_subpath_rule(
-    profile: &mut String,
+    profile: &mut ProfileText,
     operation: &str,
     path: &Path,
 ) -> Result<(), SandboxError> {
@@ -1587,7 +1602,7 @@ fn push_subpath_rule(
 }
 
 fn push_literal_rule(
-    profile: &mut String,
+    profile: &mut ProfileText,
     operation: &str,
     path: &Path,
 ) -> Result<(), SandboxError> {
@@ -1599,7 +1614,7 @@ fn push_literal_rule(
 }
 
 fn push_exact_and_subpath_rule(
-    profile: &mut String,
+    profile: &mut ProfileText,
     operation: &str,
     path: &Path,
 ) -> Result<(), SandboxError> {
@@ -1638,7 +1653,7 @@ fn volume_expression(volume: &Path, path: &Path) -> Result<String, SandboxError>
 }
 
 fn push_volume_exact_and_subpath_rule(
-    profile: &mut String,
+    profile: &mut ProfileText,
     operation: &str,
     volume: &Path,
     path: &Path,
@@ -1651,23 +1666,30 @@ fn push_volume_exact_and_subpath_rule(
     Ok(())
 }
 
-fn push_line(profile: &mut String, line: &str) {
-    profile.push_str(line);
-    profile.push('\n');
-    // An explicit file-read-data rule takes precedence over file-read*, even
-    // when the wildcard comes later. Give every read rule the same specificity
-    // so ordered denies and carve-backs govern actual reads as well as metadata.
+fn push_line(profile: &mut ProfileText, line: &str) {
+    profile.text.push_str(line);
+    profile.text.push('\n');
     let Some((operations, filters)) = line.split_once(" (") else {
         return;
     };
     let Some((effect, names)) = operations.split_once(' ') else {
         return;
     };
-    if names.split_whitespace().any(|name| name == "file-read*") {
-        profile.push_str(effect);
-        profile.push_str(" file-read-data (");
-        profile.push_str(filters);
-        profile.push('\n');
+    let wildcard = names.split_whitespace().any(|name| name == "file-read*");
+    // An explicit file-read-data rule takes precedence over file-read*, even
+    // when the wildcard comes later. Give every read rule the same specificity
+    // so ordered denies and carve-backs govern actual reads as well as metadata.
+    if wildcard {
+        profile.text.push_str(effect);
+        profile.text.push_str(" file-read-data (");
+        profile.text.push_str(filters);
+        profile.text.push('\n');
+    }
+    if profile.exec_follows_read && (wildcard || names == "file-read-data") {
+        profile.text.push_str(effect);
+        profile.text.push_str(" process-exec (");
+        profile.text.push_str(filters);
+        profile.text.push('\n');
     }
 }
 
@@ -2667,12 +2689,15 @@ if ({writable}) {{
         std::os::unix::fs::symlink(&secret, &store).unwrap();
         sandbox.additional_denies.push(main.clone());
         sandbox.main_mount = Some(main.clone());
-        let mut emitted = String::new();
+        let mut emitted = ProfileText {
+            text: String::new(),
+            exec_follows_read: true,
+        };
         let warning = push_main_snapshot_store(&mut emitted, &sandbox, &main)
             .unwrap()
             .unwrap();
         assert!(
-            emitted.is_empty(),
+            emitted.text.is_empty(),
             "an escaping store contributes no authority"
         );
         assert_eq!(warning.lines().count(), 1);
@@ -2698,6 +2723,66 @@ if ({writable}) {{
             "unrelated exec remains usable: {output:?}"
         );
     }
+    /// Exec follows read: a program under a directory the job cannot read does not start, and the
+    /// same program where the job reads it does. With exec allowed everywhere, a 755
+    /// `#!/usr/bin/env bun` entry Bun could not read started anyway; Bun's command fallback ran it
+    /// again, one nested process per level (607 under one shed's supervisor). The probe's
+    /// interpreter line runs a readable recorder first, as `env bun` ran Bun before Bun failed to
+    /// read its entry: each start appends a line to a log the job writes, and none recurses.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_seatbelt_runs_only_what_the_job_reads() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &fs::canonicalize(std::env::temp_dir()).unwrap(),
+            "cowshed-exec-follows-read",
+        );
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        sandbox.home = root.join("home");
+        sandbox.mount_root = root.join("mounts");
+        sandbox.workspace_mount = sandbox.mount_root.join("acme/widget/raven");
+        sandbox.exec_temp_dir = root.join("tmp");
+        sandbox.store_root = root.join("store");
+        sandbox.grants = SandboxGrants::default();
+        sandbox.allowed_unix_sockets.clear();
+        let hidden = sandbox.home.join("refs");
+        for directory in [&hidden, &sandbox.workspace_mount, &sandbox.exec_temp_dir] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let log = sandbox.exec_temp_dir.join("starts");
+        let recorder = sandbox.exec_temp_dir.join("recorder");
+        fs::write(&recorder, format!("echo started >> '{}'\n", log.display())).unwrap();
+        let script = format!("#!/bin/sh {}\n", recorder.display());
+        let unreadable = hidden.join("probe");
+        let readable = sandbox.exec_temp_dir.join("probe");
+        for probe in [&unreadable, &readable] {
+            fs::write(probe, &script).unwrap();
+            fs::set_permissions(probe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let launch =
+            crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
+        let run = |program: &Path| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(launch.args())
+                .arg(program)
+                .current_dir(&sandbox.workspace_mount)
+                .output_bounded()
+                .unwrap()
+        };
+        let refused = run(&unreadable);
+        assert!(
+            !refused.status.success()
+                && String::from_utf8_lossy(&refused.stderr).contains("Operation not permitted"),
+            "{refused:?}"
+        );
+        assert!(!log.exists(), "the unreadable program started");
+        let ran = run(&readable);
+        assert!(ran.status.success(), "{ran:?}");
+        assert_eq!(fs::read_to_string(&log).unwrap(), "started\n");
+    }
+
     /// A workspace-relative deny closes reads and writes beneath a path of the job's own mount:
     /// the read+write deny (with its file-read-data twin) and the ancestor unlink denies follow
     /// every mount allow, the same shape a write-only deny has.
@@ -3711,7 +3796,8 @@ if ({writable}) {{
         let broad = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery)
             .unwrap()
             .into_text();
-        assert!(broad.contains("(allow process-exec process-fork)"));
+        assert!(broad.contains("(allow process-fork)"));
+        assert!(broad.contains("(allow process-exec (literal \"/usr\") (subpath \"/usr\"))"));
     }
 
     /// Every role, Git's included, reads the entropy devices; none reaches the per-user directory
@@ -3790,8 +3876,10 @@ if ({writable}) {{
                 .collect::<Vec<_>>();
             let broad = lines
                 .iter()
-                .position(|line| *line == "(allow process-exec process-fork)")
-                .unwrap_or_else(|| panic!("{role:?} executes workspace programs"));
+                .position(|line| {
+                    *line == "(allow process-exec (literal \"/bin\") (subpath \"/bin\"))"
+                })
+                .unwrap_or_else(|| panic!("{role:?} executes system programs"));
             assert!(
                 matches!(escapes.as_slice(), [(index, PROCESS_STATUS_EXEC)] if broad < *index),
                 "{role:?}: {escapes:?}"

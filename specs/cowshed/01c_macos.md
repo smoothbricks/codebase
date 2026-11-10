@@ -956,8 +956,8 @@ Find the symptom in the left column and follow the link.
   included, and `/bin/ps` is set-user-ID root; the one Seatbelt form that admits it is `(with no-sandbox)`, which runs
   the program outside every sandbox (_owner text_).
 - **Rule.** Every role that runs workspace commands carries exactly one
-  `(allow process-exec (literal "/bin/ps") (with no-sandbox))` after the broad exec allow, and every other set-user-ID
-  program stays refused.
+  `(allow process-exec (literal "/bin/ps") (with no-sandbox))` beside the exec its `/bin` read carve-back admits, and
+  every other set-user-ID program stays refused.
 - **Owners.** [04_sandbox.md §Process inspection](./04_sandbox.md#process-inspection);
   [04_sandbox.md §Baseline (closed) profile](./04_sandbox.md#baseline-closed-profile). Code:
   [`cowshed-core/src/sandbox.rs`] `PROCESS_STATUS_EXEC`.
