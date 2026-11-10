@@ -2010,7 +2010,8 @@ export type LandSeed =
     })
   | ({ readonly kind: 'sealBusy' } & {
       readonly reason: string;
-    });
+    })
+  | { readonly kind: 'unread' };
 
 /**
  * What a land that froze its target's seed did about compacting it (16_build_volumes.md, "Seed

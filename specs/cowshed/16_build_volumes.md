@@ -490,14 +490,20 @@ build-state contribution, not a storage-side list of tool names. The declared-st
 retained; other capabilities opt in explicitly. Legacy records without a retention mark require canonical rediscovery
 before seeding, rather than guessing from path spelling.
 
-No fork reads an mbx seed; a land or re-adoption still mints one as follows. A retained seed starts as a blank image at
-the live volume's capacity. Its retained subtrees are copied whole from one atomic CoW image snapshot of the source.
-Normal mbx refresh/capture holds the existing lifecycle/image lock and takes a shared hold on the source volume without
-waiting: that hold prevents release, and the lock excludes adoption. Existing jobs, kept shell hosts and transactional
-writers do not refuse or stop for retained-only capture; the shared guard stays alive through the immutable snapshot. An
-exclusive lifecycle claim still refuses capture by holder and path, without falling back to an old full-cache seed.
-Quiet landing capture and re-adoption borrow their existing admission/claim authority unchanged. The named
-non-transactional writer exclusions below remain the protocol for non-mbx warm capture.
+No fork reads an mbx seed, so on an mbx target only a land that keeps its workspace (`--no-retire`, whose refork
+captures the target's new seed under the target's image lock, Land step 6) or a re-adoption mints one. A retiring land
+of an mbx target mints none, claims none of the target's seeds, and leaves the target the seeds it has: a seed nothing
+reads is pure cost, paid under the image lock every fork of the target waits on. Each mint copies and hashes the
+retained trees: about 100 s for 9.9 GB in a large project's fork (Why two volumes, above), and in a consumer's land
+237.6 s of its 325 s build-volume step for about 17.3 GB at about 85 MB/s, 29.2 s of it mounting the temporary clone. A
+minted retained seed starts as a blank image at the live volume's capacity. Its retained subtrees are copied whole from
+one atomic CoW image snapshot of the source. Normal mbx refresh/capture holds the existing lifecycle/image lock and
+takes a shared hold on the source volume without waiting: that hold prevents release, and the lock excludes adoption.
+Existing jobs, kept shell hosts and transactional writers do not refuse or stop for retained-only capture; the shared
+guard stays alive through the immutable snapshot. An exclusive lifecycle claim still refuses capture by holder and path,
+without falling back to an old full-cache seed. Quiet landing capture and re-adoption borrow their existing
+admission/claim authority unchanged. The named non-transactional writer exclusions below remain the protocol for non-mbx
+warm capture.
 
 This is not a whole-image rewrite: old Cargo/Nx blocks are shared only by the temporary snapshot, not copied into the
 new seed. The source snapshot and superseded seeds go through the ordinary single released-image owner. The finished
@@ -684,6 +690,8 @@ precedence; lifecycle seed lookups remain fresh.
   at the landed tree; unit tests of the nearness order; real Cargo build-script rendezvous tests for both an existing
   profile and a profile created after quiescence and lock enumeration; and the sealed-source holder and
   attachment-exclusion tests.
+- **Seed reader enforced by**: `directory_mbx_land_mints_a_seed_only_for_a_refork`: on an mbx target, a retiring land's
+  freeze creates no image and publishes no seed, and a `--no-retire` land's freeze mints the seed its refork reads.
 - **Freshness boundary enforced by**: real APFS capture without a job write remains Fresh without tolerance; actual job
   admission is refused during canonical restore, both by a direct capture's exclusive claim and a land's retained
   stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
@@ -1024,7 +1032,10 @@ unit's export.
       Capture does not unmount the live volume or kill an index reader. On success, publish the target's new seed and
       claim its previous seeds, released once the land lets go of the target's image lock (Garbage collection). Writes
       after the snapshot reach the seed through a reseed (Targets and seeds); the documented new-host-profile gap is not
-      claimed closed.
+      claimed closed. A land that retires its workspace into an mbx target captures nothing here: no fork reads an mbx
+      seed and no refork follows, so it mints no seed, claims none of the target's seeds, and reports `unread`; the
+      target keeps the seeds it has (Targets and seeds). A `--no-retire` land into it mints the retained seed its refork
+      captures after 6.4.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a

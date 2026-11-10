@@ -140,6 +140,7 @@ type ReaderName =
   | 'LAND_SEED__FROZEN'
   | 'LAND_SEED__SEAL_BUSY'
   | 'LAND_SEED__UNCHANGED'
+  | 'LAND_SEED__UNREAD'
   | 'LAND_TURN_QUEUE'
   | 'LEAF'
   | 'LOAD_AVERAGES'
@@ -1210,6 +1211,7 @@ const READERS: Readers<ReaderName> = {
       ['unchanged', 'LAND_SEED__UNCHANGED'],
       ['frozen', 'LAND_SEED__FROZEN'],
       ['sealBusy', 'LAND_SEED__SEAL_BUSY'],
+      ['unread', 'LAND_SEED__UNREAD'],
     ],
   },
   LAND_SEED_COMPACTION: {
@@ -1229,6 +1231,7 @@ const READERS: Readers<ReaderName> = {
   LAND_SEED__FROZEN: { kind: 'record', fields: [['compaction', 'LAND_SEED_COMPACTION']] },
   LAND_SEED__SEAL_BUSY: { kind: 'record', fields: [['reason', 'LEAF']] },
   LAND_SEED__UNCHANGED: { kind: 'record', fields: [] },
+  LAND_SEED__UNREAD: { kind: 'record', fields: [] },
   LAND_TURN_QUEUE: {
     kind: 'record',
     fields: [

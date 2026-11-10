@@ -3937,6 +3937,11 @@ pub enum LandSeed {
     /// while adoption goes ahead. The next fork may capture the adopted volume once that admission
     /// succeeds; open handles on exempt contributed caches do not refuse capture.
     SealBusy { reason: String },
+    /// The target uses mbx and the land retired its workspace, so nothing would read a new seed:
+    /// no fork reads an mbx seed (each clones the target's live volume) and no kept workspace
+    /// reforks from one. No seed was minted, sparing the copy of the retained state under the
+    /// target's image lock; the target keeps the seeds it has.
+    Unread,
 }
 
 /// What a land that froze its target's seed did about compacting it (16_build_volumes.md, "Seed

@@ -3785,6 +3785,9 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
         LandSeed::SealBusy { reason } => lines.push(format!(
             "build volume: the target keeps its previous seed, because the landed volume could not be sealed for capture: {reason}; the next fork's reseed refreezes it once that holder lets go"
         )),
+        LandSeed::Unread => lines.push(
+            "build volume: no seed minted: the target's forks clone its live volume and the retired workspace reforks from none; the target keeps the seeds it has".to_owned(),
+        ),
     }
     match &build.adoption {
         Adoption::Skipped { reason } => {

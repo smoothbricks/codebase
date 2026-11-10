@@ -564,6 +564,7 @@ static LAND_SEED: Reader = Reader::Internal {
         ("unchanged", &LAND_SEED__UNCHANGED),
         ("frozen", &LAND_SEED__FROZEN),
         ("sealBusy", &LAND_SEED__SEAL_BUSY),
+        ("unread", &LAND_SEED__UNREAD),
     ],
 };
 static LAND_SEED_COMPACTION: Reader = Reader::Internal {
@@ -582,6 +583,7 @@ static LAND_SEED_COMPACTION__STARTED: Reader = Reader::Record(&[("pid", &LEAF)])
 static LAND_SEED__FROZEN: Reader = Reader::Record(&[("compaction", &LAND_SEED_COMPACTION)]);
 static LAND_SEED__SEAL_BUSY: Reader = Reader::Record(&[("reason", &LEAF)]);
 static LAND_SEED__UNCHANGED: Reader = Reader::Record(&[]);
+static LAND_SEED__UNREAD: Reader = Reader::Record(&[]);
 static LAND_TURN_QUEUE: Reader = Reader::Record(&[
     ("repo", &LEAF),
     ("tickets", &SEQ__TICKET),

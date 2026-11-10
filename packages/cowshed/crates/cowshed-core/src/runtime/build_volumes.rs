@@ -255,6 +255,17 @@ impl<H: RuntimeStorageHost> Contended<H> {
     }
 }
 
+/// Who reads the seed a land's freeze would mint (16_build_volumes.md, "Targets and seeds").
+/// Every fork of a target without mbx clones its seed; no fork reads an mbx seed, so on an mbx
+/// target only a `land --no-retire`'s refork of the kept workspace does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeedReader {
+    /// The land keeps its workspace, which reforks from the target's new seed.
+    Refork,
+    /// The land retires its workspace: nothing reads a new mbx seed.
+    Nobody,
+}
+
 /// What [`BuildVolumes::freeze_seed`] did with the target's seed after Nx and existing Cargo
 /// profiles admitted capture (Land step 5.4).
 #[derive(Debug)]
@@ -267,6 +278,9 @@ pub(crate) enum Freeze {
     },
     /// A conflicting storage claim refused capture; the previous seed stays.
     SealBusy { reason: String },
+    /// The target uses mbx and the land has no refork: nothing would read a new seed, so none
+    /// is minted and no older seed is claimed; the target keeps the seeds it has.
+    Unread,
 }
 
 /// The seeds of `target` a new seed replaced (16_build_volumes.md, "Garbage collection"), each
@@ -1698,11 +1712,14 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// existing Cargo profile locks through mounted capture and publication, then claim every
     /// older seed for [`Self::retire_superseded`] once the lock is let go. Other contributed cache/index handles do not refuse capture. Quiet retains
     /// the stopped supervisor's admission lease and shared GC hold throughout this operation.
+    /// An mbx target's seed is minted only for a [`SeedReader::Refork`]; with no reader the
+    /// freeze answers [`Freeze::Unread`] and touches no image.
     pub async fn freeze_seed(
         &self,
         locked: &TargetLock<H>,
         quiet: &Quiet,
         tree: GitOid,
+        reader: SeedReader,
     ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
         let quiet = quiet.clone();
         let target = locked.target.clone();
@@ -1719,7 +1736,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     incarnation: target.incarnation.clone(),
                 },
             );
-            seal(host, layout, &quiet, &target, &registration)
+            seal(host, layout, &quiet, &target, &registration, reader)
         })
         .await
     }
@@ -2908,23 +2925,28 @@ pub(crate) fn extent_images(
 /// Capture the quiet landing volume under the Nx and existing Cargo profile guards.
 /// Contributed paths outside those protocols are exempt. A host Cargo build can still create
 /// a new profile after enumeration; closing that gap requires a producer-side lease.
+/// An mbx target mints its retained seed only for a refork that reads it: no fork reads one.
 fn seal(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     quiet: &Quiet,
     target: &Owner,
     registration: &Registration,
+    reader: SeedReader,
 ) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
     if quiet.state.mbx.is_some() {
-        return Ok(Ok(Freeze::Frozen {
-            superseded: retained_seed(
-                host,
-                layout,
-                target,
-                SeedCapture::Quiet(quiet),
-                &quiet.state,
-            )?,
-            operation_elapsed: None,
+        return Ok(Ok(match reader {
+            SeedReader::Nobody => Freeze::Unread,
+            SeedReader::Refork => Freeze::Frozen {
+                superseded: retained_seed(
+                    host,
+                    layout,
+                    target,
+                    SeedCapture::Quiet(quiet),
+                    &quiet.state,
+                )?,
+                operation_elapsed: None,
+            },
         }));
     }
     if let Err(busy) = nx::close(host.census(), &quiet.mount, &quiet.state)
@@ -6045,7 +6067,12 @@ mod tests {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6090,7 +6117,7 @@ mod tests {
             if let Some(quiet) = quiet.take() {
                 let frozen = scratch
                     .volumes
-                    .freeze_seed(&locked, &quiet, tree.clone())
+                    .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -6451,7 +6478,12 @@ fn main() {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await
             .unwrap()
             .expect("the initial capture has no writer");
@@ -6478,7 +6510,12 @@ fn main() {
         drop(enumerated);
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("b".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("b".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await;
         writer.write_all(b"G").await.unwrap();
         drop(writer);
@@ -6554,7 +6591,7 @@ fn main() {
         let tree = GitOid::new("a".repeat(40)).unwrap();
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
             .await;
         let seed = scratch
             .layout
@@ -6608,7 +6645,12 @@ fn main() {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6636,7 +6678,7 @@ fn main() {
         let tree = GitOid::new("b".repeat(40)).unwrap();
         let landed = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
             .await;
         drop(quiet);
         let direct = capture(&*scratch.host, &scratch.layout, &target, &live, Some(tree));
@@ -6784,7 +6826,12 @@ fn main() {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await;
         let seed = scratch
             .layout
@@ -6862,7 +6909,12 @@ fn main() {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await;
         let seed = scratch
             .layout
@@ -7607,7 +7659,12 @@ fn main() {
         let locked = scratch.lock(&target).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(
+                &locked,
+                &quiet,
+                GitOid::new("a".repeat(40)).unwrap(),
+                SeedReader::Refork,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -7640,6 +7697,81 @@ fn main() {
         }
         assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
         assert!(scratch.layout.image(&live).exists());
+        drop(quiet);
+        scratch.release_all();
+    }
+
+    /// A retiring land of an mbx target mints no seed: no fork reads an mbx seed and no kept
+    /// workspace reforks from it (16_build_volumes.md, "Targets and seeds"). A `--no-retire`
+    /// land's refork reads the target's new seed, so its freeze still mints one.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_mbx_land_mints_a_seed_only_for_a_refork() {
+        let scratch = Scratch::directory("mbx-seed-reader");
+        let (checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let (target_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        BuildVolumeState {
+            paths: vec![BuildStatePath::new(".kept", "kept").unwrap().retain()],
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        fs::create_dir_all(mount.join("kept")).unwrap();
+        fs::write(mount.join("kept/marker"), b"landing state").unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&checkout),
+                scratch.stopped(&checkout).await,
+                target_checkout,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        let before = scratch.layout.list().unwrap();
+        let locked = scratch.lock(&target).await;
+        let retiring = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Nobody)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(retiring, Freeze::Unread), "{retiring:?}");
+        assert_eq!(
+            scratch.layout.list().unwrap(),
+            before,
+            "a retiring land creates no image: {retiring:?}"
+        );
+        assert!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .is_none(),
+            "a retiring land publishes no seed"
+        );
+        let kept = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, tree, SeedReader::Refork)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(locked);
+        let Freeze::Frozen { superseded, .. } = kept else {
+            panic!("a refork land mints the seed its refork reads: {kept:?}")
+        };
+        scratch.volumes.retire_superseded(superseded).await;
+        assert!(
+            scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .is_some(),
+            "a refork land publishes the target's new seed"
+        );
         drop(quiet);
         scratch.release_all();
     }
@@ -8208,7 +8340,7 @@ fn main() {
         let locked = scratch.lock(&owner("main", '0')).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -8476,6 +8608,7 @@ fn main() {
     /// lets the target's image lock go.
     #[derive(Debug, Eq, PartialEq)]
     enum Froze {
+        Unread,
         Frozen,
         SealBusy { reason: String },
     }
@@ -8487,6 +8620,7 @@ fn main() {
                 Froze::Frozen
             }
             Freeze::SealBusy { reason } => Froze::SealBusy { reason },
+            Freeze::Unread => Froze::Unread,
         }
     }
 
@@ -8573,7 +8707,7 @@ fn main() {
         let locked = scratch.lock(&owner("main", '0')).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -9167,7 +9301,7 @@ fn main() {
         let locked = scratch.lock(&main).await;
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, tree.clone())
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
             .await
             .unwrap()
             .expect("nothing holds the landing volume");
@@ -9360,7 +9494,7 @@ fn main() {
                 waiting.send(()).expect("the new waits for the land");
                 let locked = contended.wait().await?;
                 let frozen = volumes
-                    .freeze_seed(&locked, &quiet, tree.clone())
+                    .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
                     .await?
                     .expect("nothing holds the landing volume");
                 let Freeze::Frozen { superseded, .. } = frozen else {

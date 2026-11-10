@@ -6214,11 +6214,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .await?;
         // A busy seal keeps the previous seed and the adoption still runs: the seal fences only
         // the captured bytes, and the restored volume is as quiet for the target as before. The
-        // seeds a freeze replaced are claimed under the lock and retired once it is let go.
-        let (seal_busy, superseded, operation_elapsed) = match timed_async(
+        // seeds a freeze replaced are claimed under the lock and retired once it is let go. No
+        // fork reads an mbx seed, so on an mbx target only the kept workspace's refork reads the
+        // new one, and a retiring land mints none.
+        let reader = if retire {
+            super::build_volumes::SeedReader::Nobody
+        } else {
+            super::build_volumes::SeedReader::Refork
+        };
+        let (unfrozen, superseded, operation_elapsed) = match timed_async(
             "land",
             "freeze-seed",
-            volumes.freeze_seed(&locked, &quiet, tree.clone()),
+            volumes.freeze_seed(&locked, &quiet, tree.clone(), reader),
         )
         .await?
         {
@@ -6226,7 +6233,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 superseded,
                 operation_elapsed,
             }) => (None, Some(superseded), operation_elapsed),
-            Ok(super::build_volumes::Freeze::SealBusy { reason }) => (Some(reason), None, None),
+            Ok(super::build_volumes::Freeze::SealBusy { reason }) => {
+                (Some(LandSeed::SealBusy { reason }), None, None)
+            }
+            Ok(super::build_volumes::Freeze::Unread) => (Some(LandSeed::Unread), None, None),
             Err(reason) => return Ok(skipped(reason)),
         };
         let closed = match closed {
@@ -6237,7 +6247,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     volumes.retire_superseded(superseded).await;
                 }
                 return Ok(LandBuildVolume {
-                    seed: self.land_seed(&owner, seal_busy, operation_elapsed, &volumes),
+                    seed: self.land_seed(&owner, unfrozen, operation_elapsed, &volumes),
                     adoption: Adoption::Skipped { reason },
                 });
             }
@@ -6309,31 +6319,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         };
         Ok(LandBuildVolume {
-            seed: self.land_seed(&owner, seal_busy, operation_elapsed, &volumes),
+            seed: self.land_seed(&owner, unfrozen, operation_elapsed, &volumes),
             adoption,
         })
     }
 
-    /// A frozen seed's foreground advice is the necessary operation's live receipt, not an
-    /// extent query. Background start failures remain report values and retain the build hold.
+    /// The land's seed report: `unfrozen` when its freeze minted no seed, otherwise the frozen
+    /// seed's foreground advice, the necessary operation's live receipt, not an extent query.
+    /// Background start failures remain report values and retain the build hold.
     fn land_seed(
         &self,
         target: &super::build_volumes::Owner,
-        seal_busy: Option<String>,
+        unfrozen: Option<crate::api::dto::LandSeed>,
         operation_elapsed: Option<std::time::Duration>,
         volumes: &super::build_volumes::BuildVolumes<H>,
     ) -> crate::api::dto::LandSeed {
-        use crate::api::dto::LandSeed;
-        match seal_busy {
-            Some(reason) => LandSeed::SealBusy { reason },
-            None => LandSeed::Frozen {
-                compaction: volumes.advise_compaction(
-                    target,
-                    operation_elapsed,
-                    &self.descriptor.git_root,
-                ),
-            },
-        }
+        unfrozen.unwrap_or_else(|| crate::api::dto::LandSeed::Frozen {
+            compaction: volumes.advise_compaction(
+                target,
+                operation_elapsed,
+                &self.descriptor.git_root,
+            ),
+        })
     }
 
     /// `coordinator.compactSeed` (16_build_volumes.md, "Seed compaction"). Under the project's
