@@ -440,12 +440,13 @@ while main is rewritten under its forks. The fork still succeeded. What to do, i
    or links files keeps their old modification time; `-xdev` keeps the walk on the source image, off the build volume
    mounted inside it. Typical answers are `node_modules/…` (a reinstall), a build's output directories (a build run in
    main) and `.git/objects` (a repack).
-2. **Keep main still.** Install dependencies in main only when its lockfile changed: the managed install records the
-   lockfile digests in `node_modules/.smoo-install`, and `cowshed doctor` reports `node-modules-lock-drift` when main's
-   lockfile no longer matches. Never `rm -rf node_modules` or force a reinstall in main: change dependencies in a shed,
-   land the lockfile, then install once in main. Build and test in sheds (`cowshed exec <ws> -- …`), where outputs land
-   in the shed's own image, not main's. Keep each tool cache at its default path: a moved Bun cache relinks all of
-   `node_modules` ([Disk usage](#disk-usage)).
+2. **Keep main still.** Install dependencies in main only when what it reads changed (its lockfile, a patch file): the
+   managed install records the lockfile digests in `node_modules/.smoo-install`, and `cowshed doctor` reports
+   `node-modules-lock-drift` when main's lockfile no longer matches (a patch edit moves no lockfile: the managed shell
+   watches each patch and reruns the install at its next entry). Never `rm -rf node_modules` or force a reinstall in
+   main: change dependencies in a shed, land the lockfile or patch, then install once in main. Build and test in sheds
+   (`cowshed exec <ws> -- …`), where outputs land in the shed's own image, not main's. Keep each tool cache at its
+   default path: a moved Bun cache relinks all of `node_modules` ([Disk usage](#disk-usage)).
 3. **Then rewrite main once.** `cowshed defrag main` rewrites main's source image, its live build source and its seeds
    contiguously. Main must be idle: it detaches main the way `resize` does, and a file open or a job running refuses
    before the image is touched. It needs free space equal to main's allocated bytes, and keeps it while older clones

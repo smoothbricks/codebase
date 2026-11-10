@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync, realpathSync, watch } from 'node:fs';
-import { copyFile, cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -353,48 +353,130 @@ describe('the managed .envrc', () => {
     '  ;;',
     '  direnv-export)',
     '    [ -n "${STUB_DEVENV_FAILS-}" ] && { echo "devenv: evaluation killed" >&2; exit 137; }',
+    '    echo x >> "${STUB_EVALUATIONS:?}"',
     '    echo "export DEVENV_ROOT=$PWD"',
     '  ;;',
     'esac',
     '',
   ].join('\n');
 
-  it('fails shell entry when devenv builds no environment, and enters when it builds one', async () => {
+  type Exported = Readonly<Record<string, string | null>>;
+  interface Entry {
+    readonly exitCode: number;
+    readonly stderr: string;
+    readonly exported: Exported;
+  }
+  interface EnvrcCheckout {
+    readonly root: string;
+    /** One `direnv export json` in the checkout, under the environment a shell carries (`shell`). */
+    readonly enter: (shell?: Readonly<Record<string, string>>) => Entry;
+    /** How many times the stubbed devenv built an environment. */
+    readonly evaluations: () => number;
+  }
+
+  /** The variables an entry exported: what the shell that took them runs its next command under. */
+  const loaded = (entry: Entry): Record<string, string> =>
+    Object.fromEntries(Object.entries(entry.exported).filter((pair): pair is [string, string] => pair[1] !== null));
+
+  /** A checkout holding `files` and the managed .envrc over the stubbed devenv, which counts the environments it builds. */
+  async function withEnvrcCheckout(
+    files: Readonly<Record<string, string>>,
+    run: (checkout: EnvrcCheckout) => Promise<void>,
+  ): Promise<void> {
     const scratch = realpathSync(await mkdtemp(join(tmpdir(), 'smoo-envrc-')));
     try {
-      const checkout = join(scratch, 'checkout');
-      await mkdir(join(checkout, 'tooling', 'direnv'), { recursive: true });
-      await copyFile(join(MANAGED, 'envrc'), join(checkout, '.envrc'));
+      const root = join(scratch, 'checkout');
+      await mkdir(join(root, 'tooling', 'direnv'), { recursive: true });
+      await copyFile(join(MANAGED, 'envrc'), join(root, '.envrc'));
+      for (const [name, text] of Object.entries(files)) {
+        await mkdir(dirname(join(root, name)), { recursive: true });
+        await writeFile(join(root, name), text);
+      }
       const bin = join(scratch, 'bin');
       await mkdir(bin);
       await writeFile(join(bin, 'devenv'), DEVENV_STUB, { mode: 0o755 });
       const home = join(scratch, 'home');
       await mkdir(home);
+      const ledger = join(scratch, 'evaluations');
       const env = {
-        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        PATH: `${bin}:${dirname(process.execPath)}:${process.env.PATH ?? ''}`,
         HOME: home,
         XDG_CONFIG_HOME: join(scratch, 'config'),
         XDG_DATA_HOME: join(scratch, 'data'),
         XDG_CACHE_HOME: join(scratch, 'cache'),
+        STUB_EVALUATIONS: ledger,
       };
-      expect(Bun.spawnSync(['direnv', 'allow', checkout], { env }).exitCode).toBe(0);
-
-      const failed = Bun.spawnSync(['direnv', 'export', 'json'], {
-        cwd: checkout,
-        env: { ...env, STUB_DEVENV_FAILS: '1' },
+      expect(Bun.spawnSync(['direnv', 'allow', root], { env }).exitCode).toBe(0);
+      await run({
+        root,
+        enter: (shell = {}) => {
+          const result = Bun.spawnSync(['direnv', 'export', 'json'], { cwd: root, env: { ...env, ...shell } });
+          const stdout = result.stdout.toString().trim();
+          return {
+            exitCode: result.exitCode,
+            stderr: result.stderr.toString(),
+            exported: stdout === '' ? {} : JSON.parse(stdout),
+          };
+        },
+        evaluations: () => (existsSync(ledger) ? readFileSync(ledger, 'utf8').split('\n').filter(Boolean).length : 0),
       });
-      expect(failed.exitCode, failed.stderr.toString()).toBe(1);
-      expect(failed.stderr.toString()).toContain(
-        "devenv built no environment (see above): this checkout's shell is not entered",
-      );
-
-      const entered = Bun.spawnSync(['direnv', 'export', 'json'], { cwd: checkout, env });
-      expect(entered.exitCode, entered.stderr.toString()).toBe(0);
-      expect(JSON.parse(entered.stdout.toString()).DEVENV_ROOT).toBe(join(checkout, 'tooling', 'direnv'));
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }
+  }
+
+  it('fails shell entry when devenv builds no environment, and enters when it builds one', async () => {
+    await withEnvrcCheckout({ 'package.json': '{}' }, async ({ root, enter }) => {
+      const failed = enter({ STUB_DEVENV_FAILS: '1' });
+      expect(failed.exitCode, failed.stderr).toBe(1);
+      expect(failed.stderr).toContain("devenv built no environment (see above): this checkout's shell is not entered");
+
+      const entered = enter();
+      expect(entered.exitCode, entered.stderr).toBe(0);
+      expect(entered.exported.DEVENV_ROOT).toBe(join(root, 'tooling', 'direnv'));
+    });
   });
+
+  // bun.lock records where each patch lives and never what it says, so a pull or a rebase that changes only a patch
+  // moves no other input: the shell stayed on the package it had installed, and smoo:install was never asked.
+  it('re-enters the shell when a patch the manifest names is edited', async () => {
+    const patch = 'patches/left-pad@1.3.0.patch';
+    await withEnvrcCheckout(
+      { 'package.json': JSON.stringify({ patchedDependencies: { 'left-pad@1.3.0': patch } }), [patch]: 'one\n' },
+      async ({ root, enter, evaluations }) => {
+        const entered = enter();
+        expect(entered.exitCode, entered.stderr).toBe(0);
+        expect(evaluations()).toBe(1);
+
+        // A shell that stays loaded runs its next command in what the entry exported, and nothing it read changed.
+        const shell = loaded(entered);
+        expect(enter(shell).exitCode).toBe(0);
+        expect(evaluations()).toBe(1);
+
+        // direnv compares whole-second mtimes, so the edit sits a minute ahead of the entry.
+        await writeFile(join(root, patch), 'two\n');
+        const later = Date.now() / 1000 + 60;
+        await utimes(join(root, patch), later, later);
+        expect(enter(shell).exitCode).toBe(0);
+        expect(evaluations()).toBe(2);
+      },
+    );
+  });
+
+  for (const [what, manifest] of [
+    ['is not JSON', '{ "patchedDependencies": '],
+    ['names a patch that is no path', JSON.stringify({ patchedDependencies: { 'left-pad@1.3.0': 1 } })],
+    ['maps no patches', JSON.stringify({ patchedDependencies: 'patches/left-pad@1.3.0.patch' })],
+  ] as const) {
+    it(`says a manifest that ${what}, and still enters, so the shell that repairs it loads`, async () => {
+      await withEnvrcCheckout({ 'package.json': manifest }, async ({ root, enter }) => {
+        const entered = enter();
+        expect(entered.exitCode, entered.stderr).toBe(0);
+        expect(entered.stderr).toContain("package.json's patchedDependencies could not be read (see above)");
+        expect(entered.exported.DEVENV_ROOT).toBe(join(root, 'tooling', 'direnv'));
+      });
+    });
+  }
 });
 describe('the project root a shell entry owns', () => {
   /**

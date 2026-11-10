@@ -42,9 +42,9 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    main under its forks. Fork a shed instead.
 4. Workspaces publish `.cowshed/env`; direnv users need nothing extra (`source_env_if_exists .cowshed/env` is the
    optional hook). After a reboot or eject, `cowshed attach` re-mounts; it is idempotent.
-5. Keep main still: install dependencies there only when its lockfile changed, never wipe or force-reinstall its
-   `node_modules`, and build in sheds. A fork that warns its source clone took over 4 s names the command that lists
-   what main rewrote; stop that churn, then `cowshed defrag main` with main idle.
+5. Keep main still: install dependencies there only when what it reads changed (its lockfile, a patch file), never wipe
+   or force-reinstall its `node_modules`, and build in sheds. A fork that warns its source clone took over 4 s names the
+   command that lists what main rewrote; stop that churn, then `cowshed defrag main` with main idle.
 
 ## Commands
 

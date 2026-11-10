@@ -58,6 +58,30 @@ watch_file \
   tooling/direnv/secret-references.ts \
   tooling/direnv/toolchain-stamp.ts
 
+# bun.lock records where each patch lives and never what it says, and `bun install`
+# applies the bytes of the patches the root package.json's patchedDependencies
+# names. Editing a patch therefore moves no file watched above: a pull that
+# changed only a patch left the shell on the package it had installed, and
+# devenv's smoo:install was never asked to apply the new bytes. So each patch is
+# watched too. A manifest that cannot be read is said and the shell still loads;
+# package.json is watched, so mending it re-enters.
+smoo_patches=()
+if smoo_patch_list=$(bun --eval '
+  const patches = JSON.parse(await Bun.file("package.json").text()).patchedDependencies ?? {};
+  if (typeof patches !== "object" || Array.isArray(patches) || Object.values(patches).some((patch) => typeof patch !== "string")) {
+    throw new Error("patchedDependencies must map each package to a patch path");
+  }
+  for (const patch of Object.values(patches)) console.log(patch);
+'); then
+  while IFS= read -r smoo_patch; do
+    [ -z "$smoo_patch" ] || smoo_patches+=("$smoo_patch")
+  done <<<"$smoo_patch_list"
+  [ "${#smoo_patches[@]}" -eq 0 ] || watch_file "${smoo_patches[@]}"
+else
+  log_error "package.json's patchedDependencies could not be read (see above): its patches are not watched"
+fi
+unset smoo_patches smoo_patch_list smoo_patch
+
 # A cowshed workspace's environment, for interactive shells inside one; an
 # absent file is skipped.
 source_env_if_exists .cowshed/env

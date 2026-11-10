@@ -337,11 +337,12 @@ forward, was slewed or stamps coarsely, and the filesystem's stamps are the only
 clock beside them drifts from the wall clock by slewing alone). A newly listed input written while the clock was stepped
 back can still count as older, and the shell serves until that input changes again. An input on another filesystem,
 which may stamp in whole seconds, must predate the start's second. A change to a path not on the list costs nothing. The
-repository decides what else counts as shell input with `watch_file`: lockfiles and devenv inputs whose change must
-rerun shell entry. devenv leaves directory inputs off the list it hands direnv (only files can be `watch_file`d), so a
-directory a devenv module reads, such as a package's build recipe a source filter is rooted at, is named by the
-repository with direnv's `watch_dir`, which records every file beneath it. An input missing from the list is the one way
-a warm or inherited shell can serve stale: neither the identity check nor the content key can see it.
+repository decides what else counts as shell input with `watch_file`: lockfiles, the patch files `patchedDependencies`
+names (`bun.lock` records a patch's path and never its bytes, so an edited patch moves no lockfile), and devenv inputs
+whose change must rerun shell entry. devenv leaves directory inputs off the list it hands direnv (only files can be
+`watch_file`d), so a directory a devenv module reads, such as a package's build recipe a source filter is rooted at, is
+named by the repository with direnv's `watch_dir`, which records every file beneath it. An input missing from the list
+is the one way a warm or inherited shell can serve stale: neither the identity check nor the content key can see it.
 
 **Kept readings.** Admission asks some answers of files on every exec: the checkout's tracked build inputs (one
 `git ls-files`, and one per declared pattern; 15_capabilities.md, "Detection inputs"), the installed mbx's scheduler

@@ -621,13 +621,15 @@ nothing when nothing changed:
   about the declared links (Declared Links, below). Managed toolchain cache maintenance (`toolchain-stamp.ts`) skips
   that capture pass too: it exports no variables, and compiler probes and invalidation belong after tasks and project
   hooks have settled the toolchain, not once before them and again afterward. The managed `.envrc` watches
-  `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
-  or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and `_sources/generated.nix`.
-  Import the existing local flake outputs directly in `devenv.nix`
-  (`((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default`), rather than declaring the overlay as a `path:`
-  flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
-  watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
-  second version witness is needed.
+  `package.json`, the lockfiles, the patch files its `patchedDependencies` names and the scripts shell entry runs, so a
+  shell direnv keeps loaded re-enters after a pull, a patch edit or a script change. `bun.lock` records where a patch
+  lives and never what it says, so a patch edit moves no lockfile: without its own watch the shell keeps the patched
+  package it installed, and a test run in it reads the old patch. Local nvfetcher overlays also watch
+  `nixpkgs-overlay/flake.nix` and `_sources/generated.nix`. Import the existing local flake outputs directly in
+  `devenv.nix` (`((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default`), rather than declaring the overlay
+  as a `path:` flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as
+  direnv's watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced
+  refresh or second version witness is needed.
 - This repository's entry proper bootstraps the CLI and Nx plugin plus their transitive `workspace:*` runtime
   dependencies, once each and dependency first, using `ttsc -p tsconfig.lib.json --emit` without calling Nx or smoo. The
   existing `node_modules/.cache/smoo/dist-verified` markers gate emit, and absent or empty `dist` rebuilds even with a
