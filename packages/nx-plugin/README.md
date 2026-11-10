@@ -2684,13 +2684,14 @@ task id and the hash it ran at:
   exceed it too. Its `tests` name those the runner reported running (nextest's `SLOW`, libtest's
   `has been running for over`) and never finished, and those the JUnit report says it aborted when the bound stopped it.
   Its `lockWaits` lists only regular files the run holds on numbered descriptors that processes outside the run also
-  hold open, naming those holders' pids and commands. This is open-handle evidence, not kernel lock-owner proof. The
-  open-file census runs only on macOS, so on every other platform `lockWaits` is always empty. An incomplete or raced
-  capture records none. Its `cpuRising` lists each process of the run's tree whose CPU time rose between the snapshot's
-  two process censuses by at least the larger of 0.5 s and twice the coarser resolution of its two readings (2 s at
-  whole seconds, 0.5 s at centiseconds), with its pid, command and gain: a build inside the test, which is a defect and
-  not a hang. It is empty when no process rose or the closing census did not complete, and a record written before it
-  carries none.
+  hold open, naming those holders' pids and commands. This is open-handle evidence, not kernel lock-owner proof; the
+  snapshot also stack-samples each named waiter its leaf samples left out, so its text shows the call that waiter blocks
+  in. The open-file census runs only on macOS, so on every other platform `lockWaits` is always empty. An incomplete or
+  raced capture records none. Its `cpuRising` lists each process of the run's tree whose CPU time rose between the
+  snapshot's two process censuses by at least the larger of 0.5 s and twice the coarser resolution of its two readings
+  (2 s at whole seconds, 0.5 s at centiseconds), with its pid, command and gain: a build inside the test, which is a
+  defect and not a hang. It is empty when no process rose or the closing census did not complete, and a record written
+  before it carries none.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the

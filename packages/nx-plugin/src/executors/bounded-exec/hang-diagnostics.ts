@@ -37,9 +37,9 @@ const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,cputime=,lstart=,command=
 const CPU_INTERVAL_MS = 5_000;
 /**
  * Stack samples: `sample` suspends a process every millisecond for one second and reports its threads' call graph. The
- * runner and at most this many leaf processes are sampled, all at once. `-mayDie` is not passed: it reads symbols
- * before sampling and measured about a second slower under load, and a process that exits mid-sample is a raced
- * capture all the same.
+ * runner and at most this many leaf processes are sampled, all at once, and then at most this many named lock waiters
+ * those left out. `-mayDie` is not passed: it reads symbols before sampling and measured about a second slower under
+ * load, and a process that exits mid-sample is a raced capture all the same.
  */
 const MAX_SAMPLED_LEAVES = 4;
 const SAMPLE_SECONDS = 1;
@@ -254,40 +254,45 @@ export function captureHangDiagnostics(
       }
       return tree;
     };
-    /**
-     * One-second call stacks of the runner and of its tree's leaf processes, taken at once: a stack names the call a
-     * process waits in, which the open-file census cannot. A sample sudo refuses, or one that does not answer, is named
-     * as no stack for that process; stacks never change the holder outcome.
-     */
-    const stackSamples = async (tree: readonly ObservedProcess[]): Promise<void> => {
+    /** The runner and up to MAX_SAMPLED_LEAVES leaf processes of `tree` (members with no live child), and the leaves past that bound. */
+    const leafSamples = (tree: readonly ObservedProcess[]): { sampled: number[]; omitted: number[] } => {
       const live = tree.filter((entry) => !entry.stat.startsWith('Z'));
       const parents = new Set(live.map((entry) => entry.ppid));
       const leaves = live.filter((entry) => entry.pid !== request.pid && !parents.has(entry.pid));
-      const omitted = leaves.slice(MAX_SAMPLED_LEAVES).map((entry) => entry.pid);
+      return {
+        sampled: [request.pid, ...leaves.slice(0, MAX_SAMPLED_LEAVES).map((entry) => entry.pid)],
+        omitted: leaves.slice(MAX_SAMPLED_LEAVES).map((entry) => entry.pid),
+      };
+    };
+    /**
+     * One one-second call stack of `pid`, until the closing census would have less than its own limit left: a stack
+     * names the call a process waits in, which the open-file census cannot. A sample sudo refuses, or one that does
+     * not answer, is named as no stack for that process; stacks never change the holder outcome.
+     */
+    const sampleStack = async (pid: number): Promise<void> => {
+      const name = `stack sample pid ${pid}`;
+      // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
+      const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-file', '/dev/stdout'];
+      const result = await probe(name, 'sudo', args, endsAtMs - Date.now() - CENSUS_LIMIT_MS);
+      if (finished) return;
+      const report = callGraph(result.stdout);
+      if (result.status === 'exited' && result.code === 0 && report !== '') {
+        lines.push(`${name} (${SAMPLE_SECONDS}s; binary image list omitted):\n${report}`);
+        return;
+      }
+      if (report !== '') lines.push(`Partial ${name} output:\n${report}`);
+      lines.push(
+        `${name}: no stack; sudo -n sample did not answer, so the call this process waits in is not observed.`,
+      );
+    };
+    /** The runner's and its tree's leaf processes' stacks, taken at once. */
+    const stackSamples = async (tree: readonly ObservedProcess[]): Promise<void> => {
+      const { sampled, omitted } = leafSamples(tree);
       if (omitted.length > 0)
         lines.push(
           `Stack samples bounded to the runner and ${MAX_SAMPLED_LEAVES} leaf processes; not sampled: pid ${omitted.join(', ')}`,
         );
-      const limitMs = endsAtMs - Date.now() - CENSUS_LIMIT_MS;
-      const sampled = [request.pid, ...leaves.slice(0, MAX_SAMPLED_LEAVES).map((entry) => entry.pid)];
-      await Promise.all(
-        sampled.map(async (pid) => {
-          const name = `stack sample pid ${pid}`;
-          // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
-          const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-file', '/dev/stdout'];
-          const result = await probe(name, 'sudo', args, limitMs);
-          if (finished) return;
-          const report = callGraph(result.stdout);
-          if (result.status === 'exited' && result.code === 0 && report !== '') {
-            lines.push(`${name} (${SAMPLE_SECONDS}s; binary image list omitted):\n${report}`);
-            return;
-          }
-          if (report !== '') lines.push(`Partial ${name} output:\n${report}`);
-          lines.push(
-            `${name}: no stack; sudo -n sample did not answer, so the call this process waits in is not observed.`,
-          );
-        }),
-      );
+      await Promise.all(sampled.map(sampleStack));
     };
     /**
      * A process in an uninterruptible kernel wait (state U) is in a file-system or device call no signal ends, and its
@@ -370,6 +375,11 @@ export function captureHangDiagnostics(
               lines.push('Lock holder census incomplete; no lock wait is named.');
             } else {
               waits = lockWaits(rows, new Set(before.map((entry) => entry.pid)), openers);
+              // A lock wait is open-handle evidence: only the waiter's own stack says whether it blocks in the lock
+              // call. Each named waiter the leaf samples left out is sampled the same way, inside the same window.
+              const stacked = new Set(leafSamples(before).sampled);
+              const waiters = [...new Set(waits.flatMap((wait) => wait.waiters))].filter((pid) => !stacked.has(pid));
+              await Promise.all(waiters.slice(0, MAX_SAMPLED_LEAVES).map(sampleStack));
             }
           }
         };

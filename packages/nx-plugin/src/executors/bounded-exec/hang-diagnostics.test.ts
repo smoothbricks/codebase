@@ -218,6 +218,18 @@ describe('pre-expiry hang diagnostics', () => {
     expect(calls[2]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
   });
 
+  it('stack-samples a named lock waiter that the leaf samples left out', async () => {
+    // Pid 202 has a child, so no leaf sample takes its stack, yet it is the run's process the lock wait names: its
+    // stack is what says whether it blocks in the lock call at all.
+    const opened =
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n';
+    const outside = 'p202\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
+    const { host, samples } = scriptedHost([exited(census), exited(opened), exited(outside), exited(census)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.lockWaits.map((wait) => wait.waiters)).toEqual([[202]]);
+    expect(samples.map((sample) => sample.pid).sort((left, right) => left - right)).toEqual([ROOT, 202, 303, 404]);
+    expect(capture.text).toContain('stack sample pid 202 (1s; binary image list omitted)');
+  });
   it('names no lock wait for a file the run holds only through an unnumbered descriptor', async () => {
     const library =
       'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 303 tester txt REG 1,2 4 123 /fixture/library\n';
