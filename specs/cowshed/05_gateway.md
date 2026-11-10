@@ -1738,11 +1738,18 @@ in order, each lane's `old` then its `new`. Its laws are the policy's contract, 
 arrival order and under shortest predicted first (`Spt`) alike unless named:
 
 - `conserved`, `never_overcommits`: no step makes or loses a permit, so the grants never exceed the pool.
-- `lanes_in_order`: after a decision each lane needs nothing, or every lane after it is as it was.
-- `work_conserving`: after a decision every lane needs nothing, or no permit is free: a later lane is admitted whenever
-  the lanes before it are filled, so landing gets priority and never exclusivity.
-- `first_in_order_filled`: in each list a request is filled, or nothing after it changed, and a lane's `new` changes
-  only once its `old` is filled.
+- `lanes_in_order`, `work_conserving`, `first_in_order_filled` hold for every decision while no waiting request names a
+  minimum (`min_le_one_is_today`: any trace without one runs exactly as the policy without minimums): after a decision
+  each lane needs nothing or every lane after it is as it was; every lane needs nothing or no permit is free, so landing
+  gets priority and never exclusivity; in each list a request is filled or nothing after it changed, and a lane's `new`
+  changes only once its `old` is filled.
+- A request may name a minimum and a party. `a_gatherer_starts_with_its_minimum`: every request granted from `new` holds
+  at least min(minimum, want). `only_a_gather_leaves_permits_free`: after a decision no permit is free, or every request
+  still waiting is held back by a gather (it gathers, or is low work or of a gatherer's party behind it).
+  `gather_ends_at_the_bound`: aged requests are granted as without minimums, so a gather lasts at most the aging bound.
+  `round9_gathers_then_starts_on_its_minimum` and `round9_starts_short_at_the_bound` compute the land gate's case below.
+  The model holds back only the party's requests after the gatherer in walk order; mbx also holds a same-party request
+  that asked later and sorts ahead, or that aged in a lower lane, and the binding's traces stop where those arise.
 - `decide_never_preempts`, `arrival_never_preempts`, `finish_takes_only_its_own`, `tick_regroups`: no step takes a
   permit from a request but its own end; a tick moves aged requests to `old` with their grants.
 - `tick_bounds_wait`: after a tick every request still in `new` has waited fewer ticks than the aging bound.
@@ -1840,6 +1847,16 @@ host's load.
   that submits twenty jobs holds one place in the queue, so checkouts take turns, and a gate never waits behind its own
   checkout's background job. An admitted hold is never preempted, and its count never grows: a job granted fewer cores
   than it asked runs on those to its end.
+
+- **A minimum for a whole suite.** A reservation may name a minimum (`min` on the run endpoint's request,
+  `mbx reserve --min`): until it has waited the aging bound it starts only once that many cores are free, then takes
+  what is free up to its ask, and while it gathers, low work and the later requests of its own party (one run endpoint,
+  or one Cargo build's `mbx reserve`) wait behind it; every other request passes it, and two gatherers wait for each
+  other only in the pass order, so none deadlocks. At the aging bound it starts on what is free. A whole-suite test leaf
+  names as its minimum the fewest threads at which its last recorded test walls, longest first, never leave 180 s
+  without a test finishing. Measured 2026-11-10 (the land gate of 07:13-07:32 replayed): a suite started on 2 of its 18
+  cores ran 693-926 s; with its measured minimum of 3-4 it gathered 4 within 0.2 s from its own run's short leaves and
+  ran 349-517 s, and no other request waited longer.
 
 - **The fence is admission.** A gate's priority in the pool replaces the fence. A gate, the land gate and a train's
   proof alike, is never held ("Declaration"): its leaves are admitted at `normal` ("A land is a gate job") and pass

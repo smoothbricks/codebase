@@ -11,6 +11,13 @@
 # request is granted min(want, free) once, and a grant is never taken back nor grown. `Tick`
 # ages every request in `new` and moves those that reached the bound into `old` by ticket.
 #
+# A minimum (mbx e95a64c, `min`): until it ages, a request in `new` that names a minimum m
+# starts only once least = min(m, want) permits are free (a least of 0 or 1 is none), then takes
+# what is free up to its want. When its turn comes with fewer free it takes nothing and opens a
+# gather: while that gather is open, later requests of its party (`p`, 0: none) and all low work
+# take nothing; everything else passes. `old` is walked as today, so a gather ends at the bound.
+# `step.today` is the policy without minimums, kept to state what changed.
+#
 # Today: `new` is in arrival order, so the whole lane is. Spt: `new` is ordered by the
 # predicted run time measured from the request's class history, so a lane's shortest request
 # goes first unless an older one has aged.
@@ -20,9 +27,10 @@ type Pol is Data:
   Today{}
   Spt{}
 
-# k: the permits it holds; pred: its predicted run time; age: ticks waited in `new`.
+# k: the permits it holds; pred: its predicted run time; age: ticks waited in `new`; m: the
+# fewest permits it starts on before it ages (0 or 1: none); p: its party (0: none).
 type E is Data:
-  E{id: Nat, want: Nat, k: Nat, pred: Nat, age: Nat}
+  E{id: Nat, want: Nat, k: Nat, pred: Nat, age: Nat, m: Nat, p: Nat}
 
 type Lane is Data:
   Lane{old: +List<E>, new: +List<E>}
@@ -56,7 +64,7 @@ type Band is Data:
 
 # `elapsed`: how long the request's job has run when it asks (seconds).
 type Op is Data:
-  Arrive{band: Band, id: Nat, want: Nat, pred: Nat, elapsed: Nat}
+  Arrive{band: Band, id: Nat, want: Nat, pred: Nat, elapsed: Nat, min: Nat, party: Nat}
   Decide{}
   Tick{}
   Finish{id: Nat}
@@ -144,7 +152,7 @@ def need.k(+want: Nat, k: Nat) -> Nat:
 
 def need(e: E) -> Nat:
   match e:
-    case E{id, want, k, pred, age}:
+    case E{id, want, k, pred, age, mi, pa}:
       need.k(want, k)
 
 # --- a list walk ------------------------------------------------------------------
@@ -173,8 +181,8 @@ def walk(lane: +List<E>, +free: Nat) -> W:
   match lane:
     case Nil{}:
       W{free, []}
-    case Con{E{+id, +want, +k, +pred, +age}, t}:
-      W.cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), free)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), free)))
+    case Con{E{+id, +want, +k, +pred, +age, +mi, +pa}, t}:
+      W.cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), free)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), free)))
 
 # --- a lane walk: its aged requests, then the rest ----------------------------------
 
@@ -196,7 +204,7 @@ def lwalk(l: Lane, +free: Nat) -> LW:
     case Lane{+o, +n}:
       LW{wf(walk(n, wf(walk(o, free)))), Lane{wl(walk(o, free)), wl(walk(n, wf(walk(o, free))))}}
 
-# A decision walks each lane in order with what the lanes before it left free.
+# Today's decision walks each lane in order with what the lanes before it left free.
 def walks(ls: +List<Lane>, +f: Nat) -> LS:
   match ls:
     case Nil{}:
@@ -204,21 +212,189 @@ def walks(ls: +List<Lane>, +f: Nat) -> LS:
     case Con{+l, +t}:
       LS{lsf(walks(t, lf(lwalk(l, f)))), Con{ll(lwalk(l, f)), lsl(walks(t, lf(lwalk(l, f))))}}
 
-def decide(s: St) -> St:
+def decide.today(s: St) -> St:
   match s:
     case St{+f, +b, +ls}:
       St{lsf(walks(ls, f)), b, lsl(walks(ls, f))}
+
+# --- the gather (mbx e95a64c, `admission_pass`) -------------------------------------
+# A request in `new` that names a minimum gathers: when its turn comes with fewer than
+# least = min(m, want) permits free, and least is 2 or more, it takes none and opens a gather.
+# While a gather is open, a later request of the gatherer's party (not 0) takes none, and so does
+# all low work. Aged requests (`old`) are walked as today, so a gather ends at the aging bound.
+#
+# A decision carries the parties of the open gathers, one per gather (0: none), in `g`.
+
+# What a request in `new` does when its turn comes.
+type Act is Data:
+  Take{}
+  Hold{}
+  Open{}
+
+# p and q are one party: 0 is none, and matches nothing.
+def pmatch(p: Nat, +q: Nat) -> Bool:
+  match p:
+    case 0n:
+      False{}
+    case 1n+a:
+      same(1n+a, q)
+
+def anyp(+p: Nat, g: +List<Nat>) -> Bool:
+  match g:
+    case Nil{}:
+      False{}
+    case Con{q, t}:
+      Bool.or(pmatch(p, q), anyp(p, t))
+
+# Held behind an open gather: low work (`lo`), or of a gatherer's party.
+def held(+lo: Bool, +p: Nat, g: +List<Nat>) -> Bool:
+  match g:
+    case Nil{}:
+      False{}
+    case Con{+q, +t}:
+      Bool.or(lo, anyp(p, q <> t))
+
+# Fewer than `least` free, when `least` is 2 or more (a minimum of 0 or 1 is none).
+def short(l: Nat, +f: Nat) -> Bool:
+  match l:
+    case 0n:
+      False{}
+    case 1n+a:
+      match a:
+        case 0n:
+          False{}
+        case 1n+b:
+          Bool.not(le(2n+b, f))
+
+def act0(h: Bool, s: Bool) -> Act:
+  match h s:
+    case True{} s0:
+      Hold{}
+    case False{} True{}:
+      Open{}
+    case False{} False{}:
+      Take{}
+
+# A request that holds permits has started and takes none; one that waits is held, gathers, or
+# takes what it needs.
+def act(+lo: Bool, +g: +List<Nat>, k: Nat, +want: Nat, +mi: Nat, +pa: Nat, +f: Nat) -> Act:
+  match k:
+    case 0n:
+      act0(held(lo, pa, g), short(gg(mi, want), f))
+    case 1n+j:
+      Take{}
+
+def gact(+lo: Bool, +g: +List<Nat>, e: E, +f: Nat) -> Act:
+  match e:
+    case E{id, +want, +k, pred, age, +mi, +pa}:
+      act(lo, g, k, want, mi, pa, f)
+
+def en(a: Act, n: Nat) -> Nat:
+  match a:
+    case Take{}:
+      n
+    case Hold{}:
+      0n
+    case Open{}:
+      0n
+
+# What a request in `new` takes toward: what it still needs, or nothing while held or gathering.
+def gneed(+lo: Bool, +g: +List<Nat>, e: E, +f: Nat) -> Nat:
+  match e:
+    case E{id, +want, +k, pred, age, +mi, +pa}:
+      en(act(lo, g, k, want, mi, pa, f), need.k(want, k))
+
+def gnext(a: Act, +pa: Nat, g: +List<Nat>) -> +List<Nat>:
+  match a:
+    case Take{}:
+      g
+    case Hold{}:
+      g
+    case Open{}:
+      pa <> g
+
+# A walk of `new` in a lane (`lo`: the low lane) with the gathers `g` open.
+def gwalk(+lo: Bool, lane: +List<E>, +free: Nat, +g: +List<Nat>) -> W:
+  match lane:
+    case Nil{}:
+      W{free, []}
+    case Con{E{+id, +want, +k, +pred, +age, +mi, +pa}, t}:
+      W.cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, free), free)), pred, age, mi, pa},
+        gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, free), free), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, free), pa, g)))
+
+# The gathers open after that walk.
+def gend(+lo: Bool, lane: +List<E>, +free: Nat, +g: +List<Nat>) -> +List<Nat>:
+  match lane:
+    case Nil{}:
+      g
+    case Con{E{+id, +want, +k, +pred, +age, +mi, +pa}, t}:
+      gend(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, free), free), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, free), pa, g))
+
+# The low lane takes nothing while a gather above it is open.
+def skip(+lo: Bool, g: +List<Nat>) -> Bool:
+  match g:
+    case Nil{}:
+      False{}
+    case Con{q, t}:
+      lo
+
+# A lane: its aged requests as today, then the rest with the gathers open.
+def glwalk.if(sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +free: Nat, +g: +List<Nat>) -> LW:
+  match sk:
+    case True{}:
+      LW{free, Lane{o, n}}
+    case False{}:
+      LW{wf(gwalk(lo, n, wf(walk(o, free)), g)), Lane{wl(walk(o, free)), wl(gwalk(lo, n, wf(walk(o, free)), g))}}
+
+def glwalk(+lo: Bool, l: Lane, +free: Nat, +g: +List<Nat>) -> LW:
+  match l:
+    case Lane{+o, +n}:
+      glwalk.if(skip(lo, g), lo, o, n, free, g)
+
+def glg.if(sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +free: Nat, +g: +List<Nat>) -> +List<Nat>:
+  match sk:
+    case True{}:
+      g
+    case False{}:
+      gend(lo, n, wf(walk(o, free)), g)
+
+def glg(+lo: Bool, l: Lane, +free: Nat, +g: +List<Nat>) -> +List<Nat>:
+  match l:
+    case Lane{+o, +n}:
+      glg.if(skip(lo, g), lo, o, n, free, g)
+
+# The last lane is the low one.
+def islow(t: +List<Lane>) -> Bool:
+  match t:
+    case Nil{}:
+      True{}
+    case Con{h, r}:
+      False{}
+
+# A decision walks each lane in order with what the lanes before it left free and the gathers
+# they left open.
+def gwalks(ls: +List<Lane>, +f: Nat, +g: +List<Nat>) -> LS:
+  match ls:
+    case Nil{}:
+      LS{f, []}
+    case Con{+l, +t}:
+      LS{lsf(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), Con{ll(glwalk(islow(t), l, f, g)), lsl(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)))}}
+
+def decide(s: St) -> St:
+  match s:
+    case St{+f, +b, +ls}:
+      St{lsf(gwalks(ls, f, [])), b, lsl(gwalks(ls, f, []))}
 
 # --- arrivals: Today appends, Spt inserts by prediction ----------------------------
 
 def eid(e: E) -> Nat:
   match e:
-    case E{id, want, k, pred, age}:
+    case E{id, want, k, pred, age, mi, pa}:
       id
 
 def epred(e: E) -> Nat:
   match e:
-    case E{id, want, k, pred, age}:
+    case E{id, want, k, pred, age, mi, pa}:
       pred
 
 def snoc(xs: +List<E>, +y: E) -> +List<E>:
@@ -319,8 +495,8 @@ def split(n: +List<E>, +b: Nat) -> Sp:
   match n:
     case Nil{}:
       Sp{[], []}
-    case Con{E{+id, +want, +k, +pred, +age}, t}:
-      split.if(E{id, want, k, pred, 1n+age}, split(t, b), le(b, 1n+age))
+    case Con{E{+id, +want, +k, +pred, +age, +mi, +pa}, t}:
+      split.if(E{id, want, k, pred, 1n+age, mi, pa}, split(t, b), le(b, 1n+age))
 
 def append(xs: +List<E>, +ys: +List<E>) -> +List<E>:
   match xs:
@@ -348,19 +524,19 @@ def tick(s: St) -> St:
 
 # --- an end gives its entry's permits back -----------------------------------------
 
-def fin.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, t: +List<E>, rest: W, hit: Bool) -> W:
+def fin.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, t: +List<E>, rest: W, hit: Bool) -> W:
   match hit:
     case True{}:
       W{k, t}
     case False{}:
-      W.cons(E{id, want, k, pred, age}, rest)
+      W.cons(E{id, want, k, pred, age, mi, pa}, rest)
 
 def fin(lane: +List<E>, +x: Nat) -> W:
   match lane:
     case Nil{}:
       W{0n, []}
-    case Con{E{+id, +want, +k, +pred, +age}, +t}:
-      fin.if(id, want, k, pred, age, t, fin(t, x), same(x, id))
+    case Con{E{+id, +want, +k, +pred, +age, +mi, +pa}, +t}:
+      fin.if(id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id))
 
 def lfin(l: Lane, +x: Nat) -> LW:
   match l:
@@ -414,8 +590,8 @@ def lane(band: Band, +elapsed: Nat) -> Nat:
 
 def step(+p: Pol, o: Op, +s: St) -> St:
   match o:
-    case Arrive{+band, id, want, +pred, +elapsed}:
-      arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, s)
+    case Arrive{+band, id, want, +pred, +elapsed, mi, pa}:
+      arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, s)
     case Decide{}:
       decide(s)
     case Tick{}:
@@ -429,6 +605,25 @@ def run(+p: Pol, os: +List<Op>, s: St) -> St:
       s
     case Con{o, t}:
       run(p, t, step(p, o, s))
+
+# Today's policy: the same steps, with a decision that knows no minimum.
+def step.today(+p: Pol, o: Op, +s: St) -> St:
+  match o:
+    case Arrive{+band, id, want, +pred, +elapsed, mi, pa}:
+      arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, s)
+    case Decide{}:
+      decide.today(s)
+    case Tick{}:
+      tick(s)
+    case Finish{x}:
+      finish(x, s)
+
+def run.today(+p: Pol, os: +List<Op>, s: St) -> St:
+  match os:
+    case Nil{}:
+      s
+    case Con{o, t}:
+      run.today(p, t, step.today(p, o, s))
 
 def empty(cap: Nat, bound: Nat) -> St:
   St{cap, bound, [Lane{[], []}, Lane{[], []}, Lane{[], []}]}
@@ -527,7 +722,7 @@ def sum2(+x1: Nat, +y1: Nat, +z1: Nat, +x2: Nat, +y2: Nat, +z2: Nat,
 
 def ek(e: E) -> Nat:
   match e:
-    case E{id, want, k, pred, age}:
+    case E{id, want, k, pred, age, mi, pa}:
       k
 
 def sumk(lane: +List<E>) -> Nat:
@@ -559,20 +754,20 @@ def cons_sum(+h: E, +w: W) -> {add(wf(W.cons(h, w)), sumk(wl(W.cons(h, w)))) == 
     case W{f, l}:
       add_swap(f, ek(h), sumk(l))
 
-def walk_sum.con(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +f: Nat, +n: Nat,
-  ih: {add(wf(walk(t, gr(n, f))), sumk(wl(walk(t, gr(n, f))))) == add(gr(n, f), sumk(t)) : Nat})
-  -> {add(wf(W.cons(E{id, want, add(k, gg(n, f)), pred, age}, walk(t, gr(n, f)))), sumk(wl(W.cons(E{id, want, add(k, gg(n, f)), pred, age}, walk(t, gr(n, f)))))) == add(f, add(k, sumk(t))) : Nat}:
+def walk_sum.con(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +f: Nat, +n: Nat, +w: W,
+  ih: {add(wf(w), sumk(wl(w))) == add(gr(n, f), sumk(t)) : Nat})
+  -> {add(wf(W.cons(E{id, want, add(k, gg(n, f)), pred, age, mi, pa}, w)), sumk(wl(W.cons(E{id, want, add(k, gg(n, f)), pred, age, mi, pa}, w)))) == add(f, add(k, sumk(t))) : Nat}:
   Equal.trans(Nat,
-    add(wf(W.cons(E{id, want, add(k, gg(n, f)), pred, age}, walk(t, gr(n, f)))), sumk(wl(W.cons(E{id, want, add(k, gg(n, f)), pred, age}, walk(t, gr(n, f)))))),
-    add(add(k, gg(n, f)), add(wf(walk(t, gr(n, f))), sumk(wl(walk(t, gr(n, f)))))),
+    add(wf(W.cons(E{id, want, add(k, gg(n, f)), pred, age, mi, pa}, w)), sumk(wl(W.cons(E{id, want, add(k, gg(n, f)), pred, age, mi, pa}, w)))),
+    add(add(k, gg(n, f)), add(wf(w), sumk(wl(w)))),
     add(f, add(k, sumk(t))),
-    cons_sum(E{id, want, add(k, gg(n, f)), pred, age}, walk(t, gr(n, f))),
+    cons_sum(E{id, want, add(k, gg(n, f)), pred, age, mi, pa}, w),
   Equal.trans(Nat,
-    add(add(k, gg(n, f)), add(wf(walk(t, gr(n, f))), sumk(wl(walk(t, gr(n, f)))))),
+    add(add(k, gg(n, f)), add(wf(w), sumk(wl(w)))),
     add(add(k, gg(n, f)), add(gr(n, f), sumk(t))),
     add(f, add(k, sumk(t))),
     Equal.cong(Nat, Nat, x => add(add(k, gg(n, f)), x),
-      add(wf(walk(t, gr(n, f))), sumk(wl(walk(t, gr(n, f))))), add(gr(n, f), sumk(t)), ih),
+      add(wf(w), sumk(wl(w))), add(gr(n, f), sumk(t)), ih),
   Equal.trans(Nat,
     add(add(k, gg(n, f)), add(gr(n, f), sumk(t))),
     add(k, add(gg(n, f), add(gr(n, f), sumk(t)))),
@@ -598,42 +793,61 @@ def walk_sum(+lane: +List<E>, +f: Nat) -> {add(wf(walk(lane, f)), sumk(wl(walk(l
   match lane:
     case Nil{}:
       {==}
-    case Con{E{id, want, k, pred, age}, t}:
-      walk_sum.con(id, want, k, pred, age, t, f, need(E{id, want, k, pred, age}),
-        walk_sum(t, gr(need(E{id, want, k, pred, age}), f)))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      walk_sum.con(id, want, k, pred, age, mi, pa, t, f, need(E{id, want, k, pred, age, mi, pa}), walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)),
+        walk_sum(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))
 
-def lwalk_sum(+l: Lane, +f: Nat) -> {add(lf(lwalk(l, f)), suml(ll(lwalk(l, f)))) == add(f, suml(l)) : Nat}:
+def gwalk_sum(+lo: Bool, +lane: +List<E>, +f: Nat, +g: +List<Nat>) -> {add(wf(gwalk(lo, lane, f, g)), sumk(wl(gwalk(lo, lane, f, g)))) == add(f, sumk(lane)) : Nat}:
+  match lane:
+    case Nil{}:
+      {==}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      walk_sum.con(id, want, k, pred, age, mi, pa, t, f, gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f),
+        gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)),
+        gwalk_sum(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)))
+
+def glwalk_sum.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>)
+  -> {add(lf(glwalk.if(sk, lo, o, n, f, g)), suml(ll(glwalk.if(sk, lo, o, n, f, g)))) == add(f, suml(Lane{o, n})) : Nat}:
+  match sk:
+    case True{}:
+      {==}
+    case False{}:
+      chain2(wf(gwalk(lo, n, wf(walk(o, f)), g)), sumk(wl(walk(o, f))), sumk(wl(gwalk(lo, n, wf(walk(o, f)), g))),
+        wf(walk(o, f)), f, sumk(o), sumk(n), walk_sum(o, f), gwalk_sum(lo, n, wf(walk(o, f)), g))
+
+def glwalk_sum(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>) -> {add(lf(glwalk(lo, l, f, g)), suml(ll(glwalk(lo, l, f, g)))) == add(f, suml(l)) : Nat}:
   match l:
     case Lane{o, n}:
-      chain2(wf(walk(n, wf(walk(o, f)))), sumk(wl(walk(o, f))), sumk(wl(walk(n, wf(walk(o, f))))),
-        wf(walk(o, f)), f, sumk(o), sumk(n), walk_sum(o, f), walk_sum(n, wf(walk(o, f))))
+      glwalk_sum.if(skip(lo, g), lo, o, n, f, g)
 
-def walks_sum(+ls: +List<Lane>, +f: Nat) -> {add(lsf(walks(ls, f)), sumls(lsl(walks(ls, f)))) == add(f, sumls(ls)) : Nat}:
+def gwalks_sum(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>) -> {add(lsf(gwalks(ls, f, g)), sumls(lsl(gwalks(ls, f, g)))) == add(f, sumls(ls)) : Nat}:
   match ls:
     case Nil{}:
       {==}
     case Con{+l, +t}:
-      chain2(lsf(walks(t, lf(lwalk(l, f)))), suml(ll(lwalk(l, f))), sumls(lsl(walks(t, lf(lwalk(l, f))))),
-        lf(lwalk(l, f)), f, suml(l), sumls(t), lwalk_sum(l, f), walks_sum(t, lf(lwalk(l, f))))
+      chain2(lsf(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), suml(ll(glwalk(islow(t), l, f, g))),
+        sumls(lsl(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)))),
+        lf(glwalk(islow(t), l, f, g)), f, suml(l), sumls(t), glwalk_sum(islow(t), l, f, g),
+        gwalks_sum(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)))
 
 def decide_total(+s: St) -> {total(decide(s)) == total(s) : Nat}:
   match s:
     case St{f, b, ls}:
-      walks_sum(ls, f)
+      gwalks_sum(ls, f, [])
 
 # --- an arrival holds nothing ----------------------------------------------------------
 
-def snoc_sum(+xs: +List<E>, +id: Nat, +want: Nat, +pred: Nat) -> {sumk(snoc(xs, E{id, want, 0n, pred, 0n})) == sumk(xs) : Nat}:
+def snoc_sum(+xs: +List<E>, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat) -> {sumk(snoc(xs, E{id, want, 0n, pred, 0n, mi, pa})) == sumk(xs) : Nat}:
   match xs:
     case Nil{}:
       {==}
     case Con{h, t}:
-      %snoc_sum(t, id, want, pred) : {add(ek(h), sumk(snoc(t, E{id, want, 0n, pred, 0n}))) == add(ek(h), _) : Nat}
+      %snoc_sum(t, id, want, pred, mi, pa) : {add(ek(h), sumk(snoc(t, E{id, want, 0n, pred, 0n, mi, pa}))) == add(ek(h), _) : Nat}
       {==}
 
-def insert_sum.if(+id: Nat, +want: Nat, +pred: Nat, +h: E, +t: +List<E>, +rest: +List<E>, +before: Bool,
+def insert_sum.if(+id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat, +h: E, +t: +List<E>, +rest: +List<E>, +before: Bool,
   ih: {sumk(rest) == sumk(t) : Nat})
-  -> {sumk(insert.if(E{id, want, 0n, pred, 0n}, h, t, rest, before)) == add(ek(h), sumk(t)) : Nat}:
+  -> {sumk(insert.if(E{id, want, 0n, pred, 0n, mi, pa}, h, t, rest, before)) == add(ek(h), sumk(t)) : Nat}:
   match before:
     case True{}:
       {==}
@@ -641,42 +855,42 @@ def insert_sum.if(+id: Nat, +want: Nat, +pred: Nat, +h: E, +t: +List<E>, +rest: 
       %Equal.sym(Nat, sumk(rest), sumk(t), ih) : {add(ek(h), _) == add(ek(h), sumk(t)) : Nat}
       {==}
 
-def insert_sum(+xs: +List<E>, +id: Nat, +want: Nat, +pred: Nat) -> {sumk(insert(xs, E{id, want, 0n, pred, 0n})) == sumk(xs) : Nat}:
+def insert_sum(+xs: +List<E>, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat) -> {sumk(insert(xs, E{id, want, 0n, pred, 0n, mi, pa})) == sumk(xs) : Nat}:
   match xs:
     case Nil{}:
       {==}
     case Con{h, t}:
-      insert_sum.if(id, want, pred, h, t, insert(t, E{id, want, 0n, pred, 0n}),
-        Bool.not(le(epred(h), epred(E{id, want, 0n, pred, 0n}))), insert_sum(t, id, want, pred))
+      insert_sum.if(id, want, pred, mi, pa, h, t, insert(t, E{id, want, 0n, pred, 0n, mi, pa}),
+        Bool.not(le(epred(h), epred(E{id, want, 0n, pred, 0n, mi, pa}))), insert_sum(t, id, want, pred, mi, pa))
 
-def enter_sum(+p: Pol, +n: +List<E>, +id: Nat, +want: Nat, +pred: Nat) -> {sumk(enter(p, n, E{id, want, 0n, pred, 0n})) == sumk(n) : Nat}:
+def enter_sum(+p: Pol, +n: +List<E>, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat) -> {sumk(enter(p, n, E{id, want, 0n, pred, 0n, mi, pa})) == sumk(n) : Nat}:
   match p:
     case Today{}:
-      snoc_sum(n, id, want, pred)
+      snoc_sum(n, id, want, pred, mi, pa)
     case Spt{}:
-      insert_sum(n, id, want, pred)
+      insert_sum(n, id, want, pred, mi, pa)
 
-def arrive_lane_sum(+p: Pol, +id: Nat, +want: Nat, +pred: Nat, +l: Lane) -> {suml(arrive.lane(p, E{id, want, 0n, pred, 0n}, l)) == suml(l) : Nat}:
+def arrive_lane_sum(+p: Pol, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat, +l: Lane) -> {suml(arrive.lane(p, E{id, want, 0n, pred, 0n, mi, pa}, l)) == suml(l) : Nat}:
   match l:
     case Lane{o, n}:
-      %Equal.sym(Nat, sumk(enter(p, n, E{id, want, 0n, pred, 0n})), sumk(n), enter_sum(p, n, id, want, pred)) : {add(sumk(o), _) == add(sumk(o), sumk(n)) : Nat}
+      %Equal.sym(Nat, sumk(enter(p, n, E{id, want, 0n, pred, 0n, mi, pa})), sumk(n), enter_sum(p, n, id, want, pred, mi, pa)) : {add(sumk(o), _) == add(sumk(o), sumk(n)) : Nat}
       {==}
 
-def arrive_at_sum(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +ls: +List<Lane>) -> {sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n}, ls)) == sumls(ls) : Nat}:
+def arrive_at_sum(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat, +ls: +List<Lane>) -> {sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n, mi, pa}, ls)) == sumls(ls) : Nat}:
   match i ls:
     case 0n Con{+l, +t}:
-      %Equal.sym(Nat, suml(arrive.lane(p, E{id, want, 0n, pred, 0n}, l)), suml(l), arrive_lane_sum(p, id, want, pred, l)) : {add(_, sumls(t)) == add(suml(l), sumls(t)) : Nat}
+      %Equal.sym(Nat, suml(arrive.lane(p, E{id, want, 0n, pred, 0n, mi, pa}, l)), suml(l), arrive_lane_sum(p, id, want, pred, mi, pa, l)) : {add(_, sumls(t)) == add(suml(l), sumls(t)) : Nat}
       {==}
     case 1n+j Con{+l, +t}:
-      %Equal.sym(Nat, sumls(arrive.at(p, j, E{id, want, 0n, pred, 0n}, t)), sumls(t), arrive_at_sum(p, j, id, want, pred, t)) : {add(suml(l), _) == add(suml(l), sumls(t)) : Nat}
+      %Equal.sym(Nat, sumls(arrive.at(p, j, E{id, want, 0n, pred, 0n, mi, pa}, t)), sumls(t), arrive_at_sum(p, j, id, want, pred, mi, pa, t)) : {add(suml(l), _) == add(suml(l), sumls(t)) : Nat}
       {==}
     case i0 Nil{}:
       {==}
 
-def arrive_total(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +s: St) -> {total(arrive(p, i, E{id, want, 0n, pred, 0n}, s)) == total(s) : Nat}:
+def arrive_total(+p: Pol, +i: Nat, +id: Nat, +want: Nat, +pred: Nat, +mi: Nat, +pa: Nat, +s: St) -> {total(arrive(p, i, E{id, want, 0n, pred, 0n, mi, pa}, s)) == total(s) : Nat}:
   match s:
     case St{f, b, ls}:
-      %Equal.sym(Nat, sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n}, ls)), sumls(ls), arrive_at_sum(p, i, id, want, pred, ls)) : {add(f, _) == add(f, sumls(ls)) : Nat}
+      %Equal.sym(Nat, sumls(arrive.at(p, i, E{id, want, 0n, pred, 0n, mi, pa}, ls)), sumls(ls), arrive_at_sum(p, i, id, want, pred, mi, pa, ls)) : {add(f, _) == add(f, sumls(ls)) : Nat}
       {==}
 
 # --- a tick moves requests between a lane's lists, and no permit ----------------------
@@ -697,8 +911,8 @@ def split_sum(+n: +List<E>, +b: Nat) -> {add(sumk(sm(split(n, b))), sumk(ss(spli
   match n:
     case Nil{}:
       {==}
-    case Con{E{id, want, k, pred, age}, t}:
-      split_sum.if(E{id, want, k, pred, 1n+age}, split(t, b), le(b, 1n+age), sumk(t), split_sum(t, b))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      split_sum.if(E{id, want, k, pred, 1n+age, mi, pa}, split(t, b), le(b, 1n+age), sumk(t), split_sum(t, b))
 
 def append_sum(+xs: +List<E>, +ys: +List<E>) -> {sumk(append(xs, ys)) == add(sumk(xs), sumk(ys)) : Nat}:
   match xs:
@@ -768,24 +982,24 @@ def tick_total(+s: St) -> {total(tick(s)) == total(s) : Nat}:
 
 # --- an end gives back what its entry held ----------------------------------------------
 
-def fin_sum.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+def fin_sum.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
   ih: {add(wf(rest), sumk(wl(rest))) == sumk(t) : Nat})
-  -> {add(wf(fin.if(id, want, k, pred, age, t, rest, hit)), sumk(wl(fin.if(id, want, k, pred, age, t, rest, hit)))) == add(k, sumk(t)) : Nat}:
+  -> {add(wf(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit)), sumk(wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit)))) == add(k, sumk(t)) : Nat}:
   match hit:
     case True{}:
       {==}
     case False{}:
-      Equal.trans(Nat, add(wf(W.cons(E{id, want, k, pred, age}, rest)), sumk(wl(W.cons(E{id, want, k, pred, age}, rest)))),
+      Equal.trans(Nat, add(wf(W.cons(E{id, want, k, pred, age, mi, pa}, rest)), sumk(wl(W.cons(E{id, want, k, pred, age, mi, pa}, rest)))),
         add(k, add(wf(rest), sumk(wl(rest)))), add(k, sumk(t)),
-        cons_sum(E{id, want, k, pred, age}, rest),
+        cons_sum(E{id, want, k, pred, age, mi, pa}, rest),
         Equal.cong(Nat, Nat, x => add(k, x), add(wf(rest), sumk(wl(rest))), sumk(t), ih))
 
 def fin_sum(+lane: +List<E>, +x: Nat) -> {add(wf(fin(lane, x)), sumk(wl(fin(lane, x)))) == sumk(lane) : Nat}:
   match lane:
     case Nil{}:
       {==}
-    case Con{E{id, want, k, pred, age}, t}:
-      fin_sum.if(id, want, k, pred, age, t, fin(t, x), same(x, id), fin_sum(t, x))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      fin_sum.if(id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), fin_sum(t, x))
 
 def lfin_sum(+l: Lane, +x: Nat) -> {add(lf(lfin(l, x)), suml(ll(lfin(l, x)))) == suml(l) : Nat}:
   match l:
@@ -817,8 +1031,8 @@ law conserved:
 
 def conserved(p, o, s):
   match o:
-    case Arrive{band, id, want, pred, elapsed}:
-      arrive_total(p, lane(band, elapsed), id, 1n+want, pred, s)
+    case Arrive{band, id, want, pred, elapsed, mi, pa}:
+      arrive_total(p, lane(band, elapsed), id, 1n+want, pred, mi, pa, s)
     case Decide{}:
       decide_total(s)
     case Tick{}:
@@ -854,8 +1068,8 @@ def AllFilled(lane: +List<E>) -> Data:
     case Con{h, t}:
       Sigma<&2, &2, IsZero(need(h)), u => AllFilled(t)>
 
-def head_fd(+k: Nat, +want: Nat, +f: Nat, +id: Nat, +pred: Nat, +age: Nat)
-  -> Either<&2, &2, IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age})), IsZero(gr(need(E{id, want, k, pred, age}), f))>:
+def head_fd(+k: Nat, +want: Nat, +f: Nat, +id: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat)
+  -> Either<&2, &2, IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa})), IsZero(gr(need(E{id, want, k, pred, age, mi, pa}), f))>:
   match k want f:
     case 0n 0n f0:
       Inl{Unit{}}
@@ -894,21 +1108,21 @@ def walk_zero_l(+lane: +List<E>) -> {lane == wl(walk(lane, 0n)) : +List<E>}:
   match lane:
     case Nil{}:
       {==}
-    case Con{E{id, want, k, pred, age}, t}:
-      %gg_z(need(E{id, want, k, pred, age})) : {E{id, want, k, pred, age} <> t == wl(W.cons(E{id, want, add(k, _), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), 0n)))) : +List<E>}
-      %Equal.sym(Nat, add(k, 0n), k, add_zero_r(k)) : {E{id, want, k, pred, age} <> t == wl(W.cons(E{id, want, _, pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), 0n)))) : +List<E>}
-      %gr_z(need(E{id, want, k, pred, age})) : {E{id, want, k, pred, age} <> t == wl(W.cons(E{id, want, k, pred, age}, walk(t, _))) : +List<E>}
-      %wl_cons(E{id, want, k, pred, age}, walk(t, 0n)) : {E{id, want, k, pred, age} <> t == _ : +List<E>}
-      %walk_zero_l(t) : {E{id, want, k, pred, age} <> t == E{id, want, k, pred, age} <> _ : +List<E>}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %gg_z(need(E{id, want, k, pred, age, mi, pa})) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, add(k, _), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), 0n)))) : +List<E>}
+      %Equal.sym(Nat, add(k, 0n), k, add_zero_r(k)) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, _, pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), 0n)))) : +List<E>}
+      %gr_z(need(E{id, want, k, pred, age, mi, pa})) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, k, pred, age, mi, pa}, walk(t, _))) : +List<E>}
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, walk(t, 0n)) : {E{id, want, k, pred, age, mi, pa} <> t == _ : +List<E>}
+      %walk_zero_l(t) : {E{id, want, k, pred, age, mi, pa} <> t == E{id, want, k, pred, age, mi, pa} <> _ : +List<E>}
       {==}
 
 def walk_zero_f(+lane: +List<E>) -> {0n == wf(walk(lane, 0n)) : Nat}:
   match lane:
     case Nil{}:
       {==}
-    case Con{E{id, want, k, pred, age}, t}:
-      %wf_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), 0n)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), 0n))) : {0n == _ : Nat}
-      %gr_z(need(E{id, want, k, pred, age})) : {0n == wf(walk(t, _)) : Nat}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wf_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), 0n)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), 0n))) : {0n == _ : Nat}
+      %gr_z(need(E{id, want, k, pred, age, mi, pa})) : {0n == wf(walk(t, _)) : Nat}
       walk_zero_f(t)
 
 def iz_eq(+x: Nat, z: IsZero(x)) -> {0n == x : Nat}:
@@ -949,19 +1163,19 @@ def walk_fd(+lane: +List<E>, +f: Nat) -> Either<&2, &2, AllFilled(wl(walk(lane, 
   match lane:
     case Nil{}:
       Inl{Unit{}}
-    case Con{E{id, want, k, pred, age}, t}:
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f)))
-        : Either<&2, &2, AllFilled(_), IsZero(wf(W.cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f)))))>
-      %wf_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f)))
-        : Either<&2, &2, AllFilled(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age} <> wl(walk(t, gr(need(E{id, want, k, pred, age}), f)))), IsZero(_)>
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))
+        : Either<&2, &2, AllFilled(_), IsZero(wf(W.cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))))>
+      %wf_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))
+        : Either<&2, &2, AllFilled(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa} <> wl(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))), IsZero(_)>
       fd_combine(
-        IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age})),
-        AllFilled(wl(walk(t, gr(need(E{id, want, k, pred, age}), f)))),
-        IsZero(wf(walk(t, gr(need(E{id, want, k, pred, age}), f)))),
-        IsZero(gr(need(E{id, want, k, pred, age}), f)),
-        head_fd(k, want, f, id, pred, age),
-        walk_fd(t, gr(need(E{id, want, k, pred, age}), f)),
-        z => dry_tail(t, gr(need(E{id, want, k, pred, age}), f), z))
+        IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa})),
+        AllFilled(wl(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))),
+        IsZero(wf(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))),
+        IsZero(gr(need(E{id, want, k, pred, age, mi, pa}), f)),
+        head_fd(k, want, f, id, pred, age, mi, pa),
+        walk_fd(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)),
+        z => dry_tail(t, gr(need(E{id, want, k, pred, age, mi, pa}), f), z))
 
 # --- a lane walk: its old list first, then its new one --------------------------------
 
@@ -1091,11 +1305,14 @@ def lsdry_tail(+ls: +List<Lane>, +r: Nat, z: IsZero(r)) -> IsZero(lsf(walks(ls, 
       match z:
 
 # --- LAW (lanes in order): a lane gains a permit only once every lane before it needs none ---
+# This and the next two laws are today's decision's (`step.today`). A gather breaks each of them
+# on purpose: it leaves permits free while it waits and lets requests behind it pass. They hold
+# of `step` for every state without a minimum (`..._without_min`, below `min_le_one_is_today`).
 
 law lanes_in_order:
   for +p: Pol
   for +s: St
-  Before(slanes(s), slanes(step(p, Decide{}, s)))
+  Before(slanes(s), slanes(step.today(p, Decide{}, s)))
 
 def lanes_in_order.go(+l: Lane, +t: +List<Lane>, +f: Nat,
   fd: Either<&2, &2, AllFilledL(ll(lwalk(l, f))), IsZero(lf(lwalk(l, f)))>)
@@ -1124,7 +1341,7 @@ def lanes_in_order(p, s):
 law work_conserving:
   for +p: Pol
   for +s: St
-  Either<&2, &2, AllL(l => AllFilledL(l), slanes(step(p, Decide{}, s))), IsZero(sfree(step(p, Decide{}, s)))>
+  Either<&2, &2, AllL(l => AllFilledL(l), slanes(step.today(p, Decide{}, s))), IsZero(sfree(step.today(p, Decide{}, s)))>
 
 def walks_fd(+ls: +List<Lane>, +f: Nat) -> Either<&2, &2, AllL(l => AllFilledL(l), lsl(walks(ls, f))), IsZero(lsf(walks(ls, f)))>:
   match ls:
@@ -1167,17 +1384,17 @@ def walk_order(+lane: +List<E>, +f: Nat) -> Order(lane, wl(walk(lane, f))):
   match lane:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f)))
-        : Order(E{id, want, k, pred, age} <> t, _)
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))
+        : Order(E{id, want, k, pred, age, mi, pa} <> t, _)
       order_head(
-        IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age})),
-        Order(t, wl(walk(t, gr(need(E{id, want, k, pred, age}), f)))),
-        {wl(walk(t, gr(need(E{id, want, k, pred, age}), f))) == t : +List<E>},
-        IsZero(gr(need(E{id, want, k, pred, age}), f)),
-        head_fd(k, want, f, id, pred, age),
-        walk_order(t, gr(need(E{id, want, k, pred, age}), f)),
-        z => zero_tail_l(t, gr(need(E{id, want, k, pred, age}), f), z))
+        IsZero(need(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa})),
+        Order(t, wl(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))),
+        {wl(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))) == t : +List<E>},
+        IsZero(gr(need(E{id, want, k, pred, age, mi, pa}), f)),
+        head_fd(k, want, f, id, pred, age, mi, pa),
+        walk_order(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)),
+        z => zero_tail_l(t, gr(need(E{id, want, k, pred, age, mi, pa}), f), z))
 
 def lold(l: Lane) -> +List<E>:
   match l:
@@ -1208,7 +1425,7 @@ def lwalk_order(+l: Lane, +f: Nat) -> OrderL(l, ll(lwalk(l, f))):
 law first_in_order_filled:
   for +p: Pol
   for +s: St
-  All2(l => m => OrderL(l, m), slanes(s), slanes(step(p, Decide{}, s)))
+  All2(l => m => OrderL(l, m), slanes(s), slanes(step.today(p, Decide{}, s)))
 
 def walks_order(+ls: +List<Lane>, +f: Nat) -> All2(l => m => OrderL(l, m), ls, lsl(walks(ls, f))):
   match ls:
@@ -1261,35 +1478,59 @@ def walk_kept(+lane: +List<E>, +f: Nat) -> Kept(lane, wl(walk(lane, f))):
   match lane:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f)))
-        : Kept(E{id, want, k, pred, age} <> t, _)
-      (same_refl(id), (le_add(k, gg(need(E{id, want, k, pred, age}), f)), walk_kept(t, gr(need(E{id, want, k, pred, age}), f))))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)))
+        : Kept(E{id, want, k, pred, age, mi, pa} <> t, _)
+      (same_refl(id), (le_add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), walk_kept(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))))
+
+def gwalk_kept(+lo: Bool, +lane: +List<E>, +f: Nat, +g: +List<Nat>) -> Kept(lane, wl(gwalk(lo, lane, f, g))):
+  match lane:
+    case Nil{}:
+      Unit{}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)))
+        : Kept(E{id, want, k, pred, age, mi, pa} <> t, _)
+      (same_refl(id), (le_add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)),
+        gwalk_kept(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))))
+
+def kept_refl(+xs: +List<E>) -> Kept(xs, xs):
+  match xs:
+    case Nil{}:
+      Unit{}
+    case Con{h, t}:
+      (same_refl(eid(h)), (LE_refl(ek(h)), kept_refl(t)))
 
 def KeptL(l: Lane, m: Lane) -> Data:
   Sigma<&2, &2, Kept(lold(l), lold(m)), u => Kept(lnew(l), lnew(m))>
 
-def lwalk_kept(+l: Lane, +f: Nat) -> KeptL(l, ll(lwalk(l, f))):
+def glwalk_kept.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>) -> KeptL(Lane{o, n}, ll(glwalk.if(sk, lo, o, n, f, g))):
+  match sk:
+    case True{}:
+      (kept_refl(o), kept_refl(n))
+    case False{}:
+      (walk_kept(o, f), gwalk_kept(lo, n, wf(walk(o, f)), g))
+
+def glwalk_kept(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>) -> KeptL(l, ll(glwalk(lo, l, f, g))):
   match l:
     case Lane{o, n}:
-      (walk_kept(o, f), walk_kept(n, wf(walk(o, f))))
+      glwalk_kept.if(skip(lo, g), lo, o, n, f, g)
 
 law decide_never_preempts:
   for +p: Pol
   for +s: St
   All2(l => m => KeptL(l, m), slanes(s), slanes(step(p, Decide{}, s)))
 
-def walks_kept(+ls: +List<Lane>, +f: Nat) -> All2(l => m => KeptL(l, m), ls, lsl(walks(ls, f))):
+def gwalks_kept(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>) -> All2(l => m => KeptL(l, m), ls, lsl(gwalks(ls, f, g))):
   match ls:
     case Nil{}:
       Unit{}
     case Con{+l, +t}:
-      (lwalk_kept(l, f), walks_kept(t, lf(lwalk(l, f))))
+      (glwalk_kept(islow(t), l, f, g), gwalks_kept(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)))
 
 def decide_never_preempts(p, s):
   match s:
     case St{f, b, ls}:
-      walks_kept(ls, f)
+      gwalks_kept(ls, f, [])
 
 # Every entry of xs is in ys, unchanged and in its order.
 def Sub(xs: +List<E>, ys: +List<E>) -> Data:
@@ -1373,13 +1614,15 @@ law arrival_never_preempts:
   for +want: Nat
   for +pred: Nat
   for +elapsed: Nat
+  for +mi: Nat
+  for +pa: Nat
   for +s: St
-  All2(l => m => SubL(l, m), slanes(s), slanes(step(p, Arrive{band, id, want, pred, elapsed}, s)))
+  All2(l => m => SubL(l, m), slanes(s), slanes(step(p, Arrive{band, id, want, pred, elapsed, mi, pa}, s)))
 
-def arrival_never_preempts(p, band, id, want, pred, elapsed, s):
+def arrival_never_preempts(p, band, id, want, pred, elapsed, mi, pa, s):
   match s:
     case St{f, b, ls}:
-      subls_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls)
+      subls_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, ls)
 
 # An end removes its own entry; every other entry stays as it was.
 def sub_cons_r(+xs: +List<E>, +e: E) -> Sub(xs, e <> xs):
@@ -1389,22 +1632,22 @@ def sub_cons_r(+xs: +List<E>, +e: E) -> Sub(xs, e <> xs):
     case Con{h, t}:
       Inr{sub_refl(h <> t)}
 
-def sub_fin.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool, ih: Sub(wl(rest), t))
-  -> Sub(wl(fin.if(id, want, k, pred, age, t, rest, hit)), E{id, want, k, pred, age} <> t):
+def sub_fin.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool, ih: Sub(wl(rest), t))
+  -> Sub(wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit)), E{id, want, k, pred, age, mi, pa} <> t):
   match hit:
     case True{}:
-      sub_cons_r(t, E{id, want, k, pred, age})
+      sub_cons_r(t, E{id, want, k, pred, age, mi, pa})
     case False{}:
-      %wl_cons(E{id, want, k, pred, age}, rest)
-        : Sub(_, E{id, want, k, pred, age} <> t)
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest)
+        : Sub(_, E{id, want, k, pred, age, mi, pa} <> t)
       Inl{({==}, ih)}
 
 def sub_fin(+lane: +List<E>, +x: Nat) -> Sub(wl(fin(lane, x)), lane):
   match lane:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
-      sub_fin.if(id, want, k, pred, age, t, fin(t, x), same(x, id), sub_fin(t, x))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      sub_fin.if(id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), sub_fin(t, x))
 
 def subl_fin(+l: Lane, +x: Nat) -> SubL(ll(lfin(l, x)), l):
   match l:
@@ -1433,7 +1676,7 @@ def finish_takes_only_its_own(p, x, s):
 
 def eage(e: E) -> Nat:
   match e:
-    case E{id, want, k, pred, age}:
+    case E{id, want, k, pred, age, mi, pa}:
       age
 
 def Regroup(x: E, y: E) -> Data:
@@ -1479,8 +1722,8 @@ def split_il(+n: +List<E>, +b: Nat) -> Il(n, sm(split(n, b)), ss(split(n, b))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
-      split_il.if(E{id, want, k, pred, age}, E{id, want, k, pred, 1n+age}, t, split(t, b), le(b, 1n+age),
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      split_il.if(E{id, want, k, pred, age, mi, pa}, E{id, want, k, pred, 1n+age, mi, pa}, t, split(t, b), le(b, 1n+age),
         ({==}, ({==}, {==})), split_il(t, b))
 
 def hd_eq(+x: E, +y: E, +xt: +List<E>, +yt: +List<E>, +q: Sigma<&2, &2, {x == y : E}, u => Sub(xt, yt)>) -> {x == y : E}:
@@ -1599,8 +1842,8 @@ def split_age(+n: +List<E>, +b: Nat) -> Sigma<&2, &2, Aged(b, sm(split(n, b))), 
   match n:
     case Nil{}:
       (Unit{}, Unit{})
-    case Con{E{id, want, k, pred, age}, t}:
-      split_age.if(b, E{id, want, k, pred, 1n+age}, split(t, b), le(b, 1n+age), {==}, split_age(t, b))
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      split_age.if(b, E{id, want, k, pred, 1n+age, mi, pa}, split(t, b), le(b, 1n+age), {==}, split_age(t, b))
 
 law tick_bounds_wait:
   for +p: Pol
@@ -1733,23 +1976,23 @@ def sorted_insert(+xs: +List<E>, +y: E, +s: Sorted(xs)) -> Sorted(insert(xs, y))
       (sh, st) = s
       sorted_insert.if(y, h, t, Bool.not(le(epred(h), epred(y))), {==}, sh, st, sorted_insert(t, y, st))
 
-def walk_allge(+p: Nat, +n: +List<E>, +f: Nat, +a: AllGe(p, n)) -> AllGe(p, wl(walk(n, f))):
+def gwalk_allge(+lo: Bool, +p: Nat, +n: +List<E>, +f: Nat, +g: +List<Nat>, +a: AllGe(p, n)) -> AllGe(p, wl(gwalk(lo, n, f, g))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (h, at) = a
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f))) : AllGe(p, _)
-      (h, walk_allge(p, t, gr(need(E{id, want, k, pred, age}), f), at))
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : AllGe(p, _)
+      (h, gwalk_allge(lo, p, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), at))
 
-def walk_sorted(+n: +List<E>, +f: Nat, +s: Sorted(n)) -> Sorted(wl(walk(n, f))):
+def gwalk_sorted(+lo: Bool, +n: +List<E>, +f: Nat, +g: +List<Nat>, +s: Sorted(n)) -> Sorted(wl(gwalk(lo, n, f, g))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (sh, st) = s
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f))) : Sorted(_)
-      (walk_allge(pred, t, gr(need(E{id, want, k, pred, age}), f), sh), walk_sorted(t, gr(need(E{id, want, k, pred, age}), f), st))
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : Sorted(_)
+      (gwalk_allge(lo, pred, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), sh), gwalk_sorted(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), st))
 
 def split_allge.if(+p: Nat, +y: E, +rest: Sp, +aged: Bool, +py: IsTrue(le(p, epred(y))), +ih: AllGe(p, ss(rest)))
   -> AllGe(p, ss(split.if(y, rest, aged))):
@@ -1765,9 +2008,9 @@ def split_allge(+p: Nat, +n: +List<E>, +b: Nat, +a: AllGe(p, n)) -> AllGe(p, ss(
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (h, at) = a
-      split_allge.if(p, E{id, want, k, pred, 1n+age}, split(t, b), le(b, 1n+age), h, split_allge(p, t, b, at))
+      split_allge.if(p, E{id, want, k, pred, 1n+age, mi, pa}, split(t, b), le(b, 1n+age), h, split_allge(p, t, b, at))
 
 def split_sorted.if(+y: E, +t: +List<E>, +b: Nat, +rest: Sp, +aged: Bool, +ya: AllGe(epred(y), ss(rest)), +ih: Sorted(ss(rest)))
   -> Sorted(ss(split.if(y, rest, aged))):
@@ -1783,45 +2026,45 @@ def split_sorted(+n: +List<E>, +b: Nat, +s: Sorted(n)) -> Sorted(ss(split(n, b))
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (sh, st) = s
-      split_sorted.if(E{id, want, k, pred, 1n+age}, t, b, split(t, b), le(b, 1n+age), split_allge(pred, t, b, sh), split_sorted(t, b, st))
+      split_sorted.if(E{id, want, k, pred, 1n+age, mi, pa}, t, b, split(t, b), le(b, 1n+age), split_allge(pred, t, b, sh), split_sorted(t, b, st))
 
-def fin_allge.if(+p: Nat, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+def fin_allge.if(+p: Nat, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
   +ph: IsTrue(le(p, pred)), +pt: AllGe(p, t), +ih: AllGe(p, wl(rest)))
-  -> AllGe(p, wl(fin.if(id, want, k, pred, age, t, rest, hit))):
+  -> AllGe(p, wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit))):
   match hit:
     case True{}:
       pt
     case False{}:
-      %wl_cons(E{id, want, k, pred, age}, rest) : AllGe(p, _)
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest) : AllGe(p, _)
       (ph, ih)
 
 def fin_allge(+p: Nat, +n: +List<E>, +x: Nat, +a: AllGe(p, n)) -> AllGe(p, wl(fin(n, x))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (h, at) = a
-      fin_allge.if(p, id, want, k, pred, age, t, fin(t, x), same(x, id), h, at, fin_allge(p, t, x, at))
+      fin_allge.if(p, id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), h, at, fin_allge(p, t, x, at))
 
-def fin_sorted.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+def fin_sorted.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
   +sh: AllGe(pred, wl(rest)), +st: Sorted(t), +ih: Sorted(wl(rest)))
-  -> Sorted(wl(fin.if(id, want, k, pred, age, t, rest, hit))):
+  -> Sorted(wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit))):
   match hit:
     case True{}:
       st
     case False{}:
-      %wl_cons(E{id, want, k, pred, age}, rest) : Sorted(_)
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest) : Sorted(_)
       (sh, ih)
 
 def fin_sorted(+n: +List<E>, +x: Nat, +s: Sorted(n)) -> Sorted(wl(fin(n, x))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (sh, st) = s
-      fin_sorted.if(id, want, k, pred, age, t, fin(t, x), same(x, id), fin_allge(pred, t, x, sh), st, fin_sorted(t, x, st))
+      fin_sorted.if(id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), fin_allge(pred, t, x, sh), st, fin_sorted(t, x, st))
 
 def SortedL(l: Lane) -> Data:
   Sorted(lnew(l))
@@ -1834,10 +2077,17 @@ def sorted_lane.arrive(+y: E, +l: Lane, +s: SortedL(l)) -> SortedL(arrive.lane(S
     case Lane{o, n}:
       sorted_insert(n, y, s)
 
-def sorted_lane.walk(+l: Lane, +f: Nat, +s: SortedL(l)) -> SortedL(ll(lwalk(l, f))):
+def sorted_lane.walk.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>, +s: Sorted(n)) -> SortedL(ll(glwalk.if(sk, lo, o, n, f, g))):
+  match sk:
+    case True{}:
+      s
+    case False{}:
+      gwalk_sorted(lo, n, wf(walk(o, f)), g, s)
+
+def sorted_lane.walk(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>, +s: SortedL(l)) -> SortedL(ll(glwalk(lo, l, f, g))):
   match l:
     case Lane{o, n}:
-      walk_sorted(n, wf(walk(o, f)), s)
+      sorted_lane.walk.if(skip(lo, g), lo, o, n, f, g, s)
 
 def sorted_lane.tick(+b: Nat, +l: Lane, +s: SortedL(l)) -> SortedL(tick.lane(b, l)):
   match l:
@@ -1866,13 +2116,13 @@ def sorted_arrive(+i: Nat, +y: E, +ls: +List<Lane>, +h: AllL(l => SortedL(l), ls
     case i0 Nil{}:
       Unit{}
 
-def sorted_walks(+ls: +List<Lane>, +f: Nat, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), lsl(walks(ls, f))):
+def sorted_walks(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), lsl(gwalks(ls, f, g))):
   match ls:
     case Nil{}:
       Unit{}
     case Con{+l, +t}:
       (sl, st) = h
-      (sorted_lane.walk(l, f, sl), sorted_walks(t, lf(lwalk(l, f)), st))
+      (sorted_lane.walk(islow(t), l, f, g, sl), sorted_walks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g), st))
 
 def sorted_ticks(+b: Nat, +ls: +List<Lane>, +h: AllL(l => SortedL(l), ls)) -> AllL(l => SortedL(l), ticks(b, ls)):
   match ls:
@@ -1892,10 +2142,10 @@ def sorted_fins(+ls: +List<Lane>, +x: Nat, +h: AllL(l => SortedL(l), ls)) -> All
 
 def spt_keeps_new_sorted(o, s, i):
   match o s:
-    case Arrive{band, id, want, pred, elapsed} St{f, b, ls}:
-      sorted_arrive(lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls, i)
+    case Arrive{band, id, want, pred, elapsed, mi, pa} St{f, b, ls}:
+      sorted_arrive(lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, ls, i)
     case Decide{} St{f, b, ls}:
-      sorted_walks(ls, f, i)
+      sorted_walks(ls, f, [], i)
     case Tick{} St{f, b, ls}:
       sorted_ticks(b, ls, i)
     case Finish{x} St{f, b, ls}:
@@ -1966,55 +2216,55 @@ def walk_allgei(+p: Nat, +n: +List<E>, +f: Nat, +a: AllGeI(p, n)) -> AllGeI(p, w
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (h, at) = a
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f))) : AllGeI(p, _)
-      (h, walk_allgei(p, t, gr(need(E{id, want, k, pred, age}), f), at))
+      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))) : AllGeI(p, _)
+      (h, walk_allgei(p, t, gr(need(E{id, want, k, pred, age, mi, pa}), f), at))
 
 def walk_sortedI(+n: +List<E>, +f: Nat, +s: SortedI(n)) -> SortedI(wl(walk(n, f))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (sh, st) = s
-      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age}), f)), pred, age}, walk(t, gr(need(E{id, want, k, pred, age}), f))) : SortedI(_)
-      (walk_allgei(id, t, gr(need(E{id, want, k, pred, age}), f), sh), walk_sortedI(t, gr(need(E{id, want, k, pred, age}), f), st))
+      %wl_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))) : SortedI(_)
+      (walk_allgei(id, t, gr(need(E{id, want, k, pred, age, mi, pa}), f), sh), walk_sortedI(t, gr(need(E{id, want, k, pred, age, mi, pa}), f), st))
 
-def fin_allgei.if(+p: Nat, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+def fin_allgei.if(+p: Nat, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
   +ph: IsTrue(le(p, id)), +pt: AllGeI(p, t), +ih: AllGeI(p, wl(rest)))
-  -> AllGeI(p, wl(fin.if(id, want, k, pred, age, t, rest, hit))):
+  -> AllGeI(p, wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit))):
   match hit:
     case True{}:
       pt
     case False{}:
-      %wl_cons(E{id, want, k, pred, age}, rest) : AllGeI(p, _)
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest) : AllGeI(p, _)
       (ph, ih)
 
 def fin_allgei(+p: Nat, +n: +List<E>, +x: Nat, +a: AllGeI(p, n)) -> AllGeI(p, wl(fin(n, x))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (h, at) = a
-      fin_allgei.if(p, id, want, k, pred, age, t, fin(t, x), same(x, id), h, at, fin_allgei(p, t, x, at))
+      fin_allgei.if(p, id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), h, at, fin_allgei(p, t, x, at))
 
-def fin_sortedI.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+def fin_sortedI.if(+id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
   +sh: AllGeI(id, wl(rest)), +st: SortedI(t), +ih: SortedI(wl(rest)))
-  -> SortedI(wl(fin.if(id, want, k, pred, age, t, rest, hit))):
+  -> SortedI(wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit))):
   match hit:
     case True{}:
       st
     case False{}:
-      %wl_cons(E{id, want, k, pred, age}, rest) : SortedI(_)
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest) : SortedI(_)
       (sh, ih)
 
 def fin_sortedI(+n: +List<E>, +x: Nat, +s: SortedI(n)) -> SortedI(wl(fin(n, x))):
   match n:
     case Nil{}:
       Unit{}
-    case Con{E{id, want, k, pred, age}, t}:
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
       (sh, st) = s
-      fin_sortedI.if(id, want, k, pred, age, t, fin(t, x), same(x, id), fin_allgei(id, t, x, sh), st, fin_sortedI(t, x, st))
+      fin_sortedI.if(id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), fin_allgei(id, t, x, sh), st, fin_sortedI(t, x, st))
 
 
 def sorted_insall(+m: +List<E>, +o: +List<E>, +s: SortedI(o)) -> SortedI(insall(m, o)):
@@ -2030,10 +2280,17 @@ def OldOrderedL(l: Lane) -> Data:
 def OldOrdered(s: St) -> Data:
   AllL(l => OldOrderedL(l), slanes(s))
 
-def old_lane.walk(+l: Lane, +f: Nat, +s: OldOrderedL(l)) -> OldOrderedL(ll(lwalk(l, f))):
+def old_lane.walk.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>, +s: SortedI(o)) -> OldOrderedL(ll(glwalk.if(sk, lo, o, n, f, g))):
+  match sk:
+    case True{}:
+      s
+    case False{}:
+      walk_sortedI(o, f, s)
+
+def old_lane.walk(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>, +s: OldOrderedL(l)) -> OldOrderedL(ll(glwalk(lo, l, f, g))):
   match l:
     case Lane{o, n}:
-      walk_sortedI(o, f, s)
+      old_lane.walk.if(skip(lo, g), lo, o, n, f, g, s)
 
 def old_lane.tick(+b: Nat, +l: Lane, +s: OldOrderedL(l)) -> OldOrderedL(tick.lane(b, l)):
   match l:
@@ -2070,13 +2327,13 @@ def old_arrive(+p: Pol, +i: Nat, +y: E, +ls: +List<Lane>, +h: AllL(l => OldOrder
     case i0 Nil{}:
       Unit{}
 
-def old_walks(+ls: +List<Lane>, +f: Nat, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), lsl(walks(ls, f))):
+def old_walks(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), lsl(gwalks(ls, f, g))):
   match ls:
     case Nil{}:
       Unit{}
     case Con{+l, +t}:
       (sl, st) = h
-      (old_lane.walk(l, f, sl), old_walks(t, lf(lwalk(l, f)), st))
+      (old_lane.walk(islow(t), l, f, g, sl), old_walks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g), st))
 
 def old_ticks(+b: Nat, +ls: +List<Lane>, +h: AllL(l => OldOrderedL(l), ls)) -> AllL(l => OldOrderedL(l), ticks(b, ls)):
   match ls:
@@ -2096,10 +2353,10 @@ def old_fins(+ls: +List<Lane>, +x: Nat, +h: AllL(l => OldOrderedL(l), ls)) -> Al
 
 def old_stays_in_arrival_order(p, o, s, i):
   match o s:
-    case Arrive{band, id, want, pred, elapsed} St{f, b, ls}:
-      old_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n}, ls, i)
+    case Arrive{band, id, want, pred, elapsed, mi, pa} St{f, b, ls}:
+      old_arrive(p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, ls, i)
     case Decide{} St{f, b, ls}:
-      old_walks(ls, f, i)
+      old_walks(ls, f, [], i)
     case Tick{} St{f, b, ls}:
       old_ticks(b, ls, i)
     case Finish{x} St{f, b, ls}:
@@ -2111,18 +2368,18 @@ def old_stays_in_arrival_order(p, o, s, i):
 # into `old`, and Spt then grants it ahead of a newer, shorter request.
 law spt_serves_shortest_then_the_aged:
   Sigma<&2, &2,
-    {nth(2n, slanes(run(Today{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{1n, 1n, 1n, 9n, 0n}, E{2n, 1n, 0n, 1n, 0n}]} : Lane},
+    {nth(2n, slanes(run(Today{}, [Arrive{Background{}, 1n, 0n, 9n, 0n, 0n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n, 0n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{1n, 1n, 1n, 9n, 0n, 0n, 0n}, E{2n, 1n, 0n, 1n, 0n, 0n, 0n}]} : Lane},
     u => Sigma<&2, &2,
-    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{2n, 1n, 1n, 1n, 0n}, E{1n, 1n, 0n, 9n, 0n}]} : Lane},
+    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n, 0n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n, 0n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[], [E{2n, 1n, 1n, 1n, 0n, 0n, 0n}, E{1n, 1n, 0n, 9n, 0n, 0n, 0n}]} : Lane},
     v =>
-    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Tick{}, Tick{}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[E{1n, 1n, 1n, 9n, 2n}], [E{2n, 1n, 0n, 1n, 0n}]} : Lane}>>
+    {nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n, 0n, 0n}, Tick{}, Tick{}, Arrive{Background{}, 2n, 0n, 1n, 0n, 0n, 0n}, Decide{}], empty(1n, 2n)))) == Lane{[E{1n, 1n, 1n, 9n, 2n, 0n, 0n}], [E{2n, 1n, 0n, 1n, 0n, 0n, 0n}]} : Lane}>>
 
 def spt_serves_shortest_then_the_aged():
   ({==}, ({==}, {==}))
 
 # Two requests aging on one tick enter `old` by ticket, whatever their predictions.
 law same_tick_ages_by_ticket:
-  {lold(nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n}, Tick{}], empty(0n, 1n))))) == [E{1n, 1n, 0n, 9n, 1n}, E{2n, 1n, 0n, 1n, 1n}] : +List<E>}
+  {lold(nth(2n, slanes(run(Spt{}, [Arrive{Background{}, 1n, 0n, 9n, 0n, 0n, 0n}, Arrive{Background{}, 2n, 0n, 1n, 0n, 0n, 0n}, Tick{}], empty(0n, 1n))))) == [E{1n, 1n, 0n, 9n, 1n, 0n, 0n}, E{2n, 1n, 0n, 1n, 1n, 0n, 0n}] : +List<E>}
 
 def same_tick_ages_by_ticket():
   {==}
@@ -2190,10 +2447,10 @@ def interactive_decays_through_the_bands():
 # shorter gate leaf; at 250 s it is background work.
 law interactive_before_the_gate_until_it_decays:
   Sigma<&2, &2,
-    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 0n}, Decide{}], empty(1n, 30n))) == [Lane{[], [E{2n, 1n, 1n, 5n, 0n}]}, Lane{[], [E{1n, 1n, 0n, 1n, 0n}]}, Lane{[], []}] : +List<Lane>},
+    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n, 0n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 0n, 0n, 0n}, Decide{}], empty(1n, 30n))) == [Lane{[], [E{2n, 1n, 1n, 5n, 0n, 0n, 0n}]}, Lane{[], [E{1n, 1n, 0n, 1n, 0n, 0n, 0n}]}, Lane{[], []}] : +List<Lane>},
     u => Sigma<&2, &2,
-    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 130n}, Decide{}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], [E{1n, 1n, 1n, 1n, 0n}, E{2n, 1n, 0n, 5n, 0n}]}, Lane{[], []}] : +List<Lane>},
-    v => {slanes(run(Spt{}, [Arrive{Interactive{}, 3n, 0n, 5n, 250n}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], []}, Lane{[], [E{3n, 1n, 0n, 5n, 0n}]}] : +List<Lane>}>>
+    {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 1n, 0n, 0n, 0n}, Arrive{Interactive{}, 2n, 0n, 5n, 130n, 0n, 0n}, Decide{}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], [E{1n, 1n, 1n, 1n, 0n, 0n, 0n}, E{2n, 1n, 0n, 5n, 0n, 0n, 0n}]}, Lane{[], []}] : +List<Lane>},
+    v => {slanes(run(Spt{}, [Arrive{Interactive{}, 3n, 0n, 5n, 250n, 0n, 0n}], empty(1n, 30n))) == [Lane{[], []}, Lane{[], []}, Lane{[], [E{3n, 1n, 0n, 5n, 0n, 0n, 0n}]}] : +List<Lane>}>>
 
 def interactive_before_the_gate_until_it_decays():
   ({==}, ({==}, {==}))
@@ -2201,7 +2458,857 @@ def interactive_before_the_gate_until_it_decays():
 # Aging stays within a band: a gate request that has aged into `old` still waits behind a
 # fresh interactive one (the case a shared top lane got wrong).
 law aged_gate_stays_behind_fresh_interactive:
-  {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 9n, 0n}, Tick{}, Tick{}, Arrive{Interactive{}, 2n, 0n, 1n, 0n}, Decide{}], empty(1n, 2n))) == [Lane{[], [E{2n, 1n, 1n, 1n, 0n}]}, Lane{[E{1n, 1n, 0n, 9n, 2n}], []}, Lane{[], []}] : +List<Lane>}
+  {slanes(run(Spt{}, [Arrive{Gate{}, 1n, 0n, 9n, 0n, 0n, 0n}, Tick{}, Tick{}, Arrive{Interactive{}, 2n, 0n, 1n, 0n, 0n, 0n}, Decide{}], empty(1n, 2n))) == [Lane{[], [E{2n, 1n, 1n, 1n, 0n, 0n, 0n}]}, Lane{[E{1n, 1n, 0n, 9n, 2n, 0n, 0n}], []}, Lane{[], []}] : +List<Lane>}
 
 def aged_gate_stays_behind_fresh_interactive():
   {==}
+
+# === the minimum (mbx e95a64c) ======================================================
+
+# --- every request in `new`: a fact of its grant, want, minimum and party ----------------
+# A tick, an end and an arrival move requests and keep those four fields; only a decision
+# changes a grant, so each fact below is proven once for those steps and once for the walk.
+
+def RE(R: Nat -> Nat -> Nat -> Nat -> Data, e: E) -> Data:
+  match e:
+    case E{id, want, k, pred, age, mi, pa}:
+      R(k, want, mi, pa)
+
+def AllE(R: Nat -> Nat -> Nat -> Nat -> Data, xs: +List<E>) -> Data:
+  match xs:
+    case Nil{}:
+      Unit
+    case Con{x, xt}:
+      Sigma<&2, &2, RE(R, x), u => AllE(R, xt)>
+
+def AllN(R: Nat -> Nat -> Nat -> Nat -> Data, ls: +List<Lane>) -> Data:
+  AllL(l => AllE(R, lnew(l)), ls)
+
+def alle_snoc(-R: Nat -> Nat -> Nat -> Nat -> Data, +xs: +List<E>, +y: E, +a: AllE(R, xs), +ry: RE(R, y)) -> AllE(R, snoc(xs, y)):
+  match xs:
+    case Nil{}:
+      (ry, Unit{})
+    case Con{h, t}:
+      (ah, at) = a
+      (ah, alle_snoc(R, t, y, at, ry))
+
+def alle_insert.if(-R: Nat -> Nat -> Nat -> Nat -> Data, +y: E, +h: E, +t: +List<E>, +rest: +List<E>, +before: Bool,
+  +ry: RE(R, y), +rh: RE(R, h), +at: AllE(R, t), +ih: AllE(R, rest))
+  -> AllE(R, insert.if(y, h, t, rest, before)):
+  match before:
+    case True{}:
+      (ry, (rh, at))
+    case False{}:
+      (rh, ih)
+
+def alle_insert(-R: Nat -> Nat -> Nat -> Nat -> Data, +xs: +List<E>, +y: E, +a: AllE(R, xs), +ry: RE(R, y)) -> AllE(R, insert(xs, y)):
+  match xs:
+    case Nil{}:
+      (ry, Unit{})
+    case Con{h, t}:
+      (ah, at) = a
+      alle_insert.if(R, y, h, t, insert(t, y), Bool.not(le(epred(h), epred(y))), ry, ah, at, alle_insert(R, t, y, at, ry))
+
+def alle_lane_arrive(-R: Nat -> Nat -> Nat -> Nat -> Data, +p: Pol, +y: E, +l: Lane, +a: AllE(R, lnew(l)), +ry: RE(R, y)) -> AllE(R, lnew(arrive.lane(p, y, l))):
+  match p l:
+    case Today{} Lane{o, n}:
+      alle_snoc(R, n, y, a, ry)
+    case Spt{} Lane{o, n}:
+      alle_insert(R, n, y, a, ry)
+
+def alle_arrive(-R: Nat -> Nat -> Nat -> Nat -> Data, +p: Pol, +i: Nat, +y: E, +ls: +List<Lane>, +ry: RE(R, y), +h: AllN(R, ls)) -> AllN(R, arrive.at(p, i, y, ls)):
+  match i ls:
+    case 0n Con{+l, +t}:
+      (sl, st) = h
+      (alle_lane_arrive(R, p, y, l, sl, ry), st)
+    case 1n+j Con{+l, +t}:
+      (sl, st) = h
+      (sl, alle_arrive(R, p, j, y, t, ry, st))
+    case i0 Nil{}:
+      Unit{}
+
+def alle_split.if(-R: Nat -> Nat -> Nat -> Nat -> Data, +y: E, +rest: Sp, +aged: Bool, +ry: RE(R, y), +ih: AllE(R, ss(rest))) -> AllE(R, ss(split.if(y, rest, aged))):
+  match rest:
+    case Sp{m, s}:
+      match aged:
+        case True{}:
+          ih
+        case False{}:
+          (ry, ih)
+
+def alle_split(-R: Nat -> Nat -> Nat -> Nat -> Data, +n: +List<E>, +b: Nat, +a: AllE(R, n)) -> AllE(R, ss(split(n, b))):
+  match n:
+    case Nil{}:
+      Unit{}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      alle_split.if(R, E{id, want, k, pred, 1n+age, mi, pa}, split(t, b), le(b, 1n+age), h, alle_split(R, t, b, at))
+
+def alle_tick_lane(-R: Nat -> Nat -> Nat -> Nat -> Data, +b: Nat, +l: Lane, +a: AllE(R, lnew(l))) -> AllE(R, lnew(tick.lane(b, l))):
+  match l:
+    case Lane{o, n}:
+      alle_split(R, n, b, a)
+
+def alle_ticks(-R: Nat -> Nat -> Nat -> Nat -> Data, +b: Nat, +ls: +List<Lane>, +h: AllN(R, ls)) -> AllN(R, ticks(b, ls)):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (alle_tick_lane(R, b, l, sl), alle_ticks(R, b, t, st))
+
+def alle_fin.if(-R: Nat -> Nat -> Nat -> Nat -> Data, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>, +rest: W, +hit: Bool,
+  +rh: R(k, want, mi, pa), +at: AllE(R, t), +ih: AllE(R, wl(rest)))
+  -> AllE(R, wl(fin.if(id, want, k, pred, age, mi, pa, t, rest, hit))):
+  match hit:
+    case True{}:
+      at
+    case False{}:
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, rest) : AllE(R, _)
+      (rh, ih)
+
+def alle_fin(-R: Nat -> Nat -> Nat -> Nat -> Data, +n: +List<E>, +x: Nat, +a: AllE(R, n)) -> AllE(R, wl(fin(n, x))):
+  match n:
+    case Nil{}:
+      Unit{}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      alle_fin.if(R, id, want, k, pred, age, mi, pa, t, fin(t, x), same(x, id), h, at, alle_fin(R, t, x, at))
+
+def alle_lane_fin(-R: Nat -> Nat -> Nat -> Nat -> Data, +l: Lane, +x: Nat, +a: AllE(R, lnew(l))) -> AllE(R, lnew(ll(lfin(l, x)))):
+  match l:
+    case Lane{o, n}:
+      alle_fin(R, n, x, a)
+
+def alle_fins(-R: Nat -> Nat -> Nat -> Nat -> Data, +ls: +List<Lane>, +x: Nat, +h: AllN(R, ls)) -> AllN(R, lsl(fins(ls, x))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (alle_lane_fin(R, l, x, sl), alle_fins(R, t, x, st))
+
+# --- LAW (a minimum of 0 or 1 is none): without minimums, the policy is today's -----------
+
+# A request names no minimum.
+def RM() -> Nat -> Nat -> Nat -> Nat -> Data:
+  k => w => m => q => IsTrue(le(m, 1n))
+
+def NoMin(s: St) -> Data:
+  AllN(RM(), slanes(s))
+
+# An arrival names no minimum.
+def ArrM(o: Op) -> Data:
+  match o:
+    case Arrive{band, id, want, pred, elapsed, mi, pa}:
+      IsTrue(le(mi, 1n))
+    case Decide{}:
+      Unit
+    case Tick{}:
+      Unit
+    case Finish{x}:
+      Unit
+
+def AllArr(os: +List<Op>) -> Data:
+  match os:
+    case Nil{}:
+      Unit
+    case Con{o, t}:
+      Sigma<&2, &2, ArrM(o), u => AllArr(t)>
+
+# With no gather open, a request without a minimum takes what it needs, as today.
+def act_take(+lo: Bool, +k: Nat, +mi: Nat, +want: Nat, +pa: Nat, +f: Nat, h: IsTrue(le(mi, 1n))) -> {Take{} == act(lo, [], k, want, mi, pa, f) : Act}:
+  match k:
+    case 0n:
+      match mi:
+        case 0n:
+          {==}
+        case 1n+z:
+          match z:
+            case 0n:
+              match want:
+                case 0n:
+                  {==}
+                case 1n+w:
+                  {==}
+            case 1n+y:
+              match h:
+    case 1n+j:
+      {==}
+
+def gwalk_today(+lo: Bool, +lane: +List<E>, +f: Nat, +a: AllE(RM(), lane)) -> {walk(lane, f) == gwalk(lo, lane, f, []) : W}:
+  match lane:
+    case Nil{}:
+      {==}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      %act_take(lo, k, mi, want, pa, f, h) : {W.cons(E{id, want, add(k, gg(need.k(want, k), f)), pred, age, mi, pa}, walk(t, gr(need.k(want, k), f))) == W.cons(E{id, want, add(k, gg(en(_, need.k(want, k)), f)), pred, age, mi, pa}, gwalk(lo, t, gr(en(_, need.k(want, k)), f), gnext(_, pa, []))) : W}
+      Equal.cong(W, W, w => W.cons(E{id, want, add(k, gg(need.k(want, k), f)), pred, age, mi, pa}, w),
+        walk(t, gr(need.k(want, k), f)), gwalk(lo, t, gr(need.k(want, k), f), []), gwalk_today(lo, t, gr(need.k(want, k), f), at))
+
+def gend_today(+lo: Bool, +lane: +List<E>, +f: Nat, +a: AllE(RM(), lane)) -> {[] == gend(lo, lane, f, []) : +List<Nat>}:
+  match lane:
+    case Nil{}:
+      {==}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      %act_take(lo, k, mi, want, pa, f, h) : {[] == gend(lo, t, gr(en(_, need.k(want, k)), f), gnext(_, pa, [])) : +List<Nat>}
+      gend_today(lo, t, gr(need.k(want, k), f), at)
+
+def glwalk_today(+lo: Bool, +l: Lane, +f: Nat, +a: AllE(RM(), lnew(l))) -> {lwalk(l, f) == glwalk(lo, l, f, []) : LW}:
+  match l:
+    case Lane{o, n}:
+      %gwalk_today(lo, n, wf(walk(o, f)), a) : {LW{wf(walk(n, wf(walk(o, f)))), Lane{wl(walk(o, f)), wl(walk(n, wf(walk(o, f))))}} == LW{wf(_), Lane{wl(walk(o, f)), wl(_)}} : LW}
+      {==}
+
+def glg_today(+lo: Bool, +l: Lane, +f: Nat, +a: AllE(RM(), lnew(l))) -> {[] == glg(lo, l, f, []) : +List<Nat>}:
+  match l:
+    case Lane{o, n}:
+      gend_today(lo, n, wf(walk(o, f)), a)
+
+def gwalks_today(+ls: +List<Lane>, +f: Nat, +a: AllN(RM(), ls)) -> {walks(ls, f) == gwalks(ls, f, []) : LS}:
+  match ls:
+    case Nil{}:
+      {==}
+    case Con{+l, +t}:
+      (al, at) = a
+      %glg_today(islow(t), l, f, al) : {LS{lsf(walks(t, lf(lwalk(l, f)))), Con{ll(lwalk(l, f)), lsl(walks(t, lf(lwalk(l, f))))}} == LS{lsf(gwalks(t, lf(glwalk(islow(t), l, f, [])), _)), Con{ll(glwalk(islow(t), l, f, [])), lsl(gwalks(t, lf(glwalk(islow(t), l, f, [])), _))}} : LS}
+      %glwalk_today(islow(t), l, f, al) : {LS{lsf(walks(t, lf(lwalk(l, f)))), Con{ll(lwalk(l, f)), lsl(walks(t, lf(lwalk(l, f))))}} == LS{lsf(gwalks(t, lf(_), [])), Con{ll(_), lsl(gwalks(t, lf(_), []))}} : LS}
+      %gwalks_today(t, lf(lwalk(l, f)), at) : {LS{lsf(walks(t, lf(lwalk(l, f)))), Con{ll(lwalk(l, f)), lsl(walks(t, lf(lwalk(l, f))))}} == LS{lsf(_), Con{ll(lwalk(l, f)), lsl(_)}} : LS}
+      {==}
+
+def decide_today(+s: St, +a: NoMin(s)) -> {decide.today(s) == decide(s) : St}:
+  match s:
+    case St{f, b, ls}:
+      %gwalks_today(ls, f, a) : {St{lsf(walks(ls, f)), b, lsl(walks(ls, f))} == St{lsf(_), b, lsl(_)} : St}
+      {==}
+
+def step_today(+p: Pol, +o: Op, +s: St, +a: NoMin(s)) -> {step.today(p, o, s) == step(p, o, s) : St}:
+  match o:
+    case Arrive{band, id, want, pred, elapsed, mi, pa}:
+      {==}
+    case Decide{}:
+      decide_today(s, a)
+    case Tick{}:
+      {==}
+    case Finish{x}:
+      {==}
+
+# A decision keeps every request's minimum.
+def nomin_gwalk(+lo: Bool, +n: +List<E>, +f: Nat, +g: +List<Nat>, +a: AllE(RM(), n)) -> AllE(RM(), wl(gwalk(lo, n, f, g))):
+  match n:
+    case Nil{}:
+      Unit{}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : AllE(RM(), _)
+      (h, nomin_gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), at))
+
+def nomin_glwalk.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>, +a: AllE(RM(), n)) -> AllE(RM(), lnew(ll(glwalk.if(sk, lo, o, n, f, g)))):
+  match sk:
+    case True{}:
+      a
+    case False{}:
+      nomin_gwalk(lo, n, wf(walk(o, f)), g, a)
+
+def nomin_glwalk(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>, +a: AllE(RM(), lnew(l))) -> AllE(RM(), lnew(ll(glwalk(lo, l, f, g)))):
+  match l:
+    case Lane{o, n}:
+      nomin_glwalk.if(skip(lo, g), lo, o, n, f, g, a)
+
+def nomin_gwalks(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>, +h: AllN(RM(), ls)) -> AllN(RM(), lsl(gwalks(ls, f, g))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (nomin_glwalk(islow(t), l, f, g, sl), nomin_gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g), st))
+
+def step_nomin(+p: Pol, +o: Op, +s: St, +ao: ArrM(o), +a: NoMin(s)) -> NoMin(step(p, o, s)):
+  match o s:
+    case Arrive{band, id, want, pred, elapsed, mi, pa} St{f, b, ls}:
+      alle_arrive(RM(), p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, ls, ao, a)
+    case Decide{} St{f, b, ls}:
+      nomin_gwalks(ls, f, [], a)
+    case Tick{} St{f, b, ls}:
+      alle_ticks(RM(), b, ls, a)
+    case Finish{x} St{f, b, ls}:
+      alle_fins(RM(), ls, x, a)
+
+def run_today(+p: Pol, +os: +List<Op>, +s: St, +ao: AllArr(os), +a: NoMin(s)) -> {run.today(p, os, s) == run(p, os, s) : St}:
+  match os:
+    case Nil{}:
+      {==}
+    case Con{o, t}:
+      (ho, at) = ao
+      %Equal.sym(St, step.today(p, o, s), step(p, o, s), step_today(p, o, s, a)) : {run.today(p, t, _) == run(p, t, step(p, o, s)) : St}
+      run_today(p, t, step(p, o, s), at, step_nomin(p, o, s, ho, a))
+
+# LAW (a minimum of 0 or 1 is none): every trace whose arrivals name no minimum (min <= 1)
+# decides as today's policy, step by step from an empty pool.
+law min_le_one_is_today:
+  for +p: Pol
+  for +os: +List<Op>
+  for +cap: Nat
+  for +bound: Nat
+  for +a: AllArr(os)
+  {run(p, os, empty(cap, bound)) == run.today(p, os, empty(cap, bound)) : St}
+
+def min_le_one_is_today(p, os, cap, bound, a):
+  Equal.sym(St, run.today(p, os, empty(cap, bound)), run(p, os, empty(cap, bound)),
+    run_today(p, os, empty(cap, bound), a, (Unit{}, (Unit{}, (Unit{}, Unit{})))))
+
+# In any state whose waiting requests name no minimum, a step is today's step.
+law step_without_min_is_today:
+  for +p: Pol
+  for +o: Op
+  for +s: St
+  for +a: NoMin(s)
+  {step(p, o, s) == step.today(p, o, s) : St}
+
+def step_without_min_is_today(p, o, s, a):
+  Equal.sym(St, step.today(p, o, s), step(p, o, s), step_today(p, o, s, a))
+
+# Today's order laws hold of every decision on a state without a minimum.
+law lanes_in_order_without_min:
+  for +p: Pol
+  for +s: St
+  for +a: NoMin(s)
+  Before(slanes(s), slanes(step(p, Decide{}, s)))
+
+def lanes_in_order_without_min(p, s, a):
+  %step_today(p, Decide{}, s, a) : Before(slanes(s), slanes(_))
+  lanes_in_order(p, s)
+
+law work_conserving_without_min:
+  for +p: Pol
+  for +s: St
+  for +a: NoMin(s)
+  Either<&2, &2, AllL(l => AllFilledL(l), slanes(step(p, Decide{}, s))), IsZero(sfree(step(p, Decide{}, s)))>
+
+def work_conserving_without_min(p, s, a):
+  %step_today(p, Decide{}, s, a) : Either<&2, &2, AllL(l => AllFilledL(l), slanes(_)), IsZero(sfree(_))>
+  work_conserving(p, s)
+
+law first_in_order_filled_without_min:
+  for +p: Pol
+  for +s: St
+  for +a: NoMin(s)
+  All2(l => m => OrderL(l, m), slanes(s), slanes(step(p, Decide{}, s)))
+
+def first_in_order_filled_without_min(p, s, a):
+  %step_today(p, Decide{}, s, a) : All2(l => m => OrderL(l, m), slanes(s), slanes(_))
+  first_in_order_filled(p, s)
+
+# --- LAW (a gatherer starts with its minimum) -------------------------------------------
+# Every request in `new` holds nothing, or at least least = min(m, want): before it ages, no
+# request starts short of its minimum. (A minimum of 0 or 1 asks for no more than any start.)
+
+def Least(+k: Nat, want: Nat, mi: Nat) -> Data:
+  Either<&2, &2, IsZero(k), IsTrue(le(gg(mi, want), k))>
+
+def RL() -> Nat -> Nat -> Nat -> Nat -> Data:
+  k => w => m => q => Least(k, w, m)
+
+def Started(s: St) -> Data:
+  AllN(RL(), slanes(s))
+
+def gg_le_r(+a: Nat, +b: Nat) -> IsTrue(le(gg(a, b), b)):
+  match a b:
+    case 0n b0:
+      Unit{}
+    case 1n+a1 0n:
+      Unit{}
+    case 1n+a1 1n+b1:
+      gg_le_r(a1, b1)
+
+def le_gg(+l: Nat, +a: Nat, +b: Nat, la: IsTrue(le(l, a)), lb: IsTrue(le(l, b))) -> IsTrue(le(l, gg(a, b))):
+  match l a b:
+    case 0n a0 b0:
+      Unit{}
+    case 1n+l1 0n b0:
+      match la:
+    case 1n+l1 1n+a1 0n:
+      match lb:
+    case 1n+l1 1n+a1 1n+b1:
+      le_gg(l1, a1, b1, la, lb)
+
+def short_one(+want: Nat, +f: Nat, lw: IsTrue(le(1n, want))) -> Either<&2, &2, IsZero(gg(want, f)), IsTrue(le(1n, gg(want, f)))>:
+  match want f:
+    case 0n f0:
+      match lw:
+    case 1n+w 0n:
+      Inl{Unit{}}
+    case 1n+w 1n+c:
+      Inr{Unit{}}
+
+# Not short of `least` (at most `want`): what is free is none, or covers it.
+def short_false(+l: Nat, +want: Nat, +f: Nat, lw: IsTrue(le(l, want)), es: {False{} == short(l, f) : Bool})
+  -> Either<&2, &2, IsZero(gg(want, f)), IsTrue(le(l, gg(want, f)))>:
+  match l:
+    case 0n:
+      Inr{Unit{}}
+    case 1n+a:
+      match a:
+        case 0n:
+          short_one(want, f, lw)
+        case 1n+b:
+          Inr{le_gg(2n+b, want, f, lw, not_false(le(2n+b, f), es))}
+
+def least_act0(+h: Bool, +s: Bool, +want: Nat, +mi: Nat, +f: Nat, es: {s == short(gg(mi, want), f) : Bool})
+  -> Least(gg(en(act0(h, s), want), f), want, mi):
+  match h s:
+    case True{} s0:
+      Inl{Unit{}}
+    case False{} True{}:
+      Inl{Unit{}}
+    case False{} False{}:
+      short_false(gg(mi, want), want, f, gg_le_r(mi, want), es)
+
+# A request's turn keeps it at none or at least its minimum.
+def least_head(+lo: Bool, +g: +List<Nat>, +k: Nat, +want: Nat, +mi: Nat, +pa: Nat, +f: Nat, h: Least(k, want, mi))
+  -> Least(add(k, gg(en(act(lo, g, k, want, mi, pa, f), need.k(want, k)), f)), want, mi):
+  match k:
+    case 0n:
+      least_act0(held(lo, pa, g), short(gg(mi, want), f), want, mi, f, {==})
+    case 1n+j:
+      match h:
+        case Inl{z}:
+          match z:
+        case Inr{r}:
+          %Equal.sym(Nat, add(j, 0n), j, add_zero_r(j)) : Least(1n+_, want, mi)
+          Inr{r}
+
+def least_gwalk(+lo: Bool, +n: +List<E>, +f: Nat, +g: +List<Nat>, +a: AllE(RL(), n)) -> AllE(RL(), wl(gwalk(lo, n, f, g))):
+  match n:
+    case Nil{}:
+      Unit{}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      (h, at) = a
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : AllE(RL(), _)
+      (least_head(lo, g, k, want, mi, pa, f, h), least_gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), at))
+
+def least_glwalk.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>, +a: AllE(RL(), n)) -> AllE(RL(), lnew(ll(glwalk.if(sk, lo, o, n, f, g)))):
+  match sk:
+    case True{}:
+      a
+    case False{}:
+      least_gwalk(lo, n, wf(walk(o, f)), g, a)
+
+def least_glwalk(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>, +a: AllE(RL(), lnew(l))) -> AllE(RL(), lnew(ll(glwalk(lo, l, f, g)))):
+  match l:
+    case Lane{o, n}:
+      least_glwalk.if(skip(lo, g), lo, o, n, f, g, a)
+
+def least_gwalks(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>, +h: AllN(RL(), ls)) -> AllN(RL(), lsl(gwalks(ls, f, g))):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      (sl, st) = h
+      (least_glwalk(islow(t), l, f, g, sl), least_gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g), st))
+
+# Every step keeps it: an arrival holds nothing, a tick and an end move requests unchanged,
+# and a decision starts a request in `new` only on its minimum or more.
+law minimum_kept_by_every_step:
+  for +p: Pol
+  for +o: Op
+  for +s: St
+  for +i: Started(s)
+  Started(step(p, o, s))
+
+def minimum_kept_by_every_step(p, o, s, i):
+  match o s:
+    case Arrive{band, id, want, pred, elapsed, mi, pa} St{f, b, ls}:
+      alle_arrive(RL(), p, lane(band, elapsed), E{id, 1n+want, 0n, pred, 0n, mi, pa}, ls, Inl{Unit{}}, i)
+    case Decide{} St{f, b, ls}:
+      least_gwalks(ls, f, [], i)
+    case Tick{} St{f, b, ls}:
+      alle_ticks(RL(), b, ls, i)
+    case Finish{x} St{f, b, ls}:
+      alle_fins(RL(), ls, x, i)
+
+def run_started(+p: Pol, +os: +List<Op>, +s: St, +i: Started(s)) -> Started(run(p, os, s)):
+  match os:
+    case Nil{}:
+      i
+    case Con{o, t}:
+      run_started(p, t, step(p, o, s), minimum_kept_by_every_step(p, o, s, i))
+
+# LAW: in every state a trace reaches from an empty pool, so after every decision, each
+# request in any lane's `new` holds 0 permits or at least min(m, want).
+law a_gatherer_starts_with_its_minimum:
+  for +p: Pol
+  for +os: +List<Op>
+  for +cap: Nat
+  for +bound: Nat
+  Started(run(p, os, empty(cap, bound)))
+
+def a_gatherer_starts_with_its_minimum(p, os, cap, bound):
+  run_started(p, os, empty(cap, bound), (Unit{}, (Unit{}, (Unit{}, Unit{}))))
+
+# --- LAW (a gather ends at the bound) -----------------------------------------------------
+# A lane's aged requests are walked by today's `walk`, which reads no minimum: each takes
+# min(want, free) of what is free when its lane's turn comes. A request stops gathering on the
+# tick that moves it into `old` (`tick_bounds_wait`) and starts on what is free. The one
+# exception is the low lane, which takes nothing while a gather above it is open.
+
+def gather_ends_at_the_bound.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>, e: {sk == skip(lo, g) : Bool})
+  -> Either<&2, &2, {lold(ll(glwalk.if(sk, lo, o, n, f, g))) == wl(walk(o, f)) : +List<E>},
+       Sigma<&2, &2, IsTrue(skip(lo, g)), u => {ll(glwalk.if(sk, lo, o, n, f, g)) == Lane{o, n} : Lane}>>:
+  match sk:
+    case True{}:
+      Inr{(true_is(skip(lo, g), e), {==})}
+    case False{}:
+      Inl{{==}}
+
+law gather_ends_at_the_bound:
+  for +lo: Bool
+  for +l: Lane
+  for +f: Nat
+  for +g: +List<Nat>
+  Either<&2, &2, {lold(ll(glwalk(lo, l, f, g))) == wl(walk(lold(l), f)) : +List<E>},
+    Sigma<&2, &2, IsTrue(skip(lo, g)), u => {ll(glwalk(lo, l, f, g)) == l : Lane}>>
+
+def gather_ends_at_the_bound(lo, l, f, g):
+  match l:
+    case Lane{o, n}:
+      gather_ends_at_the_bound.if(skip(lo, g), lo, o, n, f, g, {==})
+
+# --- round 9, computed ----------------------------------------------------------------------
+# A pool of 4: a gate job holds 3, so 1 is free. A reservation asks 18 with min 4 (party 1):
+# it gathers and holds nothing, where today's policy starts it on 1. The job ends, freeing 3;
+# with 4 free the reservation starts on 4.
+law round9_gathers_then_starts_on_its_minimum:
+  Sigma<&2, &2,
+    {run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Decide{}], empty(4n, 30n)) == St{1n, 30n, [Lane{[], []}, Lane{[], [E{1n, 3n, 3n, 5n, 0n, 0n, 0n}, E{2n, 18n, 0n, 9n, 0n, 4n, 1n}]}, Lane{[], []}]} : St},
+    u => Sigma<&2, &2,
+    {run.today(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Decide{}], empty(4n, 30n)) == St{0n, 30n, [Lane{[], []}, Lane{[], [E{1n, 3n, 3n, 5n, 0n, 0n, 0n}, E{2n, 18n, 1n, 9n, 0n, 4n, 1n}]}, Lane{[], []}]} : St},
+    v =>
+    {run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Decide{}, Finish{1n}, Decide{}], empty(4n, 30n)) == St{0n, 30n, [Lane{[], []}, Lane{[], [E{2n, 18n, 4n, 9n, 0n, 4n, 1n}]}, Lane{[], []}]} : St}>>
+
+def round9_gathers_then_starts_on_its_minimum():
+  ({==}, ({==}, {==}))
+
+# The same gather at the bound: with a bound of 2, two ticks age it into `old`, and the next
+# decision starts it on the 1 that is free.
+law round9_starts_short_at_the_bound:
+  {run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Decide{}, Tick{}, Tick{}, Decide{}], empty(4n, 2n)) == St{0n, 2n, [Lane{[], []}, Lane{[E{1n, 3n, 3n, 5n, 2n, 0n, 0n}, E{2n, 18n, 1n, 9n, 2n, 4n, 1n}], []}, Lane{[], []}]} : St}
+
+def round9_starts_short_at_the_bound():
+  {==}
+
+# What a gather holds back: a pool of 6, a gate job holds 3. The reservation (min 4, party 1)
+# gathers with 3 free; a later request of its party waits, and so does low work; a later gate
+# request of another party passes and starts. Two permits stay free.
+law a_gather_holds_back_its_party_and_low_work:
+  {run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Arrive{Gate{}, 3n, 0n, 20n, 0n, 0n, 1n}, Arrive{Gate{}, 4n, 0n, 20n, 0n, 0n, 2n}, Arrive{Background{}, 5n, 0n, 1n, 0n, 0n, 0n}, Decide{}], empty(6n, 30n)) == St{2n, 30n, [Lane{[], []}, Lane{[], [E{1n, 3n, 3n, 5n, 0n, 0n, 0n}, E{2n, 18n, 0n, 9n, 0n, 4n, 1n}, E{3n, 1n, 0n, 20n, 0n, 0n, 1n}, E{4n, 1n, 1n, 20n, 0n, 0n, 2n}]}, Lane{[], [E{5n, 1n, 0n, 1n, 0n, 0n, 0n}]}]} : St}
+
+def a_gather_holds_back_its_party_and_low_work():
+  {==}
+
+# What the model leaves out (mbx also holds back a request of the gatherer's party that asked
+# after it but is ordered before it): under Spt a shorter request of the gatherer's party that
+# asked later sits ahead of it in `new` and starts on the free permit before the gather opens.
+law spt_gap_a_shorter_request_of_the_party_passes:
+  {run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}, Arrive{Gate{}, 3n, 0n, 1n, 0n, 0n, 1n}, Decide{}], empty(4n, 30n)) == St{0n, 30n, [Lane{[], []}, Lane{[], [E{3n, 1n, 1n, 1n, 0n, 0n, 1n}, E{1n, 3n, 3n, 5n, 0n, 0n, 0n}, E{2n, 18n, 0n, 9n, 0n, 4n, 1n}]}, Lane{[], []}]} : St}
+
+def spt_gap_a_shorter_request_of_the_party_passes():
+  {==}
+
+# --- LAW (only a gather leaves permits free) ------------------------------------------------
+# What replaces `work_conserving` once requests gather: after a decision either no permit is
+# free, or every request still waiting is one a gather holds back. Re-examine the lanes in pass
+# order with what is left free (`fe`): a lane's aged requests are all filled unless it is the low
+# lane behind an open gather; and each request in `new`, given its turn again, takes nothing
+# more (`Waits`): it has all it asked for, it is short of its minimum (a gatherer), or it is low
+# work or of a gatherer's party behind one. The gathers it sees are those of the requests before
+# it in that re-examination, so "behind a gather" is read off the state the decision leaves.
+
+def Waits(a: Act, n: Nat) -> Data:
+  match a:
+    case Take{}:
+      IsZero(n)
+    case Hold{}:
+      Unit
+    case Open{}:
+      Unit
+
+def WaitsN(+fe: Nat, +lo: Bool, xs: +List<E>, +acc: +List<Nat>) -> Data:
+  match xs:
+    case Nil{}:
+      Unit
+    case Con{E{id, +want, +k, pred, age, +mi, +pa}, t}:
+      Sigma<&2, &2, Waits(act(lo, acc, k, want, mi, pa, fe), need.k(want, k)), u => WaitsN(fe, lo, t, gnext(act(lo, acc, k, want, mi, pa, fe), pa, acc))>
+
+# The gathers open after that re-examination of `xs`.
+def gacc(+fe: Nat, +lo: Bool, xs: +List<E>, +acc: +List<Nat>) -> +List<Nat>:
+  match xs:
+    case Nil{}:
+      acc
+    case Con{E{id, +want, +k, pred, age, +mi, +pa}, t}:
+      gacc(fe, lo, t, gnext(act(lo, acc, k, want, mi, pa, fe), pa, acc))
+
+def WaitsLane(+fe: Nat, +lo: Bool, +acc: +List<Nat>, l: Lane) -> Data:
+  match l:
+    case Lane{o, n}:
+      Sigma<&2, &2, Either<&2, &2, AllFilled(o), IsTrue(skip(lo, acc))>, u => WaitsN(fe, lo, n, acc)>
+
+def gaccL(+fe: Nat, +lo: Bool, +acc: +List<Nat>, l: Lane) -> +List<Nat>:
+  match l:
+    case Lane{o, n}:
+      gacc(fe, lo, n, acc)
+
+def WaitsLs(+fe: Nat, ls: +List<Lane>, +acc: +List<Nat>) -> Data:
+  match ls:
+    case Nil{}:
+      Unit
+    case Con{+l, +t}:
+      Sigma<&2, &2, WaitsLane(fe, islow(t), acc, l), u => WaitsLs(fe, t, gaccL(fe, islow(t), acc, l))>
+
+def pfst(-A: Data, -B: Data, +p: Sigma<&2, &2, A, u => B>) -> A:
+  (a, b) = p
+  a
+
+def psnd(-A: Data, -B: Data, +p: Sigma<&2, &2, A, u => B>) -> B:
+  (a, b) = p
+  b
+
+# What is free only shrinks along a decision.
+def le_succ(+b: Nat) -> IsTrue(le(b, 1n+b)):
+  match b:
+    case 0n:
+      Unit{}
+    case 1n+c:
+      le_succ(c)
+
+def gr_le(+a: Nat, +b: Nat) -> IsTrue(le(gr(a, b), b)):
+  match a b:
+    case 0n b0:
+      le_refl(b0)
+    case 1n+a1 0n:
+      Unit{}
+    case 1n+a1 1n+b1:
+      le_trans(gr(a1, b1), b1, 1n+b1, gr_le(a1, b1), le_succ(b1))
+
+def walk_le(+xs: +List<E>, +f: Nat) -> IsTrue(le(wf(walk(xs, f)), f)):
+  match xs:
+    case Nil{}:
+      le_refl(f)
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wf_cons(E{id, want, add(k, gg(need(E{id, want, k, pred, age, mi, pa}), f)), pred, age, mi, pa}, walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))) : IsTrue(le(_, f))
+      le_trans(wf(walk(t, gr(need(E{id, want, k, pred, age, mi, pa}), f))), gr(need(E{id, want, k, pred, age, mi, pa}), f), f, walk_le(t, gr(need(E{id, want, k, pred, age, mi, pa}), f)), gr_le(need(E{id, want, k, pred, age, mi, pa}), f))
+
+def gwalk_le(+lo: Bool, +xs: +List<E>, +f: Nat, +g: +List<Nat>) -> IsTrue(le(wf(gwalk(lo, xs, f, g)), f)):
+  match xs:
+    case Nil{}:
+      le_refl(f)
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %wf_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : IsTrue(le(_, f))
+      le_trans(wf(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), f, gwalk_le(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)), gr_le(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f))
+
+def glwalk_le.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>) -> IsTrue(le(lf(glwalk.if(sk, lo, o, n, f, g)), f)):
+  match sk:
+    case True{}:
+      le_refl(f)
+    case False{}:
+      le_trans(wf(gwalk(lo, n, wf(walk(o, f)), g)), wf(walk(o, f)), f, gwalk_le(lo, n, wf(walk(o, f)), g), walk_le(o, f))
+
+def glwalk_le(+lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>) -> IsTrue(le(lf(glwalk(lo, l, f, g)), f)):
+  match l:
+    case Lane{o, n}:
+      glwalk_le.if(skip(lo, g), lo, o, n, f, g)
+
+def gwalks_le(+ls: +List<Lane>, +f: Nat, +g: +List<Nat>) -> IsTrue(le(lsf(gwalks(ls, f, g)), f)):
+  match ls:
+    case Nil{}:
+      le_refl(f)
+    case Con{+l, +t}:
+      le_trans(lsf(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), lf(glwalk(islow(t), l, f, g)), f, gwalks_le(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)), glwalk_le(islow(t), l, f, g))
+
+def le_wf_cons(+fe: Nat, +h: E, +w: W, hf: IsTrue(le(fe, wf(W.cons(h, w))))) -> IsTrue(le(fe, wf(w))):
+  match w:
+    case W{f0, l0}:
+      hf
+
+def no_room(+fe: Nat, +x: Nat, nz: IsTrue(le(1n, fe)), hx: IsTrue(le(fe, x)), z: IsZero(x)) -> Empty:
+  match fe x:
+    case 0n x0:
+      match nz:
+    case 1n+q 0n:
+      match hx:
+    case 1n+q 1n+r:
+      match z:
+
+def is_true_eq(+b: Bool, h: IsTrue(b)) -> {True{} == b : Bool}:
+  match b:
+    case True{}:
+      {==}
+    case False{}:
+      match h:
+
+def not_le_mono(+l: Nat, +fe: Nat, +f: Nat, hle: IsTrue(le(fe, f)), hn: IsTrue(Bool.not(le(l, f)))) -> IsTrue(Bool.not(le(l, fe))):
+  match l fe f:
+    case 0n fe0 f0:
+      match hn:
+    case 1n+l1 0n f0:
+      Unit{}
+    case 1n+l1 1n+e1 0n:
+      match hle:
+    case 1n+l1 1n+e1 1n+f1:
+      not_le_mono(l1, e1, f1, hle, hn)
+
+# Short of `least` with `f` free is short of it with less.
+def short_mono(+l: Nat, +fe: Nat, +f: Nat, hle: IsTrue(le(fe, f)), hs: IsTrue(short(l, f))) -> IsTrue(short(l, fe)):
+  match l:
+    case 0n:
+      match hs:
+    case 1n+a:
+      match a:
+        case 0n:
+          match hs:
+        case 1n+b:
+          not_le_mono(2n+b, fe, f, hle, hs)
+
+# A request's turn, given again with what is finally left free, takes nothing more and opens
+# the same gather.
+def waits_head0(+h: Bool, +s: Bool, +lo: Bool, +g: +List<Nat>, +mi: Nat, +pa: Nat, +fe: Nat, +nz: IsTrue(le(1n, fe)),
+  +want: Nat, +f: Nat, +hf: IsTrue(le(fe, f)), +eh: {h == held(lo, pa, g) : Bool}, +es: {s == short(gg(mi, want), f) : Bool})
+  -> Sigma<&2, &2, Waits(act(lo, g, gg(en(act0(h, s), want), f), want, mi, pa, fe), need.k(want, gg(en(act0(h, s), want), f))),
+       u => {gnext(act(lo, g, gg(en(act0(h, s), want), f), want, mi, pa, fe), pa, g) == gnext(act0(h, s), pa, g) : +List<Nat>}>:
+  match h s:
+    case True{} s0:
+      %eh : Sigma<&2, &2, Waits(act0(_, short(gg(mi, want), fe)), want), u => {gnext(act0(_, short(gg(mi, want), fe)), pa, g) == g : +List<Nat>}>
+      (Unit{}, {==})
+    case False{} True{}:
+      %eh : Sigma<&2, &2, Waits(act0(_, short(gg(mi, want), fe)), want), u => {gnext(act0(_, short(gg(mi, want), fe)), pa, g) == pa <> g : +List<Nat>}>
+      %is_true_eq(short(gg(mi, want), fe), short_mono(gg(mi, want), fe, f, hf, true_is(short(gg(mi, want), f), es)))
+        : Sigma<&2, &2, Waits(act0(False{}, _), want), u => {gnext(act0(False{}, _), pa, g) == pa <> g : +List<Nat>}>
+      (Unit{}, {==})
+    case False{} False{}:
+      match want f:
+        case 0n f0:
+          %eh : Sigma<&2, &2, Waits(act0(_, short(gg(mi, 0n), fe)), 0n), u => {gnext(act0(_, short(gg(mi, 0n), fe)), pa, g) == g : +List<Nat>}>
+          %gg_z(mi) : Sigma<&2, &2, Waits(act0(False{}, short(_, fe)), 0n), u => {gnext(act0(False{}, short(_, fe)), pa, g) == g : +List<Nat>}>
+          (Unit{}, {==})
+        case 1n+w 0n:
+          absurd_nat(Sigma<&2, &2, Waits(act(lo, g, 0n, 1n+w, mi, pa, fe), need.k(1n+w, 0n)), u => {gnext(act(lo, g, 0n, 1n+w, mi, pa, fe), pa, g) == g : +List<Nat>}>,
+            no_room(fe, 0n, nz, hf, Unit{}))
+        case 1n+w 1n+c:
+          (Unit{}, {==})
+
+def waits_head(+fe: Nat, +nz: IsTrue(le(1n, fe)), +lo: Bool, +g: +List<Nat>, +k: Nat, +want: Nat, +mi: Nat, +pa: Nat, +f: Nat, +hf: IsTrue(le(fe, f)))
+  -> Sigma<&2, &2, Waits(act(lo, g, add(k, gg(en(act(lo, g, k, want, mi, pa, f), need.k(want, k)), f)), want, mi, pa, fe), need.k(want, add(k, gg(en(act(lo, g, k, want, mi, pa, f), need.k(want, k)), f)))),
+       u => {gnext(act(lo, g, add(k, gg(en(act(lo, g, k, want, mi, pa, f), need.k(want, k)), f)), want, mi, pa, fe), pa, g) == gnext(act(lo, g, k, want, mi, pa, f), pa, g) : +List<Nat>}>:
+  match k:
+    case 0n:
+      waits_head0(held(lo, pa, g), short(gg(mi, want), f), lo, g, mi, pa, fe, nz, want, f, hf, {==}, {==})
+    case 1n+j:
+      (Unit{}, {==})
+
+def waits_gwalk(+fe: Nat, +nz: IsTrue(le(1n, fe)), +lo: Bool, +xs: +List<E>, +f: Nat, +g: +List<Nat>, +hf: IsTrue(le(fe, wf(gwalk(lo, xs, f, g)))))
+  -> Sigma<&2, &2, WaitsN(fe, lo, wl(gwalk(lo, xs, f, g)), g), u => {gacc(fe, lo, wl(gwalk(lo, xs, f, g)), g) == gend(lo, xs, f, g) : +List<Nat>}>:
+  match xs:
+    case Nil{}:
+      (Unit{}, {==})
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      +ht = le_wf_cons(fe, E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)), hf)
+      +hp = waits_head(fe, nz, lo, g, k, want, mi, pa, f, le_trans(fe, wf(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), f, ht, le_trans(wf(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), f, gwalk_le(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)), gr_le(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f))))
+      +tp = waits_gwalk(fe, nz, lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), ht)
+      %wl_cons(E{id, want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))) : Sigma<&2, &2, WaitsN(fe, lo, _, g), u => {gacc(fe, lo, _, g) == gend(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) : +List<Nat>}>
+      %Equal.sym(+List<Nat>, gnext(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), pa, g), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g), psnd(Waits(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), need.k(want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)))), {gnext(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), pa, g) == gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g) : +List<Nat>}, hp))
+        : Sigma<&2, &2, Sigma<&2, &2, Waits(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), need.k(want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)))), u => WaitsN(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), _)>, u => {gacc(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), _) == gend(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) : +List<Nat>}>
+      ((pfst(Waits(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), need.k(want, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)))), {gnext(act(lo, g, add(k, gg(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f)), want, mi, pa, fe), pa, g) == gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g) : +List<Nat>}, hp), pfst(WaitsN(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)), {gacc(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) == gend(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) : +List<Nat>}, tp)), psnd(WaitsN(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)), {gacc(fe, lo, wl(gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g))), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) == gend(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, f), f), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, f), pa, g)) : +List<Nat>}, tp))
+
+def waits_skip.go(+fe: Nat, +q: Nat, +r: +List<Nat>, +xs: +List<E>) -> Sigma<&2, &2, WaitsN(fe, True{}, xs, q <> r), u => {gacc(fe, True{}, xs, q <> r) == q <> r : +List<Nat>}>:
+  match xs:
+    case Nil{}:
+      (Unit{}, {==})
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      match k:
+        case 0n:
+          +sp = waits_skip.go(fe, q, r, t)
+          ((Unit{}, pfst(WaitsN(fe, True{}, t, q <> r), {gacc(fe, True{}, t, q <> r) == q <> r : +List<Nat>}, sp)), psnd(WaitsN(fe, True{}, t, q <> r), {gacc(fe, True{}, t, q <> r) == q <> r : +List<Nat>}, sp))
+        case 1n+j:
+          +sp = waits_skip.go(fe, q, r, t)
+          ((Unit{}, pfst(WaitsN(fe, True{}, t, q <> r), {gacc(fe, True{}, t, q <> r) == q <> r : +List<Nat>}, sp)), psnd(WaitsN(fe, True{}, t, q <> r), {gacc(fe, True{}, t, q <> r) == q <> r : +List<Nat>}, sp))
+
+# The low lane behind an open gather: every request in it is held.
+def waits_skip(+fe: Nat, +lo: Bool, +g: +List<Nat>, +xs: +List<E>, h: IsTrue(skip(lo, g)))
+  -> Sigma<&2, &2, WaitsN(fe, lo, xs, g), u => {gacc(fe, lo, xs, g) == g : +List<Nat>}>:
+  match lo g:
+    case False{} Nil{}:
+      match h:
+    case False{} Con{q, r}:
+      match h:
+    case True{} Nil{}:
+      match h:
+    case True{} Con{+q, +r}:
+      waits_skip.go(fe, q, r, xs)
+
+def old_ok(-A: Data, -B: Data, +fe: Nat, +x: Nat, +nz: IsTrue(le(1n, fe)), +hx: IsTrue(le(fe, x)), fd: Either<&2, &2, A, IsZero(x)>) -> Either<&2, &2, A, B>:
+  match fd:
+    case Inl{a}:
+      Inl{a}
+    case Inr{z}:
+      absurd_nat(Either<&2, &2, A, B>, no_room(fe, x, nz, hx, z))
+
+def waits_glwalk.if(+sk: Bool, +fe: Nat, +nz: IsTrue(le(1n, fe)), +lo: Bool, +o: +List<E>, +n: +List<E>, +f: Nat, +g: +List<Nat>,
+  +hl: IsTrue(le(fe, lf(glwalk.if(sk, lo, o, n, f, g)))), +e: {sk == skip(lo, g) : Bool})
+  -> Sigma<&2, &2, WaitsLane(fe, lo, g, ll(glwalk.if(sk, lo, o, n, f, g))), u => {gaccL(fe, lo, g, ll(glwalk.if(sk, lo, o, n, f, g))) == glg.if(sk, lo, o, n, f, g) : +List<Nat>}>:
+  match sk:
+    case True{}:
+      +sp = waits_skip(fe, lo, g, n, true_is(skip(lo, g), e))
+      ((Inr{true_is(skip(lo, g), e)}, pfst(WaitsN(fe, lo, n, g), {gacc(fe, lo, n, g) == g : +List<Nat>}, sp)), psnd(WaitsN(fe, lo, n, g), {gacc(fe, lo, n, g) == g : +List<Nat>}, sp))
+    case False{}:
+      +np = waits_gwalk(fe, nz, lo, n, wf(walk(o, f)), g, hl)
+      ((old_ok(AllFilled(wl(walk(o, f))), IsTrue(skip(lo, g)), fe, wf(walk(o, f)), nz,
+         le_trans(fe, wf(gwalk(lo, n, wf(walk(o, f)), g)), wf(walk(o, f)), hl, gwalk_le(lo, n, wf(walk(o, f)), g)), walk_fd(o, f)), pfst(WaitsN(fe, lo, wl(gwalk(lo, n, wf(walk(o, f)), g)), g), {gacc(fe, lo, wl(gwalk(lo, n, wf(walk(o, f)), g)), g) == gend(lo, n, wf(walk(o, f)), g) : +List<Nat>}, np)), psnd(WaitsN(fe, lo, wl(gwalk(lo, n, wf(walk(o, f)), g)), g), {gacc(fe, lo, wl(gwalk(lo, n, wf(walk(o, f)), g)), g) == gend(lo, n, wf(walk(o, f)), g) : +List<Nat>}, np))
+
+def waits_glwalk(+fe: Nat, +nz: IsTrue(le(1n, fe)), +lo: Bool, +l: Lane, +f: Nat, +g: +List<Nat>, +hl: IsTrue(le(fe, lf(glwalk(lo, l, f, g)))))
+  -> Sigma<&2, &2, WaitsLane(fe, lo, g, ll(glwalk(lo, l, f, g))), u => {gaccL(fe, lo, g, ll(glwalk(lo, l, f, g))) == glg(lo, l, f, g) : +List<Nat>}>:
+  match l:
+    case Lane{o, n}:
+      waits_glwalk.if(skip(lo, g), fe, nz, lo, o, n, f, g, hl, {==})
+
+def islow_gwalks(+t: +List<Lane>, +f: Nat, +g: +List<Nat>) -> {islow(t) == islow(lsl(gwalks(t, f, g))) : Bool}:
+  match t:
+    case Nil{}:
+      {==}
+    case Con{+l, +r}:
+      {==}
+
+def waits_gwalks(+fe: Nat, +nz: IsTrue(le(1n, fe)), +ls: +List<Lane>, +f: Nat, +g: +List<Nat>, +hf: IsTrue(le(fe, lsf(gwalks(ls, f, g)))))
+  -> WaitsLs(fe, lsl(gwalks(ls, f, g)), g):
+  match ls:
+    case Nil{}:
+      Unit{}
+    case Con{+l, +t}:
+      +lp = waits_glwalk(fe, nz, islow(t), l, f, g, le_trans(fe, lsf(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), lf(glwalk(islow(t), l, f, g)), hf, gwalks_le(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))))
+      %islow_gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g)) : Sigma<&2, &2, WaitsLane(fe, _, g, ll(glwalk(islow(t), l, f, g))), u => WaitsLs(fe, lsl(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), gaccL(fe, _, g, ll(glwalk(islow(t), l, f, g))))>
+      %Equal.sym(+List<Nat>, gaccL(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))), glg(islow(t), l, f, g), psnd(WaitsLane(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))), {gaccL(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))) == glg(islow(t), l, f, g) : +List<Nat>}, lp)) : Sigma<&2, &2, WaitsLane(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))), u => WaitsLs(fe, lsl(gwalks(t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g))), _)>
+      (pfst(WaitsLane(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))), {gaccL(fe, islow(t), g, ll(glwalk(islow(t), l, f, g))) == glg(islow(t), l, f, g) : +List<Nat>}, lp), waits_gwalks(fe, nz, t, lf(glwalk(islow(t), l, f, g)), glg(islow(t), l, f, g), hf))
+
+def le_of_eq(+a: Nat, +b: Nat, e: {a == b : Nat}) -> IsTrue(le(a, b)):
+  %e : IsTrue(le(a, _))
+  le_refl(a)
+
+def only_a_gather_leaves_permits_free.top(+fe: Nat, +ls: +List<Lane>, +f: Nat, +e: {fe == lsf(gwalks(ls, f, [])) : Nat})
+  -> Either<&2, &2, IsZero(lsf(gwalks(ls, f, []))), WaitsLs(lsf(gwalks(ls, f, [])), lsl(gwalks(ls, f, [])), [])>:
+  match fe:
+    case 0n:
+      %e : Either<&2, &2, IsZero(_), WaitsLs(_, lsl(gwalks(ls, f, [])), [])>
+      Inl{Unit{}}
+    case 1n+q:
+      %e : Either<&2, &2, IsZero(_), WaitsLs(_, lsl(gwalks(ls, f, [])), [])>
+      Inr{waits_gwalks(1n+q, Unit{}, ls, f, [], le_of_eq(1n+q, lsf(gwalks(ls, f, [])), e))}
+
+law only_a_gather_leaves_permits_free:
+  for +p: Pol
+  for +s: St
+  Either<&2, &2, IsZero(sfree(step(p, Decide{}, s))), WaitsLs(sfree(step(p, Decide{}, s)), slanes(step(p, Decide{}, s)), [])>
+
+def only_a_gather_leaves_permits_free(p, s):
+  match s:
+    case St{f, b, ls}:
+      only_a_gather_leaves_permits_free.top(lsf(gwalks(ls, f, [])), ls, f, {==})

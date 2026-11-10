@@ -192,7 +192,7 @@ fn granted(state: &St) -> BTreeMap<u64, u64> {
     while let List::Con(Lane::Lane(old, new), rest) = lane {
         for list in [old, new] {
             let mut at: &List<E> = list;
-            while let List::Con(E::E(id, _, k, _, _), rest) = at {
+            while let List::Con(E::E(id, _, k, _, _, _, _), rest) = at {
                 if *k > 0 {
                     granted.insert(*id, *k);
                 }
@@ -247,6 +247,10 @@ fn drive(cap: u32, acts: &[Act]) -> Result<(), TestCaseError> {
                     u64::from(want - 1),
                     u64::from(pred),
                     u64::from(elapsed),
+                    // The simulator names no minimum: the model decides as today when none
+                    // does (`min_le_one_is_today`).
+                    0,
+                    0,
                 );
                 let declared = band.sim(pool.now, elapsed);
                 prop_assert_eq!(
