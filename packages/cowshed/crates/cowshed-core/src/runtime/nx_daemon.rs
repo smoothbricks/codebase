@@ -1997,6 +1997,54 @@ mod tests {
         );
     }
 
+    /// A landing daemon's stop is bounded by the daemon's exit within the shared grace, never by a
+    /// command run beside it. A batch land on 2026-11-10 spent 259 s in `stop-landing-nx`:
+    /// its `nx daemon --stop` entered the shed's shell through `direnv exec`, whose cold
+    /// `devenv direnv-export` waited on the Nix daemon, for a daemon already gone. The stop here
+    /// meets a shell that never answers, and still ends within the grace with the daemon exited.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stopping_an_owned_daemon_ends_within_its_exit_grace() {
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "nx-daemon-owned-bounded",
+        );
+        let (mut daemon, worker) = sandboxed_daemon_with_worker();
+        let ledger = ledger_naming(&scratch, &daemon);
+        let record = scratch.join("server-process.json");
+        write_record(&record, daemon.id(), &scratch.join("refusing.sock"));
+        let DaemonStopPlan::Owned { process, watch } =
+            prepare_daemon_stop(&record, &ledger).unwrap()
+        else {
+            panic!("a ledger-proven live daemon is owned");
+        };
+        let grace = crate::build_volume::nx::DAEMON_EXIT_GRACE;
+        let started = std::time::Instant::now();
+        let stopped = tokio::time::timeout(
+            grace,
+            stop_owned_daemon(process, watch, || {
+                std::future::pending::<std::io::Result<std::process::Output>>()
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        daemon.wait_bounded().unwrap();
+        let outlived = outlived(&worker);
+        let Ok(outcome) = stopped else {
+            panic!("the stop was still running after {elapsed:?}, past the {grace:?} grace");
+        };
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.signalled && outcome.exited,
+            "the daemon took the SIGTERM and exited: {outcome:?}"
+        );
+        assert!(
+            !outlived,
+            "the daemon's plugin worker {} outlived its stop: {outcome:?}",
+            worker.pid()
+        );
+    }
+
     /// Closing a checkout's Nx state -- the keeper's stop of an idle shed's daemon, and every
     /// retirement's -- ends the daemon's plugin workers with it, so the census that follows finds
     /// none of them on the mount.
