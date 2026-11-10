@@ -30,6 +30,8 @@ mod input_memo;
 pub mod land_turn;
 pub mod landing;
 pub mod lease_holder;
+#[cfg(target_os = "macos")]
+pub mod lost_mounts;
 pub mod media_room;
 pub mod metadata;
 pub mod port_zero;
@@ -90,8 +92,8 @@ pub use error::{
 };
 pub use gateway_inventory::{
     AdoptedProject, AttachedInventory, GatewayInventoryError, GatewaySessionFact,
-    GatewayStoreBackend, HeldWorkspace, NativeGatewayInventory, ProjectHealOutcome,
-    StartupHealState, UnreachableMain, forming_re_adoption_checkout,
+    GatewayStoreBackend, HeldWorkspace, LostMount, NativeGatewayInventory, ProjectHealOutcome,
+    RemountScope, StartupHealState, UnreachableMain, forming_re_adoption_checkout,
 };
 pub use project_retirement::ProjectRetirementReport;
 pub use storage::bootstrap::ValidatedHostStorage;

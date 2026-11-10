@@ -628,6 +628,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         mount_point: &Path,
     ) -> Result<bool, ApfsStorageError>;
+    /// The whole device through which the kernel still holds `workspace`'s image attached while
+    /// its mount is not as [`Substrate::ensure_mounted`] leaves it ([`Self::mount_settled`]): its
+    /// volume, or the build volume its checkout links, lost a mount no cowshed release made, as a
+    /// restart of `fseventsd` took about 100 on 2026-11-10 (05_gateway.md, "Lost mounts"). `None`
+    /// for a settled workspace and for a detached one, which holds nothing to lose.
+    fn lost_mount(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+    ) -> Result<Option<String>, ApfsStorageError>;
     fn retain_mounted(
         &self,
         workspace: &LifecycleWorkspace,
@@ -1929,6 +1939,55 @@ where
                 }
             })
             .await
+    }
+
+    /// Mount `workspace` again when it lost its mount while the kernel kept its image attached
+    /// ([`ApfsExecutionHost::lost_mount`]), by the same settle under its image lock, and with the
+    /// same canonical mount policy, as every heal: never a workspace that stands mounted or
+    /// detached. The lock is only tried: a holder is a live lifecycle operation, a detach or a
+    /// retirement among them, which owns the image's state until it lets go, so a lost mount it
+    /// holds answers [`Remount::Locked`] and the caller waits for the lock before it asks again.
+    pub(crate) async fn remount_lost(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Remount, ApfsStorageError> {
+        let lock = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
+        let holding = LockHolding::of(LockOperation::Mount, workspace.name());
+        let workspace = workspace.clone();
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        self.lane
+            .dispatch(move || {
+                let locks = std::slice::from_ref(&lock);
+                let mount_point = mount_point(&config, &workspace)?;
+                let guard = host.lock_images(locks, LockMode::Try, &holding)?;
+                let Some(device) = host.lost_mount(&workspace, &mount_point)? else {
+                    return Ok(Remount::Standing);
+                };
+                let Some(_guard) = guard else {
+                    return Ok(Remount::Locked { device });
+                };
+                host.recover_pending(&config, locks)?;
+                settle_mount(host.as_ref(), &config, &workspace, MountIntent::default())?;
+                Ok(Remount::Remounted {
+                    device,
+                    mount_point,
+                })
+            })
+            .await
+    }
+
+    /// [`ApfsExecutionHost::lost_mount`] for `workspace`, read without its lock: what `doctor`
+    /// reports, never what a remount acts on.
+    pub(crate) async fn lost_mount(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Option<String>, ApfsStorageError> {
+        let workspace = workspace.clone();
+        self.dispatch_read(move |host, config| {
+            host.lost_mount(&workspace, &mount_point(&config, &workspace)?)
+        })
+        .await
     }
 
     /// Wait until no other process holds `workspace`'s image lock, then let go of it at once.
@@ -3244,6 +3303,22 @@ fn apply_retire<H: ApfsExecutionHost>(
         current.clone(),
         Revision::new(current.revision().get() + 1),
     )))
+}
+
+/// What [`ApfsSubstrate::remount_lost`] found of one workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Remount {
+    /// Mounted as `ensure_mounted` leaves it, or detached: no mount was lost.
+    Standing,
+    /// Its mount was lost while its image stayed attached through `device`; it is mounted again
+    /// at `mount_point`.
+    Remounted {
+        device: String,
+        mount_point: PathBuf,
+    },
+    /// Its mount was lost while its image stayed attached through `device`, and a live lifecycle
+    /// operation holds its image lock: nothing was mounted.
+    Locked { device: String },
 }
 
 /// Settle `workspace`'s mount under its image lock, which the caller holds: heal a mount the

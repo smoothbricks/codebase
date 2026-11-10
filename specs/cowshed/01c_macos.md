@@ -60,6 +60,7 @@ Find the symptom in the left column and follow the link.
 | `dev.cowshed.storage` exits 1 at `merge Spotlight Search Privacy exclusions`; `mkstemp failed on /System/Volumes/Data/.Spotlight-V100/…`                                                                 | [Spotlight indexing opt-outs](#spotlight-indexing-opt-outs)                                                                                     |
 | `fseventsd` load; a root-owned `.fseventsd` in a volume root                                                                                                                                             | [`fseventsd` keeps a persistent event log per volume](#fseventsd-keeps-a-persistent-event-log-per-volume)                                       |
 | A watcher probe is late or never comes back; `fseventsd` holds gigabytes and its router thread stays busy                                                                                                | [`fseventsd` slows with uptime](#fseventsd-slows-with-uptime)                                                                                   |
+| Cowshed volumes attached but mounted nowhere after an `fseventsd` restart; `doctor` `mount-lost`                                                                                                         | [05_gateway.md §Lost mounts](./05_gateway.md#lost-mounts)                                                                                       |
 | `root-held-event-debris`; a retired mountpoint cowshed cannot delete                                                                                                                                     | [A root-owned `.fseventsd` lands on a bare mountpoint](#a-root-owned-fseventsd-lands-on-a-bare-mountpoint)                                      |
 | Rewritten image blocks stay allocated; `tmutil` reports the store excluded                                                                                                                               | [Time Machine and local snapshots](#time-machine-and-local-snapshots)                                                                           |
 | After a reboot the store is absent; a DiskUnlock dialog at login; `environment-missing` naming the store                                                                                                 | [The store volume mounts before login](#the-store-volume-mounts-before-login)                                                                   |
@@ -595,10 +596,13 @@ Find the symptom in the left column and follow the link.
   (`sudo -n killall fseventsd`; launchd respawns it): an instance up three days held 12.4–12.8 GB, kept its router
   thread busy in every sample and left a test stream's touch undelivered after 89 s, while a restarted instance held
   4.2–4.4 MB at 0–9 % router load and answered probes in 0.2–42 ms with the same clients, so no client causes it
-  (_measured_ by thread sampling).
+  (_measured_ by thread sampling). A restart unmounts volumes it should not: on 2026-11-10 one left about 100 cowshed
+  volumes attached and mounted nowhere, every main and shed, and the RAM temp volume's 8 GiB disk (_measured_).
 - **Rule.** A daemon answers from the files as they are when its watcher probe comes back late or not at all, never from
-  a stream that has gone quiet, and cowshed never restarts `fseventsd`.
+  a stream that has gone quiet, and cowshed never restarts `fseventsd`. The gateway remounts a held volume that loses
+  its mount, and a RAM lease on a volume that lost its mount releases the stranded disk.
 - **Owners.** _No spec owner_ for the path table and the restart.
+  [05_gateway.md §Lost mounts](./05_gateway.md#lost-mounts) for the remount and the RAM release.
   [16_build_volumes.md §The Nx daemon stays on](./16_build_volumes.md#the-nx-daemon-stays-on), “A daemon answers from
   the files as they are” (the lost-probe rule). Code: [`packages/nx-plugin/src/nx-daemon-watch-stream-host.test.ts`].
   See also [`fseventsd` keeps a persistent event log per volume](#fseventsd-keeps-a-persistent-event-log-per-volume).

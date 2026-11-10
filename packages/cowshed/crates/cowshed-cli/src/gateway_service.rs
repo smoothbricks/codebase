@@ -1829,20 +1829,64 @@ async fn run_daemon() -> Result<()> {
             Ok(released) => cowshed_os::eprintln!("cowshed: closed {released} carried workspace listener(s) no restored session claimed"),
             Err(error) => cowshed_os::eprintln!("cowshed: could not close the unclaimed carried listeners: {error}"),
         }
-        Ok::<(), CowshedError>(())
+        // From here on the gateway keeps what the pass restored mounted: a held volume that loses
+        // its mount is remounted (05_gateway.md, "Lost mounts").
+        Ok::<_, CowshedError>(watch_lost_mounts(heal_inventory))
     }
     .await;
-    if let Err(primary) = started {
-        return match gateway.drain().await {
-            Ok(()) => Err(primary),
-            Err(error) => Err(CowshedError::internal(format!(
-                "{}; gateway drain also failed: {error}",
-                primary.message
-            ))),
-        };
-    }
+    let lost_mounts = match started {
+        Ok(watch) => watch,
+        Err(primary) => {
+            return match gateway.drain().await {
+                Ok(()) => Err(primary),
+                Err(error) => Err(CowshedError::internal(format!(
+                    "{}; gateway drain also failed: {error}",
+                    primary.message
+                ))),
+            };
+        }
+    };
 
-    drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
+    let drained = drain_after_shutdown(gateway, wait_for_shutdown_signal()).await;
+    drop(lost_mounts);
+    drained
+}
+
+/// Start the watch that remounts a volume the gateway holds once it loses its mount, saying
+/// every one it finds on stderr, the gateway's log. A watch that cannot start is said there too,
+/// and the gateway serves without it: a lost mount then waits for a verb or the next start.
+#[cfg(target_os = "macos")]
+fn watch_lost_mounts(
+    inventory: NativeGatewayInventory,
+) -> Option<cowshed_core::lost_mounts::LostMountWatch> {
+    let watch = cowshed_core::lost_mounts::watch(inventory, |lost| {
+        cowshed_os::eprintln!("cowshed: {lost}");
+        if matches!(
+            lost,
+            cowshed_core::LostMount::Unread { .. }
+                | cowshed_core::LostMount::Workspace {
+                    remount: Err(_),
+                    ..
+                }
+        ) {
+            cowshed_os::eprintln!("next: cowshed doctor");
+        }
+    });
+    match watch {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: the watch on lost mounts did not start: {error}; a held volume that loses its mount stays unmounted until a verb or the next gateway start heals it"
+            );
+            None
+        }
+    }
+}
+
+/// No kernel image a gateway holds off macOS can lose a mount under it.
+#[cfg(not(target_os = "macos"))]
+fn watch_lost_mounts(_inventory: NativeGatewayInventory) -> Option<()> {
+    None
 }
 
 /// The daemon's startup pass, as the gateway's status and its session changes see it: the

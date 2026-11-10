@@ -2169,6 +2169,114 @@ async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_a
     fixture.stop_gateway().await;
 }
 
+/// A volume the gateway holds that loses its mount while its image stays attached is mounted
+/// again where it belongs (05_gateway.md, "Lost mounts"). On 2026-11-10 a restart of `fseventsd`
+/// left about 100 cowshed volumes so, every main and shed of the host, and each stayed unmounted
+/// until an operator mounted main and attached every shed by hand. Here the fixture's own main and
+/// shed lose their mounts to a Disk Arbitration unmount under the gateway's watch, their images
+/// left attached; the watch hears the kernel, remounts both through the heal's settle, with the
+/// canonical `nobrowse,owners` policy, and says so for each.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount() {
+    use cowshed_core::LostMount;
+    use cowshed_core::storage::apfs::Remount;
+
+    let mut fixture = Fixture::with(Project::Plain);
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let shed = new_workspace(&mut service, "shed").await;
+    // Nothing of the runtime holds either volume while the test unmounts it.
+    service.shutdown().await.expect("shutdown runtime");
+    let held = |mount: &Path| {
+        SystemKernelMountSource
+            .mounts()
+            .expect("own fixture mounts")
+            .into_iter()
+            .find(|kernel| kernel.mount_point == mount)
+    };
+    for mount in [&fixture.checkout, &shed] {
+        assert!(held(mount).is_some(), "{} is mounted", mount.display());
+    }
+
+    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
+    let watch = cowshed_core::lost_mounts::watch(
+        cowshed_core::NativeGatewayInventory::new(fixture.storage.clone()),
+        move |lost| {
+            let _ = heard.send(lost);
+        },
+    )
+    .expect("arm the gateway's watch on lost mounts");
+    for mount in [&fixture.checkout, &shed] {
+        let unmount = cowshed_apfs::CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [OsString::from("unmount"), mount.as_os_str().to_os_string()],
+        );
+        let result = fixture
+            .runner()
+            .run(&unmount, "fixture unmount")
+            .expect("run diskutil unmount")
+            .output;
+        assert!(
+            result.succeeded(),
+            "diskutil unmount {}: {result:?}",
+            mount.display()
+        );
+    }
+
+    let mut remounted = std::collections::BTreeMap::new();
+    while remounted.len() < 2 {
+        let lost = tokio::time::timeout(Duration::from_secs(120), hearing.recv())
+            .await
+            .expect("the watch remounts both volumes")
+            .expect("the watch runs");
+        match lost {
+            LostMount::Workspace {
+                workspace,
+                remount:
+                    Ok(Remount::Remounted {
+                        device,
+                        mount_point,
+                    }),
+            } => {
+                assert!(device.starts_with("/dev/disk"), "{device}");
+                remounted.insert(workspace.name().to_string(), mount_point);
+            }
+            other => panic!("a lost mount the watch did not remount: {other}"),
+        }
+    }
+    assert_eq!(
+        remounted,
+        [
+            ("main".to_owned(), fixture.checkout.clone()),
+            ("shed".to_owned(), shed.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    for mount in [&fixture.checkout, &shed] {
+        let kernel = held(mount).unwrap_or_else(|| panic!("{} is mounted again", mount.display()));
+        assert!(!kernel.browse(), "{} is mounted nobrowse", mount.display());
+        assert!(
+            kernel.owners_honoured(),
+            "{} honours owners",
+            mount.display()
+        );
+        assert!(
+            mount
+                .join(cowshed_core::storage::WORKSPACE_MARKER_PATH)
+                .is_file(),
+            "{} carries its marker",
+            mount.display()
+        );
+    }
+    drop(watch);
+    fixture.stop_gateway().await;
+}
 /// Making room under IOKit's media match-notification ceiling on the real kernel
 /// (02_workspaces.md, "Making room for an attach"), with a small cap as the decision input rather
 /// than a fake registry: a test namespace makes room by the media its own store's attached images

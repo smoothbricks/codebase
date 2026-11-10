@@ -2323,7 +2323,13 @@ attach and the lease is still on it. Once the attach is gone the mountpoint is a
 volume, where a write through `TMPDIR` can make the lease path again, and that free space is not the lease's: the ENOSPC
 line then says the lease was lost and why, or that the volume could not be read. Its release says it the same way
 (`RAM temp volume: lease <lease> was lost while its task held it: …`) and is never taken as a release of a lease that
-was there.
+was there. When the volume itself went from the mountpoint, the disk the lease was taken on can still be attached,
+mounted nowhere: its mount was lost (on 2026-11-10 a restart of `fseventsd` left the user's 8 GiB disk so, owned by no
+lease). No path reaches its files and no lease can be taken on it, so that release detaches it, by the registry entry
+the lease was taken on, through the gateway's `ram-detach` under a detach claim, and its message names the disk, the
+lost mount and what the detach did; a disk mounted anywhere is left attached and named. A creator detaches a kept disk a
+lost mount stranded before it judges the bare mountpoint, so what the lost tasks wrote there afterwards keeps a new
+volume from being mounted over it but never keeps the old disk resident.
 
 What a command leaves running is ended by its owner, never chosen by where it works (`specs/cowshed/11_shell.md`,
 "Process identity and signal ownership"; `specs/cowshed/07_api.md`, `JobSubtreeHandle`). When the job's supervisor

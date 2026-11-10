@@ -17410,16 +17410,42 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     };
                     match &workspace.derived.mount_state {
                         crate::storage::lifecycle::MountState::Detached => {
-                            findings.push(crate::api::dto::Finding {
-                                code: "mount".into(),
-                                severity: crate::api::dto::FindingSeverity::Info,
-                                message: format!(
-                                    "workspace {workspace_name} is detached; expected mount {}",
-                                    expected_mount.display()
-                                ),
-                                hint: format!("cowshed attach {workspace_name}"),
-                                path: Some(expected_mount),
-                            });
+                            // Detached by the mount table alone: the kernel may still hold its image,
+                            // whose mount was lost under it (05_gateway.md, "Lost mounts").
+                            match crate::doctor::probe(
+                                format!("{workspace_name}/lost-mount"),
+                                self.substrate.lost_mount(&workspace.derived.workspace),
+                            )
+                            .await
+                            {
+                                Ok(Some(device)) => findings.push(crate::api::dto::Finding {
+                                    code: "mount-lost".into(),
+                                    severity: crate::api::dto::FindingSeverity::Error,
+                                    message: format!(
+                                        "workspace {workspace_name} lost its mount: the kernel holds its image attached as {device} with nothing mounted at {}; the gateway remounts a held volume that loses its mount",
+                                        expected_mount.display()
+                                    ),
+                                    hint: format!(
+                                        "cowshed gateway status; if the gateway is running and {workspace_name} stays unmounted, cowshed attach {workspace_name}"
+                                    ),
+                                    path: Some(expected_mount),
+                                }),
+                                Ok(None) => findings.push(crate::api::dto::Finding {
+                                    code: "mount".into(),
+                                    severity: crate::api::dto::FindingSeverity::Info,
+                                    message: format!(
+                                        "workspace {workspace_name} is detached; expected mount {}",
+                                        expected_mount.display()
+                                    ),
+                                    hint: format!("cowshed attach {workspace_name}"),
+                                    path: Some(expected_mount),
+                                }),
+                                Err(error) => findings.push(native_finding(
+                                    "mount-lost",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    native_storage_error(error),
+                                )),
+                            }
                             if self.supervisors.contains_key(&workspace_name) {
                                 findings.push(crate::api::dto::Finding {
                                     code: "mount-supervisor".into(),

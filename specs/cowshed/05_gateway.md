@@ -2427,6 +2427,50 @@ second mount pathway that every existing invariant — kernel mount facts, marke
 crash-window classification — would have to be reconciled against, for mounts cowshed did not perform and cannot fence.
 One mount pathway cowshed owns end to end is worth more than the eager pass it would save.
 
+## Lost mounts
+
+A volume the gateway holds can lose its mount while the kernel keeps its image attached. On 2026-11-10 at 03:55 +04 a
+restart of `fseventsd` (`killall fseventsd`, [01c_macos.md](./01c_macos.md#fseventsd-slows-with-uptime)) did that to
+about 100 cowshed volumes, every main and shed of the host. Each stayed unmounted: `doctor` reported every main not
+mounted and every shed detached, and an operator released the attachments and ran `mount main` and `attach --all` ten
+minutes later. No cowshed verb had made the unmount, so no verb's settle ran, and the startup pass had long ended.
+
+Once its startup pass is over the gateway watches for this (`cowshed-core`'s `lost_mounts`). The kernel signals every
+unmount, whoever made it, to a kqueue `EVFILT_FS` filter (`cowshed-apfs`'s `MountTableEvents`); on each signal the watch
+reads the mount table (`getfsstat`) and names the mount points that went since its last read. A project is reached when
+one of them lies below its checkout, its sessions' mount root or its build volumes' mount root. For each workspace of a
+reached project the gateway tries the workspace's image lock and asks whether the kernel still holds its image attached
+while its mount is not as `ensure_mounted` leaves it, its volume or the build volume its checkout links mounted nowhere
+it belongs (`ApfsExecutionHost::lost_mount`). Such a workspace is mounted again at its recorded mountpoint by the settle
+every heal runs, under that lock and with the canonical mount policy (01a_apfs.md, "Mounts" and "Mount and per-volume
+policy"). A workspace standing mounted, or detached, is passed over, so a verb's detach is never undone. A workspace
+whose image lock a live operation holds is that holder's until it lets go: the watch waits for the lock alone, holding
+no lease, as a startup heal left to a holder waits ("Startup contract", step 3), and remounts it only if it is still
+lost then. The watch is the one owner of those waits, one per workspace. When it starts, it makes one pass over every
+workspace of every recorded project, for a mount lost while no gateway watched.
+
+The mount table decides, because it is the authority for what is mounted where (01_storage.md, "Runtime state: derived,
+never stored"). Disk Arbitration's disappeared callback fires when a disk leaves, not when a volume of a disk that stays
+attached unmounts; its description-changed callback reports the volume path only once `diskarbitrationd`, which
+serializes every client on the host (01c_macos.md), has processed the change, and cowshed's mounts are `mount_apfs`
+mounts Disk Arbitration did not make. Nor is the session table the ledger: it is a cache of host inventory, never an
+authority ("Control plane"), and holds no main.
+
+The gateway says every lost mount on its stderr:
+`cowshed: <repo>: <ws> lost its mount while its image stayed attached as <device>; remounted at <mountpoint>`, or that
+its image lock is held and it is remounted once the holder lets go, or why it was not remounted, followed by
+`next: cowshed doctor`. Each reached project's check is the lifecycle span `lost-mounts check <repo>`. `doctor` reports
+a workspace whose image is attached with nothing mounted as `mount-lost`, an error naming the device, rather than as
+detached. A watch that cannot start, or whose kernel events fail, says so on stderr; the gateway serves on, and a lost
+mount then waits for a verb or the next start.
+
+A RAM temp volume is no held workspace: its disk is its keeping caller's ("RAM disks"), and a lost mount of it is
+settled through its leases (`packages/nx-plugin/README.md`, RAM temp).
+
+The regression is `cowshed-cli`'s `real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount`: a real fixture
+adopts main and forks a shed, arms the watch on its own store, unmounts both with `diskutil unmount`, and hears both
+remounted at their mountpoints, `nobrowse` with owners honoured and their markers in place.
+
 ## Deleting released images
 
 A released image is freed by the gateway. Every image a cowshed operation removes is released, never unlinked by the

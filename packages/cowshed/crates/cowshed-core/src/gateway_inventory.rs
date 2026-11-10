@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use crate::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use crate::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, Remount,
 };
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::directory::DirectoryExecutionHost;
@@ -40,6 +41,8 @@ pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
 /// The span every startup heal step reports under.
 const HEAL_SCOPE: &str = "startup-heal";
+/// The span every remount pass reports under (05_gateway.md, "Lost mounts").
+const LOST_MOUNT_SCOPE: &str = "lost-mounts";
 
 /// How far the daemon's startup pass has got, as the requests it answers meanwhile see it
 /// (05_gateway.md "Startup contract"). It only moves forward: fewer projects left to mount, then
@@ -166,6 +169,83 @@ pub struct ProjectHealOutcome {
     pub main: Result<PathBuf, GatewayInventoryError>,
 }
 
+/// Which held workspaces a remount pass looks at (05_gateway.md, "Lost mounts").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemountScope {
+    /// Every workspace of every recorded project: the pass a gateway makes once it has started,
+    /// for a mount lost while no gateway watched.
+    Every,
+    /// The workspaces of each project one of whose mount roots holds a mount point the kernel's
+    /// table no longer lists.
+    Vanished(BTreeSet<PathBuf>),
+}
+
+impl RemountScope {
+    /// Whether this scope reaches a project whose volumes mount below `roots`. Roots that could
+    /// not be read reach it, so the pass names the project's failure rather than skipping it.
+    fn reaches(&self, roots: &Result<Vec<PathBuf>, GatewayInventoryError>) -> bool {
+        match (self, roots) {
+            (Self::Every, _) | (Self::Vanished(_), Err(_)) => true,
+            (Self::Vanished(gone), Ok(roots)) => gone
+                .iter()
+                .any(|path| roots.iter().any(|root| path.starts_with(root))),
+        }
+    }
+}
+
+/// One finding of a remount pass: a workspace whose mount was lost while its image stayed
+/// attached, and what remounting it did, or a project whose workspaces could not be read.
+#[derive(Debug)]
+pub enum LostMount {
+    Workspace {
+        workspace: LifecycleWorkspace,
+        remount: Result<Remount, GatewayInventoryError>,
+    },
+    Unread {
+        repo_id: RepoId,
+        error: GatewayInventoryError,
+    },
+}
+
+impl fmt::Display for LostMount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workspace { workspace, remount } => {
+                let (repo, name) = (workspace.repo(), workspace.name());
+                match remount {
+                    Ok(Remount::Remounted {
+                        device,
+                        mount_point,
+                    }) => write!(
+                        formatter,
+                        "{repo}: {name} lost its mount while its image stayed attached as {device}; remounted at {}",
+                        mount_point.display()
+                    ),
+                    Ok(Remount::Locked { device }) => write!(
+                        formatter,
+                        "{repo}: {name} lost its mount while its image stayed attached as {device}; its image lock is held, so it is remounted once the holder lets go"
+                    ),
+                    Ok(Remount::Standing) => write!(
+                        formatter,
+                        "{repo}: {name} stands mounted or detached as its image lock's holder left it"
+                    ),
+                    Err(error) => write!(
+                        formatter,
+                        "{repo}: {name} lost its mount and was not remounted: {error}"
+                    ),
+                }
+            }
+            Self::Unread { repo_id, error } => write!(
+                formatter,
+                "{repo_id}: its workspaces were not checked for a lost mount: {error}"
+            ),
+        }
+    }
+}
+
+/// A wait a project hands out that owns everything it needs, so the caller lets go of the project,
+/// and of its reader lease, before it awaits it.
+type OwnedWait<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 impl fmt::Debug for GatewaySessionFact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -508,6 +588,18 @@ trait ProjectMounts: Send + Sync {
     /// Mount one workspace where this project's checkout layout puts it.
     async fn mount(&self, workspace: &LifecycleWorkspace)
     -> Result<PathBuf, GatewayInventoryError>;
+    /// Mount one workspace again when its mount was lost while its image stayed attached.
+    async fn remount_lost(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Remount, GatewayInventoryError>;
+    /// [`Self::remount_lost`] once the holder of the workspace's image lock lets go, waiting for
+    /// that lock alone, holding no lease, as a startup heal left to a holder waits (01_storage.md,
+    /// "Lock order").
+    fn remount_once_released(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> OwnedWait<Result<Remount, GatewayInventoryError>>;
 }
 
 #[async_trait]
@@ -652,6 +744,51 @@ impl<H: ApfsExecutionHost> ProjectMounts for SubstrateMounts<H> {
             repo: self.repo.clone(),
             workspace: workspace.name().clone(),
         })
+    }
+
+    async fn remount_lost(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Remount, GatewayInventoryError> {
+        require_active(&self.substrate, &self.repo)?;
+        Ok(self.substrate.remount_lost(workspace).await?)
+    }
+
+    fn remount_once_released(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> OwnedWait<Result<Remount, GatewayInventoryError>> {
+        let substrate = self.substrate.clone();
+        let repo = self.repo.clone();
+        let workspace = workspace.clone();
+        Box::pin(async move { remount_once_released(&substrate, &repo, &workspace).await })
+    }
+}
+
+/// A remount left to the holder of the workspace's image lock: wait for that lock holding no
+/// lease, then take a project reader lease, refuse a project whose retirement owns it, and remount
+/// without waiting, as [`heal_once_released`] mounts. A lock taken again meanwhile is waited for
+/// again; a holder that detached or settled the workspace leaves nothing to remount.
+async fn remount_once_released<H: ApfsExecutionHost>(
+    substrate: &ApfsSubstrate<H>,
+    repo: &RepoId,
+    workspace: &LifecycleWorkspace,
+) -> Result<Remount, GatewayInventoryError> {
+    let store = &substrate.config().store_root;
+    loop {
+        substrate.wait_for_mount_lock(workspace).await?;
+        let _lease =
+            crate::project_retirement::acquire_project_reader(store, repo).map_err(|error| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: store.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+        require_active(substrate, repo)?;
+        match substrate.remount_lost(workspace).await? {
+            Remount::Locked { .. } => {}
+            settled => return Ok(settled),
+        }
     }
 }
 
@@ -1217,23 +1354,76 @@ impl NativeGatewayInventory {
     pub async fn recorded_projects(&self) -> Result<Vec<RepoId>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
         cowshed_os::timing::timed_async(HEAL_SCOPE, "discover", async move {
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                let mut repositories = discover_repositories(&store)?;
-                // Only a positive pending authorization removes a project from ordinary heal.
-                // An unreadable record remains a per-project open failure, not a silent skip or
-                // a reason to stop every other project's startup.
-                repositories.retain(|repo| {
-                    !matches!(
-                        crate::project_retirement::retirement_blocks_open(&store, repo),
-                        Ok(true)
-                    )
-                });
-                Ok(repositories)
-            })
-            .await
-            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+            crate::storage::lifecycle::dispatch_blocking(move || active_repositories(&store))
+                .await
+                .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
         })
         .await
+    }
+
+    /// Mount again every workspace of the projects `scope` reaches whose mount was lost while the
+    /// kernel kept its image attached (05_gateway.md, "Lost mounts"), and say what each remount
+    /// did. A workspace standing mounted, or detached, is passed over. One whose image lock a live
+    /// operation holds answers [`Remount::Locked`], for the caller to wait on
+    /// ([`Self::remount_once_released`]). Failures are per project and per workspace, as in the
+    /// startup heal; only reading the recorded projects at all fails the pass.
+    pub async fn remount_lost(
+        &self,
+        scope: &RemountScope,
+    ) -> Result<Vec<LostMount>, GatewayInventoryError> {
+        let storage = self.storage.clone();
+        let reached = scope.clone();
+        let repositories = crate::storage::lifecycle::dispatch_blocking(move || {
+            Ok::<_, GatewayInventoryError>(
+                active_repositories(storage.store())?
+                    .into_iter()
+                    .filter(|repo| reached.reaches(&project_mount_roots(&storage, repo)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))??;
+        let mut lost = Vec::new();
+        for repo_id in repositories {
+            let found = cowshed_os::timing::timed_async(
+                LOST_MOUNT_SCOPE,
+                format!("check {repo_id}"),
+                self.remount_lost_in(&repo_id),
+            )
+            .await;
+            lost.extend(found.unwrap_or_else(|error| vec![LostMount::Unread { repo_id, error }]));
+        }
+        Ok(lost)
+    }
+
+    /// One reached project's share of [`Self::remount_lost`].
+    async fn remount_lost_in(
+        &self,
+        repo: &RepoId,
+    ) -> Result<Vec<LostMount>, GatewayInventoryError> {
+        let mounts = self.heal.open(&self.storage, repo).await?;
+        let mut lost = Vec::new();
+        for workspace in mounts.workspaces().await? {
+            match mounts.remount_lost(&workspace).await {
+                Ok(Remount::Standing) => {}
+                remount => lost.push(LostMount::Workspace { workspace, remount }),
+            }
+        }
+        Ok(lost)
+    }
+
+    /// Remount `workspace` once the holder of its image lock lets go, as
+    /// [`Self::remount_lost`] would have; the project is let go of before the wait.
+    pub async fn remount_once_released(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Remount, GatewayInventoryError> {
+        let waiting = self
+            .heal
+            .open(&self.storage, workspace.repo())
+            .await?
+            .remount_once_released(workspace);
+        waiting.await
     }
 
     /// Attach and mount every one of `repositories`' mains, telling `progress` as each project is
@@ -2223,6 +2413,47 @@ impl NativeGatewayInventory {
             credentials,
         })
     }
+}
+
+/// The recorded projects no positive pending retirement removes from the gateway's mounts: an
+/// unreadable retirement record remains a per-project open failure, not a silent skip or a reason
+/// to pass over every other project.
+fn active_repositories(store: &Path) -> Result<Vec<RepoId>, GatewayInventoryError> {
+    let mut repositories = discover_repositories(store)?;
+    repositories.retain(|repo| {
+        !matches!(
+            crate::project_retirement::retirement_blocks_open(store, repo),
+            Ok(true)
+        )
+    });
+    Ok(repositories)
+}
+
+/// The roots below which `repo`'s volumes mount: its adopted checkout, which is main's mount point,
+/// its sessions' mount root and its build volumes' mount root.
+fn project_mount_roots(
+    storage: &ValidatedHostStorage,
+    repo: &RepoId,
+) -> Result<Vec<PathBuf>, GatewayInventoryError> {
+    let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+        GatewayInventoryError::InvalidMetadata {
+            path: storage.store().to_owned(),
+            message: error.to_string(),
+        }
+    })?;
+    let builds =
+        crate::build_volume::BuildVolumeLayout::new(layout.project()).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: layout.project().project_root.clone(),
+                message: error.to_string(),
+            }
+        })?;
+    let mut roots = vec![
+        layout.project().mount_root.clone(),
+        builds.mounts().to_path_buf(),
+    ];
+    roots.extend(authoritative_checkout_path(&layout, repo)?);
+    Ok(roots)
 }
 
 /// Enumerate the projects in the store, skipping everything that is not one.
@@ -5235,6 +5466,22 @@ mod tests {
                 });
             }
             Ok(PathBuf::from("/mounted").join(key))
+        }
+
+        async fn remount_lost(
+            &self,
+            _: &LifecycleWorkspace,
+        ) -> Result<crate::storage::apfs::Remount, GatewayInventoryError> {
+            Ok(crate::storage::apfs::Remount::Standing)
+        }
+
+        fn remount_once_released(
+            &self,
+            _: &LifecycleWorkspace,
+        ) -> crate::gateway_inventory::OwnedWait<
+            Result<crate::storage::apfs::Remount, GatewayInventoryError>,
+        > {
+            Box::pin(async { Ok(crate::storage::apfs::Remount::Standing) })
         }
     }
 

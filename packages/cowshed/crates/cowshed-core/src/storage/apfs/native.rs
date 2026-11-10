@@ -4312,6 +4312,21 @@ where
             .is_some_and(|device| device == attachment.volume_device()))
     }
 
+    fn lost_mount(
+        &self,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
+    ) -> Result<Option<String>, ApfsStorageError> {
+        if self.mount_settled(workspace, mount_point)? {
+            return Ok(None);
+        }
+        let canonical = layout(&self.config, workspace.repo())?
+            .canonical_image(workspace.name())?
+            .image()
+            .to_owned();
+        self.attached_device(&canonical)
+    }
+
     fn detach(
         &self,
         attachment: Self::Attachment,

@@ -1252,6 +1252,71 @@ describe('creating the RAM temp volume', () => {
       rmSync(parent, { recursive: true, force: true });
     }
   });
+
+  it('detaches the kept disk a lost mount stranded even while files the lost tasks wrote hold its bare mountpoint', async () => {
+    // On 2026-11-10 a restart of fseventsd took the volume's mount: the kept disk stayed attached, mounted nowhere, and
+    // tasks that recorded their subtree handles after the loss wrote them onto the bare mountpoint. Every later creator
+    // refused that directory before it reclaimed anything, so the disk held 8 GiB with no lease and no owner. The
+    // ledger's record still names the disk: it is detached first, and the bare directory is still never mounted over.
+    const parent = mkdtempSync(join(tmpdir(), 'ra-stranded-'));
+    const root = join(parent, 'root');
+    mkdirSync(root, { mode: 0o700 });
+    const paths = {
+      ...ramTempPaths(userInfo(), NAMESPACE),
+      root,
+      mountpoint: join(root, 'ram'),
+      leaseBytesMax: Number.MAX_SAFE_INTEGER,
+      staging: join(root, 'ram-new'),
+      lockFile: join(parent, 'v.lock'),
+    };
+    mkdirSync(paths.mountpoint);
+    writeFileSync(join(paths.mountpoint, '43844-aKNk6s.subtree'), '{}\n', { mode: 0o600 });
+    writeFileSync(
+      `${paths.lockFile}.ledger`,
+      `${JSON.stringify({ version: 1, lifecycle: null, claims: [], held: [], kept: '0x100000def' })}\n`,
+      { mode: 0o600 },
+    );
+    const capacity = 64 * 1024 * 1024;
+    let registry = registryRamDisk({
+      entry: '0x100000def',
+      uid: paths.uid,
+      sectors: capacity / 512,
+      device: 'disk9',
+      volume: paths.volumeName,
+    });
+    const calls: string[] = [];
+    const commands: HostCommands = {
+      async run(file, args): Promise<CommandOutput> {
+        if (file === '/usr/sbin/ioreg') {
+          return { status: 0, stdout: args.includes('AppleDiskImageDevice') ? '' : registry, stderr: '' };
+        }
+        if (file === '/sbin/mount') return { status: 0, stdout: '', stderr: '' };
+        throw new Error(`${file} ${args.join(' ')} ran`);
+      },
+      async detachRam(device, registryEntry) {
+        calls.push(`detach ${device} ${registryEntry}`);
+        registry = '';
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      async attachRam() {
+        calls.push('attach');
+        return { ok: false, error: 'a creator attached over a directory it does not own' };
+      },
+    };
+    try {
+      expect(await new RamTempVolume(paths, capacity, commands).acquire(noSubtrees)).toEqual({
+        ok: false,
+        error: {
+          kind: 'ram-unavailable',
+          reason: 'unproven-owner',
+          detail: `${paths.mountpoint} is an unmounted directory with unowned contents; nothing removed or hidden by a new mount`,
+        },
+      });
+      expect(calls).toEqual(['detach /dev/disk9 0x100000def']);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('observing the RAM temp volume', () => {

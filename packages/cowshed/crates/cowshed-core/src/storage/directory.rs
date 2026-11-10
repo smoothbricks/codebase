@@ -1704,6 +1704,15 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         ) && observed_mount(&build.image(&id))?.as_deref() == Some(build.mount(&id).as_path()))
     }
 
+    /// A directory payload is no kernel attachment, so nothing it holds can lose a mount.
+    fn lost_mount(
+        &self,
+        _workspace: &LifecycleWorkspace,
+        _mount_point: &Path,
+    ) -> Result<Option<String>, ApfsStorageError> {
+        Ok(None)
+    }
+
     /// The workspace's mount, kept: the canonical payload must be mounted, through this handle,
     /// at the workspace's mountpoint. The mount id is the mount record's inode.
     fn retain_mounted(

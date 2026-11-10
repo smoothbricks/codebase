@@ -713,23 +713,46 @@ async function aLeaseLostUnderItsTask(): Promise<void> {
     expect(measured).toMatchObject({ kind: 'measured', lease: lease.directory, mountpoint: paths.mountpoint });
     expect(measured.kind === 'measured' && measured.capacityBytes <= capacity).toBe(true);
 
-    // Another owner takes the volume away by force under the held lease, and a write through TMPDIR makes the lease
-    // directory again below the bare mountpoint, on the Data volume. Forced, since what the test owns is the lease and
-    // not every other process on the host: an unforced detach of the fresh volume was refused busy in a land gate.
-    const unmounted = await createHostCommands(gatewaySocket).run('/sbin/umount', ['-f', paths.mountpoint]);
+    // Another owner takes the volume's mount away under the held lease, as the restart of fseventsd on 2026-11-10 took
+    // about 100 cowshed mounts: a Disk Arbitration unmount that leaves the disk attached, mounted nowhere, its pages
+    // still resident. Forced, since what the test owns is the lease and not every other process on the host: an
+    // unforced detach of the fresh volume was refused busy in a land gate. A write through TMPDIR then makes the lease
+    // directory again below the bare mountpoint, on the Data volume.
+    const [disk] = (await attachedDisks(paths, capacity, gatewaySocket)).filter((candidate) =>
+      candidate.mountpoints.includes(paths.mountpoint),
+    );
+    if (disk?.physical == null) {
+      throw new Error(`no RAM disk of this fixture is mounted at ${paths.mountpoint}`);
+    }
+    const stranded = async () =>
+      (await attachedDisks(paths, capacity, gatewaySocket)).filter((candidate) => candidate.entry === disk.entry);
+    const unmounted = await createHostCommands(gatewaySocket).run('/usr/sbin/diskutil', [
+      'unmount',
+      'force',
+      paths.mountpoint,
+    ]);
     expect(unmounted.status, unmounted.stderr).toBe(0);
+    expect(await stranded()).toMatchObject([{ physical: disk.physical, mountpoints: [] }]);
     mkdirSync(join(lease.directory, 'node-compile-cache'), { recursive: true });
-    const detail = `no marked volume is mounted at ${paths.mountpoint} any more: it was detached while the task held its lease`;
+    const detail = `no marked volume is mounted at ${paths.mountpoint} any more: it was unmounted or detached while the task held its lease`;
     expect(await volume.space(lease)).toEqual({
       kind: 'lost',
       lease: lease.directory,
       mountpoint: paths.mountpoint,
       detail,
     });
+    // The release fails loudly, naming the lost mount, and detaches the stranded disk through cowshed's own release (the
+    // gateway's registry-bound ram-detach), so its RAM is never left resident.
     expect(await volume.release(lease, true, provisionOnly)).toEqual({
       ok: false,
-      error: { kind: 'lease-lost', lease: lease.directory, mountpoint: paths.mountpoint, detail },
+      error: {
+        kind: 'lease-lost',
+        lease: lease.directory,
+        mountpoint: paths.mountpoint,
+        detail: `${detail}; its disk ${disk.physical} (registry ${disk.entry}) stayed attached with its mount at ${paths.mountpoint} lost, and this release detached it`,
+      },
     });
+    expect(await stranded()).toEqual([]);
   } finally {
     try {
       await detachOwned(owned, paths.uid, gatewaySocket);
@@ -815,7 +838,7 @@ describe('temporary-directory policy on this host', () => {
       aFailedStepLeavesNoNamedVolume,
     );
     it(
-      'says a lease lost when its volume is detached under its task, never measuring the host disk in its place',
+      'says a lease lost when its volume loses its mount under its task, and detaches the disk the lost mount stranded',
       aLeaseLostUnderItsTask,
     );
   } else {

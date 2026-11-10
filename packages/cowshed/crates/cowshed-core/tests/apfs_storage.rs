@@ -556,6 +556,14 @@ impl ApfsExecutionHost for FakeHost {
         ))
     }
 
+    fn lost_mount(
+        &self,
+        _: &LifecycleWorkspace,
+        _: &Path,
+    ) -> Result<Option<String>, ApfsStorageError> {
+        Ok(None)
+    }
+
     fn retain_mounted(
         &self,
         workspace: &LifecycleWorkspace,

@@ -445,6 +445,11 @@ export interface RamTempLease {
    * another attach, or none, is not this lease's volume: its free space is some other filesystem's.
    */
   attach: string;
+  /**
+   * The I/O Registry entry of the disk that attach is on, which the volume's marker named and the registry proved when
+   * the lease was taken: the disk a release of a lease whose volume lost its mount detaches.
+   */
+  registryEntry: string;
 }
 
 export interface RamUnavailable {
@@ -686,7 +691,8 @@ type Taken =
     };
 
 type Releasing =
-  | { readonly kind: 'lost'; readonly detail: string }
+  /** `stranded`: the volume itself went from the mountpoint, not just the lease from the volume. */
+  | { readonly kind: 'lost'; readonly detail: string; readonly stranded: boolean }
   | { readonly kind: 'wait'; readonly claim: LifecycleClaim }
   | {
       readonly kind: 'claimed';
@@ -901,6 +907,7 @@ export class RamTempVolume {
                 directory: value.directory,
                 mountpoint: this.paths.mountpoint,
                 attach: value.volume.attach,
+                registryEntry: value.volume.registryEntry,
               },
               held: [...value.held, ...settled.value.held].map((lease) => lease.text),
               reaped: [...settled.value.reaped],
@@ -942,7 +949,15 @@ export class RamTempVolume {
         const directory = await this.make(op);
         return {
           ledger: next,
-          value: { ok: true, value: { directory, mountpoint: this.paths.mountpoint, attach: volume.attach } },
+          value: {
+            ok: true,
+            value: {
+              directory,
+              mountpoint: this.paths.mountpoint,
+              attach: volume.attach,
+              registryEntry: volume.registryEntry,
+            },
+          },
         };
       },
     );
@@ -1015,7 +1030,7 @@ export class RamTempVolume {
         // A lease that went while its task held it is said, never released as though it were there.
         const held = leaseOn(lease, volume);
         if ('lost' in held) {
-          return { ledger, value: { kind: 'lost', detail: held.lost } };
+          return { ledger, value: { kind: 'lost', detail: held.lost, stranded: volume?.attach !== lease.attach } };
         }
         if (ledger.lifecycle !== null) {
           return { ledger, value: { kind: 'wait', claim: ledger.lifecycle } };
@@ -1034,7 +1049,9 @@ export class RamTempVolume {
         case 'lost':
           return {
             ok: false,
-            error: { kind: 'lease-lost', lease: lease.directory, mountpoint: lease.mountpoint, detail: value.detail },
+            error: value.stranded
+              ? await this.releaseLost(op, lease, value.detail)
+              : { kind: 'lease-lost', lease: lease.directory, mountpoint: lease.mountpoint, detail: value.detail },
           };
         case 'wait': {
           const yielded = await this.yieldTo(op, value.claim, waited);
@@ -1086,6 +1103,90 @@ export class RamTempVolume {
     }
   }
 
+  /**
+   * Release a lease whose volume went from the mountpoint while its task held it. A volume that lost its mount leaves its
+   * disk attached and mounted nowhere: no path reaches its files and no lease can be taken on it, yet its pages stay
+   * resident until it is detached (on 2026-11-10 a restart of fseventsd stranded the user's 8 GiB disk so, owned by no
+   * lease). The lease's own registry entry, which the registry proved when the lease was taken, makes the disk this
+   * volume's: the release detaches it through the gateway's registry-bound `ram-detach`, under a detach claim no other
+   * caller passes, and the lease is said lost with what became of its disk. A disk mounted anywhere is left as it is and
+   * named, and one already gone is said so; nothing is forced.
+   */
+  private async releaseLost(op: Operation, lease: RamTempLease, lost: string): Promise<RamTempError> {
+    const said = (detail: string): RamTempError => ({
+      kind: 'lease-lost',
+      lease: lease.directory,
+      mountpoint: lease.mountpoint,
+      detail: `${lost}; ${detail}`,
+    });
+    const entry = lease.registryEntry;
+    let waited: ClaimWait | null = null;
+    for (;;) {
+      const found = await this.diskOf(entry);
+      if (!found.ok)
+        return said(`its disk (registry ${entry}) could not be read: ${describeRamTempError(found.error)}`);
+      const disk = found.value;
+      if (disk === null) return said(`its disk (registry ${entry}) is no longer attached`);
+      if (disk.mountpoints.length > 0) {
+        return said(
+          `its disk ${disk.physical} (registry ${entry}) is mounted at ${disk.mountpoints.join(', ')}, so this release left it attached`,
+        );
+      }
+      const stranded = `its disk ${disk.physical} (registry ${entry}) stayed attached with its mount at ${lease.mountpoint} lost`;
+      const taken = await this.locked(
+        op,
+        'release',
+        async (ledger): Promise<Step<LifecycleClaim | null>> =>
+          ledger.lifecycle !== null
+            ? { ledger, value: ledger.lifecycle }
+            : { ledger: { ...ledger, lifecycle: { kind: 'detach', owner: op.owner } }, value: null },
+      );
+      if (!taken.ok) {
+        const why = taken.error.kind === 'lock-denied' ? taken.error.detail : describeRamTempError(taken.error);
+        return said(`${stranded}, and no detach claim could be taken: ${why}`);
+      }
+      if (taken.value !== null) {
+        // Another caller is creating or detaching: look at the disk again once it has.
+        const yielded = await this.yieldTo(op, taken.value, waited);
+        if (!yielded.ok) {
+          const why = yielded.error.kind === 'lock-denied' ? yielded.error.detail : describeRamTempError(yielded.error);
+          return said(`${stranded}, and waiting on another caller's ${taken.value.kind} failed: ${why}`);
+        }
+        waited = yielded.value;
+        continue;
+      }
+      const command = await this.runDetach(op, disk.physical, entry);
+      if (!command.ok) return said(`${stranded}, and its detach failed: ${describeRamTempError(command.error)}`);
+      if (command.value.pending !== undefined) {
+        return said(`${stranded}; its detach still runs in the gateway (${commandText(command.value)})`);
+      }
+      const detached = detachOutcome(command.value, disk, 'hdiutil detach (lost mount)');
+      return said(
+        detached.ok
+          ? `${stranded}, and this release detached it`
+          : `${stranded}, and its detach failed: ${describeRamTempError(detached.error)}`,
+      );
+    }
+  }
+
+  /** The RAM disk of this volume's user and size that registry entry `entry` registers, as one read finds it; else null. */
+  private async diskOf(entry: string): Promise<Result<AttachedRamDisk | null, RamTempError>> {
+    const registry = await this.commands.run('/usr/sbin/ioreg', ['-r', '-c', 'IOHDIXHDDriveOutKernel', '-l', '-w0']);
+    if (registry.status !== 0) return failed('ioreg (RAM disks)', commandText(registry));
+    const table = await this.commands.run('/sbin/mount', []);
+    if (table.status !== 0) return failed('mount (mount table)', commandText(table));
+    const disks = ramDisksIn(registry.stdout, table.stdout);
+    if (!disks.ok) return failed('ioreg (RAM disks)', disks.error);
+    const disk = disks.value.find(
+      (candidate) =>
+        candidate.entry === entry && candidate.uid === this.paths.uid && candidate.sectors === this.sectors,
+    );
+    if (disk === undefined) return { ok: true, value: null };
+    const { physical } = disk;
+    return physical === null
+      ? failed('ioreg (RAM disks)', `registry entry ${entry} has published no whole disk`)
+      : { ok: true, value: { ...disk, physical } };
+  }
   /**
    * Wait out another caller's creation or detach. Liveness of its owner is its pid's, so a crashed
    * owner whose pid was reused holds every caller here; past each `CLAIM_WAIT_NOTICE_MS` on the same
@@ -1798,11 +1899,23 @@ export class RamTempVolume {
     return confirmed;
   }
 
-  /** Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. */
+  /**
+   * Check the root the volume mounts below, detach what earlier creators left, then attach and provision the volume. The
+   * detach comes before the bare mountpoint is judged: a kept disk whose mount was lost is debris whatever that
+   * directory holds, and tasks that held leases on it may have written there after the loss.
+   */
   private async provisionVolume(op: Operation): Promise<Result<void, RamTempError>> {
+    const root = await rootReadiness(this.paths);
+    if (!root.ok) {
+      return root;
+    }
+    const strays = await this.reclaimStrays(op, this.holdersPass());
+    if (!strays.ok) {
+      return strays;
+    }
     try {
-      const [root, parent] = await Promise.all([stat(this.paths.mountpoint), stat(join(this.paths.mountpoint, '..'))]);
-      if (root.dev === parent.dev && (await readdir(this.paths.mountpoint)).length !== 0) {
+      const [mount, parent] = await Promise.all([stat(this.paths.mountpoint), stat(join(this.paths.mountpoint, '..'))]);
+      if (mount.dev === parent.dev && (await readdir(this.paths.mountpoint)).length !== 0) {
         return {
           ok: false,
           error: {
@@ -1814,14 +1927,6 @@ export class RamTempVolume {
       }
     } catch (error) {
       if (errorCode(error) !== 'ENOENT') return failed('provenance', errorText(error));
-    }
-    const root = await rootReadiness(this.paths);
-    if (!root.ok) {
-      return root;
-    }
-    const strays = await this.reclaimStrays(op, this.holdersPass());
-    if (!strays.ok) {
-      return strays;
     }
     const attached = await this.commands.attachRam(this.sectors);
     if (!attached.ok) {
@@ -2276,7 +2381,7 @@ function leaseOn(
 ): { readonly on: MountedVolume } | { readonly lost: string } {
   if (volume === null) {
     return {
-      lost: `no marked volume is mounted at ${lease.mountpoint} any more: it was detached while the task held its lease`,
+      lost: `no marked volume is mounted at ${lease.mountpoint} any more: it was unmounted or detached while the task held its lease`,
     };
   }
   if (volume.attach !== lease.attach) {

@@ -144,6 +144,121 @@ pub fn kernel_mounts() -> io::Result<Vec<KernelMountSnapshot>> {
     }
 }
 
+/// The kernel's word that its mount table changed: one kqueue `EVFILT_FS` filter, which every
+/// unmount signals (`VQ_UNMOUNT`, and `VQ_DEAD` for a forced one), whoever made it. Disk
+/// Arbitration's own unmounts, an operator's `diskutil unmount`, and the ones a restart of
+/// `fseventsd` caused on 2026-11-10 all arrive here, with no daemon between the kernel and the
+/// reader. The event names no filesystem: a reader learns which mounts went by reading
+/// [`kernel_mounts`] again and comparing it with the table it held before.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct MountTableEvents {
+    queue: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl MountTableEvents {
+    /// Register for the kernel's filesystem events. A change made after this returns is never
+    /// missed: the filter collects every signal until [`Self::next`] takes it.
+    pub fn new() -> io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        // SAFETY: kqueue takes no arguments and returns a new descriptor or -1 with errno set.
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: kqueue just returned this descriptor, which nothing else owns.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        // SAFETY: kqueue descriptors are not inherited across fork, but a close-on-exec flag keeps
+        // an exec'd child from holding the queue for its own life either way.
+        if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let change = libc::kevent {
+            ident: 0,
+            filter: libc::EVFILT_FS,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one initialized change in, no events out, no timeout; the queue is live.
+        let added = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &raw const change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if added == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { queue })
+    }
+
+    /// Block until the kernel signals a filesystem event, then answer. Every signal raised before
+    /// the call is folded into the one event it takes, so a burst of unmounts wakes a reader once.
+    pub fn next(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        loop {
+            // SAFETY: an all-zero kevent is a valid value of the plain C struct.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            // SAFETY: no changes, room for one event out, no timeout: block until one fires.
+            let fired = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &raw mut event,
+                    1,
+                    std::ptr::null(),
+                )
+            };
+            match fired {
+                1 => {
+                    // `struct kevent` is packed on Darwin: copy the fields out before reading them.
+                    let (flags, data) = (event.flags, event.data);
+                    if flags & libc::EV_ERROR != 0 {
+                        return Err(io::Error::from_raw_os_error(
+                            i32::try_from(data).unwrap_or(libc::EINVAL),
+                        ));
+                    }
+                    return Ok(());
+                }
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The mount points `before` held that `after` holds no longer: what went between two reads of
+/// the kernel's table, by the path the kernel reports.
+pub fn vanished(
+    before: &[KernelMountSnapshot],
+    after: &[KernelMountSnapshot],
+) -> std::collections::BTreeSet<PathBuf> {
+    let standing = after
+        .iter()
+        .map(|mount| &mount.mount_point)
+        .collect::<std::collections::BTreeSet<_>>();
+    before
+        .iter()
+        .filter(|mount| !standing.contains(&mount.mount_point))
+        .map(|mount| mount.mount_point.clone())
+        .collect()
+}
+
 /// The kernel FSID returned by fstatfs/getfsstat, never a mountpoint hash or BSD spelling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FilesystemId([i32; 2]);
