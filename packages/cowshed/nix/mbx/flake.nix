@@ -28,8 +28,10 @@
 # only when the driver's own ld is a wrapper, the background collector's unlinks paced (1,000 a
 # second, flights 200), a size budget that never takes a present checkout's target, a compilation's
 # paths resolved once, flights reclaimed after an hour unpublished or seven days unused, and a
-# reservation's minimum (`min`) gathered before it starts, from smoothbricks/mr-boxington at the pinned
-# revision.
+# reservation's minimum (`min`) gathered before it starts, an automatic store sweep that resumes at
+# its first unfinished phase, a bypassed library's rlib kept reproducible while its sources are
+# settled, and the proven pool model emitted with native compares, from smoothbricks/mr-boxington
+# at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -41,7 +43,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/6238163f1263d8accc47c5a7b8360120ceb6a02b";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/c9f9973d1b4548be88b677db0ee2cd919c698d91";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
