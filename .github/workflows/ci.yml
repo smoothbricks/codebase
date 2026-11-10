@@ -13,13 +13,12 @@ permissions:
   statuses: write
 
 concurrency:
-  # This workflow validates and never deploys, so there is no in-flight
-  # deployment for a newer push to protect: every pull request, and every ref
-  # for pushes, cancels its superseded runs. Queuing them instead serializes
-  # the staging branch, and a burst of pushes then reports the newest commit
-  # one full run per queued push late.
+  # One in-flight run per pull request, and per ref for pushes. Pushes to the first
+  # push branch queue behind a running workflow instead of canceling it, so every
+  # push there ends in a finished run and a newer push never cancels a deploy job
+  # mid-flight. Pull requests and other branches keep canceling superseded runs.
   group: CI-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:

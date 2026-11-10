@@ -119,7 +119,10 @@ export interface CiWorkflowDefinitionOptions extends DeployStepSecretConfig {
   deploy: boolean;
   browserTests: boolean;
   e2eDeployment: boolean;
-  /** The first entry is the branch whose pushes deploy the staging stage. */
+  /**
+   * The first entry is the branch whose pushes queue behind a running CI run instead of canceling it, and, with
+   * deploy, deploy the staging stage.
+   */
   pushBranches: NonEmptyArray<string>;
   /** Default ubuntu-latest when omitted. */
   runsOn?: string | string[];
@@ -297,22 +300,12 @@ permissions:
 ${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
 concurrency:
-${
-  options.deploy
-    ? `  # One in-flight run per pull request, and per ref for pushes. Pushes to the
-  # staging push branch queue behind a running workflow instead of canceling it,
-  # so a newer push never cancels the deploy job mid-flight. Pull requests and
-  # other branches keep canceling superseded runs.
+  # One in-flight run per pull request, and per ref for pushes. Pushes to the first
+  # push branch queue behind a running workflow instead of canceling it, so every
+  # push there ends in a finished run and a newer push never cancels a deploy job
+  # mid-flight. Pull requests and other branches keep canceling superseded runs.
   group: ${CI_CONCURRENCY_GROUP}
-  cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}`
-    : `  # This workflow validates and never deploys, so there is no in-flight
-  # deployment for a newer push to protect: every pull request, and every ref
-  # for pushes, cancels its superseded runs. Queuing them instead serializes
-  # the staging branch, and a burst of pushes then reports the newest commit
-  # one full run per queued push late.
-  group: ${CI_CONCURRENCY_GROUP}
-  cancel-in-progress: true`
-}
+  cancel-in-progress: \${{ github.ref != ${stagingRefLiteral(options)} }}
 
 defaults:
   run:
@@ -1194,7 +1187,10 @@ export const SAME_REPO_GATE_FOLDED = [
   '          }}',
 ];
 
-/** The first push branch is the one whose pushes deploy the staging stage. */
+/**
+ * The first push branch is the one whose pushes queue behind a running CI run, and, with deploy, deploy the staging
+ * stage.
+ */
 function stagingPushBranch(options: CiWorkflowDefinitionOptions): string {
   return options.pushBranches[0];
 }

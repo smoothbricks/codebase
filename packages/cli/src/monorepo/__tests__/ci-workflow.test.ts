@@ -964,11 +964,11 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
     }
   });
 
-  it('cancels superseded pushes when the workflow has no deploy job to protect', () => {
+  it('queues pushes to the first push branch when the workflow has no deploy job', () => {
     const validateOnly = renderCiWorkflowYaml(options());
 
-    expect(validateOnly).toContain('cancel-in-progress: true');
-    expect(validateOnly).not.toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+    expect(validateOnly).toContain("cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}");
+    expect(validateOnly).not.toContain('cancel-in-progress: true');
   });
 
   it('keeps a protected staging environment off CI runs that do not deploy', () => {

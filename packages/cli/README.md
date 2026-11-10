@@ -1320,16 +1320,17 @@ directory; that cache is a convenience for repeated queries only. Nothing that d
 it refuses — rather than answering `unknown` — without credentials, on an API error, or while traffic is split between
 two versions.
 
-Pushes to the staging push branch queue behind a running workflow instead of canceling it, so a newer push never cancels
-a production deployment mid-flight. Pull requests and other branches keep canceling superseded runs. The e2e and
-production jobs repeat the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors
-shift with the configuration instead of staying fixed. The PR preview cleanup job runs the same preflight and carries
-the same job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations. It shares
-the pull request's CI concurrency group, `CI-${{ github.event.pull_request.number || github.ref }}`: one group per pull
-request, by its number, and one per ref for pushes. The number names it because a close that merged the pull request
-carries the base branch's ref, not the pull request's. Closing a pull request cancels that pull request's running CI
-run, so the cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a
-running cleanup, whose kept records let the next close finish the stage.
+Pushes to the first push branch queue behind a running workflow instead of canceling it, so every push there ends in a
+finished run and a newer push never cancels a production deployment mid-flight; a workflow with no deploy job queues
+them the same way. Pull requests and other branches keep canceling superseded runs. The e2e and production jobs repeat
+the Cargo credential and sibling-source preflight before SetupDevenv, so their `--step` anchors shift with the
+configuration instead of staying fixed. The PR preview cleanup job runs the same preflight and carries the same
+job-level Cargo and private npm read tokens, since its SetupDevenv resolves the same declarations. It shares the pull
+request's CI concurrency group, `CI-${{ github.event.pull_request.number || github.ref }}`: one group per pull request,
+by its number, and one per ref for pushes. The number names it because a close that merged the pull request carries the
+base branch's ref, not the pull request's. Closing a pull request cancels that pull request's running CI run, so the
+cleanup starts only after its stage deploy has stopped, and a reopened pull request's CI run cancels a running cleanup,
+whose kept records let the next close finish the stage.
 
 Upgrading from a smoo that named a pull request's group after its ref: follow
 [Upgrading to a smoo that records stages](#upgrading-to-a-smoo-that-records-stages), which covers the group change. A
