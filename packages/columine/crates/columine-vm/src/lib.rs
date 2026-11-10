@@ -74,3 +74,4 @@ pub mod temporal;
 pub mod ttl_plan;
 pub mod undo_log;
 pub mod vm;
+pub mod watch_log;

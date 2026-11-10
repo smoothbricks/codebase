@@ -151,7 +151,7 @@ pub fn batch_map_upsert(
     batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
-        hooks.feed_records(slot_idx),
+        hooks.records(slot_idx),
         upsert_rows(
             strategy, delta_mode, state, meta, slot_idx, cuts, keys, vals, cmp_col, cmp_type,
             hooks,
@@ -306,7 +306,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
                 Some(old) => Change::Updated(Some(u64::from(old))),
                 None => Change::Inserted,
             };
-            hooks.feed_record(slot, Key::one(key), change);
+            hooks.record(state, slot, Key::one(key), change);
         }
     }
     ErrorCode::Ok
@@ -366,7 +366,7 @@ pub fn batch_map_remove(
     let result = batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
-        hooks.feed_records(slot_idx),
+        hooks.records(slot_idx),
         remove_rows(
             delta_mode,
             state,
@@ -449,7 +449,12 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         }
         hooks.finish_capture(delta_mode, state, capture);
         if let Some(old) = prior {
-            hooks.feed_record(slot, Key::one(key), Change::Removed(Some(u64::from(old))));
+            hooks.record(
+                state,
+                slot,
+                Key::one(key),
+                Change::Removed(Some(u64::from(old))),
+            );
         }
     }
     ErrorCode::Ok

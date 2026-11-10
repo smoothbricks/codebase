@@ -11,13 +11,13 @@ use bitmosaic::Bitmosaic;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::operand::encode_index;
 use columine_types::types::{
-    AggType, ErrorCode, Opcode, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
-    state_num_slots,
+    AggType, ErrorCode, NET_CHANGE_ALIGN, NET_CHANGE_HEADER_SIZE, NetChangeKind, NetChangeOffset,
+    Opcode, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, state_num_slots,
 };
 use columine_vm::bitmap_ops::{BitmapAlgebraOp, BitmapSource};
 use columine_vm::change_feed::{Change, Source};
 use columine_vm::hashmap_ops::{CmpType, Strategy};
-use columine_vm::key_index::Key;
+use columine_vm::key_index::{Key, NoStrings};
 use columine_vm::meta::slot_meta_base;
 use columine_vm::row_exprs::StoredRow;
 use columine_vm::state_init::{
@@ -25,6 +25,7 @@ use columine_vm::state_init::{
     init_state,
 };
 use columine_vm::vm::{Vm, f64s_as_bytes, i64s_as_bytes, u32s_as_bytes};
+use columine_vm::watch_log::{NetAnswer, NetChanges};
 use common::memory::with_allocations;
 
 const OK: u32 = ErrorCode::Ok as u32;
@@ -226,6 +227,36 @@ fn clear_flags(state: &mut [u8]) {
     state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = 0;
 }
 
+/// The slot's write sequence (§6).
+fn write_seq(state: &[u8], slot: u32) -> u64 {
+    let at = (slot_meta_base(slot) + SlotMetaOffset::WRITE_SEQ) as usize;
+    u64::from_le_bytes(state[at..at + 8].try_into().unwrap())
+}
+
+/// `slot`'s watch-log net change from `since` (§7), as key lanes and kind.
+fn net(vm: &Vm, state: &[u8], slot: u32, since: u64) -> Vec<(u32, u32, u8)> {
+    let mut out = NetChanges::default();
+    assert_eq!(
+        vm.net_changes(state, slot, since, &NoStrings, &mut out),
+        Ok(NetAnswer::Changes)
+    );
+    let bytes = out.bytes();
+    let mut changes = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let u32_at = |offset: u32| {
+            u32::from_le_bytes(bytes[at + offset as usize..][..4].try_into().unwrap())
+        };
+        changes.push((
+            u32_at(NetChangeOffset::KEY1),
+            u32_at(NetChangeOffset::KEY2),
+            bytes[at + NetChangeOffset::KIND as usize],
+        ));
+        at = (at + NET_CHANGE_HEADER_SIZE as usize + u32_at(NetChangeOffset::PRIOR_LEN) as usize)
+            .next_multiple_of(NET_CHANGE_ALIGN as usize);
+    }
+    changes
+}
 /// Bind `tracked`, clear the flags and begin a pass.
 fn arm(vm: &mut Vm, state: &mut [u8], tracked: &[u64], facts: u16, cap: u32) {
     vm.feed_bind(tracked, facts, cap).expect("bind");
@@ -592,6 +623,7 @@ fn a_counts_fold_records_once_though_admission_dry_runs_it() {
     let mut state = image(&code);
     let mut vm = Vm::default();
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     let dry_runs = vm.capacity_counts().dry_run_fit;
     let log = [add(KEY, 0, 1, 0), add(6, 0, 1, 0), add(KEY, 0, 1, 0)];
     assert_eq!(OK, run(&mut vm, &mut state, &code, &batch(&log)));
@@ -608,6 +640,16 @@ fn a_counts_fold_records_once_though_admission_dry_runs_it() {
             (slot(0), one(KEY), Change::Updated(None)),
         ]
     );
+    // Three row writes, each logged once though admission dry-ran them.
+    assert_eq!(write_seq(&state, 0), 3);
+    assert_eq!(
+        net(&vm, &state, 0, 0),
+        [
+            (KEY, 0, NetChangeKind::INSERT),
+            (6, 0, NetChangeKind::INSERT)
+        ]
+    );
+    assert_eq!(net(&vm, &state, 0, 2), [(KEY, 0, NetChangeKind::UPDATE)]);
 }
 
 #[test]
@@ -658,6 +700,8 @@ fn a_guarded_upsert_records_its_row_and_the_claim_it_consumes() {
         run(&mut vm, &mut state, &claims, &batch(&[add(KEY, 0, 0, 0)]))
     );
     arm(&mut vm, &mut state, &plane(&[0, 1], false), 0, 64);
+    assert_eq!(vm.watch(&state, 0, 64, 4096), Ok(0));
+    assert_eq!(vm.watch(&state, 1, 64, 4096), Ok(1));
     assert_eq!(
         OK,
         run(&mut vm, &mut state, &code, &batch(&[add(KEY, 0, 1, 0)]))
@@ -669,6 +713,9 @@ fn a_guarded_upsert_records_its_row_and_the_claim_it_consumes() {
             (slot(1), one(KEY), Change::Removed(None)),
         ]
     );
+    assert_eq!((write_seq(&state, 0), write_seq(&state, 1)), (1, 2));
+    assert_eq!(net(&vm, &state, 0, 0), [(KEY, 0, NetChangeKind::INSERT)]);
+    assert_eq!(net(&vm, &state, 1, 1), [(KEY, 0, NetChangeKind::DELETE)]);
 }
 
 #[test]
@@ -685,6 +732,7 @@ fn a_conditional_upsert_records_only_the_rows_its_predicate_admits() {
     let mut state = image(&code);
     let mut vm = Vm::default();
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     // value2 is each row's predicate: KEY is written and then rewritten, 6 is
     // refused while absent and stays absent, and KEY's last row is refused.
     let log = [
@@ -701,6 +749,10 @@ fn a_conditional_upsert_records_only_the_rows_its_predicate_admits() {
             (slot(0), one(KEY), Change::Updated(None)),
         ]
     );
+    // A refused row writes nothing and logs nothing.
+    assert_eq!(write_seq(&state, 0), 2);
+    assert_eq!(net(&vm, &state, 0, 0), [(KEY, 0, NetChangeKind::INSERT)]);
+    assert_eq!(net(&vm, &state, 0, 1), [(KEY, 0, NetChangeKind::UPDATE)]);
     // What the entries claim is what the slot holds: 6 is absent, and KEY
     // keeps its last admitted value.
     assert!(
@@ -734,6 +786,7 @@ fn a_conditional_upsert_records_once_though_admission_dry_runs_it() {
     let mut state = image(&code);
     let mut vm = Vm::default();
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     let dry_runs = vm.capacity_counts().dry_run_fit;
     let mut log: Vec<Row> = (100..148).map(|key| add(key, 0, 1, 0)).collect();
     log.extend([add(KEY, 0, 2, 1), add(6, 0, 3, 1)]);
@@ -748,6 +801,14 @@ fn a_conditional_upsert_records_once_though_admission_dry_runs_it() {
         [
             (slot(0), one(KEY), Change::Inserted),
             (slot(0), one(6), Change::Inserted),
+        ]
+    );
+    assert_eq!(write_seq(&state, 0), 2);
+    assert_eq!(
+        net(&vm, &state, 0, 0),
+        [
+            (KEY, 0, NetChangeKind::INSERT),
+            (6, 0, NetChangeKind::INSERT)
         ]
     );
 }
@@ -800,8 +861,11 @@ fn a_probe_upsert_records_its_output_key() {
     let row = batch(&[add(KEY, 0, 3, 0)]);
     assert_eq!(OK, run(&mut vm, &mut state, &sources, &row));
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     assert_eq!(OK, run(&mut vm, &mut state, &code, &row));
     assert_eq!(entries(&vm), [(slot(0), one(KEY), Change::Inserted)]);
+    assert_eq!(write_seq(&state, 0), 1);
+    assert_eq!(net(&vm, &state, 0, 0), [(KEY, 0, NetChangeKind::INSERT)]);
 }
 
 #[test]
@@ -826,6 +890,7 @@ fn scatter_writes_record_only_a_changed_card() {
     let mut state = image(&code);
     let mut vm = Vm::default();
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     for value in [1, 1, 2] {
         assert_eq!(
             OK,
@@ -839,6 +904,10 @@ fn scatter_writes_record_only_a_changed_card() {
             (slot(0), one(KEY), Change::Updated(None)),
         ]
     );
+    // An unchanged card writes nothing.
+    assert_eq!(write_seq(&state, 0), 2);
+    assert_eq!(net(&vm, &state, 0, 0), [(KEY, 0, NetChangeKind::INSERT)]);
+    assert_eq!(net(&vm, &state, 0, 1), [(KEY, 0, NetChangeKind::UPDATE)]);
 }
 
 #[test]
@@ -868,11 +937,15 @@ fn a_guarded_scatter_records_its_stamped_row() {
     let mut state = image(&code);
     let mut vm = Vm::default();
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    vm.watch(&state, 0, 64, 4096).expect("watch");
     assert_eq!(
         OK,
         run(&mut vm, &mut state, &code, &batch(&[add(KEY, 0, 1, 0)]))
     );
     assert_eq!(entries(&vm), [(slot(0), one(KEY), Change::Inserted)]);
+    // The stamp and the card are one row write.
+    assert_eq!(write_seq(&state, 0), 1);
+    assert_eq!(net(&vm, &state, 0, 0), [(KEY, 0, NetChangeKind::INSERT)]);
 }
 
 #[test]
@@ -900,6 +973,7 @@ fn static_expiry_records_only_changed_keys_it_removes() {
         )
     );
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
+    assert_eq!(vm.watch(&state, 0, 64, 4096), Ok(2));
     assert_eq!(
         OK,
         run(&mut vm, &mut state, &sweep, &batch(&[add(KEY, 0, 2, 0)]))
@@ -911,6 +985,9 @@ fn static_expiry_records_only_changed_keys_it_removes() {
             (slot(0), one(KEY), Change::Removed(None)),
         ]
     );
+    // The upsert and the sweep's removal are two writes; KEY nets to gone.
+    assert_eq!(write_seq(&state, 0), 4);
+    assert_eq!(net(&vm, &state, 0, 2), [(KEY, 0, NetChangeKind::DELETE)]);
     assert!(
         StoredRow::lookup(&state, 0, 6, None)
             .expect("stored key")

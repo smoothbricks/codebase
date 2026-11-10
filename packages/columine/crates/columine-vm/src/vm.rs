@@ -43,6 +43,7 @@ use crate::struct_map::{
 use crate::temporal::{NO_COMPANION, Temporal};
 use crate::ttl_plan::{TtlBatchPlan, TtlBatchScratch, consume_ttl_batch, prepare_ttl_batch};
 use crate::undo_log::{FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp};
+use crate::watch_log::{NetAnswer, NetChanges, Prior, Recorders, WatchLog, scalar_prior};
 use bitmosaic::BitmosaicView;
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::operand::Operands;
@@ -388,7 +389,7 @@ fn remove_entry_by_key(
 pub(crate) fn evict_expired(
     delta_mode: bool,
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     env: &mut BitmapEnv,
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -487,7 +488,9 @@ pub(crate) fn evict_expired(
         match remove_entry_by_key(delta_mode, undo, env, state, meta, key) {
             Ok(Some(change)) => {
                 meta.mark(state, ChangeFlag::EVICTED);
-                feed.record_slot(meta.slot(), Key::one(key), change);
+                rec.feed.record_slot(meta.slot(), Key::one(key), change);
+                rec.watch
+                    .record_change(state, meta.slot(), Key::one(key), change);
                 if meta.has_evict_trigger() {
                     let buffer = meta.evicted_buffer_offset(state);
                     let timestamp = evict_ts(state, base, processed);
@@ -1116,9 +1119,10 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     element_struct_map2_tuple: StructMap2TupleOperands,
     element_list_vals: ScalarOperands,
     nested_scratch: nested::NestedScratch,
-    /// The changed-key feed of the running RETE pass (`change_feed`): bound
-    /// once per program, recorded by the key-scoped kernels.
-    feed: ChangeFeed,
+    /// The key-scoped kernels' recorders: the changed-key feed of the
+    /// running RETE pass (`change_feed`), bound once per program, and the
+    /// watch log (`watch_log`), whose rings a host reserves per slot.
+    rec: Recorders,
     /// The running batch's removal cuts (`removal_cut`), retained across
     /// batches.
     removal_cuts: RemovalCuts,
@@ -1164,7 +1168,7 @@ impl<I: KeyIndex> Vm<I> {
             element_struct_map2_tuple: StructMap2TupleOperands::EMPTY,
             element_list_vals: ScalarOperands::EMPTY,
             nested_scratch: nested::NestedScratch::default(),
-            feed: ChangeFeed::default(),
+            rec: Recorders::default(),
             removal_cuts: RemovalCuts::default(),
             keys: KeyScratch::default(),
             capacity: CapacityScratch::default(),
@@ -1181,12 +1185,12 @@ impl Default for Vm {
     }
 }
 
-/// The VM's undo lane and change feed as the container-ops hook boundary. It
+/// The VM's undo lane and recorders (change feed and watch log) as the container-ops hook boundary. It
 /// borrows only those, so a bitmap operation can take `&mut self.bitmap_env`
 /// alongside it as a split borrow instead of a throwaway environment.
 pub(crate) struct VmCtx<'a> {
     pub(crate) undo: &'a mut UndoState,
-    pub(crate) feed: &'a mut ChangeFeed,
+    pub(crate) rec: &'a mut Recorders,
 }
 
 impl<I: KeyIndex> Vm<I> {
@@ -1195,7 +1199,7 @@ impl<I: KeyIndex> Vm<I> {
     pub(crate) fn ctx(&mut self) -> VmCtx<'_> {
         VmCtx {
             undo: &mut self.undo,
-            feed: &mut self.feed,
+            rec: &mut self.rec,
         }
     }
 
@@ -1493,7 +1497,7 @@ impl<I: KeyIndex> Vm<I> {
         if meta.slot_type() == SlotType::Bitmap {
             let hooks = &mut VmCtx {
                 undo: &mut self.undo,
-                feed: &mut self.feed,
+                rec: &mut self.rec,
             };
             return batch_bitmap_add(
                 &mut self.bitmap_env,
@@ -1552,7 +1556,7 @@ impl<I: KeyIndex> Vm<I> {
         if meta.slot_type() == SlotType::Bitmap {
             let hooks = &mut VmCtx {
                 undo: &mut self.undo,
-                feed: &mut self.feed,
+                rec: &mut self.rec,
             };
             return batch_bitmap_remove(
                 &mut self.bitmap_env,
@@ -1588,7 +1592,7 @@ impl<I: KeyIndex> Vm<I> {
                 &mut vm.bitmap_env,
                 &mut VmCtx {
                     undo: &mut vm.undo,
-                    feed: &mut vm.feed,
+                    rec: &mut vm.rec,
                 },
                 delta_mode,
                 op,
@@ -1615,7 +1619,7 @@ impl<I: KeyIndex> Vm<I> {
         }
         let hooks = &mut VmCtx {
             undo: &mut self.undo,
-            feed: &mut self.feed,
+            rec: &mut self.rec,
         };
         bitmap_ops::bitmap_import(&mut self.bitmap_env, hooks, state, &meta, input)
     }
@@ -1627,16 +1631,28 @@ impl VmHooks for VmCtx<'_> {
     }
 
     #[inline(always)]
-    fn feed_records(&self, slot: u32) -> bool {
-        self.feed.records(slot)
+    fn records(&self, slot: u32) -> bool {
+        self.rec.records(slot)
     }
 
-    fn feed_record(&mut self, slot: u32, key: Key, change: Change) {
-        self.feed.record_slot(slot, key, change);
+    fn record(&mut self, state: &[u8], slot: u32, key: Key, change: Change) {
+        self.rec.record_container(state, slot, key, change);
     }
 
-    fn feed_changed_whole(&mut self, slot: u32) {
-        self.feed.changed_whole(slot);
+    fn record_members(
+        &mut self,
+        state: &[u8],
+        slot: u32,
+        members: &[u32],
+        changed: &[u64],
+        change: Change,
+    ) {
+        self.rec
+            .record_members(state, slot, members, changed, change);
+    }
+
+    fn changed_whole(&mut self, state: &[u8], slot: u32) {
+        self.rec.changed_whole(state, slot);
     }
 
     fn take_erase_scratch(&mut self) -> EraseScratch {
@@ -1677,7 +1693,7 @@ impl VmHooks for VmCtx<'_> {
         plan: TtlBatchPlan,
     ) {
         consume_ttl_batch(state, meta, plan, &mut self.undo.ttl_batch_scratch);
-        self.feed.note_ttl_write();
+        self.rec.feed.note_ttl_write();
     }
 }
 
@@ -1792,6 +1808,23 @@ impl<P: Copy> RowTarget<P> {
         }
     }
 
+    /// The row's ordinal when its key is present before the write.
+    fn held(&self) -> Option<u32> {
+        match self {
+            Self::Present(pos) => Some(*pos),
+            Self::New(_) => None,
+        }
+    }
+
+    /// The change-flag bit a landed write to this row makes.
+    fn kind(&self) -> u8 {
+        if self.is_new() {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        }
+    }
+
     fn is_new(&self) -> bool {
         matches!(self, Self::New(_))
     }
@@ -1815,7 +1848,7 @@ impl<P: Copy> RowTarget<P> {
 #[allow(clippy::too_many_arguments)]
 fn journal_row_write<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     map: &StructMapSlot<I>,
@@ -1825,6 +1858,9 @@ fn journal_row_write<I: KeyIndex, S: InternBytes + ?Sized>(
     cx: &mut KeyCx<'_, I, S>,
     write: impl FnOnce(&mut [u8]) -> ErrorCode,
 ) -> ErrorCode {
+    let prior = rec
+        .watch
+        .row_prior(state, slot, &map.rows(), target.held(), cx.strings);
     let capture = match undo.begin_capture(state, || row_capture_ranges(map, slot, &target)) {
         Ok(capture) => capture,
         Err(error) => return error,
@@ -1835,7 +1871,9 @@ fn journal_row_write<I: KeyIndex, S: InternBytes + ?Sized>(
     };
     undo.finish_capture(delta_mode, state, capture);
     if result == ErrorCode::Ok {
-        feed.record_slot(slot, Key::one(key), target.change());
+        rec.feed.record_slot(slot, Key::one(key), target.change());
+        rec.watch
+            .record(state, slot, Key::one(key), target.kind(), prior);
     }
     result
 }
@@ -1950,7 +1988,7 @@ fn write_card_one<I: KeyIndex>(
 #[allow(clippy::too_many_arguments)]
 fn scatter_card_one<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     map: &StructMapSlot<I>,
@@ -1986,7 +2024,7 @@ fn scatter_card_one<I: KeyIndex, S: InternBytes + ?Sized>(
     let pos = target.pos();
     journal_row_write(
         undo,
-        feed,
+        rec,
         delta_mode,
         state,
         map,
@@ -2935,7 +2973,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
     fn apply<S: InternBytes + ?Sized>(
         &self,
         undo: &mut UndoState,
-        feed: &mut ChangeFeed,
+        rec: &mut Recorders,
         delta_mode: bool,
         state: &mut [u8],
         arrays: Option<&ArenaWrites>,
@@ -2964,6 +3002,13 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
                 .push(header)
                 .push(append)
         };
+        let prior = rec.watch.row_prior(
+            state,
+            self.slot,
+            &self.map.rows(),
+            self.target.held(),
+            cx.strings,
+        );
         let capture = undo.begin_capture(state, ranges)?;
         let written = self.write(state, cx);
         if written.is_ok()
@@ -2973,7 +3018,15 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
         }
         undo.finish_capture(delta_mode, state, capture);
         if written.is_ok() {
-            feed.record_slot(self.slot, Key::one(self.key), self.target.change());
+            rec.feed
+                .record_slot(self.slot, Key::one(self.key), self.target.change());
+            rec.watch.record(
+                state,
+                self.slot,
+                Key::one(self.key),
+                self.target.kind(),
+                prior,
+            );
         }
         written
     }
@@ -2985,7 +3038,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
@@ -3019,12 +3072,15 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     let pos = target.pos();
     let row = smap.row_off(pos);
     let meta = slot_meta_base(slot);
-    let feeds = feed.records(slot);
+    let feeds = rec.feed.records(slot);
     let prior = if feeds && !target.is_new() {
         struct_map2_value(state, smap, row)
     } else {
         None
     };
+    let watched = rec
+        .watch
+        .row_prior(state, slot, &smap.rows(), target.held(), cx.strings);
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, if target.is_new() { 4 } else { 0 }))
@@ -3062,8 +3118,10 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
         } else {
             Change::Updated(prior)
         };
-        feed.record_slot(slot, Key::two(key1, key2), change);
+        rec.feed.record_slot(slot, Key::two(key1, key2), change);
     }
+    rec.watch
+        .record(state, slot, Key::two(key1, key2), target.kind(), watched);
     ErrorCode::Ok
 }
 
@@ -3085,7 +3143,7 @@ fn struct_map2_value<I: KeyIndex>(state: &[u8], smap: &StructMap2Slot<I>, row: u
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
@@ -3119,7 +3177,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     vals.push(operands.cmp2_col, operands.cmp2_field);
     single_struct_map2_upsert_last(
         undo,
-        feed,
+        rec,
         delta_mode,
         state,
         smap,
@@ -3139,7 +3197,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
@@ -3150,9 +3208,13 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
 ) -> ErrorCode {
     let row = smap.row_off(plan.ordinal);
     let meta = slot_meta_base(slot);
-    let prior = feed
+    let prior = rec
+        .feed
         .records(slot)
         .then(|| struct_map2_value(state, smap, row));
+    let watched = rec
+        .watch
+        .row_prior(state, slot, &smap.rows(), Some(plan.ordinal), cx.strings);
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, 4))
@@ -3169,8 +3231,10 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
             smap.clear_bitset(state, row);
             mark_meta(state, meta, ChangeFlag::REMOVED);
             if let Some(old) = prior {
-                feed.record_slot(slot, key, Change::Removed(old));
+                rec.feed.record_slot(slot, key, Change::Removed(old));
             }
+            rec.watch
+                .record(state, slot, key, ChangeFlag::REMOVED, watched);
             ErrorCode::Ok
         }
         Err(error) => error,
@@ -3182,7 +3246,7 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map2_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
@@ -3195,7 +3259,7 @@ fn single_struct_map2_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     }
     match smap.plan_remove(state, key.k1, key.k2, cx) {
         Ok(Some(plan)) => {
-            remove_struct_map2_row(undo, feed, delta_mode, state, smap, slot, key, &plan, cx)
+            remove_struct_map2_row(undo, rec, delta_mode, state, smap, slot, key, &plan, cx)
         }
         Ok(None) => ErrorCode::Ok,
         Err(error) => error,
@@ -3210,7 +3274,7 @@ fn single_struct_map2_remove<I: KeyIndex, S: InternBytes + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn remove_struct_map2_prefix<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMap2Slot<I>,
@@ -3240,7 +3304,7 @@ fn remove_struct_map2_prefix<I: KeyIndex, S: InternBytes + ?Sized>(
         };
         let removed = remove_struct_map2_row(
             undo,
-            feed,
+            rec,
             delta_mode,
             state,
             smap,
@@ -3263,7 +3327,7 @@ fn remove_struct_map2_prefix<I: KeyIndex, S: InternBytes + ?Sized>(
 /// clear), including rows whose key cell is the absent sentinel.
 fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     slot: u32,
@@ -3284,6 +3348,9 @@ fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     };
     let row = smap.row_off(plan.ordinal);
     let meta = slot_meta_base(slot);
+    let prior = rec
+        .watch
+        .row_prior(state, slot, &smap.rows(), Some(plan.ordinal), cx.strings);
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, 4))
@@ -3299,7 +3366,10 @@ fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
         Ok(()) => {
             smap.clear_bitset(state, row);
             mark_meta(state, meta, ChangeFlag::REMOVED);
-            feed.record_slot(slot, Key::one(key), Change::Removed(None));
+            rec.feed
+                .record_slot(slot, Key::one(key), Change::Removed(None));
+            rec.watch
+                .record(state, slot, Key::one(key), ChangeFlag::REMOVED, prior);
             ErrorCode::Ok
         }
         Err(error) => error,
@@ -3352,7 +3422,7 @@ fn guard_admits<I: KeyIndex, S: InternBytes + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     operands: &StructMapGuardedUpsertOperands,
@@ -3387,7 +3457,7 @@ fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     }
     let result = upsert_struct_map_row(
         undo,
-        feed,
+        rec,
         delta_mode,
         state,
         smap,
@@ -3405,7 +3475,7 @@ fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     }
     single_struct_map_remove(
         undo,
-        feed,
+        rec,
         delta_mode,
         state,
         operands.companion_slot,
@@ -3588,7 +3658,7 @@ fn validate_guard_pairing(code: &[u8]) -> Option<()> {
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     out_slot: u32,
@@ -3624,6 +3694,9 @@ fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
     let out_row = out.row_off(target.pos());
     let meta = slot_meta_base(out_slot);
 
+    let prior = rec
+        .watch
+        .row_prior(state, out_slot, &out.rows(), target.held(), cx.strings);
     let ranges = || {
         CaptureRanges::new()
             .push((out.size_off, if target.is_new() { 4 } else { 0 }))
@@ -3665,7 +3738,10 @@ fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
         },
     );
     undo.finish_capture(delta_mode, state, capture);
-    feed.record_slot(out_slot, Key::one(out_key), target.change());
+    rec.feed
+        .record_slot(out_slot, Key::one(out_key), target.change());
+    rec.watch
+        .record(state, out_slot, Key::one(out_key), target.kind(), prior);
     ErrorCode::Ok
 }
 //#endregion reduce-typed-state.probe-upsert
@@ -3834,7 +3910,7 @@ impl ArenaWrites {
 #[allow(clippy::too_many_arguments)]
 fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     smap: &StructMapSlot<I>,
@@ -3874,7 +3950,7 @@ fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
             Err(error) => return error as u32,
         }
     };
-    match row.apply(undo, feed, delta_mode, state, arrays.as_ref(), cx) {
+    match row.apply(undo, rec, delta_mode, state, arrays.as_ref(), cx) {
         Ok(()) => OK,
         Err(error) => error as u32,
     }
@@ -3900,7 +3976,7 @@ fn counts_error(error: crate::counts_fold::CountsFoldError) -> ErrorCode {
 #[allow(clippy::too_many_arguments)]
 fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
-    feed: &mut ChangeFeed,
+    rec: &mut Recorders,
     delta_mode: bool,
     state: &mut [u8],
     op: &crate::counts_fold::CountsFoldOp<'_>,
@@ -3982,6 +4058,9 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
         if stored > insert { stored } else { insert }
     };
     let meta = slot_meta_base(op.slot);
+    let prior = rec
+        .watch
+        .row_prior(state, op.slot, &map.rows(), target.held(), cx.strings);
     let capture = match undo.begin_capture(state, || {
         // Entries past the change flag stay empty; an empty range plans nothing.
         let mut ranges = [(0, 0); MAX_RANGES];
@@ -4039,7 +4118,10 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
         },
     );
     undo.finish_capture(delta_mode, state, capture);
-    feed.record_slot(op.slot, Key::one(key), target.change());
+    rec.feed
+        .record_slot(op.slot, Key::one(key), target.change());
+    rec.watch
+        .record(state, op.slot, Key::one(key), target.kind(), prior);
     OK
 }
 
@@ -4059,12 +4141,16 @@ fn exec_agg_f64(
     vals: &[f64],
     type_mask: Option<TypeMask<'_>>,
     pred_col: Option<&[u32]>,
+    watch: &mut WatchLog,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let old_val = bytes::read_f64(state, meta.offset);
     let new_val = aggregates::reduce_col_f64(kind, vals, old_val, type_mask, pred_col);
     #[allow(clippy::float_cmp)]
     if new_val != old_val {
+        let prior = watch
+            .watches(slot)
+            .then(|| Prior::value_cell(state, meta.offset));
         let ranges = || {
             let [flag, seq] = mark_ranges(meta.meta_base);
             [(meta.offset, 8), flag, seq]
@@ -4076,6 +4162,9 @@ fn exec_agg_f64(
         bytes::write_f64(state, meta.offset, new_val);
         meta.mark(state, ChangeFlag::SIZE_CHANGED);
         undo.finish_capture(delta_mode, state, capture);
+        if let Some(prior) = prior {
+            watch.record(state, slot, Key::one(0), ChangeFlag::SIZE_CHANGED, prior);
+        }
     }
     ErrorCode::Ok
 }
@@ -4091,11 +4180,15 @@ fn exec_agg_i64(
     vals: &[i64],
     type_mask: Option<TypeMask<'_>>,
     pred_col: Option<&[u32]>,
+    watch: &mut WatchLog,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let old_val = bytes::read_i64(state, meta.offset);
     let new_val = aggregates::reduce_col_i64(kind, vals, old_val, type_mask, pred_col);
     if new_val != old_val {
+        let prior = watch
+            .watches(slot)
+            .then(|| Prior::value_cell(state, meta.offset));
         let ranges = || {
             let [flag, seq] = mark_ranges(meta.meta_base);
             [(meta.offset, 8), flag, seq]
@@ -4107,6 +4200,9 @@ fn exec_agg_i64(
         bytes::write_i64(state, meta.offset, new_val);
         meta.mark(state, ChangeFlag::SIZE_CHANGED);
         undo.finish_capture(delta_mode, state, capture);
+        if let Some(prior) = prior {
+            watch.record(state, slot, Key::one(0), ChangeFlag::SIZE_CHANGED, prior);
+        }
     }
     ErrorCode::Ok
 }
@@ -4118,6 +4214,7 @@ fn exec_agg_count(
     state: &mut [u8],
     slot: u32,
     matched: u64,
+    watch: &mut WatchLog,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     if matched == 0 {
@@ -4127,6 +4224,9 @@ fn exec_agg_count(
     let Some(next) = previous.checked_add(matched) else {
         return ErrorCode::CountOverflow;
     };
+    let prior = watch
+        .watches(slot)
+        .then(|| Prior::value_cell(state, meta.offset));
     let ranges = || {
         let [flag, seq] = mark_ranges(meta.meta_base);
         [(meta.offset, 8), flag, seq]
@@ -4138,6 +4238,9 @@ fn exec_agg_count(
     bytes::write_u64(state, meta.offset, next);
     meta.mark(state, ChangeFlag::SIZE_CHANGED);
     undo.finish_capture(delta_mode, state, capture);
+    if let Some(prior) = prior {
+        watch.record(state, slot, Key::one(0), ChangeFlag::SIZE_CHANGED, prior);
+    }
     ErrorCode::Ok
 }
 
@@ -4153,6 +4256,7 @@ fn exec_scalar_latest(
     cmp_vals: &[f64],
     batch_len: u32,
     type_mask: Option<(&[u32], u32)>,
+    watch: &mut WatchLog,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let data = meta.offset;
@@ -4225,6 +4329,7 @@ fn exec_scalar_latest(
         return ErrorCode::Ok;
     };
     let width = if kind == AggType::ScalarU32 { 4 } else { 8 };
+    let prior = watch.watches(slot).then(|| scalar_prior(state, data));
     let ranges = || {
         let [flag, seq] = mark_ranges(meta.meta_base);
         [(data, width), (data + 8, 8), flag, seq]
@@ -4238,6 +4343,14 @@ fn exec_scalar_latest(
     bytes::write_f64(state, data + 8, latest);
     meta.mark(state, ChangeFlag::UPDATED);
     undo.finish_capture(delta_mode, state, capture);
+    if let Some(prior) = prior {
+        let kind = if matches!(prior, Prior::Absent) {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        };
+        watch.record(state, slot, Key::one(0), kind, prior);
+    }
     ErrorCode::Ok
 }
 
@@ -4495,7 +4608,7 @@ impl<I: KeyIndex> Vm<I> {
                         .checked_add(evict_expired(
                             delta_mode,
                             &mut vm.undo,
-                            &mut vm.feed,
+                            &mut vm.rec,
                             &mut vm.bitmap_env,
                             state,
                             &meta,
@@ -4701,6 +4814,7 @@ impl<I: KeyIndex> Vm<I> {
                     return OUT_OF_MEMORY;
                 };
                 if let Err(error) = vm
+                    .rec
                     .feed
                     .reserve_row_keys(table.iter().map(|expiry| expiry.slot), count)
                 {
@@ -4796,14 +4910,14 @@ impl<I: KeyIndex> Vm<I> {
         } else {
             image.extend_from_slice(state);
             let enabled = core::mem::replace(&mut self.undo.enabled, false);
-            let armed = self.feed.suspend();
+            let armed = self.rec.suspend();
             let result = if let Some(table) = temporal {
                 self.execute_temporal(false, &mut image, table, batch, live, cx)
             } else {
                 self.execute_ops(false, &mut image, code, batch, live, cx)
             };
             self.undo.enabled = enabled;
-            self.feed.resume(armed);
+            self.rec.resume(armed);
             result
         };
         if !shadowed {
@@ -4825,7 +4939,7 @@ impl<I: KeyIndex> Vm<I> {
     /// overflows the derived-facts table, and a slot past the `u16` an entry
     /// names is `InvalidProgram`.
     pub fn feed_bind(&mut self, tracked: &[u64], facts: u16, cap: u32) -> Result<(), ErrorCode> {
-        self.feed.bind(tracked, facts, cap)
+        self.rec.feed.bind(tracked, facts, cap)
     }
 
     /// Start a RETE pass over `state`, before its evictions: forget the last
@@ -4833,30 +4947,103 @@ impl<I: KeyIndex> Vm<I> {
     /// already set (a write the feed did not see) or whose slot kind records
     /// no keys, and arm.
     pub fn feed_begin_pass(&mut self, state: &[u8]) {
-        self.feed.begin_pass(state);
+        self.rec.feed.begin_pass(state);
     }
 
     /// End the pass at its final flag clear or early return: nothing records
     /// until the next begin.
     pub fn feed_end_pass(&mut self) {
-        self.feed.end_pass();
+        self.rec.feed.end_pass();
     }
 
     /// The running or last pass's entries, chains and overflow.
     pub fn feed(&self) -> &ChangeFeed {
-        &self.feed
+        &self.rec.feed
     }
 
     /// Record a landed change of derived fact `(fact_idx, key)`, with the
     /// fact's prior value image where it had one.
     pub fn feed_record_fact(&mut self, fact_idx: u16, key: u32, change: Change) {
-        self.feed
+        self.rec
+            .feed
             .record(Source::Fact(fact_idx), Key::one(key), change);
     }
 
     /// What the feed recorded, dropped and overflowed since it was bound.
     pub fn feed_work(&self) -> FeedWork {
-        self.feed.work()
+        self.rec.feed.work()
+    }
+
+    /// Start logging `slot` in the watch log
+    /// (`specs/columine/07-change-feed.md` §7) with a ring of `entries`
+    /// entries and `image_bytes` bytes of prior values, reserved here, or
+    /// keep its existing log. Answers the slot's coverage: the sequence above
+    /// which its log is complete, its current write sequence when logging
+    /// starts. Storage that cannot be had is `OutOfMemory` and changes
+    /// nothing; a slot past the state's slots is `InvalidSlot`; a ring of no
+    /// entries is `CapacityExceeded`. Recording never allocates.
+    pub fn watch(
+        &mut self,
+        state: &[u8],
+        slot: u32,
+        entries: u32,
+        image_bytes: u32,
+    ) -> Result<u64, ErrorCode> {
+        self.rec.watch.watch(state, slot, entries, image_bytes)
+    }
+
+    /// Release `slot`'s log.
+    pub fn unwatch(&mut self, slot: u32) {
+        self.rec.watch.unwatch(slot);
+    }
+
+    /// Whether `slot` is watched.
+    pub fn watched(&self, slot: u32) -> bool {
+        self.rec.watch.watched(slot)
+    }
+
+    /// The sequence above which `slot`'s log is complete, or `None` when
+    /// the slot is not watched.
+    pub fn coverage(&self, slot: u32) -> Option<u64> {
+        self.rec.watch.coverage(slot)
+    }
+
+    /// `state` replaced the state the log followed with a different
+    /// future: drop every entry stamped above its slot's sequence in
+    /// `state` and clamp coverage to it. An undo rollback settles by itself.
+    pub fn log_settle(&mut self, state: &[u8]) {
+        self.rec.watch.settle(state);
+    }
+
+    /// Replace this VM's watch log with `other`'s rings, images and
+    /// coverage: a host that continues `other`'s history in this VM (a
+    /// replay fork) carries the log with the state. A cold path; it may
+    /// allocate.
+    pub fn log_clone_from(&mut self, other: &Self) {
+        self.rec.watch.clone_from_log(&other.rec.watch);
+    }
+
+    /// Every `u32` lane prior `slot`'s ring holds, oldest first: a hash
+    /// map's values and a u32 scalar's value lanes. A host whose lanes hold
+    /// interned ids counts them as references of those ids while the log
+    /// holds them.
+    pub fn log_priors(&self, slot: u32) -> impl Iterator<Item = u32> + '_ {
+        self.rec.watch.priors(slot)
+    }
+
+    /// `slot`'s net change from `since` to its sequence in `state`, its
+    /// struct-map keys and row images resolved through `strings`. See
+    /// [`NetAnswer`] and [`NetChanges`]. A slot this VM does not watch
+    /// answers `Overflowed`; a slot past the state's slots is `InvalidSlot`.
+    pub fn net_changes<S: InternBytes + ?Sized>(
+        &self,
+        state: &[u8],
+        slot: u32,
+        since: u64,
+        strings: &S,
+        out: &mut NetChanges<I>,
+    ) -> Result<NetAnswer, ErrorCode> {
+        self.rec.watch.net_changes(state, slot, since, strings, out)
     }
 
     fn temporal_minimum(&self, state: &[u8], table: Temporal<'_>) -> Option<i64> {
@@ -4996,7 +5183,7 @@ impl<I: KeyIndex> Vm<I> {
             if verdict.is_some() {
                 let result = single_struct_map_remove(
                     &mut self.undo,
-                    &mut self.feed,
+                    &mut self.rec,
                     delta,
                     state,
                     expiry.slot,
@@ -5071,7 +5258,7 @@ impl<I: KeyIndex> Vm<I> {
                 }
                 let result = single_struct_map_remove(
                     &mut self.undo,
-                    &mut self.feed,
+                    &mut self.rec,
                     delta,
                     state,
                     expiry.slot,
@@ -5119,7 +5306,7 @@ impl<I: KeyIndex> Vm<I> {
                             && let Err(error) = evict_expired(
                                 delta,
                                 &mut self.undo,
-                                &mut self.feed,
+                                &mut self.rec,
                                 &mut self.bitmap_env,
                                 state,
                                 &meta,
@@ -5130,7 +5317,7 @@ impl<I: KeyIndex> Vm<I> {
                         }
                     }
                 }
-                self.feed.begin_row();
+                self.rec.feed.begin_row();
                 let folded = self.execute_element_opcodes(
                     delta,
                     state,
@@ -5143,13 +5330,13 @@ impl<I: KeyIndex> Vm<I> {
                     live.as_deref_mut(),
                     cx,
                 );
-                let changed = self.feed.finish_row();
-                let schedule_changed = self.feed.row_ttl_written();
+                let changed = self.rec.feed.finish_row();
+                let schedule_changed = self.rec.feed.row_ttl_written();
                 if folded != OK {
                     return folded;
                 }
                 for index in 0..changed {
-                    let (slot, key) = self.feed.row_key(index);
+                    let (slot, key) = self.rec.feed.row_key(index);
                     let Some(expiry) = table.get(slot) else {
                         return INVALID_PROGRAM;
                     };
@@ -5241,7 +5428,7 @@ impl<I: KeyIndex> Vm<I> {
                         cmp_type,
                         &mut VmCtx {
                             undo: &mut self.undo,
-                            feed: &mut self.feed,
+                            rec: &mut self.rec,
                         },
                     );
                     if result != ErrorCode::Ok {
@@ -5270,7 +5457,7 @@ impl<I: KeyIndex> Vm<I> {
                         CmpType::F64,
                         &mut VmCtx {
                             undo: &mut self.undo,
-                            feed: &mut self.feed,
+                            rec: &mut self.rec,
                         },
                     );
                     if result != ErrorCode::Ok {
@@ -5308,7 +5495,7 @@ impl<I: KeyIndex> Vm<I> {
                         CmpType::F64,
                         &mut VmCtx {
                             undo: &mut self.undo,
-                            feed: &mut self.feed,
+                            rec: &mut self.rec,
                         },
                     );
                     if result != ErrorCode::Ok {
@@ -5342,7 +5529,7 @@ impl<I: KeyIndex> Vm<I> {
                         CmpType::F64,
                         &mut VmCtx {
                             undo: &mut self.undo,
-                            feed: &mut self.feed,
+                            rec: &mut self.rec,
                         },
                     );
                     if result != ErrorCode::Ok {
@@ -5408,7 +5595,7 @@ impl<I: KeyIndex> Vm<I> {
                         cmp_type,
                         &mut VmCtx {
                             undo: &mut self.undo,
-                            feed: &mut self.feed,
+                            rec: &mut self.rec,
                         },
                     );
                     if result != ErrorCode::Ok {
@@ -5585,6 +5772,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_col!(col_f64_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5600,6 +5788,7 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         slot,
                         u64::from(batch_len),
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5623,6 +5812,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_col!(col_i64_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5647,6 +5837,7 @@ impl<I: KeyIndex> Vm<I> {
                         cmp_vals,
                         batch_len,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -5700,7 +5891,7 @@ impl<I: KeyIndex> Vm<I> {
 
                         let result = upsert_struct_map_row(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -5729,7 +5920,7 @@ impl<I: KeyIndex> Vm<I> {
                     for row in 0..batch_len {
                         let result = fold_counts_row(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &operands,
@@ -5770,7 +5961,7 @@ impl<I: KeyIndex> Vm<I> {
                         }
                         let result = single_struct_map2_upsert_last(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -5818,7 +6009,7 @@ impl<I: KeyIndex> Vm<I> {
                         }
                         let result = single_struct_map2_upsert_tuple(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -5853,7 +6044,7 @@ impl<I: KeyIndex> Vm<I> {
                     for (row, (&key1, &key2)) in (0..batch_len).zip(keys1.iter().zip(keys2)) {
                         let result = single_struct_map2_remove(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -5885,7 +6076,7 @@ impl<I: KeyIndex> Vm<I> {
                     for (row, &key1) in (0..batch_len).zip(keys1) {
                         let result = remove_struct_map2_prefix(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -5911,7 +6102,7 @@ impl<I: KeyIndex> Vm<I> {
                     for (row, &key) in (0..batch_len).zip(keys) {
                         let result = single_struct_map_remove(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             slot,
@@ -5968,7 +6159,7 @@ impl<I: KeyIndex> Vm<I> {
                         }
                         let result = single_struct_map_guarded_upsert_last(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &operands,
@@ -6150,6 +6341,7 @@ impl<I: KeyIndex> Vm<I> {
                             id: type_id,
                         }),
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6158,8 +6350,14 @@ impl<I: KeyIndex> Vm<I> {
                 Opcode::BatchAggCount => {
                     let slot = operand!(r.index());
                     let matched = aggregates::masked_agg_count(type_data, type_id);
-                    let result =
-                        exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
+                    let result = exec_agg_count(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        u64::from(matched),
+                        &mut self.rec.watch,
+                    );
                     if result != ErrorCode::Ok {
                         return result as u32;
                     }
@@ -6190,6 +6388,7 @@ impl<I: KeyIndex> Vm<I> {
                             col_at(cols, pred_col as usize),
                             batch_len
                         ))),
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6205,7 +6404,14 @@ impl<I: KeyIndex> Vm<I> {
                             matched += 1;
                         }
                     }
-                    let result = exec_agg_count(&mut self.undo, delta_mode, state, slot, matched);
+                    let result = exec_agg_count(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        matched,
+                        &mut self.rec.watch,
+                    );
                     if result != ErrorCode::Ok {
                         return result as u32;
                     }
@@ -6227,6 +6433,7 @@ impl<I: KeyIndex> Vm<I> {
                         cmp_vals,
                         batch_len,
                         Some((type_data, type_id)),
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6251,6 +6458,7 @@ impl<I: KeyIndex> Vm<I> {
                             id: type_id,
                         }),
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6363,7 +6571,14 @@ impl<I: KeyIndex> Vm<I> {
                     if let Some(pred) = pred {
                         predicate!(pred);
                     }
-                    let result = exec_agg_count(&mut self.undo, delta_mode, state, slot, 1);
+                    let result = exec_agg_count(
+                        &mut self.undo,
+                        delta_mode,
+                        state,
+                        slot,
+                        1,
+                        &mut self.rec.watch,
+                    );
                     if result != ErrorCode::Ok {
                         return result as u32;
                     }
@@ -6402,6 +6617,7 @@ impl<I: KeyIndex> Vm<I> {
                         &[cell_f64(cols, col, child_idx)],
                         None,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6425,6 +6641,7 @@ impl<I: KeyIndex> Vm<I> {
                         &[bytes::read_i64(col_at(cols, col as usize), child_idx * 8)],
                         None,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -6457,6 +6674,7 @@ impl<I: KeyIndex> Vm<I> {
                         &[cell_f64(cols, cmp, child_idx)],
                         1,
                         None,
+                        &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
                         return result as u32;
@@ -7034,7 +7252,7 @@ impl<I: KeyIndex> Vm<I> {
                     if should_write {
                         let result = upsert_struct_map_row(
                             &mut self.undo,
-                            &mut self.feed,
+                            &mut self.rec,
                             delta_mode,
                             state,
                             &smap,
@@ -7062,7 +7280,7 @@ impl<I: KeyIndex> Vm<I> {
                     bpc = operands.end;
                     let result = fold_counts_row(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         &operands,
@@ -7097,7 +7315,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
                     let result = single_struct_map2_upsert_last(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         &smap,
@@ -7138,7 +7356,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
                     let result = single_struct_map2_upsert_tuple(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         &smap,
@@ -7171,7 +7389,7 @@ impl<I: KeyIndex> Vm<I> {
                     );
                     let result = single_struct_map2_remove(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         &smap,
@@ -7199,7 +7417,7 @@ impl<I: KeyIndex> Vm<I> {
                     let key1 = cell_u32(cols, key1_col, child_idx);
                     let result = remove_struct_map2_prefix(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         &smap,
@@ -7221,7 +7439,7 @@ impl<I: KeyIndex> Vm<I> {
                     let key = cell_u32(cols, key_col, child_idx);
                     let result = single_struct_map_remove(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         slot,
@@ -7269,7 +7487,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
                     let result = single_struct_map_guarded_upsert_last(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         operands,
@@ -7334,7 +7552,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
                     let result = single_struct_map_upsert_from_probe(
                         &mut self.undo,
-                        &mut self.feed,
+                        &mut self.rec,
                         delta_mode,
                         state,
                         out_slot,
@@ -7467,7 +7685,7 @@ impl<I: KeyIndex> Vm<I> {
                             }
                             let code = scatter_card_one(
                                 &mut self.undo,
-                                &mut self.feed,
+                                &mut self.rec,
                                 delta_mode,
                                 state,
                                 &out,
@@ -7598,7 +7816,7 @@ impl<I: KeyIndex> Vm<I> {
                             }
                             let code = scatter_card_one(
                                 &mut self.undo,
-                                &mut self.feed,
+                                &mut self.rec,
                                 delta_mode,
                                 state,
                                 &out,
@@ -7823,7 +8041,7 @@ impl<I: KeyIndex> Vm<I> {
                             let is_new = target.is_new();
                             let written = journal_row_write(
                                 &mut self.undo,
-                                &mut self.feed,
+                                &mut self.rec,
                                 delta_mode,
                                 state,
                                 &guarded,
@@ -7877,6 +8095,15 @@ impl<I: KeyIndex> Vm<I> {
                         // every other kind.
                         let meta = SlotMetaView::read(state, dest_slot);
                         let v = cell_u32(cols, v_col, child_idx);
+                        let guard_prior = self.rec.watch.row_prior(
+                            state,
+                            guard_slot,
+                            &guarded.rows(),
+                            target
+                                .filter(|_| stamp_needed)
+                                .and_then(|target| target.held()),
+                            cx.strings,
+                        );
                         let guard_frame = match target.filter(|_| stamp_needed) {
                             Some(target) => {
                                 match self.undo.begin_capture(state, || {
@@ -7923,10 +8150,17 @@ impl<I: KeyIndex> Vm<I> {
                                             ChangeFlag::UPDATED
                                         },
                                     );
-                                    self.feed.record_slot(
+                                    self.rec.feed.record_slot(
                                         guard_slot,
                                         Key::one(key),
                                         target.change(),
+                                    );
+                                    self.rec.watch.record(
+                                        state,
+                                        guard_slot,
+                                        Key::one(key),
+                                        target.kind(),
+                                        guard_prior,
                                     );
                                 }
                             }
@@ -8016,6 +8250,14 @@ impl<I: KeyIndex> Vm<I> {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     mark_meta(state, meta_base, ChangeFlag::INSERTED);
                     self.undo.finish_capture(delta_mode, state, capture);
+                    // A member is keyed by its position.
+                    self.rec.watch.record(
+                        state,
+                        slot,
+                        Key::one(count - 1),
+                        ChangeFlag::INSERTED,
+                        Prior::Absent,
+                    );
                 }
 
                 // LIST_APPEND_STRUCT (0x85)
@@ -8138,6 +8380,13 @@ impl<I: KeyIndex> Vm<I> {
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
                     mark_meta(state, meta_base, ChangeFlag::INSERTED);
                     self.undo.finish_capture(delta_mode, state, capture);
+                    self.rec.watch.record(
+                        state,
+                        slot,
+                        Key::one(count - 1),
+                        ChangeFlag::INSERTED,
+                        Prior::Absent,
+                    );
                 }
 
                 // FLAT_MAP (0xE1)
@@ -8200,7 +8449,7 @@ impl<I: KeyIndex> Vm<I> {
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
                     // An inner container write names no key of the slot.
-                    self.feed.changed_whole(slot);
+                    self.rec.changed_whole(state, slot);
                 }
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
@@ -8231,7 +8480,7 @@ impl<I: KeyIndex> Vm<I> {
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
                     // An inner container write names no key of the slot.
-                    self.feed.changed_whole(slot);
+                    self.rec.changed_whole(state, slot);
                 }
 
                 // NESTED_AGG_UPDATE (0x95)
@@ -8260,7 +8509,7 @@ impl<I: KeyIndex> Vm<I> {
                     let (state, _) = plan.apply();
                     self.undo.finish_capture(delta_mode, state, capture);
                     // An inner container write names no key of the slot.
-                    self.feed.changed_whole(slot);
+                    self.rec.changed_whole(state, slot);
                 }
 
                 _ => return INVALID_PROGRAM,
@@ -8403,6 +8652,7 @@ impl<I: KeyIndex> Vm<I> {
         let exported = (u.export_count * FLAT_UNDO_ENTRY_SIZE) as usize;
         u.export_undo.truncate(exported);
         u.export_redo.truncate(exported);
+        self.rec.watch.settle(state);
         Ok(size)
     }
 
@@ -8573,6 +8823,9 @@ impl<I: KeyIndex> Vm<I> {
             let entry = parse_entry(undo_segment, i)?;
             rollback_entry(state, &entry)?;
         }
+        // A rollback restores an earlier state of this history: the log
+        // settles as for an undo rollback.
+        self.rec.watch.settle(state);
         Ok(size)
     }
 
@@ -8595,6 +8848,9 @@ impl<I: KeyIndex> Vm<I> {
             let entry = parse_entry(redo_segment, i)?;
             rollback_entry(state, &entry)?;
         }
+        // These writes reached no recording site: each watched slot they
+        // moved logs one whole-slot entry.
+        self.rec.watch.record_unseen(state);
         Ok(size)
     }
 }

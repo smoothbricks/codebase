@@ -427,6 +427,50 @@ impl ChangeFlag {
     pub const EVICTED: u8 = 0x10;
 }
 
+/// Bytes of one net-change record's header in a watch log's
+/// `net_changes` output (`specs/columine/07-change-feed.md` §7): its fields
+/// sit at [`NetChangeOffset`], little-endian, and `prior_len` prior bytes
+/// follow, zero-padded so the next record starts at a multiple of
+/// [`NET_CHANGE_ALIGN`].
+pub const NET_CHANGE_HEADER_SIZE: u32 = 16;
+
+/// The alignment of every net-change record.
+pub const NET_CHANGE_ALIGN: u32 = 8;
+
+/// Field offsets in a net-change record's header.
+pub struct NetChangeOffset;
+
+impl NetChangeOffset {
+    /// The key's first lane, `u32`; 0 for an aggregate's or scalar's
+    /// keyless change.
+    pub const KEY1: u32 = 0;
+    /// The key's second lane, `u32`; 0 for a one-key slot.
+    pub const KEY2: u32 = 4;
+    /// The change, a [`NetChangeKind`] byte.
+    pub const KIND: u32 = 8;
+    /// 1 when a prior follows, else 0.
+    pub const HAS_PRIOR: u32 = 9;
+    /// Two zero bytes.
+    pub const PAD: u32 = 10;
+    /// Bytes of the prior, `u32`: a hash map's 4-byte value, an
+    /// aggregate's or scalar's 8-byte value cell, or a struct-map row's
+    /// self-contained image.
+    pub const PRIOR_LEN: u32 = 12;
+}
+
+/// What a net change did to its key between `since` and the state.
+pub struct NetChangeKind;
+
+impl NetChangeKind {
+    /// Absent before, present after; no prior.
+    pub const INSERT: u8 = 1;
+    /// Present before and after, its value different; the prior follows.
+    pub const UPDATE: u8 = 2;
+    /// Present before, absent after; the prior follows when the key had a
+    /// value.
+    pub const DELETE: u8 = 3;
+}
+
 /// VM slot category. This deliberately has a four-bit encoding in
 /// `SlotTypeFlags`; the Rust enum uses `u8` because Rust has no `u4` repr.
 #[repr(u8)]

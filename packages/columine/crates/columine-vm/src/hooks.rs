@@ -1,7 +1,8 @@
 //! Service boundary between container operations and VM-owned state.
 //!
 //! HashMap, HashSet and BITMAP operations use this trait for undo logging,
-//! TTL eviction-index maintenance and the change feed. The VM supplies the implementation;
+//! TTL eviction-index maintenance, the change feed and the watch log. The VM
+//! supplies the implementation;
 //! [`NoVm`] is the deliberately minimal environment used when those services
 //! are not wired. BITMAP work itself is not a hook: the VM routes a set
 //! opcode on a BITMAP-typed slot to `bitmap_ops` with its own `BitmapEnv`.
@@ -106,12 +107,12 @@ pub enum TtlMutation {
 }
 
 /// Run a batch kernel's row loop `$rows::<RECORDING, TTL, FEED>` specialized
-/// on the journal's recording state, the slot's TTL flag and whether the
-/// change feed records the slot, all fixed for the whole batch: an
-/// unrecorded loop carries no capture code, a loop over a slot without TTL
-/// no planner calls, and a loop the feed does not record no prior-value read
-/// or record call, so none pays for them per row in branches or in registers
-/// saved around a call.
+/// on the journal's recording state, the slot's TTL flag and whether a
+/// recorder (the change feed or the watch log) records the slot, all fixed
+/// for the whole batch: an unrecorded loop carries no capture code, a loop
+/// over a slot without TTL no planner calls, and a loop nothing records no
+/// prior-value read or record call, so none pays for them per row in
+/// branches or in registers saved around a call.
 macro_rules! batch_rows {
     ($recording:expr, $ttl:expr, $feed:expr, $rows:ident($($arg:expr),* $(,)?)) => {
         match ($recording, $ttl, $feed) {
@@ -164,17 +165,32 @@ pub trait VmHooks {
         plan: crate::ttl_plan::TtlBatchPlan,
     );
 
-    /// Whether a write to `slot` records in the change feed now. A kernel
-    /// reads it once per call, before its row loop, and reads a prior value
-    /// only when it is set.
-    fn feed_records(&self, slot: u32) -> bool;
+    /// Whether a write to `slot` records now, in the change feed or the
+    /// watch log. A kernel reads it once per call, before its row loop, and
+    /// reads a prior value only when it is set.
+    fn records(&self, slot: u32) -> bool;
 
-    /// Record one landed change of `slot`'s `key` in the change feed.
-    fn feed_record(&mut self, slot: u32, key: Key, change: Change);
+    /// Record one landed change of `slot`'s `key`, written at the slot's
+    /// sequence in `state`.
+    fn record(&mut self, state: &[u8], slot: u32, key: Key, change: Change);
+
+    /// Record one landed bitmap patch of `slot`: the change feed takes
+    /// every requested member (the patch reports counts, not members), the
+    /// watch log the members whose bit `changed` sets (bit `i` for
+    /// `members[i]`).
+    fn record_members(
+        &mut self,
+        state: &[u8],
+        slot: u32,
+        members: &[u32],
+        changed: &[u64],
+        change: Change,
+    );
 
     /// A landed write changed `slot` in a way no key names: the change feed
-    /// treats the whole slot as changed.
-    fn feed_changed_whole(&mut self, slot: u32);
+    /// treats the whole slot as changed, the watch log logs a whole-slot
+    /// entry.
+    fn changed_whole(&mut self, state: &[u8], slot: u32);
 }
 
 /// Minimal environment with undo and TTL services disabled. Calling an
@@ -190,18 +206,29 @@ impl VmHooks for NoVm {
         false
     }
 
-    /// No feed is wired: nothing records, so the record services are never
-    /// reached.
-    fn feed_records(&self, _slot: u32) -> bool {
+    /// No recorder is wired: nothing records, so the record services are
+    /// never reached.
+    fn records(&self, _slot: u32) -> bool {
         false
     }
 
-    fn feed_record(&mut self, _slot: u32, _key: Key, _change: Change) {
-        unreachable!("the change feed requires the VM")
+    fn record(&mut self, _state: &[u8], _slot: u32, _key: Key, _change: Change) {
+        unreachable!("the recorders require the VM")
     }
 
-    fn feed_changed_whole(&mut self, _slot: u32) {
-        unreachable!("the change feed requires the VM")
+    fn record_members(
+        &mut self,
+        _state: &[u8],
+        _slot: u32,
+        _members: &[u32],
+        _changed: &[u64],
+        _change: Change,
+    ) {
+        unreachable!("the recorders require the VM")
+    }
+
+    fn changed_whole(&mut self, _state: &[u8], _slot: u32) {
+        unreachable!("the recorders require the VM")
     }
 
     fn take_erase_scratch(&mut self) -> EraseScratch {

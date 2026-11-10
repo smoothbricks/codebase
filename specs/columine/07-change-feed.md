@@ -109,14 +109,20 @@ before the write:
 - a struct-map or two-key row's image (below);
 - none for a set, bitmap or ordered-list member, whose `kind` says whether it was held.
 
-An insertion has no prior. The sites are §3's plus the aggregate, scalar and ordered-list writes. They record whether or
-not the feed is armed: the log does not depend on the feed's pass.
+An insertion has no prior: an unset scalar, whose timestamp is still −∞, decodes to nothing, so its first write inserts
+it. A hash map's or u32 scalar's prior is its stored lane; a host whose lane holds interned ids counts the log's priors
+(`log_priors(slot)`) as references of those ids while the log holds them. A bitmap patch is one write: it logs the
+members it added or removed, which its witness names. The sites are §3's plus the aggregate, scalar and ordered-list
+writes, an ordered-list member keyed by its position. They record whether or not the feed is armed: the log does not
+depend on the feed's pass, and a capacity dry run records nothing.
 
 **Row images** are self-contained. An image is the row's bytes as stored, then, in descriptor order, each set field that
 names text or an arena payload (an interned string, an arena array, a value-object payload), length-prefixed: a `u32`
 length, then the bytes. An interned-string array is written element by element. An image never holds an interner id or
 an arena offset that a later write, growth, seal or interner release could invalidate, so it decodes for as long as the
-log holds it.
+log holds it. A row image whose interned text the kernel's strings cannot resolve, or that is larger than the slot's
+whole image ring, is not recorded; the write appends a whole-slot entry instead. A host that watches a slot holding
+interned text passes the interner its kernels write through.
 
 **Eviction and overflow.** An entry that does not fit the ring evicts the slot's oldest entries until it fits, and
 coverage moves to the last evicted entry's stamp. Which entries above a `since` survive therefore depends only on the
@@ -131,6 +137,8 @@ replaces the state with a different future (restoring a speculation basis whose 
 `log_settle(state)`, which drops every entry stamped above its slot's current sequence and clamps coverage to it. An
 undo rollback settles by itself. A host that copies a state into another VM to continue its history there (a replay
 fork) copies the log with it: `log_clone_from(other)` replaces this VM's log with `other`'s rings, images and coverage.
+A rollforward of a delta segment is a keyless write of every watched slot whose sequence it moves: it appends that
+slot's whole-slot entry at the new sequence. A rollback of one settles by itself, as an undo rollback does.
 
 **Net changes.** `net_changes(state, slot, since, strings, out)` answers the slot's net change over the window from
 `since` to the slot's sequence in `state`; entries stamped above that sequence belong to a later state and are ignored.
@@ -142,8 +150,12 @@ is present in `state`, and keeps the key only when they differ:
 - a delete: a prior, and the key is absent;
 - an update: a prior, the key is present, and the current value's image differs from the prior's.
 
-A key written and written back nets to nothing. An aggregate or scalar answers at most one keyless change. `out` holds
-each change's key lanes, kind and prior image in record order; the host reads the current value from the state.
+A key written and written back nets to nothing. An aggregate or scalar answers at most one keyless change, keyed `0, 0`.
+`out` (`NetChanges`) holds each change's key lanes, kind and prior image in record order; the host reads the current
+value from the state. Each record is little-endian and starts at a multiple of 8 (`NET_CHANGE_ALIGN`): a 16-byte header
+(`NET_CHANGE_HEADER_SIZE`, offsets `NetChangeOffset`)
+`key1 u32 · key2 u32 · kind u8 · has_prior u8 · pad u16 · prior_len u32`, `kind` 1 insert, 2 update or 3 delete
+(`NetChangeKind`), then `prior_len` prior bytes, zero-padded. A slot the VM does not watch answers `Overflowed`.
 
 ## 8. Behavioral acceptance
 

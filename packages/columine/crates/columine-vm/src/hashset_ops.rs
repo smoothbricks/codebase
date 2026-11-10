@@ -39,7 +39,7 @@ pub fn batch_set_insert(
     batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
-        hooks.feed_records(slot_idx),
+        hooks.records(slot_idx),
         insert_rows(delta_mode, state, meta, slot_idx, elems, ts_col, hooks)
     )
 }
@@ -132,7 +132,7 @@ fn insert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         hooks.finish_capture(delta_mode, state, capture);
         // A TTL refresh of a held member changes nothing a rule binds.
         if FEED && !probe.found {
-            hooks.feed_record(slot, Key::one(elem), Change::Inserted);
+            hooks.record(state, slot, Key::one(elem), Change::Inserted);
         }
     }
     ErrorCode::Ok
@@ -169,7 +169,7 @@ pub fn batch_set_remove(
     let result = batch_rows!(
         hooks.undo_enabled(),
         meta.has_ttl(),
-        hooks.feed_records(slot_idx),
+        hooks.records(slot_idx),
         remove_rows(
             delta_mode,
             state,
@@ -248,7 +248,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         }
         hooks.finish_capture(delta_mode, state, capture);
         if FEED {
-            hooks.feed_record(slot, Key::one(elem), Change::Removed(None));
+            hooks.record(state, slot, Key::one(elem), Change::Removed(None));
         }
     }
     ErrorCode::Ok
