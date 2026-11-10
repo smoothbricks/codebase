@@ -1768,6 +1768,13 @@ arrival order and under shortest predicted first (`Spt`) alike unless named:
   `round9_gathers_then_starts_on_its_minimum` and `round9_starts_short_at_the_bound` compute the land gate's case below.
   The model holds back only the party's requests after the gatherer in walk order; mbx also holds a same-party request
   that asked later and sorts ahead, or that aged in a lower lane, and the binding's traces stop where those arise.
+- `gate_waits_only_for_admitted_work_or_a_gather`, on the pool's three lanes: after a decision every gate request is
+  filled, or the low lane is as it was (`low_never_passes_a_waiting_gate`) and no permit is free or every request still
+  waiting is held back by a gather (`only_a_gather_leaves_permits_free`). Without a minimum no gather opens, and
+  `lanes_in_order_without_min` with `work_conserving_without_min` give the form a land's latency stood on before
+  minimums: every gate request is filled, or the low lane is as it was and no permit is free. A gather refutes that form
+  (`gate_waits_only_for_admitted_work_refuted`, round 9's state): a gate request that gathers waits beside a free
+  permit, and so does a later gate request of its party.
 - `decide_never_preempts`, `arrival_never_preempts`, `finish_takes_only_its_own`, `tick_regroups`: no step takes a
   permit from a request but its own end; a tick moves aged requests to `old` with their grants.
 - `tick_bounds_wait`: after a tick every request still in `new` has waited fewer ticks than the aging bound.
@@ -1789,11 +1796,26 @@ its arrival among the requests that aged before it, and every permit an end free
 highest lane that needs one, so an aged request waits only for the ends of the work admitted before it and the aged
 requests ahead.
 
+**Land latency.** What a land waits for is bounded by laws proven in `laws/`. Its turn wait is the sum of the holds of
+the lands asked before it ("Land-turn laws": `one_holder`, `fifo`). After any admission decision, either every gate
+request is filled, or no low request gained a permit and either no permit is free or every request still waiting is held
+back by a gather (`gate_waits_only_for_admitted_work_or_a_gather`, composed of `low_never_passes_a_waiting_gate` and
+`only_a_gather_leaves_permits_free`). A gate leaf therefore waits for permits held by admitted work, for its own gather
+while fewer than its minimum are free, or behind a gather of its party opened before it in the decision's walk, and a
+gather lasts at most the aging bound (`gather_ends_at_the_bound`). Low work never runs in its place. Without minimums it
+waits only for permits held by admitted work, and with no preemption and no reserve that wait is bounded by the
+remaining life of those holders. "A ready land completes within its compute chain times a factor" is an open law: it
+holds only while no admitted hold outlives a factor of a gate leaf, and a held job keeps its grant for its life ("Held
+jobs", Tradeoff).
+
 The code is bound to the model by generated drivers: the model's kernel, emitted by bend-emit into each consumer with
 the model's sha256 in its header (a test refuses a kernel whose model moved), and a conformance test that runs seeded
 random traces, and in mbx the recorded window of 2026-11-09 21:48-22:40, through the kernel and the code and requires
 the same requests granted the same cores after every decision: mbx's `admission_pass` (`scheduler_bend_tests`) and the
-simulator's `POOL_RULE` (`cowshed-admission-sim` `bend_driver`).
+simulator's `POOL_RULE` (`cowshed-admission-sim` `bend_driver`). The simulator names no minimum, so its conformance
+traces also hold the land-latency form without one after every decision; seeded traces whose requests name minimums and
+parties hold `gate_waits_only_for_admitted_work_or_a_gather` through the kernel alone, and round 9's state refutes the
+form without minimums there too.
 
 ### Held jobs
 

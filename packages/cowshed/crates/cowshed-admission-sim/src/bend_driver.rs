@@ -224,6 +224,121 @@ fn lane(band: Priority) -> u64 {
     }
 }
 
+/// Every item of a model list, in order.
+fn items<T: Clone>(list: &Rc<List<T>>) -> Vec<T> {
+    let mut out = Vec::new();
+    let mut at: &List<T> = list;
+    while let List::Con(head, rest) = at {
+        out.push(head.clone());
+        at = rest;
+    }
+    out
+}
+
+/// The model's `AllFilled`: no request of `list` needs another permit.
+fn all_filled(list: &Rc<List<E>>) -> bool {
+    items(list).into_iter().all(|entry| bend::need(entry) == 0)
+}
+
+/// The free permits and the three lanes of a state of the pool `empty` makes: interactive, the
+/// gate's and low.
+fn lanes(state: &St) -> (u64, [Lane; 3]) {
+    let St::St(free, _, lanes) = state;
+    let lanes: [Lane; 3] = items(lanes)
+        .try_into()
+        .unwrap_or_else(|_| panic!("the pool `empty` makes has three lanes"));
+    (*free, lanes)
+}
+
+/// The model's `WaitsLs(free, lanes, [])`: re-examined in pass order with what is left `free`,
+/// each lane's aged requests are filled unless it is the low lane behind an open gather, and each
+/// request in `new`, given its turn again, takes nothing more.
+fn only_gathers_hold_back(free: u64, lanes: &[Lane; 3]) -> bool {
+    let mut gathers: Rc<List<u64>> = Rc::new(List::Nil);
+    for (at, Lane::Lane(old, new)) in lanes.iter().enumerate() {
+        let low = at + 1 == lanes.len();
+        if !(all_filled(old) || bend::skip(low, gathers.clone())) {
+            return false;
+        }
+        for E::E(_, want, k, _, _, min, party) in items(new) {
+            let act = bend::act(low, gathers.clone(), k, want, min, party, free);
+            if act == bend::Act::Take && bend::need_k(want, k) != 0 {
+                return false;
+            }
+            gathers = bend::gnext(act, party, gathers);
+        }
+    }
+    true
+}
+
+/// The model's `gate_waits_only_for_admitted_work_or_a_gather` on the decision from `before` to
+/// `after`: every gate request is filled, or the low lane is as it was and no permit is free or
+/// every request still waiting is held back by a gather.
+fn gate_waits_only_for_admitted_work_or_a_gather(before: &St, after: &St) -> bool {
+    let (_, [_, _, low_before]) = lanes(before);
+    let (free, lanes_after) = lanes(after);
+    let [_, Lane::Lane(gate_old, gate_new), low] = &lanes_after;
+    (all_filled(gate_old) && all_filled(gate_new))
+        || (*low == low_before && (free == 0 || only_gathers_hold_back(free, &lanes_after)))
+}
+
+/// The law as it holds without minimums (`gate_waits_only_for_admitted_work_refuted` refutes it
+/// with one): every gate request is filled, or the low lane is as it was and no permit is free.
+fn gate_waits_only_for_admitted_work(before: &St, after: &St) -> bool {
+    let (_, [_, _, low_before]) = lanes(before);
+    let (free, [_, Lane::Lane(gate_old, gate_new), low]) = lanes(after);
+    (all_filled(&gate_old) && all_filled(&gate_new)) || (low == low_before && free == 0)
+}
+
+/// Runs `acts` through the model's kernel alone, each arrival naming the minimum and party drawn
+/// with it (the simulator names neither), and holds
+/// `gate_waits_only_for_admitted_work_or_a_gather` after every decision.
+fn drive_gathers(cap: u32, acts: &[(Act, u32, u32)]) -> Result<(), TestCaseError> {
+    let mut model = empty(cap);
+    let mut arrived = 0_u64;
+    for (at, &(act, min, party)) in acts.iter().enumerate() {
+        model = match act {
+            Act::Arrive {
+                band,
+                want,
+                pred,
+                elapsed,
+            } => {
+                arrived += 1;
+                let op = Op::Arrive(
+                    band.model(),
+                    arrived,
+                    u64::from(want - 1),
+                    u64::from(pred),
+                    u64::from(elapsed),
+                    u64::from(min),
+                    u64::from(party),
+                );
+                bend::step(Pol::Spt, op, model)
+            }
+            Act::Decide => {
+                let after = bend::step(Pol::Spt, Op::Decide, model.clone());
+                prop_assert!(
+                    gate_waits_only_for_admitted_work_or_a_gather(&model, &after),
+                    "act {} left a gate request waiting for neither admitted work nor a gather: \
+                     the model was {} and is now {}",
+                    at,
+                    bend::show_St(&model),
+                    bend::show_St(&after)
+                );
+                after
+            }
+            Act::Tick(ticks) => {
+                (0..ticks).fold(model, |state, _| bend::step(Pol::Spt, Op::Tick, state))
+            }
+            Act::Finish(pick) if arrived > 0 => {
+                bend::step(Pol::Spt, Op::Finish(pick % arrived + 1), model)
+            }
+            Act::Finish(_) => model,
+        };
+    }
+    Ok(())
+}
 /// Runs `acts` on a pool of `cap` cores through the model's `step(Spt, …)` and the sim's pool
 /// rule, and holds that every decision grants the same requests the same cores in both.
 fn drive(cap: u32, acts: &[Act]) -> Result<(), TestCaseError> {
@@ -263,8 +378,18 @@ fn drive(cap: u32, acts: &[Act]) -> Result<(), TestCaseError> {
                 pool.arrive(arrived, declared, want, pred);
             }
             Act::Decide => {
+                let prior = model.clone();
                 let before = granted(&model);
                 model = bend::step(Pol::Spt, Op::Decide, model);
+                // The simulator names no minimum, so no gather opens.
+                prop_assert!(
+                    gate_waits_only_for_admitted_work(&prior, &model),
+                    "act {} left a gate request waiting beside a free permit or a low grant: the \
+                     model was {} and is now {}",
+                    at,
+                    bend::show_St(&prior),
+                    bend::show_St(&model)
+                );
                 let mut by_model = granted(&model);
                 by_model.retain(|id, _| !before.contains_key(id));
                 let by_sim = pool.decide(cap);
@@ -315,6 +440,18 @@ proptest! {
     ) {
         drive(cap, &acts)?;
     }
+
+    /// Seeded random traces whose requests name a minimum of 0 to 5 cores and a party of 0 to 2,
+    /// on pools of 1 to 8 cores, through the model's kernel: after every decision every gate
+    /// request is filled, or the low lane is as it was and no permit is free or every request
+    /// still waiting is held back by a gather.
+    #[test]
+    fn a_gate_waits_only_for_admitted_work_or_a_gather(
+        cap in 1..=8_u32,
+        acts in prop::collection::vec((act(), 0..=5_u32, 0..=2_u32), 0..=40),
+    ) {
+        drive_gathers(cap, &acts)?;
+    }
 }
 
 /// The sim's decay bounds are the model's `b1()` and `b2()`, and an interactive ask takes the
@@ -328,4 +465,29 @@ fn an_interactive_ask_decays_at_the_models_bounds() {
         let sim = (Declared::Interactive { job_started: 0.0 }).band(Secs::from(elapsed));
         assert_eq!(lane(sim), bend::iband(u64::from(elapsed)), "at {elapsed} s");
     }
+}
+
+/// Round 9 through the kernel (`gate_waits_only_for_admitted_work_refuted`): on a pool of 4 a gate
+/// job holds 3, and a gate reservation asks 18 with a minimum of 4 (party 1). The decision leaves
+/// it gathering beside a free permit: it waits for its own gather, not for admitted work.
+#[test]
+fn a_gathering_gate_request_waits_beside_a_free_permit() {
+    let before = [
+        Op::Arrive(Band::Gate, 1, 2, 5, 0, 0, 0),
+        Op::Decide,
+        Op::Arrive(Band::Gate, 2, 17, 9, 0, 4, 1),
+    ]
+    .into_iter()
+    .fold(empty(4), |state, op| bend::step(Pol::Spt, op, state));
+    let after = bend::step(Pol::Spt, Op::Decide, before.clone());
+    assert!(
+        !gate_waits_only_for_admitted_work(&before, &after),
+        "{}",
+        bend::show_St(&after)
+    );
+    assert!(
+        gate_waits_only_for_admitted_work_or_a_gather(&before, &after),
+        "{}",
+        bend::show_St(&after)
+    );
 }

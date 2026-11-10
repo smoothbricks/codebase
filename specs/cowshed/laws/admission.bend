@@ -3312,3 +3312,237 @@ def only_a_gather_leaves_permits_free(p, s):
   match s:
     case St{f, b, ls}:
       only_a_gather_leaves_permits_free.top(lsf(gwalks(ls, f, [])), ls, f, {==})
+
+# --- LAW (a gate waits only for admitted work or a gather) ---------------------------------
+# What a land's gate leaves wait for (05 "Gates and lands", "Land latency"). Without a minimum, a
+# decision leaves every gate request filled, or no permit free and the low lane as it was, so a
+# waiting gate leaf waits only for permits held by admitted work. A gather breaks that
+# (`gate_waits_only_for_admitted_work_refuted`): a gate request that gathers waits with permits
+# free, and so does a later gate request of its party (`a_gather_holds_back_its_party_and_low_work`).
+# What holds on the pool `empty` makes: after a decision every gate request is filled, or the low
+# lane is as it was and no permit is free or every request still waiting is one a gather holds
+# back (`only_a_gather_leaves_permits_free`): a gatherer short of its minimum, or a request of the
+# party of a gather opened before it. Low work never runs in a waiting gate request's place, and a
+# gather ends at the bound (`gather_ends_at_the_bound`).
+
+def sgate(s: St) -> Lane:
+  nth(1n, slanes(s))
+
+def slow(s: St) -> Lane:
+  nth(2n, slanes(s))
+
+# A gather is open once `g` names one, and stays open along a re-examination.
+def gnext_open(a: Act, +pa: Nat, +g: +List<Nat>, h: IsTrue(skip(True{}, g))) -> IsTrue(skip(True{}, gnext(a, pa, g))):
+  match a:
+    case Take{}:
+      h
+    case Hold{}:
+      h
+    case Open{}:
+      Unit{}
+
+def gacc_open(+fe: Nat, +lo: Bool, +xs: +List<E>, +acc: +List<Nat>, h: IsTrue(skip(True{}, acc))) -> IsTrue(skip(True{}, gacc(fe, lo, xs, acc))):
+  match xs:
+    case Nil{}:
+      h
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      gacc_open(fe, lo, t, gnext(act(lo, acc, k, want, mi, pa, fe), pa, acc), gnext_open(act(lo, acc, k, want, mi, pa, fe), pa, acc, h))
+
+def open_eq(+a: +List<Nat>, +b: +List<Nat>, e: {a == b : +List<Nat>}, h: IsTrue(skip(True{}, a))) -> IsTrue(skip(True{}, b)):
+  %e : IsTrue(skip(True{}, _))
+  h
+
+# A lane that is not the low one is never skipped.
+def skip_false(+acc: +List<Nat>, x: IsTrue(skip(False{}, acc))) -> Empty:
+  match acc:
+    case Nil{}:
+      match x:
+    case Con{q, r}:
+      match x:
+
+def filled_cons(-A: Data, -B: Data, -C: Data, a: A, ih: Either<&2, &2, B, C>) -> Either<&2, &2, Sigma<&2, &2, A, u => B>, C>:
+  match ih:
+    case Inl{b}:
+      Inl{(a, b)}
+    case Inr{c}:
+      Inr{c}
+
+# A request outside the low lane with no gather before it waits filled or opens a gather.
+def waitsn_open.s(+fe: Nat, +s: Bool, +want: Nat, +pa: Nat, +t: +List<E>,
+  w: Sigma<&2, &2, Waits(act0(False{}, s), want), u => WaitsN(fe, False{}, t, gnext(act0(False{}, s), pa, []))>,
+  rec: WaitsN(fe, False{}, t, []) -> Either<&2, &2, AllFilled(t), IsTrue(skip(True{}, gacc(fe, False{}, t, [])))>)
+  -> Either<&2, &2, Sigma<&2, &2, IsZero(want), u => AllFilled(t)>, IsTrue(skip(True{}, gacc(fe, False{}, t, gnext(act0(False{}, s), pa, []))))>:
+  match s:
+    case True{}:
+      Inr{gacc_open(fe, False{}, t, pa <> [], Unit{})}
+    case False{}:
+      (w1, w2) = w
+      filled_cons(IsZero(want), AllFilled(t), IsTrue(skip(True{}, gacc(fe, False{}, t, []))), w1, rec(w2))
+
+def waitsn_open.k(+fe: Nat, +id: Nat, +want: Nat, +k: Nat, +pred: Nat, +age: Nat, +mi: Nat, +pa: Nat, +t: +List<E>,
+  w: WaitsN(fe, False{}, E{id, want, k, pred, age, mi, pa} <> t, []),
+  rec: WaitsN(fe, False{}, t, []) -> Either<&2, &2, AllFilled(t), IsTrue(skip(True{}, gacc(fe, False{}, t, [])))>)
+  -> Either<&2, &2, AllFilled(E{id, want, k, pred, age, mi, pa} <> t), IsTrue(skip(True{}, gacc(fe, False{}, E{id, want, k, pred, age, mi, pa} <> t, [])))>:
+  match k:
+    case 0n:
+      waitsn_open.s(fe, short(gg(mi, want), fe), want, pa, t, w, rec)
+    case 1n+j:
+      (w1, w2) = w
+      filled_cons(Unit, AllFilled(t), IsTrue(skip(True{}, gacc(fe, False{}, t, []))), w1, rec(w2))
+
+def waitsn_open.nil(+fe: Nat, +xs: +List<E>, w: WaitsN(fe, False{}, xs, []))
+  -> Either<&2, &2, AllFilled(xs), IsTrue(skip(True{}, gacc(fe, False{}, xs, [])))>:
+  match xs:
+    case Nil{}:
+      Inl{Unit{}}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      waitsn_open.k(fe, id, want, k, pred, age, mi, pa, t, w, r => waitsn_open.nil(fe, t, r))
+
+def waitsn_open(+fe: Nat, +xs: +List<E>, +acc: +List<Nat>, w: WaitsN(fe, False{}, xs, acc))
+  -> Either<&2, &2, AllFilled(xs), IsTrue(skip(True{}, gacc(fe, False{}, xs, acc)))>:
+  match acc:
+    case Nil{}:
+      waitsn_open.nil(fe, xs, w)
+    case Con{q, r}:
+      Inr{gacc_open(fe, False{}, xs, q <> r, Unit{})}
+
+def waitslane_open.o(+fe: Nat, +acc: +List<Nat>, +o: +List<E>, +n: +List<E>,
+  wo: Either<&2, &2, AllFilled(o), IsTrue(skip(False{}, acc))>, wn: WaitsN(fe, False{}, n, acc))
+  -> Either<&2, &2, Sigma<&2, &2, AllFilled(o), u => AllFilled(n)>, IsTrue(skip(True{}, gacc(fe, False{}, n, acc)))>:
+  match wo:
+    case Inl{ao}:
+      filled_cons(AllFilled(o), AllFilled(n), IsTrue(skip(True{}, gacc(fe, False{}, n, acc))), ao, waitsn_open(fe, n, acc, wn))
+    case Inr{x}:
+      absurd_nat(Either<&2, &2, Sigma<&2, &2, AllFilled(o), u => AllFilled(n)>, IsTrue(skip(True{}, gacc(fe, False{}, n, acc)))>, skip_false(acc, x))
+
+# A lane outside the low one, every request of it waiting, is filled or leaves a gather open.
+def waitslane_open(+fe: Nat, +acc: +List<Nat>, +m: Lane, w: WaitsLane(fe, False{}, acc, m))
+  -> Either<&2, &2, AllFilledL(m), IsTrue(skip(True{}, gaccL(fe, False{}, acc, m)))>:
+  match m:
+    case Lane{o, n}:
+      (wo, wn) = w
+      waitslane_open.o(fe, acc, o, n, wo, wn)
+
+# A walk on no free permit changes no request.
+def gwalk_zero_l(+lo: Bool, +lane: +List<E>, +g: +List<Nat>) -> {lane == wl(gwalk(lo, lane, 0n, g)) : +List<E>}:
+  match lane:
+    case Nil{}:
+      {==}
+    case Con{E{id, want, k, pred, age, mi, pa}, t}:
+      %gg_z(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, 0n)) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, add(k, _), pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), 0n), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), pa, g)))) : +List<E>}
+      %Equal.sym(Nat, add(k, 0n), k, add_zero_r(k)) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, _, pred, age, mi, pa}, gwalk(lo, t, gr(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), 0n), gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), pa, g)))) : +List<E>}
+      %gr_z(gneed(lo, g, E{id, want, k, pred, age, mi, pa}, 0n)) : {E{id, want, k, pred, age, mi, pa} <> t == wl(W.cons(E{id, want, k, pred, age, mi, pa}, gwalk(lo, t, _, gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), pa, g)))) : +List<E>}
+      %wl_cons(E{id, want, k, pred, age, mi, pa}, gwalk(lo, t, 0n, gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), pa, g))) : {E{id, want, k, pred, age, mi, pa} <> t == _ : +List<E>}
+      %gwalk_zero_l(lo, t, gnext(gact(lo, g, E{id, want, k, pred, age, mi, pa}, 0n), pa, g)) : {E{id, want, k, pred, age, mi, pa} <> t == E{id, want, k, pred, age, mi, pa} <> _ : +List<E>}
+      {==}
+
+def glwalk_zero.if(+sk: Bool, +lo: Bool, +o: +List<E>, +n: +List<E>, +g: +List<Nat>) -> {ll(glwalk.if(sk, lo, o, n, 0n, g)) == Lane{o, n} : Lane}:
+  match sk:
+    case True{}:
+      {==}
+    case False{}:
+      %walk_zero_f(o) : {Lane{wl(walk(o, 0n)), wl(gwalk(lo, n, _, g))} == Lane{o, n} : Lane}
+      %walk_zero_l(o) : {Lane{_, wl(gwalk(lo, n, 0n, g))} == Lane{o, n} : Lane}
+      %gwalk_zero_l(lo, n, g) : {Lane{o, _} == Lane{o, n} : Lane}
+      {==}
+
+def glwalk_zero(+lo: Bool, +l: Lane, +g: +List<Nat>) -> {ll(glwalk(lo, l, 0n, g)) == l : Lane}:
+  match l:
+    case Lane{o, n}:
+      glwalk_zero.if(skip(lo, g), lo, o, n, g)
+
+# The low lane behind an open gather is skipped.
+def low_skip(+l: Lane, +f: Nat, +g: +List<Nat>, h: IsTrue(skip(True{}, g))) -> {ll(glwalk(True{}, l, f, g)) == l : Lane}:
+  match l:
+    case Lane{o, n}:
+      match g:
+        case Nil{}:
+          match h:
+        case Con{q, r}:
+          {==}
+
+def gate_or_low_kept.or(+gl: Lane, +l: Lane, +f: Nat, +g: +List<Nat>, +fe: Nat,
+  eq: {gaccL(fe, False{}, g, ll(glwalk(False{}, gl, f, g))) == glg(False{}, gl, f, g) : +List<Nat>},
+  r: Either<&2, &2, AllFilledL(ll(glwalk(False{}, gl, f, g))), IsTrue(skip(True{}, gaccL(fe, False{}, g, ll(glwalk(False{}, gl, f, g)))))>)
+  -> Either<&2, &2, AllFilledL(ll(glwalk(False{}, gl, f, g))), {ll(glwalk(True{}, l, lf(glwalk(False{}, gl, f, g)), glg(False{}, gl, f, g))) == l : Lane}>:
+  match r:
+    case Inl{a}:
+      Inl{a}
+    case Inr{op}:
+      Inr{low_skip(l, lf(glwalk(False{}, gl, f, g)), glg(False{}, gl, f, g), open_eq(gaccL(fe, False{}, g, ll(glwalk(False{}, gl, f, g))), glg(False{}, gl, f, g), eq, op))}
+
+def gate_or_low_kept.go(+gl: Lane, +l: Lane, +f: Nat, +g: +List<Nat>, +fe: Nat,
+  w: Sigma<&2, &2, WaitsLane(fe, False{}, g, ll(glwalk(False{}, gl, f, g))), u => {gaccL(fe, False{}, g, ll(glwalk(False{}, gl, f, g))) == glg(False{}, gl, f, g) : +List<Nat>}>)
+  -> Either<&2, &2, AllFilledL(ll(glwalk(False{}, gl, f, g))), {ll(glwalk(True{}, l, lf(glwalk(False{}, gl, f, g)), glg(False{}, gl, f, g))) == l : Lane}>:
+  (wa, eq) = w
+  gate_or_low_kept.or(gl, l, f, g, fe, eq, waitslane_open(fe, g, ll(glwalk(False{}, gl, f, g)), wa))
+
+# The gate's lane, walked on what the interactive lane left free with the gathers it left open:
+# filled, or it leaves no permit free, or a gather open, and either way the low lane as it was.
+def gate_or_low_kept(+fe: Nat, +gl: Lane, +l: Lane, +f: Nat, +g: +List<Nat>, +e: {fe == lf(glwalk(False{}, gl, f, g)) : Nat})
+  -> Either<&2, &2, AllFilledL(ll(glwalk(False{}, gl, f, g))), {ll(glwalk(True{}, l, lf(glwalk(False{}, gl, f, g)), glg(False{}, gl, f, g))) == l : Lane}>:
+  match fe:
+    case 0n:
+      %e : Either<&2, &2, AllFilledL(ll(glwalk(False{}, gl, f, g))), {ll(glwalk(True{}, l, _, glg(False{}, gl, f, g))) == l : Lane}>
+      Inr{glwalk_zero(True{}, l, glg(False{}, gl, f, g))}
+    case 1n+q:
+      gate_or_low_kept.go(gl, l, f, g, 1n+q, waits_glwalk(1n+q, Unit{}, False{}, gl, f, g, le_of_eq(1n+q, lf(glwalk(False{}, gl, f, g)), e)))
+
+# LAW (low work never passes a waiting gate request): after a decision on the pool's three lanes,
+# every gate request is filled, or the low lane is as it was.
+law low_never_passes_a_waiting_gate:
+  for +p: Pol
+  for +f: Nat
+  for +b: Nat
+  for +i: Lane
+  for +g: Lane
+  for +l: Lane
+  Either<&2, &2, AllFilledL(sgate(step(p, Decide{}, St{f, b, [i, g, l]}))), {slow(step(p, Decide{}, St{f, b, [i, g, l]})) == l : Lane}>
+
+def low_never_passes_a_waiting_gate(p, f, b, i, g, l):
+  gate_or_low_kept(lf(glwalk(False{}, g, lf(glwalk(False{}, i, f, [])), glg(False{}, i, f, []))), g, l, lf(glwalk(False{}, i, f, [])), glg(False{}, i, f, []), {==})
+
+def gate_waits.go(-A: Data, -B: Data, -C: Data, gf: Either<&2, &2, A, B>, og: C) -> Either<&2, &2, A, Sigma<&2, &2, B, u => C>>:
+  match gf:
+    case Inl{a}:
+      Inl{a}
+    case Inr{e}:
+      Inr{(e, og)}
+
+# LAW: after a decision on the pool's three lanes, every gate request is filled, or the low lane is
+# as it was and either no permit is free or every request still waiting is held back by a gather.
+law gate_waits_only_for_admitted_work_or_a_gather:
+  for +p: Pol
+  for +f: Nat
+  for +b: Nat
+  for +i: Lane
+  for +g: Lane
+  for +l: Lane
+  Either<&2, &2, AllFilledL(sgate(step(p, Decide{}, St{f, b, [i, g, l]}))),
+    Sigma<&2, &2, {slow(step(p, Decide{}, St{f, b, [i, g, l]})) == l : Lane},
+      u => Either<&2, &2, IsZero(sfree(step(p, Decide{}, St{f, b, [i, g, l]}))), WaitsLs(sfree(step(p, Decide{}, St{f, b, [i, g, l]})), slanes(step(p, Decide{}, St{f, b, [i, g, l]})), [])>>>
+
+def gate_waits_only_for_admitted_work_or_a_gather(p, f, b, i, g, l):
+  gate_waits.go(AllFilledL(sgate(step(p, Decide{}, St{f, b, [i, g, l]}))), {slow(step(p, Decide{}, St{f, b, [i, g, l]})) == l : Lane},
+    Either<&2, &2, IsZero(sfree(step(p, Decide{}, St{f, b, [i, g, l]}))), WaitsLs(sfree(step(p, Decide{}, St{f, b, [i, g, l]})), slanes(step(p, Decide{}, St{f, b, [i, g, l]})), [])>,
+    low_never_passes_a_waiting_gate(p, f, b, i, g, l), only_a_gather_leaves_permits_free(p, St{f, b, [i, g, l]}))
+
+# Refuted, proven: the law as it held without minimums. Round 9's pool of 4: a gate job holds 3,
+# and a gate reservation asks 18 with min 4 (party 1). The decision leaves it gathering, unfilled,
+# with 1 permit free: a gate request waits for its own gather, not for admitted work.
+law gate_waits_only_for_admitted_work_refuted:
+  for +h: Either<&2, &2, AllFilledL(sgate(step(Spt{}, Decide{}, run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}], empty(4n, 30n))))),
+    Sigma<&2, &2, {slow(step(Spt{}, Decide{}, run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}], empty(4n, 30n)))) == slow(run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}], empty(4n, 30n))) : Lane},
+      u => IsZero(sfree(step(Spt{}, Decide{}, run(Spt{}, [Arrive{Gate{}, 1n, 2n, 5n, 0n, 0n, 0n}, Decide{}, Arrive{Gate{}, 2n, 17n, 9n, 0n, 4n, 1n}], empty(4n, 30n)))))>>
+  Empty
+
+def gate_waits_only_for_admitted_work_refuted(h):
+  match h:
+    case Inl{a}:
+      (ao, an) = a
+      (h1, t1) = an
+      (h2, t2) = t1
+      match h2:
+    case Inr{c}:
+      (e, z) = c
+      match z:
