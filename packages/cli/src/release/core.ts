@@ -4,6 +4,9 @@
  */
 export const RELEASE_BUMPS = ['auto', 'patch', 'minor', 'major', 'prerelease'] as const;
 
+/** One `--bump` value. */
+export type ReleaseBump = (typeof RELEASE_BUMPS)[number];
+
 export interface ReleasePackageInfo {
   name: string;
   projectName: string;

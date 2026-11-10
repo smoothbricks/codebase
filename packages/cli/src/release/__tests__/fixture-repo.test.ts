@@ -20,6 +20,12 @@ import {
   type ReleasePackageInfo,
   releaseTag,
 } from '../core.js';
+import {
+  dispatchRelease,
+  type PublishRun,
+  type ReleaseDispatchOptions,
+  type ReleaseDispatchShell,
+} from '../dispatch.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
   FIXTURE_DAEMON_MARKER,
@@ -449,6 +455,64 @@ describe('release planning with fixture git repositories', () => {
   });
 });
 
+describe('a publish dispatched as the land turn command', () => {
+  it('holds the turn until its run ends, so a land queued behind it never moves main under the release push', async () => {
+    await withFixtureRepo(async (main) => {
+      const remote = await publishFixture(main);
+      const turn = new LandTurn();
+      const shell = new LocalPublishShell(main, remote);
+      // Boxed: a deferred resolved with a promise adopts it, and would wait for the land itself.
+      const landAsked = Promise.withResolvers<{ landing: Promise<void> }>();
+      // The candidate builds until a land has either moved main or is queued behind the publish's turn.
+      shell.buildWindow = async () => {
+        await Promise.race([turn.contended(), (await landAsked.promise).landing]);
+      };
+
+      const publishing = turn.hold(() => dispatchRelease(shell, publishOptions()));
+      // The land asks once the publish is past its dispatch: returned, or holding the turn on its run.
+      await Promise.race([publishing, shell.awaiting.promise]);
+      const landing = turn.hold(() => landFastForward(main, 'land.md')).then(() => pushMain(main));
+      landAsked.resolve({ landing });
+      await Promise.all([publishing, landing]);
+
+      expect(await shell.outcome(0)).toEqual({ conclusion: 'success' });
+      expect(await gitOutput(remote, ['log', '--format=%s', 'main'])).toBe(
+        ['land.md', 'chore(release): publish', 'release cli 0.1.0'].join('\n'),
+      );
+      expect(await gitOutput(remote, ['rev-parse', 'cli@0.2.0^{commit}'])).toBe(
+        await gitOutput(remote, ['rev-parse', 'main~1']),
+      );
+    });
+  });
+
+  it('refuses to dispatch while main holds a landed commit its remote lacks, and releases on top once it is pushed', async () => {
+    await withFixtureRepo(async (main) => {
+      const remote = await publishFixture(main);
+      const turn = new LandTurn();
+      const shell = new LocalPublishShell(main, remote);
+      // A land fast-forwarded main and ended its turn; its push runs after the turn, detached.
+      await landFastForward(main, 'landed.md');
+      const landed = await gitOutput(main, ['rev-parse', 'HEAD']);
+      const pushed = await gitOutput(remote, ['rev-parse', 'main']);
+      shell.buildWindow = () => pushMain(main);
+
+      await expect(turn.hold(() => dispatchRelease(shell, publishOptions()))).rejects.toThrow(
+        `Cannot dispatch publish.yml: HEAD is at ${landed.slice(0, 12)}, which origin/main at ${pushed.slice(0, 12)} does not hold.`,
+      );
+      expect(shell.dispatches).toBe(0);
+
+      await pushMain(main);
+      shell.buildWindow = async () => {};
+      await turn.hold(() => dispatchRelease(shell, publishOptions()));
+
+      expect(await shell.outcome(0)).toEqual({ conclusion: 'success' });
+      expect(await gitOutput(remote, ['log', '--format=%s', 'main'])).toBe(
+        ['chore(release): publish', 'landed.md', 'release cli 0.1.0'].join('\n'),
+      );
+    });
+  });
+});
+
 /**
  * Run a test file whose single test returns while its fixture body is still
  * running, once `body` has run in that fixture. Bun ends a timed-out test
@@ -656,5 +720,154 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
       return;
     }
     await git(this.root, ['tag', '-a', tagName, '-m', tagName, 'HEAD']);
+  }
+}
+
+/** The fixture's host main: one package at 0.1.0, pushed to a bare remote the publish runs clone. */
+async function publishFixture(main: string): Promise<string> {
+  await writePackage(main, '@scope/cli', 'packages/cli', '0.1.0');
+  await git(main, ['add', 'packages']);
+  await git(main, ['commit', '-m', 'release cli 0.1.0']);
+  const remote = join(main, 'remote.git');
+  await git(main, ['init', '--bare', '-b', 'main', remote]);
+  await git(main, ['remote', 'add', 'origin', remote]);
+  await git(main, ['push', 'origin', 'main']);
+  return remote;
+}
+
+function publishOptions(): ReleaseDispatchOptions {
+  return {
+    workflow: 'publish.yml',
+    remote: 'origin',
+    branch: 'main',
+    inputs: { bump: 'auto', projects: '', dryRun: false },
+  };
+}
+
+/**
+ * A declared land's turn span (02_workspaces.md "A declared land"): main is brought to the remote's branch (step 3),
+ * then the gated commit is fast-forwarded onto it (step 5). Its push comes after the turn ends (step 6).
+ */
+async function landFastForward(main: string, file: string): Promise<void> {
+  await git(main, ['fetch', 'origin', 'main']);
+  await git(main, ['merge', '--ff-only', 'origin/main']);
+  await writeFile(join(main, file), `${file}\n`);
+  await git(main, ['add', file]);
+  await git(main, ['commit', '-m', file]);
+}
+
+/** A land's detached push of main (step 6). */
+async function pushMain(main: string): Promise<void> {
+  await git(main, ['push', 'origin', 'main']);
+}
+
+/**
+ * The repository's land turn as the gateway keeps it (05_gateway.md "Land turns", laws `one_holder` and `fifo`): the
+ * first ticket holds the turn until its command ends, and each later ticket waits in the order it asked.
+ */
+class LandTurn {
+  private tail: Promise<void> = Promise.resolve();
+  private tickets = 0;
+  private readonly contention = Promise.withResolvers<void>();
+
+  hold<T>(command: () => Promise<T>): Promise<T> {
+    this.tickets += 1;
+    if (this.tickets > 1) {
+      this.contention.resolve();
+    }
+    const turn = this.tail.then(command);
+    const release = () => {
+      this.tickets -= 1;
+    };
+    this.tail = turn.then(release, release);
+    return turn;
+  }
+
+  /** Settles once a ticket waits behind the holder. */
+  contended(): Promise<void> {
+    return this.contention.promise;
+  }
+}
+
+type PublishRunOutcome = { conclusion: 'success' } | { conclusion: 'failure'; reason: string };
+
+/**
+ * The host's main checkout and the forge. A dispatch creates a run that clones the branch as it is at that moment,
+ * commits the version bump, builds through `buildWindow`, and pushes the release refs as `smoo release publish` does.
+ */
+class LocalPublishShell implements ReleaseDispatchShell {
+  readonly logs: string[] = [];
+  readonly awaiting = Promise.withResolvers<void>();
+  buildWindow: () => Promise<void> = async () => {};
+  private readonly runs: Array<{ run: PublishRun; outcome: Promise<PublishRunOutcome> }> = [];
+
+  constructor(
+    private readonly main: string,
+    private readonly remote: string,
+  ) {}
+
+  get dispatches(): number {
+    return this.runs.length;
+  }
+
+  async outcome(index: number): Promise<PublishRunOutcome> {
+    const run = this.runs[index];
+    if (!run) {
+      throw new Error(`no run ${index} was dispatched`);
+    }
+    return run.outcome;
+  }
+
+  head(): Promise<string> {
+    return gitOutput(this.main, ['rev-parse', 'HEAD']);
+  }
+
+  async fetchRemoteHead(branch: string): Promise<string | null> {
+    await git(this.main, ['fetch', 'origin', branch]);
+    return gitOutput(this.main, ['rev-parse', `origin/${branch}`]);
+  }
+
+  isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    return gitIsAncestor(this.main, ancestor, descendant);
+  }
+
+  async dispatchPublishWorkflow(_workflow: string, branch: string): Promise<PublishRun> {
+    const number = this.runs.length + 1;
+    const runner = join(this.main, `runner-${number}`);
+    await git(this.main, ['clone', '--branch', branch, this.remote, runner]);
+    await git(runner, ['config', 'user.name', 'Test User']);
+    await git(runner, ['config', 'user.email', 'test@example.com']);
+    const run = { id: String(number), url: `https://github.test/scope/repo/actions/runs/${number}` };
+    const outcome = this.release(runner).then(
+      (): PublishRunOutcome => ({ conclusion: 'success' }),
+      (error: unknown): PublishRunOutcome => ({
+        conclusion: 'failure',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    this.runs.push({ run, outcome });
+    return run;
+  }
+
+  async awaitPublishRun(run: PublishRun): Promise<string> {
+    this.awaiting.resolve();
+    const found = this.runs.find((candidate) => candidate.run.id === run.id);
+    if (!found) {
+      throw new Error(`run ${run.id} was never dispatched`);
+    }
+    return (await found.outcome).conclusion;
+  }
+
+  log(message: string): void {
+    this.logs.push(message);
+  }
+
+  private async release(runner: string): Promise<void> {
+    await writePackage(runner, '@scope/cli', 'packages/cli', '0.2.0');
+    await git(runner, ['add', 'packages/cli/package.json']);
+    await git(runner, ['commit', '-m', 'chore(release): publish']);
+    await this.buildWindow();
+    const next: ReleasePackageInfo = { name: '@scope/cli', projectName: 'cli', path: 'packages/cli', version: '0.2.0' };
+    await new LocalGitRepairShell(runner).pushReleaseRefs([next]);
   }
 }

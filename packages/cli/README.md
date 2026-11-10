@@ -48,6 +48,7 @@ smoo release repair-pending [--dry-run [true|false]]
 smoo release version --bump <auto|patch|minor|major|prerelease> [--projects <projects|all>] [--dry-run [true|false]] [--github-output <path>]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--dry-run [true|false]]
 smoo release retag-unpublished <tag...> [--to <ref>] [--push] [--dispatch] [--remote <remote>] [--branch <branch>] [--dry-run [true|false]]
+smoo release dispatch [--bump <auto|patch|minor|major|prerelease>] [--projects <projects>] [--dry-run [true|false]] [--remote <remote>] [--branch <branch>]
 smoo release bootstrap-npm-packages [--dry-run [true|false]] [--skip-login] [--package <name...>]
 smoo release trust-publisher [--bootstrap] [--dry-run [true|false]] [--skip-login] [--package <name...>]
 
@@ -1605,7 +1606,18 @@ Versioning:
   exists on npm, when the GitHub Release exists, or when the target ref's package manifest does not contain the tagged
   version. Pass `--push` to update remote tags with `--force-with-lease`; pass `--dispatch` to also start `publish.yml`
   with `bump=auto`. Dispatch validates that the target ref is already the remote branch head so the workflow will
-  publish the same commit that was retagged.
+  publish the same commit that was retagged. It does not hold the run; to keep lands off the branch while it runs, retag
+  with `--push` and start the run with `smoo release dispatch` under the land turn (below).
+- `smoo release dispatch` starts `publish.yml` on the release branch with the `bump`, `projects` and `dry_run` inputs
+  given as `--bump`, `--projects` and `--dry-run`, then holds until the run completes and exits with its verdict:
+  nonzero, naming the run, unless it concluded `success`. The run pushes its release commit at its end and refuses a
+  branch that moved while it built (`Release branch main diverged`), so a repository that serializes its lands under a
+  turn dispatches through it as that turn's command, and its lands queue behind the run (smoothbricks:
+  `cowshed land-turn smoothbricks --workspace publish -- direnv exec . smoo release dispatch`,
+  `specs/cowshed/05_gateway.md` "A publish holds the land turn"). It first fetches the remote branch and refuses while
+  `HEAD` is a commit that branch does not hold, since that commit's push would move the branch during the run. It holds
+  GitHub Actions runs only: it reads the created run from `gh workflow run` and asks `gh run view` every 30 s until the
+  run completes.
 
 ### Repair Process
 

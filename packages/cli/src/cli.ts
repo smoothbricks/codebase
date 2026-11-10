@@ -370,6 +370,27 @@ function buildProgram(): Command {
       await releasePack(await findRepoRoot(), options);
     });
   release
+    .command('dispatch')
+    .description('Start publish.yml on the release branch and hold until its run completes')
+    .addOption(bumpOption().default('auto'))
+    .option(
+      '--projects <projects>',
+      'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
+    )
+    .option(
+      '--dry-run [dryRun]',
+      'dispatch a release run that writes no versions, tags, publishes or GitHub Releases',
+      dryRunOption,
+    )
+    .option('--remote <remote>', 'git remote whose branch the run releases')
+    .option('--branch <branch>', 'branch the run is dispatched on')
+    .action(
+      async (options: { bump: string; projects?: string; dryRun?: boolean; remote?: string; branch?: string }) => {
+        const { releaseDispatch } = await import('./release/index.js');
+        await releaseDispatch(await findRepoRoot(), { ...options, dryRun: options.dryRun === true });
+      },
+    );
+  release
     .command('retag-unpublished')
     .description('Move unpublished owned release tags to a later commit without bumping versions')
     .argument('<tag...>', 'owned release tags to move, for example @scope/pkg@1.2.3')

@@ -229,6 +229,13 @@ is the host-installed CLI of `packages/cowshed`.
   which owns acceptance of the rebased tree (do not invoke it directly or reconstruct its retry/waiver taxonomy in this
   file), fast-forwards main under the ref turn (rebasing and gating again when main moved), retires `<ws>`, then pushes
   and runs the declared after-land commands, detached. `--no-push` skips the push.
+- **Publish:** from main's checkout in the trusted host shell,
+  `cowshed land-turn smoothbricks --workspace publish -- direnv exec . smoo release dispatch [--bump <bump>] [--projects <a,b>]`,
+  in a session of its own (`setsid`, output to a file); never `gh workflow run publish.yml`. The release pushes its
+  version commit onto main at the end of its ~45 min run and refuses a main that moved meanwhile, so the dispatch holds
+  the land turn until the run completes and lands queue behind it (`specs/cowshed/05_gateway.md`, "A publish holds the
+  land turn"). It refuses while main holds a commit the remote lacks (a land's push still pending); dispatch again once
+  it is pushed.
 - **Doc commit (Markdown only):** `cowshed doc-commit -m 'docs: summary' (--patch <file> | --icm <program>)` from
   `main`; the edit is the input, never main's tree. It takes only the ref turn and runs no gate of its own, and it
   refuses a path that is not Markdown or that main holds uncommitted. The declared `[doc] check` also refuses an edit

@@ -539,6 +539,21 @@ inside it; a writer that holds the ref turn never asks for the land turn, so the
 (`--ref-lock`) orders no waiters: the kernel wakes them all and the first to retry wins, and it names no holder in
 order.
 
+**A publish holds the land turn.** A release workflow that versions, tags and pushes a release commit onto main from a
+CI runner (smoothbricks' `publish.yml`, about 45 minutes) writes the push remote's main once, at the end of its run, and
+refuses a main that moved while it built: its tags and tarballs describe the release commit's tree and its platform legs
+built the dispatch commit (packages/cli/PUBLISH.md, "Invariants"), so it never rebases onto commits it did not build.
+Measured 2026-11-10: run 42752601857 failed at its final push, "Release branch main diverged", because a land pushed
+main while it ran. The runner cannot take the host's turn, so the host takes it for the run: from main's checkout,
+`cowshed land-turn <repo> --workspace publish -- direnv exec . smoo release dispatch [--bump <bump>] [--projects <list>]`
+dispatches the workflow and exits only once its run has completed, with the run's verdict (packages/cli/README.md,
+`smoo release dispatch`). Lands queue behind it as behind any land, and the first one after it finds the release commit
+on the remote and fast-forwards main to it (02_workspaces.md "A declared land" step 3). A land pushes after its turn
+ends, so the turn alone does not fence a push already pending: the dispatch refuses while main's head is a commit the
+remote's branch does not hold, and is run again once that push has landed. A publish takes no ref turn: a doc commit
+moves main's checkout, never the remote, so it never breaks the run's push. The dispatch holds the turn for the whole
+run, so its caller starts it in a session of its own, as a land's (above).
+
 **A ticket's life is said.** Measured 2026-10-21: a land queued for 635 s vanished with its agent's session, its log
 stopping mid-wait, and nothing recorded it, so it read as running for half an hour while it did not exist. The gateway
 says each ticket's life on its stderr log, one line per event: asked (with the workspace, pid and command), held (after

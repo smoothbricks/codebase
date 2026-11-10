@@ -5,7 +5,13 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
-import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
+import {
+  type GithubApiProcessResult,
+  type GithubApiProcessRunner,
+  githubCiApplyOutputs,
+  githubCiNxRunMany,
+  NodeGithubApiProcessRunner,
+} from '../github-ci/index.js';
 import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
@@ -73,12 +79,14 @@ import {
   pendingReleaseTargets,
   RELEASE_BUMPS,
   RELEASE_COMMIT_SUBJECT,
+  type ReleaseBump,
   type ReleasePackageInfo,
   releaseCommitProjects,
   releasedByCommit,
   releaseTag,
   releaseTagAliases,
 } from './core.js';
+import { dispatchRelease, publishRunFromDispatchOutput, type ReleaseDispatchShell } from './dispatch.js';
 import {
   type DurableState,
   probeWithTransportRetry,
@@ -643,6 +651,32 @@ export async function releaseRetagUnpublished(root: string, options: ReleaseReta
     dryRun: options.dryRun === true,
     branch,
     workflow: 'publish.yml',
+  });
+}
+
+export interface ReleaseDispatchCommandOptions {
+  bump?: string;
+  projects?: string;
+  dryRun?: boolean;
+  remote?: string;
+  branch?: string;
+}
+
+/** `smoo release dispatch`: start `publish.yml` on the release branch and hold until its run completes. */
+export async function releaseDispatch(root: string, options: ReleaseDispatchCommandOptions): Promise<void> {
+  const source = resolveSourceRepository(root);
+  if (source.kind !== 'github') {
+    throw new Error(
+      `smoo release dispatch holds GitHub Actions runs only; this repository's source is ${source.kind}.`,
+    );
+  }
+  const branch = options.branch ?? (await releaseBranch(root));
+  const remote = options.remote ?? (await releaseRemote(root, branch));
+  await dispatchRelease(releaseDispatchShell(root, remote, `${source.owner}/${source.repo}`), {
+    workflow: 'publish.yml',
+    remote,
+    branch,
+    inputs: { bump: releaseBumpArg(options.bump), projects: options.projects ?? '', dryRun: options.dryRun === true },
   });
 }
 
@@ -1370,6 +1404,112 @@ function releaseRetagShell(root: string, remote: string) {
   };
 }
 
+/** How often a held dispatch asks GitHub whether its run has completed. */
+const PUBLISH_RUN_POLL_MS = 30_000;
+/** Failed asks in a row after which a held dispatch stops holding rather than hold the turn blind. */
+const PUBLISH_RUN_POLL_FAILURES = 10;
+const parsePublishRunState = typia.json.createIsParse<PublishRunState>();
+
+interface PublishRunState {
+  status: string;
+  conclusion: string;
+}
+
+function releaseDispatchShell(root: string, remote: string, repository: string): ReleaseDispatchShell {
+  const gh = new NodeGithubApiProcessRunner();
+  return {
+    head: () => gitHead(root),
+    fetchRemoteHead: async (branch) => {
+      if ((await remoteBranchSha(root, remote, branch)) === null) {
+        return null;
+      }
+      await run('git', ['fetch', remote, `refs/heads/${branch}`], root);
+      return gitSha(root, 'FETCH_HEAD');
+    },
+    isAncestor: (ancestor, descendant) => gitIsAncestor(root, ancestor, descendant),
+    dispatchPublishWorkflow: async (workflow, branch, inputs) => {
+      const args = [
+        'workflow',
+        'run',
+        workflow,
+        '--repo',
+        repository,
+        '--ref',
+        branch,
+        '-f',
+        `bump=${inputs.bump}`,
+        '-f',
+        `projects=${inputs.projects}`,
+        '-f',
+        `dry_run=${inputs.dryRun}`,
+      ];
+      const result = await gh.run(args, '', root);
+      if (result.exitCode !== 0) {
+        throw new Error(`gh ${args.join(' ')} exited ${result.exitCode}: ${result.stderr.trim()}`);
+      }
+      const created = publishRunFromDispatchOutput(`${result.stdout}\n${result.stderr}`);
+      if (!created) {
+        throw new Error(
+          `gh ${args.join(' ')} started a run but named none, so this dispatch cannot hold it until it completes:\n${result.stdout.trim()}`,
+        );
+      }
+      return created;
+    },
+    awaitPublishRun: async (publishRun) => {
+      const args = ['run', 'view', publishRun.id, '--repo', repository, '--json', 'status,conclusion'];
+      let reported = '';
+      let failures = 0;
+      for (;;) {
+        const answer = await askPublishRun(gh, args, root);
+        if (answer.ok) {
+          failures = 0;
+          if (answer.state.status === 'completed') {
+            return answer.state.conclusion;
+          }
+          if (answer.state.status !== reported) {
+            console.log(`${publishRun.url}: ${answer.state.status}`);
+            reported = answer.state.status;
+          }
+        } else {
+          failures += 1;
+          console.error(`${publishRun.url}: ${answer.reason} (${failures} of ${PUBLISH_RUN_POLL_FAILURES} in a row)`);
+          if (failures === PUBLISH_RUN_POLL_FAILURES) {
+            throw new Error(
+              `Stopped holding ${publishRun.url}: GitHub did not answer its state ${failures} times in a row, and the run may still be going.`,
+            );
+          }
+        }
+        await delay(PUBLISH_RUN_POLL_MS);
+      }
+    },
+    log: (message) => console.log(message),
+  };
+}
+
+/** One ask of a run's state; a failed ask is a value, so the hold can say it and ask again. */
+async function askPublishRun(
+  gh: GithubApiProcessRunner,
+  args: string[],
+  root: string,
+): Promise<{ ok: true; state: PublishRunState } | { ok: false; reason: string }> {
+  let result: GithubApiProcessResult;
+  try {
+    result = await gh.run(args, '', root);
+  } catch (error) {
+    if (error instanceof RemoteHttpTimeoutError) {
+      return { ok: false, reason: error.message };
+    }
+    throw error;
+  }
+  if (result.exitCode !== 0) {
+    return { ok: false, reason: `gh ${args.join(' ')} exited ${result.exitCode}: ${result.stderr.trim()}` };
+  }
+  const state = parsePublishRunState(result.stdout);
+  return state
+    ? { ok: true, state }
+    : { ok: false, reason: `gh ${args.join(' ')} answered no status and conclusion: ${result.stdout.trim()}` };
+}
+
 // These helpers serve two commands. Hardcoding "Repair pending releases" made
 // `release build-platform-outputs` announce a repair it was not performing: it
 // plans pending targets only because macOS artifacts cannot be built by the
@@ -2042,11 +2182,12 @@ async function gitRemoteExists(root: string, remote: string): Promise<boolean> {
   return result.exitCode === 0;
 }
 
-function releaseBumpArg(bump = 'auto'): string {
-  if (!RELEASE_BUMPS.some((allowed) => allowed === bump)) {
+function releaseBumpArg(bump = 'auto'): ReleaseBump {
+  const allowed = RELEASE_BUMPS.find((candidate) => candidate === bump);
+  if (allowed === undefined) {
     throw new Error(`Invalid --bump "${bump}". Expected ${RELEASE_BUMPS.join(', ')}.`);
   }
-  return bump;
+  return allowed;
 }
 
 function githubRepositoryFromRootPackage(root: string): string {

@@ -110,6 +110,7 @@
     "src/release/__tests__/core.test.ts": 4,
     "src/release/__tests__/publish-plan.test.ts": 4,
     "src/release/__tests__/retag-unpublished.test.ts": 4,
-    "src/secrets/repository.test.ts": 4
+    "src/secrets/repository.test.ts": 4,
+    "src/release/__tests__/dispatch.test.ts": 3
   }
 }
