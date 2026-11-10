@@ -9078,6 +9078,104 @@ async fn directory_a_declared_land_of_a_head_main_already_holds_pushes_nothing_s
         .expect("stop the real directory project");
 }
 
+/// The daemon an install left: a supervisor manager of another build at `store`, which refuses
+/// every build check as that build does (`supervisor_manager::require_same_build`), on the
+/// manager's own wire (a 4-byte big-endian length, then the JSON). Served until dropped.
+struct OtherBuildDaemon(tokio::task::JoinHandle<()>);
+
+impl OtherBuildDaemon {
+    async fn serve(store: &Path) -> Self {
+        use cowshed_core::error::OtherBuild;
+        use cowshed_core::runtime::supervisor_socket::BuildId;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let socket = cowshed_core::runtime::supervisor_manager::manager_socket_path(store);
+        fs::create_dir_all(socket.parent().expect("the run directory"))
+            .expect("create the store's run directory");
+        let refused = cowshed_core::CowshedError::other_build(OtherBuild {
+            daemon: serde_json::from_value(serde_json::json!("the-installed-build"))
+                .expect("a build"),
+            caller: Some(BuildId::current().expect("this build").clone()),
+        });
+        let answer = serde_json::to_vec(&serde_json::json!({ "refused": refused }))
+            .expect("encode the refusal");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the manager socket");
+        Self(tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut length = [0_u8; 4];
+                if stream.read_exact(&mut length).await.is_err() {
+                    continue;
+                }
+                let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+                if stream.read_exact(&mut request).await.is_err() {
+                    continue;
+                }
+                let prefix = u32::try_from(answer.len())
+                    .expect("a short answer")
+                    .to_be_bytes();
+                let _ = stream.write_all(&prefix).await;
+                let _ = stream.write_all(&answer).await;
+            }
+        }))
+    }
+}
+
+impl Drop for OtherBuildDaemon {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// An install can restart the gateway in one stretch of a land's life only: after the land's
+/// step began and before it asked its turn, since an install's read of the turns refuses while
+/// any queue holds a ticket (05_gateway.md "The read fences the turns", `fence_only_when_free`).
+/// A land whose daemon became another build there is that other build's to refuse at its first
+/// supervisor, after its fast-forward. So once it holds its turn it asks the daemon's build, and a
+/// daemon of another build ends the land before anything moves: no gate ran, main and the
+/// workspace are where they were, its turn was ended, never abandoned, and the refusal is the
+/// other build's, which `cowshed land` answers by going on as the installed cowshed.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_whose_daemon_became_another_build_before_its_turn_moves_nothing_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-replaced-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let main_head = git_stdout(&declared.main, &["rev-parse", "HEAD"]);
+    let topic_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+
+    let daemon = OtherBuildDaemon::serve(fixture.storage.store()).await;
+    let (result, _, stderr) = run(&mut service, ["land", "topic"]).await;
+    drop(daemon);
+    let refused = match result {
+        Err(refused) => refused,
+        Ok(code) => panic!(
+            "a land whose daemon is another build went on (exit {code}): {}",
+            String::from_utf8_lossy(&stderr)
+        ),
+    };
+    assert!(refused.other_build_source().is_some(), "{refused:?}");
+    assert_eq!(declared.gated(), Vec::<String>::new(), "no gate ran");
+    assert_eq!(
+        git_stdout(&declared.main, &["rev-parse", "HEAD"]),
+        main_head,
+        "main did not move"
+    );
+    assert_eq!(git_stdout(&topic, &["rev-parse", "HEAD"]), topic_head);
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the land ended its turn, never abandoned it"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 /// A declared land whose retire is refused still lands and pushes: a process cowshed does not run
 /// holds the workspace's mount, so the retire the land ends with is refused and the workspace is
 /// kept, yet main moved, so the land records it landed, pushes it, and runs its after-land command.

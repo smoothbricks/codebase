@@ -459,24 +459,22 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         // A land step that starts while an install holds the slot waits for that install, and
         // then holds nothing (`install_basis::wait_for_install`): no install ever waits on a land
         // step. Waited for before the build check, so the step judges the daemon the install left.
-        let mut waited_in = None;
+        // What the stable name named as the step began is read first: an install that replaced it
+        // since makes this process another build than the daemon that install left.
+        let mut step = None;
         if is_land_step(&parsed.command) {
             let home = cowshed_core::gateway_sessions::canonical_home()?;
             let support = cowshed_core::host_dirs::support_directory(&home);
-            if install_basis::wait_for_install(&support).await? {
-                waited_in = Some(support);
-            }
+            let started = install_basis::StepStart::at(&support);
+            install_basis::wait_for_install(&support).await?;
+            step = Some(started);
         }
         // The daemon refuses another build's cowshed at the first supervisor a verb asks for,
         // which is after the verb's first step. Ask it now, before anything is changed.
         if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
-            // A step the install it waited for replaced goes on as the installed build, in place.
-            if let (Some(support), Some(_)) = (&waited_in, error.other_build_source()) {
-                return Err(continue_as_installed(support));
-            }
-            return Err(error);
+            return Err(goes_on_as_installed(step.as_ref(), error));
         }
-        Ok::<_, CowshedError>(prepared)
+        Ok::<_, CowshedError>((prepared, step))
     };
     // Handlers armed for a resident answer stay installed, so a signal during the preflight ends
     // the command as it would during the relay, never waits for the preflight to finish.
@@ -487,7 +485,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
         },
         None => preflight.await,
     };
-    let prepared = match prepared {
+    let (prepared, step) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return Ok(finish(Err(error), &mut output, json, &waits)),
     };
@@ -511,7 +509,27 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             signal = interrupts.received() => return Err(signal),
         }
     };
+    // A declared land whose daemon an install replaced before its turn ends unmoved with the
+    // daemon's refusal (`declared_land::land`), as does a step refused at its first supervisor.
+    let outcome = outcome.map_err(|error| goes_on_as_installed(step.as_ref(), error));
     Ok(finish(outcome, &mut output, json, &waits))
+}
+
+/// A land step refused as another build after an install replaced the installed cowshed since the
+/// step began goes on as the installed cowshed, in place (05_gateway.md "A land step waits for an
+/// install in progress"): refused while it waited at its start, or, for a declared land, once it
+/// held its turn. Any other failure, and a step no install replaced, is returned as it is; the
+/// copy it goes on as reads the stable name afresh, so no step goes on as one copy twice.
+fn goes_on_as_installed(
+    step: Option<&install_basis::StepStart>,
+    error: CowshedError,
+) -> CowshedError {
+    match step {
+        Some(step) if error.other_build_source().is_some() && step.replaced() => {
+            continue_as_installed(step.support())
+        }
+        _ => error,
+    }
 }
 
 /// Replace this process with the installed cowshed, run with this process's own arguments

@@ -206,6 +206,9 @@ pub trait CliService: Send {
     /// `<support>/bin/cowshed` (05_gateway.md "The installed cowshed"), the gateway's own program.
     /// `None` when this store's home has none installed.
     fn background_program(&self) -> Result<Option<PathBuf>>;
+    /// Whether the daemon of this project's store runs this build: `Err` with the daemon's
+    /// refusal, carrying both builds, when it runs another (`supervisor_manager::require_same_build`).
+    async fn require_daemon_of_this_build(&self) -> Result<()>;
     async fn shutdown(self) -> Result<()>
     where
         Self: Sized;
@@ -901,6 +904,10 @@ impl CliService for ActorBridge {
         let program = cowshed_core::host_dirs::installed_binary_directory(self.storage()?.home())
             .join("cowshed");
         Ok(program.is_file().then_some(program))
+    }
+
+    async fn require_daemon_of_this_build(&self) -> Result<()> {
+        cowshed_core::runtime::supervisor_manager::require_same_build(self.storage()?.store()).await
     }
 
     async fn remove_project(

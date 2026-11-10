@@ -182,6 +182,46 @@ pub fn continue_as_installed(support_directory: &Path) -> Result<std::process::C
     Ok(command)
 }
 
+/// Where a land step began: the stored copy the stable name named then. A step an install
+/// replaced since — while it waited for that install at its start, or while it ran before its turn
+/// — is still the build it started as, and the daemon the install left refuses it.
+pub struct StepStart {
+    support: PathBuf,
+    installed: Option<PathBuf>,
+}
+
+impl StepStart {
+    /// Read the stable name in `support_directory` now, as a land step begins.
+    pub fn at(support_directory: &Path) -> Self {
+        Self {
+            support: support_directory.to_path_buf(),
+            installed: installed_copy(support_directory),
+        }
+    }
+
+    /// Whether the stable name names another copy than it did when the step began: an install
+    /// replaced the installed cowshed since. A step that goes on as the installed cowshed reads it
+    /// afresh, so it never goes on as the same copy twice.
+    pub fn replaced(&self) -> bool {
+        installed_copy(&self.support) != self.installed
+    }
+
+    pub fn support(&self) -> &Path {
+        &self.support
+    }
+}
+
+/// The copy the stable name in `support_directory` names; `None` when it names none or cannot
+/// be read, which no install leaves.
+fn installed_copy(support_directory: &Path) -> Option<PathBuf> {
+    std::fs::read_link(
+        support_directory
+            .join("bin")
+            .join(crate::launchd::COWSHED_BINARY_NAME),
+    )
+    .ok()
+}
+
 fn slot_error(path: &Path, operation: &str, error: &io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!(
@@ -696,6 +736,37 @@ pub(crate) mod tests {
             refused.message.contains("cannot be read"),
             "{}",
             refused.message
+        );
+    }
+
+    /// A land step is replaced exactly when the stable name names another copy than it did as the
+    /// step began, however long the step has run; a step that went on as the installed copy reads
+    /// the stable name afresh, so it is never replaced by the copy it now is.
+    #[test]
+    fn a_land_step_is_replaced_only_by_an_install_since_it_began() {
+        let main = Main::new("step-start");
+        let bin = main.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stable = bin.join(crate::launchd::COWSHED_BINARY_NAME);
+        std::os::unix::fs::symlink(format!("cowshed-{}", "a".repeat(64)), &stable).unwrap();
+        let step = StepStart::at(&main.root);
+        assert!(!step.replaced(), "no install ran since the step began");
+
+        std::fs::remove_file(&stable).unwrap();
+        std::os::unix::fs::symlink(format!("cowshed-{}", "b".repeat(64)), &stable).unwrap();
+        assert!(
+            step.replaced(),
+            "an install replaced the copy since the step began"
+        );
+        assert!(
+            !StepStart::at(&main.root).replaced(),
+            "the step that goes on as the new copy is not replaced by it"
+        );
+
+        let nothing = Main::new("step-start-none");
+        assert!(
+            !StepStart::at(&nothing.root).replaced(),
+            "no installed cowshed is no install"
         );
     }
 

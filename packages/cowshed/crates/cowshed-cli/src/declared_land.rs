@@ -113,6 +113,16 @@ where
         output,
     )
     .await?;
+    // An install restarts the gateway only while no queue holds a ticket (05_gateway.md "The read
+    // fences the turns"), so the one stretch of this land it can fall in is before its turn: from
+    // the step's start to the ask. A daemon that became another build there refuses this process
+    // at its first supervisor, after the fast-forward. So the land asks the daemon's build once,
+    // holding its turn, and ends before anything moves when it is another; `run` then goes on as
+    // the installed cowshed (05_gateway.md "A land step waits for an install in progress").
+    if let Err(refused) = service.require_daemon_of_this_build().await {
+        turn.end(format!("refused: {}", refused.message));
+        return Err(refused);
+    }
     let routed = route(
         service,
         main,
@@ -263,6 +273,11 @@ async fn start_after<S: CliService>(
         .map_err(|error| error.message)?
         .ok_or_else(|| "this store names no cowshed executable for background work".to_owned())?;
     let argv = crate::land_after::argv(&program, request).map_err(|error| error.message)?;
+    let rerun = argv
+        .iter()
+        .map(|word| shell_word(&word.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
     let command = crate::runtime::ExecCommand {
         workspace: cowshed_core::git::MAIN_REMOTE.to_owned(),
         request: cowshed_core::api::ExecRequest {
@@ -289,6 +304,8 @@ async fn start_after<S: CliService>(
         background: true,
         timeout: None,
     };
+    // The request is written, so a job refused now, by a daemon an install restarted onto another
+    // build after this land's turn ended, can be run by hand as the installed cowshed.
     let result = service
         .exec(
             command,
@@ -297,8 +314,27 @@ async fn start_after<S: CliService>(
             &mut std::io::sink(),
         )
         .await
-        .map_err(|error| error.message)?;
+        .map_err(|error| not_admitted(&error, &rerun))?;
     Ok(result.info.job_id.get())
+}
+
+/// Why the after-land job was not admitted, and the command that runs it by hand: `rerun`, the
+/// job's own argv, whose program is the installed cowshed's stable name.
+fn not_admitted(error: &CowshedError, rerun: &str) -> String {
+    format!("{}; run it by hand: {rerun}", error.message)
+}
+
+/// `word` as one shell word.
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=@%+-".contains(&byte))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 /// Steps 3 to 5 under the land turn: rebase, gate, fast-forward and the primitive's retire; back
@@ -982,4 +1018,32 @@ fn note<W: Write + Send, E: Write + Send>(
 /// Where a turn's after-land output is kept.
 pub(crate) fn after_directory(turn: &Path) -> PathBuf {
     turn.join("lands")
+}
+
+#[cfg(test)]
+mod tests {
+    /// An after-land job a daemon of another build refused — one an install restarted the gateway
+    /// onto after the land's turn ended — is recorded naming both builds and the command that runs
+    /// it by hand as the installed cowshed, the job's own argv quoted for a shell.
+    #[test]
+    fn a_refused_after_job_names_the_builds_and_its_rerun() {
+        use cowshed_core::error::OtherBuild;
+        let refused = cowshed_core::CowshedError::other_build(OtherBuild {
+            daemon: serde_json::from_value(serde_json::json!("installed-build")).unwrap(),
+            caller: Some(serde_json::from_value(serde_json::json!("landing-build")).unwrap()),
+        });
+        let rerun = [
+            "/Users/someone/Library/Application Support/dev.cowshed/bin/cowshed",
+            "__land-after",
+            "/tmp/lands/head.json",
+        ]
+        .map(super::shell_word)
+        .join(" ");
+        assert_eq!(
+            super::not_admitted(&refused, &rerun),
+            "the cowshed daemon is build installed-build; this cowshed is build landing-build; \
+             run it by hand: '/Users/someone/Library/Application Support/dev.cowshed/bin/cowshed' \
+             __land-after /tmp/lands/head.json"
+        );
+    }
 }
