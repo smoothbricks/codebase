@@ -36,3 +36,6 @@ pub mod vo;
 pub mod wasm_abi;
 
 pub use types::*;
+
+mod interned;
+pub use interned::{InternedStr, MAX_INTERNED_STR_BYTES, TooLongToIntern};

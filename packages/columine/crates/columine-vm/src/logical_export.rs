@@ -53,6 +53,7 @@ use crate::nested::{self, NestedPrefix};
 use crate::state_init::{self, GrowthRoom};
 use crate::struct_map::{ArenaRegion, StructMap2Slot, StructMapSlot};
 use bitmosaic::{Bitmosaic, BitmosaicView, IMAGE_ID_LEN};
+use columine_types::InternedStr;
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY,
     EVICTED_BUFFER_CAP, ErrorCode, SlotMetaOffset, SlotType, StructFieldType, TOMBSTONE, align8,
@@ -455,7 +456,7 @@ pub trait InternLookup {
 /// }
 /// ```
 pub trait Interner: InternLookup {
-    fn intern(&mut self, text: &str) -> Result<u32, ErrorCode>;
+    fn intern(&mut self, text: InternedStr<'_>) -> Result<u32, ErrorCode>;
 }
 
 // =============================================================================
@@ -492,6 +493,10 @@ pub enum LogicalExportCause {
         capacity: u64,
     },
     InvalidRow(&'static str),
+    /// Text an interned lane would hold, longer than an interned identity may be.
+    TextTooLong {
+        bytes: usize,
+    },
 }
 
 impl From<ErrorCode> for LogicalExportCause {
@@ -534,6 +539,12 @@ fn decode_u32(
     }
 }
 
+/// The bounded identity `text` is, or the refusal naming its length.
+fn interned(text: &str) -> CauseResult<InternedStr<'_>> {
+    InternedStr::new(text).map_err(|refused| LogicalExportCause::TextTooLong {
+        bytes: refused.bytes,
+    })
+}
 fn encode_u32(
     value: &LogicalValue,
     enc: CellEncoding,
@@ -542,9 +553,9 @@ fn encode_u32(
     match (enc, value) {
         (CellEncoding::Raw, LogicalValue::U32(v)) => Ok(*v),
         (CellEncoding::Boolean, LogicalValue::Bool(v)) => Ok(u32::from(*v)),
-        (CellEncoding::Interned, LogicalValue::Text(text)) => {
-            interner.intern(text).map_err(LogicalExportCause::Vm)
-        }
+        (CellEncoding::Interned, LogicalValue::Text(text)) => interner
+            .intern(interned(text)?)
+            .map_err(LogicalExportCause::Vm),
         _ => Err(LogicalExportCause::FieldTypeMismatch {
             field: 0,
             expected: match enc {
@@ -1357,7 +1368,7 @@ fn encode_arena_payload(
             }
             (StructFieldType::ArrayString, LogicalValue::Text(t)) => payload.extend_from_slice(
                 &interner
-                    .intern(t)
+                    .intern(interned(t)?)
                     .map_err(LogicalExportCause::Vm)?
                     .to_le_bytes(),
             ),
@@ -1425,7 +1436,9 @@ fn write_row_fields(
             },
             StructFieldType::String => match value {
                 LogicalValue::Text(t) => {
-                    let id = interner.intern(t).map_err(LogicalExportCause::Vm)?;
+                    let id = interner
+                        .intern(interned(t)?)
+                        .map_err(LogicalExportCause::Vm)?;
                     bytes::write_u32(state, at, id);
                 }
                 _ => return Err(mismatch("text")),
@@ -2027,7 +2040,9 @@ fn write_scalar_cell(
         },
         StructFieldType::String => match value {
             LogicalValue::Text(t) => {
-                let id = interner.intern(t).map_err(LogicalExportCause::Vm)?;
+                let id = interner
+                    .intern(interned(t)?)
+                    .map_err(LogicalExportCause::Vm)?;
                 bytes::write_u32(state, at, id);
             }
             _ => return Err(mismatch("text")),

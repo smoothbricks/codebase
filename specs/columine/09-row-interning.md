@@ -18,6 +18,11 @@ of the same log in the same order makes the same ids. A table that cannot take t
 spliced. `NoStrings` is the interner of a state with no string table: it names no text and refuses an intern with
 `InvalidProgram`.
 
+An interned lane holds an identity, never content: `intern` takes an `InternedStr` (columine-types), text at most
+`MAX_INTERNED_STR_BYTES` (65,536 bytes) long, so unbounded text does not type there. Whoever makes text an identity
+constructs one and answers the refusal by value: an expression whose built string is longer refuses its cell with
+`InvalidCellValue`, and a logical import refuses with `TextTooLong`.
+
 ## 3. Bind and reduce
 
 `bind_row_columns(program, plan, state, cols, batch_len, eval, strings, rows)` runs the program's `RowPlan`

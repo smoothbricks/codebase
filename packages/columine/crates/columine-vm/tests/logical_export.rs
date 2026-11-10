@@ -5,6 +5,7 @@
 //! transform plans, and typed refusals. Generated cases come from a deterministic
 //! LCG so every run exercises the same states.
 
+use columine_types::InternedStr;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_FORMAT_VERSION,
@@ -126,7 +127,8 @@ impl InternLookup for TestInterner {
 }
 
 impl Interner for TestInterner {
-    fn intern(&mut self, text: &str) -> Result<u32, ErrorCode> {
+    fn intern(&mut self, text: InternedStr<'_>) -> Result<u32, ErrorCode> {
+        let text = text.as_str();
         if let Some(&id) = self.ids.get(text) {
             return Ok(id);
         }
@@ -190,9 +192,11 @@ fn borrowed_text_import_matches_owned_without_a_text_allocation() {
     };
     let prog = program(1, &halt(slot_def(0, SlotType::HashMap as u8, 8)));
     let mut interner = TestInterner::default();
-    interner.intern(&key).expect("key admitted before import");
     interner
-        .intern(&value)
+        .intern(InternedStr::new(&key).expect("a short key"))
+        .expect("key admitted before import");
+    interner
+        .intern(InternedStr::new(&value).expect("a short value"))
         .expect("value admitted before import");
     let mut borrowed = base_slot(0, SlotType::HashMap);
     borrowed.rows.push(row(

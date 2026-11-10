@@ -257,7 +257,7 @@ impl crate::logical_export::InternLookup for NoStrings {
 }
 
 impl crate::logical_export::Interner for NoStrings {
-    fn intern(&mut self, _text: &str) -> Result<u32, ErrorCode> {
+    fn intern(&mut self, _text: columine_types::InternedStr<'_>) -> Result<u32, ErrorCode> {
         Err(ErrorCode::InvalidProgram)
     }
 }

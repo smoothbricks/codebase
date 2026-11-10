@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use columine_types::InternedStr;
 use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{CmpType, ErrorCode};
 use columine_vm::column_uses::ReduceReads;
@@ -45,7 +46,9 @@ impl Table {
             limit,
         };
         for text in seed {
-            table.intern(text).expect("the seed fits");
+            table
+                .intern(InternedStr::new(text).expect("a short seed"))
+                .expect("the seed fits");
         }
         table
     }
@@ -58,7 +61,8 @@ impl InternLookup for Table {
 }
 
 impl Interner for Table {
-    fn intern(&mut self, text: &str) -> Result<u32, ErrorCode> {
+    fn intern(&mut self, text: InternedStr<'_>) -> Result<u32, ErrorCode> {
+        let text = text.as_str();
         if let Some(&id) = self.ids.get(text) {
             return Ok(id);
         }
@@ -122,7 +126,9 @@ impl RowExpression for Join {
                 .text(id(expr[1]))
                 .ok_or(ErrorCode::InvalidCellValue)?,
         );
-        strings.intern(&self.scratch).map(RowCell::U32)
+        // A joined key longer than an interned identity holds no u32 cell (09 §2).
+        let joined = InternedStr::new(&self.scratch).map_err(|_| ErrorCode::InvalidCellValue)?;
+        strings.intern(joined).map(RowCell::U32)
     }
 }
 
@@ -332,5 +338,6 @@ fn an_interner_refusal_refuses_the_bind_and_splices_nothing() {
 fn no_strings_names_no_text_and_refuses_an_intern() {
     let mut strings = NoStrings;
     assert_eq!(strings.text(0), None);
-    assert_eq!(strings.intern("s1::c1"), Err(ErrorCode::InvalidProgram));
+    let joined = InternedStr::new("s1::c1").expect("a short key");
+    assert_eq!(strings.intern(joined), Err(ErrorCode::InvalidProgram));
 }
