@@ -926,7 +926,7 @@ pub enum Members<'a> {
     #[cfg(target_os = "macos")]
     OwnGroup,
     /// A cgroup v2 leaf of this run alone, `path` opened as `cgroup`, which the child enters
-    /// before it executes: a controller run's leaf, or one an after-land job makes for each command.
+    /// before it executes: the leaf an after-land job makes for each command.
     #[cfg(target_os = "linux")]
     Leaf {
         cgroup: std::os::fd::BorrowedFd<'a>,

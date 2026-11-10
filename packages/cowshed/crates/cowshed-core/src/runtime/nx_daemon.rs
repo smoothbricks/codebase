@@ -1069,62 +1069,49 @@ pub(crate) async fn next_probe(
 }
 
 /// What stopping one ledger-owned landing daemon did. Every failure is a diagnostic here, never an
-/// error: a failed cleanup cannot abort a land whose HEAD has already moved.
+/// error: a failed stop cannot abort a land whose HEAD has already moved.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub(crate) struct OwnedStopOutcome {
     pub(crate) pid: i32,
     pub(crate) exited: bool,
     pub(crate) signalled: bool,
-    pub(crate) stderr: Vec<u8>,
     pub(crate) diagnostics: Vec<String>,
 }
 
-/// Stop the job's own daemon process: take the forks it made since the plan while it still runs,
-/// `SIGTERM` the exact identity the ledger proved, run the caller's socket-cleanup command, then
-/// wait on the exit watch registered before any signal for the shared grace and end the plugin
-/// workers it forked ([`super::daemon_watch::Orphans::end`]). Only a join failure of the wait is an
-/// error.
+/// Stop the job's own daemon process as stock `nx daemon --stop` stops it, without running Nx:
+/// take the forks it made since the plan while it still runs, `SIGTERM` the exact identity the
+/// ledger proved, then wait on the exit watch registered before any signal for the shared grace
+/// and end the plugin workers it forked ([`super::daemon_watch::Orphans::end`]). The daemon's own
+/// `SIGTERM` handler closes its socket and deletes its record (pinned Nx 24.0.3,
+/// `daemon/server/shutdown-utils.js`), so nothing is left to clean, and no command, nor the shell
+/// activation it would enter through, can hold the stop past the grace (16_build_volumes.md,
+/// Land 4). A daemon already gone is stopped: a signal it no longer accepts is said only when it
+/// still runs. Only a join failure of the wait is an error.
 #[cfg(target_os = "macos")]
-pub(crate) async fn stop_owned_daemon<F, Fut, E>(
+pub(crate) async fn stop_owned_daemon(
     process: super::job_groups::OwnedGroupProcess,
     mut watch: super::daemon_watch::DaemonWatch,
-    cleanup: F,
-) -> Result<OwnedStopOutcome>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<std::process::Output, E>>,
-    E: std::fmt::Display,
-{
+) -> Result<OwnedStopOutcome> {
     let pid = process.pid();
     let mut diagnostics = Vec::new();
     // Once the daemon exits its children are launchd's, and nothing names them its own.
     if let Err(error) = watch.follow_forks() {
         diagnostics.push(format!("following the forks of pid {pid} failed: {error}"));
     }
-    let signalled = match process.terminate() {
-        Ok(true) => true,
-        Ok(false) => {
-            diagnostics.push(format!(
+    let (signalled, refused) = match process.terminate() {
+        Ok(true) => (true, None),
+        Ok(false) => (
+            false,
+            Some(format!(
                 "the proven identity of pid {pid} no longer accepts a signal; no SIGTERM was delivered"
-            ));
-            false
-        }
-        Err(error) => {
-            diagnostics.push(format!("sending SIGTERM to pid {pid} failed: {error}"));
-            false
-        }
+            )),
+        ),
+        Err(error) => (
+            false,
+            Some(format!("sending SIGTERM to pid {pid} failed: {error}")),
+        ),
     };
-    let mut stderr = Vec::new();
-    match cleanup().await {
-        Ok(output) => {
-            if !output.status.success() {
-                diagnostics.push(format!("nx daemon --stop ended {}", output.status));
-            }
-            stderr = output.stderr;
-        }
-        Err(error) => diagnostics.push(format!("nx daemon --stop did not run: {error}")),
-    }
     let grace = crate::build_volume::nx::DAEMON_EXIT_GRACE;
     let waited = crate::storage::lifecycle::dispatch_blocking(move || {
         watch
@@ -1148,11 +1135,13 @@ where
             )));
         }
     };
+    if !exited {
+        diagnostics.extend(refused);
+    }
     Ok(OwnedStopOutcome {
         pid,
         exited,
         signalled,
-        stderr,
         diagnostics,
     })
 }
@@ -1980,13 +1969,7 @@ mod tests {
         else {
             panic!("a ledger-proven live daemon is owned");
         };
-        let outcome = stop_owned_daemon(process, watch, || async {
-            std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .output_bounded()
-        })
-        .await
-        .unwrap();
+        let outcome = stop_owned_daemon(process, watch).await.unwrap();
         daemon.wait_bounded().unwrap();
         let outlived = outlived(&worker);
         assert!(outcome.exited, "the daemon exits: {outcome:?}");
@@ -1997,11 +1980,11 @@ mod tests {
         );
     }
 
-    /// A landing daemon's stop is bounded by the daemon's exit within the shared grace, never by a
-    /// command run beside it. A batch land on 2026-11-10 spent 259 s in `stop-landing-nx`:
+    /// A landing daemon's stop is bounded by the daemon's exit within the shared grace: it runs no
+    /// command beside the signal. A batch land on 2026-11-10 spent 259 s in `stop-landing-nx`:
     /// its `nx daemon --stop` entered the shed's shell through `direnv exec`, whose cold
     /// `devenv direnv-export` waited on the Nix daemon, for a daemon already gone. The stop here
-    /// meets a shell that never answers, and still ends within the grace with the daemon exited.
+    /// ends within the grace with the daemon exited.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn stopping_an_owned_daemon_ends_within_its_exit_grace() {
@@ -2020,13 +2003,7 @@ mod tests {
         };
         let grace = crate::build_volume::nx::DAEMON_EXIT_GRACE;
         let started = std::time::Instant::now();
-        let stopped = tokio::time::timeout(
-            grace,
-            stop_owned_daemon(process, watch, || {
-                std::future::pending::<std::io::Result<std::process::Output>>()
-            }),
-        )
-        .await;
+        let stopped = tokio::time::timeout(grace, stop_owned_daemon(process, watch)).await;
         let elapsed = started.elapsed();
         daemon.wait_bounded().unwrap();
         let outlived = outlived(&worker);
@@ -2147,7 +2124,7 @@ mod tests {
 
     /// The race the ledger must win: the plan proves the owned leader, the record is then rewritten
     /// to name a settled foreign sandboxed process the ledger never named, and the real stop runs.
-    /// The owned process exits, the foreign process stays alive, and the cleanup touches neither.
+    /// The owned process exits and the foreign process stays alive.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_record_rewritten_to_a_foreign_pid_after_the_plan_cannot_redirect_the_stop() {
@@ -2170,13 +2147,7 @@ mod tests {
         let forged = scratch.join("forged.json");
         write_record(&forged, foreign.id(), &scratch.join("refusing.sock"));
         std::fs::rename(&forged, &record).unwrap();
-        let outcome = stop_owned_daemon(process, watch, || async {
-            std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .output_bounded()
-        })
-        .await
-        .unwrap();
+        let outcome = stop_owned_daemon(process, watch).await.unwrap();
         let owned_exited = owned.try_wait().unwrap().is_some();
         if !owned_exited {
             owned.kill().unwrap();
@@ -2437,11 +2408,7 @@ mod tests {
         line.clear();
         stdout.read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "EXECUTED");
-        let outcome = stop_owned_daemon(process, watch, || async {
-            std::process::Command::new("/bin/true").output_bounded()
-        })
-        .await
-        .unwrap();
+        let outcome = stop_owned_daemon(process, watch).await.unwrap();
         let alive = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait_bounded().unwrap();
@@ -2463,9 +2430,7 @@ mod tests {
 /// pids, so the kernel's own refusal is part of each proof.
 #[cfg(all(test, target_os = "macos"))]
 mod lifecycle_authority_tests {
-    use cowshed_os::test_backstop::{
-        AsyncCommandBackstop as _, ChildBackstop as _, CommandBackstop as _,
-    };
+    use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
     use std::os::unix::process::CommandExt as _;
 
     use super::*;
@@ -2525,7 +2490,7 @@ mod lifecycle_authority_tests {
     }
 
     #[tokio::test]
-    async fn an_owned_daemon_refuses_a_sandboxed_signal_and_a_failed_cleanup_never_aborts() {
+    async fn an_owned_daemon_refuses_a_sandboxed_signal_and_stops_on_the_controllers_sigterm() {
         let scratch = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
             "nx-daemon-owned-stop",
@@ -2556,20 +2521,12 @@ mod lifecycle_authority_tests {
             panic!("still running");
         };
 
-        let outcome = stop_owned_daemon(process, watch, || async {
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.args(["-c", "exit 17"]);
-            command.output_bounded().await
-        })
-        .await
-        .expect("a failed cleanup is a diagnostic, never an error");
+        let outcome = stop_owned_daemon(process, watch)
+            .await
+            .expect("the controller stops its owned process");
         assert!(
-            outcome.exited,
+            outcome.signalled && outcome.exited,
             "the owned process exited on the controller's SIGTERM: {outcome:?}"
-        );
-        assert!(
-            outcome.diagnostics.iter().any(|line| line.contains("17")),
-            "the failed cleanup is reported: {outcome:?}"
         );
         child.wait_bounded().expect("reap the stopped process");
     }
@@ -2750,16 +2707,36 @@ mod lifecycle_authority_tests {
         let Err(watch) = watch.await_exit(Duration::ZERO).expect("the watch answers") else {
             panic!("the sandboxed stop signalled nothing");
         };
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("the daemon's record"))
+                .expect("the record parses");
+        let socket = PathBuf::from(
+            recorded["socketPath"]
+                .as_str()
+                .expect("the record names its socket"),
+        );
+        assert!(
+            socket.exists(),
+            "the live daemon's socket {}",
+            socket.display()
+        );
 
-        let outcome = stop_owned_daemon(process, watch, || async {
-            let mut command = tokio::process::Command::from(sandboxed_nx_stop(&root, &node, &nx));
-            command.output_bounded().await
-        })
-        .await
-        .expect("the controller stops its owned daemon");
+        let outcome = stop_owned_daemon(process, watch)
+            .await
+            .expect("the controller stops its owned daemon");
         assert!(
             outcome.exited,
             "the exact-identity SIGTERM ended the real daemon: {outcome:?}"
+        );
+        // What `nx daemon --stop` would still have cleaned, the daemon's SIGTERM handler did.
+        assert!(
+            !record_path.exists(),
+            "the stopped daemon deleted its record"
+        );
+        assert!(
+            !socket.exists(),
+            "the stopped daemon closed its socket {}",
+            socket.display()
         );
         daemon.wait_bounded().expect("reap the real daemon");
     }

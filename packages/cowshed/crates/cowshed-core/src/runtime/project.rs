@@ -6077,22 +6077,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         };
         // Step 4, controller-owned (16_build_volumes.md, Land 4). Each landing Nx daemon's plan is
         // read from the trusted ledger before the supervisor retires: the record only nominates a
-        // pid, and only a ledger-proven process of the job is ever signalled. The sandbox is taken
-        // here too, for the socket-cleanup job that follows the signal.
-        let current = self.current(workspace).await?;
-        let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let sandbox = supervisor_sandbox(
-            &self.home,
-            &self.program_directories,
-            &self.layout,
-            &self.telemetry_root,
-            &current,
-            &grants,
-            landing.to_owned(),
-            main_mount,
-            volumes.layout.grant(workspace, landing)?,
-        )?;
+        // pid, and only a ledger-proven process of the job is ever signalled. The stop runs no Nx
+        // command: a one-shot `nx daemon --stop` would enter the shed's shell, whose activation
+        // held a land 259 s on 2026-11-10 for a daemon already gone.
         let ledger =
             crate::runtime::job_groups::ledger_path(&super::supervisor_socket::socket_path(
                 self.descriptor.storage.store(),
@@ -6107,7 +6094,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             let root = landing.join(root);
             let record = crate::capabilities::nx::daemon_record(&root);
             match crate::runtime::nx_daemon::prepare_daemon_stop(&record, &ledger) {
-                Ok(plan) => daemons.push((root, plan)),
+                Ok(plan) => daemons.push(plan),
                 Err(reason) => return Ok(skipped(reason)),
             }
         }
@@ -6119,7 +6106,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             )
             .await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
-        for (root, plan) in daemons {
+        for plan in daemons {
             match plan {
                 crate::runtime::nx_daemon::DaemonStopPlan::NotRunning => {}
                 crate::runtime::nx_daemon::DaemonStopPlan::Unproven { pid, reason } => {
@@ -6134,40 +6121,16 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }));
                 }
                 crate::runtime::nx_daemon::DaemonStopPlan::Owned { process, watch } => {
-                    let outcome =
-                        crate::runtime::nx_daemon::stop_owned_daemon(process, watch, || async {
-                            let (_cancel, cancelled) = tokio::sync::oneshot::channel();
-                            let observed = super::supervisor::JobRunState::default();
-                            timed_async(
-                                "land",
-                                "stop-landing-nx",
-                                super::supervisor::run_as_job(
-                                    &sandbox,
-                                    &landing_owner.incarnation,
-                                    &root,
-                                    vec![
-                                        root.join("node_modules/.bin/nx").into_os_string(),
-                                        "daemon".into(),
-                                        "--stop".into(),
-                                    ],
-                                    super::supervisor::RunControl {
-                                        silence: crate::build_volume::nx::DAEMON_EXIT_GRACE,
-                                        queued: Box::new(|| None),
-                                        cancelled,
-                                        observed: &observed,
-                                    },
-                                ),
-                            )
-                            .await
-                        })
-                        .await?;
+                    let outcome = timed_async(
+                        "land",
+                        "stop-landing-nx",
+                        crate::runtime::nx_daemon::stop_owned_daemon(process, watch),
+                    )
+                    .await?;
                     for diagnostic in &outcome.diagnostics {
                         cowshed_os::eprintln!(
                             "cowshed: the landing workspace's Nx daemon: {diagnostic}"
                         );
-                    }
-                    if !outcome.stderr.is_empty() {
-                        cowshed_os::eprint!("{}", String::from_utf8_lossy(&outcome.stderr));
                     }
                     if !outcome.exited {
                         return Ok(skipped(AdoptionSkip::LandingDaemonStayed {

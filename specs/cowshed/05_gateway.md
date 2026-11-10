@@ -1147,26 +1147,23 @@ the handshake bound.
       `output_by_progress` collects them), its child a member of a source its caller names, which is authoritative for
       every member wherever it was reparented: on Darwin the child leads a process group of its own, which the kernel
       lists (`proc_listpgrppids`); on Linux a cgroup v2 leaf of this run alone that the child enters before it executes:
-      a controller run's (07_api.md "Complete job accounting and observation reconciliation"), or one an after-land job
-      makes for each command inside its own job cgroup, so nothing an earlier command left behind is counted as the next
-      one's or takes its `SIGTERM`. A failure to enter the leaf names it and its `cgroup.procs`. The members are never
-      read by a census of the host. Its progress is its output or CPU advancing among its members: each chunk restarts
-      its silence bound, which its caller names, and once the silence is spent the members' CPU (each one's own and its
-      reaped children's on Darwin, the cgroup's `usage_usec` on Linux) is read and compared with the last reading, so a
-      hook computing in silence keeps it going. A child its caller names as waiting in line behind a live holder is
-      queued, not silent: it keeps waiting, said on stderr. A child that shows none of these for its silence fails
-      `SILENT`, naming its pid, the state the kernel shows it in, the bytes it wrote and every running member by pid,
-      command and state; the members are sent `SIGTERM`, the child reaped within the reap bound and collected later past
-      it. A child that ends its streams is reaped within the reap bound and its status answers. Its callers: a
-      repository mirror's transfers (`clone --mirror` and the `fetch --prune` that updates it), with `--progress`, their
-      output in the mirror's transfer log; workspace git that runs repository-selected merge drivers, filters and hooks
-      (both Darwin's); a project's tool the controller runs outside any job (the land's nx daemon --stop), in a
-      controller run's leaf on Linux; and a declared land's push and after commands, inside their after-land job
-      (02_workspaces.md "A declared land" step 6). Discovery's Cargo instead runs in its canonical workspace job and
+      one an after-land job makes for each command inside its own job cgroup, so nothing an earlier command left behind
+      is counted as the next one's or takes its `SIGTERM`. A failure to enter the leaf names it and its `cgroup.procs`.
+      The members are never read by a census of the host. Its progress is its output or CPU advancing among its members:
+      each chunk restarts its silence bound, which its caller names, and once the silence is spent the members' CPU
+      (each one's own and its reaped children's on Darwin, the cgroup's `usage_usec` on Linux) is read and compared with
+      the last reading, so a hook computing in silence keeps it going. A child its caller names as waiting in line
+      behind a live holder is queued, not silent: it keeps waiting, said on stderr. A child that shows none of these for
+      its silence fails `SILENT`, naming its pid, the state the kernel shows it in, the bytes it wrote and every running
+      member by pid, command and state; the members are sent `SIGTERM`, the child reaped within the reap bound and
+      collected later past it. A child that ends its streams is reaped within the reap bound and its status answers. Its
+      callers: a repository mirror's transfers (`clone --mirror` and the `fetch --prune` that updates it), with
+      `--progress`, their output in the mirror's transfer log; workspace git that runs repository-selected merge
+      drivers, filters and hooks (both Darwin's); and a declared land's push and after commands, inside their after-land
+      job (02_workspaces.md "A declared land" step 6). Discovery's Cargo instead runs in its canonical workspace job and
       applies the same heartbeat silence (15 s, HEARTBEAT_SILENCE) only after its command starts; waiting on shared
       shell activation does not spend it (11_shell.md, "One spare and a SIEVE cache"). Neither query waits on Cargo's
-      package-cache lock, measured, so no holder extends its command silence. nx daemon --stop has the 10 s a stopped
-      daemon gets after SIGTERM (DAEMON_EXIT_GRACE); push and after commands have 180 s.
+      package-cache lock, measured, so no holder extends its command silence. Push and after commands have 180 s.
   - **The gateway's drain reaps its Nx backends within one reap bound.** Once nothing is in flight, the drain sends
     `SIGTERM` to every Nx cache backend it started and waits for all of them within one reap bound
     (`cowshed-os::deadline::reap_async`). The actor is therefore parked at most that long, and the drain ends inside

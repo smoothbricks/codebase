@@ -1295,18 +1295,12 @@ delegation refuses admission with `NotDelegated`, naming the unwritable director
 `cgroup.subtree_control`. A cgroup that cannot be created, or whose `cgroup.kill` cannot be opened, likewise refuses the
 job; there is no uncontained fallback. Changing sessions, including after the parent exits, does not change membership.
 
-A command the controller runs outside any admitted job has a leaf of its own beside the jobs of its class,
-`<class>/run-<incarnation>-<controller pid>-<n>`: discovery's Cargo, which runs while the controller admits a job's
-build state and so before any job of that workspace exists, and the Nx daemon retirement of a landing workspace, which
-runs after its supervisor has stopped. The controller that holds the delegation allocates it (the first `n` its pid has
-not taken), its child enters it before exec, and its membership and CPU are read from it as a job leaf's are
-(`cgroup.procs`, `cpu.stat`), so the run's progress bound (05_gateway.md "Deadlines") sees every member wherever it was
-reparented. Once the run ends the leaf is killed, waited empty within the reap bound and removed; a leaf whose
-controller no longer runs is retired by the next run of its incarnation, and a leaf another run retired first is done,
-not a failure. A census of jobs passes run leaves over. A declared land's after-land job, which runs its push and after
-commands one after another, gives each its own leaf inside its job cgroup (`after-<log>`, 02_workspaces.md "A declared
-land" step 6): the job's cgroup enables no controller for its children, so it holds the job's own process and the leaves
-alike, and a command's leftovers are never counted as the next one's.
+No command the controller runs has a leaf outside an admitted job: discovery's Cargo runs in its canonical workspace job
+(05_gateway.md "Deadlines"), and a landing workspace's Nx daemon is stopped by a `SIGTERM` alone, running no command
+(16_build_volumes.md, Land 4). A declared land's after-land job, which runs its push and after commands one after
+another, gives each its own leaf inside its job cgroup (`after-<log>`, 02_workspaces.md "A declared land" step 6): the
+job's cgroup enables no controller for its children, so it holds the job's own process and the leaves alike, and a
+command's leftovers are never counted as the next one's.
 
 Terminal retirement signals the cgroup's observed members through pidfds, grants TERM one grace deadline, then writes
 `cgroup.kill` if membership remains. The job seals only after `cgroup.events` reads `populated 0`; `poll(POLLPRI)` wakes

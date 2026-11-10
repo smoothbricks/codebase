@@ -18,13 +18,11 @@
 //! <delegated>/controller                                   the controller process itself
 //! <delegated>/<class>/                                     gate, interactive or background
 //! <delegated>/<class>/job-<incarnation>-<id>               one job of one workspace incarnation
-//! <delegated>/<class>/run-<incarnation>-<pid>-<n>          one run its controller (pid) makes
 //! ```
 //!
-//! A run is a command the controller itself runs outside any admitted job: discovery's Cargo, a
-//! landing workspace's Nx daemon retirement after its supervisor stopped ([`RunCgroup`]). Its
-//! leaf gives it the same authoritative membership and CPU as a job's, which a run bounded by its
-//! progress reads (`cowshed_os::deadline::Members::Leaf`).
+//! A command an after-land job runs has a leaf of its own inside that job's cgroup
+//! ([`RunCgroup::inside`]), which gives it the same authoritative membership and CPU as a job's,
+//! read by a run bounded by its progress (`cowshed_os::deadline::Members::Leaf`).
 //!
 //! A job is never given a name or a path to choose: its first process enters its cgroup through a
 //! write end of `cgroup.procs` the controller opened ([`Placement`]), close-on-exec from birth, so
@@ -92,7 +90,6 @@ pub const CONTROLLER_LEAF: &str = "controller";
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 
 const JOB_PREFIX: &str = "job-";
-const RUN_PREFIX: &str = "run-";
 
 /// A cgroup v2 controller job cgroups use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -645,13 +642,6 @@ impl IncarnationCgroups {
                 }
                 let path = entry.path();
                 let name = entry.file_name();
-                if name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(RUN_PREFIX))
-                {
-                    // A run's leaf ([`RunCgroup`]), its controller's: no job of any incarnation.
-                    continue;
-                }
                 let Some(name) = name.to_str().filter(|name| name.starts_with(JOB_PREFIX)) else {
                     return Err(CgroupError::Malformed {
                         path,
@@ -681,64 +671,10 @@ impl IncarnationCgroups {
         identities.sort_by_key(|identity| identity.job_id);
         Ok(identities)
     }
-
-    /// A fresh cgroup leaf for one run of this incarnation's controller, in `class`'s cgroup and
-    /// placed as a job of `class` is: `run-<incarnation>-<this pid>-<n>`, the first `n` not
-    /// taken. A leaf of this incarnation whose controller no longer runs is retired first, within
-    /// `reap`: a controller that died mid-run left it, with whatever its run still held.
-    pub fn run(&self, class: ExecClass, reap: Bound) -> Result<RunCgroup> {
-        let class = ClassCgroup::of(class);
-        let parent = self.root.join(class.name());
-        let own = format!("{RUN_PREFIX}{}-", self.incarnation.as_str());
-        for entry in fs::read_dir(&parent).map_err(failed("readdir", &parent))? {
-            let entry = entry.map_err(failed("readdir", &parent))?;
-            let name = entry.file_name();
-            let Some(controller) = name
-                .to_str()
-                .and_then(|name| run_leaf_controller(name, &self.incarnation))
-            else {
-                continue;
-            };
-            if cowshed_os::process::running(controller).map_err(failed("stat", &entry.path()))? {
-                continue;
-            }
-            match RunCgroup::open(entry.path()) {
-                Ok(stale) => stale.retire(reap)?,
-                // Another run of this incarnation retired it first.
-                Err(CgroupError::Missing { .. }) => {}
-                Err(CgroupError::KillUnavailable { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // SAFETY: getpid takes nothing and cannot fail.
-        let controller = unsafe { libc::getpid() };
-        let mut n = 1_u64;
-        loop {
-            let path = parent.join(format!("{own}{controller}-{n}"));
-            n += 1;
-            if !make_directory(&path)? {
-                continue;
-            }
-            let opened = RunCgroup::open(path.clone()).and_then(|run| {
-                class.place_job(&run.path)?;
-                Ok(run)
-            });
-            return opened.map_err(|admission| match fs::remove_dir(&path) {
-                Ok(()) => admission,
-                Err(source) => CgroupError::AdmissionCleanup {
-                    path,
-                    admission: Box::new(admission),
-                    source,
-                },
-            });
-        }
-    }
 }
 
-/// The cgroup leaf of one run the controller makes outside any admitted job
-/// ([`IncarnationCgroups::run`]): the run's child enters it before it executes, and its
-/// membership and CPU are the leaf's.
+/// The cgroup leaf of one command an after-land job runs ([`RunCgroup::inside`]): the command's
+/// child enters it before it executes, and its membership and CPU are the leaf's.
 #[derive(Debug)]
 pub struct RunCgroup {
     path: PathBuf,
@@ -1582,18 +1518,6 @@ fn finish_cgroup(
     Ok(totals)
 }
 
-/// The pid of the controller whose run leaf `name` is, `run-<incarnation>-<pid>-<n>`, when it is a
-/// well-formed run leaf of `incarnation`.
-fn run_leaf_controller(name: &str, incarnation: &WorkspaceIncarnation) -> Option<libc::pid_t> {
-    let rest = name
-        .strip_prefix(RUN_PREFIX)?
-        .strip_prefix(incarnation.as_str())?
-        .strip_prefix('-')?;
-    let (pid, n) = rest.split_once('-')?;
-    n.parse::<u64>().ok()?;
-    pid.parse().ok()
-}
-
 /// Wait until the kernel reports no live member of the cgroup at `directory` (`path`), for as
 /// long as `remaining` grants (`None` once the wait's deadline has passed); whether membership
 /// emptied. No clock samples the membership: cgroup.events changes wake ppoll(POLLPRI), clipped
@@ -1939,23 +1863,6 @@ fn keyed_counter(path: &Path, text: &str, counter: &'static str) -> Result<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A run leaf names its controller only when it is this incarnation's and well formed.
-    #[test]
-    fn a_run_leaf_names_its_controller_only_for_its_incarnation() {
-        let own =
-            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("an incarnation");
-        let cases = [
-            ("run-0198f2c0b7e34dc795f17b238b331c80-4242-3", Some(4242)),
-            ("run-0198f2c0b7e34dc795f17b238b331c80-4242", None),
-            ("run-0198f2c0b7e34dc795f17b238b331c80-x-3", None),
-            ("run-0298f2c0b7e34dc795f17b238b331c80-4242-3", None),
-            ("job-0198f2c0b7e34dc795f17b238b331c80-7", None),
-        ];
-        for (name, expected) in cases {
-            assert_eq!(run_leaf_controller(name, &own), expected, "{name}");
-        }
-    }
 
     #[test]
     fn the_unified_line_names_the_membership() {
