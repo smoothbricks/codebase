@@ -773,6 +773,39 @@ bin directory present, absent or spelled through the workspace with `..`, an uns
 a child process. In a child whose workspace is a fixture, a bin directory reached through a workspace link and `..` must
 stay, one above the workspace must go while proved absent and stay once a lookup into it is refused (EACCES).
 
+## A run's reservation endpoint is no graph identity
+
+<a id="smoo!n/nx-run-endpoint-graph-identity"></a>A run's `preTasksExecution` publishes the endpoint of its tasks' mbx
+reservations in the environment every task inherits
+(`packages/nx-plugin/src/executors/bounded-exec/mbx-reservations.ts`): `MBX_RESERVATIONS_SOCKET`, a fresh socket
+directory per run, or `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when the endpoint did not start. No plugin reads either.
+Stock Nx 24.0.3 counts both as project-graph identity, so the first request carrying a run's endpoint discarded the
+daemon's graph and built it again: 6.1 to 6.7 s of every dev boot of a consumer ("Graph recompute necessary due to env
+variable refresh. Changed keys: MBX_RESERVATIONS_SOCKET"). `normalizeDaemonEnvironmentForGraph` leaves both out beside
+the package-manager scaffolding above. The daemon and its plugin workers still receive them, and `hashDaemonClientEnv`,
+which keys a plugin's cache, follows the identity.
+
+`packages/nx-plugin/src/nx-run-env-identity.test.ts` requires the installed normalization to give the same identity with
+and without either variable, whatever the socket's path, the daemon's env to still carry the socket, and any other
+variable a client sets to stay identity.
+
+## Sync generators run when a client asks
+
+<a id="smoo!n/nx-sync-generators-run-on-request"></a>Stock Nx 24.0.3's daemon schedules every registered sync generator
+100 ms after each project-graph recomputation (`collectAndScheduleSyncGenerators`, `daemon/server/sync-generators.js`),
+ahead of any request for its changes. A generator is synchronous work on the daemon's one event loop, so the client that
+caused the recomputation waits for it: `@smoothbricks/nx-plugin:managed-files` took 2,372 ms of a consumer's cold
+daemon's first graph request and 70 ms of each later rebuild, while no client asked for its changes in any boot
+(`nx run` collects task generators only and skips sync in CI). The patched daemon still collects the registered
+generators after each recomputation and marks each stale, and runs none. A client that asks (`nx sync`, `nx sync:check`,
+`getCachedSyncGeneratorChanges`) gets each stale generator run then, against the graph current then
+(`getFromCacheOrRunGenerators` runs a generator that is scheduled or not cached), and the result is cached until the
+next recomputation marks it stale again.
+
+`packages/nx-plugin/src/nx-daemon-sync-schedule.test.ts` advances a fake clock a minute past a recomputation and
+requires that no scheduled run asked for the graph, and that the generators `nx.json` registers are still collected for
+the client that asks. Drop the hunk once upstream Nx runs no sync generator unasked.
+
 ## A refused daemon stop is a failure
 
 Stock `DaemonClient.stop` sent SIGTERM to the pid the daemon record names and, whatever the kernel answered other than

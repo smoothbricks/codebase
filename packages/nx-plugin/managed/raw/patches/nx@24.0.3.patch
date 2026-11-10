@@ -972,7 +972,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
 diff --git a/dist/src/daemon/client/daemon-environment.d.ts b/dist/src/daemon/client/daemon-environment.d.ts
-index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..9a68ae94318403ce70aef08f08a3af9cb5cbb6ad 100644
+index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..7e79adfe9efef8a58674757be0380f6e9c34f043 100644
 --- a/dist/src/daemon/client/daemon-environment.d.ts
 +++ b/dist/src/daemon/client/daemon-environment.d.ts
 @@ -3,7 +3,9 @@
@@ -986,7 +986,7 @@ index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..9a68ae94318403ce70aef08f08a3af9c
   */
  export declare function hashDaemonClientEnv(): string;
  export declare function getDaemonEnv(): NodeJS.ProcessEnv & {
-@@ -63,12 +65,28 @@ export declare function getAppliedDaemonClientEnv(): {
+@@ -63,12 +65,32 @@ export declare function getAppliedDaemonClientEnv(): {
   */
  export declare function applyDaemonEnvFromClient(newEnv: NodeJS.ProcessEnv): string[];
  /**
@@ -1016,13 +1016,17 @@ index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..9a68ae94318403ce70aef08f08a3af9c
 + *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
 + *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
 + *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
++ * - A run's mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`, or
++ *   `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when it did not start): the endpoint
++ *   of one Nx run, fresh for each, which every task inherits and no plugin
++ *   reads. It leaves the identity; the daemon still receives it.
 + * The order of the remaining PATH entries is kept. Returns a copy; never
 + * mutates runtime env.
   */
  export declare function normalizeDaemonEnvironmentForGraph(env: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
  export declare function getChangedEnvKeys(before: NodeJS.ProcessEnv, after: NodeJS.ProcessEnv): string[];
 diff --git a/dist/src/daemon/client/daemon-environment.js b/dist/src/daemon/client/daemon-environment.js
-index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b92426e15 100644
+index 427ced7822fb05ba966d0543c224c5760b016572..4f07a52210d000864d12dcc4a5bdff55b5ee5bcb 100644
 --- a/dist/src/daemon/client/daemon-environment.js
 +++ b/dist/src/daemon/client/daemon-environment.js
 @@ -8,7 +8,10 @@ exports.getAppliedDaemonClientEnv = getAppliedDaemonClientEnv;
@@ -1056,10 +1060,20 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
  }
  /**
   * `NX_LOAD_DOT_ENV_FILES` as its meaning rather than its spelling. `run-command`
-@@ -379,36 +384,174 @@ function applyDaemonEnvFromClient(newEnv) {
-     return [...changedKeys];
+@@ -380,35 +385,185 @@ function applyDaemonEnvFromClient(newEnv) {
  }
  const BERRY_BIN_FOLDER_GRAPH_IDENTITY = '<YARN_BERRY_BIN_FOLDER>';
+ /**
+- * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
+- * first on PATH. The wrappers inside are runtime state the daemon and workers
+- * must receive, but the folder's random name is not project-graph identity:
+- * two invocations whose environments differ only by it would compute the same
+- * graph. Strips the folder from PATH and pins the var to a sentinel so such
+- * environments compare equal. Returns a copy; never mutates runtime env.
++ * What a run's task hooks publish for its tasks: the endpoint of the run's mbx
++ * reservations, or why it has none. Fresh for each run, and read by no plugin.
++ */
++const RUN_RESERVATION_ENV = ['MBX_RESERVATIONS_SOCKET', 'BOUNDED_EXEC_RESERVATIONS_UNSERVED'];
 +/** The directory Bun makes for one run when it finds no `node` on PATH. */
 +const BUN_NODE_SHIM = /^bun-node-[0-9a-f]+$/;
 +/** Errors that prove a path names nothing; any other leaves it unknown. */
@@ -1142,13 +1156,7 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
 +    }
 +    return { workspace: locate(workspaceRoot, paths), entries: located, resolvedNode };
 +}
- /**
-- * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
-- * first on PATH. The wrappers inside are runtime state the daemon and workers
-- * must receive, but the folder's random name is not project-graph identity:
-- * two invocations whose environments differ only by it would compute the same
-- * graph. Strips the folder from PATH and pins the var to a sentinel so such
-- * environments compare equal. Returns a copy; never mutates runtime env.
++/**
 + * An env as project-graph identity: the env without what a package manager
 + * adds to run one command in this workspace. The daemon and its workers still
 + * receive all of it, but two clients whose envs differ only by it compute the
@@ -1169,6 +1177,10 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
 + *   `bun-node-<hash>` directory whose `node` is Bun, puts it on PATH and names
 + *   it in NODE; that directory leaves PATH with NODE when its `node` is the one
 + *   PATH resolves. Any other NODE stays, and so does every other PATH entry.
++ * - A run's mbx reservation endpoint (`MBX_RESERVATIONS_SOCKET`, or
++ *   `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when it did not start): the endpoint
++ *   of one Nx run, fresh for each, which every task inherits and no plugin
++ *   reads. It leaves the identity; the daemon still receives it.
 + * The order of the remaining PATH entries is kept. Returns a copy; never
 + * mutates runtime env.
   */
@@ -1191,6 +1203,17 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
 +    if (normalized.BERRY_BIN_FOLDER) {
 +        scaffolding.add(canonicalize(normalized.BERRY_BIN_FOLDER));
 +        normalized.BERRY_BIN_FOLDER = BERRY_BIN_FOLDER_GRAPH_IDENTITY;
+     }
+-    const pathKey = Object.keys(normalized).find((key) => key.toUpperCase() === 'PATH');
+-    if (pathKey && normalized[pathKey]) {
+-        const pathDelimiter = platform === 'win32' ? ';' : ':';
+-        const canonicalize = (value) => {
+-            const withPlatformSeparators = platform === 'win32' ? value.replaceAll('/', '\\') : value;
+-            return platform === 'win32'
+-                ? withPlatformSeparators.toLowerCase()
+-                : withPlatformSeparators;
++    for (const key of RUN_RESERVATION_ENV) {
++        delete normalized[key];
 +    }
 +    if (normalized.NODE && facts.resolvedNode !== undefined) {
 +        const node = canonicalize(normalized.NODE);
@@ -1205,15 +1228,7 @@ index 427ced7822fb05ba966d0543c224c5760b016572..303548db369472e0f99f31c3bc66ae9b
 +            }
 +            delete normalized.NODE;
 +        }
-     }
--    const pathKey = Object.keys(normalized).find((key) => key.toUpperCase() === 'PATH');
--    if (pathKey && normalized[pathKey]) {
--        const pathDelimiter = platform === 'win32' ? ';' : ':';
--        const canonicalize = (value) => {
--            const withPlatformSeparators = platform === 'win32' ? value.replaceAll('/', '\\') : value;
--            return platform === 'win32'
--                ? withPlatformSeparators.toLowerCase()
--                : withPlatformSeparators;
++    }
 +    if (entries.length > 0) {
 +        const within = (path, directory) => path === directory ||
 +            path.startsWith(directory.endsWith(paths.sep) ? directory : directory + paths.sep);
@@ -3012,6 +3027,49 @@ index 3b0c4d67595cbff1d083f21bb6b70abeda8e377e..d87056c79d0097182de7d725a93100ea
          });
          (0, cache_1.deleteDaemonJsonProcessCache)();
          (0, get_plugins_1.cleanupPlugins)();
+diff --git a/dist/src/daemon/server/sync-generators.js b/dist/src/daemon/server/sync-generators.js
+index 731ba638ab39ae3babe35db7d98ee9e66995b62f..78c9296b4322cfd8fc024a8c26aa6fe036b0ff8c 100644
+--- a/dist/src/daemon/server/sync-generators.js
++++ b/dist/src/daemon/server/sync-generators.js
+@@ -90,31 +90,13 @@ function collectAndScheduleSyncGenerators(projectGraph) {
+         scheduledGenerators.add(generator);
+     }
+     log('scheduling:', [...scheduledGenerators]);
+-    if (scheduledTimeoutId) {
+-        // we have a scheduled run already, so we don't need to do anything
+-        return;
+-    }
+-    scheduledTimeoutId = setTimeout(async () => {
+-        scheduledTimeoutId = undefined;
+-        if (waitPeriod < 4000) {
+-            waitPeriod = waitPeriod * 2;
+-        }
+-        if (scheduledGenerators.size === 0) {
+-            // no generators to run
+-            return;
+-        }
+-        // Fetch the latest graph instead of using the captured one which might be stale
+-        const { projectGraph: latestGraph, error } = await (0, project_graph_incremental_recomputation_1.getCachedSerializedProjectGraphPromise)();
+-        if (!latestGraph || error) {
+-            log('Cannot run scheduled generators: graph unavailable or errored');
+-            return;
+-        }
+-        const { projects } = (0, project_graph_1.readProjectsConfigurationFromProjectGraph)(latestGraph);
+-        for (const generator of scheduledGenerators) {
+-            syncGeneratorsCacheResultPromises.set(generator, runGenerator(generator, projects));
+-        }
+-        await Promise.all(syncGeneratorsCacheResultPromises.values());
+-    }, waitPeriod);
++    // Nothing runs here. A generator left in `scheduledGenerators` is stale, and
++    // runs when a client asks for its changes (getFromCacheOrRunGenerators) against
++    // the graph that is current then. Running each one 100 ms after every graph
++    // recomputation put its synchronous work on the daemon's one event loop while
++    // the client that caused the recomputation waited for its graph: 2.4 s of a cold
++    // daemon's first project graph for `managed-files`, in a workspace whose clients
++    // never ask for its sync changes.
+ }
+ async function getCachedRegisteredSyncGenerators() {
+     log('get registered sync generators');
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
 index fb36b09efa216204d5148f5e6c1fc68f462a4929..ad6409689f42cd37e00acb2488972005a9d9f667 100644
 --- a/dist/src/daemon/socket-utils.d.ts
