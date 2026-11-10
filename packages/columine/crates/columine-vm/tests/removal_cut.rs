@@ -898,11 +898,14 @@ fn run_delta(vm: &mut Vm, state: &mut [u8], program: &[u8], batch: &Batch) -> u3
 
 /// The image as a later batch reads it: sealed, so every struct map and every
 /// TTL eviction index holds canonical bytes, with the per-batch change flags
-/// cleared.
+/// and the write sequences cleared: a sequence counts writes, and a removal
+/// cut skips in one batch rows that a batch per row writes and removes.
 fn settled(vm: &mut Vm, mut state: Vec<u8>) -> Vec<u8> {
     vm.seal_state(&mut state, &NoStrings).expect("seal");
     for slot in 0..state_num_slots(&state) {
-        state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+        let meta = slot_meta_base(slot) as usize;
+        state[meta + SlotMetaOffset::CHANGE_FLAGS as usize] = 0;
+        state[meta + SlotMetaOffset::WRITE_SEQ as usize..][..8].fill(0);
     }
     state
 }

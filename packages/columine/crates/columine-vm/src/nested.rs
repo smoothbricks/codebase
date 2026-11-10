@@ -320,8 +320,9 @@ pub struct NestedScratch {
 }
 
 /// Most ranges a plan that does not rehash can push: an outer insert pushes its
-/// key, size, inner header, entry, arena usage, outer pointer and change flag.
-const PLAIN_PLAN_RANGES: usize = 7;
+/// key, size, inner header, entry, arena usage, outer pointer, change flag and
+/// write sequence.
+const PLAIN_PLAN_RANGES: usize = 8;
 
 /// The largest inner-table rehash one batch or call can plan: from
 /// `old_cap` cells into `grown_cap` cells. Zero when no rehash is possible.
@@ -360,11 +361,11 @@ impl NestedScratch {
     }
 
     /// Admit a rehash from `old_cap` cells into `grown_cap` cells. The whole
-    /// plan pushes at most `old_cap + 8` ranges: four before this point, three
+    /// plan pushes at most `old_cap + 9` ranges: four before this point, four
     /// finishing ranges, and one run per destination, of which there are at
     /// most `old_cap + 1`.
     fn admit_rehash(&mut self, old_cap: u32, grown_cap: u32) -> Result<(), ErrorCode> {
-        self.admit_ranges(old_cap as usize + 8)?;
+        self.admit_ranges(old_cap as usize + 9)?;
         reserve_cleared(&mut self.placements, old_cap as usize + 1)?;
         reserve_cleared(&mut self.occupied, grown_cap as usize)?;
         self.check_sealed();
@@ -386,7 +387,7 @@ impl NestedScratch {
     pub(crate) fn reserve_for(&mut self, demand: NestedPlanDemand) -> Result<(), ErrorCode> {
         let old = usize::try_from(demand.old_cap).map_err(|_| ErrorCode::OutOfMemory)?;
         let grown = usize::try_from(demand.grown_cap).map_err(|_| ErrorCode::OutOfMemory)?;
-        let rehash_ranges = old.checked_add(8).ok_or(ErrorCode::OutOfMemory)?;
+        let rehash_ranges = old.checked_add(9).ok_or(ErrorCode::OutOfMemory)?;
         reserve_cleared(&mut self.ranges, PLAIN_PLAN_RANGES.max(rehash_ranges))?;
         if old > 0 {
             let destinations = old.checked_add(1).ok_or(ErrorCode::OutOfMemory)?;
@@ -669,7 +670,7 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
             },
         }
         if self.flags != 0 {
-            self.meta.set_change_flag(state, self.flags);
+            self.meta.mark(state, self.flags);
         }
         (state, &self.scratch.ranges)
     }
@@ -760,10 +761,9 @@ fn finish_plan(plan: &mut NestedMutation<'_, '_>) {
         plan.push_range(plan.outer.ptrs_off + plan.outer_pos * 4, 4);
     }
     if plan.flags != 0 {
-        plan.push_range(
-            plan.meta.meta_base + columine_types::types::SlotMetaOffset::CHANGE_FLAGS,
-            1,
-        );
+        for (offset, len) in crate::meta::mark_ranges(plan.meta.meta_base) {
+            plan.push_range(offset, len);
+        }
     }
 }
 

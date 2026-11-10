@@ -344,7 +344,7 @@ impl StateFlags {
     pub const HAS_RETE: u8 = 0x01;
 }
 
-pub const SLOT_META_SIZE: u32 = 48;
+pub const SLOT_META_SIZE: u32 = 56;
 
 pub struct SlotMetaOffset;
 
@@ -375,6 +375,11 @@ impl SlotMetaOffset {
     /// byte 19 free; the slot's `TYPE_FLAGS` byte stores its flags without
     /// these bits, so no TTL reader mistakes them for TTL flags.
     pub const STRUCT_KEY_LANES: u32 = 19;
+    /// Every slot: its write sequence, a little-endian `u64` that every
+    /// flagging write advances by one ([`SLOT_META_SIZE`] bytes 48..56;
+    /// `specs/columine/07-change-feed.md` §6). Init writes 0, growth copies
+    /// it, nothing clears it.
+    pub const WRITE_SEQ: u32 = 48;
 }
 
 /// Bytecode encoding for duration units from the Ax expression language. The

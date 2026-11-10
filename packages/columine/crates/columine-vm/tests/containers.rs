@@ -5,7 +5,7 @@
 //! of the contract. Assertions pin insertion, lookup, size, and placement.
 
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, PROGRAM_FORMAT_VERSION, STATE_FORMAT_VERSION,
+    ChangeFlag, EMPTY_KEY, ErrorCode, PROGRAM_FORMAT_VERSION, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, TOMBSTONE,
     hash_key,
 };
@@ -131,7 +131,7 @@ fn allocations_during<T>(run: impl FnOnce() -> T) -> (T, usize) {
 // slot-metadata record, and slot data immediately after it.
 // ---------------------------------------------------------------------------
 
-const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // SLOT_META_SIZE
+const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + SLOT_META_SIZE;
 
 fn mk_slot_state(cap: u32, type_flags_byte: u8) -> Vec<u8> {
     let mut state = vec![0u8; 8192usize.max((SLOT_OFFSET + cap * 32) as usize)];
@@ -1663,7 +1663,7 @@ fn map_tombstone_insert_and_unused_allocated_aux_restore_exact_images() {
         }
         cmp_lane_fill(&mut state, 16, f64::NEG_INFINITY.to_bits());
         table.set_key_at(&mut state, 15, TOMBSTONE);
-        meta.set_change_flag(&mut state, ChangeFlag::REMOVED);
+        meta.mark(&mut state, ChangeFlag::REMOVED);
         let before = state.clone();
         let mut vm = Vm::default();
         vm.undo_enable(&state)
@@ -1745,7 +1745,7 @@ fn wrapped_map_delete_restores_shifted_lanes_and_tail_at_nested_savepoints() {
             ),
             ErrorCode::Ok,
         );
-        meta.set_change_flag(&mut state, ChangeFlag::UPDATED);
+        meta.mark(&mut state, ChangeFlag::UPDATED);
         let before = state.clone();
         vm.undo_enable(&state)
             .expect("begin valid speculation window");
@@ -1784,7 +1784,7 @@ fn set_collision_wrap_insert_delete_restores_tombstones_and_flags() {
         let meta = meta_of(&state);
         let table = bind_slot_set(&meta);
         table.set_key_at(&mut state, 15, TOMBSTONE);
-        meta.set_change_flag(&mut state, ChangeFlag::UPDATED);
+        meta.mark(&mut state, ChangeFlag::UPDATED);
         let before = state.clone();
         let mut vm = Vm::default();
         vm.undo_enable(&state)
@@ -2136,7 +2136,7 @@ fn public_vm_mutations_own_change_flags_once_without_raw_context_access() {
             if is_map {
                 cmp_lane_fill(&mut state, 16, f64::NEG_INFINITY.to_bits());
             }
-            meta.set_change_flag(&mut state, ChangeFlag::REMOVED);
+            meta.mark(&mut state, ChangeFlag::REMOVED);
             let before = state.clone();
             let mut vm = Vm::default();
             vm.undo_enable(&state)
@@ -2158,8 +2158,8 @@ fn public_vm_mutations_own_change_flags_once_without_raw_context_access() {
             assert_eq!(result, ErrorCode::Ok);
             assert_eq!(
                 vm.undo_checkpoint(),
-                if is_map { 4 } else { 3 },
-                "one physical flag owner"
+                if is_map { 5 } else { 4 },
+                "one physical flag and sequence owner"
             );
             assert_eq!(
                 meta.change_flags(&state),
@@ -3036,23 +3036,24 @@ fn public_physical_capture_finishes_on_error_return_and_owns_flags_once() {
     for delta in [false, true] {
         let mut state = mk_slot_state(16, 0x00);
         let meta = meta_of(&state);
-        let flag = meta.meta_base + SlotMetaOffset::CHANGE_FLAGS;
+
         let value = meta.offset + meta.capacity * 4;
-        let ranges = [(flag, 1), (value, 4)];
+        let [flag_range, seq_range] = columine_vm::meta::mark_ranges(meta.meta_base);
+        let ranges = [flag_range, seq_range, (value, 4)];
         let before = state.clone();
         let mut vm = Vm::default();
         vm.undo_enable(&state)
             .expect("begin valid speculation window");
         let result = vm.capture_mutation(delta, &mut state, &ranges, |state| {
-            meta.set_change_flag(state, ChangeFlag::UPDATED);
+            meta.mark(state, ChangeFlag::UPDATED);
             bytes::write_u32(state, value, 123);
             Err::<(), _>(ErrorCode::CapacityExceeded)
         });
         assert_eq!(result, Ok(Err(ErrorCode::CapacityExceeded)));
         assert_eq!(
             vm.undo_checkpoint(),
-            2,
-            "one record per changed range and no duplicate flag"
+            3,
+            "one record per changed range and no duplicate flag or sequence"
         );
         if delta {
             assert_exported_images(&mut vm, 0, &before, &state);

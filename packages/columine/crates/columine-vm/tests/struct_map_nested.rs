@@ -6,7 +6,7 @@
 //! tests use a deterministic LCG because the random stream is not contract.
 
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_MAGIC, STATE_FORMAT_VERSION,
+    ChangeFlag, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType,
     TOMBSTONE, hash_key, struct_field_size,
 };
@@ -33,7 +33,7 @@ use proptest::prelude::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // one 48-byte slot-meta record
+const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + SLOT_META_SIZE;
 
 /// Second key lane used by every exact-pair table in the differentials. Lane 2
 /// is held constant so the pair table answers the same membership question as

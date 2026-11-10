@@ -5,8 +5,8 @@
 
 use columine_types::types::{
     DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
-    PROGRAM_MAGIC, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
-    StateHeaderOffset,
+    PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset,
 };
 use columine_vm::bytes;
 use columine_vm::hashmap_ops::{CmpType, Strategy, bind_slot_map};
@@ -23,7 +23,7 @@ use proptest::prelude::*;
 use proptest::strategy::Strategy as PropStrategy;
 use std::collections::{BTreeMap, BTreeSet};
 
-const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48;
+const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + SLOT_META_SIZE;
 
 fn mk_slot_state(cap: u32, kind: SlotType) -> Vec<u8> {
     let mut state = vec![0xa5; 4096];

@@ -1598,11 +1598,12 @@ fn element_upsert_arms_overflow_lands_and_rolls_back_byte_exact() {
                 vm.undo_enable(&state).expect("undo window opens");
                 let initial = state.clone();
 
-                // Four records of room remain. The root boundary reserves
-                // slots + derived flag (3) and is admitted; the family's first
-                // capture then exhausts the budget. The shadow takes the image
-                // before that write, and the write lands unrecorded.
-                fill_element_journal(&mut vm, &mut state, &count, delta, 4);
+                // Five records of room remain. The root boundary reserves each
+                // slot's flag and write sequence and the derived flag (5) and
+                // is admitted; the family's first capture then exhausts the
+                // budget. The shadow takes the image before that write, and
+                // the write lands unrecorded.
+                fill_element_journal(&mut vm, &mut state, &count, delta, 5);
                 let checkpoint = vm.undo_checkpoint();
                 let before = state.clone();
 
@@ -1740,8 +1741,9 @@ fn nested_element_journal_overflow_lands_whole_batch_and_rolls_back_exactly() {
             let mut vm = Vm::default();
             vm.undo_enable(&state).expect("undo window opens");
             let initial = state.clone();
-            // The real COUNT reducer leaves the window 96 records short of its end.
-            fill_element_journal(&mut vm, &mut state, &count_prog, delta, 96);
+            // The real COUNT reducer leaves the window 97 records short of its
+            // end: each COUNT batch journals its value and write sequence.
+            fill_element_journal(&mut vm, &mut state, &count_prog, delta, 97);
             let before = state.clone();
             let checkpoint = vm.undo_checkpoint();
 

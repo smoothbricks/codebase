@@ -715,7 +715,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     // refused where the image enters the VM, never read as absence.
     for (const slot of [0, 1, 2]) {
       const malformed = committed.slice();
-      new DataView(malformed.buffer).setUint32(32 + slot * 48 + 4, 3, true);
+      new DataView(malformed.buffer).setUint32(32 + slot * 56 + 4, 3, true);
       expect(() => backend.deserialize(reducer, malformed)).toThrow(VmStateAdmissionError);
     }
     expect(() => backend.deserialize(reducer, committed.slice(0, -1))).toThrow(VmStateAdmissionError);
@@ -825,17 +825,18 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         const initial = new Uint8Array(memory.buffer, statePtr, size).slice();
         expect(invoke(exports, 'vm_undo_enable', statePtr, size)).toBe(ErrorCode.OK);
         // A COUNT batch folds all its rows into one accumulated journal record (one batched fill measured checkpoint 3,
-        // not 16288), so the filler is successive one-row executions; each success's journal progress is measured, never assumed.
+        // not 16287), so the filler is successive one-row executions; each success's journal progress is measured, never assumed.
+        // Each journals the COUNT value and the slot's write sequence: two records, so the end is odd.
         const oneRow = [new Uint32Array([typeId])];
         let checkpoint = invoke(exports, 'vm_undo_checkpoint', statePtr);
-        while (checkpoint < 16384 - 96) {
+        while (checkpoint < 16384 - 97) {
           expect(execute(fillProgram, oneRow, 1)).toBe(ErrorCode.OK);
           const next = invoke(exports, 'vm_undo_checkpoint', statePtr);
           expect(next).toBeGreaterThan(checkpoint);
-          expect(next).toBeLessThanOrEqual(16384 - 96);
+          expect(next).toBeLessThanOrEqual(16384 - 97);
           checkpoint = next;
         }
-        expect(checkpoint).toBe(16384 - 96);
+        expect(checkpoint).toBe(16384 - 97);
         const before = new Uint8Array(memory.buffer, statePtr, size).slice();
         const keys = Uint32Array.from({ length: 128 }, (_, i) => i + 1);
         const values = Uint32Array.from(keys, (key) => key * 10);

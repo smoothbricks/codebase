@@ -38,7 +38,7 @@ use crate::bitmap_ttl::{TtlAlgebraDemand, TtlAlgebraScratch, merge_expiries};
 use crate::change_feed::Change;
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks};
 use crate::key_index::{HashIndex, Key, KeyIndex};
-use crate::meta::SlotMetaView;
+use crate::meta::{SlotMetaView, mark_ranges};
 use crate::state_init::bind_slot_in;
 use crate::ttl_plan::TtlBatchPlan;
 use bitmosaic::{
@@ -257,7 +257,7 @@ impl BitmapEnv {
 
     /// Back every buffer the patches `demand` bounds can fill: the value and
     /// witness buffers, the capture ranges (one run per old payload word and
-    /// eight per touched chunk, then the tail, size, flag and two TTL
+    /// eight per touched chunk, then the tail, size, flag, write sequence and two TTL
     /// ranges), the kernel's patch scratch and the TTL algebra merge.
     /// Capacity already held is kept.
     pub(crate) fn reserve_for(&mut self, demand: BitmapPatchDemand) -> Result<(), ErrorCode> {
@@ -270,7 +270,7 @@ impl BitmapEnv {
         hold(&mut self.removes_held, planes)?;
         let ranges = (demand.image_bytes / 8)
             .saturating_add(demand.touches.saturating_mul(8))
-            .saturating_add(6);
+            .saturating_add(7);
         hold(&mut self.capture_ranges, ranges)?;
         backed(&mut self.scratch)?
             .try_reserve_for(demand.image_bytes, demand.touches)
@@ -519,7 +519,7 @@ fn capture_bitmap_patch(
     // The shared owner filters this byte when an enclosing boundary owns it;
     // a direct container caller without that boundary still journals flags.
     env.capture_ranges
-        .push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+        .extend_from_slice(&mark_ranges(meta.meta_base));
     let ttl_plan = match ttl_capture {
         BitmapTtlCapture::Unchanged => None,
         BitmapTtlCapture::Prepared(plan) => Some(plan),
@@ -641,7 +641,7 @@ pub fn batch_bitmap_add(
         };
         meta.set_size(state, cardinality + report.added);
         if report.added > 0 {
-            meta.set_change_flag(state, ChangeFlag::INSERTED);
+            meta.mark(state, ChangeFlag::INSERTED);
         }
         finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
         if report.added > 0 && hooks.feed_records(meta.slot()) {
@@ -735,7 +735,7 @@ pub fn batch_bitmap_add(
     };
     meta.set_size(state, cardinality + report.added);
     if report.added > 0 {
-        meta.set_change_flag(state, ChangeFlag::INSERTED);
+        meta.mark(state, ChangeFlag::INSERTED);
     }
     finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
     if report.added > 0 && hooks.feed_records(meta.slot()) {
@@ -808,7 +808,7 @@ pub fn batch_bitmap_remove(
     env.removes = removes;
     meta.set_size(state, cardinality - report.removed);
     if report.removed > 0 {
-        meta.set_change_flag(state, ChangeFlag::REMOVED);
+        meta.mark(state, ChangeFlag::REMOVED);
     }
     finish_bitmap_mutations(env, hooks, delta_mode, state, meta, capture, ttl_plan);
     if report.removed > 0 && hooks.feed_records(meta.slot()) {
@@ -1100,11 +1100,18 @@ pub fn batch_bitmap_algebra_in<I: KeyIndex>(
     // the retained kernel report is a consistency check, not new admission.
     debug_assert_eq!(report.len, u64::from(new_card));
     target_meta.set_size(state, new_card);
-    if new_card != original_size {
-        target_meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
-    }
-    if expiry_changed {
-        target_meta.set_change_flag(state, ChangeFlag::UPDATED);
+    // One write: the size and expiry flags it sets mark the slot once.
+    let flag = if new_card == original_size {
+        0
+    } else {
+        ChangeFlag::SIZE_CHANGED
+    } | if expiry_changed {
+        ChangeFlag::UPDATED
+    } else {
+        0
+    };
+    if flag != 0 {
+        target_meta.mark(state, flag);
     }
     finish_bitmap_mutations(
         env,
@@ -1127,7 +1134,8 @@ pub fn batch_bitmap_algebra_in<I: KeyIndex>(
 /// Elias-Fano root is re-encoded as the forest the slot keeps. The canonical
 /// empty image is the empty set; zero-length bytes are no native encoding
 /// and are refused. An import names no key: an armed change feed tracking
-/// the slot treats it as changed whole.
+/// the slot treats it as changed whole. It advances the slot's write sequence
+/// without a change flag (`specs/columine/07-change-feed.md` §4).
 pub fn bitmap_import(
     env: &mut BitmapEnv,
     hooks: &mut impl VmHooks,
@@ -1169,6 +1177,8 @@ pub fn bitmap_import(
     };
     slot[written..].fill(0);
     meta.set_size(state, card);
+    // Unjournaled like its payload; it sets no flag (§4).
+    meta.mark(state, 0);
     if hooks.feed_records(meta.slot()) {
         hooks.feed_changed_whole(meta.slot());
     }

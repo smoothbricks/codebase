@@ -464,7 +464,7 @@ fn payload_free_graph_edges_and_unary_layout_remain_supported() {
     assert!(unary_slot.find(&unary, 7).is_some());
     let meta_type = unary[(STATE_HEADER_SIZE + SlotMetaOffset::TYPE_FLAGS) as usize] & 0x0f;
     assert_eq!(meta_type, SlotType::StructMap as u8);
-    assert_eq!(SLOT_META_SIZE, 48);
+    assert_eq!(SLOT_META_SIZE, 56);
 }
 
 #[test]

@@ -40,7 +40,7 @@ import { align8, loadWasmBytes, WasmHostRegion } from './wasm-memory-contract.js
 // `crates/columine-types/tests/typescript_abi.rs` rather than silently
 // misreading a state blob here.
 const STATE_HEADER_SIZE = 32;
-const SLOT_META_SIZE = 48;
+const SLOT_META_SIZE = 56;
 const SLOT_META_TYPE_FLAGS_OFFSET = 12;
 const SLOT_META_EVICTED_BUFFER_OFFSET = 36;
 const SLOT_META_EVICTED_COUNT_OFFSET = 40;

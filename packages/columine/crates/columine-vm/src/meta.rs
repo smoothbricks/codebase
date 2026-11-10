@@ -14,11 +14,32 @@ pub const fn slot_meta_base(slot: u32) -> u32 {
     STATE_HEADER_SIZE + slot * SLOT_META_SIZE
 }
 
+/// [`SlotMetaView::mark`] for a write that holds its slot's metadata base,
+/// not a view.
+#[inline(always)]
+pub fn mark_meta(state: &mut [u8], meta_base: u32, flag: u8) {
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= flag;
+    let seq = meta_base + SlotMetaOffset::WRITE_SEQ;
+    bytes::write_u64(state, seq, bytes::read_u64(state, seq) + 1);
+}
+
+/// The bytes [`mark_meta`] writes for the slot at `meta_base`: its
+/// change-flag byte and its write sequence. A capture of a write that marks
+/// its slot names both; a change-flag boundary that owns the flags owns
+/// both, and filters them from the captures it encloses.
+#[inline(always)]
+pub const fn mark_ranges(meta_base: u32) -> [(u32, u32); 2] {
+    [
+        (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+        (meta_base + SlotMetaOffset::WRITE_SEQ, 8),
+    ]
+}
+
 /// Transient view of one slot's metadata, carrying values and writable-field
 /// offsets. Constructed per operation and never stored.
 #[derive(Clone, Copy, Debug)]
 pub struct SlotMetaView {
-    /// Byte offset of this slot's 48-byte metadata record.
+    /// Byte offset of this slot's 56-byte metadata record.
     pub meta_base: u32,
     /// Data-region offset (`SlotMetaOffset::OFFSET`).
     pub offset: u32,
@@ -85,11 +106,20 @@ impl SlotMetaView {
         bytes::write_u32(state, self.meta_base + SlotMetaOffset::SIZE, value);
     }
 
-    /// OR one `ChangeFlag` bit into the slot's change-flags byte.
+    /// Mark one write of this slot: OR `flag` into its change flags and
+    /// advance its write sequence by one, the one writer of both
+    /// (`specs/columine/07-change-feed.md` §6). A `flag` of 0 advances the
+    /// sequence alone: a bitmap import (§4). The caller's capture names
+    /// [`mark_ranges`] beside the bytes it writes.
     #[inline(always)]
-    pub fn set_change_flag(&self, state: &mut [u8], flag: u8) {
-        let off = (self.meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize;
-        state[off] |= flag;
+    pub fn mark(&self, state: &mut [u8], flag: u8) {
+        mark_meta(state, self.meta_base, flag);
+    }
+
+    /// The slot's write sequence.
+    #[inline(always)]
+    pub fn write_seq(&self, state: &[u8]) -> u64 {
+        bytes::read_u64(state, self.meta_base + SlotMetaOffset::WRITE_SEQ)
     }
 
     /// Convenience for tests and TTL paths.
@@ -166,22 +196,5 @@ impl SlotMetaView {
 
     pub fn has_evict_trigger(&self) -> bool {
         self.type_flags.has_evict_trigger()
-    }
-}
-
-/// Change-flag bits one batch kernel has already set on its slot. Nothing
-/// clears a flag inside a batch, so each bit is written once per batch and
-/// rows carry no read-modify-write chain through the same flag byte.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct BatchFlags(u8);
-
-impl BatchFlags {
-    /// OR `flag` into the slot's change flags unless this batch already did.
-    #[inline(always)]
-    pub(crate) fn set(&mut self, state: &mut [u8], meta: &SlotMetaView, flag: u8) {
-        if self.0 & flag != flag {
-            meta.set_change_flag(state, flag);
-            self.0 |= flag;
-        }
     }
 }

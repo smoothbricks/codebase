@@ -17,7 +17,7 @@ use crate::change_feed::Change;
 use crate::hash_table::{ENTRY_U32, ErasePlan, EraseRanges, FlatTable};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
 use crate::key_index::Key;
-use crate::meta::{BatchFlags, SlotMetaView};
+use crate::meta::{SlotMetaView, mark_ranges};
 use crate::removal_cut::{CutKey, SlotCuts};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset};
 
@@ -181,7 +181,6 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     let tbl = bind_slot_map(meta);
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
-    let mut flags = BatchFlags::default();
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
@@ -253,6 +252,7 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         } else {
             match hooks.begin_capture(state, || {
                 let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+                let [flag, seq] = mark_ranges(meta.meta_base);
                 [
                     (
                         tbl.keys_off + probe.pos * 4,
@@ -265,7 +265,8 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
                         (0, 0)
                     },
                     (tbl.size_off, if probe.found { 0 } else { 4 }),
-                    (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                    flag,
+                    seq,
                     ttl[0],
                     ttl[1],
                 ]
@@ -274,9 +275,9 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
                 Err(error) => return error,
             }
         };
-        // The prior value the change feed names; an equal rewrite changes
-        // nothing a rule binds, so it records nothing.
-        let prior = (FEED && probe.found).then(|| tbl.entry_u32_at(state, probe.pos));
+        // The prior value: an equal rewrite changes nothing a reader sees, so
+        // it marks nothing and the change feed records nothing.
+        let prior = probe.found.then(|| tbl.entry_u32_at(state, probe.pos));
         if !probe.found {
             tbl.set_key_at(state, probe.pos, key);
             local_size += 1;
@@ -286,15 +287,16 @@ fn upsert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         if stores_aux {
             write_cmp_slot(state, meta, probe.pos, new_cmp);
         }
-        flags.set(
-            state,
-            meta,
-            if probe.found {
-                ChangeFlag::UPDATED
-            } else {
-                ChangeFlag::INSERTED
-            },
-        );
+        if prior != Some(val) {
+            meta.mark(
+                state,
+                if probe.found {
+                    ChangeFlag::UPDATED
+                } else {
+                    ChangeFlag::INSERTED
+                },
+            );
+        }
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }
@@ -354,7 +356,7 @@ pub fn batch_map_remove(
         .cap
         .checked_mul(if has_ts { 12 } else { 4 })
         .and_then(|len| tbl.entries_off.checked_add(len));
-    let flag_end = meta.meta_base.checked_add(SlotMetaOffset::CHANGE_FLAGS + 1);
+    let flag_end = meta.meta_base.checked_add(SlotMetaOffset::WRITE_SEQ + 8);
     if side_end.is_none_or(|end| end as usize > state.len())
         || flag_end.is_none_or(|end| end as usize > state.len())
     {
@@ -397,7 +399,6 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     ranges: &mut EraseRanges,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    let mut flags = BatchFlags::default();
     for &key in keys {
         let Some(pos) = tbl.find(state, key) else {
             continue;
@@ -424,7 +425,9 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
                     });
                 }
                 ranges.push((tbl.size_off, 4));
-                ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+                for range in mark_ranges(meta.meta_base) {
+                    ranges.push(range);
+                }
                 if let Some(plan) = &ttl_plan {
                     for &range in plan.ranges() {
                         ranges.push(range);
@@ -440,7 +443,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         erase_slot_map_planned(state, meta, tbl, &erase);
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);
-        flags.set(state, meta, ChangeFlag::REMOVED);
+        meta.mark(state, ChangeFlag::REMOVED);
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }

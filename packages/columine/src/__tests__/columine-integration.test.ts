@@ -489,9 +489,9 @@ describe('SC1: Reduce stage for aggregation', () => {
     const state = backend.createState(program);
     const serialized = backend.serialize(state, program);
 
-    // vm.zig slot metadata layout: TYPE_FLAGS at byte 12 of each 48-byte slot meta block.
+    // vm.zig slot metadata layout: TYPE_FLAGS at byte 12 of each 56-byte slot meta block.
     const STATE_HEADER_SIZE = 32;
-    const SLOT_META_SIZE = 48;
+    const SLOT_META_SIZE = 56;
     const OFFSET_OFFSET = 0;
     const TYPE_FLAGS_OFFSET = 12;
     const slot0MetaBase = STATE_HEADER_SIZE;

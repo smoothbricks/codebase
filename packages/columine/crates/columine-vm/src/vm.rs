@@ -30,7 +30,7 @@ use crate::key_index::{
     HashIndex, INDEX_WRITES_MAX, IndexWrites, InsertPlan, InternBytes, Key, KeyCx, KeyIndex,
     KeyScratch, NoStrings, RemovePlan,
 };
-use crate::meta::{SlotMetaView, slot_meta_base};
+use crate::meta::{SlotMetaView, mark_meta, mark_ranges, slot_meta_base};
 use crate::nested;
 use crate::removal_cut::{self, CutKey, RemovalCuts, SlotCuts};
 use crate::row_exprs::{LiveColumns, StoredBinding, StoredRow};
@@ -442,16 +442,17 @@ pub(crate) fn evict_expired(
     } else {
         0
     };
+    // A stale-only eviction marks nothing; an eviction that removes marks once.
+    let [flag, seq] = mark_ranges(meta.meta_base)
+        .map(|(offset, len)| (offset, if expired == 0 { 0 } else { len }));
     let ranges = || {
         [
             (
                 meta.meta_base + SlotMetaOffset::SIZE,
                 if expired == 0 { 0 } else { 4 },
             ),
-            (
-                meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
-                if expired == 0 { 0 } else { 1 },
-            ),
+            flag,
+            seq,
             (
                 meta.meta_base + SlotMetaOffset::EVICTION_INDEX_SIZE,
                 if expired == 0 { 0 } else { 4 },
@@ -485,6 +486,7 @@ pub(crate) fn evict_expired(
         }
         match remove_entry_by_key(delta_mode, undo, env, state, meta, key) {
             Ok(Some(change)) => {
+                meta.mark(state, ChangeFlag::EVICTED);
                 feed.record_slot(meta.slot(), Key::one(key), change);
                 if meta.has_evict_trigger() {
                     let buffer = meta.evicted_buffer_offset(state);
@@ -510,7 +512,6 @@ pub(crate) fn evict_expired(
     if removed != 0 {
         if let Some(size) = meta.size(state).checked_sub(removed) {
             meta.set_size(state, size);
-            meta.set_change_flag(state, ChangeFlag::EVICTED);
         } else {
             error = Some(ErrorCode::InvalidState);
         }
@@ -641,7 +642,11 @@ pub(crate) struct UndoState {
     out_of_memory: bool,
     enabled: bool,
     state_size: u32,
-    saved_change_flags: Vec<u8>,
+    /// The open change-flag boundary's snapshot: each slot's change flag and
+    /// write sequence (`specs/columine/07-change-feed.md` §6) as it found
+    /// them, then the derived-facts flag, whose sequence is unused. Empty
+    /// while no boundary is open.
+    saved_marks: Vec<SavedMark>,
     reserved_entries: u32,
     capture_depth: u32,
     generation: u64,
@@ -765,24 +770,33 @@ impl UndoState {
         }
     }
 
-    fn boundary_flag(&self, offset: u32) -> bool {
-        if self.saved_change_flags.is_empty() {
-            return false;
-        }
+    /// How many bytes from `offset` the open change-flag boundary owns: one
+    /// at a flag byte, the rest of a slot's write sequence inside one, zero
+    /// elsewhere. A capture skips them; the boundary journals them at close.
+    fn boundary_owned(&self, offset: u32) -> u32 {
+        let Some(slots) = (self.saved_marks.len() as u32).checked_sub(1) else {
+            return 0;
+        };
         if offset == StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG {
-            return true;
+            return 1;
         }
-        let first = columine_types::types::STATE_HEADER_SIZE + SlotMetaOffset::CHANGE_FLAGS;
-        offset.checked_sub(first).is_some_and(|relative| {
-            relative % SLOT_META_SIZE == 0
-                && (relative / SLOT_META_SIZE) < self.saved_change_flags.len() as u32 - 1
-        })
+        let Some(relative) = offset.checked_sub(columine_types::types::STATE_HEADER_SIZE) else {
+            return 0;
+        };
+        if relative / SLOT_META_SIZE >= slots {
+            return 0;
+        }
+        match relative % SLOT_META_SIZE {
+            SlotMetaOffset::CHANGE_FLAGS => 1,
+            within if within >= SlotMetaOffset::WRITE_SEQ => SLOT_META_SIZE - within,
+            _ => 0,
+        }
     }
 
     fn chunk_len(&self, offset: u32, remaining: u32) -> u32 {
         let max = remaining.min(8);
         (1..max)
-            .find(|relative| self.boundary_flag(offset + relative))
+            .find(|relative| self.boundary_owned(offset + relative) != 0)
             .unwrap_or(max)
     }
 
@@ -813,11 +827,12 @@ impl UndoState {
             }
             let mut cursor = offset;
             while cursor < end {
-                if self.boundary_flag(cursor) {
-                    cursor += 1;
-                } else {
-                    count = count.checked_add(1).ok_or(ErrorCode::InvalidState)?;
-                    cursor += self.chunk_len(cursor, end - cursor);
+                match self.boundary_owned(cursor) {
+                    0 => {
+                        count = count.checked_add(1).ok_or(ErrorCode::InvalidState)?;
+                        cursor += self.chunk_len(cursor, end - cursor);
+                    }
+                    owned => cursor += owned,
                 }
             }
         }
@@ -887,8 +902,9 @@ impl UndoState {
             let end = offset + len;
             let mut cursor = offset;
             while cursor < end {
-                if self.boundary_flag(cursor) {
-                    cursor += 1;
+                let owned = self.boundary_owned(cursor);
+                if owned != 0 {
+                    cursor += owned;
                 } else {
                     let size = self.chunk_len(cursor, end - cursor);
                     debug_assert!(
@@ -975,7 +991,7 @@ impl UndoState {
         {
             return Err(ErrorCode::InvalidState);
         }
-        if !self.saved_change_flags.is_empty() {
+        if !self.saved_marks.is_empty() {
             return Ok(false);
         }
         let slots = state_num_slots(state);
@@ -986,7 +1002,11 @@ impl UndoState {
         if end as usize > state.len() {
             return Err(ErrorCode::InvalidState);
         }
-        let count = slots.checked_add(1).ok_or(ErrorCode::InvalidState)?;
+        // Each slot's flag and sequence, then the derived-facts flag.
+        let count = slots
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(ErrorCode::InvalidState)?;
         if !self.within_budget(count) {
             // The shadow holds the flags as they stand: an overflowed window
             // owns no flag boundary.
@@ -994,36 +1014,63 @@ impl UndoState {
             return Ok(false);
         }
         self.reserve_entries(count)?;
-        self.saved_change_flags.extend(
-            (0..slots)
-                .map(|slot| state[(slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize]),
-        );
-        self.saved_change_flags
-            .push(state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize]);
+        self.saved_marks.extend((0..slots).map(|slot| {
+            let meta = slot_meta_base(slot);
+            SavedMark {
+                flag: state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize],
+                seq: bytes::read_u64(state, meta + SlotMetaOffset::WRITE_SEQ),
+            }
+        }));
+        self.saved_marks.push(SavedMark {
+            flag: state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize],
+            seq: 0,
+        });
         Ok(true)
     }
 
     fn finish_change_flags(&mut self, delta_mode: bool, state: &[u8]) {
-        for index in 0..self.saved_change_flags.len() {
-            let offset = if index + 1 == self.saved_change_flags.len() {
+        let slots = self.saved_marks.len() - 1;
+        for index in 0..self.saved_marks.len() {
+            let saved = self.saved_marks[index];
+            let offset = if index == slots {
                 StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG
             } else {
                 slot_meta_base(index as u32) + SlotMetaOffset::CHANGE_FLAGS
             };
-            let before = self.saved_change_flags[index];
             let after = state[offset as usize];
             // As in `finish_recording`: the shadow may hold a flag the
             // boundary moved after opening, even if it moved back.
-            if before != after || (self.overflowed && before != self.image[offset as usize]) {
+            if saved.flag != after || (self.overflowed && saved.flag != self.image[offset as usize])
+            {
                 self.push_reserved(
-                    state_bytes_entry(offset, 1, &[before]),
+                    state_bytes_entry(offset, 1, &[saved.flag]),
                     delta_mode.then(|| state_bytes_entry(offset, 1, &[after])),
                 );
             }
+            if index == slots {
+                continue;
+            }
+            let offset = slot_meta_base(index as u32) + SlotMetaOffset::WRITE_SEQ;
+            let after = bytes::read_u64(state, offset);
+            if saved.seq != after
+                || (self.overflowed && saved.seq != bytes::read_u64(&self.image, offset))
+            {
+                self.push_reserved(
+                    state_bytes_entry(offset, 8, &saved.seq.to_le_bytes()),
+                    delta_mode.then(|| state_bytes_entry(offset, 8, &after.to_le_bytes())),
+                );
+            }
         }
-        self.reserved_entries -= self.saved_change_flags.len() as u32;
-        self.saved_change_flags.clear();
+        self.reserved_entries -= (2 * slots + 1) as u32;
+        self.saved_marks.clear();
     }
+}
+
+/// One slot's mark bytes as an open change-flag boundary found them.
+#[derive(Clone, Copy, Debug)]
+struct SavedMark {
+    flag: u8,
+    seq: u64,
 }
 
 fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
@@ -1202,8 +1249,10 @@ impl<I: KeyIndex> Vm<I> {
     ///
     /// Outside a batch, no internal flag boundary is open: a writer that
     /// changes slot or derived-fact flags MUST include those actual flag bytes
-    /// in `ranges`. Flag bytes are filtered from a capture only when an
-    /// internal boundary already owns and has reserved their journal records.
+    /// in `ranges`, and a writer that marks a slot its
+    /// [`crate::meta::mark_ranges`] (flag and write sequence). Those bytes are
+    /// filtered from a capture only when an internal boundary already owns and
+    /// has reserved their journal records.
     /// Returning an error stops the writer; it does not discard prior writes.
     /// Those writes are always captured on normal callback return.
     pub fn capture_mutation<T>(
@@ -1223,8 +1272,9 @@ impl<I: KeyIndex> Vm<I> {
         Ok(result)
     }
 
-    /// Run `mutate` as one change-flag boundary. The slot change flags and the
-    /// derived-facts flag it leaves different from how it found them are
+    /// Run `mutate` as one change-flag boundary. The slot change flags, the
+    /// slot write sequences and the derived-facts flag it leaves different
+    /// from how it found them are
     /// journaled at its close as exact before-bytes (and, on the delta lane,
     /// after-bytes), so a rollback to a checkpoint taken before it restores
     /// them and a rollback to one taken after leaves them. The outermost
@@ -1689,6 +1739,11 @@ impl CaptureRanges {
     }
 
     /// Append an index plan's writes.
+    /// Append the slot's mark ranges ([`mark_ranges`]).
+    fn marks(self, meta_base: u32) -> Self {
+        let [flag, seq] = mark_ranges(meta_base);
+        self.push(flag).push(seq)
+    }
     fn writes(mut self, writes: &IndexWrites) -> Self {
         for &range in writes.as_slice() {
             self = self.push(range);
@@ -1797,7 +1852,7 @@ fn row_capture_ranges<I: KeyIndex>(
     let size_cell = if target.is_new() { 4 } else { 0 };
     CaptureRanges::new()
         .push((map.size_off, size_cell))
-        .push((slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS, 1))
+        .marks(slot_meta_base(slot))
         .writes(&target.writes())
         .push((map.row_off(target.pos()), map.row_size))
 }
@@ -1850,43 +1905,41 @@ fn card_one_changes<I: KeyIndex>(
 }
 
 /// The card-one write of one row, under the caller's capture. An assert stores
-/// `cell` and sets the presence bit, recording INSERTED or UPDATED from the bit as
-/// it stood. A retract clears the bit and the cell only while the stored cell
-/// still equals `cell`, recording REMOVED.
-#[allow(clippy::too_many_arguments)]
+/// `cell` and sets the presence bit, answering INSERTED or UPDATED from the bit
+/// as it stood. A retract clears the bit and the cell only while the stored
+/// cell still equals `cell`, answering REMOVED. A retract of an absent value
+/// and an assert of a held one write nothing and answer 0. The caller marks
+/// the slot with the answer, once per row write.
 fn write_card_one<I: KeyIndex>(
     state: &mut [u8],
     map: &StructMapSlot<I>,
-    slot: u32,
     pos: u32,
     field: u8,
     cell: &[u8; 8],
     cell_size: u32,
     is_retract: bool,
-) {
+) -> u8 {
     let row = map.row_off(pos);
     let dst_off = row + map.field_offset(state, field);
-    let flags = (slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS) as usize;
     let held = card_one_held(state, map, pos, field, cell, cell_size);
     match (held, is_retract) {
         (true, true) => {
             StructMapSlot::clear_scalar_field(state, row, field);
             bytes::zero(state, dst_off, cell_size);
-            state[flags] |= ChangeFlag::REMOVED;
+            ChangeFlag::REMOVED
         }
         (false, false) => {
             let prior_bit = StructMapSlot::is_field_set(state, row, field);
             StructMapSlot::set_field_bit(state, row, field);
             state[dst_off as usize..(dst_off + cell_size) as usize]
                 .copy_from_slice(&cell[..cell_size as usize]);
-            state[flags] |= if prior_bit {
+            if prior_bit {
                 ChangeFlag::UPDATED
             } else {
                 ChangeFlag::INSERTED
-            };
+            }
         }
-        // A retract of an absent value and an assert of a held one write nothing.
-        _ => {}
+        _ => 0,
     }
 }
 
@@ -1942,7 +1995,8 @@ fn scatter_card_one<I: KeyIndex, S: InternBytes + ?Sized>(
         target,
         cx,
         |state: &mut [u8]| {
-            write_card_one(state, map, slot, pos, field, cell, cell_size, is_retract);
+            let flag = write_card_one(state, map, pos, field, cell, cell_size, is_retract);
+            mark_meta(state, slot_meta_base(slot), flag);
             ErrorCode::Ok
         },
     )
@@ -2864,12 +2918,15 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
                 self.element_idx,
             );
         }
-        state[(slot_meta_base(self.slot) + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
+        mark_meta(
+            state,
+            slot_meta_base(self.slot),
             if self.target.is_new() {
                 ChangeFlag::INSERTED
             } else {
                 ChangeFlag::UPDATED
-            };
+            },
+        );
         Ok(())
     }
 
@@ -2901,7 +2958,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
                     meta + SlotMetaOffset::SIZE,
                     if self.target.is_new() { 4 } else { 0 },
                 ))
-                .push((meta + SlotMetaOffset::CHANGE_FLAGS, 1))
+                .marks(meta)
                 .writes(&self.target.writes())
                 .push((self.map.row_off(pos), self.map.row_size))
                 .push(header)
@@ -2961,7 +3018,7 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     };
     let pos = target.pos();
     let row = smap.row_off(pos);
-    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
+    let meta = slot_meta_base(slot);
     let feeds = feed.records(slot);
     let prior = if feeds && !target.is_new() {
         struct_map2_value(state, smap, row)
@@ -2971,7 +3028,7 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, if target.is_new() { 4 } else { 0 }))
-            .push((flags, 1))
+            .marks(meta)
             .writes(&target.writes())
             .push((row, smap.row_size))
     };
@@ -2989,11 +3046,15 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     for (index, &val_col) in val_cols.iter().enumerate() {
         smap.write_scalar_field(state, pos, field_idxs[index], cols, val_col, element_idx);
     }
-    state[flags as usize] |= if target.is_new() {
-        ChangeFlag::INSERTED
-    } else {
-        ChangeFlag::UPDATED
-    };
+    mark_meta(
+        state,
+        meta,
+        if target.is_new() {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        },
+    );
     undo.finish_capture(delta_mode, state, capture);
     if feeds {
         let change = if target.is_new() {
@@ -3088,14 +3149,14 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
     cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
     let row = smap.row_off(plan.ordinal);
-    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
+    let meta = slot_meta_base(slot);
     let prior = feed
         .records(slot)
         .then(|| struct_map2_value(state, smap, row));
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, 4))
-            .push((flags, 1))
+            .marks(meta)
             .writes(&plan.writes)
             .push((row, smap.bitset_bytes))
     };
@@ -3106,7 +3167,7 @@ fn remove_struct_map2_row<I: KeyIndex, S: InternBytes + ?Sized>(
     let result = match smap.apply_remove(state, plan, cx) {
         Ok(()) => {
             smap.clear_bitset(state, row);
-            state[flags as usize] |= ChangeFlag::REMOVED;
+            mark_meta(state, meta, ChangeFlag::REMOVED);
             if let Some(old) = prior {
                 feed.record_slot(slot, key, Change::Removed(old));
             }
@@ -3222,11 +3283,11 @@ fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
         Err(error) => return error,
     };
     let row = smap.row_off(plan.ordinal);
-    let flags = slot_meta_base(slot) + SlotMetaOffset::CHANGE_FLAGS;
+    let meta = slot_meta_base(slot);
     let ranges = || {
         CaptureRanges::new()
             .push((smap.size_off, 4))
-            .push((flags, 1))
+            .marks(meta)
             .writes(&plan.writes)
             .push((row, smap.bitset_bytes))
     };
@@ -3237,7 +3298,7 @@ fn single_struct_map_remove<I: KeyIndex, S: InternBytes + ?Sized>(
     let result = match smap.apply_remove(state, &plan, cx) {
         Ok(()) => {
             smap.clear_bitset(state, row);
-            state[flags as usize] |= ChangeFlag::REMOVED;
+            mark_meta(state, meta, ChangeFlag::REMOVED);
             feed.record_slot(slot, Key::one(key), Change::Removed(None));
             ErrorCode::Ok
         }
@@ -3561,12 +3622,12 @@ fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
     };
 
     let out_row = out.row_off(target.pos());
-    let flags = slot_meta_base(out_slot) + SlotMetaOffset::CHANGE_FLAGS;
+    let meta = slot_meta_base(out_slot);
 
     let ranges = || {
         CaptureRanges::new()
             .push((out.size_off, if target.is_new() { 4 } else { 0 }))
-            .push((flags, 1))
+            .marks(meta)
             .writes(&target.writes())
             .push((out_row, out.row_size))
     };
@@ -3594,11 +3655,15 @@ fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
         bytes::copy_within(state, src_off, dst_off, fsize);
     }
 
-    state[flags as usize] |= if target.is_new() {
-        ChangeFlag::INSERTED
-    } else {
-        ChangeFlag::UPDATED
-    };
+    mark_meta(
+        state,
+        meta,
+        if target.is_new() {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        },
+    );
     undo.finish_capture(delta_mode, state, capture);
     feed.record_slot(out_slot, Key::one(out_key), target.change());
     ErrorCode::Ok
@@ -3909,10 +3974,11 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
         ),
     };
     // An insert names the size cell, its index writes, the row, the arena
-    // used word and the frame; a stored fold names its frame's ranges.
+    // used word and the frame; a stored fold names its frame's ranges. Both
+    // then name the slot's mark ranges.
     const MAX_RANGES: usize = {
-        let stored = 2 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
-        let insert = 5 + INDEX_WRITES_MAX;
+        let stored = 3 + MAX_COUNTS_HISTOGRAMS + MAX_COUNTS_MASKS;
+        let insert = 6 + INDEX_WRITES_MAX;
         if stored > insert { stored } else { insert }
     };
     let meta = slot_meta_base(op.slot);
@@ -3937,7 +4003,9 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
             }
             CountsFoldTarget::Stored => op.journal_ranges(&plan, frame_offset, &mut ranges),
         };
-        ranges[range_count] = (meta + SlotMetaOffset::CHANGE_FLAGS, 1);
+        let [flag, seq] = mark_ranges(meta);
+        ranges[range_count] = flag;
+        ranges[range_count + 1] = seq;
         ranges
     }) {
         Ok(capture) => capture,
@@ -3961,11 +4029,15 @@ fn fold_counts_row<I: KeyIndex, S: InternBytes + ?Sized>(
         &plan,
         &mut state[frame_offset as usize..(frame_offset + frame_len) as usize],
     );
-    state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if target.is_new() {
-        ChangeFlag::INSERTED
-    } else {
-        ChangeFlag::UPDATED
-    };
+    mark_meta(
+        state,
+        meta,
+        if target.is_new() {
+            ChangeFlag::INSERTED
+        } else {
+            ChangeFlag::UPDATED
+        },
+    );
     undo.finish_capture(delta_mode, state, capture);
     feed.record_slot(op.slot, Key::one(key), target.change());
     OK
@@ -3994,17 +4066,15 @@ fn exec_agg_f64(
     #[allow(clippy::float_cmp)]
     if new_val != old_val {
         let ranges = || {
-            [
-                (meta.offset, 8),
-                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-            ]
+            let [flag, seq] = mark_ranges(meta.meta_base);
+            [(meta.offset, 8), flag, seq]
         };
         let capture = match undo.begin_capture(state, ranges) {
             Ok(capture) => capture,
             Err(error) => return error,
         };
         bytes::write_f64(state, meta.offset, new_val);
-        meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+        meta.mark(state, ChangeFlag::SIZE_CHANGED);
         undo.finish_capture(delta_mode, state, capture);
     }
     ErrorCode::Ok
@@ -4027,17 +4097,15 @@ fn exec_agg_i64(
     let new_val = aggregates::reduce_col_i64(kind, vals, old_val, type_mask, pred_col);
     if new_val != old_val {
         let ranges = || {
-            [
-                (meta.offset, 8),
-                (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-            ]
+            let [flag, seq] = mark_ranges(meta.meta_base);
+            [(meta.offset, 8), flag, seq]
         };
         let capture = match undo.begin_capture(state, ranges) {
             Ok(capture) => capture,
             Err(error) => return error,
         };
         bytes::write_i64(state, meta.offset, new_val);
-        meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+        meta.mark(state, ChangeFlag::SIZE_CHANGED);
         undo.finish_capture(delta_mode, state, capture);
     }
     ErrorCode::Ok
@@ -4060,17 +4128,15 @@ fn exec_agg_count(
         return ErrorCode::CountOverflow;
     };
     let ranges = || {
-        [
-            (meta.offset, 8),
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-        ]
+        let [flag, seq] = mark_ranges(meta.meta_base);
+        [(meta.offset, 8), flag, seq]
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
         Err(error) => return error,
     };
     bytes::write_u64(state, meta.offset, next);
-    meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
+    meta.mark(state, ChangeFlag::SIZE_CHANGED);
     undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
@@ -4160,11 +4226,8 @@ fn exec_scalar_latest(
     };
     let width = if kind == AggType::ScalarU32 { 4 } else { 8 };
     let ranges = || {
-        [
-            (data, width),
-            (data + 8, 8),
-            (meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
-        ]
+        let [flag, seq] = mark_ranges(meta.meta_base);
+        [(data, width), (data + 8, 8), flag, seq]
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
@@ -4173,7 +4236,7 @@ fn exec_scalar_latest(
     let encoded = value.to_le_bytes();
     state[data as usize..(data + width) as usize].copy_from_slice(&encoded[..width as usize]);
     bytes::write_f64(state, data + 8, latest);
-    meta.set_change_flag(state, ChangeFlag::UPDATED);
+    meta.mark(state, ChangeFlag::UPDATED);
     undo.finish_capture(delta_mode, state, capture);
     ErrorCode::Ok
 }
@@ -7753,7 +7816,7 @@ impl<I: KeyIndex> Vm<I> {
                     // set writes other rows, so the guard's capture is reserved before
                     // the set and the stamp lands only once the set is accepted: a
                     // refused set leaves the guard unstamped.
-                    let guard_flags = slot_meta_base(guard_slot) + SlotMetaOffset::CHANGE_FLAGS;
+                    let guard_meta = slot_meta_base(guard_slot);
                     if route_kind == 0 {
                         if let Some(target) = target.filter(|_| stamp_needed || card_changes) {
                             let pos = target.pos();
@@ -7769,29 +7832,34 @@ impl<I: KeyIndex> Vm<I> {
                                 target,
                                 cx,
                                 |state: &mut [u8]| {
+                                    // The stamp and the card write are one row write:
+                                    // they mark the slot once.
+                                    let mut flag = 0;
                                     if stamp_needed {
                                         let stamped =
                                             guard.stamp(state, &guarded, pos, cols, child_idx);
                                         if stamped != ErrorCode::Ok {
                                             return stamped;
                                         }
-                                        state[guard_flags as usize] |= if is_new {
+                                        flag |= if is_new {
                                             ChangeFlag::INSERTED
                                         } else {
                                             ChangeFlag::UPDATED
                                         };
                                     }
                                     if let Some((cell, cell_size)) = selected_cell {
-                                        write_card_one(
+                                        flag |= write_card_one(
                                             state,
                                             &guarded,
-                                            dest_slot,
                                             pos,
                                             dest_field_idx,
                                             &cell,
                                             cell_size,
                                             is_retract,
                                         );
+                                    }
+                                    if flag != 0 {
+                                        mark_meta(state, guard_meta, flag);
                                     }
                                     ErrorCode::Ok
                                 },
@@ -7846,11 +7914,15 @@ impl<I: KeyIndex> Vm<I> {
                                         Err(error) => error,
                                     };
                                 if guard_result == ErrorCode::Ok {
-                                    state[guard_flags as usize] |= if target.is_new() {
-                                        ChangeFlag::INSERTED
-                                    } else {
-                                        ChangeFlag::UPDATED
-                                    };
+                                    mark_meta(
+                                        state,
+                                        guard_meta,
+                                        if target.is_new() {
+                                            ChangeFlag::INSERTED
+                                        } else {
+                                            ChangeFlag::UPDATED
+                                        },
+                                    );
                                     self.feed.record_slot(
                                         guard_slot,
                                         Key::one(key),
@@ -7919,10 +7991,12 @@ impl<I: KeyIndex> Vm<I> {
                         return INVALID_STATE;
                     };
                     let payload_ranges = || {
+                        let [flag, seq] = mark_ranges(meta_base);
                         [
                             (write_off, elem_size),
                             (meta_base + SlotMetaOffset::SIZE, 4),
-                            (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                            flag,
+                            seq,
                         ]
                     };
                     let capture = match self.undo.begin_capture(state, payload_ranges) {
@@ -7940,8 +8014,7 @@ impl<I: KeyIndex> Vm<I> {
 
                     count += 1;
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
-                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                        ChangeFlag::INSERTED;
+                    mark_meta(state, meta_base, ChangeFlag::INSERTED);
                     self.undo.finish_capture(delta_mode, state, capture);
                 }
 
@@ -7999,10 +8072,12 @@ impl<I: KeyIndex> Vm<I> {
                         return INVALID_STATE;
                     };
                     let payload_ranges = || {
+                        let [flag, seq] = mark_ranges(meta_base);
                         [
                             (row_off, row_size),
                             (meta_base + SlotMetaOffset::SIZE, 4),
-                            (meta_base + SlotMetaOffset::CHANGE_FLAGS, 1),
+                            flag,
+                            seq,
                         ]
                     };
                     let capture = match self.undo.begin_capture(state, payload_ranges) {
@@ -8061,8 +8136,7 @@ impl<I: KeyIndex> Vm<I> {
 
                     count += 1;
                     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, count);
-                    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |=
-                        ChangeFlag::INSERTED;
+                    mark_meta(state, meta_base, ChangeFlag::INSERTED);
                     self.undo.finish_capture(delta_mode, state, capture);
                 }
 
@@ -8253,8 +8327,8 @@ impl<I: KeyIndex> Vm<I> {
         let state_size = u32::try_from(state.len()).map_err(|_| ErrorCode::InvalidState)?;
         let (slots, _) = state_init::state_geometry::<I>(state)?;
         let u = &mut self.undo;
-        debug_assert!(u.saved_change_flags.is_empty());
-        let backed = u.saved_change_flags.try_reserve(slots as usize + 1).is_ok();
+        debug_assert!(u.saved_marks.is_empty());
+        let backed = u.saved_marks.try_reserve(slots as usize + 1).is_ok();
         u.enabled = true;
         u.entries.clear();
         u.redo.clear();
@@ -8274,7 +8348,7 @@ impl<I: KeyIndex> Vm<I> {
         u.ttl_batch_scratch.reset();
         u.erase_scratch.ranges.clear();
         u.erase_scratch.payload_ranges.clear();
-        u.saved_change_flags.clear();
+        u.saved_marks.clear();
         u.state_size = state_size;
         Ok(())
     }
@@ -8351,7 +8425,7 @@ impl<I: KeyIndex> Vm<I> {
         u.export_count = 0;
         u.export_undo.clear();
         u.export_redo.clear();
-        u.saved_change_flags.clear();
+        u.saved_marks.clear();
         u.enabled = false;
     }
 

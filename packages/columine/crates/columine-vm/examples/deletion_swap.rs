@@ -138,7 +138,7 @@ fn batch_order_witness() {
         let mut shifted = state.clone();
         let table = bind_slot_map(&meta);
         tombstone(&table, &mut state, 3);
-        meta.set_change_flag(&mut state, columine_types::types::ChangeFlag::REMOVED);
+        meta.mark(&mut state, columine_types::types::ChangeFlag::REMOVED);
         batch_map_remove(false, &mut shifted, &meta, 0, &[3], &mut hooks);
         images.push((state, shifted));
     }

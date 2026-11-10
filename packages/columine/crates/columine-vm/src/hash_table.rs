@@ -71,9 +71,9 @@ pub struct Probe {
 }
 
 /// Most capture ranges one erase names: two runs (a wrap splits one) for
-/// each of the key, entry and timestamp lanes, then size, change flag and
-/// the two TTL capture ranges.
-pub const ERASE_MAX_RANGES: usize = 10;
+/// each of the key, entry and timestamp lanes, then size, change flag, write
+/// sequence and the two TTL capture ranges.
+pub const ERASE_MAX_RANGES: usize = 11;
 
 /// One backward-shift erase, planned before any byte changes: the cell the
 /// erased key vacates and the last cell the shift vacates. Every cell the

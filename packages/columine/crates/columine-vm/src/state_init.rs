@@ -624,7 +624,7 @@ fn calculate_state_size_from_view<I: KeyIndex>(
 ) -> Result<u32, ProgramInvalidCause> {
     let init_code = view.init_code;
 
-    // Header + slot metadata (48 bytes per slot).
+    // Header + slot metadata (56 bytes per slot).
     let mut size =
         (u64::from(STATE_HEADER_SIZE) + u64::from(view.num_slots) * u64::from(SLOT_META_SIZE) + 7)
             & !7;
@@ -846,6 +846,7 @@ fn write_slot_meta(
     state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] = type_flags.to_byte();
     state[(meta + SlotMetaOffset::AGG_TYPE) as usize] = agg_type_byte;
     state[(meta + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+    bytes::write_u64(state, meta + SlotMetaOffset::WRITE_SEQ, 0);
     state[(meta + SlotMetaOffset::START_OF) as usize] = ttl.start_of;
 
     bytes::write_f32(state, meta + SlotMetaOffset::TTL_SECONDS, ttl.ttl_seconds);
@@ -1287,6 +1288,7 @@ fn init_state_from_view<I: KeyIndex>(
             state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = outer_type_flags_byte;
             state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize] = inner_agg;
             state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+            bytes::write_u64(state, meta_base + SlotMetaOffset::WRITE_SEQ, 0);
             // Metadata bytes 15–47 remain zero from the initialized buffer.
 
             nested::write_nested_prefix(

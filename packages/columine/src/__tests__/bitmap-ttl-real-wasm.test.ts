@@ -24,7 +24,7 @@ import { loadColumineWasm, VmProgramAdmissionError } from '../wasm-backend.js';
 // of the native join/planner.
 const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 const META_BASE = 32;
-const META_SIZE = 48;
+const META_SIZE = 56;
 const INDEX_OFFSET = 24;
 const INDEX_CAPACITY = 28;
 const INDEX_SIZE = 32;

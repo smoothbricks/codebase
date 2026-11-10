@@ -9,7 +9,7 @@ use crate::change_feed::Change;
 use crate::hash_table::{ENTRY_NONE, EraseRanges, FlatTable};
 use crate::hooks::{ByteCapture, TtlMutation, VmHooks, batch_rows};
 use crate::key_index::Key;
-use crate::meta::{BatchFlags, SlotMetaView};
+use crate::meta::{SlotMetaView, mark_ranges};
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType};
 
 /// Bind the key-only table for a HASHSET slot.
@@ -59,7 +59,6 @@ fn insert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     let tbl = bind_slot_set(meta);
     let mut local_size = tbl.size(state);
     let max_load = tbl.max_load();
-    let mut flags = BatchFlags::default();
 
     for (i, &elem) in elems.iter().enumerate() {
         let ts = if TTL {
@@ -102,16 +101,17 @@ fn insert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         } else {
             match hooks.begin_capture(state, || {
                 let ttl = ttl_plan.as_ref().map_or(&[(0, 0); 2], |plan| plan.ranges());
+                // A held member marks nothing: its mark ranges are empty.
+                let [flag, seq] = mark_ranges(meta.meta_base)
+                    .map(|(offset, len)| (offset, if probe.found { 0 } else { len }));
                 [
                     (
                         tbl.keys_off + probe.pos * 4,
                         if probe.found { 0 } else { 4 },
                     ),
                     (tbl.size_off, if probe.found { 0 } else { 4 }),
-                    (
-                        meta.meta_base + SlotMetaOffset::CHANGE_FLAGS,
-                        if probe.found { 0 } else { 1 },
-                    ),
+                    flag,
+                    seq,
                     ttl[0],
                     ttl[1],
                 ]
@@ -124,7 +124,7 @@ fn insert_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
             tbl.set_key_at(state, probe.pos, elem);
             local_size += 1;
             tbl.set_size(state, local_size);
-            flags.set(state, meta, ChangeFlag::INSERTED);
+            meta.mark(state, ChangeFlag::INSERTED);
         }
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
@@ -161,7 +161,7 @@ pub fn batch_set_remove(
         Ok(table) => table,
         Err(error) => return error,
     };
-    let flag_end = meta.meta_base.checked_add(SlotMetaOffset::CHANGE_FLAGS + 1);
+    let flag_end = meta.meta_base.checked_add(SlotMetaOffset::WRITE_SEQ + 8);
     if flag_end.is_none_or(|end| end as usize > state.len()) {
         return ErrorCode::InvalidState;
     }
@@ -200,7 +200,6 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
     ranges: &mut EraseRanges,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    let mut flags = BatchFlags::default();
     for &elem in elems {
         let Some(pos) = tbl.find(state, elem) else {
             continue;
@@ -226,7 +225,9 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
                 ranges.clear();
                 tbl.erase_ranges(&erase, ranges);
                 ranges.push((tbl.size_off, 4));
-                ranges.push((meta.meta_base + SlotMetaOffset::CHANGE_FLAGS, 1));
+                for range in mark_ranges(meta.meta_base) {
+                    ranges.push(range);
+                }
                 if let Some(plan) = &ttl_plan {
                     for &range in plan.ranges() {
                         ranges.push(range);
@@ -241,7 +242,7 @@ fn remove_rows<const RECORDING: bool, const TTL: bool, const FEED: bool>(
         tbl.erase_planned(state, &erase, |_, _, _| {});
         let size = tbl.size(state);
         tbl.set_size(state, size - 1);
-        flags.set(state, meta, ChangeFlag::REMOVED);
+        meta.mark(state, ChangeFlag::REMOVED);
         if let Some(plan) = ttl_plan {
             hooks.consume_ttl_batch_plan(state, meta, plan);
         }

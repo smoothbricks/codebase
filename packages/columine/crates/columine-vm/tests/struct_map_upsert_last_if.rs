@@ -472,10 +472,14 @@ fn model(rows: &[Row]) -> BTreeMap<u32, Lease> {
     leases
 }
 
-/// The image as a later batch reads it: sealed, change flags cleared.
+/// The image as a later batch reads it: sealed, change flags and write
+/// sequence cleared. A sequence counts writes, and a removal cut skips in one
+/// batch rows that a batch per row writes and removes.
 fn settled(vm: &mut Vm, mut state: Vec<u8>) -> Vec<u8> {
     vm.seal_state(&mut state, &NoStrings).expect("seal");
-    state[(slot_meta_base(0) + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+    let meta = slot_meta_base(0) as usize;
+    state[meta + SlotMetaOffset::CHANGE_FLAGS as usize] = 0;
+    state[meta + SlotMetaOffset::WRITE_SEQ as usize..][..8].fill(0);
     state
 }
 
