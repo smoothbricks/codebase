@@ -949,6 +949,21 @@ drives an owned daemon RPC with the same root's trailing separator, then a genui
 daemon remains available to its own workspace. No caller root override, shared-socket allowance or namespace workaround
 replaces the guard. Drop this hunk only when upstream contains the same normalization, retaining the regression.
 
+## Sockets resolve from `process.env`
+
+Nx 24.0.3 resolves its socket paths natively (`resolveDaemonSocketPath`, `resolvePluginSocketPath`,
+`resolveForkedProcessSocketPath`, `resolveNxConsoleSocketPath`), and `daemon/tmp-dir.js` called them with no
+environment, so the native side read the C environment. Under Node that is the same as `process.env`; under Bun an
+assignment to `process.env` never reaches the C environment. `ensureBuilt` points `process.env` at the provider
+workspace (its own `NX_SOCKET_DIR` among the rest) before it loads the provider's Nx, so a Bun `smoo-nx-exec` entered
+from another workspace's shell spawned the plugin workers of its task hooks with sockets in the caller's
+`NX_SOCKET_DIR`, a second Nx listening in another workspace's namespace. `tmp-dir.js` now hands every resolver
+`process.env` (Nx Console's keeps an explicit `env` first). The native resolvers already take that argument.
+
+`packages/nx-plugin/src/ensure-built.test.ts` ("replays current outputs …") runs a Bun caller from another workspace's
+shell, records the socket each plugin worker is spawned with, and requires each one in the provider's directory and none
+in the caller's. Drop the hunk once upstream Nx resolves its sockets from `process.env`.
+
 ## The installed Nx answers, never `nx@latest`
 
 Stock Nx answers the Nx Console and AI-agent status every `nx run` asks its daemon for by installing `nx@latest` from

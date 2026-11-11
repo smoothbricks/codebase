@@ -3098,6 +3098,57 @@ index 3aed2d0e8233491ed17cf2659fc44bd3ed74eac9..cc914c2dd0755a3ee555805b4ed085eb
  // Prepare a serialized project graph result for sending over IPC from the server to the client
  function serializeResult(error, serializedProjectGraph, serializedSourceMaps) {
      // We do not want to repeat work `JSON.stringify`ing an object containing the potentially large project graph so merge as strings
+diff --git a/dist/src/daemon/tmp-dir.js b/dist/src/daemon/tmp-dir.js
+index 400e96394bbef2f44ca626a1d9445bd539674068..b7f8eb4b0eaad4519e37b3da6c728e9b79389f4d 100644
+--- a/dist/src/daemon/tmp-dir.js
++++ b/dist/src/daemon/tmp-dir.js
+@@ -224,20 +224,28 @@ function assertWithinBudget(details) {
+                 `The directory set in NX_SOCKET_DIR (${details.refusedConfiguredDir}) could not be used — see the warning above — so Nx fell back to a longer path.\nPoint NX_SOCKET_DIR at a short directory your user owns.`,
+     ].join('\n'), cause === undefined ? undefined : { cause });
+ }
++/*
++ * Every resolver below hands the native side `process.env`, the environment Nx
++ * reads its configuration from everywhere else. Given none, the native side
++ * reads the C environment, which under Bun an assignment to `process.env` never
++ * reaches: a Bun process that points `process.env.NX_SOCKET_DIR` at another
++ * workspace (smoo-nx-exec entered from another workspace's shell) would bind its
++ * plugin workers in the directory it inherited.
++ */
+ /** The daemon's own socket. */
+ function getDaemonSocketPath() {
+-    return adopt((0, native_1.resolveDaemonSocketPath)(workspace_root_1.workspaceRoot));
++    return adopt((0, native_1.resolveDaemonSocketPath)(workspace_root_1.workspaceRoot, process.env));
+ }
+ /** A forked task process's socket, in the daemon's per-run directory. */
+ function getForkedProcessSocketPath(id) {
+-    return adopt((0, native_1.resolveForkedProcessSocketPath)(workspace_root_1.workspaceRoot, id));
++    return adopt((0, native_1.resolveForkedProcessSocketPath)(workspace_root_1.workspaceRoot, id, process.env));
+ }
+ /**
+  * Plugin worker sockets get their own workspace-scoped directory rather than
+  * sitting in the shared system temp dir, which cannot be locked down.
+  */
+ function getPluginSocketPath(id) {
+-    return adopt((0, native_1.resolvePluginSocketPath)(workspace_root_1.workspaceRoot, id));
++    return adopt((0, native_1.resolvePluginSocketPath)(workspace_root_1.workspaceRoot, id, process.env));
+ }
+ /**
+  * Where the Nx Console socket lives, for whoever binds or connects to it.
+@@ -251,12 +259,12 @@ function getPluginSocketPath(id) {
+  * load a workspace `.env` into a copy rather than into `process.env`
+  */
+ function getNxConsoleSocketPath(workspaceRootOverride, env) {
+-    return adopt((0, native_1.resolveNxConsoleSocketPath)(workspaceRootOverride ?? workspace_root_1.workspaceRoot, env));
++    return adopt((0, native_1.resolveNxConsoleSocketPath)(workspaceRootOverride ?? workspace_root_1.workspaceRoot, env ?? process.env));
+ }
+ function removeSocketDir() {
+     try {
+         // The directory, not the socket: the daemon's whole per-run directory goes.
+-        (0, node_fs_1.rmSync)((0, native_1.resolveDaemonSocketPath)(workspace_root_1.workspaceRoot).dir, {
++        (0, node_fs_1.rmSync)((0, native_1.resolveDaemonSocketPath)(workspace_root_1.workspaceRoot, process.env).dir, {
+             recursive: true,
+             force: true,
+         });
 diff --git a/dist/src/hasher/check-task-files.js b/dist/src/hasher/check-task-files.js
 index b027c02a6df7532cce64ae9684bfb76e56bf975b..ce045a0e126de3d349a10d0f367a0bdbbaad820a 100644
 --- a/dist/src/hasher/check-task-files.js
