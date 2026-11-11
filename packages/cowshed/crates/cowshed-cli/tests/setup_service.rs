@@ -2006,8 +2006,8 @@ fn setup_is_in_the_command_map() {
     );
 }
 
-/// `--purge` is `gateway stop`'s alone, and it is in the gateway's help page because the parser
-/// accepts it.
+/// `--purge` is `gateway stop`'s alone, and it is in the gateway's help page and command-map line
+/// because the parser accepts it; `--gateway-socket` is `await-turns`' alone and sits beside it.
 #[test]
 fn gateway_stop_purge_is_parsed_and_documented() {
     assert_eq!(
@@ -2022,7 +2022,8 @@ fn gateway_stop_purge_is_parsed_and_documented() {
 
     let spec = help::command_named("gateway").expect("gateway has a help page");
     assert!(spec.page().contains("--purge"));
-    assert!(help::command_map().contains("[--purge]"));
+    assert!(spec.page().contains("--gateway-socket"));
+    assert!(help::command_map().contains("[--purge|--gateway-socket]"));
 }
 
 /// Git identity at a workspace depends on the host's git configuration and the fixed mount root,
