@@ -190,7 +190,7 @@ providers is authority, not speed.
   disallowed-types list (no `std::sync::Mutex`, no default-hasher maps on row paths) binds the row store.
 - **Tier-1 shapes:** the writer trips none of these shapes on a row path. `SHAPE-FMTROW`: messages cross as ordinals or
   vocabulary ids, never as formatted strings (`format!`). `SHAPE-CAP0`/`SHAPE-SEED`: blocks are pushed whole at fixed
-  capacity (`thread_buffer.rs` `ensure_rows`), never grown from zero or seeded row by row. `SHAPE-RMWROW`: span-id
+  capacity (`thread_buffer.rs` `next_block`), never grown from zero or seeded row by row. `SHAPE-RMWROW`: span-id
   allocation is thread-local, with no shared atomic read-modify-write per row. `SHAPE-SPILL`: the arena is sized at
   startup, `clear()`ed, and never grown mid-lane.
 - **Boundary signatures:** every binding entry takes borrows (`&str`, `*const u8` + length) and returns a scalar (`u8`,
@@ -210,10 +210,29 @@ providers is authority, not speed.
 
 ## 10. Flushing a long-lived store
 
-A process that traces forever flushes while spans are still open. `ThreadSpanBuffer::flush_rows` selects every written
-row except the reserved completion row of a span that is still open, and `lmao-arrow`'s `convert_thread_span_rows`
-converts exactly that selection by reference; `retain_open` then moves each open span's start and completion rows to the
-front and releases everything else. Every finished row therefore reaches exactly one flush; an open span's start row
-reaches every flush while it stays open — the last copy carrying its final attribute values — and its completion row the
-first flush after it ends. A reader takes the latest start row of a span. Each span's `SourceMetadata` rides its record,
-so every row it emits carries its provenance.
+A process that traces forever flushes while spans are still open. `ThreadSpanBuffer::flush_rows` selects every held row
+except the reserved completion row of a span that is still open, in write order, and `lmao-arrow`'s
+`convert_thread_span_rows` converts exactly that selection by reference; `retain_open` then releases every other row
+where it lies. Every finished row therefore reaches exactly one flush; an open span's start row reaches every flush
+while it stays open — the last copy carrying its final attribute values — and its completion row the first flush after
+it ends. A reader takes the latest start row of a span. Each span's `SourceMetadata` rides its record, so every row it
+emits carries its provenance.
+
+**An open span never moves.** A row's index is its slot, `block * capacity + slot`. An open span's start and completion
+rows stay in the slots they were written to until the first flush after it ends releases them, so the row a receipt
+named is that span's row for its whole life, and a flush copies none of its cells. A block that holds no open span's row
+is cleared, one store per validity word, and returns to the pool; a block that holds one stays, its other slots released
+(they carry span id 0 and read as absent) until those spans end, and appends move on to a free block. A flush reads the
+held blocks in the order they were first written, so its rows keep write order.
+
+Appends move to the first free block after the current one in index order, wrapping, else to a new block. The rows of a
+store that has not retained since its last reset are therefore dense from row 0, which the window form of conversion
+(`convert_thread_span_buffer`, a lane's `rowCount` window) relies on; after a retain the held rows lie wherever they
+were written. A span's completion row is its start row's successor, which a lane addresses as `start + 1`: a pair
+crosses a block boundary only when appends move on to the block that follows in index order; otherwise the pair starts
+in the next block and that one slot stays unwritten. Keeping an open span costs memory, not time: a block it holds stays
+out of the pool, so a store holds at most a window's blocks plus two per open span.
+
+**Rejected:** compacting the open spans to the front on every retain. It copied every open span that a released row
+preceded, cell by cell across every attribute field, on each flush after an earlier span ended, which in a host whose
+open set churns from the front was most of its flush thread's work; and it moved rows a foreign writer had been handed.

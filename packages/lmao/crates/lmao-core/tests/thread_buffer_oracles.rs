@@ -71,7 +71,7 @@ fn open_when_one_slot_remains_does_not_leave_a_dense_row_hole() {
     assert_eq!(
         child_start,
         7,
-        "ensure_rows(2) with remaining==1 abandoned the last slot of the live block; child start_row is {child_start}, row_count is {}",
+        "an open with one slot left abandoned the last slot of a store that never retained; child start_row is {child_start}, row_count is {}",
         buffer.row_count()
     );
     for row in 0..buffer.row_count() {

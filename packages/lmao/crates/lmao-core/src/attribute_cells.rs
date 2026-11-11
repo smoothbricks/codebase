@@ -112,32 +112,13 @@ impl AttributeCells {
         filled
     }
 
-    /// Copy every field's cell and validity from `from` in `source` to `to` in
-    /// `self`. `source` may be `self`.
-    pub fn copy_row(&self, to: usize, source: &Self, from: usize) {
-        let fields = self.words.len() / stride(self.capacity);
-        for field in 0..fields {
-            let (from_word, from_bit) = source.validity(field, from);
-            let (to_word, to_bit) = self.validity(field, to);
-            let valid = from_word.load(Ordering::Relaxed) & from_bit != 0;
-            let cell = source.words[source.value_index(field, from)].load(Ordering::Relaxed);
-            self.words[self.value_index(field, to)].store(cell, Ordering::Relaxed);
-            let bits = to_word.load(Ordering::Relaxed);
-            to_word.store(
-                if valid { bits | to_bit } else { bits & !to_bit },
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    /// Mark rows `start..capacity` empty in every field. Value cells keep their
-    /// bytes; validity is the only authority on whether a row holds a value.
-    pub fn clear_from(&self, start: usize) {
-        let fields = self.words.len() / stride(self.capacity);
-        for field in 0..fields {
-            for row in start..self.capacity {
-                let (word, bit) = self.validity(field, row);
-                word.store(word.load(Ordering::Relaxed) & !bit, Ordering::Relaxed);
+    /// Mark every row empty in every field: one store per validity word.
+    /// Value cells keep their bytes; validity is the only authority on whether
+    /// a row holds a value.
+    pub fn clear(&self) {
+        for field in self.words.chunks_exact(stride(self.capacity)) {
+            for word in &field[self.capacity..] {
+                word.store(0, Ordering::Relaxed);
             }
         }
     }
@@ -185,24 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn fill_leaves_direct_writes_alone_and_clear_empties_the_tail() {
-        let cells = AttributeCells::new(1, 8);
+    fn fill_leaves_direct_writes_alone_and_clear_empties_every_field() {
+        let cells = AttributeCells::new(2, 128);
         cells.set(0, 3, 30);
         assert_eq!(cells.fill_unset(0, 2, 6, 7), 3);
         assert_eq!(cells.get(0, 3), Some(30));
         assert_eq!(cells.get(0, 5), Some(7));
-        cells.clear_from(4);
+        cells.set(1, 127, 9);
+        cells.clear();
+        assert_eq!(cells.get(0, 3), None);
         assert_eq!(cells.get(0, 5), None);
-        assert_eq!(cells.get(0, 3), Some(30));
-    }
-
-    #[test]
-    fn a_copied_row_carries_absence_as_well_as_values() {
-        let cells = AttributeCells::new(2, 8);
-        cells.set(0, 6, 1);
-        cells.set(1, 0, 2);
-        cells.copy_row(0, &cells, 6);
-        assert_eq!(cells.get(0, 0), Some(1));
-        assert_eq!(cells.get(1, 0), None);
+        assert_eq!(cells.get(1, 127), None);
     }
 }

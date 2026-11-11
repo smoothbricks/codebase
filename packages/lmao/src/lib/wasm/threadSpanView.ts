@@ -291,9 +291,9 @@ export class ThreadSpanView {
   readonly fakeToReal = new Map<number, number>();
   /**
    * The store's {@link ThreadSpanBufferBinding.rowGeneration} the rows above
-   * were read at. A flush moves an open span's rows and a reset releases them,
-   * so rows read at an earlier generation are re-read before any write
-   * ({@link currentRows}).
+   * were read at. A flush releases the rows of spans that ended and a reset
+   * releases every row, so rows read at an earlier generation are re-read
+   * before any write ({@link currentRows}).
    */
   rowGeneration = 0;
 

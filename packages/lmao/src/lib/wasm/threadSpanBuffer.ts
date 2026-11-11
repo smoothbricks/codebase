@@ -115,11 +115,12 @@ export interface ThreadSpanBufferBinding {
    */
   reset(): number;
   /**
-   * Moves each time the store may have moved or released rows a view holds: a
-   * {@link reset}, and a host flush that keeps the open spans by moving their
-   * rows to the front (`lmao-core` `ThreadStore::retain_open`). Within one
-   * generation a receipt's row stays that span's row; a view that holds rows
-   * from an earlier generation reads them again ({@link spanStartRow}).
+   * Moves each time the store may have released rows a view holds: a
+   * {@link reset}, and a host flush (`lmao-core`
+   * `ThreadSpanBuffer::retain_open`), which releases the rows of spans that
+   * ended and leaves an open span's rows where they are. A view that holds
+   * rows from an earlier generation reads them again ({@link spanStartRow}):
+   * an open span answers the row its receipt named.
    */
   readonly rowGeneration: number;
   /**

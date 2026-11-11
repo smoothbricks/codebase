@@ -11,10 +11,13 @@
 //! this type's methods, so a foreign writer can name a value but never a row's
 //! identity or entry type.
 //!
-//! Blocks are recycled, never freed while the store lives: [`Self::reset`] and
-//! [`Self::retain_open`] keep every block's allocations, so the addresses a
-//! foreign writer viewed stay valid and a flushed store writes again without
-//! allocating.
+//! A row's index names its slot, `block * capacity + slot`, for as long as the
+//! store holds the row: [`ThreadSpanBuffer::retain_open`] releases a flushed
+//! row where it lies and never moves an open span's rows, so the row a receipt
+//! named stays that span's until it ends. Blocks are recycled, never freed
+//! while the store lives: a block returns to the pool once it holds no open
+//! span's row, keeping its allocations, so the addresses a foreign writer
+//! viewed stay valid and a flushed store writes again without allocating.
 
 use crate::arena::{ArenaFull, StringArena, TextInput};
 use crate::attribute_cells::AttributeCells;
@@ -239,26 +242,19 @@ impl ThreadSpanBlock {
         self.rows += 1;
         row
     }
-    /// The system cells of `row`, for moving the row elsewhere.
-    fn row_input(&self, row: usize) -> RowInput {
-        RowInput {
-            timestamp: self.timestamps[row],
-            trace: self.traces[row],
-            header: self.headers[row],
-            span_id: self.span_ids[row],
-            parent_thread_id: self.parent_thread_ids[row],
-            parent_span_id: self.parent_span_ids[row],
-            message: self.messages[row],
-            line: self.lines[row],
-        }
-    }
-    /// Forget rows `start..` while keeping every allocation.
-    fn truncate(&mut self, start: usize) {
-        self.rows = self.rows.min(start);
-        self.messages[start..].fill(None);
-        self.attributes.clear_from(start);
+    /// Forget every row while keeping every allocation, so the next window
+    /// writes from slot 0. Validity goes word by word, rows a foreign writer
+    /// stored past the written ones included.
+    fn clear(&mut self) {
+        self.messages[..self.rows].fill(None);
+        self.attributes.clear();
+        self.rows = 0;
     }
 }
+
+/// The span id a released row carries. No span is issued id 0, so a slot
+/// holding it belongs to no span and reads as absent.
+const RELEASED: u32 = 0;
 
 #[derive(Debug, Clone, Copy)]
 struct SpanRecord {
@@ -385,17 +381,21 @@ pub struct ThreadSpanBuffer {
     thread_id: u64,
     capacity: usize,
     fields: &'static [FieldMeta],
-    /// Every block this store has allocated. Blocks `..active_blocks` hold
-    /// rows; the rest are recycled and empty, kept so their attribute cells
-    /// keep the addresses a foreign writer viewed.
+    /// Every block this store has allocated, at a fixed index: row `r` lives
+    /// in block `r / capacity`. A block that holds no row is free.
     blocks: Vec<ThreadSpanBlock>,
-    active_blocks: usize,
+    /// The blocks holding rows, in the order they were first written; the last
+    /// takes appends. A flush reads them in this order, so rows keep write
+    /// order whichever slots they landed in.
+    active: Vec<u32>,
+    /// Rows held: written and not yet released by a flush or a reset.
     row_count: usize,
     next_span_id: u32,
     spans: SpanIdMap<SpanRecord>,
     scopes: SpanIdMap<Option<SpanScope>>,
-    /// `retain_open`'s working list, kept so a flush allocates nothing.
-    open_scratch: Vec<(u32, u32)>,
+    /// `retain_open`'s working set, one flag per block: whether an open span
+    /// holds a row in it. Kept so a flush allocates nothing.
+    pinned: Vec<bool>,
     /// Every dynamic string this thread has written, stored once, contiguous.
     /// Replaces a `Vec<Arc<str>>` plus a `HashMap<Arc<str>, u32>` — two
     /// structures that between them allocated an `Arc` per distinct value and
@@ -424,7 +424,7 @@ impl ThreadSpanBuffer {
             capacity,
             fields,
             blocks: Vec::new(),
-            active_blocks: 1,
+            active: Vec::new(),
             row_count: 0,
             next_span_id: 1,
             spans: SpanIdMap::with_capacity_and_hasher(capacity / 2, BuildHasherDefault::default()),
@@ -432,7 +432,7 @@ impl ThreadSpanBuffer {
                 capacity / 2,
                 BuildHasherDefault::default(),
             ),
-            open_scratch: Vec::new(),
+            pinned: Vec::new(),
             arena: StringArena::new(MAX_STRING_ARENA_BYTES),
             text_epoch: 0,
             traces: Vec::new(),
@@ -460,10 +460,10 @@ impl ThreadSpanBuffer {
     /// writer kept names no span after it (until 2^32 later opens wrap the
     /// counter).
     pub fn reset(&mut self) {
-        for block in &mut self.blocks[..self.active_blocks] {
-            block.truncate(0);
+        for &block in &self.active {
+            self.blocks[block as usize].clear();
         }
-        self.active_blocks = 1;
+        self.active.clear();
         self.row_count = 0;
         self.spans.clear();
         self.scopes.clear();
@@ -485,7 +485,8 @@ impl ThreadSpanBuffer {
     }
 
     /// Rebuild the trace table from the rows a retain kept, renumbering them,
-    /// so it holds the traces of live rows only.
+    /// so it holds the traces of live rows only. The kept rows are the open
+    /// spans' pairs, so the span table names every one of them.
     fn retain_traces(&mut self) {
         let mut kept = std::mem::take(&mut self.traces_scratch);
         kept.clear();
@@ -493,18 +494,20 @@ impl ThreadSpanBuffer {
         self.trace_remap.clear();
         self.trace_remap.resize(self.traces.len(), u32::MAX);
         let capacity = self.capacity;
-        for row in 0..self.row_count {
-            let block = &mut self.blocks[row / capacity];
-            let local = row % capacity;
-            let old = block.traces[local] as usize;
-            let mut slot = self.trace_remap[old];
-            if slot == u32::MAX {
-                slot = u32::try_from(kept.len()).expect("a row store's live traces fit u32");
-                kept.push(self.traces[old].clone());
-                self.trace_slots.insert(self.traces[old].clone(), slot);
-                self.trace_remap[old] = slot;
+        for record in self.spans.values() {
+            for row in [record.start_row, record.completion_row] {
+                let (block, local) = Self::block_row(row as usize, capacity);
+                let block = &mut self.blocks[block];
+                let old = block.traces[local] as usize;
+                let mut slot = self.trace_remap[old];
+                if slot == u32::MAX {
+                    slot = u32::try_from(kept.len()).expect("a row store's live traces fit u32");
+                    kept.push(self.traces[old].clone());
+                    self.trace_slots.insert(self.traces[old].clone(), slot);
+                    self.trace_remap[old] = slot;
+                }
+                block.traces[local] = slot;
             }
-            block.traces[local] = slot;
         }
         std::mem::swap(&mut self.traces, &mut kept);
         kept.clear();
@@ -538,33 +541,38 @@ impl ThreadSpanBuffer {
         let mut fresh = StringArena::new(MAX_STRING_ARENA_BYTES);
         let old = &self.arena;
         let capacity = self.capacity;
-        for row in 0..self.row_count {
-            let block = &mut self.blocks[row / capacity];
-            let local = row % capacity;
-            if let Some(SharedStr::Arena(handle)) = block.messages[local] {
-                block.messages[local] = Some(SharedStr::Arena(
-                    fresh
-                        .intern_str(old.resolve(handle))
-                        .expect("the kept text is a subset of an arena within the same budget"),
-                ));
-            }
-            for (field, meta) in self.fields.iter().enumerate() {
-                if !matches!(meta.strategy, FieldStrategy::Category | FieldStrategy::Text) {
-                    continue;
+        let fields = self.fields;
+        // The rows kept are the span table's pairs: none after a reset, the
+        // open spans' after a retain.
+        for record in self.spans.values() {
+            for row in [record.start_row, record.completion_row] {
+                let (block, local) = Self::block_row(row as usize, capacity);
+                let block = &mut self.blocks[block];
+                if let Some(SharedStr::Arena(handle)) = block.messages[local] {
+                    block.messages[local] = Some(SharedStr::Arena(
+                        fresh
+                            .intern_str(old.resolve(handle))
+                            .expect("the kept text is a subset of an arena within the same budget"),
+                    ));
                 }
-                let Some(cell) = block.attributes.get(field, local) else {
-                    continue;
-                };
-                // A foreign writer may have stored an ordinal the arena never
-                // issued; it decodes as absent, and stays absent.
-                if let Some(text) = u32::try_from(cell)
-                    .ok()
-                    .and_then(|ordinal| old.get(ordinal))
-                {
-                    let ordinal = fresh
-                        .intern(text)
-                        .expect("the kept text is a subset of an arena within the same budget");
-                    block.attributes.set(field, local, u64::from(ordinal));
+                for (field, meta) in fields.iter().enumerate() {
+                    if !matches!(meta.strategy, FieldStrategy::Category | FieldStrategy::Text) {
+                        continue;
+                    }
+                    let Some(cell) = block.attributes.get(field, local) else {
+                        continue;
+                    };
+                    // A foreign writer may have stored an ordinal the arena never
+                    // issued; it decodes as absent, and stays absent.
+                    if let Some(text) = u32::try_from(cell)
+                        .ok()
+                        .and_then(|ordinal| old.get(ordinal))
+                    {
+                        let ordinal = fresh
+                            .intern(text)
+                            .expect("the kept text is a subset of an arena within the same budget");
+                        block.attributes.set(field, local, u64::from(ordinal));
+                    }
                 }
             }
         }
@@ -580,6 +588,9 @@ impl ThreadSpanBuffer {
         self.capacity
     }
     #[inline]
+    /// Rows held: written and not yet released. A store that has not retained
+    /// since its last reset holds exactly rows `0..row_count`; after a retain
+    /// the held rows lie wherever they were written.
     pub const fn row_count(&self) -> usize {
         self.row_count
     }
@@ -651,14 +662,28 @@ impl ThreadSpanBuffer {
             _ => None,
         }
     }
-    fn ensure_rows(&mut self, count: usize) {
-        if self.blocks[self.active_blocks - 1].remaining() < count {
-            if self.active_blocks == self.blocks.len() {
-                self.blocks
-                    .push(ThreadSpanBlock::new(self.capacity, self.fields.len()));
-            }
-            self.active_blocks += 1;
+    /// The block appends move to next: the first free block after the append
+    /// block in index order, wrapping, else a new one at index `blocks.len()`.
+    /// A store that has not retained since its last reset holds blocks `0..n`
+    /// and moves to block `n`, so its rows stay dense from row 0.
+    fn free_block(&self) -> usize {
+        let after = self.active.last().map_or(0, |&last| last as usize + 1);
+        let allocated = self.blocks.len();
+        (after..allocated)
+            .chain(0..after)
+            .find(|&index| self.blocks[index].rows == 0)
+            .unwrap_or(allocated)
+    }
+    /// Take [`Self::free_block`] for appends, allocating it if it is new.
+    fn next_block(&mut self) -> usize {
+        let index = self.free_block();
+        if index == self.blocks.len() {
+            self.blocks
+                .push(ThreadSpanBlock::new(self.capacity, self.fields.len()));
         }
+        self.active
+            .push(u32::try_from(index).expect("thread buffer blocks fit u32"));
+        index
     }
     fn allocate_span_id(&mut self) -> u32 {
         loop {
@@ -673,8 +698,10 @@ impl ThreadSpanBuffer {
         }
     }
     fn append_row(&mut self, input: RowInput) -> u32 {
-        self.ensure_rows(1);
-        let block_index = self.active_blocks - 1;
+        let block_index = match self.active.last() {
+            Some(&last) if self.blocks[last as usize].remaining() > 0 => last as usize,
+            _ => self.next_block(),
+        };
         let row = self.blocks[block_index].write_row(input);
         self.row_count += 1;
         u32::try_from(block_index * self.capacity + row).expect("thread buffer rows fit u32")
@@ -755,8 +782,6 @@ impl ThreadSpanBuffer {
         })
     }
     fn open_rows(&mut self, input: OpenInput) -> Result<u32, ThreadBufferError> {
-        // Append each row independently so a pair crossing an overflow boundary
-        // remains dense instead of skipping the last slot in the old block.
         let parent_thread_id = if input.parent_span_id == 0 {
             0
         } else {
@@ -768,6 +793,16 @@ impl ThreadSpanBuffer {
             None
         };
         let trace = self.trace_slot(input.trace_id);
+        // The completion row is the start row's successor: a lane addresses it
+        // as `start + 1`. A pair crosses a block boundary only when appends
+        // move on to the block that follows in index order; otherwise the pair
+        // starts in the next block and the last slot stays unwritten.
+        if let Some(&last) = self.active.last() {
+            let last = last as usize;
+            if self.blocks[last].remaining() == 1 && self.free_block() != last + 1 {
+                self.next_block();
+            }
+        }
         let start_row = self.append_row(RowInput {
             timestamp: input.timestamp,
             trace,
@@ -810,20 +845,22 @@ impl ThreadSpanBuffer {
     fn block_row(row: usize, capacity: usize) -> (usize, usize) {
         (row / capacity, row % capacity)
     }
+    /// The block and slot of a held row. A slot no span holds, never written,
+    /// released by a flush, or in a free block, is refused.
     fn block_at(&self, row: usize) -> Result<(&ThreadSpanBlock, usize), ThreadBufferError> {
-        if row >= self.row_count {
-            return Err(ThreadBufferError::InvalidRow(row));
-        }
         let (block, local) = Self::block_row(row, self.capacity);
-        Ok((&self.blocks[block], local))
+        match self.blocks.get(block) {
+            Some(block) if local < block.rows && block.span_ids[local] != RELEASED => {
+                Ok((block, local))
+            }
+            _ => Err(ThreadBufferError::InvalidRow(row)),
+        }
     }
     fn block_at_mut(
         &mut self,
         row: usize,
     ) -> Result<(&mut ThreadSpanBlock, usize), ThreadBufferError> {
-        if row >= self.row_count {
-            return Err(ThreadBufferError::InvalidRow(row));
-        }
+        self.block_at(row)?;
         let (block, local) = Self::block_row(row, self.capacity);
         Ok((&mut self.blocks[block], local))
     }
@@ -1073,6 +1110,8 @@ impl ThreadSpanBuffer {
         self.set_scope(span_id, &[(name, Some(value))])
     }
     /// Materialize scope values for one row window. This is intentionally a flush-time operation and uses validity-aware range fills; direct row writes remain authoritative.
+    /// A window is a range of row indexes, so it names the rows of a store
+    /// that has not retained since its last reset, which are dense.
     pub fn materialize_scope_window(
         &mut self,
         start_row: usize,
@@ -1087,23 +1126,34 @@ impl ThreadSpanBuffer {
         let mut filled = 0usize;
         let mut row = start_row;
         while row < end_row {
-            let (block_index, local) = Self::block_row(row, self.capacity);
-            let block_end = ((block_index + 1) * self.capacity).min(end_row);
+            let (block, local) = Self::block_row(row, self.capacity);
+            let end = local + (end_row - row).min(self.capacity - local);
+            filled += self.materialize_block(block, local, end)?;
+            row += end - local;
+        }
+        Ok(filled)
+    }
+    /// Fill scope values over slots `from..to` of one block, one run of a
+    /// span's rows at a time. Slots past the written ones and released slots
+    /// belong to no span, so nothing is filled there.
+    fn materialize_block(
+        &mut self,
+        block_index: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<usize, ThreadBufferError> {
+        let fields = self.fields;
+        let to = to.min(self.blocks[block_index].rows);
+        let mut filled = 0usize;
+        let mut local = from;
+        while local < to {
             let block = &self.blocks[block_index];
             let span_id = block.span_ids[local];
-            let mut run_end = row + 1;
-            while run_end < block_end && block.span_ids[run_end % self.capacity] == span_id {
+            let mut run_end = local + 1;
+            while run_end < to && block.span_ids[run_end] == span_id {
                 run_end += 1;
             }
-            let scope = self.scopes.get(&span_id).cloned().flatten();
-            if let Some(scope) = scope {
-                let fields = self.fields;
-                let capacity = self.capacity;
-                let local_end = if run_end == block_end && run_end.is_multiple_of(capacity) {
-                    capacity
-                } else {
-                    run_end % capacity
-                };
+            if let Some(scope) = self.scopes.get(&span_id).cloned().flatten() {
                 for (name, value) in scope.iter() {
                     let Some(index) = fields.iter().position(|field| field.name == name) else {
                         continue;
@@ -1114,7 +1164,7 @@ impl ThreadSpanBuffer {
                         Some(cell) => {
                             filled += self.blocks[block_index]
                                 .attributes
-                                .fill_unset(index, local, local_end, cell);
+                                .fill_unset(index, local, run_end, cell);
                         }
                         None => crate::scope::report_scope_mismatch(
                             name,
@@ -1124,7 +1174,7 @@ impl ThreadSpanBuffer {
                     }
                 }
             }
-            row = run_end;
+            local = run_end;
         }
         Ok(filled)
     }
@@ -1142,95 +1192,82 @@ impl ThreadSpanBuffer {
             timestamp,
         })
     }
-    /// Select the rows one streaming flush emits: every written row except the
-    /// reserved completion row of a span that is still open. An open span's
-    /// start row IS emitted — it is how a reader sees a span that has not ended
-    /// — and is emitted again by every later flush while the span stays open,
-    /// the last copy carrying the final attribute values. Scope is materialized
-    /// over the emitted rows first.
+    /// Select the rows one streaming flush emits, in write order: every held
+    /// row except the reserved completion row of a span that is still open. An
+    /// open span's start row IS emitted — it is how a reader sees a span that
+    /// has not ended — and is emitted again by every later flush while the span
+    /// stays open, the last copy carrying the final attribute values. Scope is
+    /// materialized over the emitted rows first.
     pub fn flush_rows(&mut self, rows: &mut Vec<usize>) -> Result<(), ThreadBufferError> {
-        self.materialize_scope_window(0, self.row_count)?;
+        for position in 0..self.active.len() {
+            let block = self.active[position] as usize;
+            let written = self.blocks[block].rows;
+            self.materialize_block(block, 0, written)?;
+        }
         rows.clear();
-        rows.extend((0..self.row_count).filter(|&row| {
-            let span_id = self.blocks[row / self.capacity].span_ids[row % self.capacity];
-            self.spans
-                .get(&span_id)
-                .is_none_or(|record| record.ended || record.completion_row as usize != row)
-        }));
+        for &index in &self.active {
+            let block = &self.blocks[index as usize];
+            let base = index as usize * self.capacity;
+            rows.extend((0..block.rows).filter_map(|local| {
+                let span_id = block.span_ids[local];
+                let row = base + local;
+                (span_id != RELEASED
+                    && self
+                        .spans
+                        .get(&span_id)
+                        .is_none_or(|record| record.ended || record.completion_row as usize != row))
+                .then_some(row)
+            }));
+        }
         Ok(())
     }
-    /// Drop every flushed row while keeping the spans still open, so a
-    /// long-lived store can flush without losing a span that outlives the
-    /// window. Each open span's start row and reserved completion row move to
-    /// the front, in open order; everything else — completed spans, log rows,
-    /// their scopes — is released. Blocks keep their allocations.
+    /// Release every flushed row where it lies and keep the spans still open,
+    /// so a long-lived store can flush without losing a span that outlives the
+    /// window. An open span's start and completion rows stay in the slots they
+    /// were written to; everything else (completed spans, log rows, their
+    /// scopes) is released. A block that holds no open span's row is cleared
+    /// and returns to the pool; one that does stays, its other slots released
+    /// until those spans end.
     ///
-    /// Two rows move per open span. Nothing else is copied, and nothing is
-    /// allocated once the working list has grown to the open-span count —
-    /// unless the arena has passed its reclaim threshold, when the kept rows'
-    /// text moves to a fresh arena ([`Self::reclaim_text`]).
+    /// Nothing moves, so nothing is copied: a flush costs a clear per freed
+    /// block and a span id store per written slot of a block an open span
+    /// holds. Nothing is allocated once the working set has grown to the block
+    /// count, unless the arena has passed its reclaim threshold, when the kept
+    /// rows' text moves to a fresh arena ([`Self::reclaim_text`]).
     pub fn retain_open(&mut self) {
-        let mut open = std::mem::take(&mut self.open_scratch);
-        open.clear();
-        open.extend(
-            self.spans
-                .iter()
-                .filter(|(_, record)| !record.ended)
-                .map(|(&id, record)| (record.start_row, id)),
-        );
-        open.sort_unstable();
         self.spans.retain(|_, record| !record.ended);
         let spans = &self.spans;
         self.scopes.retain(|id, _| spans.contains_key(id));
 
         let capacity = self.capacity;
-        let mut next = 0usize;
-        for &(start_row, span_id) in &open {
-            // A span's rows are consecutive and open spans are visited in row
-            // order, so the destination never passes the source: moving forward
-            // in place overwrites only rows already moved or released.
-            for source in [start_row as usize, start_row as usize + 1] {
-                if source != next {
-                    let input = self.blocks[source / capacity].row_input(source % capacity);
-                    let (to_block, to) = (next / capacity, next % capacity);
-                    let block = &mut self.blocks[to_block];
-                    block.timestamps[to] = input.timestamp;
-                    block.traces[to] = input.trace;
-                    block.headers[to] = input.header;
-                    block.span_ids[to] = input.span_id;
-                    block.parent_thread_ids[to] = input.parent_thread_id;
-                    block.parent_span_ids[to] = input.parent_span_id;
-                    block.lines[to] = input.line;
-                    block.messages[to] = input.message;
-                    let from = &self.blocks[source / capacity].attributes;
-                    self.blocks[to_block]
-                        .attributes
-                        .copy_row(to, from, source % capacity);
-                }
-                next += 1;
+        let pinned = &mut self.pinned;
+        pinned.clear();
+        pinned.resize(self.blocks.len(), false);
+        for record in self.spans.values() {
+            pinned[record.start_row as usize / capacity] = true;
+            pinned[record.completion_row as usize / capacity] = true;
+        }
+        let blocks = &mut self.blocks;
+        self.active.retain(|&index| {
+            let block = &mut blocks[index as usize];
+            if pinned[index as usize] {
+                let written = block.rows;
+                block.span_ids[..written].fill(RELEASED);
+                true
+            } else {
+                block.clear();
+                false
             }
-            let record = self
-                .spans
-                .get_mut(&span_id)
-                .expect("open span retained above");
-            record.start_row = u32::try_from(next - 2).expect("thread buffer rows fit u32");
-            record.completion_row = u32::try_from(next - 1).expect("thread buffer rows fit u32");
+        });
+        for (&span_id, record) in &self.spans {
+            for row in [record.start_row, record.completion_row] {
+                let (block, local) = Self::block_row(row as usize, capacity);
+                self.blocks[block].span_ids[local] = span_id;
+            }
         }
-        let kept_blocks = next.div_ceil(capacity).max(1);
-        for (index, block) in self.blocks[..self.active_blocks].iter_mut().enumerate() {
-            let keep = next.saturating_sub(index * capacity).min(capacity);
-            block.truncate(keep);
-        }
-        self.active_blocks = kept_blocks;
-        self.row_count = next;
-        self.open_scratch = open;
+        self.row_count = 2 * self.spans.len();
         self.retain_traces();
         self.reclaim_text();
-    }
-    /// Blocks currently holding rows. Row `r` lives in block `r / capacity`.
-    #[inline]
-    pub fn block_count(&self) -> usize {
-        self.active_blocks
     }
     /// The attribute cells of `block`, for a foreign writer's view. A block
     /// that exists keeps this allocation for the store's whole life, recycled
@@ -1319,7 +1356,7 @@ impl ThreadSpanBuffer {
             .get(&span_id)
             .map(|record| record.start_row as usize)
     }
-    /// Iterate span IDs in deterministic open order for Arrow completion synthesis.
+    /// Iterate span IDs in row order, which is deterministic, for Arrow completion synthesis.
     pub fn span_ids(&self) -> impl Iterator<Item = u32> + '_ {
         let mut ids: Vec<(u32, u32)> = self
             .spans
@@ -1421,25 +1458,88 @@ mod tests {
         assert!(buffer.span_trace_id(done).is_none());
 
         // The retained span still takes rows and completes, and its tag lands
-        // on the start row the next flush re-emits.
+        // on the start row the next flush re-emits. The rows the flush
+        // released stay released: the late log takes the next unwritten slot.
         buffer
             .write_tag(pending, 12, ColumnValue::Number(5.0))
             .unwrap();
-        buffer
+        let late = buffer
             .append_log(pending, EntryType::Info, Some("late".into()), 5, 5)
             .unwrap();
+        assert_eq!(late, 5);
+        assert_eq!(buffer.span_id_at(2), None, "a released row reads as absent");
         buffer.end_ok(pending, 6).unwrap();
         buffer.flush_rows(&mut rows).unwrap();
-        assert_eq!(rows, vec![0, 1, 2]);
+        assert_eq!(rows, vec![0, 1, 5]);
         assert_eq!(buffer.timestamp_at(1), Some(6));
         assert_eq!(buffer.dynamic_message_at(0), Some("pending"));
-        assert_eq!(buffer.dynamic_message_at(2), Some("late"));
+        assert_eq!(buffer.dynamic_message_at(5), Some("late"));
         assert_eq!(
             buffer.attribute_at(0, 12),
             Some(ColumnValueRef::Number(5.0))
         );
         buffer.retain_open();
         assert_eq!(buffer.row_count(), 0);
+    }
+
+    fn fill(buffer: &mut ThreadSpanBuffer, span: u32, rows: usize) {
+        for _ in 0..rows {
+            buffer
+                .append_log(span, EntryType::Info, Some("fill".into()), 1, 1)
+                .unwrap();
+        }
+    }
+
+    /// A span's completion row is its start row's successor, which a lane
+    /// relies on. Past a retain, the block after the append block may be one an
+    /// open span holds; a pair then starts in a fresh block rather than split
+    /// across blocks that are not adjacent, and a flush still reads every row
+    /// in write order.
+    #[test]
+    fn a_span_pair_stays_adjacent_when_the_next_block_is_held() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let first = buffer
+            .open_span(trace(), 0, 0, "first".into(), 1, 1)
+            .unwrap();
+        fill(&mut buffer, first, 6);
+        let ended = buffer
+            .open_span(trace(), 0, 0, "ended".into(), 1, 1)
+            .unwrap();
+        fill(&mut buffer, ended, 6);
+        let second = buffer
+            .open_span(trace(), 0, 0, "second".into(), 1, 1)
+            .unwrap();
+        fill(&mut buffer, second, 6);
+        buffer.end_ok(ended, 2).unwrap();
+        assert_eq!(
+            (buffer.start_row(first), buffer.start_row(second)),
+            (Some(0), Some(16))
+        );
+        let mut rows = Vec::new();
+        buffer.flush_rows(&mut rows).unwrap();
+        buffer.retain_open();
+
+        // Block 1 held only finished rows, so it is free again and takes the
+        // next rows, up to its last slot.
+        fill(&mut buffer, first, 7);
+        let pair = buffer
+            .open_span(trace(), 0, 0, "pair".into(), 3, 1)
+            .unwrap();
+        let start = buffer.start_row(pair).unwrap();
+        assert_eq!(
+            start, 24,
+            "block 2 is held, so the pair starts in a fresh block"
+        );
+        assert_eq!(buffer.completion_row(pair), Some(start + 1));
+        assert_eq!(
+            buffer.span_id_at(15),
+            None,
+            "the slot the pair skipped holds no row"
+        );
+
+        buffer.flush_rows(&mut rows).unwrap();
+        let expected: Vec<usize> = [0, 16].into_iter().chain(8..15).chain([24]).collect();
+        assert_eq!(rows, expected);
     }
     #[test]
     fn recycled_blocks_keep_their_addresses_and_forget_their_rows() {

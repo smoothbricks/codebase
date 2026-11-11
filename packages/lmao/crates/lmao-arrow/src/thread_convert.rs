@@ -109,7 +109,7 @@ pub fn convert_thread_span_rows(
     vocabulary: &StableVocabularyCatalog<'_>,
     rows: &[usize],
 ) -> Result<RecordBatch, ConvertError> {
-    if let Some(&row) = rows.iter().find(|&&row| row >= buffer.row_count()) {
+    if let Some(&row) = rows.iter().find(|&&row| buffer.span_id_at(row).is_none()) {
         return Err(ConvertError::MissingSourceValue {
             row,
             column: "thread-buffer selection",
