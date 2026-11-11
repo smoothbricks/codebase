@@ -1552,14 +1552,14 @@ gateway that starts with no build-cache volume mounted starts no timer and says 
 store (15_capabilities.md, "mbx detection"); its next start sweeps. While no mbx is installed, or its link does not
 resolve, no run starts; the gateway says why on its stderr once, and again only when the reason changes.
 
-Each run leads a process group of its own, so neither a job's retirement nor launchd's teardown of the gateway's group
-(launchd.plist(5), `AbandonProcessGroup`, which the agent leaves unset) reaches it. Its stdin and stdout are
-`/dev/null`, and its stderr is appended to mbx's own sweep log, `<store>/actions/gc/v1/sweep.log`, as mbx's own
-collector's is. The timer opens the log once, when it starts, and every run appends through it; a log that cannot be
-opened leaves every run's stderr discarded, said on the gateway's stderr, since a full disk is when the sweep matters
-most. The thread waits for each run's exit before it counts the next five minutes, so the gateway never starts a run
-beside a running one. That wait has no bound: the run's own end ends it, and a run started beside it would find
-`collector.lock` held and exit. The gateway's stderr names every run,
+<a id="smoo/cowshed!n/mbx-sweep-own-group"></a>Each run leads a process group of its own, so neither a job's retirement
+nor launchd's teardown of the gateway's group (launchd.plist(5), `AbandonProcessGroup`, which the agent leaves unset)
+reaches it. Its stdin and stdout are `/dev/null`, and its stderr is appended to mbx's own sweep log,
+`<store>/actions/gc/v1/sweep.log`, as mbx's own collector's is. The timer opens the log once, when it starts, and every
+run appends through it; a log that cannot be opened leaves every run's stderr discarded, said on the gateway's stderr,
+since a full disk is when the sweep matters most. The thread waits for each run's exit before it counts the next five
+minutes, so the gateway never starts a run beside a running one. That wait has no bound: the run's own end ends it, and
+a run started beside it would find `collector.lock` held and exit. The gateway's stderr names every run,
 `cowshed: mbx sweep pid <pid> started: <program> gc --automatic, MBX_CACHE_DIR=<store>`, and its exit status and wall
 time.
 
@@ -1573,7 +1573,11 @@ The regressions are `cowshed-core`'s `a_build_never_starts_the_automatic_sweep`,
 timer starts a stand-in for the installed mbx behind a fixture home's link. When the job concludes, its retirement
 signals no sweep, the sweep runs on with `HOME`, the store and no `MBX_GC_AUTO` in its environment, and its stderr is in
 the store's sweep log; the same sweep forked inside a job is retired with it. Each sweep reports whether another of its
-store was running when it started, and the next one starts, alone, only once the first has ended.
+store was running when it started, and the next one starts, alone, only once the first has ended. Since each sweep leads
+its own group, nothing but its fixture ends one a failed test left waiting: the fixture's store is its fake's release
+fifo's only writer, so dropping it, on every way out of a test, closes the fifo, and it kills the group of any sweep
+still running after that. `a_failing_body_leaves_no_sweep_behind` panics while a sweep waits for its release and finds
+no member of that sweep's group running.
 
 ## Host scheduling
 

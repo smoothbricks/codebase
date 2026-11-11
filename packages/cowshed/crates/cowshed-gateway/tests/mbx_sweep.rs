@@ -228,6 +228,8 @@ fn install_fake_mbx(root: &Path) -> (PathBuf, PathBuf) {
     (home, link)
 }
 
+//#region smoo/cowshed!n/mbx-sweep-own-group
+
 /// A test whose body fails leaves no sweep behind: every sweep the fixture saw start ends with
 /// its fixture, on every way out of a test, a panic included. On 2026-11-11 a sweep of a run that
 /// failed an assertion waited for its release an hour after its test had ended: it leads a
@@ -385,3 +387,4 @@ fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
     swept.release();
     exited(second.pid);
 }
+//#endregion smoo/cowshed!n/mbx-sweep-own-group
