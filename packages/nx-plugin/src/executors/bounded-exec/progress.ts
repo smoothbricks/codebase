@@ -1,5 +1,6 @@
 import { StringDecoder } from 'node:string_decoder';
 import typia, { type tags } from 'typia';
+import type { GoRunSummary } from './go-run-summary.js';
 import { invocationSpan, withInvocationFlag } from './runner-sizing.js';
 import type { NativeTestResult } from './test-result-writer.js';
 import { BUN_TEST, GO_TEST, GO_TEST_RUNNER, NEXTEST_RUN } from './verdict.js';
@@ -37,6 +38,8 @@ export interface RunProgress {
   /** The tests the runner reported running and has not reported finished, in the order it first named them. */
   inFlight(): string[];
   error(): string | null;
+  /** The Go run so far, by its top-level tests; null for a command that runs no Go tests. */
+  goSummary(): GoRunSummary | null;
 }
 
 export type OutputStream = 'stdout' | 'stderr';
@@ -126,6 +129,10 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
   const running = new Set<string>();
   const packages = new Map<string, Set<string>>();
   const goOutput = new Map<string, string[]>();
+  // A Go run prints no count: its events are summed here, by top-level test, for the summary its output ends with.
+  const goVerdicts = new Map<string, { package: string; test: string; status: 'pass' | 'fail' | 'skip' }>();
+  const goPackages = new Set<string>();
+  const goFailedPackages: string[] = [];
   const decoders: Record<OutputStream, StringDecoder> = {
     stdout: new StringDecoder('utf8'),
     stderr: new StringDecoder('utf8'),
@@ -156,6 +163,7 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
       switch (event.Action) {
         case 'start':
           packages.set(event.Package, new Set());
+          goPackages.add(event.Package);
           return false;
         case 'run':
           packages.get(event.Package)?.add(event.Test);
@@ -164,10 +172,21 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
         case 'fail':
         case 'skip':
         case 'bench':
-          if (event.Test === undefined) packages.delete(event.Package);
-          else {
+          if (event.Test === undefined) {
+            packages.delete(event.Package);
+            goPackages.add(event.Package);
+            // A package that fails with no failed test of its own did not get to run them: a build, a TestMain.
+            if (
+              event.Action === 'fail' &&
+              ![...goVerdicts.values()].some((test) => test.package === event.Package && test.status === 'fail')
+            )
+              goFailedPackages.push(event.Package);
+          } else {
             packages.get(event.Package)?.delete(event.Test);
             const id = `${event.Package}::${event.Test}`;
+            // A subtest's verdict is its parent's, which Go reports after it: only the parent is counted.
+            if (event.Action !== 'bench' && !event.Test.includes('/'))
+              goVerdicts.set(id, { package: event.Package, test: event.Test, status: event.Action });
             if (event.Action !== 'bench' && goResults)
               closed?.({
                 id,
@@ -297,6 +316,22 @@ export function createRunProgress(command = '', closed?: (result: NativeTestResu
       return progressed;
     },
     error: () => failure,
+    goSummary: () => {
+      if (!goResults) return null;
+      const verdicts = [...goVerdicts.values()];
+      const count = (status: 'pass' | 'fail' | 'skip'): number =>
+        verdicts.filter((test) => test.status === status).length;
+      return {
+        passed: count('pass'),
+        failed: count('fail'),
+        skipped: count('skip'),
+        packages: goPackages.size,
+        failedTests: verdicts
+          .filter((test) => test.status === 'fail')
+          .map((test) => ({ package: test.package, test: test.test })),
+        failedPackages: [...goFailedPackages],
+      };
+    },
     inFlight: () => [
       ...running,
       ...[...packages].flatMap(([name, tests]) =>

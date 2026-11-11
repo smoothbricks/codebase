@@ -111,7 +111,7 @@ describe('a Go run summary', () => {
       const module = root.slice(dirname(root).length + 1);
       expect(text).toBe(
         [
-          'go test summary: 4 passed, 2 failed, 1 skipped, 4 packages',
+          'go test summary: 3 passed, 2 failed, 1 skipped, 4 packages',
           `go test failed: ${module}/fails/fails_test.go:6 TestFails`,
           `go test failed: ${module}/fails/fails_test.go:8 TestParent`,
           '',

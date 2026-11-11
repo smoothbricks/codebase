@@ -19,6 +19,7 @@ import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment }
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import type { CpuRise } from './cpu-rise.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
+import { declaredGoTests, goRunSummaryText } from './go-run-summary.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { type LeafPeak, PEAK_FD, peakWaiter, readWaiterReport, underWaiter } from './leaf-peak.js';
@@ -1459,6 +1460,16 @@ async function runCommand(
   }
   const peakBytes = reported?.kind === 'measured' ? reported.bytes : null;
 
+  // A Go run sums nothing itself, and a reader that keeps part of a long output cannot count it: the sum ends the output.
+  const goRun = progress.goSummary();
+  if (goRun !== null) {
+    appendStdout(
+      goRunSummaryText(
+        goRun,
+        declaredGoTests(goRun.failedTests, cwd, context.root, mergeEnv(lease?.directory ?? ordinaryTemp, env)),
+      ),
+    );
+  }
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
   const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
