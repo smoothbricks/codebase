@@ -163,11 +163,11 @@ fn exited(pid: u32) {
         .expect("the sweep exits");
 }
 
-#[test]
-fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
-    let root = fixture_dir::secure_fixture_dir(&format!("mbx-sweep-{}", std::process::id()));
-    let home = root.path().join("home");
-    let program = root.path().join("mbx-pin/bin/mbx");
+/// The installed mbx under `root`: the fake behind the link setup makes, in a home of the
+/// fixture's own. Answers that home and the link.
+fn install_fake_mbx(root: &Path) -> (PathBuf, PathBuf) {
+    let home = root.join("home");
+    let program = root.join("mbx-pin/bin/mbx");
     std::fs::create_dir_all(program.parent().expect("a bin directory")).expect("the pin's bin");
     std::fs::write(&program, FAKE_MBX).expect("the fake mbx");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
@@ -175,6 +175,54 @@ fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
     let link = cowshed_core::capabilities::mbx::host_link(&home);
     std::fs::create_dir_all(link.parent().expect("the installed bin")).expect("the installed bin");
     std::os::unix::fs::symlink(&program, &link).expect("the installed mbx link");
+    (home, link)
+}
+
+/// A test whose body fails leaves no sweep behind: every sweep the fixture saw start ends with
+/// its fixture, on every way out of a test, a panic included. On 2026-11-11 a sweep of a run that
+/// failed an assertion waited for its release an hour after its test had ended: it leads a
+/// process group of its own, as every gateway sweep does, so nothing else ends it.
+#[test]
+fn a_failing_body_leaves_no_sweep_behind() {
+    let root = fixture_dir::secure_fixture_dir(&format!("mbx-sweep-fail-{}", std::process::id()));
+    let (home, _) = install_fake_mbx(root.path());
+    let store = root.path().join("store");
+    let (sent, started) = mpsc::channel();
+    // The closure owns everything it touches; nothing it leaves half-written is read after it.
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let swept = Store::new(store.clone());
+        let _timer = MbxSweep {
+            home,
+            store,
+            every: Duration::from_millis(10),
+        }
+        .start()
+        .expect("start the sweep timer");
+        let first = swept.next();
+        sent.send(first.pid)
+            .expect("the test hears the sweep's pid");
+        panic!(
+            "a failing body, while sweep pid {} waits for its release",
+            first.pid
+        );
+    }));
+    assert!(failed.is_err(), "the body failed");
+    let pid = started
+        .try_recv()
+        .expect("a sweep started before the body failed");
+    let deadline = cowshed_os::deadline::start("a failed body's sweep", REAP);
+    let ended = cowshed_os::deadline::await_exit("fake sweep", pid, &deadline, Progress::Nothing);
+    let left = cowshed_os::process::group_members(libc::pid_t::try_from(pid).expect("a pid"));
+    assert!(
+        ended.is_ok() && left.as_ref().is_ok_and(Vec::is_empty),
+        "the sweep's group ended with its failed test: {ended:?}; still running: {left:?}"
+    );
+}
+
+#[test]
+fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
+    let root = fixture_dir::secure_fixture_dir(&format!("mbx-sweep-{}", std::process::id()));
+    let (home, link) = install_fake_mbx(root.path());
     let swept = Store::new(root.path().join("store"));
 
     // A job runs, and the gateway's timer starts the sweep meanwhile.
