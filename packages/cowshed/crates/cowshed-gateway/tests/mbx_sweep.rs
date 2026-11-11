@@ -12,12 +12,13 @@
 #[path = "support/fixture_dir.rs"]
 mod fixture_dir;
 
+use std::fs::File;
 use std::io::{BufRead as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use cowshed_core::api::dto::JobId;
@@ -26,23 +27,29 @@ use cowshed_core::runtime::process_monitor::ProcessMonitor;
 use cowshed_core::runtime::process_tree::{ProcessIdentity, TreeOwner};
 use cowshed_gateway::MbxSweep;
 use cowshed_os::deadline::{Progress, REAP};
+use cowshed_os::process::ExitWatch;
 use cowshed_os::test_backstop::ChildBackstop as _;
 
-/// The installed mbx's stand-in. It records its environment and says one line on stderr, then
-/// reports its start on its store's `started` fifo: its pid, whether another sweep of that store
-/// was running (`alone` or `stacked`, by an atomic `mkdir`), and its arguments. It runs until a
-/// line, or the end, arrives on its store's `release` fifo.
+/// The installed mbx's stand-in. It records its environment and says one line on stderr, opens
+/// its store's `release` fifo, then reports its start on its store's `started` fifo: its pid,
+/// whether another sweep of that store was running (`alone` or `stacked`, by an atomic `mkdir`),
+/// and its arguments. It runs until a line arrives on `release`, or the fifo's last writer, its
+/// [`Store`], closes it.
 const FAKE_MBX: &str = r#"#!/bin/sh
 env > "$MBX_CACHE_DIR/env.$$"
 echo "fake sweep $$" >&2
 if mkdir "$MBX_CACHE_DIR/running" 2>/dev/null; then alone=alone; else alone=stacked; fi
+exec 3< "$MBX_CACHE_DIR/release"
 printf '%s %s %s\n' "$$" "$alone" "$*" > "$MBX_CACHE_DIR/started"
-read -r _ < "$MBX_CACHE_DIR/release"
+read -r _ <&3
 [ "$alone" = stacked ] || rmdir "$MBX_CACHE_DIR/running"
 "#;
 
-/// How long a fixture waits for a sweep to report or to take its release.
+/// How long a fixture waits for a sweep to report.
 const BOUND: Duration = Duration::from_secs(30);
+
+/// How long a sweep the fixture released, or whose release fifo it closed, may take to end.
+const SETTLE: Duration = Duration::from_secs(5);
 
 /// One sweep's report of its start.
 #[derive(Debug)]
@@ -52,10 +59,19 @@ struct Start {
     args: String,
 }
 
-/// A store a sweep is pointed at, and the starts its sweeps report, in order.
+/// A store a sweep is pointed at, the starts its sweeps report, in order, and the end of every
+/// sweep that reported: on every way out of a test, a panic included, dropping the store closes
+/// its release fifo, which ends each sweep waiting on it, and kills the group of any sweep still
+/// running past [`SETTLE`]. Each sweep leads a process group of its own, as every gateway sweep
+/// does, so nothing else would end it.
 struct Store {
     root: PathBuf,
     starts: mpsc::Receiver<Start>,
+    /// The release fifo's only writer: a line releases the sweep waiting on it, and its close
+    /// releases every one.
+    release: Option<File>,
+    /// Each sweep that reported, by its pid and the watch on its exit taken while it ran.
+    watched: Arc<Mutex<Vec<(u32, ExitWatch)>>>,
 }
 
 fn fifo(path: &Path) {
@@ -71,51 +87,64 @@ fn fifo(path: &Path) {
     );
 }
 
-/// `work` on a thread of its own, answered within [`BOUND`]: a fifo's open blocks until its other
-/// end opens, and only the bound ends a wait for an end that never comes.
-fn within<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
-    let (sent, answer) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sent.send(work());
-    });
-    answer
-        .recv_timeout(BOUND)
-        .unwrap_or_else(|error| panic!("{what} within {BOUND:?}: {error}"))
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `path`, a fifo, open for reading and writing: its open never waits for the other end, and a
+/// reader on the fifo sees its end only once this descriptor closes.
+fn held(path: &Path) -> File {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("hold {} open: {error}", path.display()))
 }
 
 impl Store {
-    /// A store at `root` with its two fifos, and a reader of every start its sweeps report: each
-    /// open of `started` blocks until a sweep opens it to write, and reads every line written
-    /// before the last writer closes it.
+    /// A store at `root` with its two fifos, both held open by the store, and a reader of every
+    /// start its sweeps report, which watches each sweep's exit before the test hears of it.
     fn new(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).expect("the store");
         fifo(&root.join("started"));
         fifo(&root.join("release"));
+        let reports = held(&root.join("started"));
+        let release = held(&root.join("release"));
         let (sent, starts) = mpsc::channel();
-        let started = root.join("started");
+        let watched = Arc::new(Mutex::new(Vec::new()));
+        let watching = Arc::clone(&watched);
+        // This thread holds a writer of the fifo it reads, so its reads never see an end: it
+        // reads for as long as the test process lives, and a sweep's report never waits on it.
         std::thread::spawn(move || {
-            loop {
-                let Ok(file) = std::fs::File::open(&started) else {
-                    return;
+            for line in std::io::BufReader::new(reports).lines() {
+                let Ok(line) = line else { return };
+                let mut words = line.splitn(3, ' ');
+                let start = Start {
+                    pid: words
+                        .next()
+                        .and_then(|pid| pid.parse().ok())
+                        .expect("a pid"),
+                    alone: words.next() == Some("alone"),
+                    args: words.next().unwrap_or_default().to_owned(),
                 };
-                for line in std::io::BufReader::new(file).lines() {
-                    let Ok(line) = line else { return };
-                    let mut words = line.splitn(3, ' ');
-                    let start = Start {
-                        pid: words
-                            .next()
-                            .and_then(|pid| pid.parse().ok())
-                            .expect("a pid"),
-                        alone: words.next() == Some("alone"),
-                        args: words.next().unwrap_or_default().to_owned(),
-                    };
-                    if sent.send(start).is_err() {
-                        return;
+                // Watched before the test hears of it, so before its release: the sweep waits on
+                // the release fifo it opened before reporting, and its pid is still its own.
+                match ExitWatch::of(start.pid) {
+                    Ok(Some(watch)) => lock(&watching).push((start.pid, watch)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        cowshed_os::eprintln!("watch the exit of sweep pid {}: {error}", start.pid)
                     }
                 }
+                let _ = sent.send(start);
             }
         });
-        Self { root, starts }
+        Self {
+            root,
+            starts,
+            release: Some(release),
+            watched,
+        }
     }
 
     /// The next sweep's start, within [`BOUND`].
@@ -127,14 +156,35 @@ impl Store {
 
     /// Let the running sweep end.
     fn release(&self) {
-        let release = self.root.join("release");
-        within("a sweep took its release", move || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&release)
-                .and_then(|mut fifo| fifo.write_all(b"\n"))
-                .expect("release the sweep");
-        });
+        let mut release = self
+            .release
+            .as_ref()
+            .expect("the store holds its release fifo");
+        release.write_all(b"\n").expect("release the sweep");
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // The release fifo's only writer closes: every sweep waiting on it reads its end.
+        drop(self.release.take());
+        let watched = std::mem::take(&mut *lock(&self.watched));
+        for (pid, watch) in watched {
+            if matches!(watch.within(SETTLE), Ok(true)) {
+                continue;
+            }
+            // Still running past its release. Its watch, taken while it ran, has not fired, so
+            // the pid still names it, and it leads its own group.
+            let group = libc::pid_t::try_from(pid).expect("a pid");
+            // SAFETY: the process group a running sweep leads.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+            if !matches!(watch.within(SETTLE), Ok(true)) {
+                cowshed_os::eprintln!(
+                    "sweep pid {pid} of {} outlived its fixture's SIGKILL",
+                    self.root.display()
+                );
+            }
+        }
     }
 }
 
