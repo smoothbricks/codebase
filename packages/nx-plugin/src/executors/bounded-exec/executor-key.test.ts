@@ -78,6 +78,7 @@ const KEYED = [
   'executors/bounded-exec/child-exit-diagnostics.ts',
   'executors/bounded-exec/cpu-rise.ts',
   'executors/bounded-exec/executor.ts',
+  'executors/bounded-exec/go-run-summary.ts',
   'executors/bounded-exec/leaf-peak.ts',
   'executors/bounded-exec/lock-wait.ts',
   'executors/bounded-exec/mbx-pool.ts',
