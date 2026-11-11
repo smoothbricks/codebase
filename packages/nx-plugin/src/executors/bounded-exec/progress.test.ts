@@ -231,6 +231,37 @@ describe('run progress', () => {
     ]);
   });
 
+  it('sums a Go run by its top-level tests, naming each failed one and each package that failed without one', () => {
+    const progress = createRunProgress('go test -json ./...');
+    progress.scan(
+      'stdout',
+      `${[
+        '{"Action":"start","Package":"m/a"}',
+        '{"Action":"run","Package":"m/a","Test":"TestOk"}',
+        '{"Action":"pass","Package":"m/a","Test":"TestOk","Elapsed":0}',
+        '{"Action":"run","Package":"m/a","Test":"TestTable"}',
+        '{"Action":"pass","Package":"m/a","Test":"TestTable/case_one","Elapsed":0}',
+        '{"Action":"fail","Package":"m/a","Test":"TestTable/case_two","Elapsed":0}',
+        '{"Action":"fail","Package":"m/a","Test":"TestTable","Elapsed":0}',
+        '{"Action":"skip","Package":"m/a","Test":"TestLater","Elapsed":0}',
+        '{"Action":"fail","Package":"m/a","Elapsed":0.1}',
+        '{"Action":"start","Package":"m/b"}',
+        '{"Action":"fail","Package":"m/b","Elapsed":0}',
+        '{"Action":"start","Package":"m/c"}',
+        '{"Action":"pass","Package":"m/c","Elapsed":0}',
+      ].join('\n')}\n`,
+    );
+    // A subtest's verdict is its parent's: one failed test, not two, and the passing case is no second pass.
+    expect(progress.goSummary()).toEqual({
+      passed: 1,
+      failed: 1,
+      skipped: 1,
+      packages: 3,
+      failedTests: [{ package: 'm/a', test: 'TestTable' }],
+      failedPackages: ['m/b'],
+    });
+    expect(createRunProgress('bun test').goSummary()).toBeNull();
+  });
   it('maps a prebuilt Go test run as go test, scanning only its JSON', () => {
     const lines =
       '{"Action":"output","Package":"pkg","Test":"TestA","Output":"assertion\\n"}\n' +

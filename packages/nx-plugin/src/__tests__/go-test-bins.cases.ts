@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { declaredGoTests, goRunSummaryText } from '../executors/bounded-exec/go-run-summary.js';
 import { createRunProgress } from '../executors/bounded-exec/progress.js';
 import type { NativeTestResult } from '../executors/bounded-exec/test-result-writer.js';
 import { GO_TESTS_MANIFEST } from '../go-tests.js';
@@ -94,6 +95,33 @@ function recorded(command: string, stdout: string): NativeTestResult[] {
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
+describe('a Go run summary', () => {
+  it('names each failed test of a real run at the line that declares it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'go-run-summary-'));
+    try {
+      await writeModule(root, PARITY_MODULE);
+      const env = goEnvironment(root);
+      const direct = spawnSync('go', ['test', '-json', './...'], { cwd: root, env, encoding: 'utf8' });
+      const progress = createRunProgress('go test -json ./...');
+      progress.scan('stdout', direct.stdout);
+      const summary = progress.goSummary();
+      if (summary === null) throw new Error('a go test run has a summary');
+      // The workspace is the module's parent here, so a declaration reads `<module directory>/fails/fails_test.go`.
+      const text = goRunSummaryText(summary, declaredGoTests(summary.failedTests, root, dirname(root), env));
+      const module = root.slice(dirname(root).length + 1);
+      expect(text).toBe(
+        [
+          'go test summary: 4 passed, 2 failed, 1 skipped, 4 packages',
+          `go test failed: ${module}/fails/fails_test.go:6 TestFails`,
+          `go test failed: ${module}/fails/fails_test.go:8 TestParent`,
+          '',
+        ].join('\n'),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 describe('prebuilt Go test binaries', () => {
   it('run with the results and exit status go test -json gives the same packages', async () => {
     const root = await mkdtemp(join(tmpdir(), 'go-test-bins-'));
