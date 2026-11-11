@@ -1533,6 +1533,55 @@ mod tests {
         assert!(buffer.row_count() > 8);
     }
 
+    /// An open span stays in the rows it was written to across every flush: a
+    /// retain releases the rows around it and copies none of its own, so the
+    /// row its receipt named, and the cells a foreign view holds, stay the
+    /// span's until it ends. The open set churns from the front, behind
+    /// finished rows, which is what made a compacting retain copy every flush.
+    #[test]
+    fn a_flush_leaves_every_open_span_in_its_rows() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, FIELDS);
+        let mut rows = Vec::new();
+        let mut open = std::collections::VecDeque::new();
+        for window in 0..12u32 {
+            let timestamp = i64::from(window);
+            let done = buffer
+                .open_span(trace(), 0, 0, "done".into(), timestamp, 1)
+                .unwrap();
+            buffer
+                .append_log(done, EntryType::Info, Some("work".into()), 2, timestamp)
+                .unwrap();
+            buffer.end_ok(done, timestamp).unwrap();
+            let long = buffer
+                .open_span(trace(), 0, 0, "long".into(), timestamp, 3)
+                .unwrap();
+            let row = buffer.start_row(long).unwrap();
+            buffer
+                .write_tag(long, 12, ColumnValue::Number(f64::from(window)))
+                .unwrap();
+            open.push_back((long, row, f64::from(window)));
+            if open.len() > 3 {
+                let (oldest, _, _) = open.pop_front().unwrap();
+                buffer.end_ok(oldest, timestamp).unwrap();
+            }
+            buffer.flush_rows(&mut rows).unwrap();
+            buffer.retain_open();
+            assert_eq!(buffer.row_count(), 2 * open.len());
+            for &(span, row, tag) in &open {
+                assert_eq!(
+                    buffer.start_row(span),
+                    Some(row),
+                    "window {window}: open span {span} moved"
+                );
+                assert_eq!(buffer.completion_row(span), Some(row + 1));
+                assert_eq!(
+                    buffer.attribute_at(row, 12),
+                    Some(ColumnValueRef::Number(tag))
+                );
+            }
+        }
+    }
+
     #[test]
     fn abi_decoder_rejects_invalid_kind_and_value_pairs() {
         let mut buffer = ThreadSpanBuffer::new(7, 8, &[]);

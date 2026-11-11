@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "hot_path"
 harness = false
+
+[[bench]]
+name = "flush_open_spans"
+harness = false
