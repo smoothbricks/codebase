@@ -165,14 +165,13 @@ describe('PR preview cleanup workflow', () => {
     }
 
     const cleanup = renderPrPreviewCleanupWorkflowYaml({ runsOn: 'ubuntu-latest' });
-    // CI that runs on pushes to the events' base branch, and deploys staging from
-    // it where it deploys, so the merge's push is a run CI starts. That run queues
-    // behind a running staging deploy instead of canceling it; a validating CI has
-    // no deploy to protect and cancels.
+    // CI that runs on pushes to the events' base branch, so the merge's push is a run CI starts.
+    // That run queues behind a running one instead of canceling it, whether or not CI deploys
+    // staging from that branch.
     const baseBranchCi: Parameters<typeof renderCiWorkflowYaml>[0] = { ...deployingCi, pushBranches: ['private'] };
     const ciVariants = {
-      deploying: { ci: renderCiWorkflowYaml(baseBranchCi), stagingPushCancels: false },
-      validating: { ci: renderCiWorkflowYaml({ ...baseBranchCi, deploy: false }), stagingPushCancels: true },
+      deploying: renderCiWorkflowYaml(baseBranchCi),
+      validating: renderCiWorkflowYaml({ ...baseBranchCi, deploy: false }),
     };
 
     it('cancels the run it finds in progress in that group', () => {
@@ -180,7 +179,7 @@ describe('PR preview cleanup workflow', () => {
       expect(cancelsFor(cleanup, events.prClosedUnmerged)).toBe(true);
     });
 
-    for (const [variant, { ci, stagingPushCancels }] of Object.entries(ciVariants)) {
+    for (const [variant, ci] of Object.entries(ciVariants)) {
       describe(`with ${variant} CI`, () => {
         it('whether the close merged the pull request or not', () => {
           const prCi = groupFor(ci, events.prSynchronize);
@@ -195,7 +194,7 @@ describe('PR preview cleanup workflow', () => {
         });
 
         it("never in the group of the base branch's own run after the merge", () => {
-          expect(cancelsFor(ci, events.pushToBase)).toBe(stagingPushCancels);
+          expect(cancelsFor(ci, events.pushToBase)).toBe(false);
           expect(groupFor(cleanup, events.prClosedMerged)).not.toBe(groupFor(ci, events.pushToBase));
         });
 
