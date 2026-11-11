@@ -31,8 +31,8 @@
 # reservation's minimum (`min`) gathered before it starts, an automatic store sweep that resumes at
 # its first unfinished phase, a bypassed library's rlib kept reproducible while its sources are
 # settled, the proven pool model emitted with native compares, and an over-budget sweep that evicts
-# what was stored or hit since the last sweep last, rooted or not, from smoothbricks/mr-boxington at
-# the pinned revision.
+# what was stored or hit since the last sweep last, rooted or not, and build-script runs that record
+# key diagnostics, from smoothbricks/mr-boxington at the pinned revision.
 #
 #   nix build /path/to/nix/mbx#mbx   # result/bin/mbx
 #
@@ -44,7 +44,7 @@
 
   # Keep the exact revision and mbx's own locked nixpkgs: setup installs this one build for
   # every Cargo checkout (specs/cowshed/05_gateway.md, "Pool selection and revision").
-  inputs.mbx.url = "github:smoothbricks/mr-boxington/ee0d5b075264b082f8574e26b537d711ede8e877";
+  inputs.mbx.url = "github:smoothbricks/mr-boxington/1f75b2bf9384fdb31ec8dc94b287a48ef2d353d1";
 
   outputs = {mbx, ...}: {
     packages = builtins.mapAttrs (_: packages: {mbx = packages.default;}) mbx.packages;
