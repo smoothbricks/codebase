@@ -198,7 +198,13 @@ fn the_gateway_sweep_belongs_to_no_job_and_never_stacks() {
         "the timer ran the installed mbx's automatic sweep: {first:?}"
     );
 
-    drop(child.stdin.take());
+    // The job ends on the line it waits for: `read` answers an input closed without one with 1.
+    child
+        .stdin
+        .take()
+        .expect("the job's stdin")
+        .write_all(b"\n")
+        .expect("end the job");
     let output = child
         .wait_with_output_bounded()
         .expect("the job's root ends");
