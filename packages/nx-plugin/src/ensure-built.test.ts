@@ -1172,6 +1172,53 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
             expect(daemon.socketPath.startsWith(`${providerSockets}/`), record).toBe(true);
           }
 
+          // Every plugin worker the call starts binds where the provider's Nx binds, never in the caller's directory: a
+          // socket there is a second Nx listening in another workspace's namespace. The call loads the provider's
+          // plugins in its own process for the task hooks, and under Bun an assignment to `process.env` does not reach
+          // the C environment Nx's native socket resolver reads. A Bun caller records the socket each plugin worker is
+          // spawned with (Nx passes it as the argument after the worker script), so the run is judged on every path it
+          // the workers have closed.
+          const workerSocketsEntry = join(root, 'plugin-worker-sockets.ts');
+          await writeFile(
+            workerSocketsEntry,
+            `
+import { createRequire } from 'node:module';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const workspace = process.argv[2];
+// Loading any Nx here would bind this process to the caller's root before the call binds the provider's.
+const childProcess = createRequire(import.meta.url)('node:child_process');
+const spawn = childProcess.spawn;
+const bound = [];
+childProcess.spawn = (command, args, options) => {
+  const worker = Array.isArray(args) ? args.findIndex((arg) => arg.endsWith('/plugin-worker.js')) : -1;
+  if (worker !== -1) bound.push(args[worker + 1]);
+  return spawn(command, args, options);
+};
+const result = await ensureBuilt({ target: 'app:build', cwd: workspace });
+console.log(JSON.stringify({ result, bound }));
+`,
+          );
+          const workerSockets = await run('bun', workerSocketsEntry, caller, [workspace], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_SOCKET_DIR: socketDir,
+          });
+          expect(workerSockets.code, workerSockets.stdout + workerSockets.stderr).toBe(0);
+          const { result: workerSocketsResult, bound } = typia.json.assertParse<{
+            result: import('./ensure-built.js').EnsureBuiltResult;
+            bound: string[];
+          }>(workerSockets.stdout);
+          expect(workerSocketsResult).toEqual({ disposition: 'hit' });
+          expect(bound.length, 'plugin workers the call started in its own process').toBeGreaterThan(0);
+          for (const path of bound) {
+            expect(path.startsWith(`${socketDir}/`), `a plugin worker bound ${path} in the caller's ${socketDir}`).toBe(
+              false,
+            );
+            if (providerSockets !== null) {
+              expect(path.startsWith(`${providerSockets}/`), `plugin worker socket ${path}`).toBe(true);
+            }
+          }
+
           // That hit re-armed the daemon's records. The emitted wrapper, under
           // Node and with nothing to exec, is as silent.
           const again = await run('node', builtBinEntry, workspace, ['app:build'], {
