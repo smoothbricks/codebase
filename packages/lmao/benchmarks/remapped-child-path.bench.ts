@@ -1,12 +1,5 @@
 import { bench, do_not_optimize, group, run, summary } from 'mitata';
-import {
-  defineLogSchema,
-  defineOpContext,
-  JsBufferStrategy,
-  S,
-  type SchemaWithMetadata,
-  TestTracer,
-} from '../src/index.js';
+import { defineLogSchema, defineOpContext, type Field, JsBufferStrategy, S, TestTracer } from '../src/index.js';
 import { convertSpanTreeToLeasedArrowTable } from '../src/lib/convertToArrow.js';
 import { createRemapDescriptor } from '../src/lib/library.js';
 import type { RemapDescriptor } from '../src/lib/logBinding.js';
@@ -66,13 +59,13 @@ interface TreeFixture {
   readonly legacyViews: ReadonlyMap<AnySpanBuffer, AnySpanBuffer> | undefined;
 }
 
-function numberFields(names: readonly string[]): Record<string, SchemaWithMetadata> {
-  const fields: Record<string, SchemaWithMetadata> = {};
+function numberFields(names: readonly string[]): Record<string, Field> {
+  const fields: Record<string, Field> = {};
   for (const name of names) fields[name] = S.number();
   return fields;
 }
 
-function createBufferPlan(fields: Record<string, SchemaWithMetadata>, label: string): BufferPlan {
+function createBufferPlan(fields: Record<string, Field>, label: string): BufferPlan {
   const context = defineOpContext({ logSchema: defineLogSchema(fields) });
   const op = context.defineOp(label, (ctx) => ctx.ok(undefined));
   const plan = op.callsitePlan;

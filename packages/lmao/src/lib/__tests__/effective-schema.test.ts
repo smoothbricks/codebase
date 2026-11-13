@@ -348,6 +348,91 @@ describe('Effective Schema Computation', () => {
     });
   });
 
+  //#region smoo/lmao!n/library-integration-shared-columns
+  describe('Shared Columns Across Libraries', () => {
+    const library = <T extends Parameters<typeof defineLogSchema>[0]>(fields: T) =>
+      defineOpContext({ logSchema: defineLogSchema(fields) }).defineOps({ run: async (ctx) => ctx.ok({}) });
+
+    it('two_libraries_mapping_a_field_to_one_column_share_it', () => {
+      const pg = library({ query: S.text(), rows: S.number() });
+      const mysql = library({ query: S.text(), rows: S.number() });
+      const pgWired = pg.mapColumns({ query: 'query', rows: 'pg_rows' });
+      const mysqlWired = mysql.mapColumns({ query: 'query', rows: 'mysql_rows' });
+
+      const app = defineOpContext({
+        logSchema: defineLogSchema({ user_id: S.category() }),
+        deps: { pg: pgWired, mysql: mysqlWired },
+      });
+
+      expect(app.logSchema._columnNames).toEqual(['user_id', 'query', 'pg_rows', 'mysql_rows']);
+      // Each library's rows reach the one output column from its own source column.
+      expect(pgWired.run.callsitePlan.remapDescriptor?.sourceNames).toEqual({ query: 'query', pg_rows: 'rows' });
+      expect(mysqlWired.run.callsitePlan.remapDescriptor?.sourceNames).toEqual({ query: 'query', mysql_rows: 'rows' });
+    });
+
+    it('a_library_field_mapped_onto_the_applications_own_column_shares_it', () => {
+      const pg = library({ query: S.text() });
+      const app = defineOpContext({
+        logSchema: defineLogSchema({ query: S.text() }),
+        deps: { pg: pg.mapColumns({ query: 'query' }) },
+      });
+      expect(app.logSchema._columnNames).toEqual(['query']);
+    });
+
+    it('a_shared_column_of_two_types_is_refused_naming_both_sides', () => {
+      const http = library({ status: S.number() });
+      const process = library({ state: S.text() });
+      expect(() =>
+        defineOpContext({
+          logSchema: defineLogSchema({ user_id: S.category() }),
+          deps: { http: http.mapColumns({ status: 'status' }), process: process.mapColumns({ state: 'status' }) },
+        }),
+      ).toThrow(
+        "Schema conflict: column 'status' would hold two types: field 'status' of dep 'http' is f64(), field 'state' of dep 'process' is text().",
+      );
+    });
+
+    it('a_name_reached_without_mapColumns_is_refused_even_at_equal_types', () => {
+      const pg = library({ query: S.text() });
+      const mysql = library({ query: S.text() });
+      expect(() =>
+        defineOpContext({
+          logSchema: defineLogSchema({ user_id: S.category() }),
+          deps: { pg, mysql: mysql.mapColumns({ query: 'query' }) },
+        }),
+      ).toThrow(/column 'query' is reached by field 'query' of dep 'pg' and field 'query' of dep 'mysql'/);
+    });
+
+    it('two_fields_of_one_library_cannot_be_one_span_column', () => {
+      const lib = library({ first: S.text(), second: S.text() });
+      expect(() => lib.mapColumns({ first: 'both', second: 'both' })).toThrow(
+        /fields 'first' and 'second' of library 'log' are both mapped to column 'both'/,
+      );
+    });
+
+    it('a_field_mapColumns_does_not_name_keeps_its_column_in_the_descriptor', () => {
+      const lib = library({ kept: S.number(), renamed: S.number(), dropped: S.number() });
+      const wired = lib.mapColumns({ renamed: 'lib_renamed', dropped: null });
+      expect(wired.run.callsitePlan.remapDescriptor?.sourceNames).toEqual({ kept: 'kept', lib_renamed: 'renamed' });
+    });
+  });
+  //#endregion smoo/lmao!n/library-integration-shared-columns
+
+  //#region smoo/lmao!n/schema-fields
+  describe('Span buffer lanes', () => {
+    it('a_field_of_a_kind_span_buffers_cannot_store_is_refused_by_name', () => {
+      expect(() => defineOpContext({ logSchema: defineLogSchema({ retries: S.u16() }) })).toThrow(
+        "Field 'retries' is u16(): span buffers store enum, category, text, f64, boolean, u64 and binary-column kinds",
+      );
+    });
+
+    it('an_optional_field_is_stored_in_its_kinds_lane', () => {
+      const context = defineOpContext({ logSchema: defineLogSchema({ retries: S.optional(S.number()) }) });
+      expect(context.logSchema.fields.retries.kind).toBe('f64');
+    });
+  });
+  //#endregion smoo/lmao!n/schema-fields
+
   describe('LogBinding Schema', () => {
     it('should expose effective schema via factory.logSchema', () => {
       // Define library

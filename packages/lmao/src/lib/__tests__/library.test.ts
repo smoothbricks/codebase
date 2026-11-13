@@ -14,117 +14,14 @@
 
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
-import { createPrefixMapping, createRemapDescriptor, prefixSchema } from '../library.js';
+import { createRemapDescriptor } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { getEnumValues, storageLaneOf } from '../schema/typeGuards.js';
 import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
 
 describe('Library Integration Pattern', () => {
-  describe('Schema Prefixing', () => {
-    it('should prefix all field names in schema', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-        method: S.enum(['GET', 'POST']),
-      });
-
-      const prefixed = prefixSchema(schema, 'http');
-
-      expect(prefixed).toHaveProperty('http_status');
-      expect(prefixed).toHaveProperty('http_method');
-      expect(prefixed).not.toHaveProperty('status');
-      expect(prefixed).not.toHaveProperty('method');
-    });
-
-    it('should preserve schema metadata during prefixing', () => {
-      const schema = defineLogSchema({
-        operation: S.enum(['CREATE', 'DELETE']),
-      });
-
-      const prefixed = prefixSchema(schema, 'db');
-      const dbOperation = prefixed.db_operation;
-
-      if (typeof dbOperation !== 'object' || dbOperation === null) {
-        throw new Error('Expected prefixed db_operation metadata to be an object');
-      }
-      expect(dbOperation).toHaveProperty('__schema_type', 'enum');
-      expect(dbOperation).toHaveProperty('__enum_values');
-      expect(Reflect.get(dbOperation, '__enum_values')).toEqual(['CREATE', 'DELETE']);
-    });
-
-    it('should create correct prefix mapping', () => {
-      const schema = defineLogSchema({
-        status: S.number(),
-        method: S.category(),
-        url: S.text(),
-      });
-
-      const mapping = createPrefixMapping(schema, 'http');
-
-      expect(mapping).toEqual({
-        status: 'http_status',
-        method: 'http_method',
-        url: 'http_url',
-      });
-    });
-
-    it('should handle empty schema', () => {
-      const schema = defineLogSchema({});
-      const mapping = createPrefixMapping(schema, 'test');
-
-      expect(mapping).toEqual({});
-    });
-
-    it('should handle complex schema types with prefixing', () => {
-      const schema = defineLogSchema({
-        enumField: S.enum(['A', 'B', 'C']),
-        categoryField: S.category(),
-        textField: S.text(),
-        numberField: S.number(),
-        booleanField: S.boolean(),
-      });
-
-      const prefixed = prefixSchema(schema, 'test');
-
-      // All fields should be prefixed
-      expect(prefixed).toHaveProperty('test_enumField');
-      expect(prefixed).toHaveProperty('test_categoryField');
-      expect(prefixed).toHaveProperty('test_textField');
-      expect(prefixed).toHaveProperty('test_numberField');
-      expect(prefixed).toHaveProperty('test_booleanField');
-
-      // Metadata should be preserved
-      expect(prefixed.test_enumField).toHaveProperty('__schema_type', 'enum');
-      expect(prefixed.test_categoryField).toHaveProperty('__schema_type', 'category');
-      expect(prefixed.test_textField).toHaveProperty('__schema_type', 'text');
-      expect(prefixed.test_numberField).toHaveProperty('__schema_type', 'number');
-      expect(prefixed.test_booleanField).toHaveProperty('__schema_type', 'boolean');
-    });
-
-    it('should handle special characters in prefix', () => {
-      const schema = defineLogSchema({
-        field: S.text(),
-      });
-
-      const prefixed = prefixSchema(schema, 'prefix-with-dashes');
-
-      expect(prefixed).toHaveProperty('prefix-with-dashes_field');
-    });
-
-    it('should handle schema with many fields', () => {
-      const schemaFields: Record<string, ReturnType<typeof S.number>> = {};
-      for (let i = 0; i < 100; i++) {
-        schemaFields[`field${i}`] = S.number();
-      }
-      const schema = defineLogSchema(schemaFields);
-
-      const prefixed = prefixSchema(schema, 'many');
-
-      expect(prefixed._columnNames.length).toBe(100);
-      expect(prefixed).toHaveProperty('many_field0');
-      expect(prefixed).toHaveProperty('many_field99');
-    });
-  });
-
+  //#region smoo/lmao!n/library-integration-remapped-view
   describe('Remap descriptor metadata', () => {
     it('preserves composed output order and schema identity in immutable cold-path metadata', () => {
       const schema = defineLogSchema({
@@ -151,6 +48,7 @@ describe('Library Integration Pattern', () => {
       expect(descriptor.columns.every(Object.isFrozen)).toBe(true);
     });
   });
+  //#endregion smoo/lmao!n/library-integration-remapped-view
 });
 
 describe('Module Builder Pattern Integration', () => {
@@ -188,6 +86,7 @@ describe('Module Builder Pattern Integration', () => {
     return defineOps({});
   };
 
+  //#region smoo/lmao!n/op-context-defining-ops
   describe('OpGroup Definition and Schema Access', () => {
     it('should define OpGroups with schemas', () => {
       const { defineOps } = defineOpContext({
@@ -277,7 +176,9 @@ describe('Module Builder Pattern Integration', () => {
       expect(opGroup).toBeDefined();
     });
   });
+  //#endregion smoo/lmao!n/op-context-defining-ops
 
+  //#region smoo/lmao!n/library-integration-column-mapping
   describe('Prefix Application', () => {
     it('should apply prefix to OpGroup schema', () => {
       const httpOpGroup = createHttpOpGroup();
@@ -325,13 +226,20 @@ describe('Module Builder Pattern Integration', () => {
 
     it('should preserve schema metadata in prefixed OpGroups', () => {
       const httpOpGroup = createHttpOpGroup();
+      const prefixedHttp = httpOpGroup.prefix('http');
 
-      // Schema should preserve field metadata
+      // The group's schema keeps its field nodes, before and after prefixing
       const statusField = getOpGroupInternals(httpOpGroup)._logSchema.fields.status;
-      expect(statusField).toHaveProperty('__schema_type', 'number');
+      expect(storageLaneOf(statusField)).toBe('number');
+
+      const prefixedFields = getMappedOpGroupInternals(prefixedHttp)._logSchema.fields;
+      expect(prefixedFields.status).toBe(statusField);
+      expect(getEnumValues(prefixedFields.method)).toEqual(['GET', 'POST', 'PUT', 'DELETE']);
     });
   });
+  //#endregion smoo/lmao!n/library-integration-column-mapping
 
+  //#region smoo/lmao!n/library-integration-column-mapping
   describe('OpGroup Mapping and Composition', () => {
     it('should map OpGroup columns', () => {
       const httpOpGroup = createHttpOpGroup();
@@ -397,8 +305,20 @@ describe('Module Builder Pattern Integration', () => {
       expect(getMappedOpGroupInternals(mappedHttp)._logSchema._columnNames).toContain('status');
       expect(getMappedOpGroupInternals(mappedRetry)._logSchema._columnNames).toContain('attempt');
     });
-  });
 
+    it('mapColumns names the library own fields after prefix, and an unnamed field keeps its column', () => {
+      const dbOpGroup = createDbOpGroup();
+      const wired = dbOpGroup.prefix('pg').mapColumns({ query: 'query', rows: null });
+
+      const columns = getMappedOpGroupInternals(wired)._columnMapping;
+      expect(columns.query).toBe('query');
+      expect(columns.rows).toBeNull();
+      expect(columns.duration).toBe('pg_duration');
+    });
+  });
+  //#endregion smoo/lmao!n/library-integration-column-mapping
+
+  //#region smoo/lmao!n/op-context-define-returns
   describe('Op Context Creation', () => {
     it('should define Op context with extra properties', () => {
       const factory = defineOpContext({
@@ -457,8 +377,10 @@ describe('Module Builder Pattern Integration', () => {
       expect(factory.logBinding).toBeDefined();
     });
   });
+  //#endregion smoo/lmao!n/op-context-define-returns
 });
 
+//#region smoo/lmao!n/library-integration-column-mapping
 describe('Library Composition Scenarios', () => {
   // Helper factories for creating Op contexts
   const createHttpOpGroupFactory = () => {
@@ -662,57 +584,4 @@ describe('Library Composition Scenarios', () => {
     });
   });
 });
-
-describe('Edge Cases and Error Handling', () => {
-  describe('Prefix Edge Cases', () => {
-    it('should handle empty prefix string', () => {
-      const schema = defineLogSchema({
-        field: S.text(),
-      });
-
-      const prefixed = prefixSchema(schema, '');
-
-      expect(prefixed).toHaveProperty('_field');
-    });
-
-    it('should handle null and undefined values gracefully', () => {
-      // Test with undefined field (edge case)
-      const schemaWithUndefined = defineLogSchema({
-        validField: S.text(),
-      });
-      Reflect.apply(Array.prototype.push, schemaWithUndefined._columns, [['undefinedField', undefined]]);
-
-      const prefixedWithUndefined = prefixSchema(schemaWithUndefined, 'test');
-
-      expect(prefixedWithUndefined).toHaveProperty('test_validField');
-      expect(prefixedWithUndefined).toHaveProperty('test_undefinedField');
-      expect(Reflect.get(prefixedWithUndefined, 'test_undefinedField')).toBeUndefined();
-
-      // Test with null field (edge case)
-      const schemaWithNull = defineLogSchema({
-        validField: S.text(),
-      });
-      Reflect.apply(Array.prototype.push, schemaWithNull._columns, [['nullField', null]]);
-
-      const prefixedWithNull = prefixSchema(schemaWithNull, 'test');
-
-      expect(prefixedWithNull).toHaveProperty('test_validField');
-      expect(prefixedWithNull).toHaveProperty('test_nullField');
-      expect(Reflect.get(prefixedWithNull, 'test_nullField')).toBeNull();
-    });
-
-    it('should handle schema with many fields', () => {
-      const schemaFields: Record<string, ReturnType<typeof S.number>> = {};
-      for (let i = 0; i < 100; i++) {
-        schemaFields[`field${i}`] = S.number();
-      }
-      const schema = defineLogSchema(schemaFields);
-
-      const prefixed = prefixSchema(schema, 'many');
-
-      expect(prefixed._columnNames.length).toBe(100);
-      expect(prefixed).toHaveProperty('many_field0');
-      expect(prefixed).toHaveProperty('many_field99');
-    });
-  });
-});
+//#endregion smoo/lmao!n/library-integration-column-mapping

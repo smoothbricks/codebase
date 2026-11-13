@@ -6,15 +6,18 @@
  * - Runtime validation
  * - Masking transformations
  * - Schema extension
- * - Reserved name validation
+ * - Reserved names: refused where a tag context is built (defineOpContext), accepted by the schema itself
  */
 
 import { describe, expect, test } from 'bun:test';
+import { getMaskTransform } from '@smoothbricks/arrow-builder';
+import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../builder.js';
 import { defineLogSchema } from '../defineLogSchema.js';
 import { extendSchema } from '../extend.js';
 import { LogSchema } from '../LogSchema.js';
 
+//#region smoo/lmao!n/schema-log-schema
 describe('defineLogSchema with Sury', () => {
   test('defines base attributes with Sury schemas', () => {
     const attrs = defineLogSchema({
@@ -51,7 +54,7 @@ describe('defineLogSchema with Sury', () => {
 
     expect(() => {
       attrs.validate({ count: 'not a number' });
-    }).toThrow();
+    }).toThrow('Field "count": expected number, got "not a number"');
   });
 
   test('parse returns null on error', () => {
@@ -110,7 +113,7 @@ describe('defineLogSchema with Sury', () => {
 
     expect(() => {
       schema.validate({ operation: 'INVALID' });
-    }).toThrow();
+    }).toThrow('Field "operation": expected one of [SELECT, INSERT], got "INVALID"');
   });
 
   test('handles optional fields correctly', () => {
@@ -159,37 +162,26 @@ describe('defineLogSchema with Sury', () => {
     expect(result.apiUrl).toBe('https://api.example.com/users');
     expect(result.query).toBe("SELECT * FROM users WHERE id = 123 AND name = 'test'");
 
-    // Verify mask metadata exists on schemas (will be used during Arrow conversion)
-    // Fields are accessed via schema.fields
-    expect((schema.fields.userId as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.fields.email as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.fields.apiUrl as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.fields.query as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    // The mask is a field hint, no part of the type: it is read where the column is written out (Arrow conversion).
+    for (const field of [schema.fields.userId, schema.fields.email, schema.fields.apiUrl, schema.fields.query]) {
+      expect(typeof getMaskTransform(field)).toBe('function');
+    }
+    expect(getMaskTransform(schema.fields.email)?.('john@example.com')).toBe('j*****@example.com');
+    expect(getMaskTransform(S.category())).toBeUndefined();
   });
 
-  test('should reject field names starting with _', () => {
-    expect(() =>
-      defineLogSchema({
-        _reserved: S.text(),
-      }),
-    ).toThrow("Field name '_reserved' cannot start with '_'");
-  });
+  //#region smoo/lmao!n/schema-fields
+  test('a field name starting with _ is a legal schema field and is refused by defineOpContext', () => {
+    const logSchema = defineLogSchema({ _reserved: S.text() });
 
-  test('rejects reserved attribute names', () => {
-    expect(() => {
-      LogSchema.assertUserFieldNames(['with']); // Reserved!
-    }).toThrow(/reserved/i);
-
-    expect(() => {
-      LogSchema.assertUserFieldNames(['message']); // Reserved!
-    }).toThrow(/reserved/i);
-
-    expect(() => {
-      LogSchema.assertUserFieldNames(['tag']); // Reserved!
-    }).toThrow(/reserved/i);
+    expect(logSchema._columnNames).toContain('_reserved');
+    expect(() => defineOpContext({ logSchema })).toThrow("Field name '_reserved' cannot start with '_'");
   });
 
   test.each([
+    'with',
+    'message',
+    'tag',
     'success',
     'value',
     'error',
@@ -213,17 +205,25 @@ describe('defineLogSchema with Sury', () => {
     'hasOwnProperty',
     'isPrototypeOf',
     'propertyIsEnumerable',
-  ])('rejects result member or protocol name %s in definitions and extensions', (name) => {
-    expect(() => defineLogSchema({ [name]: S.text() })).toThrow(/reserved/i);
-    const base = new LogSchema({ requestId: S.category() });
-    expect(() => base.extend({ [name]: S.text() })).toThrow(/reserved/i);
+  ])('the tag-member name %s is a legal schema field and is refused by defineOpContext', (name) => {
+    const fields = { [name]: S.text() };
+    const logSchema = defineLogSchema(fields);
+
+    // A schema nothing tags through may use the name: defining and extending it never refuses.
+    expect(logSchema._columnNames).toContain(name);
+    expect(new LogSchema({ requestId: S.category() }).extend(fields)._columnNames).toContain(name);
+    expect(Object.keys(extendSchema({ requestId: S.category() }, fields))).toContain(name);
+
+    // The op context builds the setters that the name would shadow, so it refuses with the reserved-name message.
+    expect(() => defineOpContext({ logSchema })).toThrow(`Attribute name '${name}' is reserved and cannot be used.`);
   });
 
-  test('allows non-reserved names', () => {
-    expect(() => {
-      LogSchema.assertUserFieldNames(['requestId', 'userId']);
-    }).not.toThrow();
+  test('defineOpContext accepts field names that no tag-context member shadows', () => {
+    const logSchema = defineLogSchema({ requestId: S.category(), userId: S.category() });
+
+    expect(() => defineOpContext({ logSchema })).not.toThrow();
   });
+  //#endregion smoo/lmao!n/schema-fields
 
   test('fluent extend API works', () => {
     const base = new LogSchema({
@@ -265,18 +265,6 @@ describe('defineLogSchema with Sury', () => {
     }).toThrow(/conflict/i);
   });
 
-  test('union schemas work', () => {
-    const schema = defineLogSchema({
-      payload: S.union([S.category(), S.number()]),
-    });
-
-    const result1 = schema.validate({ payload: 'test' });
-    expect(result1.payload).toBe('test');
-
-    const result2 = schema.validate({ payload: 42 });
-    expect(result2.payload).toBe(42);
-  });
-
   test('complex nested schema validation', () => {
     const schema = defineLogSchema({
       requestId: S.category(),
@@ -305,22 +293,12 @@ describe('defineLogSchema with Sury', () => {
   // Validates that schema validation semantics were not weakened
   // =========================================================================
 
-  test('rejects unknown __schema_type instead of silently accepting', () => {
-    // Craft a schema object with an unknown __schema_type to verify
-    // validateField throws instead of falling through to a default: return value.
-    // We create a valid number schema then corrupt its __schema_type at runtime
-    // to simulate an unrecognized schema variant.
-    const numberSchema = S.number();
-    // Runtime mutation to inject an unrecognized schema type — this is
-    // testing defensive validation, not normal usage
-    Object.assign(numberSchema, { __schema_type: 'nonexistent' });
-    const weirdSchema = defineLogSchema({ field: numberSchema });
+  test('a missing or null required value is refused naming the field and its type', () => {
+    const schema = defineLogSchema({ count: S.number() });
 
-    expect(() => {
-      weirdSchema.validate({ field: 42 });
-    }).toThrow(/unknown schema type/i);
+    expect(() => schema.validate({})).toThrow('Field "count": expected f64(), got undefined');
+    expect(() => schema.validate({ count: null })).toThrow('Field "count": expected f64(), got null');
   });
-
   test('optional(enum(...)) rejects invalid inner values', () => {
     const schema = defineLogSchema({
       status: S.optional(S.enum(['active', 'inactive'])),
@@ -335,7 +313,7 @@ describe('defineLogSchema with Sury', () => {
     // Invalid: wrong enum value — must throw, not silently accept
     expect(() => {
       schema.validate({ status: 'bogus' });
-    }).toThrow(/expected one of/);
+    }).toThrow('Field "status": expected one of [active, inactive], got "bogus"');
   });
 
   test('optional(number()) rejects wrong type when present', () => {
@@ -352,21 +330,7 @@ describe('defineLogSchema with Sury', () => {
     // Invalid: string when number expected
     expect(() => {
       schema.validate({ count: 'five' });
-    }).toThrow(/expected number/);
-  });
-
-  test('union rejects when no member matches', () => {
-    const schema = defineLogSchema({
-      payload: S.union([S.category(), S.number()]),
-    });
-
-    // Valid members
-    expect(schema.validate({ payload: 'hello' }).payload).toBe('hello');
-    expect(schema.validate({ payload: 42 }).payload).toBe(42);
-
-    // Invalid: boolean is not in the union
-    expect(() => {
-      schema.validate({ payload: true });
-    }).toThrow(/does not match any union member/);
+    }).toThrow('Field "count": expected number, got "five"');
   });
 });
+//#endregion smoo/lmao!n/schema-log-schema

@@ -1,37 +1,54 @@
 /**
- * Schema builder for arrow-builder
+ * The field builder: `S`.
  *
- * Provides the S object that creates schema objects with __schema_type metadata.
- * This enables arrow-builder to determine which TypedArray to create for each field.
+ * One builder for every type a column can hold. Each function returns a field node (field.ts) of a shared kind; a
+ * package's private kinds come from `defineFieldKind` and stand beside these.
  *
- * STRING TYPE SYSTEM:
- * - S.enum(['A', 'B', 'C']) - Known values at compile time (Uint8Array, 1 byte)
- * - S.category() - Repeated values (Uint32Array with string interning)
- * - S.text() - Unique values (no dictionary overhead)
+ * Strings are three kinds, each with one meaning:
+ * - S.enum(['A', 'B']): a closed set the declaration lists; the column is a dictionary of the variants.
+ * - S.category(): a bounded set of repeated values the data brings; the column is a dictionary of the stream.
+ * - S.text(): everything else; a plain string column.
  */
 
-import { uint8, uint16, uint32 } from '@uwdata/flechette';
-import { intern } from '../arrow/interner.js';
-import { type Input, type Output, type Schema, optional as schemaOptional, union as schemaUnion } from './core.js';
+import {
+  binaryKind,
+  booleanKind,
+  categoryKind,
+  durationKind,
+  type EnumParams,
+  enumKind,
+  type Field,
+  f64Kind,
+  fixedBinaryKind,
+  i8Kind,
+  i16Kind,
+  i32Kind,
+  i64Kind,
+  type MaskTransform,
+  type OptionalField,
+  optional,
+  textKind,
+  timestampKind,
+  u8Kind,
+  u16Kind,
+  u32Kind,
+  u64Kind,
+  withFieldMethods,
+} from './field.js';
+import type { TimeUnit } from './physical.js';
 import type {
-  BinaryEncoder,
-  EagerBigUint64Schema,
-  EagerBinarySchema,
-  EagerBooleanSchema,
-  EagerCategorySchema,
-  EagerEnumSchema,
-  EagerNumberSchema,
-  EagerTextSchema,
-  EnumUtf8Precomputed,
-  LazyBigUint64Schema,
+  EagerField,
+  EnumField,
   LazyBinarySchema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
+  LazyField,
   LazyNumberSchema,
   LazyTextSchema,
+  LazyU64Schema,
+  MaskableField,
   MaskPreset,
-  MaskTransform,
 } from './types.js';
 
 /**
@@ -88,285 +105,136 @@ export const maskingTransforms: Record<MaskPreset, MaskTransform> = {
   },
 };
 
-/**
- * Resolve a mask preset name or custom function to a MaskTransform function
- */
 function resolveMaskTransform(preset: MaskPreset | MaskTransform): MaskTransform {
   return typeof preset === 'function' ? preset : maskingTransforms[preset];
 }
 
+function assertEager<F extends Field>(field: Field): asserts field is EagerField<F> {
+  if (!field.hints.eager) throw new TypeError(`expected an eager '${field.kind}' field`);
+}
+
+function assertLazy<F extends Field>(field: Field): asserts field is F & { readonly hints: { readonly eager: false } } {
+  if (field.hints.eager) throw new TypeError(`expected a lazy '${field.kind}' field`);
+}
+
+function eagerOf<F extends Field>(field: F, mask: MaskTransform | undefined): EagerField<F> {
+  const made = withFieldMethods(field, { eager: true, mask }, {});
+  assertEager<F>(made);
+  return made;
+}
+
 /**
- * Pre-compute UTF-8 bytes for enum values at schema definition time.
- *
- * This is a COLD PATH operation that happens once per schema definition.
- * The pre-computed bytes are stored on the schema metadata and used
- * during Arrow conversion to avoid re-encoding enum strings.
- *
- * @param values - Array of enum string values
- * @returns Pre-computed UTF-8 data ready for Arrow dictionary
+ * The field as a lazy column with `.eager()`. A builder outside this package gives its own kinds the same two
+ * forms through this.
  */
-function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
-  // Use intern() to ensure all enum strings are globally interned for UTF-8 reuse
-  const bytes = values.map((v) => intern(v));
-
-  // Calculate total size and build offsets
-  const offsets = new Int32Array(values.length + 1);
-  offsets[0] = 0;
-  let totalSize = 0;
-  for (let i = 0; i < bytes.length; i++) {
-    totalSize += bytes[i].length;
-    offsets[i + 1] = totalSize;
-  }
-
-  // Build concatenated buffer
-  const concatenated = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const b of bytes) {
-    concatenated.set(b, offset);
-    offset += b.length;
-  }
-
-  return { bytes, concatenated, offsets };
+export function lazyField<T, K extends string, P>(field: Field<T, K, P>): LazyField<Field<T, K, P>> {
+  const made = withFieldMethods(field, { eager: false, mask: undefined }, { eager: () => eagerOf(field, undefined) });
+  assertLazy<typeof made>(made);
+  return made;
 }
 
-function createLazyNumberSchema(): LazyNumberSchema {
-  return {
-    __schema_type: 'number',
-    eager(): EagerNumberSchema {
-      return { __schema_type: 'number', __eager: true };
+function maskableField<T, K extends string, P>(
+  field: Field<T, K, P>,
+  mask: MaskTransform | undefined,
+): MaskableField<Field<T, K, P>> {
+  const made = withFieldMethods(
+    field,
+    { eager: false, mask },
+    {
+      eager: () => eagerOf(field, mask),
+      mask: (preset: MaskPreset | MaskTransform) => maskableField(field, resolveMaskTransform(preset)),
     },
-  };
+  );
+  assertLazy<typeof made>(made);
+  return made;
 }
 
-function createLazyBigUint64Schema(): LazyBigUint64Schema {
-  return {
-    __schema_type: 'bigUint64',
-    eager(): EagerBigUint64Schema {
-      return { __schema_type: 'bigUint64', __eager: true };
-    },
-  };
-}
-
-function createLazyBooleanSchema(): LazyBooleanSchema {
-  return {
-    __schema_type: 'boolean',
-    eager(): EagerBooleanSchema {
-      return { __schema_type: 'boolean', __eager: true };
-    },
-  };
-}
-
-function createLazyEnumSchema<T extends string>(
+function assertEnumOf<T extends string>(
+  field: Field<string, 'enum', EnumParams>,
   values: readonly T[],
-  enumUtf8: EnumUtf8Precomputed,
-  indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
-  arrowIndexType: ReturnType<typeof uint8> | ReturnType<typeof uint16> | ReturnType<typeof uint32>,
-): LazyEnumSchema<T> {
-  return {
-    __schema_type: 'enum',
-    __enum_values: values,
-    __enum_utf8: enumUtf8,
-    __index_array_ctor: indexArrayCtor,
-    __arrow_index_type: arrowIndexType,
-    eager(): EagerEnumSchema<T> {
-      return {
-        __schema_type: 'enum',
-        __enum_values: values,
-        __enum_utf8: enumUtf8,
-        __index_array_ctor: indexArrayCtor,
-        __arrow_index_type: arrowIndexType,
-        __eager: true,
-      };
-    },
-  };
+): asserts field is EnumField<T> {
+  if (field.params.variants.length !== values.length) throw new TypeError('enum field lost its variants');
 }
 
-function createLazyCategorySchema(maskTransform?: MaskTransform): LazyCategorySchema {
-  return {
-    __schema_type: 'category',
-    __mask_transform: maskTransform,
-    mask(preset: MaskPreset | MaskTransform): LazyCategorySchema {
-      return createLazyCategorySchema(resolveMaskTransform(preset));
-    },
-    eager(): EagerCategorySchema {
-      return {
-        __schema_type: 'category',
-        __mask_transform: maskTransform,
-        __eager: true,
-      };
-    },
-  };
-}
+/** The field builder's shape. */
+export interface FieldBuilder {
+  boolean(): LazyBooleanSchema;
 
-function createLazyBinarySchema<T = Uint8Array>(encoder?: BinaryEncoder): LazyBinarySchema<T> {
-  return {
-    __schema_type: 'binary',
-    __binary_encoder: encoder,
-    eager(): EagerBinarySchema<T> {
-      return {
-        __schema_type: 'binary',
-        __binary_encoder: encoder,
-        __eager: true,
-      };
-    },
-  };
-}
+  i8(): Field<number, 'i8', null>;
+  i16(): Field<number, 'i16', null>;
+  i32(): Field<number, 'i32', null>;
+  i64(): Field<bigint, 'i64', null>;
+  u8(): Field<number, 'u8', null>;
+  u16(): Field<number, 'u16', null>;
+  u32(): Field<number, 'u32', null>;
+  u64(): LazyU64Schema;
 
-function createLazyTextSchema(maskTransform?: MaskTransform): LazyTextSchema {
-  return {
-    __schema_type: 'text',
-    __mask_transform: maskTransform,
-    mask(preset: MaskPreset | MaskTransform): LazyTextSchema {
-      return createLazyTextSchema(resolveMaskTransform(preset));
-    },
-    eager(): EagerTextSchema {
-      return {
-        __schema_type: 'text',
-        __mask_transform: maskTransform,
-        __eager: true,
-      };
-    },
-  };
-}
-
-/**
- * Schema builder interface for arrow-builder
- *
- * Returns schema objects with __schema_type metadata attached.
- * Consumer packages (like lmao) can extend these schemas with additional functionality.
- */
-export interface ArrowSchemaBuilder {
-  /**
-   * Create number schema
-   * Storage: Float64Array
-   * @returns Schema with chainable `.eager()` method
-   */
+  /** A 64-bit float. */
+  f64(): LazyNumberSchema;
+  /** `f64` under the name a JavaScript value has. */
   number(): LazyNumberSchema;
 
   /**
-   * Create bigUint64 schema
-   * Storage: BigUint64Array
-   * @returns Schema with chainable `.eager()` method
-   */
-  bigUint64(): LazyBigUint64Schema;
-
-  /**
-   * Create boolean schema
-   * Storage: Uint8Array (0/1)
-   * @returns Schema with chainable `.eager()` method
-   */
-  boolean(): LazyBooleanSchema;
-
-  /**
-   * Enum - Known values at compile time
-   * Storage: Uint8Array (1 byte) with compile-time mapping
-   * Arrow: Dictionary with pre-defined values
-   * Use for: Operations, HTTP methods, entry types, status enums
-   * @returns Schema with chainable `.eager()` method
-   */
-  enum<T extends readonly string[]>(values: T): LazyEnumSchema<T[number]>;
-
-  /**
-   * Category - Values that often repeat (limited cardinality)
-   * Storage: Uint32Array indices with string interning
-   * Arrow: Dictionary built dynamically from interned strings
-   * Use for: userIds, sessionIds, moduleNames, spanNames
+   * A closed set of strings the declaration lists. A variant's ordinal is its position; the list is append-only,
+   * and a variant no longer written keeps its place.
    *
-   * Returns a schema with a chainable .mask() method for applying
-   * masking transforms during Arrow conversion (cold path).
+   * @throws TypeError for an empty list or a repeated variant.
    */
+  enum<const T extends readonly string[]>(values: T): LazyEnumSchema<T[number]>;
+
+  /** A bounded set of repeated strings the data brings (a region, a model, a table name). */
   category(): LazyCategorySchema;
 
-  /**
-   * Text - Unique values that rarely repeat
-   * Storage: Raw strings without interning
-   * Arrow: Plain string column (no dictionary overhead)
-   * Use for: Error messages, URLs, request bodies
-   *
-   * Returns a schema with a chainable .mask() method for applying
-   * masking transforms during Arrow conversion (cold path).
-   */
+  /** Any other string: ids, keys, free text. A plain string column. */
   text(): LazyTextSchema;
 
-  /**
-   * Binary - Raw bytes or encoder-wrapped values
-   * Storage: Array (object references, frozen at tag time)
-   * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
-   * Use for: Arbitrary payloads, serialized objects, msgpack blobs
-   *
-   * Without encoder: accepts Uint8Array (raw binary)
-   * With encoder: accepts any value T (encoded to bytes at flush time)
-   *
-   * @returns Schema with chainable `.eager()` method
-   */
-  binary(): LazyBinarySchema<Uint8Array>;
-  binary<T = unknown>(options: { encoder: BinaryEncoder }): LazyBinarySchema<T>;
+  /** Raw bytes. */
+  binary(): LazyBinarySchema;
+  /** Raw bytes of one width. */
+  fixedBinary(width: number): Field<Uint8Array, 'fixedBinary', number>;
+
+  /** A point in time: a count of `unit` since the Unix epoch, UTC. */
+  timestamp(unit: TimeUnit): Field<bigint, 'timestamp', TimeUnit>;
+  /** A span of time: a count of `unit`. */
+  duration(unit: TimeUnit): Field<bigint, 'duration', TimeUnit>;
 
   /**
-   * Wrap schema to make it optional
+   * The field, optional: the same kind and column; empty is a clear validity bit. There is no other empty state.
+   *
+   * @throws TypeError for an eager field.
    */
-  optional<T>(schema: Schema<T>): Schema<T | undefined, T | undefined>;
-
-  /**
-   * Create union of multiple schemas
-   */
-  union<T extends readonly [Schema, ...Schema[]]>(schemas: T): Schema<Output<T[number]>, Input<T[number]>>;
+  optional<F extends Field>(field: F): OptionalField<F>;
 }
 
-/**
- * Schema builder implementation
- */
-const schemaBuilderImpl: ArrowSchemaBuilder = {
-  number: (): LazyNumberSchema => {
-    return createLazyNumberSchema();
+export const S: FieldBuilder = {
+  boolean: () => lazyField(booleanKind(null)),
+  i8: () => i8Kind(null),
+  i16: () => i16Kind(null),
+  i32: () => i32Kind(null),
+  i64: () => i64Kind(null),
+  u8: () => u8Kind(null),
+  u16: () => u16Kind(null),
+  u32: () => u32Kind(null),
+  u64: () => lazyField(u64Kind(null)),
+  f64: () => lazyField(f64Kind(null)),
+  number: () => lazyField(f64Kind(null)),
+  enum: <const T extends readonly string[]>(values: T): LazyEnumSchema<T[number]> => {
+    if (values.length === 0) throw new TypeError('Enum must have at least one value');
+    if (new Set(values).size !== values.length) throw new TypeError(`Enum repeats a variant: [${values.join(', ')}]`);
+    // The list is the caller's and is held as given: a declaration is not copied per field.
+    const field = enumKind(Object.freeze({ variants: values }));
+    assertEnumOf<T[number]>(field, values);
+    return lazyField(field);
   },
-
-  bigUint64: (): LazyBigUint64Schema => {
-    return createLazyBigUint64Schema();
+  category: () => maskableField(categoryKind(null), undefined),
+  text: () => maskableField(textKind(null), undefined),
+  binary: () => lazyField(binaryKind(null)),
+  fixedBinary: (width) => {
+    if (!Number.isInteger(width) || width <= 0)
+      throw new TypeError(`fixedBinary needs a positive integer width, got ${width}`);
+    return fixedBinaryKind(width);
   },
-
-  boolean: (): LazyBooleanSchema => {
-    return createLazyBooleanSchema();
-  },
-
-  enum: <T extends readonly string[]>(values: T): LazyEnumSchema<T[number]> => {
-    if (values.length === 0) {
-      throw new Error('Enum must have at least one value');
-    }
-
-    // Determine index type based on enum size
-    const uniqueCount = values.length;
-    const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-    const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
-
-    return createLazyEnumSchema(values, precomputeEnumUtf8(values), indexArrayCtor, arrowIndexType);
-  },
-
-  category: (): LazyCategorySchema => {
-    return createLazyCategorySchema();
-  },
-
-  binary: (options?: { encoder: BinaryEncoder }): LazyBinarySchema => {
-    return createLazyBinarySchema(options?.encoder);
-  },
-
-  text: (): LazyTextSchema => {
-    return createLazyTextSchema();
-  },
-
-  optional: <T>(schema: Schema<T>): Schema<T | undefined, T | undefined> => {
-    return schemaOptional(schema);
-  },
-
-  union: <T extends readonly [Schema, ...Schema[]]>(schemas: T): Schema<Output<T[number]>, Input<T[number]>> => {
-    return schemaUnion(schemas);
-  },
+  timestamp: (unit) => timestampKind(unit),
+  duration: (unit) => durationKind(unit),
+  optional,
 };
-
-/**
- * Schema builder for arrow-builder
- *
- * Creates schema objects with __schema_type metadata for columnar storage.
- * Use this to define schemas that arrow-builder can convert to TypedArrays.
- */
-export const S = schemaBuilderImpl;

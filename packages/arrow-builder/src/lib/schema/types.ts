@@ -1,54 +1,43 @@
 /**
- * Schema metadata types for arrow-builder
+ * Column types of the buffer layer, on the field node (field.ts).
  *
- * These types define the metadata attached to schema objects for columnar storage.
- * They enable arrow-builder to determine which TypedArray to create for each schema field.
+ * A field's `kind` says what its value is. The buffer layer stores a column in one of a few lanes; `StorageLane`
+ * names them, and `storageLaneOf` (typeGuards.ts) is the one mapping from a field to its lane.
  */
 
-import type { IntType } from '@uwdata/flechette';
-import type { Schema } from './core.js';
+import type { EnumParams, Field, FieldHints, MaskTransform } from './field.js';
 
 /**
- * Schema type marker for columnar storage
- * Determines which TypedArray type to use:
- * - enum: Uint8Array (1 byte, compile-time mapping)
- * - category: Uint32Array (string interning)
- * - text: string[] (no dictionary)
+ * How the buffer layer stores a column while rows are written:
+ * - enum: Uint8/16/32Array of ordinals
+ * - category, text: string[]
  * - number: Float64Array
- * - boolean: Uint8Array (0/1)
+ * - boolean: Uint8Array (bit-packed)
+ * - bigUint64: BigUint64Array
+ * - binary: unknown[] (values encoded when the column is written out)
  */
-export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean' | 'bigUint64' | 'binary';
+export type StorageLane = 'enum' | 'category' | 'text' | 'number' | 'boolean' | 'bigUint64' | 'binary';
 
-/**
- * Eager brand marker - columns marked as eager are allocated immediately
- * and have no null bitmap (column is always written for every entry).
- */
-export interface EagerBrand {
-  readonly __eager: true;
-}
+/** An eager column is allocated up front and has no validity bitmap: it is written on every row. */
+export type EagerField<F extends Field> = F & { readonly hints: FieldHints & { readonly eager: true } };
 
-/**
- * Lazy brand marker - columns marked as lazy are allocated on first write
- * and have a null bitmap for sparse data.
- */
-export interface LazyBrand {
-  readonly __eager?: never;
-}
+/** A lazy column is allocated on first write and has a validity bitmap. `.eager()` gives its eager form. */
+export type LazyField<F extends Field> = F & { readonly hints: FieldHints & { readonly eager: false } } & {
+  /** Mark this column as eager (always written, no validity bitmap). */
+  eager(): EagerField<F>;
+};
 
-/**
- * Masking preset names
- * Applied during Arrow conversion (cold path), NOT during hot path writes
- */
+/** Masking preset names. Applied where a column is written out (cold path), never on a hot-path write. */
 export type MaskPreset = 'hash' | 'url' | 'sql' | 'email';
 
-/**
- * Custom masking transform function
- */
-export type MaskTransform = (value: string) => string;
+/** A lazy string column that can be masked where it is written out. */
+export type MaskableField<F extends Field> = LazyField<F> & {
+  /** The same column with a masking transform applied where it is written out. */
+  mask(preset: MaskPreset | MaskTransform): MaskableField<F>;
+};
 
 /**
- * Pre-computed UTF-8 bytes for enum values
- * Built at schema definition time (cold path) for zero-cost Arrow conversion
+ * Pre-computed UTF-8 bytes of an enum's variants, in ordinal order: the enum column's dictionary.
  */
 export interface EnumUtf8Precomputed {
   /** UTF-8 bytes for each enum value, in order */
@@ -59,273 +48,34 @@ export interface EnumUtf8Precomputed {
   readonly offsets: Int32Array;
 }
 
-/**
- * Base schema with metadata
- * Using intersection type since we can't extend Sury.Schema directly
- */
-export type SchemaWithMetadata<T = unknown> = Schema<T> & {
-  __schema_type?: SchemaType;
-  __enum_values?: readonly string[];
-  __enum_utf8?: EnumUtf8Precomputed;
-  __eager?: boolean;
-};
+export type NumberField = Field<number, 'f64', null>;
+export type BooleanField = Field<boolean, 'boolean', null>;
+export type U64Field = Field<bigint, 'u64', null>;
+export type EnumField<T extends string = string> = Field<T, 'enum', EnumParams>;
+export type CategoryField = Field<string, 'category', null>;
+export type TextField = Field<string, 'text', null>;
+export type BinaryField = Field<Uint8Array, 'binary', null>;
 
-// =============================================================================
-// ENUM SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for enum schema (shared between lazy and eager)
- */
-interface EnumMetadataBase {
-  __schema_type: 'enum';
-  __enum_values: readonly string[];
-  /** Pre-computed UTF-8 bytes for zero-cost Arrow conversion */
-  __enum_utf8: EnumUtf8Precomputed;
-  /** TypedArray constructor for index arrays (determined from enum size at definition time) */
-  __index_array_ctor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor;
-  /** Arrow index type for Dictionary index type */
-  __arrow_index_type: IntType;
-}
+export type EagerNumberSchema = EagerField<NumberField>;
+export type LazyNumberSchema = LazyField<NumberField>;
+export type EagerBooleanSchema = EagerField<BooleanField>;
+export type LazyBooleanSchema = LazyField<BooleanField>;
+export type EagerU64Schema = EagerField<U64Field>;
+export type LazyU64Schema = LazyField<U64Field>;
+export type EagerEnumSchema<T extends string = string> = EagerField<EnumField<T>>;
+export type LazyEnumSchema<T extends string = string> = LazyField<EnumField<T>>;
+export type EagerCategorySchema = EagerField<CategoryField>;
+export type LazyCategorySchema = MaskableField<CategoryField>;
+export type EagerTextSchema = EagerField<TextField>;
+export type LazyTextSchema = MaskableField<TextField>;
+export type EagerBinarySchema = EagerField<BinaryField>;
+export type LazyBinarySchema = LazyField<BinaryField>;
 
 /**
- * Eager enum schema - allocated immediately, no null bitmap
- * Storage: Uint8Array (1 byte) with compile-time mapping
- * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
- */
-export type EagerEnumSchema<T extends string = string> = Schema<T> & EnumMetadataBase & EagerBrand;
-
-/**
- * Lazy enum schema with chainable eager method
- * Storage: Uint8Array (1 byte) with compile-time mapping
- * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
- */
-export type LazyEnumSchema<T extends string = string> = Schema<T> &
-  EnumMetadataBase &
-  LazyBrand & {
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerEnumSchema<T>;
-  };
-
-// =============================================================================
-// CATEGORY SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for category schema (shared between lazy and eager)
- */
-interface CategoryMetadataBase {
-  __schema_type: 'category';
-  __mask_transform?: MaskTransform;
-}
-
-/**
- * Eager category schema - allocated immediately, no null bitmap
- * Storage: Uint32Array indices with string interning
- * Arrow: Dictionary built dynamically from interned strings
- */
-export type EagerCategorySchema = Schema<string> & CategoryMetadataBase & EagerBrand;
-
-/**
- * Lazy category schema with chainable mask and eager methods
- * Storage: Uint32Array indices with string interning
- * Arrow: Dictionary built dynamically from interned strings
- */
-export type LazyCategorySchema = Schema<string> &
-  CategoryMetadataBase &
-  LazyBrand & {
-    /**
-     * Apply a masking transform during Arrow conversion (cold path).
-     * Returns a new lazy schema with the mask transform attached.
-     */
-    mask(preset: MaskPreset | MaskTransform): LazyCategorySchema;
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry (like message).
-     */
-    eager(): EagerCategorySchema;
-  };
-
-// =============================================================================
-// TEXT SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for text schema (shared between lazy and eager)
- */
-interface TextMetadataBase {
-  __schema_type: 'text';
-  __mask_transform?: MaskTransform;
-}
-
-/**
- * Eager text schema - allocated immediately, no null bitmap
- * Storage: Raw strings without interning
- * Arrow: Plain string column (no dictionary overhead)
- */
-export type EagerTextSchema = Schema<string> & TextMetadataBase & EagerBrand;
-
-/**
- * Lazy text schema with chainable mask and eager methods
- * Storage: Raw strings without interning
- * Arrow: Plain string column (no dictionary overhead)
- */
-export type LazyTextSchema = Schema<string> &
-  TextMetadataBase &
-  LazyBrand & {
-    /**
-     * Apply a masking transform during Arrow conversion (cold path).
-     * Returns a new lazy schema with the mask transform attached.
-     */
-    mask(preset: MaskPreset | MaskTransform): LazyTextSchema;
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerTextSchema;
-  };
-
-// =============================================================================
-// NUMBER SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for number schema (shared between lazy and eager)
- */
-interface NumberMetadataBase {
-  __schema_type: 'number';
-}
-
-/**
- * Eager number schema - allocated immediately, no null bitmap
- * Storage: Float64Array
- */
-export type EagerNumberSchema = Schema<number> & NumberMetadataBase & EagerBrand;
-
-/**
- * Lazy number schema with chainable eager method
- * Storage: Float64Array
- */
-export type LazyNumberSchema = Schema<number> &
-  NumberMetadataBase &
-  LazyBrand & {
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerNumberSchema;
-  };
-
-// =============================================================================
-// BOOLEAN SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for boolean schema (shared between lazy and eager)
- */
-interface BooleanMetadataBase {
-  __schema_type: 'boolean';
-}
-
-/**
- * Eager boolean schema - allocated immediately, no null bitmap
- * Storage: Uint8Array (0/1)
- */
-export type EagerBooleanSchema = Schema<boolean> & BooleanMetadataBase & EagerBrand;
-
-/**
- * Lazy boolean schema with chainable eager method
- * Storage: Uint8Array (0/1)
- */
-export type LazyBooleanSchema = Schema<boolean> &
-  BooleanMetadataBase &
-  LazyBrand & {
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerBooleanSchema;
-  };
-
-// =============================================================================
-// BIGUINT64 SCHEMA TYPES
-// =============================================================================
-
-/**
- * Base metadata for bigUint64 schema (shared between lazy and eager)
- */
-interface BigUint64MetadataBase {
-  __schema_type: 'bigUint64';
-}
-
-/**
- * Eager bigUint64 schema - allocated immediately, no null bitmap
- * Storage: BigUint64Array
- */
-export type EagerBigUint64Schema = Schema<bigint> & BigUint64MetadataBase & EagerBrand;
-
-/**
- * Lazy bigUint64 schema with chainable eager method
- * Storage: BigUint64Array
- */
-export type LazyBigUint64Schema = Schema<bigint> &
-  BigUint64MetadataBase &
-  LazyBrand & {
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerBigUint64Schema;
-  };
-
-// =============================================================================
-// BINARY SCHEMA TYPES
-// =============================================================================
-
-/**
- * Encoder interface for binary columns.
- * Called at flush time (cold path) to encode arbitrary values to bytes.
- *
- * WHY per-value sync: Encoding happens during Arrow conversion (cold path),
- * not during hot-path writes. Sync keeps the interface simple and composable.
+ * Encodes a binary column's values to bytes where the column is written out (cold path). A field whose kind lowers
+ * to a binary column and is not raw bytes has one: its kind's `encode` (`getBinaryEncoder`, typeGuards.ts).
  */
 export interface BinaryEncoder {
-  /** Encode a single value to bytes. Called at flush time (cold path). */
+  /** Encode a single value to bytes. */
   encode(value: unknown): Uint8Array;
 }
-
-/**
- * Base metadata for binary schema (shared between lazy and eager)
- */
-interface BinaryMetadataBase {
-  __schema_type: 'binary';
-  __binary_encoder?: BinaryEncoder;
-}
-
-/**
- * Eager binary schema - allocated immediately, no null bitmap
- * Storage: Array (object references, frozen at tag time)
- * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
- */
-export type EagerBinarySchema<T = Uint8Array> = Schema<T> & BinaryMetadataBase & EagerBrand;
-
-/**
- * Lazy binary schema with chainable eager method
- * Storage: Array (object references, frozen at tag time)
- * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
- *
- * T defaults to Uint8Array (raw binary). When an encoder is provided,
- * T will be unknown (the consumer controls the type).
- */
-export type LazyBinarySchema<T = Uint8Array> = Schema<T> &
-  BinaryMetadataBase &
-  LazyBrand & {
-    /**
-     * Mark this column as eager (always written, no null bitmap).
-     * Use for columns written on every entry.
-     */
-    eager(): EagerBinarySchema<T>;
-  };

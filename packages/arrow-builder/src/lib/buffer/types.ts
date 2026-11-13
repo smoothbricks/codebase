@@ -18,20 +18,8 @@
  */
 
 import type { ColumnSchema } from '../schema/ColumnSchema.js';
-import type {
-  EagerBigUint64Schema,
-  EagerBinarySchema,
-  EagerBooleanSchema,
-  EagerCategorySchema,
-  EagerNumberSchema,
-  EagerTextSchema,
-  LazyBigUint64Schema,
-  LazyBinarySchema,
-  LazyBooleanSchema,
-  LazyCategorySchema,
-  LazyNumberSchema,
-  LazyTextSchema,
-} from '../schema/types.js';
+import type { Schema } from '../schema/core.js';
+import type { Field } from '../schema/field.js';
 
 // ============================================================================
 // Core Types
@@ -118,21 +106,7 @@ export interface AnyColumnBuffer {
  * Matches the structure of ValuesArrayType - handles all known schema types
  * explicitly without using SchemaWithMetadata<infer T> to avoid type inference issues.
  */
-export type SetterValueType<S> = S extends { __schema_type: 'enum' }
-  ? number
-  : S extends LazyCategorySchema | EagerCategorySchema
-    ? string
-    : S extends LazyTextSchema | EagerTextSchema
-      ? string
-      : S extends LazyNumberSchema | EagerNumberSchema
-        ? number
-        : S extends LazyBigUint64Schema | EagerBigUint64Schema
-          ? bigint
-          : S extends LazyBooleanSchema | EagerBooleanSchema
-            ? boolean
-            : S extends LazyBinarySchema<infer T> | EagerBinarySchema<infer T>
-              ? T
-              : unknown;
+export type SetterValueType<S> = S extends Field<unknown, 'enum'> ? number : S extends Schema<infer T> ? T : unknown;
 
 /**
  * Infer the values array type for a schema field.
@@ -143,20 +117,19 @@ export type SetterValueType<S> = S extends { __schema_type: 'enum' }
  * - number: Float64Array
  * - boolean: Uint8Array (bit-packed)
  */
-export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
-  ? Uint8Array
-  : S extends LazyCategorySchema | EagerCategorySchema
-    ? string[]
-    : S extends LazyTextSchema | EagerTextSchema
+export type ValuesArrayType<S> =
+  S extends Field<unknown, 'enum'>
+    ? Uint8Array
+    : S extends Field<unknown, 'category' | 'text'>
       ? string[]
-      : S extends LazyNumberSchema | EagerNumberSchema
+      : S extends Field<unknown, 'f64'>
         ? Float64Array
-        : S extends LazyBigUint64Schema | EagerBigUint64Schema
+        : S extends Field<unknown, 'u64'>
           ? BigUint64Array
-          : S extends LazyBooleanSchema | EagerBooleanSchema
+          : S extends Field<unknown, 'boolean'>
             ? Uint8Array
-            : S extends LazyBinarySchema | EagerBinarySchema
-              ? unknown[]
+            : S extends Field
+              ? unknown[] | TypedArray
               : string[] | TypedArray;
 
 /**

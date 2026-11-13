@@ -38,7 +38,7 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
-import { getSchemaType } from '../schema/typeGuards.js';
+import { storageLaneOf } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { VocabularyGeneration } from '../vocabularyRegistry.js';
@@ -332,7 +332,7 @@ function generatePrefillScopedAttributesMethod(
 ): string {
   const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
     const columnName = fieldName;
-    const lmaoType = getSchemaType(fieldSchema);
+    const lmaoType = storageLaneOf(fieldSchema);
 
     // Binary columns are not scope-fillable (object payloads can't be bulk-filled)
     if (lmaoType === 'binary') {
@@ -718,10 +718,9 @@ function buildSpanLoggerPlan(
 ): SpanLoggerPlan {
   const preallocated = new Set(eagerColumns);
   const columns = schema._columns.map(([fieldName, fieldSchema]) => {
-    const isEager =
-      typeof fieldSchema === 'object' && fieldSchema !== null && Reflect.get(fieldSchema, '__eager') === true;
+    const isEager = fieldSchema.hints.eager;
     const mode: SpanLoggerColumnMode = isEager ? 'eager' : preallocated.has(fieldName) ? 'preallocated' : 'lazy';
-    return { name: fieldName, schemaType: getSchemaType(fieldSchema), mode };
+    return { name: fieldName, schemaType: storageLaneOf(fieldSchema), mode };
   });
   return {
     columns,

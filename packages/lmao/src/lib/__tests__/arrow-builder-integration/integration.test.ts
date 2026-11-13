@@ -97,9 +97,9 @@ describe('Buffer Integration', () => {
 
     // Both should have column storage (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
-    // Note: S.optional() wraps the inner schema, losing __schema_type metadata
-    // This falls back to Uint32Array (default)
-    expect(buffer.optional_values).toBeInstanceOf(Uint32Array);
+    // S.optional() is its inner field with `optional` set: same kind, same column. An optional number is a
+    // Float64Array like a required one; emptiness is a clear validity bit, not a different lane.
+    expect(buffer.optional_values).toBeInstanceOf(Float64Array);
   });
 
   it('handles masked fields in schema', () => {
@@ -113,7 +113,7 @@ describe('Buffer Integration', () => {
 
     // All should have column storage (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
-    // With chainable .mask(), the __schema_type metadata is preserved
+    // .mask() keeps the field's kind, so each masked field stays in its plain string lane
     expect(Array.isArray(buffer.userId_values)).toBe(true); // category (raw strings) - masked during Arrow conversion
     expect(Array.isArray(buffer.email_values)).toBe(true); // text (raw strings) - masked during Arrow conversion
     expect(Array.isArray(buffer.plainText_values)).toBe(true); // text (raw strings)
@@ -267,7 +267,7 @@ describe('Buffer Integration', () => {
         textField: S.text(), // Maps to string[]
         numberField: S.number(), // Maps to Float64Array
         booleanField: S.boolean(), // Maps to Uint8Array
-        optionalField: S.optional(S.number()), // Maps to Uint32Array
+        optionalField: S.optional(S.number()), // Maps to Float64Array: optional is the inner type's column
       });
 
       const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
@@ -278,7 +278,7 @@ describe('Buffer Integration', () => {
       expect(Array.isArray(buffer.textField_values)).toBe(true);
       expect(buffer.numberField_values).toBeInstanceOf(Float64Array);
       expect(buffer.booleanField_values).toBeInstanceOf(Uint8Array);
-      expect(buffer.optionalField_values).toBeInstanceOf(Uint32Array);
+      expect(buffer.optionalField_values).toBeInstanceOf(Float64Array);
 
       // Verify Arrow null bitmaps exist for all columns
       expect(buffer.enumField_nulls).toBeInstanceOf(Uint8Array);

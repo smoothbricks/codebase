@@ -1,161 +1,100 @@
 /**
- * Type guard functions for schema types
- *
- * These functions provide type-safe runtime validation for schema metadata types.
+ * Reading a field node from the buffer layer and its consumers: the storage lane, an enum's variants and
+ * dictionary bytes, the mask, the encoder of a binary column.
  */
 
-import type {
-  BinaryEncoder,
-  EagerEnumSchema,
-  EnumUtf8Precomputed,
-  LazyCategorySchema,
-  LazyEnumSchema,
-  LazyTextSchema,
-  MaskTransform,
-  SchemaType,
-  SchemaWithMetadata,
-} from './types.js';
-
-function isSchemaType(value: unknown): value is SchemaType {
-  return (
-    value === 'enum' ||
-    value === 'category' ||
-    value === 'text' ||
-    value === 'number' ||
-    value === 'boolean' ||
-    value === 'bigUint64' ||
-    value === 'binary'
-  );
-}
-
-function hasReadonlyStringArray<T extends string>(
-  value: { [K in T]?: unknown },
-  key: T,
-): value is { [K in T]: readonly string[] } {
-  return Array.isArray(value[key]) && value[key].every((entry) => typeof entry === 'string');
-}
-
-function hasMaskTransformProperty(
-  value: SchemaWithMetadata & { __mask_transform?: unknown },
-): value is SchemaWithMetadata & { __mask_transform: MaskTransform } {
-  return typeof value.__mask_transform === 'function';
-}
-
-function hasBinaryEncoderProperty(
-  value: SchemaWithMetadata & { __binary_encoder?: unknown },
-): value is SchemaWithMetadata & { __binary_encoder: BinaryEncoder } {
-  return (
-    typeof value.__binary_encoder === 'object' && value.__binary_encoder !== null && 'encode' in value.__binary_encoder
-  );
-}
-
-function hasEnumUtf8(value: { __enum_utf8?: EnumUtf8Precomputed }): value is { __enum_utf8: EnumUtf8Precomputed } {
-  return value.__enum_utf8 !== undefined;
-}
+import { intern } from '../arrow/interner.js';
+import { type EnumParams, type Field, isField, type MaskTransform } from './field.js';
+import type { BinaryEncoder, EnumField, EnumUtf8Precomputed, StorageLane } from './types.js';
 
 /**
- * Type guard to check if a value is a SchemaWithMetadata
- * This is used to safely access __schema_type metadata on schemas
+ * The lane the buffer layer stores a field in, or `undefined` when it has none: a kind whose column the buffer
+ * layer cannot hold yet. The caller that builds buffers refuses such a field by name.
  */
-/** Narrow unknown to Record<string, unknown> — non-null object with string-keyed access. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+export function storageLaneOf(value: unknown): StorageLane | undefined {
+  if (!isField(value)) return undefined;
+  switch (value.kind) {
+    case 'enum':
+    case 'category':
+    case 'text':
+    case 'boolean':
+      return value.kind;
+    case 'f64':
+      return 'number';
+    case 'u64':
+      return 'bigUint64';
+    default:
+      return value.physical.type === 'binary' ? 'binary' : undefined;
+  }
 }
 
-export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadata {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  const obj = value;
-
-  // __schema_type is optional, but if present must be a valid type
-  if ('__schema_type' in obj) {
-    return isSchemaType(obj.__schema_type);
-  }
-
-  // If __schema_type is not present, it's still valid (just unknown type)
-  return true;
+function isEnumParams(params: unknown): params is EnumParams {
+  if (typeof params !== 'object' || params === null) return false;
+  const variants: unknown = Reflect.get(params, 'variants');
+  return Array.isArray(variants) && variants.every((variant) => typeof variant === 'string');
 }
 
-/**
- * Type guard to check if a value is an enum schema (LazyEnumSchema | EagerEnumSchema)
- * This is used to safely access enum values metadata
- */
-export function isEnumSchema(value: unknown): value is LazyEnumSchema | EagerEnumSchema {
-  if (!isSchemaWithMetadata(value)) {
-    return false;
-  }
-
-  return value.__schema_type === 'enum' && hasReadonlyStringArray(value, '__enum_values');
+/** Whether a value is an enum field. */
+export function isEnumField(value: unknown): value is EnumField {
+  return isField(value) && value.kind === 'enum' && isEnumParams(value.params);
 }
 
-/**
- * Get the schema type from a value, returning undefined if not found
- * Safe alternative to casting to access __schema_type
- */
-export function getSchemaType(value: unknown): SchemaType | undefined {
-  if (isSchemaWithMetadata(value)) {
-    return value.__schema_type;
-  }
-  return undefined;
-}
-
-/**
- * Get enum values from a schema, returning undefined if not an enum schema
- * Safe alternative to casting to access __enum_values
- */
+/** An enum field's variants in ordinal order; `undefined` for anything else. */
 export function getEnumValues(value: unknown): readonly string[] | undefined {
-  if (isEnumSchema(value)) {
-    return value.__enum_values;
+  return isEnumField(value) ? value.params.variants : undefined;
+}
+
+const enumUtf8ByVariants = new WeakMap<readonly string[], EnumUtf8Precomputed>();
+
+function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
+  // intern() keeps every variant's UTF-8 bytes in the process-wide table the string lanes reuse.
+  const bytes = values.map((v) => intern(v));
+  const offsets = new Int32Array(values.length + 1);
+  let totalSize = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    totalSize += bytes[i].length;
+    offsets[i + 1] = totalSize;
   }
-  return undefined;
+  const concatenated = new Uint8Array(totalSize);
+  let offset = 0;
+  for (const b of bytes) {
+    concatenated.set(b, offset);
+    offset += b.length;
+  }
+  return { bytes, concatenated, offsets };
 }
 
 /**
- * Get pre-computed UTF-8 bytes for enum values
- * Returns undefined if not an enum schema or if UTF-8 bytes weren't pre-computed
- *
- * Per string storage design: enum UTF-8 bytes are pre-computed at schema definition
- * time (cold path) so Arrow conversion just copies the pre-built dictionary data.
+ * The dictionary bytes of an enum field: its variants' UTF-8 in ordinal order. Derived from the declaration once
+ * per variant list and kept for its life, so a flush copies ready bytes.
  */
 export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
-  if (isEnumSchema(value) && hasEnumUtf8(value)) {
-    return value.__enum_utf8;
+  if (!isEnumField(value)) return undefined;
+  const { variants } = value.params;
+  let utf8 = enumUtf8ByVariants.get(variants);
+  if (utf8 === undefined) {
+    utf8 = precomputeEnumUtf8(variants);
+    enumUtf8ByVariants.set(variants, utf8);
   }
-  return undefined;
+  return utf8;
 }
 
-/**
- * Type guard to check if a schema has a mask transform.
- * Only lazy category/text schemas have mask transforms (mask() returns lazy).
- */
-export function hasMaskTransform(value: unknown): value is LazyCategorySchema | LazyTextSchema {
-  if (!isSchemaWithMetadata(value)) {
-    return false;
-  }
-
-  return hasMaskTransformProperty(value);
-}
-
-/**
- * Get mask transform function from a schema
- * Returns undefined if not present
- */
+/** The mask a field's column is written out through, if any. */
 export function getMaskTransform(value: unknown): MaskTransform | undefined {
-  if (hasMaskTransform(value)) {
-    return value.__mask_transform;
-  }
-  return undefined;
+  return isField(value) ? value.hints.mask : undefined;
+}
+
+function bytesOf(field: Field, value: unknown): Uint8Array {
+  const cell = field.codec.encode(field.params, value);
+  if (cell instanceof Uint8Array) return cell;
+  throw new TypeError(`field kind '${field.kind}' lowers to a binary column but encoded a ${typeof cell}`);
 }
 
 /**
- * Get binary encoder from a schema, returning undefined if not a binary schema
- * or if no encoder was provided (raw Uint8Array mode).
+ * The encoder of a binary column whose values are not raw bytes: the field kind's own `encode`. `undefined` for a
+ * raw `binary` field and for a field that is not a binary column.
  */
 export function getBinaryEncoder(value: unknown): BinaryEncoder | undefined {
-  if (isSchemaWithMetadata(value) && value.__schema_type === 'binary' && hasBinaryEncoderProperty(value)) {
-    return value.__binary_encoder;
-  }
-  return undefined;
+  if (!isField(value) || value.kind === 'binary' || value.physical.type !== 'binary') return undefined;
+  return { encode: (cell) => bytesOf(value, cell) };
 }

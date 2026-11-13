@@ -9,7 +9,7 @@
 
 import type { LogSchema } from '../schema/LogSchema.js';
 import { THREAD_ATTRIBUTE_KINDS, THREAD_SYSTEM_COLUMNS } from '../schema/systemSchema.js';
-import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+import { getEnumValues, storageLaneOf } from '../schema/typeGuards.js';
 import type { ThreadAttributeKind } from './threadSpanBuffer.js';
 
 const SYSTEM_NAMES: Readonly<Record<string, true>> = Object.freeze(
@@ -50,7 +50,7 @@ export function encodeSchemaBlob(schema: LogSchema): Uint8Array {
   for (const name of schema._columnNames) {
     if (SYSTEM_NAMES[name] === true) continue;
     const field = schema.fields[name];
-    const type = getSchemaType(field);
+    const type = storageLaneOf(field);
     if (type === undefined) {
       throw new TypeError(`schema field '${name}' has no type`);
     }

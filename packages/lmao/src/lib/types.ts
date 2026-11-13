@@ -13,9 +13,9 @@ import type {
   AnyColumnBuffer,
   ColumnBuffer,
   ColumnValueType,
-  EagerBinarySchema,
-  LazyBinarySchema,
+  Field,
   Nanoseconds,
+  Schema,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
 import type { PhysicalAppenders } from './lifecycleAppenders.js';
@@ -462,33 +462,22 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 // Schema Type Helpers
 // ============================================================================
 
-type SetterValueType<S> = S extends { __schema_type: 'enum' }
-  ? number
-  : S extends { __schema_type: 'category' | 'text' }
-    ? string
-    : S extends { __schema_type: 'number' }
-      ? number
-      : S extends { __schema_type: 'bigUint64' }
-        ? bigint
-        : S extends { __schema_type: 'boolean' }
-          ? boolean
-          : S extends LazyBinarySchema<infer T> | EagerBinarySchema<infer T>
-            ? T
-            : unknown;
+type SetterValueType<S> = S extends Field<unknown, 'enum'> ? number : S extends Schema<infer T> ? T : unknown;
 
-type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
-  ? Uint8Array
-  : S extends { __schema_type: 'category' | 'text' }
-    ? string[]
-    : S extends { __schema_type: 'number' }
-      ? Float64Array
-      : S extends { __schema_type: 'bigUint64' }
-        ? BigUint64Array
-        : S extends { __schema_type: 'boolean' }
-          ? Uint8Array
-          : S extends LazyBinarySchema | EagerBinarySchema
-            ? unknown[]
-            : TypedArray | string[];
+type ValuesArrayType<S> =
+  S extends Field<unknown, 'enum'>
+    ? Uint8Array
+    : S extends Field<unknown, 'category' | 'text'>
+      ? string[]
+      : S extends Field<unknown, 'f64'>
+        ? Float64Array
+        : S extends Field<unknown, 'u64'>
+          ? BigUint64Array
+          : S extends Field<unknown, 'boolean'>
+            ? Uint8Array
+            : S extends Field
+              ? unknown[] | TypedArray
+              : TypedArray | string[];
 
 type FilterSchemaFields<T> = {
   [K in keyof T as T[K] extends (...args: unknown[]) => unknown ? never : K]: T[K];

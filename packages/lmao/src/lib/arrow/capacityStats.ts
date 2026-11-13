@@ -13,7 +13,7 @@ import {
   uint64,
 } from '@uwdata/flechette';
 import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
-import { getSchemaType } from '../schema/typeGuards.js';
+import { storageLaneOf } from '../schema/typeGuards.js';
 import type { SpanBufferConstructor } from '../spanBuffer.js';
 import type { OpMetadata } from '../types.js';
 import { createUtf8DictionaryType, getArrowIndexTypeOr, makeArrowColumn } from './flechette.js';
@@ -285,7 +285,7 @@ export function createCapacityStatsTable(
 
   for (const [fieldName, fieldSchema] of Object.entries(mergedSchema)) {
     if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) continue;
-    const lmaoType = getSchemaType(fieldSchema);
+    const lmaoType = storageLaneOf(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'number') {

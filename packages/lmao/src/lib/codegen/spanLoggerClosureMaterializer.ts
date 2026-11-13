@@ -18,7 +18,7 @@
  * thrown error messages that callers observe.
  */
 
-import type { SchemaType } from '@smoothbricks/arrow-builder';
+import type { StorageLane } from '@smoothbricks/arrow-builder';
 import type { SchemaEnumLookupDescriptor } from '../enumMetadata.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
 import {
@@ -57,7 +57,7 @@ export type SpanLoggerColumnMode = 'eager' | 'preallocated' | 'lazy';
 /** One schema column of the SpanLogger plan. */
 export interface SpanLoggerColumnPlan {
   readonly name: string;
-  readonly schemaType: SchemaType | undefined;
+  readonly schemaType: StorageLane | undefined;
   readonly mode: SpanLoggerColumnMode;
 }
 

@@ -29,8 +29,8 @@ import {
   activeMaterializerMode,
   type ColumnBufferExtension,
   DEFAULT_BUFFER_CAPACITY,
+  type Field,
   getColumnBufferClass,
-  type SchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from './capacityTuning.js';
 import { installLifecycleAppenders } from './lifecycleAppenders.js';
@@ -274,11 +274,11 @@ function getStorageSchema(
   const key = `${messageLayoutFamily}:${messagePhysicalLayout}`;
   let storageSchema = byLayout?.get(key);
   if (storageSchema === undefined) {
-    const fields: Record<string, SchemaWithMetadata> = {};
+    const fields: Record<string, Field> = {};
     for (const [name, field] of schema._columns) {
       if (name !== 'message') fields[name] = field;
     }
-    storageSchema = new LogSchema(fields);
+    storageSchema = new LogSchema(fields, schema.library);
     byLayout ??= new Map();
     byLayout.set(key, storageSchema);
     messageStorageSchemas.set(schema, byLayout);

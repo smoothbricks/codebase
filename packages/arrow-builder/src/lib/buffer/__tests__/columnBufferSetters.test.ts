@@ -10,7 +10,7 @@ const mockSchema = new ColumnSchema({
   errorMsg: S.text(),
   count: S.number(),
   isActive: S.boolean(),
-  timestamp: S.bigUint64(),
+  timestamp: S.u64(),
 });
 
 // Schema with eager column (no null bitmap, allocated in constructor)
@@ -381,8 +381,8 @@ describe('ColumnBuffer comprehensive data type coverage', () => {
 
   test('should handle BigInt values in bigUint64 columns', () => {
     const bigIntSchema = new ColumnSchema({
-      timestamp: S.bigUint64(),
-      largeId: S.bigUint64(),
+      timestamp: S.u64(),
+      largeId: S.u64(),
     });
 
     const buffer = createGeneratedColumnBuffer(bigIntSchema, 10);
@@ -416,7 +416,7 @@ describe('ColumnBuffer comprehensive data type coverage', () => {
       textCol: S.text(),
       numberCol: S.number(),
       booleanCol: S.boolean(),
-      bigIntCol: S.bigUint64(),
+      bigIntCol: S.u64(),
     });
 
     const buffer = createGeneratedColumnBuffer(testSchema, 10);

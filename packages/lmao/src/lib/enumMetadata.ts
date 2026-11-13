@@ -1,5 +1,5 @@
 import type { LogSchema } from './schema/LogSchema.js';
-import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
+import { getEnumValues, storageLaneOf } from './schema/typeGuards.js';
 
 export type EnumIndexArray = Uint8Array | Uint16Array | Uint32Array;
 export type EnumIndexArrayConstructor = Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor;
@@ -99,7 +99,7 @@ export function resolveEnumLookupDescriptor(schema: LogSchema): SchemaEnumLookup
   const ordered: EnumLookupDescriptor[] = [];
   const byField = createNullPrototypeRecord<EnumLookupDescriptor>();
   for (const [fieldName, fieldSchema] of schema._columns) {
-    if (getSchemaType(fieldSchema) !== 'enum') continue;
+    if (storageLaneOf(fieldSchema) !== 'enum') continue;
     const values = getEnumValues(fieldSchema);
     if (!values || (typeof fieldSchema !== 'object' && typeof fieldSchema !== 'function') || fieldSchema === null) {
       continue;

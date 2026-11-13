@@ -1,5 +1,5 @@
 //#region smoo/lmao!n/flag-evaluator
-import type { Schema, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
+import { isField, type Schema } from '@smoothbricks/arrow-builder';
 import { createEvaluatorClass, type GeneratedEvaluatorInstance } from '../codegen/evaluatorGenerator.js';
 import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
 import type { OpContext } from '../opContext/types.js';
@@ -9,64 +9,17 @@ import type { LogSchema } from './LogSchema.js';
 import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
 
 /**
- * Extended schema shape for flag validation — covers refine(), enum membership,
- * SchemaType union.
- */
-interface ExtendedFlagSchema extends Omit<SchemaWithMetadata, '__schema_type'> {
-  __schema_type?: string;
-  __refiner?: (value: unknown, fail: { fail(msg: string): never }) => unknown;
-}
-
-/**
- * Type guard to validate flag value matches schema.
- * Uses __schema_type metadata for type-based validation instead of Sury.
+ * A flag value judged against its schema: the value when the field's kind accepts it, the default otherwise.
+ * A schema that is not a field node accepts nothing.
  *
- * For feature flags the types are limited (string, number, boolean, enum, bigint).
- * Schemas with __refiner (from refine()) invoke the refiner — on failure, return default.
- * Schemas with __enum_values check membership.
- *
- * The runtime guard only knows the schema metadata, so the implementation returns
+ * The runtime guard only knows the field node, so the implementation returns
  * `unknown` and lets the overloads carry the caller's concrete schema type.
  */
 function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T): T;
 function validateFlagValue(value: unknown, schema: Schema<unknown>, defaultValue: unknown): unknown {
-  const meta = schema as ExtendedFlagSchema;
-
-  // Handle refine() schemas — invoke the stored refiner, fall back to default on failure
-  if (meta.__refiner) {
-    try {
-      return meta.__refiner(value, {
-        fail(msg: string): never {
-          throw new Error(msg);
-        },
-      });
-    } catch {
-      return defaultValue;
-    }
-  }
-
-  switch (meta.__schema_type) {
-    case 'number':
-      return typeof value === 'number' ? value : defaultValue;
-    case 'boolean':
-      return typeof value === 'boolean' ? value : defaultValue;
-    case 'text':
-    case 'category':
-      return typeof value === 'string' ? value : defaultValue;
-    case 'enum':
-      if (typeof value !== 'string') return defaultValue;
-      if (meta.__enum_values && !meta.__enum_values.includes(value)) return defaultValue;
-      return value;
-    case 'bigUint64':
-      return typeof value === 'bigint' ? value : defaultValue;
-    case 'key':
-      // Key schema in feature flags — validate it's a string
-      return typeof value === 'string' ? value : defaultValue;
-    default:
-      // Unknown schema type — reject by returning the default value.
-      // This prevents silently accepting invalid data for unhandled schema types.
-      return defaultValue;
-  }
+  if (!isField(schema)) return defaultValue;
+  const judged = schema.codec.validate(schema.params, value);
+  return judged.ok ? judged.value : defaultValue;
 }
 
 /**

@@ -13,7 +13,7 @@ import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
-import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+import { getEnumValues, storageLaneOf } from '../schema/typeGuards.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { ThreadSpanBufferProvider } from '../ThreadBufferStrategy.js';
 import { getThreadId } from '../threadId.js';
@@ -979,7 +979,7 @@ function buildLayout(schema: LogSchema): ThreadSpanLayout {
   const ordinals = schemaAttributeOrdinals(schema);
   const fields = new Map<string, ThreadAttributeField>();
   for (const [name, ordinal] of ordinals) {
-    const type = getSchemaType(schema.fields[name]);
+    const type = storageLaneOf(schema.fields[name]);
     const kind = type === undefined ? undefined : attributeKindForSchemaType(type);
     if (kind === undefined) continue;
     const enumValues = type === 'enum' ? getEnumValues(schema.fields[name]) : undefined;

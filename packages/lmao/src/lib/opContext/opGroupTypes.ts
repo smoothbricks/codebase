@@ -3,7 +3,7 @@
  *
  * Type definitions for OpGroups - collections of Ops that can be mapped
  * and wired as dependencies. These types enable:
- * - Column mapping (prefix, rename, drop)
+ * - Column mapping (prefix, rename, share, drop), through arrow-builder's column composition algebra
  * - Schema contribution tracking
  * - Type-safe dependency resolution
  *
@@ -15,55 +15,27 @@
  * @module opContext/opGroupTypes
  */
 
+import type {
+  ColumnFields,
+  ColumnMapping,
+  ComposedPart,
+  FieldSchema,
+  LocalColumns,
+  MappedColumns,
+  MappedFields,
+  PrefixedColumns,
+} from '@smoothbricks/arrow-builder';
 import type { AnyOp } from '../op.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { OpContext } from './types.js';
 
-// =============================================================================
-// COLUMN MAPPING TYPES
-// =============================================================================
-
-/**
- * Column mapping for wiring OpGroups.
- *
- * Maps the library's column names to the app's column names:
- * - `string` → map to that column name (must be type-compatible)
- * - `null` → drop the column (library writes are ignored)
- *
- * @example
- * ```typescript
- * // Map query to shared column, rows to prefixed, drop internal column
- * { query: 'query', rows: 'pg_rows', _internal: null }
- * ```
- */
-export type ColumnMapping<LibSchema extends SchemaFields = SchemaFields> = {
-  [K in keyof LibSchema]?: string | null;
-};
-
-/**
- * Apply a prefix to all schema field names.
- * `{ status: S.number() }` with prefix 'http' → `{ http_status: S.number() }`
- */
-export type PrefixedSchema<T extends SchemaFields, P extends string> = {
-  [K in keyof T as `${P}_${K & string}`]: T[K];
-};
+export type { ColumnMapping } from '@smoothbricks/arrow-builder';
 
 /**
  * Extract the schema fields from a LogSchema
  */
 export type SchemaFieldsOf<T> = T extends LogSchema<infer Fields> ? Fields : never;
-
-/**
- * Apply column mapping to schema.
- * - Mapped columns get new names
- * - Columns mapped to null are dropped
- * - Unmapped columns keep original names (with prefix if using prefix())
- */
-export type MappedSchema<T extends SchemaFields, M extends ColumnMapping<T>> = {
-  // For each key in mapping that maps to a string, use that string as the new key
-  [K in keyof T as M[K] extends string ? M[K] : M[K] extends null ? never : K]: T[K];
-};
 
 // =============================================================================
 // RESERVED OP NAMES
@@ -120,30 +92,32 @@ interface OpGroupMethods<Ctx extends OpContext, Ops extends object> {
   /**
    * Apply a prefix to all schema columns.
    *
-   * Shorthand for mapColumns where each column gets the prefix.
    * E.g., `httpOps.prefix('http')` transforms 'status' -> 'http_status'
    *
    * The prefixed columns become part of the combined app schema:
    * `appSchema & { http_status: S.number(), http_url: S.category() }`
    *
    * @param prefix - Prefix to apply to all schema columns
-   * @returns MappedOpGroup with prefixed schema contribution
+   * @returns MappedOpGroup with prefixed columns
    */
-  prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>, Ops>;
+  prefix<P extends string>(
+    prefix: P,
+  ): MappedOpGroup<Ctx, PrefixedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, P>, Ops>;
 
   /**
-   * Map schema columns to different names in the app's schema.
+   * Map the library's fields to columns of the app's schema.
    *
    * Use this for:
-   * - Deduplication: `{ query: 'query' }` - multiple libs share same column
+   * - Sharing: `{ query: 'query' }` - several libraries write one column
    * - Renaming: `{ rows: 'pg_row_count' }`
-   * - Dropping: `{ _internal: null }` - ignore library's internal column
+   * - Dropping: `{ _internal: null }` - the field has no column; its writes are not emitted
    * - Mixed: `{ query: 'query', rows: 'pg_rows', _debug: null }`
    *
-   * Type-safety: Target columns must have compatible schema types.
+   * A field the mapping does not name keeps its column. Two fields share a column only when each was mapped
+   * there and their types are equal; defineOpContext refuses any other meeting of two fields on one column.
    *
-   * @param mapping - Maps library column names to app column names (or null to drop)
-   * @returns MappedOpGroup with mapped schema contribution
+   * @param mapping - Maps the library's field names to app column names (or null to drop)
+   * @returns MappedOpGroup with the mapped columns
    *
    * @example
    * ```typescript
@@ -154,9 +128,9 @@ interface OpGroupMethods<Ctx extends OpContext, Ops extends object> {
    * }
    * ```
    */
-  mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
+  mapColumns<const M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>, Ops>;
+  ): MappedOpGroup<Ctx, MappedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, M>, Ops>;
 }
 
 export type OpGroup<Ctx extends OpContext, Ops extends object = NoOpMembers> = OpGroupMethods<Ctx, Ops> & Ops;
@@ -170,27 +144,27 @@ export type OpGroup<Ctx extends OpContext, Ops extends object = NoOpMembers> = O
  * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
  * for V8 hidden class optimization and cleaner API ergonomics.
  *
- * Internal properties (_logSchema, _flags, _contributedSchema, _columnMapping)
- * are hidden from intellisense but accessible at runtime.
+ * Internal properties (_logSchema, _flags, _columns) are hidden from intellisense but accessible at runtime.
  *
  * @template Ctx - OpContext (bundled type with logSchema, flags, deps, userCtx)
- * @template ContributedSchema - Schema fields this group contributes to app (after mapping)
+ * @template Columns - The column of each of the library's fields (field name → column name, or null)
  */
-interface MappedOpGroupMethods<Ctx extends OpContext, ContributedSchema extends SchemaFields, Ops extends object> {
-  /** Chain with prefix (applies prefix to current mapping) */
-  prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>, Ops>;
+interface MappedOpGroupMethods<Ctx extends OpContext, Columns, Ops extends object> {
+  /** Chain with prefix (prefixes every current column) */
+  prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedColumns<Columns, P>, Ops>;
 
-  /** Override/extend the mapping */
-  mapColumns<M extends ColumnMapping<ContributedSchema>>(
+  /** Override the columns of single fields, named by the library's field names */
+  mapColumns<const M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>, Ops>;
+  ): MappedOpGroup<Ctx, MappedColumns<Columns, M>, Ops>;
 }
 
-export type MappedOpGroup<
-  Ctx extends OpContext,
-  ContributedSchema extends SchemaFields,
-  Ops extends object = NoOpMembers,
-> = MappedOpGroupMethods<Ctx, ContributedSchema, Ops> & Ops;
+export type MappedOpGroup<Ctx extends OpContext, Columns, Ops extends object = NoOpMembers> = MappedOpGroupMethods<
+  Ctx,
+  Columns,
+  Ops
+> &
+  Ops;
 
 // =============================================================================
 // INTERNAL OP GROUP INTERFACES (for library implementation)
@@ -199,9 +173,6 @@ export type MappedOpGroup<
 /**
  * Internal OpGroup interface with all properties exposed.
  * Used by library implementation code that needs access to schema/flags.
- *
- * NOT exported from public API - use type assertion to access:
- * `(opGroup as OpGroupInternal<Ctx>)._logSchema`
  */
 export interface OpGroupInternal<Ctx extends OpContext, Ops extends object = NoOpMembers>
   extends OpGroupMethods<Ctx, Ops> {
@@ -210,28 +181,25 @@ export interface OpGroupInternal<Ctx extends OpContext, Ops extends object = NoO
 
   /** The feature flag schema (internal) */
   readonly _flags: Ctx['flags'];
+
+  /** The library's own fields, under their local names (internal) */
+  readonly _columns: FieldSchema<string, SchemaFieldsOf<Ctx['logSchema']>>;
 }
 
 /**
  * Internal MappedOpGroup interface with all properties exposed.
  * Used by library implementation code that needs access to mapping details.
  */
-export interface MappedOpGroupInternal<
-  Ctx extends OpContext,
-  ContributedSchema extends SchemaFields,
-  Ops extends object = NoOpMembers,
-> extends MappedOpGroupMethods<Ctx, ContributedSchema, Ops> {
+export interface MappedOpGroupInternal<Ctx extends OpContext, Columns, Ops extends object = NoOpMembers>
+  extends MappedOpGroupMethods<Ctx, Columns, Ops> {
   /** The log schema for this group's ops (internal) */
   readonly _logSchema: Ctx['logSchema'];
 
   /** The feature flag schema (internal) */
   readonly _flags: Ctx['flags'];
 
-  /** The schema fields this group contributes to the app's combined schema (internal) */
-  readonly _contributedSchema: ContributedSchema;
-
-  /** The column mapping (library column -> app column, or null to drop) (internal) */
-  readonly _columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
+  /** The library's fields with the columns the wiring gave them (internal) */
+  readonly _columns: MappedFields<string, SchemaFieldsOf<Ctx['logSchema']>, Columns>;
 }
 
 // =============================================================================
@@ -239,10 +207,9 @@ export interface MappedOpGroupInternal<
 // =============================================================================
 
 /**
- * Minimal structural interface for any OpGroup (internal use only).
+ * Minimal structural interface for any OpGroup, mapped or not (internal use only).
  *
- * This captures only the internal properties we need to read from an OpGroup
- * in dependency wiring. The internal properties exist at runtime but are
+ * This captures only the internal properties dependency wiring reads. They exist at runtime but are
  * hidden from the public TypeScript interfaces.
  *
  * Note: No `.ops` property - ops are accessed directly as own properties.
@@ -250,22 +217,8 @@ export interface MappedOpGroupInternal<
 export interface AnyOpGroup {
   /** The log schema - read-only access for wiring (internal property) */
   readonly _logSchema: LogSchema;
-}
-
-/**
- * Minimal structural interface for a MappedOpGroup (internal use only).
- * Used for dependency wiring when we need access to contributed schema.
- */
-export interface AnyMappedOpGroup extends AnyOpGroup {
-  /** The contributed schema after mapping (internal property) */
-  readonly _contributedSchema: SchemaFields;
-}
-
-/**
- * Type guard to check if an OpGroup has been mapped (has _contributedSchema)
- */
-export function isMappedOpGroup(dep: AnyOpGroup): dep is AnyMappedOpGroup {
-  return '_contributedSchema' in dep;
+  /** The group's part in a column composition: its own fields, mapped or under their local names */
+  readonly _columns: ComposedPart;
 }
 
 /**
@@ -277,7 +230,7 @@ export interface AnyOpGroupPublic {
   /** Apply a prefix to all schema columns */
   prefix(prefix: string): AnyOpGroupPublic;
   /** Map schema columns to different names */
-  mapColumns(mapping: ColumnMapping): AnyOpGroupPublic;
+  mapColumns(mapping: ColumnMapping<SchemaFields>): AnyOpGroupPublic;
 }
 
 /**
@@ -296,11 +249,11 @@ export type DepsConfig = Record<string, AnyOpGroupPublic>;
 // =============================================================================
 
 /**
- * Extract the contributed schema from a dep (for combining into app schema)
+ * Extract the contributed schema from a dep (for combining into app schema): column name → field
  */
 export type ContributedSchemaOf<D> =
-  D extends MappedOpGroup<infer _Ctx, infer CS, infer _Ops>
-    ? CS
+  D extends MappedOpGroup<infer Ctx, infer Columns, infer _Ops>
+    ? ColumnFields<SchemaFieldsOf<Ctx['logSchema']>, Columns>
     : D extends OpGroup<infer Ctx, infer _Ops>
       ? SchemaFieldsOf<Ctx['logSchema']>
       : never;

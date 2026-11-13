@@ -11,7 +11,7 @@
  */
 
 import type { ColumnValueType } from '@smoothbricks/arrow-builder';
-import { activeMaterializerMode, getSchemaType } from '@smoothbricks/arrow-builder';
+import { activeMaterializerMode, getEnumValues, isField, storageLaneOf } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
 import { installLifecycleAppenders } from '../lifecycleAppenders.js';
 import type { OpMetadata } from '../op.js';
@@ -199,15 +199,11 @@ export interface WasmColumnMeta {
 }
 
 function getFieldEager(value: unknown): boolean {
-  return typeof value === 'object' && value !== null && Reflect.get(value, '__eager') === true;
+  return isField(value) && value.hints.eager;
 }
 
 function getFieldEnumValues(value: unknown): readonly string[] | undefined {
-  if (typeof value !== 'object' || value === null) {
-    return undefined;
-  }
-  const enumValues = Reflect.get(value, '__enum_values');
-  return Array.isArray(enumValues) ? enumValues : undefined;
+  return getEnumValues(value);
 }
 
 function isWasmSpanBufferConstructor<T extends LogSchema = LogSchema>(
@@ -260,7 +256,7 @@ function buildColumnMeta(schema: LogSchema, eagerColumns: EagerColumnDescriptor)
 
   for (const name of schema._columnNames) {
     const field = fields[name];
-    const schemaType = getSchemaType(field);
+    const schemaType = storageLaneOf(field);
     const isSchemaEager = getFieldEager(field);
     const enumValues = getFieldEnumValues(field);
 

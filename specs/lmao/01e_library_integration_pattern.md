@@ -365,7 +365,16 @@ export default {
 
 ## Shared Columns Across Libraries <a id="smoo/lmao!n/library-integration-shared-columns"></a>
 
-Multiple libraries can write to the same column when they have semantically similar data:
+Multiple libraries can write to the same column when they have semantically similar data. The rule is the column
+composition's (`composeColumns`, `packages/arrow-builder/src/lib/schema/columns.ts`), which lmao's Op groups call:
+
+- A column holds one type. Two fields share a column only when their types are equal (`typeText`), and the refusal of
+  unequal types names both contributors, both fields and both types.
+- A column is shared only on purpose: every field on it was mapped there by `.mapColumns()`, or is the application's own
+  field. Two fields that meet on a name nobody mapped them to (two unprefixed libraries with a `status` field) are
+  refused, at equal types too.
+- A field `.mapColumns()` does not name keeps its column; `.prefix()` after `.mapColumns()` prefixes the mapped name.
+- A span row has one value per column, so two fields of one library cannot be mapped to one column.
 
 ```typescript
 const { defineOp } = defineOpContext({
@@ -430,6 +439,12 @@ deps: {
 }
 ```
 
+`defineOpContext` composes the application's schema and every dep's mapping when it is called, and throws a
+`Schema conflict` naming the column, both fields and who contributed them when a column would hold two types or two
+fields meet on a name nobody mapped them to.
+
+````
+
 ## Performance Benefits <a id="smoo/lmao!n/library-integration-performance"></a>
 
 ### Cold Path vs Hot Path Optimization
@@ -472,7 +487,7 @@ tag.method('POST');
   buffer.method_nulls[0] |= 1;
   buffer.method_values[0] = 0; // enum index
 }
-```
+````
 
 Since the op's buffer has unprefixed schema, these writes work directly.
 

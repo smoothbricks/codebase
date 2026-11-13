@@ -137,11 +137,63 @@ const { defineOp, defineOps } = httpContext;
 - **Masking rules**: Sensitive data automatically masked during serialization
 - **Columnar storage**: Schema drives efficient TypedArray column generation
 
-The schema DSL (`S.enum/category/text/number/boolean`, plus `S.binary/unknown/object` for msgpack columns and
-`.mask(preset)` on category/text) is `packages/lmao/src/lib/schema/builder.ts`; `defineLogSchema()` (validation +
-inference + reserved-name guard) is `packages/lmao/src/lib/schema/defineLogSchema.ts`. The authoring surface is
-**`defineLogSchema(...)` + `defineOpContext({ logSchema, deps, flags, ctx })` → `{ defineOp, defineOps }`**
+The schema DSL is one field builder, `S`, owned by `@smoothbricks/arrow-builder`
+(`packages/arrow-builder/src/lib/schema/builder.ts`) and extended by lmao with feature flags and its MessagePack kind
+(`packages/lmao/src/lib/schema/builder.ts`). `defineLogSchema()` (validation + inference) is
+`packages/lmao/src/lib/schema/defineLogSchema.ts`. The authoring surface is **`defineLogSchema(...)` +
+`defineOpContext({ logSchema, deps, flags, ctx })` → `{ defineOp, defineOps }`**
 (`packages/lmao/src/lib/defineOpContext.ts`). User context is the `ctx` config field (runtime defaults).
+
+### Fields and kinds <a id="smoo/lmao!n/schema-fields"></a>
+
+A field is frozen plain data: `kind` (what the value is), `params` (what the kind was declared with), `physical` (the
+Arrow column type the two determine), `optional`, and `hints` (`eager`, `mask`: storage and output choices that are no
+part of the type). A column's type follows from the declaration alone, never from the data of a batch.
+
+| Builder                                                     | Value                       | Column                                                                                                                                      |
+| ----------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `S.boolean()`                                               | `boolean`                   | Bool                                                                                                                                        |
+| `S.i8()` `S.i16()` `S.i32()` / `S.u8()` `S.u16()` `S.u32()` | `number`                    | Int8, Int16, Int32 / UInt8, UInt16, UInt32                                                                                                  |
+| `S.i64()` / `S.u64()`                                       | `bigint`                    | Int64 / UInt64                                                                                                                              |
+| `S.f64()`, `S.number()`                                     | `number`                    | Float64                                                                                                                                     |
+| `S.enum(variants)`                                          | a variant                   | Dictionary of the declared variants; the cell is the variant's position; UInt8 index up to 256 variants, UInt16 up to 65,536, UInt32 beyond |
+| `S.category()`                                              | `string`                    | Dictionary of the stream, UInt32 index                                                                                                      |
+| `S.text()`                                                  | `string`                    | Utf8                                                                                                                                        |
+| `S.binary()` / `S.fixedBinary(n)`                           | `Uint8Array`                | Binary / FixedSizeBinary(n)                                                                                                                 |
+| `S.timestamp(unit)` / `S.duration(unit)`                    | `bigint`                    | Timestamp(unit, UTC) / Duration(unit); unit is `s`, `ms`, `us` or `ns`                                                                      |
+| `S.optional(field)`                                         | the field's, or `undefined` | the field's column                                                                                                                          |
+
+- **One empty state.** `S.optional(field)` is the same field with `optional` set: the same kind, the same column, and
+  empty is a clear validity bit. An eager column has no validity bitmap, so an eager field cannot be optional.
+- **An enum's variant list is append-only.** A variant's ordinal is its position; a variant no longer written keeps its
+  place.
+- **A kind is an extension point.** `defineFieldKind({ id, physical, digest, validate, encode, decode })` gives a
+  package a kind of its own: its identity (`id` and the canonical text of its parameters), its column type (one of the
+  types above), its validation (a refusal names the path, what was expected and what was observed) and its codec between
+  the value and the column's cell. The shared kinds are defined through the same call, so validation and identity never
+  distinguish an extension from a shared kind. lmao's `S.unknown()` and `S.object<T>()` are such a kind, `lmao.msgpack`:
+  any value, MessagePack in a Binary column.
+- **A field's type has an identity.** `typeText(field)` is `kind(digest(params))`; `typeDigest(field)` is the lowercase
+  hex of the first 16 bytes of BLAKE3 over it. `optional` and the hints are outside it.
+- **Span buffers store the lanes they have.** A log schema an op context is built from holds fields of the kinds a span
+  buffer stores: `enum`, `category`, `text`, `f64`, `boolean`, `u64`, and any kind whose column is Binary.
+  `defineOpContext` refuses a field of any other kind, naming the field and its type.
+- **Reserved names belong to the tag layer.** A log schema's fields become setters on `ctx.tag`, on log entries and on
+  `Ok` / `Err`, so `defineOpContext` refuses a field named like one of their members or starting with `_`. A field
+  schema that nothing tags through may use any name.
+
+### Field numbers <a id="smoo/lmao!n/schema-field-numbers"></a>
+
+A library's fields are declared with `defineFields(library, fields)`. A field's durable identity is its library and its
+number, and the number is the field's position in the library's published field list, plain data:
+`{ library, fields: [{ name, type, retired? }] }` with `type` the field's type digest.
+
+- The list is append-only: an entry is never removed, reordered or re-typed. A field no longer declared is marked
+  `retired` and its name is never declared again. A rename edits `name` in place and changes no number.
+- `checkPublishedFields` judges a schema against its list and never rewrites it; `publishFields` is the author's run,
+  which appends new fields and marks retired ones. `schema.numbered(list)` gives the schema its numbers.
+- A column records the fields it holds in its Arrow field metadata under `sb.fields`: a JSON array of
+  `{ lib, n, name, type }`. A field without a number cannot be recorded.
 
 `OpContextConfig` has no metadata key. Source attribution (`package_name`, `package_file`, `git_sha`, `line`) is per op:
 the build-time transformer fills the optional `metadata` argument of `defineOp(name, fn, metadata)`, and `defineOp`

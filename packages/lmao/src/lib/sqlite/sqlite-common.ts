@@ -1,8 +1,8 @@
-import type { SchemaType } from '@smoothbricks/arrow-builder';
+import type { StorageLane } from '@smoothbricks/arrow-builder';
 import { hasOwn, hasOwnString, isRecord } from '@smoothbricks/validation';
 import { resolveEntryType, resolveMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import { getSchemaType } from '../schema/typeGuards.js';
+import { storageLaneOf } from '../schema/typeGuards.js';
 import { iterateSpanTree, NO_NODE } from '../traceTopology.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { SyncSQLiteDatabase } from './sqlite-db.js';
@@ -175,8 +175,8 @@ function parseSqliteTableInfoRow(row: unknown, boundary: string, rowIndex: numbe
   };
 }
 
-/** Map arrow-builder SchemaType to SQLite column type */
-function schemaTypeToSqlite(schemaType: SchemaType): string {
+/** Map arrow-builder StorageLane to SQLite column type */
+function schemaTypeToSqlite(schemaType: StorageLane): string {
   switch (schemaType) {
     case 'category':
     case 'text':
@@ -270,7 +270,7 @@ export function getMissingSchemaColumns(
   const schemaColumns: SQLiteColumnDefinition[] = [];
 
   for (const [name, field] of Object.entries(schema.fields)) {
-    const schemaType = getSchemaType(field);
+    const schemaType = storageLaneOf(field);
     if (!schemaType) continue;
 
     schemaColumns.push({ name, sqliteType: schemaTypeToSqlite(schemaType) });

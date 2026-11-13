@@ -1,30 +1,25 @@
 /**
  * Schema type definitions for lmao
  *
- * Re-exports core schema types from arrow-builder and adds lmao-specific types
+ * Re-exports the field node and column types from arrow-builder and adds lmao-specific types
  * for feature flags and type inference.
  */
 
-import type { Input, Output, Schema } from '@smoothbricks/arrow-builder';
+import type { Field, FieldBuilder, LazyField, Schema } from '@smoothbricks/arrow-builder';
 
-// Re-export schema metadata types from arrow-builder (single source of truth)
-// Re-export schema core types from arrow-builder for external use
+// Re-export the field and column types from arrow-builder (single source of truth)
 export type {
-  // Binary encoder interface
   BinaryEncoder,
-  // Eager schema types (allocated immediately, no null bitmap)
   EagerBinarySchema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerEnumSchema,
   EagerNumberSchema,
   EagerTextSchema,
-  // Metadata and utility types
   EnumUtf8Precomputed,
+  Field,
   Input,
-  // Binary schemas
   LazyBinarySchema,
-  // Lazy schema types (default - allocated on first write)
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
@@ -35,8 +30,7 @@ export type {
   Output,
   Schema,
   SchemaFields,
-  SchemaType,
-  SchemaWithMetadata,
+  StorageLane,
 } from '@smoothbricks/arrow-builder';
 // Re-export ColumnSchema and SchemaFields from arrow-builder for external use
 export { ColumnSchema, isColumnSchema } from '@smoothbricks/arrow-builder';
@@ -44,15 +38,7 @@ export { ColumnSchema, isColumnSchema } from '@smoothbricks/arrow-builder';
 // Re-export LogSchema for external use
 export { isLogSchema, LogSchema } from './LogSchema.js';
 
-// Import schema metadata types for use in InferSchema and local type definitions
 import type {
-  BinaryEncoder,
-  EagerBooleanSchema,
-  EagerCategorySchema,
-  EagerEnumSchema,
-  EagerNumberSchema,
-  EagerTextSchema,
-  LazyBinarySchema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
@@ -103,36 +89,13 @@ type SchemaFieldKeys<T> =
       : never;
 
 /**
- * Extract TypeScript output types from log schema
+ * Extract TypeScript output types from log schema: each field's value type, with `undefined` for an optional one.
  *
  * Works with LogSchema instances or plain schema objects.
- *
- * Type resolution order:
- * 1. Check if it's an enum schema -> extract enum type
- * 2. Check if it's a category schema -> string
- * 3. Check if it's a text schema -> string
- * 4. Check if it's a number schema -> number
- * 5. Check if it's a boolean schema -> boolean
- * 6. Fall back to Schema Output<T[K]>
- *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
 export type InferSchema<T extends LogSchema | SchemaFields> = {
-  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends LazyEnumSchema<infer E>
-    ? E
-    : ExtractSchemaFields<T>[K] extends EagerEnumSchema<infer E2>
-      ? E2
-      : ExtractSchemaFields<T>[K] extends LazyCategorySchema | EagerCategorySchema
-        ? string
-        : ExtractSchemaFields<T>[K] extends LazyTextSchema | EagerTextSchema
-          ? string
-          : ExtractSchemaFields<T>[K] extends LazyNumberSchema | EagerNumberSchema
-            ? number
-            : ExtractSchemaFields<T>[K] extends LazyBooleanSchema | EagerBooleanSchema
-              ? boolean
-              : ExtractSchemaFields<T>[K] extends Schema<infer Out>
-                ? Out
-                : never;
+  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Schema<infer Out> ? Out : never;
 };
 
 /**
@@ -147,7 +110,7 @@ export type InferSchemaInput<T extends LogSchema | SchemaFields> = {
 
 /**
  * Feature flag builder with default value support
- * Returned by S.string(), S.number(), S.boolean(), S.enum() when used for feature flags
+ * Returned by S.number(), S.boolean(), S.enum(), S.category(), S.text() when used for feature flags
  */
 export interface FlagBuilder<T> {
   default(value: T): FlagBuilderWithDefault<T>;
@@ -172,94 +135,57 @@ export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 's
 
 /**
  * Schema that can be used for both tag attributes and feature flags
- * This type is returned by S.string(), S.number(), etc.
  */
 export type SchemaOrFlagBuilder<T> = Schema<T> & FlagBuilder<T>;
 
-/**
- * Category schema with flag builder, mask method, and eager method.
- * Combines lmao's FlagBuilder with arrow-builder's LazyCategorySchema.
- */
-export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyCategorySchema;
+/** Category field with the flag builder, `.mask()` and `.eager()`. */
+export type CategorySchemaOrFlagBuilder = LazyCategorySchema & FlagBuilder<string>;
+
+/** Text field with the flag builder, `.mask()` and `.eager()`. */
+export type TextSchemaOrFlagBuilder = LazyTextSchema & FlagBuilder<string>;
+
+/** A field holding any value as MessagePack in a binary column. */
+export type MsgpackField<T = unknown> = LazyField<Field<T, 'lmao.msgpack', null>>;
 
 /**
- * Text schema with flag builder, mask method, and eager method.
- * Combines lmao's FlagBuilder with arrow-builder's LazyTextSchema.
+ * lmao's schema builder: arrow-builder's field builder (every shared kind), with the flag builder on the kinds a
+ * feature flag can hold, and lmao's own MessagePack kind.
+ *
+ * String types - THREE DISTINCT TYPES per specs/lmao/01a_trace_schema_system.md.
+ * IMPORTANT: Never use generic "string" - always choose enum/category/text
  */
-export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyTextSchema;
-
-/**
- * Schema builder interface that wraps arrow-builder with custom API
- * Supports both tag attributes and feature flags
- */
-export interface SchemaBuilder {
-  // Primitive types - return schemas that can also be used as flag builders
-  number(): SchemaOrFlagBuilder<number>;
-  boolean(): SchemaOrFlagBuilder<boolean>;
-
-  // String types - THREE DISTINCT TYPES per specs/lmao/01a_trace_schema_system.md
-  // IMPORTANT: Never use generic "string" - always choose enum/category/text
+export interface SchemaBuilder extends Omit<FieldBuilder, 'number' | 'boolean' | 'enum' | 'category' | 'text'> {
+  number(): LazyNumberSchema & FlagBuilder<number>;
+  boolean(): LazyBooleanSchema & FlagBuilder<boolean>;
 
   /**
    * Enum - Known values at compile time
-   * Storage: Uint8Array (1 byte) with compile-time mapping
-   * Arrow: Dictionary with pre-defined values
    * Use for: Operations, HTTP methods, entry types, status enums
    * Example: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'])
    */
-  enum<const T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
+  enum<const T extends readonly string[]>(values: T): LazyEnumSchema<T[number]> & FlagBuilder<T[number]>;
 
   /**
    * Category - Values that often repeat (limited cardinality)
-   * Storage: Uint32Array indices with string interning
-   * Arrow: Dictionary built dynamically from interned strings
    * Use for: userIds, sessionIds, moduleNames, spanNames, table names
-   *
-   * Returns a schema with:
-   * - .default().sync()/.async() for feature flags
-   * - .mask(preset) for masking during Arrow conversion
    */
   category(): CategorySchemaOrFlagBuilder;
 
   /**
    * Text - Unique values that rarely repeat
-   * Storage: Raw strings without interning
-   * Arrow: Plain string column (no dictionary overhead)
    * Use for: Unique error messages, URLs, request bodies, masked queries
-   *
-   * Returns a schema with:
-   * - .default().sync()/.async() for feature flags
-   * - .mask(preset) for masking during Arrow conversion
    */
   text(): TextSchemaOrFlagBuilder;
 
-  // Binary types - raw bytes or encoder-wrapped values
-
-  /**
-   * Binary - Raw bytes or encoder-wrapped values
-   * Storage: Array (object references, frozen at tag time)
-   * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
-   * Use for: Arbitrary payloads, serialized objects, msgpack blobs
-   */
-  binary(): LazyBinarySchema<Uint8Array>;
-  binary<T = unknown>(options: { encoder: BinaryEncoder }): LazyBinarySchema<T>;
-
   /**
    * Unknown - accepts any value, msgpack-encoded at flush time
-   * Sugar for S.binary({ encoder: msgpackEncoder })
    * Use for: arbitrary objects, request bodies, error context, unknown-shape data
    */
-  unknown(): LazyBinarySchema<unknown>;
+  unknown(): MsgpackField;
 
   /**
-   * Object<T> - typed variant of unknown, same underlying binary storage with msgpack encoding
+   * Object<T> - typed variant of unknown, same storage and encoding
    * TypeScript enforces shape at compile time; no runtime validation on hot path
    */
-  object<T extends object>(): LazyBinarySchema<T>;
-
-  // Optional wrapper
-  optional<T>(schema: Schema<T>): Schema<T | undefined, T | undefined>;
-
-  // Union types - for multiple schemas
-  union<T extends readonly [Schema, ...Schema[]]>(schemas: T): Schema<Output<T[number]>, Input<T[number]>>;
+  object<T extends object>(): MsgpackField<T>;
 }

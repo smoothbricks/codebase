@@ -1,4 +1,16 @@
-import { batchType, bool, Column, type DataType, dictionary, type IntType, utf8 } from '@uwdata/flechette';
+import { enumIndexBits, getEnumValues } from '@smoothbricks/arrow-builder';
+import {
+  batchType,
+  bool,
+  Column,
+  type DataType,
+  dictionary,
+  type IntType,
+  uint8,
+  uint16,
+  uint32,
+  utf8,
+} from '@uwdata/flechette';
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BOOL_TYPE_ID = bool().typeId;
@@ -49,31 +61,12 @@ export function isBoolType(value: unknown): value is BoolType {
   return hasTypeId(value) && value.typeId === BOOL_TYPE_ID;
 }
 
-function isArrowIndexArrayConstructor(value: unknown): value is ArrowIndexArrayConstructor {
-  return value === Uint8Array || value === Uint16Array || value === Uint32Array;
-}
-
-export function hasArrowIndexType(value: unknown): value is { readonly __arrow_index_type: IntType } {
-  return typeof value === 'object' && value !== null && '__arrow_index_type' in value;
-}
-
-export function hasArrowIndexMetadata(
-  value: unknown,
-): value is { readonly __arrow_index_type: IntType; readonly __index_array_ctor: ArrowIndexArrayConstructor } {
-  return (
-    hasArrowIndexType(value) && '__index_array_ctor' in value && isArrowIndexArrayConstructor(value.__index_array_ctor)
-  );
-}
-
+/** The index type of an enum field's dictionary: the width its declaration fixes. `fallback` for any other value. */
 export function getArrowIndexTypeOr(value: unknown, fallback: IntType): IntType {
-  return hasArrowIndexType(value) ? value.__arrow_index_type : fallback;
-}
-
-export function getArrowIndexArrayConstructorOr(
-  value: unknown,
-  fallback: ArrowIndexArrayConstructor = Uint8Array,
-): ArrowIndexArrayConstructor {
-  return hasArrowIndexMetadata(value) ? value.__index_array_ctor : fallback;
+  const variants = getEnumValues(value);
+  if (variants === undefined) return fallback;
+  const bits = enumIndexBits(variants.length);
+  return bits === 8 ? uint8() : bits === 16 ? uint16() : uint32();
 }
 
 export function makeArrowColumn(data: DictionaryColumnData): Column<unknown>;

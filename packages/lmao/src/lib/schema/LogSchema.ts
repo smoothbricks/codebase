@@ -1,128 +1,39 @@
 /**
  * LogSchema class for logging-specific schema functionality
  *
- * Extends ColumnSchema from arrow-builder with logging-specific features:
- * - Schema extension with reserved name validation
- * - Integration with lmao's logging system
- *
- * The base ColumnSchema provides generic cached field access.
- * LogSchema adds logging-specific extension capabilities.
+ * Extends ColumnSchema from arrow-builder with what a log schema is besides its columns: the fields of one
+ * library, whose name a field's identity is written under.
  */
 
 import { ColumnSchema } from '@smoothbricks/arrow-builder';
 import type { SchemaFields } from './types.js';
 
-/**
- * Reserved method names that cannot be used as attribute names
- *
- * These names are reserved to prevent conflicts or confusion:
- * - Technically conflicting: Names that would shadow actual methods/properties
- *   on TagWriter, SpanLogger, FluentLogEntry, or result objects
- * - Confusing: Names that would create confusing code patterns even though
- *   they don't technically conflict (e.g., ctx.tag.tag() or ctx.scope.scope)
- */
-const RESERVED_NAMES = new Set([
-  // Technically conflicting - methods on TagWriter/FluentLogEntry/result objects
-  'then', // Prevent Promise/await from treating results as thenables
-  'constructor', // Reserved by JavaScript classes and generated writers
-  'toString', // Object protocol members must not become field setters
-  'toLocaleString',
-  'valueOf',
-  'hasOwnProperty',
-  'isPrototypeOf',
-  'propertyIsEnumerable',
-  'with', // Used on TagWriter, FluentLogEntry, Ok, Err
-  'message', // Used on Ok, Err
-  'line', // Used on Ok, Err, FluentLogEntry (also a system column)
-
-  // Technically conflicting - Ok/Err instance properties and prototype members. Ok/Err
-  // install row-1 fluent setters per schema field (mirrors TagWriter on row 0), so a
-  // field sharing one of these names would shadow the real member instead of adding a
-  // setter. `success` is the sharp edge: it's a getter on the Ok/Err prototype, so a
-  // same-named field would silently overwrite it with a function - always truthy,
-  // treating every error as a success.
-  'success', // Ok.success / Err.success getter (ok/err discriminant)
-  'value', // Ok.value instance property (the success payload)
-  'map', // Ok.map / Err.map
-  'mapErr', // Ok.mapErr / Err.mapErr
-  'flatMap', // Ok.flatMap / Err.flatMap
-  'match', // Ok.match / Err.match
-  'isOk', // Ok.isOk / Err.isOk
-  'isErr', // Ok.isErr / Err.isErr
-  'maybeValue', // Ok.maybeValue / Err.maybeValue
-  'maybeError', // Ok.maybeError / Err.maybeError
-  'unwrapOr', // Ok.unwrapOr / Err.unwrapOr
-  'unwrapOrElse', // Ok.unwrapOrElse / Err.unwrapOrElse
-  'toJSON', // Ok.toJSON / Err.toJSON
-
-  // Technically conflicting - log level methods on SpanLogger
-  'info', // ctx.log.info()
-  'debug', // ctx.log.debug()
-  'warn', // ctx.log.warn()
-  'error', // ctx.log.error() -- also Err.error instance property (the error payload)
-  'trace', // ctx.log.trace()
-
-  // Internal SpanLogger methods (prefixed with _ but included for completeness)
-  '_nextRow', // Internal row advancement
-  '_buffer', // Internal buffer reference
-  '_writeIndex', // Internal write position
-  '_getNextBuffer', // Internal buffer chaining
-  '_setScope', // Internal scope setter
-  '_prefillScopedAttributes', // Internal scope prefill
-
-  // Internal FF logging methods (called by evaluator, not on public type)
-  'ffAccess', // Feature flag access logging
-  'ffUsage', // Feature flag usage logging
-
-  // Confusing - properties on SpanContext (not technically conflicting)
-  'tag', // ctx.tag is TagWriter; ctx.tag.tag() would be confusing
-  'scope', // ctx.scope is readonly; ctx.scope.scope would be confusing
-
-  // Confusing - methods on SpanContext (not technically conflicting)
-  'ok', // ctx.ok() is method; ctx.tag.ok() or ctx.ok(result).ok() would be confusing
-  'err', // ctx.err() is method; ctx.tag.err() or ctx.err(code, details).err() would be confusing
-  'span', // ctx.span() is method; ctx.tag.span() would be confusing
-]);
+/** The library name of a log schema that names none: it traces, and publishes no field list. */
+export const UNNAMED_LIBRARY = 'log';
 
 /**
  * LogSchema class - extends ColumnSchema with logging-specific features
  *
- * Provides all the generic schema functionality from ColumnSchema plus
- * logging-specific extension with reserved name validation.
- *
  * @template T - The schema fields type (SchemaFields)
  */
 export class LogSchema<T extends SchemaFields = SchemaFields> extends ColumnSchema<T> {
-  /**
-   * Assert that user-provided field names don't conflict with reserved names
-   * and don't start with underscore (reserved for system properties)
-   *
-   * @throws Error if any field name is reserved or starts with _
-   */
-  static assertUserFieldNames(fieldNames: readonly string[]): void {
-    for (const name of fieldNames) {
-      if (name.startsWith('_')) {
-        throw new Error(`Field name '${name}' cannot start with '_' - this prefix is reserved for system properties`);
-      }
-      if (RESERVED_NAMES.has(name)) {
-        throw new Error(
-          `Attribute name '${name}' is reserved and cannot be used. ` +
-            `Reserved names: ${Array.from(RESERVED_NAMES).join(', ')}`,
-        );
-      }
-    }
+  /** The library whose fields these are. */
+  readonly library: string;
+
+  constructor(fields: T, library: string = UNNAMED_LIBRARY) {
+    super(fields);
+    this.library = library;
   }
 
   /**
    * Extend this schema with additional fields
    *
    * Creates a new LogSchema instance with merged fields.
-   * Validates that extension fields don't conflict with existing fields
-   * and don't use reserved names (logging-specific validation).
+   * Validates that extension fields don't conflict with existing fields.
    *
    * @param extension - Additional schema fields to add
    * @returns New LogSchema instance with merged fields
-   * @throws Error if field names conflict or reserved names are used
+   * @throws Error if field names conflict
    *
    * @example
    * ```typescript
@@ -143,9 +54,6 @@ export class LogSchema<T extends SchemaFields = SchemaFields> extends ColumnSche
       }
     }
 
-    // Assert extension doesn't use reserved names (logging-specific)
-    LogSchema.assertUserFieldNames(extensionKeys);
-
     // Perform shallow merge
     // Create merged via explicit property assignment to preserve property order for V8 hidden class stability
     const merged = Object.create(null);
@@ -158,7 +66,7 @@ export class LogSchema<T extends SchemaFields = SchemaFields> extends ColumnSche
     }
 
     // Return new LogSchema instance
-    return new LogSchema(merged);
+    return new LogSchema(merged, this.library);
   }
 
   /**

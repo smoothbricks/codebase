@@ -91,7 +91,7 @@ function makeSchema(storage: Storage): LogSchema {
       userId: ArrowS.category().eager(),
       errorMessage: S.text(),
       duration: ArrowS.number().eager(),
-      requestBytes: ArrowS.bigUint64(),
+      requestBytes: ArrowS.u64(),
       operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
       isAdmin: S.boolean(),
     });
@@ -100,7 +100,7 @@ function makeSchema(storage: Storage): LogSchema {
     userId: S.category(),
     errorMessage: S.text(),
     duration: S.number(),
-    requestBytes: ArrowS.bigUint64(),
+    requestBytes: ArrowS.u64(),
     operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
     isAdmin: S.boolean(),
   });

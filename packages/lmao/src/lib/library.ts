@@ -16,85 +16,8 @@
  * descriptors for cold Arrow conversion.
  */
 
-import { isRecord } from '@smoothbricks/validation';
 import type { RemapDescriptor, RemappedColumn } from './logBinding.js';
-import { LogSchema, type SchemaFields } from './schema/types.js';
-
-function isSchemaField(value: unknown): value is SchemaFields[string] {
-  return isRecord(value);
-}
-
-/**
- * Prefix a tag attribute schema
- * Renames all fields with a prefix to avoid conflicts
- *
- * 01j "Library Compilation (Prefixed)": a library defines clean field names
- * (status, method); the consumer applies a prefix (http) at wire time. The utilities
- * below create the prefixed schema, clean-to-prefixed mapping, and immutable Arrow
- * remap descriptor.
- *
- * Example:
- * - Input: { status: S.number(), method: S.enum(['GET', 'POST']) }
- * - Prefix: 'http'
- * - Output: { http_status: S.number(), http_method: S.enum(['GET', 'POST']) }
- */
-export function prefixSchema(schema: LogSchema, prefix: string): LogSchema & Record<string, unknown> {
-  const prefixedFields: Record<string, unknown> = {};
-  const constructorFields: SchemaFields = {};
-
-  for (const [fieldName, fieldSchema] of schema._columns) {
-    const prefixedName = `${prefix}_${fieldName}`;
-    prefixedFields[prefixedName] = fieldSchema;
-    if (isSchemaField(fieldSchema)) {
-      constructorFields[prefixedName] = fieldSchema;
-    }
-  }
-
-  // Create LogSchema and spread fields directly onto result for direct access
-  const logSchema = new LogSchema(constructorFields);
-  return Object.assign(logSchema, prefixedFields);
-}
-
-/**
- * Prefix mapping: maps clean names to prefixed column names
- *
- * WHY: Library authors write ctx.tag.status() but buffer column is http_status
- * HOW: At module creation time, we build this mapping once (cold path)
- *
- * @example
- * // Input: schema = { status: S.number(), method: S.enum([...]) }, prefix = 'http'
- * // Output: { status: 'http_status', method: 'http_method' }
- */
-export interface PrefixMapping {
-  [cleanName: string]: string; // cleanName -> prefixedColumnName
-}
-
-/**
- * Create a mapping from clean field names to prefixed column names
- *
- * WHY: This mapping exposes the relationship between clean library field names and
- * their prefixed column names.
- *
- * @param schema - Clean schema (LogSchema instance)
- * @param prefix - Prefix to apply (e.g., 'http')
- * @returns Mapping from clean name to prefixed name
- *
- * @example
- * const schema = defineLogSchema({ status: S.number() });
- * const mapping = createPrefixMapping(schema, 'http');
- * // Returns: { status: 'http_status' }
- */
-export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: string): PrefixMapping {
-  const mapping: PrefixMapping = {};
-
-  // Use LogSchema.fieldNames directly (no conditional needed)
-  for (const fieldName of schema._columnNames) {
-    mapping[fieldName] = `${prefix}_${fieldName}`;
-  }
-
-  return mapping;
-}
-
+import type { LogSchema } from './schema/types.js';
 /**
  * Create immutable output-to-source metadata for cold Arrow traversal.
  *

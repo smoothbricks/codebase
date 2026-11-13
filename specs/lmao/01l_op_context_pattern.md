@@ -179,7 +179,9 @@ deps: {
 }
 ```
 
-The **effective schema** = `appSchema & http_* & pg_* & mysql_* & query`.
+The **effective schema** = `appSchema & http_* & pg_* & mysql_* & query`. `query` is one column because both deps mapped
+a field of one type there
+([Shared Columns](./01e_library_integration_pattern.md#smoo/lmao!n/library-integration-shared-columns)).
 
 ### Feature Flag Evaluator <a id="smoo/lmao!n/op-context-flag-evaluator"></a>
 

@@ -72,7 +72,7 @@ const CASES: readonly ParityCase[] = [
       errorMsg: S.text(),
       count: S.number(),
       isActive: S.boolean(),
-      timestamp: S.bigUint64(),
+      timestamp: S.u64(),
       payload: S.binary(),
       untouched: S.number(),
     }),
@@ -95,7 +95,7 @@ const CASES: readonly ParityCase[] = [
       errorMsg: S.text().eager(),
       count: S.number().eager(),
       isActive: S.boolean().eager(),
-      timestamp: S.bigUint64().eager(),
+      timestamp: S.u64().eager(),
       payload: S.binary().eager(),
     }),
     fields: [

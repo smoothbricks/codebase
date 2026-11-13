@@ -8,19 +8,19 @@
 
 import type {
   EagerCategorySchema,
-  LazyBigUint64Schema,
   LazyCategorySchema,
   LazyNumberSchema,
   LazyTextSchema,
+  LazyU64Schema,
 } from '@smoothbricks/arrow-builder';
 import { S as ArrowS } from '@smoothbricks/arrow-builder';
 import { type DefinedLogSchema, defineLogSchema } from './defineLogSchema.js';
-import { LogSchema, type Schema } from './types.js';
+import { type Field, LogSchema } from './types.js';
 
 /**
  * System schema field type - explicit type to avoid Sury's internal brand symbol leaking.
  */
-export interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
+export interface SystemSchemaFieldTypes extends Record<string, Field> {
   message: EagerCategorySchema;
   line: LazyNumberSchema;
   error_code: LazyCategorySchema;
@@ -28,7 +28,7 @@ export interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> 
   retry_delay_ms: LazyNumberSchema;
   exception_stack: LazyTextSchema;
   ff_value: LazyCategorySchema;
-  uint64_value: LazyBigUint64Schema;
+  uint64_value: LazyU64Schema;
 }
 
 // Use arrow-builder's S directly (not lmao's wrapped version) to get clean types
@@ -40,7 +40,7 @@ const retryAttemptSchema: LazyNumberSchema = ArrowS.number();
 const retryDelayMsSchema: LazyNumberSchema = ArrowS.number();
 const exceptionStackSchema: LazyTextSchema = ArrowS.text();
 const ffValueSchema: LazyCategorySchema = ArrowS.category();
-const uint64ValueSchema: LazyBigUint64Schema = ArrowS.bigUint64();
+const uint64ValueSchema: LazyU64Schema = ArrowS.u64();
 
 /**
  * Raw system schema fields object.
@@ -166,7 +166,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
    * - User large integers via .uint64() fluent method
    * - Sparse data (only rows that need uint64)
    *
-   * Uses S.bigUint64() (lazy BigUint64Array) because:
+   * Uses S.u64() (lazy BigUint64Array) because:
    * - Most trace rows don't have a uint64 value
    * - Only metrics rows and entries where .uint64() is called
    * - Zero overhead for rows that don't use it
@@ -178,11 +178,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
  * Base system schema that all modules inherit.
  * Wrapped with defineLogSchema for validation and extension support.
  */
-export const systemSchema: DefinedLogSchema<SystemSchemaFieldTypes> = defineLogSchema(
-  systemSchemaFields,
-  // Skip reserved name validation for system schema - `message` is a system column
-  { _skipReservedNameValidation: true },
-);
+export const systemSchema: DefinedLogSchema<SystemSchemaFieldTypes> = defineLogSchema(systemSchemaFields);
 
 /**
  * Merge system schema with user schema

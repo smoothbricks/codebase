@@ -125,22 +125,18 @@ This design:
 
 ### Schema System
 
-Arrow-builder uses Sury schemas with metadata to determine TypedArray types:
+Arrow-builder's field builder `S` declares what each column holds; the buffer layer stores a column by its field's
+storage lane (`storageLaneOf`):
 
 ```typescript
-import * as s from '@sury/sury';
+import { ColumnSchema, S } from '@smoothbricks/arrow-builder';
 
-const schema = {
-  userId: s.number, // → Float64Array
-  status: s.enum, // → Uint8/16/32Array (based on enum size)
-  category: s.string, // → Uint32Array (string interning)
-  isActive: s.boolean, // → Uint8Array
-};
-
-// Attach metadata
-schema.userId.__schema_type = 'number';
-schema.status.__schema_type = 'enum';
-schema.status.__enum_values = ['pending', 'active', 'completed'];
+const schema = new ColumnSchema({
+  userId: S.number(), // → Float64Array
+  status: S.enum(['pending', 'active', 'completed']), // → Uint8/16/32Array (the width the variant count fixes)
+  category: S.category(), // → string[] (dictionary built at Arrow conversion)
+  isActive: S.boolean(), // → Uint8Array
+});
 ```
 
 ### TypedArray Mapping
@@ -397,21 +393,29 @@ buffer.attr_userId_values[idx] = 0; // Value doesn't matter
 buffer.attr_userId_nulls[idx] = 0; // Mark as null
 ```
 
-### Custom Schemas
+### Custom Kinds
 
-Extend the schema system for domain-specific types:
+A package adds a kind of its own with `defineFieldKind`: its identity, its column type, its validation and its codec.
 
 ```typescript
-import * as s from '@sury/sury';
+import { defineFieldKind } from '@smoothbricks/arrow-builder';
 
-function createEnumSchema<T extends string>(values: readonly T[]) {
-  const schema = s.enum(values);
-  schema.__schema_type = 'enum';
-  schema.__enum_values = values;
-  return schema;
-}
+const isUuid = (value: unknown): value is string =>
+  typeof value === 'string' && /^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(value);
 
-const statusSchema = createEnumSchema(['pending', 'active', 'completed']);
+const uuid = defineFieldKind<string, null, 'example.uuid'>({
+  id: 'example.uuid',
+  physical: () => ({ type: 'utf8' }),
+  digest: () => '',
+  validate: (_params, value) =>
+    isUuid(value)
+      ? { ok: true, value }
+      : { ok: false, error: { path: '', expected: 'a UUID', observed: typeof value } },
+  encode: (_params, value) => value,
+  decode: (_params, cell) => String(cell),
+});
+
+const requestId = uuid(null);
 ```
 
 ## License

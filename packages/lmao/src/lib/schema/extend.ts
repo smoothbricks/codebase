@@ -22,7 +22,6 @@ export function extendSchema<T extends SchemaFields, U extends SchemaFields>(bas
  *
  * This performs shallow merge and validates:
  * - No conflicting field names
- * - No reserved names in extension
  *
  * Example:
  * ```typescript
@@ -54,9 +53,6 @@ export function extendSchema<U extends SchemaFields>(
       );
     }
   }
-
-  // Assert extension doesn't use reserved names
-  LogSchema.assertUserFieldNames(Object.keys(extension));
 
   // Perform shallow merge
   const merged = { ...baseFields, ...extension };

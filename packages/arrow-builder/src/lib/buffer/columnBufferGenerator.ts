@@ -28,7 +28,7 @@
  * - Cache-friendly: nulls and values in same ArrayBuffer
  */
 
-import { type ColumnSchema, isColumnSchema } from '../schema-types.js';
+import { type ColumnSchema, isColumnSchema } from '../schema/ColumnSchema.js';
 import { buildColumnAccessorPlan, type ColumnStorageInfo } from './accessorPlan.js';
 import { bufferHelpers } from './bufferHelpers.js';
 import { assertClosureMaterializable, materializeColumnBufferClass } from './closureMaterializers.js';

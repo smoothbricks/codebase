@@ -7,7 +7,7 @@
 
 import { S } from '../src/lib/schema/builder.js';
 import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
-import { getEnumValues, getSchemaType } from '../src/lib/schema/typeGuards.js';
+import { getEnumValues, storageLaneOf } from '../src/lib/schema/typeGuards.js';
 import {
   attributeKindForSchemaType,
   isThreadSystemColumn,
@@ -35,7 +35,7 @@ time('kinds + enums maps from _columnNames', 50_000, () => {
   const enums = new Map<string, readonly string[]>();
   for (const name of schema._columnNames) {
     if (isThreadSystemColumn(name)) continue;
-    const type = getSchemaType(schema.fields[name]);
+    const type = storageLaneOf(schema.fields[name]);
     if (type === undefined) continue;
     const kind = attributeKindForSchemaType(type);
     if (kind === undefined) continue;

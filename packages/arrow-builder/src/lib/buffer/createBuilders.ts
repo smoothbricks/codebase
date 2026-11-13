@@ -10,8 +10,10 @@
  * - boolean → Uint8Array
  */
 
+import type { ColumnSchema } from '../schema/ColumnSchema.js';
 import type { Schema } from '../schema/core.js';
-import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
+import { enumIndexBits } from '../schema/field.js';
+import { getEnumValues, storageLaneOf } from '../schema/typeGuards.js';
 import { type ColumnValueType, DEFAULT_BUFFER_CAPACITY, type TypedArrayConstructor } from './types.js';
 
 /**
@@ -50,54 +52,28 @@ export function createAttributeColumns(
  * We attach metadata to schemas in builder.ts to identify the type.
  */
 function createTypedArrayForSchema(schema: Schema, capacity: number): ColumnValueType {
-  const schemaWithMetadata = schema as SchemaWithMetadata;
-  const schemaType = schemaWithMetadata.__schema_type;
-
-  // Handle three string types
-  if (schemaType === 'enum') {
-    // Enum: Select TypedArray size based on enum value count
-    const enumValues = schemaWithMetadata.__enum_values;
-    const enumCount = enumValues?.length ?? 0;
-
-    if (enumCount === 0) {
-      // No enum values specified, default to Uint8Array
+  switch (storageLaneOf(schema)) {
+    case 'enum': {
+      // Enum: the index width the declaration fixes
+      const bits = enumIndexBits(getEnumValues(schema)?.length ?? 0);
+      return bits === 8
+        ? new Uint8Array(capacity)
+        : bits === 16
+          ? new Uint16Array(capacity)
+          : new Uint32Array(capacity);
+    }
+    case 'category':
+    case 'text':
+      // Raw string array (a dictionary, if any, is built at Arrow conversion)
+      return new Array<string>(capacity);
+    case 'number':
+      return new Float64Array(capacity);
+    case 'boolean':
       return new Uint8Array(capacity);
-    }
-    if (enumCount <= 256) {
-      // 0-255 indices (256 values total): Uint8Array (1 byte)
-      return new Uint8Array(capacity);
-    }
-    if (enumCount <= 65536) {
-      // 256-65535 indices (65536 values total): Uint16Array (2 bytes)
-      return new Uint16Array(capacity);
-    }
-    // >65536 values: Uint32Array (4 bytes)
-    return new Uint32Array(capacity);
+    default:
+      // Default to Uint32Array for unknown types
+      return new Uint32Array(capacity);
   }
-
-  if (schemaType === 'category') {
-    // Category: raw string array (dictionary built at Arrow conversion)
-    return new Array<string>(capacity);
-  }
-
-  if (schemaType === 'text') {
-    // Text: raw string array (no dictionary)
-    return new Array<string>(capacity);
-  }
-
-  // Handle number and boolean types
-  if (schemaType === 'number') {
-    // Number: Float64Array for full precision
-    return new Float64Array(capacity);
-  }
-
-  if (schemaType === 'boolean') {
-    // Boolean: Uint8Array (0 or 1)
-    return new Uint8Array(capacity);
-  }
-
-  // Default to Uint32Array for unknown types
-  return new Uint32Array(capacity);
 }
 
 /**
@@ -106,8 +82,7 @@ function createTypedArrayForSchema(schema: Schema, capacity: number): ColumnValu
  * This examines the schema to determine the appropriate TypedArray constructor.
  */
 export function getTypedArrayConstructor(schema: Schema): TypedArrayConstructor {
-  const schemaWithMetadata = schema as SchemaWithMetadata;
-  const schemaType = schemaWithMetadata.__schema_type;
+  const schemaType = storageLaneOf(schema);
 
   if (schemaType === 'enum') return Uint8Array;
   if (schemaType === 'category') return Uint32Array;

@@ -17,7 +17,7 @@
  * 3. Return `this` for chaining: `writer.nextRow().userId("123").status("ok")`
  */
 
-import type { ColumnSchema } from '../schema-types.js';
+import type { ColumnSchema } from '../schema/ColumnSchema.js';
 import { buildColumnAccessorPlan, type ColumnPlanEntry } from './accessorPlan.js';
 import { assertClosureMaterializable, materializeColumnWriterClass } from './closureMaterializers.js';
 import { activeMaterializerMode } from './codegenCapability.js';

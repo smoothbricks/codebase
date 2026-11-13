@@ -12,7 +12,10 @@
  *   per-field closures where string codegen is forbidden (e.g. workerd).
  */
 
-import type { ColumnSchema, SchemaType, SchemaWithMetadata } from '../schema-types.js';
+import type { ColumnSchema } from '../schema/ColumnSchema.js';
+import { enumIndexBits } from '../schema/field.js';
+import { getEnumValues, storageLaneOf } from '../schema/typeGuards.js';
+import type { StorageLane } from '../schema/types.js';
 
 //#region smoo/lmao!n/buffer-arch-eager-vs-lazy
 /**
@@ -22,7 +25,7 @@ export interface ColumnStorageInfo {
   constructorName: string;
   bytesPerElement: number;
   isBitPacked: boolean;
-  schemaType: SchemaType | undefined;
+  schemaType: StorageLane | undefined;
   enumValues?: readonly string[];
   /** When true, column is allocated eagerly in constructor (no null bitmap). */
   isEager: boolean;
@@ -52,60 +55,32 @@ export interface ColumnAccessorPlan {
  * Get TypedArray constructor name and byte size for a schema field
  */
 export function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStorageInfo {
-  const fieldSchema = schema.fields[fieldName];
-  const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
-  const schemaType = schemaWithMetadata?.__schema_type;
-  const isEager = schemaWithMetadata?.__eager === true;
+  const field = schema.fields[fieldName];
+  const schemaType = storageLaneOf(field);
+  const isEager = field?.hints.eager === true;
 
-  if (schemaType === 'enum') {
-    const enumValues = schemaWithMetadata.__enum_values;
-    const enumCount = enumValues?.length ?? 0;
-
-    // Uint8Array can hold 0-255 indices (256 values total)
-    if (enumCount === 0 || enumCount <= 256) {
-      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues, isEager };
+  switch (schemaType) {
+    case 'enum': {
+      const enumValues = getEnumValues(field);
+      const bits = enumIndexBits(enumValues?.length ?? 0);
+      const constructorName = bits === 8 ? 'Uint8Array' : bits === 16 ? 'Uint16Array' : 'Uint32Array';
+      return { constructorName, bytesPerElement: bits / 8, isBitPacked: false, schemaType, enumValues, isEager };
     }
-    if (enumCount <= 65536) {
-      return {
-        constructorName: 'Uint16Array',
-        bytesPerElement: 2,
-        isBitPacked: false,
-        schemaType,
-        enumValues,
-        isEager,
-      };
-    }
-    // >65536 values: Uint32Array (4 bytes)
-    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues, isEager };
-  }
-
-  if (schemaType === 'category') {
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'text') {
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'number') {
-    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'boolean') {
-    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType, isEager };
-  }
-
-  if (schemaType === 'bigUint64') {
-    return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
-  }
-
-  if (schemaType === 'binary') {
+    case 'category':
+    case 'text':
     // Binary columns use Array storage (same as category/text) to hold frozen object references
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
+    case 'binary':
+      return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
+    case 'number':
+      return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
+    case 'boolean':
+      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType, isEager };
+    case 'bigUint64':
+      return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
+    case undefined:
+      // A field with no storage lane: its buffer owner refuses it by name before a row is written.
+      return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
   }
-
-  // Default to Uint32Array for unknown types
-  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
 }
 //#endregion smoo/lmao!n/buffer-arch-eager-vs-lazy
 

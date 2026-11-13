@@ -12,7 +12,7 @@
  * nothing about application-specific concepts. Those are added by consumer packages.
  */
 
-import type { ColumnSchema } from '../schema-types.js';
+import type { ColumnSchema } from '../schema/ColumnSchema.js';
 import { createGeneratedColumnBuffer } from './columnBufferGenerator.js';
 import type { ColumnBuffer } from './types.js';
 import { DEFAULT_BUFFER_CAPACITY } from './types.js';

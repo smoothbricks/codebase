@@ -13,7 +13,7 @@ export {
   getBinaryEncoder,
   getEnumUtf8,
   getEnumValues,
-  getSchemaType,
-  isEnumSchema,
-  isSchemaWithMetadata,
+  isEnumField,
+  isField,
+  storageLaneOf,
 } from '@smoothbricks/arrow-builder';

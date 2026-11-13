@@ -1,8 +1,7 @@
 ---
 title: Store structured payloads
 description: >-
-  Record objects and optional/union values using the binary and composite schema
-  types.
+  Record objects and optional/union values using the binary and composite schema types.
 sidebar:
   order: 15
 id: vx-XqbmS3Jk
@@ -17,7 +16,8 @@ value, use the binary schema types; for nullable or multi-shape fields, use the 
 
 - `S.unknown()` — store an arbitrary value (encoded as msgpack binary).
 - `S.object<T>()` — same, but typed as `T`.
-- `S.binary({ encoder })` — store bytes with a custom encoder.
+- A field kind of your own (`defineFieldKind` from `@smoothbricks/arrow-builder`) — store any value through your own
+  codec.
 
 ```ts
 import { S, defineLogSchema } from '@smoothbricks/lmao';
@@ -51,8 +51,6 @@ const schema = defineLogSchema({
 });
 ```
 
-:::note
-For the simpler scalar string choices (`enum` / `category` / `text`), see
+:::note For the simpler scalar string choices (`enum` / `category` / `text`), see
 [Choose a string type](/guides/choose-string-types/). For the full builder list, see the
-[Schema DSL reference](/reference/schema-dsl/).
-:::
+[Schema DSL reference](/reference/schema-dsl/). :::

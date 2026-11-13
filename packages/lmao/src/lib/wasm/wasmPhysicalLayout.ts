@@ -1,4 +1,4 @@
-import { getSchemaType } from '@smoothbricks/arrow-builder';
+import { storageLaneOf } from '@smoothbricks/arrow-builder';
 import type { EagerColumnDescriptor } from '../physicalLayoutPlan.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -227,10 +227,8 @@ function buildWasmLayoutTemplate(
 
   for (const name of schema._columnNames) {
     const field = schema.fields[name];
-    const schemaType = getSchemaType(field);
-    const eager =
-      preallocatedColumns.has(name) ||
-      (typeof field === 'object' && field !== null && Reflect.get(field, '__eager') === true);
+    const schemaType = storageLaneOf(field);
+    const eager = preallocatedColumns.has(name) || field.hints.eager;
     let storage: Pick<WasmColumnLayoutTemplate, 'family' | 'arrayType' | 'byteWidth' | 'alignment'> | null = null;
 
     switch (schemaType) {

@@ -26,20 +26,21 @@ const appSchema = defineLogSchema({
 
 ## Field types (`S`)
 
-| Builder | Type | Notes |
-|---|---|---|
-| `S.number()` | number | Numeric column. |
-| `S.boolean()` | boolean | True/false column. |
-| `S.enum([...])` | string (union) | Small, known set of values. |
-| `S.category()` | string | Repeating values; dictionary-encoded on conversion. |
-| `S.text()` | string | Mostly-unique values; stored as plain strings. |
-| `S.unknown()` | unknown | Arbitrary value stored as msgpack binary. |
-| `S.object<T>()` | T (object) | Typed object stored as msgpack binary. |
-| `S.binary({ encoder })` | bytes | Raw bytes via a custom encoder. |
-| `S.optional(schema)` | `T \| undefined` | Wrap a schema to allow an absent value. |
-| `S.union([a, b, …])` | `A \| B \| …` | Allow one of several schemas. |
+| Builder                            | Type             | Notes                                                                                      |
+| ---------------------------------- | ---------------- | ------------------------------------------------------------------------------------------ |
+| `S.number()`                       | number           | Numeric column.                                                                            |
+| `S.boolean()`                      | boolean          | True/false column.                                                                         |
+| `S.enum([...])`                    | string (union)   | Small, known set of values.                                                                |
+| `S.category()`                     | string           | Repeating values; dictionary-encoded on conversion.                                        |
+| `S.text()`                         | string           | Mostly-unique values; stored as plain strings.                                             |
+| `S.unknown()`                      | unknown          | Arbitrary value stored as msgpack binary.                                                  |
+| `S.object<T>()`                    | T (object)       | Typed object stored as msgpack binary.                                                     |
+| `defineFieldKind({ ... })(params)` | your type        | A kind of your own: its column type, validation and codec (`@smoothbricks/arrow-builder`). |
+| `S.optional(schema)`               | `T \| undefined` | Wrap a schema to allow an absent value.                                                    |
+| `S.union([a, b, …])`               | `A \| B \| …`    | Allow one of several schemas.                                                              |
 
-For objects, optional, and union fields in practice, see [Store structured payloads](/guides/store-structured-payloads/).
+For objects, optional, and union fields in practice, see
+[Store structured payloads](/guides/store-structured-payloads/).
 
 For choosing between the string types, see [Choose a string type](/guides/choose-string-types/).
 
@@ -58,6 +59,6 @@ const flags = defineFeatureFlags({
 });
 ```
 
-The result exposes `.schema` (pass this to `defineOpContext({ flags })`), plus `.syncFlags` and `.asyncFlags` lists.
-The `.default(v).sync()` / `.async()` modifiers apply to **flags only**, not to log-schema fields. See
+The result exposes `.schema` (pass this to `defineOpContext({ flags })`), plus `.syncFlags` and `.asyncFlags` lists. The
+`.default(v).sync()` / `.async()` modifiers apply to **flags only**, not to log-schema fields. See
 [Feature flags](/guides/feature-flags/).

@@ -80,7 +80,7 @@ describe('WasmSpanBuffer', () => {
   }
 
   // Test schema with various column types
-  // Use ArrowS for types not exposed in lmao's S (bigUint64, eager)
+  // ArrowS is arrow-builder's field builder, which lmao's S extends: u64 and eager come from it
   const testSchema = defineLogSchema({
     userId: S.category(),
     requestId: S.category(),
@@ -88,13 +88,13 @@ describe('WasmSpanBuffer', () => {
     statusCode: ArrowS.number().eager(),
     isAdmin: S.boolean(),
     operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
-    duration: ArrowS.bigUint64(),
+    duration: ArrowS.u64(),
     errorMessage: S.text(),
   });
   const testEagerColumns = resolveEagerColumns(testSchema);
 
   const compilerEagerSchema = defineLogSchema({
-    provenNumber: S.number(),
+    provenNumber: S.optional(S.number()),
     lazyNumber: S.number(),
     provenString: S.category(),
     lazyString: S.category(),
@@ -651,9 +651,9 @@ describe('WasmSpanBuffer', () => {
       expect(overflow._descriptor.layout).toBe(child._descriptor.layout);
 
       root.provenNumber(0, 73);
-      root.provenNumber(1, null);
+      root.provenNumber(1, undefined);
       root.provenString(2, 'wasm-value');
-      overflow.provenNumber(3, null);
+      overflow.provenNumber(3, undefined);
 
       const jsBuffer = createSpanBuffer(
         planSchema,
@@ -663,7 +663,7 @@ describe('WasmSpanBuffer', () => {
         compilerEagerOp.callsitePlan.SpanBufferClass,
       );
       jsBuffer.provenNumber(0, 73);
-      jsBuffer.provenNumber(1, null);
+      jsBuffer.provenNumber(1, undefined);
       jsBuffer.provenString(2, 'wasm-value');
 
       for (const name of ['provenNumber', 'provenString']) {

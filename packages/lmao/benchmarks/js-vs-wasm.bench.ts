@@ -45,7 +45,7 @@ const opContext = defineOpContext({
 });
 
 // Extract schema type for strategy generics
-type SchemaType = typeof opContext.logBinding.logSchema;
+type BenchSchema = typeof opContext.logBinding.logSchema;
 
 // =============================================================================
 // Tracer setup (async initialization for WASM)
@@ -53,17 +53,17 @@ type SchemaType = typeof opContext.logBinding.logSchema;
 
 let jsTracer: TestTracer<typeof opContext>;
 let wasmTracer: TestTracer<typeof opContext>;
-let wasmStrategy: WasmBufferStrategy<SchemaType>;
+let wasmStrategy: WasmBufferStrategy<BenchSchema>;
 
 async function setup() {
   // JS tracer with JsBufferStrategy
   jsTracer = new TestTracer(opContext, {
-    bufferStrategy: new JsBufferStrategy<SchemaType>(),
+    bufferStrategy: new JsBufferStrategy<BenchSchema>(),
     createTraceRoot,
   });
 
   // WASM tracer with WasmBufferStrategy
-  wasmStrategy = await WasmBufferStrategy.create<SchemaType>({
+  wasmStrategy = await WasmBufferStrategy.create<BenchSchema>({
     capacity: 8,
   });
   wasmTracer = new TestTracer(opContext, {
@@ -233,7 +233,7 @@ summary(() => {
     bench('JS', async () => {
       // Create fresh tracer each iteration
       const tracer = new TestTracer(opContext, {
-        bufferStrategy: new JsBufferStrategy<SchemaType>(),
+        bufferStrategy: new JsBufferStrategy<BenchSchema>(),
         createTraceRoot,
       });
       await tracer.trace('test', async (ctx) => ctx.ok('done'));
@@ -241,7 +241,7 @@ summary(() => {
 
     bench('WASM', async () => {
       // Create fresh strategy + tracer each iteration
-      const strategy = await WasmBufferStrategy.create<SchemaType>({ capacity: 8 });
+      const strategy = await WasmBufferStrategy.create<BenchSchema>({ capacity: 8 });
       const tracer = new TestTracer(opContext, {
         bufferStrategy: strategy,
         createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
@@ -255,7 +255,7 @@ summary(() => {
   group('Cold start: Trace with tags (6 columns)', () => {
     bench('JS', async () => {
       const tracer = new TestTracer(opContext, {
-        bufferStrategy: new JsBufferStrategy<SchemaType>(),
+        bufferStrategy: new JsBufferStrategy<BenchSchema>(),
         createTraceRoot,
       });
       await tracer.trace('test', async (ctx) => {
@@ -270,7 +270,7 @@ summary(() => {
     });
 
     bench('WASM', async () => {
-      const strategy = await WasmBufferStrategy.create<SchemaType>({ capacity: 8 });
+      const strategy = await WasmBufferStrategy.create<BenchSchema>({ capacity: 8 });
       const tracer = new TestTracer(opContext, {
         bufferStrategy: strategy,
         createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
@@ -292,7 +292,7 @@ summary(() => {
   group('Cold start: Multiple log entries (50)', () => {
     bench('JS', async () => {
       const tracer = new TestTracer(opContext, {
-        bufferStrategy: new JsBufferStrategy<SchemaType>(),
+        bufferStrategy: new JsBufferStrategy<BenchSchema>(),
         createTraceRoot,
       });
       await tracer.trace('test', async (ctx) => {
@@ -304,7 +304,7 @@ summary(() => {
     });
 
     bench('WASM', async () => {
-      const strategy = await WasmBufferStrategy.create<SchemaType>({ capacity: 8 });
+      const strategy = await WasmBufferStrategy.create<BenchSchema>({ capacity: 8 });
       const tracer = new TestTracer(opContext, {
         bufferStrategy: strategy,
         createTraceRoot: createWasmTraceRootFactory(strategy.allocator),

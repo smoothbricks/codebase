@@ -10,14 +10,7 @@ import type { SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
-import type {
-  ColumnMapping,
-  MappedOpGroup,
-  MappedOpGroupInternal,
-  OpGroup,
-  OpGroupInternal,
-  SchemaFieldsOf,
-} from '../opContext/opGroupTypes.js';
+import type { MappedOpGroup, MappedOpGroupInternal, OpGroup, OpGroupInternal } from '../opContext/opGroupTypes.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { OpContext } from '../opContext/types.js';
 import { type CallsitePlan, getPhysicalLayoutPlan, sealCallsitePlan } from '../physicalLayoutPlan.js';
@@ -50,15 +43,12 @@ function requireLogSchema(value: unknown, label: string): LogSchema {
   return value;
 }
 
-function assertColumnMapping<LibSchema extends SchemaFields>(
-  value: unknown,
-  label: string,
-): asserts value is ColumnMapping<LibSchema> {
+function assertColumnMapping<Columns>(value: unknown, label: string): asserts value is Columns {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error(`Expected ${label} to be a column mapping record`);
   }
-  for (const [key, mappingValue] of Object.entries(value)) {
-    if (typeof mappingValue !== 'string' && mappingValue !== null) {
+  for (const [key, column] of Object.entries(value)) {
+    if (typeof column !== 'string' && column !== null) {
       throw new Error(`Expected column mapping '${key}' in ${label} to be a string or null`);
     }
   }
@@ -71,13 +61,19 @@ function assertOpGroupInternals<Ctx extends OpContext>(
   requireLogSchema(Reflect.get(opGroup, '_logSchema'), `${label}._logSchema`);
 }
 
-function assertMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
-  opGroup: MappedOpGroup<Ctx, ContributedSchema>,
+function assertMappedOpGroupInternals<Ctx extends OpContext, Columns>(
+  opGroup: MappedOpGroup<Ctx, Columns>,
   label: string,
-): asserts opGroup is MappedOpGroupInternal<Ctx, ContributedSchema> {
+): asserts opGroup is MappedOpGroupInternal<Ctx, Columns> {
   requireLogSchema(Reflect.get(opGroup, '_logSchema'), `${label}._logSchema`);
-  const columnMapping = Reflect.get(opGroup, '_columnMapping');
-  assertColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>(columnMapping, `${label}._columnMapping`);
+  const mapped: unknown = Reflect.get(opGroup, '_columns');
+  if (typeof mapped !== 'object' || mapped === null) {
+    throw new Error(`Expected ${label}._columns to be the group's MappedFields`);
+  }
+  if (!(Reflect.get(mapped, 'named') instanceof Set)) {
+    throw new Error(`Expected ${label}._columns.named to be a Set of field names`);
+  }
+  assertColumnMapping<Columns>(Reflect.get(mapped, 'columns'), `${label}._columns.columns`);
 }
 
 export function requireStringArray(value: unknown, label: string): string[] {
@@ -332,27 +328,23 @@ export function getOpGroupInternals<Ctx extends OpContext>(
 /**
  * Get internal properties from a MappedOpGroup.
  *
- * MappedOpGroup's internal properties (_logSchema, _flags, _columnMapping,
- * _contributedSchema) are hidden from intellisense but accessible at runtime.
- * This helper provides typed access for tests.
+ * MappedOpGroup's internal properties (_logSchema, _flags, _columns) are hidden from
+ * intellisense but accessible at runtime. This helper returns the group's log schema and
+ * its column mapping, which is `_columns.columns`: every field of the library, under its
+ * local name, to the column the wiring gave it (a column name, or null when it has none).
  *
  * @param opGroup - The MappedOpGroup to access
- * @returns Internal interface with all internal properties
+ * @returns The group's log schema and its field → column mapping
  */
-export function getMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
-  opGroup: MappedOpGroup<Ctx, ContributedSchema>,
-): Pick<MappedOpGroupInternal<Ctx, ContributedSchema>, '_logSchema' | '_columnMapping'> {
+export function getMappedOpGroupInternals<Ctx extends OpContext, Columns>(
+  opGroup: MappedOpGroup<Ctx, Columns>,
+): { readonly _logSchema: Ctx['logSchema']; readonly _columnMapping: Columns } {
   assertMappedOpGroupInternals(opGroup, 'MappedOpGroup');
   return {
     _logSchema: opGroup._logSchema,
-    _columnMapping: opGroup._columnMapping,
+    _columnMapping: opGroup._columns.columns,
   };
 }
-
-/**
- * Convenience type alias for accessing column mapping from a MappedOpGroup.
- */
-export type { ColumnMapping, SchemaFieldsOf };
 
 // Re-export createTraceId for tests that need it
 export { createTraceId };

@@ -79,7 +79,7 @@ import {
   ENTRY_TYPE_TRACE,
   SYSTEM_SCHEMA_FIELD_NAMES,
 } from './schema/systemSchema.js';
-import { getBinaryEncoder, getEnumUtf8, getSchemaType } from './schema/typeGuards.js';
+import { getBinaryEncoder, getEnumUtf8, storageLaneOf } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import { walkSpanTree } from './traceTopology.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
@@ -920,7 +920,7 @@ function appendSchemaFieldColumns(
   borrowChunks: boolean,
 ): void {
   for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
+    const lmaoType = storageLaneOf(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
     const columnName = fieldName; // User columns have no prefix
 
@@ -1454,7 +1454,7 @@ export function convertSpanTreeToArrowTable(
 
   // Use cached schemaFields to filter out methods (extend, validate, parse, safeParse)
   for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
+    const lmaoType = storageLaneOf(fieldSchema);
     if (lmaoType === 'category') {
       categoryBuilders.set(fieldName, new DictBuilder(globalUtf8Cache));
       categoryMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
@@ -1779,7 +1779,7 @@ function convertBuffersWithSharedDicts(
   // User attributes first, then populated system lanes from the same SSoT as
   // convertBuffersToTable. Unpopulated lazy lanes stay absent.
   for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getSchemaType(fieldSchema);
+    const lmaoType = storageLaneOf(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
     const arrowFieldName = getArrowFieldName(fieldName);
 

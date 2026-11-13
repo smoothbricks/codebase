@@ -21,6 +21,15 @@
  */
 
 import {
+  type ComposedField,
+  type ComposedPart,
+  type CompositionRefusal,
+  composeColumns,
+  defineFields,
+  storageLaneOf,
+  typeText,
+} from '@smoothbricks/arrow-builder';
+import {
   type AnyOpGroup,
   type AnyOpGroupPublic,
   createDefineOp,
@@ -29,15 +38,15 @@ import {
   type DepsConfig,
   type EffectiveSchema,
   type FeatureFlagSchema,
-  isMappedOpGroup,
   type OpContext,
   type OpContextConfig,
   type OpContextFactory,
   RESERVED_CONTEXT_PROPS,
   type ValidateUserContext,
 } from './opContext/index.js';
+import { assertTagFieldNames } from './opContext/tagFieldNames.js';
 import { LogSchema } from './schema/LogSchema.js';
-import { mergeWithSystemSchema, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
+import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
 
 const EMPTY_FLAGS = Object.freeze({}) satisfies Record<string, never>;
@@ -48,145 +57,80 @@ const EMPTY_USER_CTX = Object.freeze({}) satisfies Record<string, never>;
 // EFFECTIVE SCHEMA COMPUTATION
 // =============================================================================
 
-// isMappedOpGroup is imported from opContext/index.js
-
-/**
- * Check if a field name is a system field (original or prefixed).
- *
- * System fields can appear as:
- * - Original names: 'message', 'line', 'error_code', etc.
- * - Prefixed names: 'http_message', 'db_line', 'auth_error_code', etc.
- *
- * @param fieldName - The field name to check
- * @returns True if the field is a system field
- */
-function isSystemField(fieldName: string): boolean {
-  // Check direct match first
-  if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) {
-    return true;
-  }
-  // Check if it's a prefixed system field (e.g., 'http_message' -> 'message')
-  const underscoreIdx = fieldName.indexOf('_');
-  if (underscoreIdx !== -1) {
-    const suffix = fieldName.slice(underscoreIdx + 1);
-    if (SYSTEM_SCHEMA_FIELD_NAMES.has(suffix)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Filter out system schema fields from a schema.
- *
- * System fields (message, line, error_code, etc.) are merged into every logSchema
- * by defineOpContext, but they should NOT be contributed when a dep is wired.
- * Each app gets its own system fields via mergeWithSystemSchema.
- *
- * This function handles both original and prefixed system field names.
- *
- * @param fields - Schema fields to filter
- * @returns Schema fields without system fields
- */
-function filterOutSystemFields(fields: SchemaFields): SchemaFields {
-  const result: SchemaFields = {};
-  for (const key of Object.keys(fields)) {
-    if (!isSystemField(key)) {
-      result[key] = fields[key];
-    }
-  }
-  return result;
-}
-
 function isInternalOpGroup(dep: AnyOpGroupPublic): dep is AnyOpGroupPublic & AnyOpGroup {
-  return '_logSchema' in dep;
+  return '_logSchema' in dep && '_columns' in dep;
+}
+
+/** Who brought a field into the composition, in the words of the wiring: the app, or a dep by its key. */
+function contributor(field: ComposedField, depNames: readonly string[]): string {
+  return field.part === 'composer' ? 'the app' : `dep '${depNames[field.part]}'`;
+}
+
+function describeConflict(refusal: CompositionRefusal, depNames: readonly string[]): string {
+  const [a, b] = refusal.fields;
+  const who = (field: ComposedField) => `field '${field.name}' of ${contributor(field, depNames)}`;
+  if (refusal.code === 'two-types-one-column') {
+    return (
+      `Schema conflict: column '${refusal.column}' would hold two types: ` +
+      `${who(a)} is ${refusal.types[0]}, ${who(b)} is ${refusal.types[1]}. ` +
+      'A shared column needs equal field types; use .prefix() or .mapColumns() to give each its own column.'
+    );
+  }
+  return (
+    `Schema conflict: column '${refusal.column}' is reached by ${who(a)} and ${who(b)}, and not both were mapped there. ` +
+    'Use .prefix() to keep them apart, or .mapColumns() on each dep to share the column.'
+  );
 }
 
 /**
- * Get the schema fields contributed by a dep (OpGroup or MappedOpGroup).
+ * Compute the effective schema: the columns of the app's own fields and of every dep's fields under the names the
+ * wiring gave them (01e "Column Mapping API").
  *
- * - For OpGroup: returns original schema fields (no transformation), excluding system fields
- * - For MappedOpGroup: returns contributedSchema (after prefix/mapping)
+ * The composition is arrow-builder's: the app is the composer, each dep one part. Two fields share a column only
+ * when each was mapped there by `.mapColumns()` (the app's own fields count as mapped) and their types are equal
+ * (01e "Shared Columns Across Libraries").
  *
- * System fields (message, line, error_code, etc.) are always filtered out because
- * each app gets its own system fields via mergeWithSystemSchema - deps should NOT
- * contribute system fields.
- *
- * The returned object maps field names to their schema definitions.
- *
- * @param dep - An OpGroup or MappedOpGroup (with internal properties _logSchema, _contributedSchema)
- * @returns The schema fields this dep contributes (user fields only, no system fields)
- */
-function getContributedSchemaFromDep(dep: AnyOpGroupPublic): SchemaFields {
-  if (!isInternalOpGroup(dep)) {
-    throw new Error('Invalid op dependency: expected an OpGroup created by defineOps()');
-  }
-
-  if (isMappedOpGroup(dep)) {
-    // MappedOpGroup has _contributedSchema with mapped field names
-    // This already excludes null-mapped columns (they were dropped in buildContributedSchema)
-    // Filter out system fields in case the original schema included them
-    return filterOutSystemFields(dep._contributedSchema);
-  }
-  // OpGroup contributes its original schema fields, excluding system fields
-  return filterOutSystemFields(dep._logSchema.fields);
-}
-
-/**
- * Compute the effective schema by merging app schema with all dep contributions.
- *
- * The effective schema is the union of:
- * 1. App's own schema fields
- * 2. All dep contributed fields (after prefix/mapping)
- *
- * Throws if multiple deps contribute the same field name (conflict detection).
- *
- * @param appFields - The app's own schema fields
+ * @param appSchema - The app's own log schema
  * @param deps - The deps config (name -> OpGroup | MappedOpGroup)
  * @returns Combined schema fields for the effective schema
- * @throws Error if deps contribute conflicting field names
+ * @throws Error naming the column, both fields, who contributed them and, for a type conflict, both types
  */
-function computeEffectiveSchema<T extends SchemaFields>(appFields: T): T;
+function computeEffectiveSchema<T extends SchemaFields>(appSchema: LogSchema<T>): T;
 function computeEffectiveSchema<T extends SchemaFields, Deps extends DepsConfig>(
-  appFields: T,
+  appSchema: LogSchema<T>,
   deps: Deps,
 ): EffectiveSchema<T, Deps>;
-function computeEffectiveSchema(appFields: SchemaFields, deps?: DepsConfig): SchemaFields {
+function computeEffectiveSchema(appSchema: LogSchema, deps?: DepsConfig): SchemaFields {
+  const appFields = appSchema.fields;
   if (!deps || Object.keys(deps).length === 0) {
     return appFields;
   }
 
-  // Start with app fields
-  const effective: SchemaFields = { ...appFields };
-
-  // Track which dep contributed each field for conflict detection
-  const fieldSource: Record<string, string> = {};
-  for (const fieldName of Object.keys(appFields)) {
-    fieldSource[fieldName] = 'app';
+  const depNames = Object.keys(deps);
+  const parts: ComposedPart[] = [];
+  for (const depName of depNames) {
+    const dep = deps[depName];
+    if (!isInternalOpGroup(dep)) {
+      throw new Error(`Invalid op dependency '${depName}': expected an OpGroup created by defineOps()`);
+    }
+    parts.push(dep._columns);
   }
 
-  // Add each dep's contributed fields
-  for (const [depName, dep] of Object.entries(deps)) {
-    // Cast to AnyOpGroup to access internal properties (_logSchema, _contributedSchema)
-    // These exist at runtime but are hidden from public TypeScript interfaces
-    const contributed = getContributedSchemaFromDep(dep);
+  const composed = composeColumns(parts, { composer: defineFields(appSchema.library, appFields) });
+  if (!composed.ok) {
+    throw new Error(composed.error.map((refusal) => describeConflict(refusal, depNames)).join('\n'));
+  }
 
-    for (const [fieldName, fieldDef] of Object.entries(contributed)) {
-      // Check for conflict
-      if (fieldName in effective) {
-        const existingSource = fieldSource[fieldName];
-        throw new Error(
-          `Schema conflict: field '${fieldName}' contributed by dep '${depName}' ` +
-            `conflicts with field from '${existingSource}'. ` +
-            'Use .prefix() or .mapColumns() to resolve the conflict.',
-        );
-      }
-
-      effective[fieldName] = fieldDef;
-      fieldSource[fieldName] = depName;
+  // App fields first, then each dep's columns in wiring order. A shared column is one field: the first that
+  // names it; every later one has the same type.
+  const effective: SchemaFields = { ...appFields };
+  for (const part of parts) {
+    const schema = 'columns' in part ? part.schema : part;
+    for (const [name, field] of Object.entries(schema.fields)) {
+      const column = 'columns' in part ? part.columns[name] : name;
+      if (column !== null && column !== undefined && !(column in effective)) effective[column] = field;
     }
   }
-
   return effective;
 }
 
@@ -196,6 +140,7 @@ function buildOpContextFactory<
   Deps extends DepsConfig,
   UserCtx extends Record<string, unknown>,
 >(
+  library: string,
   effectiveFields: EffectiveFields,
   flags: FF,
   deps: Deps,
@@ -205,7 +150,7 @@ function buildOpContextFactory<
   // System columns are always available on SpanBuffer regardless of user schema.
   // Type parameter stays on the effective user/dependency schema because callers should infer
   // only the public columns, while the runtime object still carries the merged system fields.
-  const mergedSchema = new LogSchema<EffectiveFields>(mergeWithSystemSchema(effectiveFields));
+  const mergedSchema = new LogSchema<EffectiveFields>(mergeWithSystemSchema(effectiveFields), library);
 
   // Create a LogBinding for ops to use.
   // NOTE: Stats are NO LONGER on LogBinding - they are on SpanBufferClass.stats (static property).
@@ -237,7 +182,7 @@ function buildOpContextFactory<
 
   // Create effective schema LogSchema instance for factory.logSchema.
   // This contains app fields + all dep contributed fields (user fields only, no system).
-  const effectiveLogSchema = new LogSchema(effectiveFields);
+  const effectiveLogSchema = new LogSchema(effectiveFields, library);
 
   return {
     logSchema: effectiveLogSchema,
@@ -366,41 +311,61 @@ export function defineOpContext<
   //#endregion smoo/lmao!n/schema-env-config.reserved
   //#endregion smoo/lmao!n/schema-env-config
 
+  // 01a "Log Schema Definition": the log schema's fields become setters of this context's tag writer, log entries
+  // and results, so a name that would shadow one of their members is refused here, where they are built.
+  assertTagFieldNames(config.logSchema._columnNames);
+
+  // 01a "Fields and kinds": a span buffer stores the lanes it has; a field of any other kind is refused here, by
+  // name, before a buffer class is built for it.
+  for (const [name, field] of config.logSchema._columns) {
+    if (storageLaneOf(field) === undefined) {
+      throw new Error(
+        `Field '${name}' is ${typeText(field)}: span buffers store enum, category, text, f64, boolean, u64 and binary-column kinds`,
+      );
+    }
+  }
+
   // Compute effective schema by combining app schema with dep contributions.
   // This merges app fields + all dep contributed fields (after prefix/mapping).
   if (config.deps === undefined) {
-    const effectiveFields = computeEffectiveSchema(config.logSchema.fields);
+    const effectiveFields = computeEffectiveSchema(config.logSchema);
 
     if (config.flags === undefined) {
       if (config.ctx === undefined) {
-        return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, EMPTY_DEPS, EMPTY_USER_CTX);
+        return buildOpContextFactory(
+          config.logSchema.library,
+          effectiveFields,
+          EMPTY_FLAGS,
+          EMPTY_DEPS,
+          EMPTY_USER_CTX,
+        );
       }
 
-      return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, EMPTY_DEPS, config.ctx);
+      return buildOpContextFactory(config.logSchema.library, effectiveFields, EMPTY_FLAGS, EMPTY_DEPS, config.ctx);
     }
 
     if (config.ctx === undefined) {
-      return buildOpContextFactory(effectiveFields, config.flags, EMPTY_DEPS, EMPTY_USER_CTX);
+      return buildOpContextFactory(config.logSchema.library, effectiveFields, config.flags, EMPTY_DEPS, EMPTY_USER_CTX);
     }
 
-    return buildOpContextFactory(effectiveFields, config.flags, EMPTY_DEPS, config.ctx);
+    return buildOpContextFactory(config.logSchema.library, effectiveFields, config.flags, EMPTY_DEPS, config.ctx);
   }
 
-  const effectiveFields = computeEffectiveSchema(config.logSchema.fields, config.deps);
+  const effectiveFields = computeEffectiveSchema(config.logSchema, config.deps);
 
   if (config.flags === undefined) {
     if (config.ctx === undefined) {
-      return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, config.deps, EMPTY_USER_CTX);
+      return buildOpContextFactory(config.logSchema.library, effectiveFields, EMPTY_FLAGS, config.deps, EMPTY_USER_CTX);
     }
 
-    return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, config.deps, config.ctx);
+    return buildOpContextFactory(config.logSchema.library, effectiveFields, EMPTY_FLAGS, config.deps, config.ctx);
   }
 
   if (config.ctx === undefined) {
-    return buildOpContextFactory(effectiveFields, config.flags, config.deps, EMPTY_USER_CTX);
+    return buildOpContextFactory(config.logSchema.library, effectiveFields, config.flags, config.deps, EMPTY_USER_CTX);
   }
 
-  return buildOpContextFactory(effectiveFields, config.flags, config.deps, config.ctx);
+  return buildOpContextFactory(config.logSchema.library, effectiveFields, config.flags, config.deps, config.ctx);
 }
 //#endregion smoo/lmao!n/opcontext-definition
 

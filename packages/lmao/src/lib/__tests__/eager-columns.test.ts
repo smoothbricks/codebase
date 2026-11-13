@@ -129,7 +129,7 @@ describe('compiler-proven eager user columns', () => {
 
   it('selects one immutable plan and preallocates only proven nullable lanes across root, child, and overflow', () => {
     const schema = defineLogSchema({
-      provenNumber: S.number(),
+      provenNumber: S.optional(S.number()),
       lazyString: S.category(),
       provenString: S.category(),
       lazyBoolean: S.boolean(),
@@ -183,9 +183,9 @@ describe('compiler-proven eager user columns', () => {
     expect(child._identity).not.toBe(root._identity);
 
     root.provenNumber(0, 42);
-    root.provenNumber(1, null);
+    root.provenNumber(1, undefined);
     child.provenString(2, 'child');
-    overflow.provenNumber(3, null);
+    overflow.provenNumber(3, undefined);
     root.lazyString(4, 'materialized lazily');
 
     expect(root.getColumnIfAllocated('provenNumber')?.[0]).toBe(42);

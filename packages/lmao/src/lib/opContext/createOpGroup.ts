@@ -5,7 +5,6 @@
  * Enables V8 hidden class optimization and cleaner API (`.opName` not `.ops.opName`).
  *
  * Why class-based:
- * - Private fields (#columnMapping) don't affect hidden class (truly hidden, no enumeration)
  * - Ops as own properties enable direct access and predictable object shape
  * - prefix()/mapColumns() create new instances with same SpanBufferClass (shared stats)
  * - Only immutable remap metadata differs between original and mapped op instances
@@ -16,20 +15,28 @@
  * @module opContext/createOpGroup
  */
 
+import {
+  type ColumnMapping,
+  defineFields,
+  type Field,
+  type FieldSchema,
+  type LocalColumns,
+  type MappedColumns,
+  type MappedFields,
+  type PrefixedColumns,
+} from '@smoothbricks/arrow-builder';
 import { createRemapDescriptor } from '../library.js';
 import type { RemapDescriptor } from '../logBinding.js';
 import { type AnyOp, Op } from '../op.js';
+import type { LogSchema } from '../schema/LogSchema.js';
 import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type {
-  ColumnMapping,
   MappedOpGroup,
   MappedOpGroupInternal,
-  MappedSchema,
   OpGroup,
   OpGroupInternal,
   OpGroupOps,
-  PrefixedSchema,
   SchemaFieldsOf,
 } from './opGroupTypes.js';
 import { validateOpName } from './opGroupTypes.js';
@@ -37,29 +44,64 @@ import type { OpContext } from './types.js';
 
 //#region smoo/lmao!n/column-mapping-api
 // 01l "Dependencies with Column Mapping" + 01e "Column Mapping API": .prefix(name) and
-// .mapColumns({ col: 'new' | 'shared' | null }) are composed here. Each call clones the
-// OpGroup's ops with one immutable descriptor; child buffers remain canonical and Arrow
-// interprets the descriptor only on its cold traversal path.
+// .mapColumns({ field: 'new' | 'shared' | null }) are arrow-builder's column composition algebra over the group's
+// own fields. Each call clones the OpGroup's ops with one immutable descriptor rendered from the mapping; child
+// buffers remain canonical and Arrow interprets the descriptor only on its cold traversal path.
 // =============================================================================
 // INTERNAL HELPERS
 // =============================================================================
 
-function getSchemaFields<Schema extends { readonly fields: SchemaFields }>(fieldsSchema: Schema): Schema['fields'] {
-  return fieldsSchema.fields;
+function assertFieldsOf<F extends SchemaFields>(fields: Record<string, Field>, schema: LogSchema): asserts fields is F {
+  for (const name of Object.keys(fields)) {
+    if (!(name in schema.fields)) throw new TypeError(`field '${name}' is not a field of the group's log schema`);
+  }
 }
 
 /**
- * Create the fully composed Arrow output-to-canonical-source mapping.
- * Input: clean -> output mapping; output: output -> clean mapping.
+ * A group's own fields as its library's field schema. System columns are not a library's: every application has
+ * its own, so they take no part in a column mapping.
  */
-function createReverseMapping(mapping: Record<string, string | null | undefined>): Record<string, string> {
-  const reverse: Record<string, string> = {};
-  for (const [cleanName, prefixedName] of Object.entries(mapping)) {
-    if (typeof prefixedName === 'string') {
-      reverse[prefixedName] = cleanName;
-    }
+function libraryFields<Ctx extends OpContext>(
+  logSchema: Ctx['logSchema'],
+): FieldSchema<string, SchemaFieldsOf<Ctx['logSchema']>> {
+  const own: Record<string, Field> = {};
+  for (const [name, field] of logSchema._columns) {
+    if (!SYSTEM_SCHEMA_FIELD_NAMES.has(name)) own[name] = field;
   }
-  return reverse;
+  assertFieldsOf<SchemaFieldsOf<Ctx['logSchema']>>(own, logSchema);
+  return defineFields(logSchema.library, own);
+}
+
+/**
+ * Render a column mapping as the Arrow output-to-canonical-source lookup of the library's span buffers.
+ *
+ * A span buffer reads one source column per output column, so two fields of one library cannot be one output.
+ *
+ * @throws Error naming both fields when a mapping gives two of the library's fields one column.
+ */
+function isColumns(value: unknown): value is Readonly<Record<string, string | null>> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Object.values(value).every((column) => column === null || typeof column === 'string')
+  );
+}
+
+function outputToSource(library: string, columns: unknown): Record<string, string> {
+  if (!isColumns(columns)) throw new TypeError(`library '${library}': a column mapping holds column names or null`);
+  const sources: Record<string, string> = {};
+  for (const [field, column] of Object.entries(columns)) {
+    if (column === null) continue;
+    const earlier = sources[column];
+    if (earlier !== undefined) {
+      throw new Error(
+        `Schema conflict: fields '${earlier}' and '${field}' of library '${library}' are both mapped to column '${column}'. ` +
+          'A span row has one value per column: give each field its own column.',
+      );
+    }
+    sources[column] = field;
+  }
+  return sources;
 }
 
 function isOpInstance<Ctx extends OpContext>(value: unknown): value is AnyOp<Ctx> {
@@ -108,109 +150,6 @@ function cloneOpsWithDescriptor<Ctx extends OpContext, Ops extends OpGroupOps<Ct
   return cloned;
 }
 
-function prefixContributedSchema<T extends SchemaFields, P extends string>(fields: T, prefix: P): PrefixedSchema<T, P> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(fields)) {
-    if (SYSTEM_SCHEMA_FIELD_NAMES.has(key)) continue;
-    result[`${prefix}_${key}`] = value;
-  }
-  assertMappedSchema<PrefixedSchema<T, P>>(result);
-  return result;
-}
-
-function assertMappedSchema<T extends SchemaFields>(value: Record<string, unknown>): asserts value is T {
-  for (const schema of Object.values(value)) {
-    if (typeof schema !== 'object' || schema === null) {
-      throw new TypeError('Mapped schema must contain schema metadata objects');
-    }
-  }
-}
-
-/**
- * Build a prefix mapping for all schema fields
- *
- * Why prefix all fields: Ensures no column name collisions when wiring multiple libraries.
- * Each library's columns become `${prefix}_${field}` in app schema.
- *
- * @param fieldNames - The field names from the schema
- * @param prefix - The prefix to apply
- * @returns Column mapping where each field becomes `${prefix}_${field}`
- */
-function buildPrefixMapping<T extends SchemaFields, P extends string>(
-  fieldNames: readonly string[],
-  prefix: P,
-): ColumnMapping<T> {
-  const mapping: Record<string, string> = {};
-  for (const name of fieldNames) {
-    // Skip system columns - they should NOT be prefixed
-    if (SYSTEM_SCHEMA_FIELD_NAMES.has(name)) continue;
-    mapping[name] = `${prefix}_${name}`;
-  }
-  return mapping as ColumnMapping<T>;
-}
-
-/**
- * Apply a prefix to an existing mapping
- *
- * For each entry in the mapping:
- * - If mapped to a string, prefix that string: 'status' -> 'http_status'
- * - If mapped to null (dropped), keep as null
- *
- * Why: Enables chaining `.prefix('http').prefix('api')` to build composite prefixes.
- *
- * @param mapping - Existing column mapping
- * @param prefix - Prefix to apply
- * @returns New mapping with prefixed target names
- */
-function prefixMapping<T extends SchemaFields, P extends string>(
-  mapping: ColumnMapping<T>,
-  prefix: P,
-): ColumnMapping<T> {
-  const result: Record<string, string | null> = {};
-  for (const [key, value] of Object.entries(mapping)) {
-    if (value === null) {
-      result[key] = null;
-    } else if (typeof value === 'string') {
-      result[key] = `${prefix}_${value}`;
-    }
-  }
-  return result as ColumnMapping<T>;
-}
-
-/**
- * Build the contributed schema object from the original schema and mapping
- *
- * The contributed schema reflects what columns this group adds to the app's schema
- * after mapping is applied.
- *
- * Why track contributed schema: Type system needs to know what columns are available
- * after prefix/mapping transformations for compile-time safety.
- *
- * @param fields - Original schema fields
- * @param mapping - Column mapping
- * @returns The contributed schema with renamed keys
- */
-function buildContributedSchema<T extends SchemaFields, M extends ColumnMapping<T>>(
-  fields: T,
-  mapping: M,
-): MappedSchema<T, M> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(fields)) {
-    const mappedName = mapping[key as keyof M];
-    if (mappedName === null) {
-      // Dropped column - not included in contributed schema
-    } else if (typeof mappedName === 'string') {
-      // Explicitly mapped - use the mapped name
-      result[mappedName] = value;
-    } else {
-      // Not in mapping - keep original name
-      result[key] = value;
-    }
-  }
-  assertMappedSchema<MappedSchema<T, M>>(result);
-  return result;
-}
-
 /**
  * Validate all op names in a record.
  * Throws if any name starts with underscore or is a reserved name.
@@ -221,12 +160,30 @@ function validateAllOpNames(ops: Record<string, unknown>): void {
   }
 }
 
+/** The group of `ops` wired with `mapped`: the same ops, each cloned with the mapping's remap descriptor. */
+function mappedGroup<Ctx extends OpContext, Columns, Ops extends OpGroupOps<Ctx>>(
+  logSchema: Ctx['logSchema'],
+  flags: Ctx['flags'],
+  ops: Ops,
+  mapped: MappedFields<string, SchemaFieldsOf<Ctx['logSchema']>, Columns>,
+): MappedOpGroup<Ctx, Columns, Ops> {
+  const remapDescriptor = createRemapDescriptor(logSchema, outputToSource(mapped.schema.library, mapped.columns));
+  const group = new MappedOpGroupImpl<Ctx, Columns, Ops>(
+    logSchema,
+    flags,
+    cloneOpsWithDescriptor<Ctx, Ops>(ops, remapDescriptor),
+    mapped,
+  );
+  assertGroupCarriesOps<Ctx, Ops>(group, ops);
+  return group;
+}
+
 // =============================================================================
 // OP GROUP CLASS - Phase 2 Architecture
 // =============================================================================
 
 /**
- * OpGroup class - Holds ops as own properties with private field for mapping state.
+ * OpGroup class - Holds ops as own properties.
  *
  * Why class-based:
  * 1. Private fields don't pollute object shape (no hidden class impact)
@@ -235,11 +192,6 @@ function validateAllOpNames(ops: Record<string, unknown>): void {
  * 4. Same SpanBufferClass preserved across prefix() calls (shared schema + stats)
  * 5. Only immutable remap metadata differs between original and mapped ops
  *
- * Structure enables V8 optimization:
- * - All OpGroup instances with same ops have same hidden class
- * - Private fields invisible to property enumeration
- * - Method dispatch via prototype (no per-instance copies)
- *
  * Internal properties use underscore prefix (_logSchema, _flags) to avoid
  * collision with user-defined op names.
  */
@@ -247,18 +199,16 @@ class OpGroupImpl<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>> implements
   // Allow dynamic op properties (ops spread as own properties in constructor)
   [key: string]: unknown;
 
-  // Private field - truly hidden, doesn't affect hidden class or enumeration
-  readonly #columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
   readonly #ops: Ops;
+  readonly _columns: FieldSchema<string, SchemaFieldsOf<Ctx['logSchema']>>;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
     ops: Ops,
-    columnMapping?: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
   ) {
-    this.#columnMapping = columnMapping ?? {};
     this.#ops = ops;
+    this._columns = libraryFields<Ctx>(_logSchema);
 
     // Validate op names before spreading
     validateAllOpNames(ops);
@@ -270,56 +220,26 @@ class OpGroupImpl<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>> implements
     }
   }
 
-  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<Ctx['logSchema']['fields'], P>, Ops> {
-    // Apply prefix to the current mapping
-    // Check if mapping is non-empty (empty object {} is truthy but has no entries)
-    const hasMapping = this.#columnMapping && Object.keys(this.#columnMapping).length > 0;
-    const newMapping = hasMapping
-      ? prefixMapping(this.#columnMapping, p)
-      : buildPrefixMapping(this._logSchema._columnNames, p);
-
-    const reverseMapping = createReverseMapping(newMapping);
-    const remapDescriptor = createRemapDescriptor(this._logSchema, reverseMapping);
-
-    // Create new OpGroup with prefixed ops
-    const newGroup = new MappedOpGroupImpl<Ctx, PrefixedSchema<Ctx['logSchema']['fields'], P>, Ops>(
+  prefix<P extends string>(
+    p: P,
+  ): MappedOpGroup<Ctx, PrefixedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, P>, Ops> {
+    return mappedGroup<Ctx, PrefixedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, P>, Ops>(
       this._logSchema,
       this._flags,
-      cloneOpsWithDescriptor<Ctx, Ops>(this.#ops, remapDescriptor),
-      newMapping,
-      prefixContributedSchema<Ctx['logSchema']['fields'], P>(getSchemaFields(this._logSchema), p),
+      this.#ops,
+      this._columns.prefix(p),
     );
-
-    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
-    return newGroup;
   }
 
-  mapColumns<M extends ColumnMapping<Ctx['logSchema']['fields']>>(
+  mapColumns<const M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<Ctx['logSchema']['fields'], M>, Ops> {
-    // Override/extend the existing mapping with new mapping
-    const newMapping = { ...this.#columnMapping, ...mapping };
-
-    const reverseMapping = createReverseMapping(newMapping);
-    const remapDescriptor = createRemapDescriptor(this._logSchema, reverseMapping);
-
-    // Build contributed schema from original fields with new mapping
-    const newContributed = buildContributedSchema<Ctx['logSchema']['fields'], M>(
-      getSchemaFields(this._logSchema),
-      newMapping,
-    );
-
-    // Create new OpGroup with mapped ops
-    const newGroup = new MappedOpGroupImpl<Ctx, MappedSchema<Ctx['logSchema']['fields'], M>, Ops>(
+  ): MappedOpGroup<Ctx, MappedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, M>, Ops> {
+    return mappedGroup<Ctx, MappedColumns<LocalColumns<SchemaFieldsOf<Ctx['logSchema']>>, M>, Ops>(
       this._logSchema,
       this._flags,
-      cloneOpsWithDescriptor<Ctx, Ops>(this.#ops, remapDescriptor),
-      newMapping,
-      newContributed,
+      this.#ops,
+      this._columns.mapColumns(mapping),
     );
-
-    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
-    return newGroup;
   }
 }
 
@@ -331,27 +251,24 @@ class OpGroupImpl<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>> implements
  * MappedOpGroup class - OpGroup with column mapping applied.
  *
  * Why separate class: TypeScript needs distinct type for mapped groups
- * to track contributedSchema type parameter.
+ * to track the Columns type parameter.
  *
  * Internal properties use underscore prefix to avoid collision with op names.
  */
-class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaFields, Ops extends OpGroupOps<Ctx>>
-  implements MappedOpGroupInternal<Ctx, ContributedSchema, Ops>
+class MappedOpGroupImpl<Ctx extends OpContext, Columns, Ops extends OpGroupOps<Ctx>>
+  implements MappedOpGroupInternal<Ctx, Columns, Ops>
 {
   // Allow dynamic op properties (ops spread as own properties in constructor)
   [key: string]: unknown;
 
-  readonly #columnMapping: Record<string, string | null | undefined>;
   readonly #ops: Ops;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
     ops: Ops,
-    readonly _columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
-    readonly _contributedSchema: ContributedSchema,
+    readonly _columns: MappedFields<string, SchemaFieldsOf<Ctx['logSchema']>, Columns>,
   ) {
-    this.#columnMapping = _columnMapping;
     this.#ops = ops;
 
     // Validate op names before spreading
@@ -363,52 +280,24 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     }
   }
 
-  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>, Ops> {
-    // Apply prefix to the current mapping's target names
-    const newMapping = prefixMapping(this.#columnMapping, p);
-
-    const reverseMapping = createReverseMapping(newMapping);
-    const remapDescriptor = createRemapDescriptor(this._logSchema, reverseMapping);
-
-    // Build new contributed schema by prefixing current contributed schema
-    const newContributed = prefixContributedSchema(this._contributedSchema, p);
-
-    // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl<Ctx, PrefixedSchema<ContributedSchema, P>, Ops>(
+  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedColumns<Columns, P>, Ops> {
+    return mappedGroup<Ctx, PrefixedColumns<Columns, P>, Ops>(
       this._logSchema,
       this._flags,
-      cloneOpsWithDescriptor<Ctx, Ops>(this.#ops, remapDescriptor),
-      newMapping,
-      newContributed,
+      this.#ops,
+      this._columns.prefix(p),
     );
-
-    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
-    return newGroup;
   }
 
-  mapColumns<M extends ColumnMapping<ContributedSchema>>(
+  mapColumns<const M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>, Ops> {
-    // Override/extend the existing mapping
-    const newMapping = { ...this.#columnMapping, ...mapping };
-
-    const reverseMapping = createReverseMapping(newMapping);
-    const remapDescriptor = createRemapDescriptor(this._logSchema, reverseMapping);
-
-    // Build contributed schema from current contributed fields so chained maps stay typed to the public surface.
-    const newContributed = buildContributedSchema(this._contributedSchema, mapping);
-
-    // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl<Ctx, MappedSchema<ContributedSchema, M>, Ops>(
+  ): MappedOpGroup<Ctx, MappedColumns<Columns, M>, Ops> {
+    return mappedGroup<Ctx, MappedColumns<Columns, M>, Ops>(
       this._logSchema,
       this._flags,
-      cloneOpsWithDescriptor<Ctx, Ops>(this.#ops, remapDescriptor),
-      newMapping,
-      newContributed,
+      this.#ops,
+      this._columns.mapColumns(mapping),
     );
-
-    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
-    return newGroup;
   }
 }
 

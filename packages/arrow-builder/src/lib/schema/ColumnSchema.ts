@@ -11,10 +11,10 @@
  */
 
 import type { SchemaFields } from '../schema-types.js';
-import type { SchemaWithMetadata } from './types.js';
+import type { Field } from './field.js';
 
-/** Column entry tuple: [columnName, columnSchema] */
-export type ColumnEntry = readonly [string, SchemaWithMetadata];
+/** Column entry tuple: [columnName, field] */
+export type ColumnEntry = readonly [string, Field];
 
 /**
  * ColumnSchema class - generic schema with efficient cached field access
@@ -31,13 +31,13 @@ export class ColumnSchema<T extends SchemaFields = SchemaFields> {
   /** Cached column names (computed once at construction) */
   readonly _columnNames: readonly string[];
 
-  /** Cached column entries as [columnName, columnSchema] tuples */
+  /** Cached column entries as [columnName, field] tuples */
   readonly _columns: readonly ColumnEntry[];
 
   constructor(fields: T) {
     this.fields = fields;
     this._columnNames = Object.keys(fields);
-    this._columns = Object.entries(fields) as ColumnEntry[];
+    this._columns = Object.entries<Field>(fields);
   }
 
   /** Number of columns in the schema */

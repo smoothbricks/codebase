@@ -89,7 +89,7 @@ export {
 // Schema Core Types (re-exported from arrow-builder)
 // =============================================================================
 
-export type { Input, Output, Schema, SchemaFields, SchemaType, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
+export type { Field, Input, Output, Schema, SchemaFields, StorageLane } from '@smoothbricks/arrow-builder';
 
 // =============================================================================
 // Schema System (additional exports not in defineOpContext)
