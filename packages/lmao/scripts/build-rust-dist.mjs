@@ -1,11 +1,17 @@
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 const packageRoot = resolve(import.meta.dirname, '..');
 const workspaceRoot = resolve(packageRoot, '..', '..');
 const sourceCrates = join(packageRoot, 'crates');
 const outputRoot = join(packageRoot, 'dist', 'rust');
+// Every file this copy reads: the input record (packages/build-inputs) beside the copy names exactly these.
+const inputs = [import.meta.filename, join(workspaceRoot, 'Cargo.toml'), join(workspaceRoot, 'Cargo.lock')];
+const recordFile = (source) => {
+  if (lstatSync(source).isFile()) inputs.push(source);
+  return true;
+};
 const rootManifest = Bun.TOML.parse(readFileSync(join(workspaceRoot, 'Cargo.toml'), 'utf8'));
 
 const inheritedDependencies = new Set();
@@ -55,15 +61,14 @@ rmSync(outputRoot, { recursive: true, force: true });
 mkdirSync(outputRoot, { recursive: true });
 cpSync(sourceCrates, join(outputRoot, 'crates'), {
   recursive: true,
-  filter: (source) => basename(source) !== 'target',
+  filter: (source) => basename(source) !== 'target' && recordFile(source),
 });
 mkdirSync(join(outputRoot, 'src', 'lib', 'schema'), { recursive: true });
-cpSync(join(packageRoot, 'src', 'lib', 'capacityTuning.ts'), join(outputRoot, 'src', 'lib', 'capacityTuning.ts'));
-cpSync(
-  join(packageRoot, 'src', 'lib', 'schema', 'systemSchema.ts'),
-  join(outputRoot, 'src', 'lib', 'schema', 'systemSchema.ts'),
-);
-cpSync(join(packageRoot, '.cargo'), join(outputRoot, '.cargo'), { recursive: true });
+for (const file of [join('lib', 'capacityTuning.ts'), join('lib', 'schema', 'systemSchema.ts')]) {
+  recordFile(join(packageRoot, 'src', file));
+  cpSync(join(packageRoot, 'src', file), join(outputRoot, 'src', file));
+}
+cpSync(join(packageRoot, '.cargo'), join(outputRoot, '.cargo'), { recursive: true, filter: recordFile });
 cpSync(join(workspaceRoot, 'Cargo.lock'), join(outputRoot, 'Cargo.lock'));
 writeFileSync(join(outputRoot, 'Cargo.toml'), Bun.TOML.stringify(manifest));
 const metadata = spawnSync(
@@ -73,4 +78,21 @@ const metadata = spawnSync(
 );
 if (metadata.status !== 0) {
   throw new Error(`could not derive the standalone Rust workspace lockfile (cargo exited ${metadata.status})`);
+}
+
+// The copy's input record, written through build-inputs' `smoo-nx-build-inputs --input` into dist/rust, the target's
+// declared output: a cached run restores it with the copy, so a developer link judges the copy by the bytes it read
+// (specs/cli/01_workspace_reconciliation.md, "Declared developer link pins"). Run under Nx, it names this task.
+const recorded = spawnSync(
+  process.execPath,
+  [
+    join(workspaceRoot, 'packages', 'build-inputs', 'dist', 'ts', 'bin', 'smoo-nx-build-inputs.js'),
+    ...inputs.flatMap((file) => ['--input', file]),
+    '--output',
+    outputRoot,
+  ],
+  { stdio: ['ignore', 'inherit', 'inherit'] },
+);
+if (recorded.status !== 0) {
+  throw new Error(`could not record the inputs of ${outputRoot} (smoo-nx-build-inputs exited ${recorded.status})`);
 }

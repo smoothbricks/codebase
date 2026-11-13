@@ -100,6 +100,18 @@ function build(base: string): void {
           },
           [`cli-${HOST}`]: cliTarget(HOST),
           [`cli-${OTHER_HOST}`]: cliTarget(OTHER_HOST),
+          // lmao's shape: a target that copies the crates into dist/rust, and a wasm build whose default writes the
+          // developer directory the checkout loads while production ships its copy in dist.
+          'rust-dist': { outputs: ['{projectRoot}/dist/rust/'], inputs: ['{projectRoot}/crates/**/*.rs'] },
+          'cargo-wasm': {
+            outputs: [
+              '{projectRoot}/{options.outputDir}/allocator.wasm',
+              '{projectRoot}/{options.outputDir}/.build-inputs.json',
+            ],
+            inputs: ['{projectRoot}/crates/**/*.rs'],
+            options: { outputDir: '.cache/wasm-dev' },
+            configurations: { production: { outputDir: 'dist' } },
+          },
         },
       },
     }),
@@ -399,6 +411,56 @@ const INVALID_PRODUCERS: readonly unknown[] = [
   { project: 'api', target: 'native', configuration: '' },
   { project: 'api', target: 'native', configuration: 1 },
 ];
+
+/**
+ * A package shaped like lmao (specs/cli/01_workspace_reconciliation.md, "Declared developer link pins": "Every producer
+ * of a linked package's outputs therefore writes a record, including one that only copies files"): `rust-dist` copies
+ * its crates into dist/rust, and `cargo-wasm` writes .cache/wasm-dev by default and the shipped copy into dist in
+ * production.
+ */
+describe('a live developer link to a package that copies its crates and ships a wasm build', () => {
+  it('refuses the copy and the shipped wasm without records, then judges the copy and the wasm the checkout loads', async () => {
+    const lmao = fixture();
+    record(lmao);
+    write(join(lmao.source, 'dist/rust/crates/api/src/lib.rs'), 'pub fn value() -> u8 { 1 }\\n', BUILT);
+    write(join(lmao.source, 'dist/allocator.wasm'), 'release wasm', BUILT);
+    const unrecorded = await refusal(lmao);
+    expect(unrecorded).toContain(
+      'linked-api: nx target rust-dist records no inputs (no .build-inputs.json covers packages/api/dist/rust/crates/api/src/lib.rs)',
+    );
+    expect(unrecorded).toContain(
+      'linked-api: other built files records no inputs (no .build-inputs.json covers packages/api/dist/allocator.wasm)',
+    );
+
+    // What each producer writes through @smoothbricks/build-inputs, its actual task named as the producer.
+    const read = { 'packages/api/crates/api/src/lib.rs': sha256(join(lmao.source, 'crates/api/src/lib.rs')) };
+    const receipt = (output: string, producer: object) =>
+      writeFileSync(
+        join(lmao.source, output, '.build-inputs.json'),
+        JSON.stringify({ version: 1, producer, files: read }),
+      );
+    receipt('dist/rust', { project: 'api', target: 'rust-dist' });
+    receipt('dist', { project: 'api', target: 'cargo-wasm', configuration: 'production' });
+    write(join(lmao.source, '.cache/wasm-dev/allocator.wasm'), 'dev wasm', BUILT);
+    receipt('.cache/wasm-dev', { project: 'api', target: 'cargo-wasm' });
+    expect(await link(lmao)).not.toContain('refusing');
+    expect(realpathSync(lmao.alias)).toBe(lmao.source);
+
+    // An edit makes the copy and the developer wasm stale, each naming its own cached producer; the production copy
+    // in dist is no build the checkout loads, so it is not judged.
+    write(join(lmao.source, 'crates/api/src/lib.rs'), 'pub fn value() -> u8 { 2 }\\n', LATER);
+    const stale = await refusal(lmao);
+    expect(stale).toContain(
+      'packages/api/dist/rust is stale: input packages/api/crates/api/src/lib.rs has other bytes than the build read',
+    );
+    expect(stale).toContain(
+      'packages/api/.cache/wasm-dev is stale: input packages/api/crates/api/src/lib.rs has other bytes than the build read',
+    );
+    expect(stale).toContain('nx run api:rust-dist');
+    expect(stale).toContain('nx run api:cargo-wasm');
+    expect(stale).not.toContain('packages/api/dist is stale');
+  });
+});
 
 describe('a live developer link whose developer build lies outside the published files', () => {
   it('judges the record beside each output the checkout runs, by content, and none of a build it does not run', async () => {

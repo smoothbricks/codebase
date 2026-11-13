@@ -173,7 +173,13 @@
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
-          "tsc-js"
+          "tsc-js",
+          {
+            "projects": [
+              "build-inputs"
+            ],
+            "target": "build"
+          }
         ],
         "inputs": [
           "{workspaceRoot}/Cargo.toml",
@@ -267,11 +273,17 @@
         }
       },
       "cargo-wasm": {
-        "//": "outputDir is the directory each configuration copies allocator.wasm into, and the declared output reads the same option, so the copy and what Nx restores cannot differ: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/lib/wasm/wasmAllocator.ts loads the build its package's source authority names.",
+        "//": "outputDir is the directory each configuration copies allocator.wasm into, and the declared outputs read the same option, so the copy and what Nx restores cannot differ: .cache/wasm-dev by default, dist in production, the tree the package publishes (packages/nx-plugin/README.md, Cargo profiles). src/lib/wasm/wasmAllocator.ts loads the build its package's source authority names. Each configuration writes the build's input record beside the wasm through build-inputs' smoo-nx-build-inputs from rustc's dep-info, as a declared output, so a cache hit restores it with the wasm; it names the actual task, so a developer link judges the .cache/wasm-dev build a checkout loads and leaves the production copy in dist, which no checkout loads, unjudged (specs/cli/01_workspace_reconciliation.md, Declared developer link pins).",
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
-          "^build"
+          "^build",
+          {
+            "projects": [
+              "build-inputs"
+            ],
+            "target": "build"
+          }
         ],
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
@@ -293,16 +305,17 @@
           }
         ],
         "outputs": [
-          "{projectRoot}/{options.outputDir}/allocator.wasm"
+          "{projectRoot}/{options.outputDir}/allocator.wasm",
+          "{projectRoot}/{options.outputDir}/.build-inputs.json"
         ],
         "options": {
-          "command": "just wasm dev {args.outputDir}",
+          "command": "just wasm dev {args.outputDir} && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --manifest-path crates/lmao-wasm/Cargo.toml --dep-info wasm32-unknown-unknown/debug/allocator.d --output {args.outputDir}",
           "cwd": "{projectRoot}",
           "outputDir": ".cache/wasm-dev"
         },
         "configurations": {
           "production": {
-            "command": "just wasm release {args.outputDir}",
+            "command": "just wasm release {args.outputDir} && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --manifest-path crates/lmao-wasm/Cargo.toml --dep-info wasm32-unknown-unknown/release/allocator.d --output {args.outputDir}",
             "outputDir": "dist"
           }
         }
