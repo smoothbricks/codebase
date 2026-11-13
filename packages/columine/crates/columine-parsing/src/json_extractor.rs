@@ -506,7 +506,6 @@ fn extract_json_event_open(
             while !parser.is_object_end() {
                 let member = owned(parser.expect_field_name().map_err(lex_error)?)?;
                 crate::spell_payload_column(&mut column_name, &member)?;
-                let member_schema = config.payload_member_schema(event_type.as_deref(), &member);
                 extract_named_member(
                     parser,
                     config,
@@ -515,8 +514,8 @@ fn extract_json_event_open(
                     &mut extra,
                     &mut extra_count,
                     discriminant_name,
-                    member_schema,
-                    member_schema.null_cell(),
+                    config.payload_member_schema(event_type.as_deref(), &member),
+                    config.null_cell(event_type.as_deref(), &member),
                     &column_name,
                     &member,
                 )?;

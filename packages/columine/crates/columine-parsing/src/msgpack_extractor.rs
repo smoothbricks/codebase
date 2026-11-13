@@ -367,7 +367,9 @@ fn extract_msgpack_member(
             columns,
             lookup.column,
             variants,
-            member_schema.null_cell(),
+            member.map_or(NullCell::Empty, |member| {
+                config.null_cell(event_type, member)
+            }),
             frames,
         )?;
         columns.columns_seen[lookup.column] = true;

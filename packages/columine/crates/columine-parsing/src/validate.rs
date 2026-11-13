@@ -845,6 +845,34 @@ impl SemanticSchema {
 
 /// Visit every top-level payload member declared as an enum (directly or
 /// under `optional`) with its variants in ordinal order.
+/// Visit every top-level payload member `schema` declares dynamic
+/// ([`SemanticSchema::is_dynamic`]): an object root's fields, or the fields
+/// of every arm of a union root, beneath any `optional`. Extraction does not
+/// know which arm a value conformed to, so a member that any arm declares
+/// dynamic is visited.
+pub(crate) fn collect_dynamic_members<E>(
+    schema: &SemanticSchema,
+    visit: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    match schema {
+        SemanticSchema::Object { fields, .. } => {
+            for (name, field) in fields {
+                if field.is_dynamic() {
+                    visit(name)?;
+                }
+            }
+            Ok(())
+        }
+        SemanticSchema::Union(variants) => {
+            for variant in variants {
+                collect_dynamic_members(variant, visit)?;
+            }
+            Ok(())
+        }
+        SemanticSchema::Optional(inner) => collect_dynamic_members(inner, visit),
+        _ => Ok(()),
+    }
+}
 pub(crate) fn collect_enum_members<E>(
     schema: &SemanticSchema,
     mut visit: impl FnMut(&str, &[String]) -> Result<(), E>,
