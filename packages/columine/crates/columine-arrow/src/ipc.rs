@@ -1,19 +1,22 @@
 //! Arrow IPC stream writer.
 //!
 //! All producer paths converge on [`write_arrow_ipc_from_borrowed_columns`]:
-//! schema bytes are copied once, each borrowed Arrow buffer is copied once
-//! into its final aligned body position, then the RecordBatch metadata and
-//! EOS marker are emitted around that body.
+//! the schema's preamble (its Schema message and schema dictionaries) is
+//! copied once, the stream dictionary's new values follow as one
+//! DictionaryBatch when the batch brought any, each borrowed Arrow buffer is
+//! copied once into its final aligned body position, then the RecordBatch
+//! metadata and EOS marker are emitted around that body.
 //! Borrowed custom metadata is written once on the RecordBatch's Message as standard
 //! Arrow KeyValue entries, never on the Schema or a row. Empty metadata keeps the
 //! original IPC bytes; metadata adds no allocation or intermediate serialization.
 
 use crate::columns::DynamicColumns;
 use crate::record_batch::{
-    DynamicBodyBuilder, DynamicColumn, MetadataStorage, compute_buffer_count,
-    encode_record_batch_dynamic, record_batch_metadata_size,
+    DictionaryValues, DynamicBodyBuilder, DynamicColumn, MetadataStorage, compute_buffer_count,
+    dictionary_batch_len, encode_dictionary_batch, encode_record_batch_dynamic,
+    record_batch_metadata_size,
 };
-use crate::schema::{DynamicSchemaConfig, PlaneKind, SignalSchemaField};
+use crate::schema::{DictionarySlot, DynamicSchemaConfig, PlaneKind, SignalSchemaField};
 
 pub const EOS_MARKER: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
 pub const MIN_ARROW_OUTPUT_CAPACITY: usize = 4096;
@@ -23,6 +26,37 @@ pub enum IpcError {
     BufferTooSmall { required: usize },
     InvalidColumn,
     SizeOverflow,
+}
+
+/// The values one batch added to the schema's stream dictionary, written
+/// before its record batch.
+#[derive(Clone, Copy)]
+pub struct StreamDictionaryDelta<'a> {
+    /// The added values, in ordinal order.
+    pub values: &'a dyn DictionaryValues,
+    /// Whether the dictionary held values before these. The first values of
+    /// a dictionary define it; a reader refuses a delta for a dictionary it
+    /// was never given.
+    pub is_delta: bool,
+}
+
+/// Bytes of the stream dictionary messages `delta` becomes under `schema`:
+/// one message per Arrow id the schema's stream fields declare.
+fn stream_dictionary_len(
+    schema: &DynamicSchemaConfig,
+    delta: Option<StreamDictionaryDelta<'_>>,
+) -> Result<usize, IpcError> {
+    let Some(delta) = delta else {
+        return Ok(0);
+    };
+    // Values for a dictionary the schema does not declare have no message
+    // to ride in.
+    let dictionary = schema
+        .dictionary(DictionarySlot::Stream)
+        .ok_or(IpcError::InvalidColumn)?;
+    dictionary_batch_len(delta.values)?
+        .checked_mul(dictionary.arrow_ids.len())
+        .ok_or(IpcError::SizeOverflow)
 }
 
 fn checked_align_to_8(size: usize) -> Result<usize, IpcError> {
@@ -84,6 +118,7 @@ pub fn required_arrow_ipc_len<'a, F>(
     schema_config: &DynamicSchemaConfig,
     mut column_at: F,
     custom_metadata: &[(&str, &str)],
+    stream_dictionary: Option<StreamDictionaryDelta<'_>>,
 ) -> Result<usize, IpcError>
 where
     F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
@@ -104,7 +139,8 @@ where
     );
     schema_config
         .schema_message_size()
-        .checked_add(8)
+        .checked_add(stream_dictionary_len(schema_config, stream_dictionary)?)
+        .and_then(|size| size.checked_add(8))
         .and_then(|size| size.checked_add(metadata_size))
         .and_then(|size| size.checked_add(body_length))
         .and_then(|size| size.checked_add(EOS_MARKER.len()))
@@ -157,6 +193,10 @@ fn finish_stream(
 ///
 /// `column_at` is called once during the no-mutation size preflight and once
 /// while building the body. `null_count_at` is called only during the build.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the one writer every producer converges on: each argument is a distinct borrowed input of one stream"
+)]
 pub fn write_arrow_ipc_from_borrowed_columns<'a, F, N>(
     row_count: u32,
     schema_config: &DynamicSchemaConfig,
@@ -165,12 +205,18 @@ pub fn write_arrow_ipc_from_borrowed_columns<'a, F, N>(
     mut column_at: F,
     mut null_count_at: N,
     custom_metadata: &[(&str, &str)],
+    stream_dictionary: Option<StreamDictionaryDelta<'_>>,
 ) -> Result<usize, IpcError>
 where
     F: FnMut(usize) -> Result<DynamicColumn<'a>, IpcError>,
     N: FnMut(usize) -> i64,
 {
-    let required = required_arrow_ipc_len(schema_config, &mut column_at, custom_metadata)?;
+    let required = required_arrow_ipc_len(
+        schema_config,
+        &mut column_at,
+        custom_metadata,
+        stream_dictionary,
+    )?;
     let required_capacity = required.max(MIN_ARROW_OUTPUT_CAPACITY);
     if output.len() < required_capacity {
         return Err(IpcError::BufferTooSmall {
@@ -178,11 +224,24 @@ where
         });
     }
 
-    let write_offset = schema_config.write_schema_message(output);
+    let mut write_offset = schema_config.write_schema_message(output);
     if write_offset != schema_config.schema_message_size() {
         return Err(IpcError::BufferTooSmall {
             required: required_capacity,
         });
+    }
+    if let Some(delta) = stream_dictionary {
+        let dictionary = schema_config
+            .dictionary(DictionarySlot::Stream)
+            .ok_or(IpcError::InvalidColumn)?;
+        for arrow_id in &dictionary.arrow_ids {
+            write_offset += encode_dictionary_batch(
+                &mut output[write_offset..],
+                *arrow_id,
+                delta.is_delta,
+                delta.values,
+            )?;
+        }
     }
 
     let field_count =
@@ -274,6 +333,7 @@ pub fn write_arrow_ipc_from_dynamic_columns(
     output: &mut [u8],
     metadata_storage: &mut MetadataStorage,
     custom_metadata: &[(&str, &str)],
+    stream_dictionary: Option<StreamDictionaryDelta<'_>>,
 ) -> Result<usize, IpcError> {
     write_arrow_ipc_from_borrowed_columns(
         columns.count,
@@ -283,28 +343,29 @@ pub fn write_arrow_ipc_from_dynamic_columns(
         |index| dynamic_column(columns, schema_config, index),
         |index| dynamic_null_count(columns, index),
         custom_metadata,
+        stream_dictionary,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record_batch::{MetadataLimits, MetadataStorage};
+    use crate::record_batch::MetadataStorage;
     use crate::schema::{ArrowType, DynamicSchemaConfig, SignalSchemaField};
     use arrow_array::{
         Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray,
-        StringArray,
+        StringArray, TimestampNanosecondArray,
     };
     use arrow_ipc::reader::StreamReader;
     use arrow_ipc::writer::StreamWriter;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use std::io::Cursor;
 
     fn base_fields() -> [SignalSchemaField; 4] {
         [
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
             SignalSchemaField::new(ArrowType::Binary, true),
         ]
     }
@@ -322,7 +383,7 @@ mod tests {
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
         assert!(
             config.is_base_event_log,
-            "utf8/utf8/int64/binary IS the base event log"
+            "utf8/utf8/timestamp(ns)/binary IS the base event log"
         );
 
         let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
@@ -339,11 +400,17 @@ mod tests {
         columns.append_null(3).unwrap();
         columns.end_row();
 
-        let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_fields(&fields).unwrap();
         let mut out = vec![0u8; 8192];
-        let len =
-            write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata, &[])
-                .unwrap();
+        let len = write_arrow_ipc_from_dynamic_columns(
+            &columns,
+            &config,
+            &mut out,
+            &mut metadata,
+            &[],
+            None,
+        )
+        .unwrap();
         assert!(out[..len].ends_with(&EOS_MARKER));
 
         // Read it back through the official reader: the id/type/timestamp
@@ -362,7 +429,7 @@ mod tests {
         let timestamps = batch
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
         assert_eq!(timestamps.values(), &[100, 200]);
         let values = batch
@@ -375,7 +442,7 @@ mod tests {
     }
 
     /// A four-field schema that is NOT the event log must not be classified as
-    /// one: the scanner path writes utf8/utf8/int64/binary by index, so a
+    /// one: the scanner path writes utf8/utf8/timestamp/binary by index, so a
     /// four-field extraction schema routed there produced a stream whose
     /// Schema message and body disagreed.
     #[test]
@@ -417,10 +484,11 @@ mod tests {
         cols.append_null(3).unwrap();
         cols.end_row();
 
-        let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut meta = MetadataStorage::for_fields(&fields).unwrap();
         let mut out = vec![0u8; 8192];
         let len =
-            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[]).unwrap();
+            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[], None)
+                .unwrap();
 
         // Stream = schema bytes + RecordBatch message + EOS.
         let schema_len = config.schema_bytes.len();
@@ -495,7 +563,7 @@ mod tests {
         let validity = [0b0000_0101];
         let bool_data = [0b0000_0101];
 
-        let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_fields(&fields).unwrap();
         let mut output = vec![0u8; 8192];
         let written = write_arrow_ipc_from_borrowed_columns(
             3,
@@ -540,6 +608,7 @@ mod tests {
                 _ => 0,
             },
             &[],
+            None,
         )
         .unwrap();
 
@@ -607,10 +676,10 @@ mod tests {
         let fields = base_fields();
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
         let cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
-        let mut meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut meta = MetadataStorage::for_fields(&fields).unwrap();
         let mut out = vec![0u8; 1024]; // < 4096 hard floor
         assert_eq!(
-            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[]),
+            write_arrow_ipc_from_dynamic_columns(&cols, &config, &mut out, &mut meta, &[], None),
             Err(IpcError::BufferTooSmall {
                 required: MIN_ARROW_OUTPUT_CAPACITY,
             })
@@ -633,7 +702,7 @@ mod tests {
             columns.append_variable(3, bytes).unwrap();
             columns.end_row();
         }
-        let mut storage = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut storage = MetadataStorage::for_fields(&fields).unwrap();
         let mut baseline = vec![0u8; 8192];
         let baseline_len = write_arrow_ipc_from_dynamic_columns(
             &columns,
@@ -641,6 +710,7 @@ mod tests {
             &mut baseline,
             &mut storage,
             &[],
+            None,
         )
         .unwrap();
         let expected = StreamReader::try_new(Cursor::new(&baseline[..baseline_len]), None)
@@ -659,6 +729,7 @@ mod tests {
                 &config,
                 |index| dynamic_column(&columns, &config, index),
                 custom,
+                None,
             )
             .unwrap();
             let mut output = vec![0xa5; required.max(MIN_ARROW_OUTPUT_CAPACITY)];
@@ -668,6 +739,7 @@ mod tests {
                 &mut output,
                 &mut storage,
                 custom,
+                None,
             )
             .unwrap();
             assert_eq!(written, required);

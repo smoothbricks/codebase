@@ -64,6 +64,7 @@ pub const COLUMINE_EP_EXPORTS: &[&str] = &[
     "ep_compact",
     "ep_create_log_entry",
     "ep_create_with_schema",
+    "ep_create_with_schema_and_dictionaries",
     "ep_create_with_schema_and_names",
     "ep_destroy",
     "ep_version",

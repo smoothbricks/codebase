@@ -37,18 +37,28 @@ pub use compact::{
 };
 
 use columine_arrow::{
-    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
-    MetadataLimits, MetadataStorage, required_arrow_ipc_len, write_arrow_ipc_from_borrowed_columns,
-    write_arrow_ipc_from_dynamic_columns,
+    DictionaryValues, DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES,
+    MIN_ARROW_OUTPUT_CAPACITY, MetadataStorage, StreamDictionaryDelta, required_arrow_ipc_len,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
 };
+use columine_parsing::identity::{FieldIdentity, IdentityError};
 use columine_parsing::{
-    ExtractionConfig, FrameProjections, json_extractor, json_scanner, msgpack_extractor,
-    msgpack_scanner,
+    CellLayout, CellWriter, ExtractionConfig, FrameProjections, json_extractor, json_scanner,
+    msgpack_extractor, msgpack_scanner,
     validate::{
         AddressGrammar, BatchValidationError, NoAddressGrammar, PayloadViolation, PrepareRefusal,
         PreparedSchemas, UnavailableVoAdmission, VoAdmission, VoFrameProof, VoPreparationError,
         VoPresence, VoRefusal, parse_schema_envelope,
     },
+};
+/// The stream dictionary's seam (specs/columine/10-physical-vocabulary.md
+/// §5): a parse call takes its owner's image, a compact call its length.
+pub use columine_types::category::{CategoryImage, CategoryRefusal, ListImage, NoCategories};
+/// The value-cell seam (specs/columine/10-physical-vocabulary.md §7): a
+/// processor built by [`EventProcessor::new_with_cells`] hands its embedder
+/// each value cell.
+pub use columine_types::cells::{
+    CellRefusal, CellTarget, NoValueCells, RecordRow, TEXT_HASH_BYTES, TextPlace, ValueCells,
 };
 
 /// This crate's npm artifact version.
@@ -105,12 +115,19 @@ pub enum ResultCode {
 /// nothing.
 pub const WASM_EVENT_CAPACITY: u32 = 256;
 
+/// The most values the stream dictionary of one wasm handle holds: a value
+/// past it refuses its batch with `ParseError`. Together with
+/// [`WASM_CATEGORY_VALUE_BYTES`] it bounds the memory one handle's image takes.
+pub const WASM_CATEGORY_LIMIT: u32 = 65_536;
+
+/// The longest value, in bytes, the stream dictionary of one wasm handle
+/// takes: a longer one refuses its batch with `ParseError`.
+pub const WASM_CATEGORY_VALUE_BYTES: usize = 1_024;
+
 /// Why an `ep_create_*` call produced no handle (u32 values are ABI).
 ///
 /// Handles occupy 1..=255, so any other return value is a failure and these
-/// name which one. Every cause used to collapse into a bare `0`: a schema type
-/// mismatch was indistinguishable from a capacity refusal, from a null
-/// pointer, and from an exhausted handle table.
+/// name which one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum CreateFailure {
@@ -122,7 +139,9 @@ pub enum CreateFailure {
     SchemaMessage = 0x8000_0003,
     /// More schema fields than `columine_arrow::MAX_SCHEMA_FIELDS`.
     SchemaTooManyFields = 0x8000_0004,
-    /// A four-byte physical descriptor is not a valid `[type, nullable, 0, 0]`.
+    /// An eight-byte field descriptor names no plane, dictionary slot or
+    /// index plane, sets its reserved byte, or carries a parameter its plane
+    /// does not take.
     SchemaFieldMetadata = 0x8000_0005,
     /// The schema message and the physical metadata table disagree on width.
     SchemaFieldCount = 0x8000_0006,
@@ -132,7 +151,7 @@ pub enum CreateFailure {
     SchemaNullability = 0x8000_0008,
     /// The field-name blob is malformed or not one name per field.
     SchemaFieldNames = 0x8000_0009,
-    /// Retained-metadata or extraction-config limits refused the schema.
+    /// The extraction configuration or the semantic schema refused the schema.
     Init = 0x8000_000a,
     /// All 255 handle slots are in use.
     HandlesExhausted = 0x8000_000b,
@@ -140,13 +159,21 @@ pub enum CreateFailure {
     MemoryExhausted = 0x8000_000c,
     /// The Schema message is longer than `columine_arrow::MAX_SCHEMA_MESSAGE_BYTES`.
     SchemaTooLarge = 0x8000_000d,
+    /// The schema's dictionaries and its fields disagree: a malformed
+    /// dictionary table, a dictionary no field names, a field naming one the
+    /// table lacks, an index plane too narrow for its dictionary, or an enum
+    /// member whose variants its dictionary does not hold.
+    SchemaDictionary = 0x8000_000e,
+    /// A field's `sb.fields` identity metadata is malformed, gives one column
+    /// two type digests, or names one declared field on two columns.
+    SchemaFieldIdentity = 0x8000_000f,
 }
 
 impl CreateFailure {
     /// Every handle-creation failure, ascending by code. The codes are one
-    /// contiguous block, which `parse_backend_ts_create_failures_match_rust`
-    /// checks, so a variant missing from this list shows up as a short block
-    /// there and as a surplus entry in the TypeScript decoder table.
+    /// contiguous block, which `creation_failure_codes_are_one_contiguous_block`
+    /// (`tests/host_abi.rs`) checks, so a variant missing from this list shows up
+    /// as a short block there. The generated host table is rendered from this list.
     pub const ALL: &'static [CreateFailure] = &[
         Self::BadRequest,
         Self::Capacity,
@@ -161,6 +188,8 @@ impl CreateFailure {
         Self::HandlesExhausted,
         Self::MemoryExhausted,
         Self::SchemaTooLarge,
+        Self::SchemaDictionary,
+        Self::SchemaFieldIdentity,
     ];
 }
 
@@ -177,6 +206,7 @@ impl From<columine_arrow::SchemaError> for CreateFailure {
             E::InvalidFieldNames => Self::SchemaFieldNames,
             E::MessageTooLarge => Self::SchemaTooLarge,
             E::OutOfMemory => Self::MemoryExhausted,
+            E::InvalidDictionaryTable | E::DictionaryMismatch { .. } => Self::SchemaDictionary,
         }
     }
 }
@@ -185,15 +215,27 @@ impl From<EpInitError> for CreateFailure {
     fn from(error: EpInitError) -> Self {
         match error {
             EpInitError::MemoryExhausted
-            | EpInitError::Metadata(columine_arrow::MetadataError::OutOfMemory)
             | EpInitError::Config(columine_parsing::ConfigError::OutOfMemory)
             | EpInitError::SemanticSchema(
                 columine_parsing::validate::SchemaParseError::OutOfMemory,
-            ) => Self::MemoryExhausted,
-            EpInitError::Metadata(_)
-            | EpInitError::Config(_)
+            )
+            | EpInitError::ValueCells(CellRefusal::OutOfMemory)
+            | EpInitError::FieldIdentity(IdentityError::OutOfMemory) => Self::MemoryExhausted,
+            EpInitError::Config(
+                columine_parsing::ConfigError::MissingDictionary
+                | columine_parsing::ConfigError::EnumDictionaryMismatch,
+            ) => Self::SchemaDictionary,
+            EpInitError::FieldIdentity(
+                IdentityError::Malformed { .. }
+                | IdentityError::TwoTypes { .. }
+                | IdentityError::Repeated { .. },
+            ) => Self::SchemaFieldIdentity,
+            EpInitError::Config(_)
             | EpInitError::SemanticSchema(_)
-            | EpInitError::VoAdmission(_) => Self::Init,
+            | EpInitError::VoAdmission(_)
+            | EpInitError::ValueCells(CellRefusal::Unsupported | CellRefusal::Refused { .. }) => {
+                Self::Init
+            }
         }
     }
 }
@@ -262,11 +304,16 @@ const MAX_WORK_BUFFER_SIZE: usize = MAX_VALUE_BYTES as usize;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EpInitError {
-    Metadata(columine_arrow::MetadataError),
     Config(columine_parsing::ConfigError),
     SemanticSchema(columine_parsing::validate::SchemaParseError),
     /// The value-object capability refused to prepare a declared schema.
     VoAdmission(VoPreparationError),
+    /// A field's `sb.fields` identity metadata refused the schema
+    /// (specs/columine/10-physical-vocabulary.md §6).
+    FieldIdentity(IdentityError),
+    /// The value cell writer refused a target of the schema at creation
+    /// (specs/columine/10-physical-vocabulary.md §7).
+    ValueCells(CellRefusal),
     /// The processor's storage could not be backed; nothing was built.
     MemoryExhausted,
 }
@@ -308,15 +355,24 @@ impl PayloadValidationDiagnostic {
 
 /// The public event-processor parse plane, generic over its value-object
 /// admission capability and the [`AddressGrammar`] its `axId` nodes are judged
-/// by.
+/// by, and over the writer of its value cells: an embedder's [`ValueCells`],
+/// or with [`NoValueCells`] columine's native MessagePack cells.
 ///
 /// The prepared envelope is read-only after construction and the plane is
 /// the only mutable state, so a validated input can borrow the envelope's
 /// admission proofs while it extracts into the plane.
-pub struct EventProcessor<A = UnavailableVoAdmission, G: AddressGrammar = NoAddressGrammar> {
+pub struct EventProcessor<
+    A = UnavailableVoAdmission,
+    G: AddressGrammar = NoAddressGrammar,
+    C: ValueCells = NoValueCells,
+> {
     semantic: Option<PreparedSchemas<A, G>>,
     last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
+    /// Each field's declared identities, decoded once at creation.
+    field_identities: Vec<Vec<FieldIdentity>>,
     plane: Plane,
+    /// The embedder's value cell writer; `None` is columine's native path.
+    cells: Option<C>,
 }
 
 /// The processor's mutable parse state: one column plane, its schema and
@@ -336,6 +392,11 @@ struct Plane {
     work_buffer: Vec<u8>,
     /// Independent workspace for an in-progress undeclared carrier map.
     fallback_work_buffer: Vec<u8>,
+    /// The buffer ranges of one caller-built batch, backed at creation for
+    /// the schema's buffer count, which bounds the ranges a batch can name.
+    compact_ranges: Vec<(usize, usize)>,
+    /// The bytes the embedder writes for one cell, retained across batches.
+    cell_scratch: Vec<u8>,
 }
 
 impl EventProcessor {
@@ -375,6 +436,43 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
         schema_config: DynamicSchemaConfig,
         admission: A,
     ) -> Result<Self, EpInitError> {
+        Self::create(options, column_capacity, schema_config, admission, None)
+    }
+}
+
+impl<A: VoAdmission, G: AddressGrammar, C: ValueCells> EventProcessor<A, G, C> {
+    /// [`EventProcessor::new_with_vo_admission`] whose value cells
+    /// (specs/columine/10-physical-vocabulary.md §7) are written by the
+    /// embedder's `cells`: each Binary field whose `sb.cell` names
+    /// `cells.encoding()`, the declared record, the carrier and each text.
+    /// `cells` is asked once per target before the processor exists; a
+    /// target it refuses refuses creation with [`EpInitError::ValueCells`].
+    pub fn new_with_cells(
+        options: ParseOptions,
+        column_capacity: u32,
+        schema_config: DynamicSchemaConfig,
+        admission: A,
+        cells: C,
+    ) -> Result<Self, EpInitError> {
+        Self::create(
+            options,
+            column_capacity,
+            schema_config,
+            admission,
+            Some(cells),
+        )
+    }
+
+    /// One creation for both writers: `None` is columine's native path,
+    /// whose targets are put to [`NoValueCells`] so its refusals are the
+    /// seam's own.
+    fn create(
+        options: ParseOptions,
+        column_capacity: u32,
+        schema_config: DynamicSchemaConfig,
+        admission: A,
+        mut cells: Option<C>,
+    ) -> Result<Self, EpInitError> {
         let semantic = match schema_config.semantic_schema.as_deref() {
             None => None,
             Some(envelope) => {
@@ -391,9 +489,24 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             }
         };
 
-        let record_batch_metadata =
-            MetadataStorage::for_fields(&schema_config.field_metadata, MetadataLimits::default())
-                .map_err(EpInitError::Metadata)?;
+        // Identities are decoded before any storage is backed, so a refused
+        // schema leaves nothing behind.
+        let field_identities =
+            columine_parsing::identity::decode_field_identities(&schema_config.identity_metadata)
+                .map_err(EpInitError::FieldIdentity)?;
+
+        let record_batch_metadata = MetadataStorage::for_fields(&schema_config.field_metadata)
+            .map_err(|columine_arrow::MetadataOutOfMemory| EpInitError::MemoryExhausted)?;
+
+        // A caller-built batch names at most one range per buffer of its
+        // schema, so the range table never grows past this.
+        let mut compact_ranges = Vec::new();
+        compact_ranges
+            .try_reserve_exact(
+                usize::try_from(schema_config.compute_buffer_count())
+                    .map_err(|_| EpInitError::MemoryExhausted)?,
+            )
+            .map_err(|_| EpInitError::MemoryExhausted)?;
 
         // Empty-names init keeps an empty extraction config: JSON extraction
         // cannot match keys to columns without field names.
@@ -409,13 +522,28 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
                 columine_parsing::build_extraction_config_with_semantic_schemas(
                     &schema_config.field_metadata,
                     &names,
+                    &schema_config.dictionaries,
                     semantic.as_ref().map(PreparedSchemas::schemas),
                     schema_config.payload_discriminator.as_ref(),
+                    CellLayout {
+                        cell_metadata: &schema_config.cell_metadata,
+                        record_members: &schema_config.record_members,
+                        text_columns: &schema_config.text_columns,
+                        encoding: cells.as_ref().map(ValueCells::encoding),
+                    },
                 )
                 .map_err(EpInitError::Config)?,
             )
         };
+        if let Some(config) = extraction_config.as_ref() {
+            match cells.as_mut() {
+                Some(cells) => config.prepare_cells(cells),
+                None => config.prepare_cells(&mut NoValueCells),
+            }
+            .map_err(EpInitError::ValueCells)?;
+        }
 
+        // An embedder writes its value cells only on the extraction path.
         // The base scanners store each event's raw `value` span, which is not
         // the frame a value-object admission judged, so a processor that
         // declares value objects always takes the extraction path.
@@ -423,11 +551,14 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             && schema_config.is_base_event_log
             && semantic
                 .as_ref()
-                .is_none_or(|prepared| prepared.presence() == VoPresence::Absent);
+                .is_none_or(|prepared| prepared.presence() == VoPresence::Absent)
+            && cells.is_none();
         let dynamic_columns = DynamicColumns::new(&schema_config.field_metadata, column_capacity)?;
         Ok(Self {
             semantic,
             last_validation_diagnostic: None,
+            field_identities,
+            cells,
             plane: Plane {
                 use_base_scanners,
                 dynamic_columns,
@@ -437,6 +568,8 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
                 options,
                 work_buffer: Vec::new(),
                 fallback_work_buffer: Vec::new(),
+                compact_ranges,
+                cell_scratch: Vec::new(),
             },
         })
     }
@@ -462,6 +595,13 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
         &self.plane.schema_config
     }
 
+    /// Each field's declared identities, decoded from its `sb.fields`
+    /// metadata at creation (specs/columine/10-physical-vocabulary.md §6):
+    /// one list per field, empty for a field that carries none.
+    pub fn field_identities(&self) -> &[Vec<FieldIdentity>] {
+        &self.field_identities
+    }
+
     /// Run the semantic precheck on `input` and, on success, hand back the
     /// proof that it completed: a [`ValidatedInput`] that can be extracted
     /// exactly once. The processor retains its one column plane; nothing is
@@ -484,6 +624,8 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             semantic,
             last_validation_diagnostic,
             plane,
+            field_identities: _,
+            cells,
         } = self;
         // The envelope stays shared for `'a`: the projected frames borrow it.
         let semantic: &'a Option<PreparedSchemas<A, G>> = semantic;
@@ -559,11 +701,13 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             input,
             format,
             projected,
+            cells: cells.as_mut().map(|cells| cells as &mut dyn ValueCells),
         })
     }
 
     /// The convenience composition: semantic validation, then extraction
-    /// into the retained column plane.
+    /// into the retained column plane, with no stream dictionary: a value of
+    /// a stream-dictionary column refuses the batch.
     pub fn parse<'a>(
         &'a mut self,
         input: &'a [u8],
@@ -572,9 +716,30 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
         self.validate(input, format)?.parse()
     }
 
+    /// [`EventProcessor::parse`] against the stream dictionary's `image`
+    /// (specs/columine/10-physical-vocabulary.md §5): each value of a
+    /// stream-dictionary column stores the ordinal `image` answers, and the
+    /// batch encodes the values it added.
+    ///
+    /// Undoing is the image owner's. Columine never removes a value: on any
+    /// `Err`, and when the owner drops the batch or its rows, the owner may
+    /// truncate `image` to the length it held before this call (the
+    /// batch's [`ParsedBatch::category_mark`]). A retry of the same input
+    /// then answers the same ordinals.
+    pub fn parse_with<'a>(
+        &'a mut self,
+        input: &'a [u8],
+        format: InputFormat,
+        image: &'a mut dyn CategoryImage,
+    ) -> Result<ParsedBatch<'a>, ProcessError> {
+        self.validate(input, format)?.parse_with(image)
+    }
+
     /// Process one input batch into `output` with no seen-set — validation,
     /// extraction and encoding only, the admission boundary's call:
     /// `[ResultHeader 32B][Arrow IPC stream]`. Returns the header's code.
+    /// No stream dictionary: a value of a stream-dictionary column refuses
+    /// the batch.
     pub fn create_log_entry(
         &mut self,
         input: &[u8],
@@ -582,14 +747,48 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
         output: &mut [u8],
         batch_metadata: &[(&str, &str)],
     ) -> ResultCode {
+        self.log_entry(input, format, output, batch_metadata, None)
+    }
+
+    /// [`EventProcessor::create_log_entry`] against the stream dictionary's
+    /// `image`, under [`EventProcessor::parse_with`]'s undo contract: on any
+    /// code but `Ok` the owner may truncate `image` to the length it held
+    /// before this call.
+    pub fn create_log_entry_with(
+        &mut self,
+        input: &[u8],
+        format: InputFormat,
+        output: &mut [u8],
+        batch_metadata: &[(&str, &str)],
+        image: &mut dyn CategoryImage,
+    ) -> ResultCode {
+        self.log_entry(input, format, output, batch_metadata, Some(image))
+    }
+
+    fn log_entry(
+        &mut self,
+        input: &[u8],
+        format: InputFormat,
+        output: &mut [u8],
+        batch_metadata: &[(&str, &str)],
+        image: Option<&mut dyn CategoryImage>,
+    ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutputTooSmall;
         }
-        match self.parse(input, format) {
+        let diagnostics = self.plane.options.diagnostics;
+        let parsed = match self.validate(input, format) {
+            Ok(validated) => match image {
+                Some(image) => validated.parse_with(image),
+                None => validated.parse(),
+            },
+            Err(error) => Err(error),
+        };
+        match parsed {
             Ok(batch) => batch.encode(output, batch_metadata),
             Err(error) => {
                 match error.diagnostic {
-                    Some(diagnostic) if self.plane.options.diagnostics => {
+                    Some(diagnostic) if diagnostics => {
                         write_result_header_with_diagnostic(output, error.code as u32, &diagnostic);
                     }
                     _ => write_result_header(output, error.code as u32, 0, 0, 0),
@@ -610,6 +809,9 @@ pub struct ValidatedInput<'a, A: VoAdmission + 'a = UnavailableVoAdmission> {
     input: &'a [u8],
     format: InputFormat,
     projected: Vec<A::Frame<'a>>,
+    /// The embedder's value cell writer; `None` writes columine's native
+    /// cells.
+    cells: Option<&'a mut dyn ValueCells>,
 }
 
 impl<'a, A: VoAdmission + 'a> ValidatedInput<'a, A> {
@@ -617,27 +819,65 @@ impl<'a, A: VoAdmission + 'a> ValidatedInput<'a, A> {
     /// scanners write the four base event-log columns by index when the
     /// options keep the base path and the schema IS that event log. Each
     /// projected frame's certified bytes are copied into its column, and the
-    /// proofs are released once the extraction returns.
+    /// proofs are released once the extraction returns. There is no stream
+    /// dictionary: a value of a stream-dictionary column refuses the batch.
     pub fn parse(self) -> Result<ParsedBatch<'a>, ProcessError> {
+        self.extract(None)
+    }
+
+    /// [`ValidatedInput::parse`] against the stream dictionary's `image`,
+    /// under [`EventProcessor::parse_with`]'s undo contract.
+    pub fn parse_with(
+        self,
+        image: &'a mut dyn CategoryImage,
+    ) -> Result<ParsedBatch<'a>, ProcessError> {
+        self.extract(Some(image))
+    }
+
+    fn extract(
+        self,
+        mut image: Option<&'a mut dyn CategoryImage>,
+    ) -> Result<ParsedBatch<'a>, ProcessError> {
         let ValidatedInput {
             plane,
             input,
             format,
             projected,
+            cells,
         } = self;
         let frames: Vec<(&[u8], &[u8])> = projected
             .iter()
             .map(|proof| (proof.lent(), proof.bytes()))
             .collect();
-        if plane.use_base_scanners {
+        let mark = image.as_deref().map_or(0, |image| image.len());
+        let mut batch = if plane.use_base_scanners {
             // The base scanners store each event's raw value bytes, so a
             // projected frame inside them has no cell of its own.
             if !frames.is_empty() {
                 return Err(unwritten_projection());
             }
-            return plane.parse_base(input, format);
-        }
-        plane.parse_dynamic(input, format, FrameProjections::new(&frames))
+            plane.parse_base(input, format)?
+        } else {
+            let mut no_categories = NoCategories;
+            let lane: &mut dyn CategoryImage = match image.as_deref_mut() {
+                Some(image) => image,
+                None => &mut no_categories,
+            };
+            let mut writer = match cells {
+                Some(cells) => CellWriter::Embedder(cells),
+                None => CellWriter::Native,
+            };
+            plane.parse_dynamic(
+                input,
+                format,
+                FrameProjections::new(&frames),
+                lane,
+                &mut writer,
+            )?
+        };
+        batch.image = image;
+        batch.mark = mark;
+        Ok(batch)
     }
 }
 
@@ -657,12 +897,42 @@ fn unwritten_projection() -> ProcessError {
 }
 
 /// The parsed batch: borrowed views of the processor's one column plane,
-/// schema configuration and mutable Arrow IPC metadata. Consuming
+/// schema configuration and mutable Arrow IPC metadata, and the stream
+/// dictionary's image it was parsed against. Consuming
 /// [`ParsedBatch::encode`] releases those borrows.
 pub struct ParsedBatch<'a> {
     columns: &'a mut DynamicColumns,
     schema_config: &'a DynamicSchemaConfig,
     record_batch_metadata: &'a mut MetadataStorage,
+    image: Option<&'a mut dyn CategoryImage>,
+    /// The image's length when extraction began: the values from here on
+    /// are the ones this batch added.
+    mark: u32,
+}
+
+/// The values a batch added to the stream dictionary: `image` from ordinal
+/// `mark` on, read in place for the dictionary message.
+struct AddedValues<'a> {
+    image: &'a dyn CategoryImage,
+    mark: u32,
+}
+
+impl DictionaryValues for AddedValues<'_> {
+    fn len(&self) -> u32 {
+        self.image.len().saturating_sub(self.mark)
+    }
+
+    fn value(&self, index: u32) -> Option<&[u8]> {
+        self.image
+            .value(self.mark.checked_add(index)?)
+            .map(str::as_bytes)
+    }
+}
+
+/// The values `image` holds from `mark` on, `None` when it holds none: a
+/// batch that added no value writes no dictionary message.
+fn added_values(image: &dyn CategoryImage, mark: u32) -> Option<AddedValues<'_>> {
+    (image.len() > mark).then_some(AddedValues { image, mark })
 }
 
 impl ParsedBatch<'_> {
@@ -677,8 +947,18 @@ impl ParsedBatch<'_> {
         self.columns.count
     }
 
+    /// The stream dictionary image's length when this batch's extraction
+    /// began, 0 with no image: the length its owner truncates to in order to
+    /// undo the batch.
+    pub fn category_mark(&self) -> u32 {
+        self.mark
+    }
+
     /// Encode the columns into `[ResultHeader][Arrow IPC]`, writing a
-    /// success header with zeroed bytes 16..32.
+    /// success header with zeroed bytes 16..32. When the batch added values
+    /// to the stream dictionary, one DictionaryBatch of exactly those values
+    /// precedes the record batch, a delta when the image held values before
+    /// them (specs/columine/10-physical-vocabulary.md §5).
     ///
     /// On `OutputTooSmall`, a complete result header reports offset 32 and
     /// the IPC writer's required capacity in `arrow_ipc_len`, with zero rows.
@@ -693,12 +973,22 @@ impl ParsedBatch<'_> {
             return ResultCode::OutputTooSmall;
         }
         let rows = self.columns.count;
+        let mark = self.mark;
+        let added = self
+            .image
+            .as_deref()
+            .and_then(|image| added_values(image, mark));
+        let stream_dictionary = added.as_ref().map(|values| StreamDictionaryDelta {
+            values,
+            is_delta: mark > 0,
+        });
         match write_arrow_ipc_from_dynamic_columns(
             self.columns,
             self.schema_config,
             &mut output[RESULT_HEADER_SIZE..],
             self.record_batch_metadata,
             batch_metadata,
+            stream_dictionary,
         ) {
             Ok(len) => {
                 let written = u32::try_from(len)
@@ -737,7 +1027,19 @@ impl ParsedBatch<'_> {
         }
     }
 }
-impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
+impl<A: VoAdmission, G: AddressGrammar, C: ValueCells> EventProcessor<A, G, C> {
+    /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`
+    /// with no stream dictionary: [`EventProcessor::compact_with`] over an
+    /// empty image.
+    pub fn compact(
+        &mut self,
+        batch: &[u8],
+        output: &mut [u8],
+        batch_metadata: &[(&str, &str)],
+    ) -> ResultCode {
+        self.compact_with(batch, output, batch_metadata, &NoCategories, 0)
+    }
+
     /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`.
     ///
     /// Validation and exact-size preflight finish before any Arrow output byte
@@ -745,16 +1047,27 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
     /// header reports offset 32 and the exact required Arrow IPC length so the
     /// caller can retry with `32 + max(4096, arrow_len)` bytes.
     ///
+    /// An encoded column carries its indexes (specs/columine/10-physical-vocabulary.md
+    /// §8): each valid index of a schema-dictionary column names a value of
+    /// its dictionary, and each of a stream-dictionary column an ordinal
+    /// `image` holds, or the batch is `InvalidInput` naming the field and
+    /// row. `mark` is the image's length before the values this batch
+    /// brought; those values are written as one DictionaryBatch ahead of the
+    /// record batch, a delta when `mark` is above zero. A `mark` past the
+    /// image is `InvalidInput`.
+    ///
     /// A compact batch is caller-built columns: the payload is already
     /// columns, so the semantic judgment has nothing to read. No production
     /// caller arms a semantic envelope on a compact handle, and a processor
     /// whose envelope holds value-object nodes refuses compact batches as
     /// `InvalidFormat` rather than writing value objects it never admitted.
-    pub fn compact(
+    pub fn compact_with(
         &mut self,
         batch: &[u8],
         output: &mut [u8],
         batch_metadata: &[(&str, &str)],
+        image: &dyn CategoryImage,
+        mark: u32,
     ) -> ResultCode {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutputTooSmall;
@@ -773,19 +1086,35 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             write_compact_result_header(output, ResultCode::InvalidFormat, 0, 0, 0, &diagnostic);
             return ResultCode::InvalidFormat;
         }
+        if mark > image.len() {
+            let error = CompactValidationError::mark_past_image();
+            write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+            return error.code;
+        }
         let plane = &mut self.plane;
-        let view = match CompactBatchView::parse(batch, &plane.schema_config) {
-            Ok(view) => view,
-            Err(error) => {
-                write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
-                return error.code;
-            }
-        };
+        let view =
+            match CompactBatchView::parse(batch, &plane.schema_config, &mut plane.compact_ranges)
+                .and_then(|view| {
+                    view.check_dictionary_indexes(&plane.schema_config, image)
+                        .map(|()| view)
+                }) {
+                Ok(view) => view,
+                Err(error) => {
+                    write_compact_result_header(output, error.code, 0, 0, 0, &error.diagnostic);
+                    return error.code;
+                }
+            };
+        let added = added_values(image, mark);
+        let stream_dictionary = added.as_ref().map(|values| StreamDictionaryDelta {
+            values,
+            is_delta: mark > 0,
+        });
 
         let required_ipc = match required_arrow_ipc_len(
             &plane.schema_config,
             |index| view.column(index, &plane.schema_config),
             batch_metadata,
+            stream_dictionary,
         ) {
             Ok(required) => required,
             Err(_) => {
@@ -825,6 +1154,7 @@ impl<A: VoAdmission, G: AddressGrammar> EventProcessor<A, G> {
             |index| view.column(index, &plane.schema_config),
             |index| view.null_count(index),
             batch_metadata,
+            stream_dictionary,
         );
         match result {
             Ok(written) => {
@@ -910,6 +1240,9 @@ impl Plane {
             columns: &mut self.dynamic_columns,
             schema_config: &self.schema_config,
             record_batch_metadata: &mut self.record_batch_metadata,
+            // The base event log has no stream-dictionary column.
+            image: None,
+            mark: 0,
         })
     }
 
@@ -919,6 +1252,8 @@ impl Plane {
         input: &[u8],
         format: InputFormat,
         projections: FrameProjections<'_>,
+        image: &mut dyn CategoryImage,
+        cells: &mut CellWriter<'_>,
     ) -> Result<ParsedBatch<'_>, ProcessError> {
         if format == InputFormat::ArrowPassthrough {
             return Err(ProcessError {
@@ -941,6 +1276,8 @@ impl Plane {
             &config,
             projections,
             &mut extraction_diagnostic,
+            image,
+            cells,
         );
         self.extraction_config = Some(config);
 
@@ -951,7 +1288,14 @@ impl Plane {
             let code = match err {
                 json_extractor::ExtractionError::WorkBufferTooSmall => ResultCode::OutputTooSmall,
                 json_extractor::ExtractionError::MemoryExhausted => ResultCode::MemoryExhausted,
-                _ => ResultCode::ParseError,
+                json_extractor::ExtractionError::InvalidJson
+                | json_extractor::ExtractionError::InvalidFieldType
+                | json_extractor::ExtractionError::BufferOverflow
+                | json_extractor::ExtractionError::MsgpackError
+                | json_extractor::ExtractionError::TooManyEvents
+                | json_extractor::ExtractionError::UnwrittenProjection
+                | json_extractor::ExtractionError::Category(_)
+                | json_extractor::ExtractionError::Cell(_) => ResultCode::ParseError,
             };
             // JSON carries a per-field diagnostic; MessagePack derives
             // stage/detail from its error at this level.
@@ -983,7 +1327,18 @@ impl Plane {
                         diagnostic_detail::TOO_MANY_EVENTS,
                         u16::try_from(self.dynamic_columns.capacity).unwrap_or(u16::MAX),
                     ),
-                    _ => (diagnostic_detail::INVALID_JSON, 0),
+                    json_extractor::ExtractionError::Category(_) => {
+                        (diagnostic_detail::DICTIONARY_VALUE, 0)
+                    }
+                    json_extractor::ExtractionError::Cell(_) => {
+                        (diagnostic_detail::CELL_REFUSED, 0)
+                    }
+                    json_extractor::ExtractionError::InvalidJson
+                    | json_extractor::ExtractionError::InvalidFieldType
+                    | json_extractor::ExtractionError::MsgpackError
+                    | json_extractor::ExtractionError::UnwrittenProjection => {
+                        (diagnostic_detail::INVALID_JSON, 0)
+                    }
                 };
                 ResultDiagnostic {
                     stage: diagnostic_stage::MSGPACK,
@@ -1004,6 +1359,8 @@ impl Plane {
             columns: &mut self.dynamic_columns,
             schema_config: &self.schema_config,
             record_batch_metadata: &mut self.record_batch_metadata,
+            image: None,
+            mark: 0,
         })
     }
 
@@ -1013,6 +1370,14 @@ impl Plane {
     /// the batch re-extracts from a reset column set; at the cap the error
     /// surfaces.
     ///
+    /// `image` keeps the values a discarded attempt added. That is correct:
+    /// the retry meets the same texts in the same order, so each answers the
+    /// ordinal the discarded attempt gave it, and the batch's added values
+    /// are the same either way.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one batch: input and format, configuration, projections, diagnostic, the stream image and the value cell writer"
+    )]
     fn extract_with_growth(
         &mut self,
         input: &[u8],
@@ -1020,6 +1385,8 @@ impl Plane {
         config: &ExtractionConfig,
         projections: FrameProjections<'_>,
         diagnostic: &mut json_extractor::ExtractionDiagnostic,
+        image: &mut dyn CategoryImage,
+        cells: &mut CellWriter<'_>,
     ) -> Result<usize, json_extractor::ExtractionError> {
         // A processor that never sees a format retains no scratch allocation
         // for it. The first extraction starts small; overflow proves growth.
@@ -1043,6 +1410,9 @@ impl Plane {
                     &mut self.dynamic_columns,
                     &mut self.fallback_work_buffer,
                     diagnostic,
+                    &mut *image,
+                    &mut *cells,
+                    &mut self.cell_scratch,
                 ),
                 InputFormat::Msgpack | InputFormat::MsgpackStream => {
                     msgpack_extractor::extract_msgpack_events_with_projections(
@@ -1052,6 +1422,9 @@ impl Plane {
                         &mut self.work_buffer,
                         format == InputFormat::MsgpackStream,
                         projections,
+                        &mut *image,
+                        &mut *cells,
+                        &mut self.cell_scratch,
                     )
                 }
                 InputFormat::ArrowPassthrough => {
@@ -1184,6 +1557,11 @@ mod tests {
     use columine_arrow::{ArrowType, SignalSchemaField};
     use std::io::Cursor;
 
+    /// The event log's `timestamp` column: nanoseconds since the epoch, UTC.
+    fn timestamp_field() -> SignalSchemaField {
+        SignalSchemaField::new_timestamp(arrow_schema::TimeUnit::Nanosecond, false)
+    }
+
     /// columine's own artifact wiring: base scanner path, MessagePack
     /// workspace growth, plain headers.
     fn columine_options() -> ParseOptions {
@@ -1208,7 +1586,7 @@ mod tests {
         vec![
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
+            timestamp_field(),
             SignalSchemaField::new(ArrowType::Binary, true),
         ]
     }
@@ -1326,16 +1704,13 @@ mod tests {
     }
 
     /// Base and extraction paths emit byte-identical IPC for the same
-    /// four-column content. Their representation differences are compensated:
-    /// the base JSON scanner converts numeric timestamps ms→µs (×1000), while
-    /// extraction stores them raw; the base path stores raw JSON value bytes,
-    /// while extraction stores typed MessagePack. The shared test case
-    /// pre-scales the extraction timestamp.
+    /// four-column content. Both store a numeric timestamp as the
+    /// nanoseconds it is; the base path stores raw JSON value bytes, while
+    /// extraction stores typed MessagePack, so the shared case has no value.
     #[test]
     fn base_and_dynamic_pipelines_agree() {
         let names = b"id\0type\0timestamp\0value\0";
         let input = br#"[{"id":"a-1","type":"click","timestamp":100}]"#;
-        let dyn_input = br#"[{"id":"a-1","type":"click","timestamp":100000}]"#;
 
         let mut base_ep = EventProcessor::new(
             columine_options(),
@@ -1357,7 +1732,7 @@ mod tests {
         .unwrap();
         let mut dyn_out = vec![0u8; 64 * 1024];
         assert_eq!(
-            dyn_ep.create_log_entry(dyn_input, InputFormat::Json, &mut dyn_out, &[]),
+            dyn_ep.create_log_entry(input, InputFormat::Json, &mut dyn_out, &[]),
             ResultCode::Ok
         );
 
@@ -1575,7 +1950,7 @@ mod tests {
             &[
                 SignalSchemaField::new(ArrowType::Utf8, false),
                 SignalSchemaField::new(ArrowType::Utf8, false),
-                SignalSchemaField::new(ArrowType::Int64, false),
+                timestamp_field(),
                 SignalSchemaField::new(ArrowType::Binary, true),
             ],
             b"id\0type\0timestamp\0value\0",
@@ -1831,7 +2206,7 @@ mod tests {
         let fields = [
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
+            timestamp_field(),
             SignalSchemaField::new(ArrowType::Utf8, true),
         ];
         let schema = DynamicSchemaConfig {
@@ -1919,7 +2294,7 @@ mod tests {
         let fields = [
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
+            timestamp_field(),
             SignalSchemaField::new(ArrowType::Binary, true),
             SignalSchemaField::new(ArrowType::Binary, true),
         ];
@@ -1953,7 +2328,7 @@ mod tests {
         let fields = [
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Utf8, false),
-            SignalSchemaField::new(ArrowType::Int64, false),
+            timestamp_field(),
             SignalSchemaField::new(ArrowType::Utf8, true),
             SignalSchemaField::new(ArrowType::Utf8, true),
             SignalSchemaField::new(ArrowType::Binary, true),

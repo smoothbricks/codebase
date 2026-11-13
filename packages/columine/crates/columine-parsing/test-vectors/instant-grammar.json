@@ -1,0 +1,270 @@
+{
+  "//": "One RFC 3339 instant grammar (specs/columine/10-physical-vocabulary.md \u00a78): each text is admitted with exactly its nanoseconds since the Unix epoch, or refused when nanos is null. The nanoseconds are exact over the whole four-digit calendar, so they pass a signed 64-bit integer outside 1677-09-21..2262-04-11. Read by columine-parsing's instant reader; a host reader of the same grammar reads this file.",
+  "vectors": [
+    {
+      "text": "1970-01-01T00:00:00Z",
+      "nanos": "0",
+      "case": "the epoch"
+    },
+    {
+      "text": "1970-01-01T00:00:00.000Z",
+      "nanos": "0",
+      "case": "a millisecond fraction, as wakeInstant writes"
+    },
+    {
+      "text": "1970-01-01T00:00:00.000123Z",
+      "nanos": "123000",
+      "case": "one microsecond digit run"
+    },
+    {
+      "text": "1970-01-01T00:00:00.1Z",
+      "nanos": "100000000",
+      "case": "a one-digit fraction"
+    },
+    {
+      "text": "1970-01-01T00:00:00.123456000Z",
+      "nanos": "123456000",
+      "case": "nine fraction digits, the last three zero"
+    },
+    {
+      "text": "1969-12-31T23:59:59.999999000000-00:00",
+      "nanos": "-1000",
+      "case": "negative epoch, -00:00 is UTC"
+    },
+    {
+      "text": "1970-01-01T01:00:00+01:00",
+      "nanos": "0",
+      "case": "a positive offset"
+    },
+    {
+      "text": "1969-12-31T19:00:00-05:00",
+      "nanos": "0",
+      "case": "a negative offset crossing a day"
+    },
+    {
+      "text": "0000-01-01T00:00:00Z",
+      "nanos": "-62167219200000000000",
+      "case": "year zero"
+    },
+    {
+      "text": "0000-02-29T00:00:00Z",
+      "nanos": "-62162121600000000000",
+      "case": "year zero is a leap year"
+    },
+    {
+      "text": "2000-02-29T00:00:00Z",
+      "nanos": "951782400000000000",
+      "case": "a 400-year leap day"
+    },
+    {
+      "text": "2024-02-29T23:59:59.999999Z",
+      "nanos": "1709251199999999000",
+      "case": "a 4-year leap day"
+    },
+    {
+      "text": "9999-12-31T23:59:59.999999Z",
+      "nanos": "253402300799999999000",
+      "case": "the far year"
+    },
+    {
+      "text": "9999-12-31T23:59:59.999Z",
+      "nanos": "253402300799999000000",
+      "case": "a millisecond of the far year"
+    },
+    {
+      "text": "1969-12-31T23:00:00-01:00",
+      "nanos": "0",
+      "case": "an offset landing on the epoch"
+    },
+    {
+      "text": "2024-01-01t00:00:00Z",
+      "nanos": null,
+      "case": "a lowercase t"
+    },
+    {
+      "text": "2024-01-01T00:00:00z",
+      "nanos": null,
+      "case": "a lowercase z"
+    },
+    {
+      "text": "2024-01-01T00:00:00.000000000001Z",
+      "nanos": null,
+      "case": "a non-zero twelfth fraction digit"
+    },
+    {
+      "text": "1900-02-29T00:00:00Z",
+      "nanos": null,
+      "case": "a century that is no leap year"
+    },
+    {
+      "text": "2023-02-29T00:00:00Z",
+      "nanos": null,
+      "case": "a common year has no Feb 29"
+    },
+    {
+      "text": "2024-04-31T00:00:00Z",
+      "nanos": null,
+      "case": "April has 30 days"
+    },
+    {
+      "text": "2024-06-31T00:00:00Z",
+      "nanos": null,
+      "case": "June has 30 days"
+    },
+    {
+      "text": "2024-09-31T00:00:00Z",
+      "nanos": null,
+      "case": "September has 30 days"
+    },
+    {
+      "text": "2024-11-31T00:00:00Z",
+      "nanos": null,
+      "case": "November has 30 days"
+    },
+    {
+      "text": "2024-13-01T00:00:00Z",
+      "nanos": null,
+      "case": "month 13"
+    },
+    {
+      "text": "2024-00-01T00:00:00Z",
+      "nanos": null,
+      "case": "month 0"
+    },
+    {
+      "text": "2024-01-00T00:00:00Z",
+      "nanos": null,
+      "case": "day 0"
+    },
+    {
+      "text": "2024-01-32T00:00:00Z",
+      "nanos": null,
+      "case": "day 32"
+    },
+    {
+      "text": "2024-01-01T24:00:00Z",
+      "nanos": null,
+      "case": "hour 24"
+    },
+    {
+      "text": "2024-01-01T00:60:00Z",
+      "nanos": null,
+      "case": "minute 60"
+    },
+    {
+      "text": "2016-12-31T23:59:60Z",
+      "nanos": null,
+      "case": "a leap second"
+    },
+    {
+      "text": "2024-01-01T00:00:00+24:00",
+      "nanos": null,
+      "case": "offset hour 24"
+    },
+    {
+      "text": "2024-01-01T00:00:00+00:60",
+      "nanos": null,
+      "case": "offset minute 60"
+    },
+    {
+      "text": "2024-01-01T00:00:00",
+      "nanos": null,
+      "case": "no offset"
+    },
+    {
+      "text": "2024-01-01",
+      "nanos": null,
+      "case": "a date only"
+    },
+    {
+      "text": "2024-01-01T00:00:00.Z",
+      "nanos": null,
+      "case": "an empty fraction"
+    },
+    {
+      "text": "10000-01-01T00:00:00Z",
+      "nanos": null,
+      "case": "a five-digit year"
+    },
+    {
+      "text": "20240101T000000Z",
+      "nanos": null,
+      "case": "the basic format"
+    },
+    {
+      "text": "2024-01-01 00:00:00Z",
+      "nanos": null,
+      "case": "a space separator"
+    },
+    {
+      "text": "2024-01-01T00:00:00Zjunk",
+      "nanos": null,
+      "case": "trailing text"
+    },
+    {
+      "text": "2024-01-01T00:00:00+0000",
+      "nanos": null,
+      "case": "an offset without a colon"
+    },
+    {
+      "text": "2024-02-30T00:00:00Z",
+      "nanos": null,
+      "case": "February 30"
+    },
+    {
+      "text": "2024-01-01T00:00:60Z",
+      "nanos": null,
+      "case": "second 60 outside a leap-second date"
+    },
+    {
+      "text": "1970-01-01T00:00:00.000000001Z",
+      "nanos": "1",
+      "case": "one nanosecond"
+    },
+    {
+      "text": "2026-11-13T20:23:37.993000123Z",
+      "nanos": "1794601417993000123",
+      "case": "a current instant with every nanosecond digit, past 2^53"
+    },
+    {
+      "text": "1970-01-01T00:00:00.1234567+00:00",
+      "nanos": "123456700",
+      "case": "a seventh fraction digit with an offset"
+    },
+    {
+      "text": "1970-01-01T00:00:00.123456789000Z",
+      "nanos": "123456789",
+      "case": "zero digits past the nanosecond"
+    },
+    {
+      "text": "1969-12-31T23:59:59.999999999Z",
+      "nanos": "-1",
+      "case": "one nanosecond before the epoch"
+    },
+    {
+      "text": "2262-04-11T23:47:16.854775807Z",
+      "nanos": "9223372036854775807",
+      "case": "the latest instant the event clock names"
+    },
+    {
+      "text": "2262-04-11T23:47:16.854775808Z",
+      "nanos": "9223372036854775808",
+      "case": "one nanosecond past the event clock: exact here, saturated by an event-time reader"
+    },
+    {
+      "text": "1677-09-21T00:12:43.145224192Z",
+      "nanos": "-9223372036854775808",
+      "case": "the earliest instant the event clock names"
+    },
+    {
+      "text": "2024-01-01T00:00:00.0000000001Z",
+      "nanos": null,
+      "case": "a non-zero tenth fraction digit"
+    },
+    {
+      "text": "2024-01-01T00:00:00.1234567891+00:00",
+      "nanos": null,
+      "case": "a non-zero digit past the nanosecond with an offset"
+    }
+  ]
+}

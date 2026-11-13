@@ -35,7 +35,9 @@ import {
   utf8,
 } from '@uwdata/flechette';
 
-import { loadParseBackend } from '../parse-backend.js';
+import { compactKindTag } from '../arrow-planes.js';
+import { TIME_UNIT } from '../event-processor-abi.generated.js';
+import { encodeFieldDescriptor, loadParseBackend } from '../parse-backend.js';
 import type { CompactColumn, EncodedArrowSchema } from '../pipeline.js';
 
 const backend = await loadParseBackend();
@@ -52,11 +54,7 @@ function schemaMessage(name: string, sample: unknown, type: DataType, tag: numbe
     throw new Error('Flechette schema message is not continuation-prefixed');
   }
   const messageLength = 8 + view.getUint32(4, true);
-  const fieldMetadata = new Uint8Array(4);
-  fieldMetadata[0] = tag;
-  fieldMetadata[1] = 1;
-  fieldMetadata[2] = typeParam & 0xff;
-  fieldMetadata[3] = (typeParam >>> 8) & 0xff;
+  const fieldMetadata = encodeFieldDescriptor({ plane: tag, nullable: true, typeParam });
   return { schemaBytes: stream.slice(0, messageLength), fieldMetadata };
 }
 
@@ -333,19 +331,27 @@ describe('Compact real-wasm flat planes', () => {
     expectNumeric(values[1], 1_000_000n);
   });
 
-  it('timestamp rides i64', () => {
-    const schema = schemaMessage('v', 0n, timestamp(TimeUnit.MILLISECOND), 6);
-    const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 1_700_000_000_000n]) });
+  //#region smoo/columine!n/vocab-host-table
+  it('timestamp has its own plane and counts its unit', () => {
+    const schema = schemaMessage(
+      'v',
+      0n,
+      timestamp(TimeUnit.MILLISECOND, 'UTC'),
+      compactKindTag('timestamp'),
+      TIME_UNIT.ms,
+    );
+    const values = encodeOne('v', schema, { kind: 'timestamp', data: new BigInt64Array([0n, 1_700_000_000_000n]) });
     expectNumeric(values[0], 0n);
     expectNumeric(values[1], 1_700_000_000_000n);
   });
 
-  it('duration rides i64', () => {
-    const schema = schemaMessage('v', 0n, duration(TimeUnit.MILLISECOND), 6);
-    const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 5_000n]) });
+  it('duration has its own plane and counts its unit', () => {
+    const schema = schemaMessage('v', 0n, duration(TimeUnit.MILLISECOND), compactKindTag('duration'), TIME_UNIT.ms);
+    const values = encodeOne('v', schema, { kind: 'duration', data: new BigInt64Array([0n, 5_000n]) });
     expectNumeric(values[0], 0n);
     expectNumeric(values[1], 5_000n);
   });
+  //#endregion smoo/columine!n/vocab-host-table
 
   it('intervalYearMonth', () => {
     const schema = schemaMessage('v', 0, interval(IntervalUnit.YEAR_MONTH), 20);

@@ -5,16 +5,19 @@
 #[path = "../../columine-vm/tests/common/memory.rs"]
 mod memory;
 
-use arrow_array::{Array, BinaryArray, Int64Array, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, BinaryArray, StringArray, TimestampNanosecondArray};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use columine_arrow::schema::{
-    ArrowType, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, SignalSchemaField,
+    ArrowType, DictionarySlot, IndexWidth, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES,
+    SignalSchemaField, schema_ipc_bytes,
 };
 use columine_ep_wasm::{
     MAX_EVENT_CAPACITY, ep_compact, ep_create_log_entry, ep_create_with_schema,
-    ep_create_with_schema_and_names, ep_destroy, ep_version,
+    ep_create_with_schema_and_dictionaries, ep_create_with_schema_and_names, ep_destroy,
+    ep_version,
 };
 use columine_event_processor::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, CreateFailure,
@@ -47,18 +50,27 @@ static SCHEMA_BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
     ipc_schema_bytes(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("value", DataType::Binary, true),
     ])
 });
 
 fn base_fields() -> [SignalSchemaField; 4] {
     [
-        SignalSchemaField::new(ArrowType::Utf8, false),  // id
-        SignalSchemaField::new(ArrowType::Utf8, false),  // type
-        SignalSchemaField::new(ArrowType::Int64, false), // timestamp
+        SignalSchemaField::new(ArrowType::Utf8, false), // id
+        SignalSchemaField::new(ArrowType::Utf8, false), // type
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false), // timestamp
         SignalSchemaField::new(ArrowType::Binary, true), // value
     ]
+}
+
+/// The eight-byte wire descriptors of `fields`, as the create exports take them.
+fn wire(fields: &[SignalSchemaField]) -> Vec<u8> {
+    fields.iter().flat_map(|field| field.to_wire()).collect()
 }
 
 fn create_processor(capacity: u32) -> u32 {
@@ -69,7 +81,7 @@ fn create_processor(capacity: u32) -> u32 {
             capacity,
             SCHEMA_BYTES.as_ptr(),
             SCHEMA_BYTES.len() as u32,
-            fields.as_ptr().cast(),
+            wire(&fields).as_ptr(),
             fields.len() as u32,
             names.as_ptr(),
             names.len() as u32,
@@ -175,7 +187,7 @@ fn assert_create_log_entry_capacity_retry(input: &[u8], format: u8, expected_val
         record
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap()
             .value(0),
         0
@@ -324,14 +336,18 @@ fn create_log_entry_via_caller_buffers() {
     let named_fields = [
         SignalSchemaField::new(ArrowType::Utf8, false),
         SignalSchemaField::new(ArrowType::Utf8, false),
-        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
         SignalSchemaField::new(ArrowType::Int64, true),
         SignalSchemaField::new(ArrowType::Utf8, true),
     ];
     let named_schema = ipc_schema_bytes(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("value.amount", DataType::Int64, true),
         Field::new("value.label", DataType::Utf8, true),
     ]);
@@ -341,7 +357,7 @@ fn create_log_entry_via_caller_buffers() {
             256,
             named_schema.as_ptr(),
             named_schema.len() as u32,
-            named_fields.as_ptr().cast(),
+            wire(&named_fields).as_ptr(),
             named_fields.len() as u32,
             names.as_ptr(),
             names.len() as u32,
@@ -407,7 +423,7 @@ fn create_log_entry_via_caller_buffers() {
     let carrier_fields = [
         SignalSchemaField::new(ArrowType::Utf8, false),
         SignalSchemaField::new(ArrowType::Utf8, false),
-        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
         SignalSchemaField::new(ArrowType::Int64, true),
         SignalSchemaField::new(ArrowType::Binary, true),
     ];
@@ -467,13 +483,21 @@ fn semantic_batches_refuse_exhausted_memory() {
     let fields = [
         SignalSchemaField::new(ArrowType::Utf8, false),
         SignalSchemaField::new(ArrowType::Utf8, false),
-        SignalSchemaField::new(ArrowType::Int64, false),
-        SignalSchemaField::new(ArrowType::Int32, true),
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
+        SignalSchemaField::new_dictionary(DictionarySlot::Schema(0), IndexWidth::U8, true),
         SignalSchemaField::new(ArrowType::Binary, true),
         SignalSchemaField::new(ArrowType::Binary, true),
-        SignalSchemaField::new(ArrowType::Int32, true),
+        SignalSchemaField::new_dictionary(DictionarySlot::Schema(1), IndexWidth::U8, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
         SignalSchemaField::new(ArrowType::Binary, true),
     ];
+    // An enum member's column is a schema dictionary of its variants.
+    let dictionaries = [
+        vec![Some("achieved".to_owned()), Some("stuck".to_owned())],
+        vec![Some("human".to_owned())],
+    ];
+    let schema_message = schema_ipc_bytes(&fields).expect("schema message");
     let envelope = br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"optional","value":{"kind":"enum","variants":["achieved","stuck"]}},"authorRole":{"kind":"optional","value":{"kind":"enum","variants":["human"]}},"items":{"kind":"array","item":{"kind":"object","fields":{"sku":{"kind":"string"},"qty":{"kind":"range","min":0,"max":9,"integer":true}}}},"meta":{"kind":"object","open":true,"fields":{"note":{"kind":"optional","value":{"kind":"string"}}}},"tally":{"kind":"optional","value":{"kind":"record","value":{"kind":"number"}}},"pick":{"kind":"optional","value":{"kind":"union","variants":[{"kind":"string"},{"kind":"i32"}]}}}}}"#;
     let config = || {
         columine_arrow::DynamicSchemaConfig {
@@ -486,9 +510,13 @@ fn semantic_batches_refuse_exhausted_memory() {
                 column: 6,
             }],
         }),
-        ..columine_arrow::DynamicSchemaConfig::from_physical_fields_with_names(
+        ..columine_arrow::DynamicSchemaConfig::from_parts(
             &fields,
-            b"id\0type\0timestamp\0value.outcome\0value.items\0value.meta\0authorRole@close\0value.$undeclared\0",
+            columine_arrow::schema::SchemaParts {
+                schema_message: &schema_message,
+                field_names: b"id\0type\0timestamp\0value.outcome\0value.items\0value.meta\0authorRole@close\0value.$undeclared\0value.tally\0value.pick\0",
+                dictionaries: columine_arrow::schema::SchemaDictionaryTable::Typed(&dictionaries),
+            },
         )
         .expect("semantic schema")
     }
@@ -631,7 +659,7 @@ fn create_without_names_yields_handle() {
             256,
             SCHEMA_BYTES.as_ptr(),
             SCHEMA_BYTES.len() as u32,
-            fields.as_ptr().cast(),
+            wire(&fields).as_ptr(),
             fields.len() as u32,
         )
     };
@@ -698,7 +726,15 @@ fn one_row_compact_batch() -> Vec<u8> {
     write_u32(&mut batch, 164, 5);
     batch[168..173].copy_from_slice(b"click");
 
-    descriptor(&mut batch, 2, ArrowType::Int64, 0, (0, 0), (0, 0), (176, 8));
+    descriptor(
+        &mut batch,
+        2,
+        ArrowType::Timestamp,
+        0,
+        (0, 0),
+        (0, 0),
+        (176, 8),
+    );
     batch[176..184].copy_from_slice(&1i64.to_le_bytes());
 
     descriptor(
@@ -783,7 +819,7 @@ fn compact_capacity_header_supports_one_exact_retry() {
         record
             .column(2)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap()
             .value(0),
         1
@@ -859,7 +895,8 @@ fn handle_zero_is_reserved_and_full_table_creation_fails() {
 fn creation_failures_name_their_cause() {
     let _serial = serial();
     let fields = base_fields();
-    let meta_ptr = fields.as_ptr().cast::<u8>();
+    let meta = wire(&fields);
+    let meta_ptr = meta.as_ptr();
     let names = b"id\0type\0timestamp\0value\0";
 
     let create = |schema: &[u8], meta: *const u8, count: u32| unsafe {
@@ -871,11 +908,7 @@ fn creation_failures_name_their_cause() {
     // infallible step, so every ceiling from its need up to a whole handle's
     // answers either a handle or MemoryExhausted.
     let (decoded, decode_need) = memory::peak_bytes(|| {
-        columine_arrow::DynamicSchemaConfig::from_wire_with_field_names(
-            &SCHEMA_BYTES,
-            unsafe { std::slice::from_raw_parts(meta_ptr, 16) },
-            names,
-        )
+        columine_arrow::DynamicSchemaConfig::from_wire_with_field_names(&SCHEMA_BYTES, &meta, names)
     });
     decoded.expect("the base schema decodes");
     let (handle, whole) = memory::peak_bytes(|| create_processor(256));
@@ -944,7 +977,7 @@ fn creation_failures_name_their_cause() {
     // rather than typed: this used to be a literal 9, which stopped being an
     // invalid tag the moment the plane set grew past it and turned this into a
     // test of UInt8 instead.
-    let mut bad_tags = [0u8; 16];
+    let mut bad_tags = [0u8; 32];
     bad_tags[0] = ArrowType::ALL.len() as u8;
     assert_eq!(
         create(&SCHEMA_BYTES, bad_tags.as_ptr(), 4),
@@ -958,10 +991,10 @@ fn creation_failures_name_their_cause() {
     let signed = ipc_schema_bytes(vec![Field::new("value", DataType::Int32, true)]);
     let int32_meta = [SignalSchemaField::new(ArrowType::Int32, true)];
     assert_eq!(
-        create(&unsigned, int32_meta.as_ptr().cast(), 1),
+        create(&unsigned, wire(&int32_meta).as_ptr(), 1),
         CreateFailure::SchemaTypeMismatch as u32
     );
-    let handle = create(&signed, int32_meta.as_ptr().cast(), 1);
+    let handle = create(&signed, wire(&int32_meta).as_ptr(), 1);
     assert!(
         (1..=255).contains(&handle),
         "the signed twin must create: {handle:#x}"
@@ -976,13 +1009,13 @@ fn creation_failures_name_their_cause() {
         true,
     )]);
     assert_eq!(
-        create(&over_cap, int32_meta.as_ptr().cast(), 1),
+        create(&over_cap, wire(&int32_meta).as_ptr(), 1),
         CreateFailure::SchemaTooLarge as u32
     );
 
     let non_null_meta = [SignalSchemaField::new(ArrowType::Int32, false)];
     assert_eq!(
-        create(&signed, non_null_meta.as_ptr().cast(), 1),
+        create(&signed, wire(&non_null_meta).as_ptr(), 1),
         CreateFailure::SchemaNullability as u32
     );
 
@@ -1023,7 +1056,10 @@ fn widest_schema_round_trips_and_one_more_field_is_refused() {
     };
     let widest = schema_of(MAX_SCHEMA_FIELDS);
     let over = schema_of(MAX_SCHEMA_FIELDS + 1);
-    let fields = vec![SignalSchemaField::new(ArrowType::Utf8, true); MAX_SCHEMA_FIELDS + 1];
+    let fields = wire(&vec![
+        SignalSchemaField::new(ArrowType::Utf8, true);
+        MAX_SCHEMA_FIELDS + 1
+    ]);
     let over_names: Vec<u8> = (0..=MAX_SCHEMA_FIELDS)
         .flat_map(|index| format!("f{index}\0").into_bytes())
         .collect();
@@ -1033,7 +1069,7 @@ fn widest_schema_round_trips_and_one_more_field_is_refused() {
             1,
             schema.as_ptr(),
             schema.len() as u32,
-            fields.as_ptr().cast(),
+            fields.as_ptr(),
             count,
             names.as_ptr(),
             names.len() as u32,
@@ -1154,3 +1190,139 @@ fn handle_zero_is_never_returned_across_repeated_wraparound() {
         ep_destroy(handle);
     }
 }
+
+/// The texts of a dictionary-encoded column, `None` for a null row.
+fn texts(column: &ArrayRef) -> Vec<Option<String>> {
+    let dictionary = column.as_any_dictionary();
+    let keys = dictionary.normalized_keys();
+    let values = dictionary.values().as_string::<i32>();
+    (0..column.len())
+        .map(|row| (!column.is_null(row)).then(|| values.value(keys[row]).to_owned()))
+        .collect()
+}
+
+/// Parse JSON `input` through `handle` and return the status and the output.
+fn parse_json(handle: u32, input: &[u8]) -> (u32, Vec<u8>) {
+    let mut output = vec![0u8; 64 * 1024];
+    let code = unsafe {
+        ep_create_log_entry(
+            handle,
+            input.as_ptr(),
+            input.len() as u32,
+            0,
+            output.as_mut_ptr(),
+            output.len() as u32,
+        )
+    };
+    (code, output)
+}
+
+/// The single record batch of a successful result.
+fn only_batch(output: &[u8]) -> arrow_array::RecordBatch {
+    let (_, offset, length, ..) = read_result_header(output);
+    let ipc = &output[offset as usize..(offset + length) as usize];
+    let mut reader = StreamReader::try_new(Cursor::new(ipc), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert!(reader.next().is_none());
+    batch
+}
+
+//#region smoo/columine!n/vocab-wasm-schema-dictionary
+/// A schema dictionary column created through the dictionary-table export
+/// reads back as its declared values; the same schema without the table is
+/// refused naming the dictionaries.
+#[test]
+fn a_schema_dictionary_created_with_its_table_reads_back_its_values() {
+    let _serial = serial();
+    let fields = [
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new_dictionary(DictionarySlot::Schema(0), IndexWidth::U8, true),
+    ];
+    let schema = schema_ipc_bytes(&fields).unwrap();
+    let meta = wire(&fields);
+    let names = b"id\0status\0";
+    // One dictionary of two values: [count][values][len][bytes]...
+    let mut table = Vec::new();
+    for word in [1u32, 2] {
+        table.extend(word.to_le_bytes());
+    }
+    for value in ["open", "closed"] {
+        table.extend(u32::try_from(value.len()).unwrap().to_le_bytes());
+        table.extend(value.as_bytes());
+    }
+    let handle = unsafe {
+        ep_create_with_schema_and_dictionaries(
+            16,
+            schema.as_ptr(),
+            schema.len() as u32,
+            meta.as_ptr(),
+            fields.len() as u32,
+            names.as_ptr(),
+            names.len() as u32,
+            table.as_ptr(),
+            table.len() as u32,
+        )
+    };
+    assert!((1..=255).contains(&handle), "created: {handle:#x}");
+    let (code, output) = parse_json(handle, br#"[{"id":"a","status":"closed"}]"#);
+    assert_eq!(code, ResultCode::Ok as u32);
+    assert_eq!(
+        texts(only_batch(&output).column(1)),
+        [Some("closed".to_owned())]
+    );
+    ep_destroy(handle);
+
+    let without_table = unsafe {
+        ep_create_with_schema_and_names(
+            16,
+            schema.as_ptr(),
+            schema.len() as u32,
+            meta.as_ptr(),
+            fields.len() as u32,
+            names.as_ptr(),
+            names.len() as u32,
+        )
+    };
+    assert_eq!(without_table, CreateFailure::SchemaDictionary as u32);
+}
+//#endregion smoo/columine!n/vocab-wasm-schema-dictionary
+
+//#region smoo/columine!n/vocab-wasm-image-undo
+/// A handle's stream dictionary keeps no value of a refused batch: the next
+/// accepted batch's dictionary message defines the dictionary from its own
+/// values, so its stream reads on its own.
+#[test]
+fn a_refused_batch_leaves_no_stream_value_in_the_handle() {
+    let _serial = serial();
+    let fields = [
+        SignalSchemaField::new(ArrowType::Utf8, false),
+        SignalSchemaField::new_dictionary(DictionarySlot::Stream, IndexWidth::U16, true),
+    ];
+    let schema = schema_ipc_bytes(&fields).unwrap();
+    let meta = wire(&fields);
+    let names = b"id\0tag\0";
+    let handle = unsafe {
+        ep_create_with_schema_and_names(
+            16,
+            schema.as_ptr(),
+            schema.len() as u32,
+            meta.as_ptr(),
+            fields.len() as u32,
+            names.as_ptr(),
+            names.len() as u32,
+        )
+    };
+    assert!((1..=255).contains(&handle), "created: {handle:#x}");
+
+    let (code, _) = parse_json(handle, br#"[{"id":"a","tag":"red"},{"id":"b","tag":7}]"#);
+    assert_eq!(code, ResultCode::ParseError as u32, "a number is not a tag");
+
+    let (code, output) = parse_json(handle, br#"[{"id":"c","tag":"blue"}]"#);
+    assert_eq!(code, ResultCode::Ok as u32);
+    assert_eq!(
+        texts(only_batch(&output).column(1)),
+        [Some("blue".to_owned())]
+    );
+    ep_destroy(handle);
+}
+//#endregion smoo/columine!n/vocab-wasm-image-undo

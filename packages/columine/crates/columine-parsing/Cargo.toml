@@ -12,6 +12,13 @@ columine-types = { path = "../columine-types" }
 
 [dev-dependencies]
 proptest.workspace = true
+sha2 = "0.10"
 
 [lib]
 path = "src/lib.rs"
+
+# A private consumer reads instant texts with this crate's reader (specs/columine/10 §8 "The instant grammar").
+[[package.metadata.wiring.external]]
+item = "instant::instant_nanos"
+consumer = "private"
+why = "one instant grammar reader for every host: an RFC 3339 text to its exact nanoseconds since the epoch"

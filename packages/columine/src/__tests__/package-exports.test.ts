@@ -46,6 +46,27 @@ describe('package export contract', () => {
     }
   });
 
+  //#region smoo/columine!n/vocab-host-table
+  it('exports the generated host table and the field descriptor encoder', async () => {
+    const manifest = await readPackageManifest(packageUrl);
+    const mod = await importDeclaredModule(manifest, packageUrl, '.');
+
+    expect(typeof mod.encodeFieldDescriptor).toBe('function');
+    for (const name of [
+      'ARROW_PLANES',
+      'CELL_ENCODING_KEY',
+      'DICTIONARY_SLOT',
+      'FIELD_DESCRIPTOR',
+      'FIELD_DESCRIPTOR_BYTES',
+      'FIELD_IDENTITY_KEY',
+      'TIME_UNIT',
+      'TIMESTAMP_ZONE',
+    ]) {
+      expect(mod[name], name).toBeDefined();
+    }
+  });
+  //#endregion smoo/columine!n/vocab-host-table
+
   // Both modules are instantiated with an empty import object, so a wasm-bindgen import
   // (chrono's `wasmbind` unified in from a host-only crate did exactly this) is a load failure for
   // every consumer, not a warning.

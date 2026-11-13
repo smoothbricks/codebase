@@ -10,6 +10,7 @@
 
 use std::time::Instant;
 
+use arrow_schema::TimeUnit;
 use columine_arrow::{ArrowType, DynamicSchemaConfig, SignalSchemaField};
 use columine_event_processor::{EventProcessor, InputFormat, ParseOptions, ResultCode};
 
@@ -27,7 +28,7 @@ fn base_handle(rows: u32) -> EventProcessor {
     let fields = [
         SignalSchemaField::new(ArrowType::Utf8, false),
         SignalSchemaField::new(ArrowType::Utf8, false),
-        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
         SignalSchemaField::new(ArrowType::Binary, true),
     ];
     let config = DynamicSchemaConfig::from_physical_fields_with_names(
@@ -42,7 +43,7 @@ fn named_handle(rows: u32) -> EventProcessor {
     let fields = [
         SignalSchemaField::new(ArrowType::Utf8, false),
         SignalSchemaField::new(ArrowType::Utf8, false),
-        SignalSchemaField::new(ArrowType::Int64, false),
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
         SignalSchemaField::new(ArrowType::Int64, true),
         SignalSchemaField::new(ArrowType::Utf8, true),
     ];
@@ -63,7 +64,7 @@ fn json_batch(rows: u32) -> Vec<u8> {
         out.extend(
             format!(
                 r#"{{"id":"event-{row:08}","type":"purchase","timestamp":{},"value":{{"amount":{},"label":"item label {row}"}}}}"#,
-                1_700_000_000_000_000u64 + u64::from(row),
+                1_700_000_000_000_000_000u64 + u64::from(row),
                 u64::from(row) * 7,
             )
             .bytes(),
@@ -94,7 +95,7 @@ fn msgpack_batch(rows: u32) -> Vec<u8> {
         msgpack_str(&mut out, "type");
         msgpack_str(&mut out, "purchase");
         msgpack_str(&mut out, "timestamp");
-        msgpack_i64(&mut out, 1_700_000_000_000_000 + i64::from(row));
+        msgpack_i64(&mut out, 1_700_000_000_000_000_000 + i64::from(row));
         msgpack_str(&mut out, "value");
         out.push(0x82);
         msgpack_str(&mut out, "amount");

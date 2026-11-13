@@ -19,6 +19,17 @@
 // Counts-fold capacities (generated from the native definition)
 export type { CountBounds, CountsFoldCapacities } from './counts-fold-capacities.js';
 export { COUNTS_FOLD_CAPACITIES } from './counts-fold-capacities.js';
+// Generated host table: the event-processor ABI as the Rust definitions state it
+export {
+  ARROW_PLANES,
+  CELL_ENCODING_KEY,
+  DICTIONARY_SLOT,
+  FIELD_DESCRIPTOR,
+  FIELD_DESCRIPTOR_BYTES,
+  FIELD_IDENTITY_KEY,
+  TIME_UNIT,
+  TIMESTAMP_ZONE,
+} from './event-processor-abi.generated.js';
 // Index operands (column, slot and match-count encoding)
 export { appendIndex, MAX_INDEX_LEN, readIndex } from './operand.js';
 export type {
@@ -26,12 +37,14 @@ export type {
   CompactEncodingErrorCode,
   EventProcessorCreateErrorCode,
   EventProcessorWasmExports,
+  FieldDescriptor,
   ParseCompactBackend,
 } from './parse-backend.js';
 export {
   CompactEncodingError,
   createParseCompactWasmBackend,
   EventProcessorCreateError,
+  encodeFieldDescriptor,
   loadParseBackend,
 } from './parse-backend.js';
 // Pipeline composition API

@@ -23,14 +23,18 @@
 #     and the same fields with two ids are bound.
 #
 # A column carries the `sb.fields` identities of the declared fields it holds, each
-# `Ident{lib, n, digest}`. `identities_ok` mirrors the creation check that answers
-# `IdentityError::TwoTypes` and `IdentityError::Repeated` (`columine_parsing::identity`); a malformed
-# value is not modelled. Its laws:
+# `Ident{lib, n, digest}`. `identities_ok` mirrors `decode_field_identities`
+# (packages/columine/crates/columine-parsing/src/identity.rs): `False` is its `IdentityError::TwoTypes`
+# or `IdentityError::Repeated`. A malformed value is not modelled. Its laws:
 # (5) a_column_has_one_type_digest: an accepted schema's column carries one type digest.
-# (6) an_identity_names_one_column: an accepted schema has each (lib, n) on one column.
+# (6) an_identity_is_named_once: an accepted schema names each (lib, n) at one entry of one column.
 # identity_check_decides is their definedness: the check accepts and refuses.
 #
 # Check: bun bend2/main.ts specs/columine/laws/dictionary_binding.bend --verdict
+# Bound to the code by packages/columine/crates/columine-arrow/tests/dictionary_binding_laws.rs, which
+# runs `bind` (emitted into tests/dictionary_binding_model.rs) against `DynamicSchemaConfig::from_parts`,
+# and by packages/columine/crates/columine-parsing/tests/identity_laws.rs, which runs `identities_ok`
+# (emitted into tests/identity_model.rs) against `decode_field_identities`, on generated schemas.
 import Base
 
 type Field is Data:
@@ -245,22 +249,44 @@ def shares(col: +List<Ident>, +cols: +List<+List<Ident>>) -> Bool:
     case Con{Ident{l, k, d}, r}:
       Bool.or(keyed(l, k, cols), shares(r, cols))
 
+# Each (lib, n) of the column at one entry of it.
+def distinct(col: +List<Ident>) -> Bool:
+  match col:
+    case Nil{}:
+      True{}
+    case Con{Ident{l, k, d}, +r}:
+      Bool.and(Bool.not(has_key(l, k, r)), distinct(r))
+
+# A column's checks: one type digest, each (lib, n) once in it and on no later column.
+def column_ok(+col: +List<Ident>, +later: +List<+List<Ident>>) -> Bool:
+  Bool.and(one_digest(col), Bool.and(distinct(col), Bool.not(shares(col, later))))
+
 def identities_ok(cols: +List<+List<Ident>>) -> Bool:
   match cols:
     case Nil{}:
       True{}
     case Con{+col, +r}:
-      Bool.and(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r))
+      Bool.and(column_ok(col, r), identities_ok(r))
 
-# Column c carries (l, k).
-def on(cols: +List<+List<Ident>>, c: Nat, +l: Nat, +k: Nat) -> Bool:
+# Entry p of the column names (l, k).
+def at_entry(col: +List<Ident>, p: Nat, +l: Nat, +k: Nat) -> Bool:
+  match col p:
+    case Nil{} p0:
+      False{}
+    case Con{Ident{l0, k0, d}, r} 0n:
+      Bool.and(same(l, l0), same(k, k0))
+    case Con{Ident{l0, k0, d}, r} 1n+q:
+      at_entry(r, q, l, k)
+
+# Entry p of column c names (l, k).
+def at(cols: +List<+List<Ident>>, c: Nat, +p: Nat, +l: Nat, +k: Nat) -> Bool:
   match cols c:
     case Nil{} c0:
       False{}
     case Con{col, r} 0n:
-      has_key(l, k, col)
-    case Con{col, r} 1n+p:
-      on(r, p, l, k)
+      at_entry(col, p, l, k)
+    case Con{col, r} 1n+q:
+      at(r, q, p, l, k)
 
 # Column c carries type digest d.
 def digest_on(cols: +List<+List<Ident>>, c: Nat, +d: Nat) -> Bool:
@@ -653,14 +679,29 @@ def col_one(+col: +List<Ident>, +d1: Nat, +d2: Nat, +ho: {one_digest(col) == Tru
     case Con{Ident{l, k, d}, r}:
       same_via(d1, d2, d, in_all(d, Ident{l, k, d} <> r, d1, same_refl_all(d, r, ho), h1), in_all(d, Ident{l, k, d} <> r, d2, same_refl_all(d, r, ho), h2))
 
+def ok_column(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {identities_ok(col <> r) == True{} : Bool}) -> {column_ok(col, r) == True{} : Bool}:
+  and_l(column_ok(col, r), identities_ok(r), h)
+
+def ok_rest(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {identities_ok(col <> r) == True{} : Bool}) -> {identities_ok(r) == True{} : Bool}:
+  and_r(column_ok(col, r), identities_ok(r), h)
+
+def col_digest(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {identities_ok(col <> r) == True{} : Bool}) -> {one_digest(col) == True{} : Bool}:
+  and_l(one_digest(col), Bool.and(distinct(col), Bool.not(shares(col, r))), ok_column(col, r, h))
+
+def col_distinct(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {identities_ok(col <> r) == True{} : Bool}) -> {distinct(col) == True{} : Bool}:
+  and_l(distinct(col), Bool.not(shares(col, r)), and_r(one_digest(col), Bool.and(distinct(col), Bool.not(shares(col, r))), ok_column(col, r, h)))
+
+def col_apart(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {identities_ok(col <> r) == True{} : Bool}) -> {Bool.not(shares(col, r)) == True{} : Bool}:
+  and_r(distinct(col), Bool.not(shares(col, r)), and_r(one_digest(col), Bool.and(distinct(col), Bool.not(shares(col, r))), ok_column(col, r, h)))
+
 def one_type(+cols: +List<+List<Ident>>, +c: Nat, +d1: Nat, +d2: Nat, +h: {identities_ok(cols) == True{} : Bool}, +h1: {digest_on(cols, c, d1) == True{} : Bool}, +h2: {digest_on(cols, c, d2) == True{} : Bool}) -> {same(d1, d2) == True{} : Bool}:
   match cols c:
     case Nil{} c0:
       Empty.absurd({same(d1, d2) == True{} : Bool}, false_true(h1))
     case Con{col, r} 0n:
-      col_one(col, d1, d2, and_l(one_digest(col), Bool.not(shares(col, r)), and_l(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r), h)), h1, h2)
+      col_one(col, d1, d2, col_digest(col, r, h), h1, h2)
     case Con{col, r} 1n+p:
-      one_type(r, p, d1, d2, and_r(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r), h), h1, h2)
+      one_type(r, p, d1, d2, ok_rest(col, r, h), h1, h2)
 
 # (5) A column of an accepted schema carries one type digest.
 law a_column_has_one_type_digest:
@@ -676,15 +717,6 @@ law a_column_has_one_type_digest:
 def a_column_has_one_type_digest(cols, c, d1, d2, h, h1, h2):
   one_type(cols, c, d1, d2, h, h1, h2)
 
-def on_keyed(+cols: +List<+List<Ident>>, +c: Nat, +l: Nat, +k: Nat, +h: {on(cols, c, l, k) == True{} : Bool}) -> {keyed(l, k, cols) == True{} : Bool}:
-  match cols c:
-    case Nil{} c0:
-      Empty.absurd({keyed(l, k, []) == True{} : Bool}, false_true(h))
-    case Con{col, r} 0n:
-      or_l(has_key(l, k, col), keyed(l, k, r), h)
-    case Con{col, r} 1n+p:
-      or_r(has_key(l, k, col), keyed(l, k, r), on_keyed(r, p, l, k, h))
-
 def shares_head(+l: Nat, +k: Nat, +l0: Nat, +k0: Nat, +r: +List<Ident>, +cols: +List<+List<Ident>>, +m: {Bool.and(same(l, l0), same(k, k0)) == True{} : Bool}, +hl: {keyed(l, k, cols) == True{} : Bool}) -> {Bool.or(keyed(l0, k0, cols), shares(r, cols)) == True{} : Bool}:
   %same_eq(l, l0, and_l(same(l, l0), same(k, k0), m)) : {Bool.or(keyed(_, k0, cols), shares(r, cols)) == True{} : Bool}
   %same_eq(k, k0, and_r(same(l, l0), same(k, k0), m)) : {Bool.or(keyed(l, _, cols), shares(r, cols)) == True{} : Bool}
@@ -697,45 +729,83 @@ def shares_of(+col: +List<Ident>, +cols: +List<+List<Ident>>, +l: Nat, +k: Nat, 
     case Con{Ident{l0, k0, d}, r}:
       or_elim({Bool.or(keyed(l0, k0, cols), shares(r, cols)) == True{} : Bool}, Bool.and(same(l, l0), same(k, k0)), has_key(l, k, r), hk, m => shares_head(l, k, l0, k0, r, cols, m, hl), hr => or_r(keyed(l0, k0, cols), shares(r, cols), shares_of(r, cols, l, k, hr, hl)))
 
-def apart_cols(+col: +List<Ident>, +r: +List<+List<Ident>>, +h: {Bool.and(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r)) == True{} : Bool}) -> {Bool.not(shares(col, r)) == True{} : Bool}:
-  and_r(one_digest(col), Bool.not(shares(col, r)), and_l(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r), h))
+def at_entry_key(+col: +List<Ident>, +p: Nat, +l: Nat, +k: Nat, +h: {at_entry(col, p, l, k) == True{} : Bool}) -> {has_key(l, k, col) == True{} : Bool}:
+  match col p:
+    case Nil{} p0:
+      Empty.absurd({has_key(l, k, []) == True{} : Bool}, false_true(h))
+    case Con{Ident{l0, k0, d}, r} 0n:
+      or_l(Bool.and(same(l, l0), same(k, k0)), has_key(l, k, r), h)
+    case Con{Ident{l0, k0, d}, r} 1n+q:
+      or_r(Bool.and(same(l, l0), same(k, k0)), has_key(l, k, r), at_entry_key(r, q, l, k, h))
 
-def one_column(+cols: +List<+List<Ident>>, +c1: Nat, +c2: Nat, +l: Nat, +k: Nat, +h: {identities_ok(cols) == True{} : Bool}, +h1: {on(cols, c1, l, k) == True{} : Bool}, +h2: {on(cols, c2, l, k) == True{} : Bool}) -> {same(c1, c2) == True{} : Bool}:
-  match cols c1 c2:
+def at_keyed(+cols: +List<+List<Ident>>, +c: Nat, +p: Nat, +l: Nat, +k: Nat, +h: {at(cols, c, p, l, k) == True{} : Bool}) -> {keyed(l, k, cols) == True{} : Bool}:
+  match cols c:
+    case Nil{} c0:
+      Empty.absurd({keyed(l, k, []) == True{} : Bool}, false_true(h))
+    case Con{col, r} 0n:
+      or_l(has_key(l, k, col), keyed(l, k, r), at_entry_key(col, p, l, k, h))
+    case Con{col, r} 1n+q:
+      or_r(has_key(l, k, col), keyed(l, k, r), at_keyed(r, q, p, l, k, h))
+
+def key_moves(+l: Nat, +k: Nat, +l0: Nat, +k0: Nat, +r: +List<Ident>, +m: {Bool.and(same(l, l0), same(k, k0)) == True{} : Bool}, +h: {has_key(l, k, r) == True{} : Bool}) -> {has_key(l0, k0, r) == True{} : Bool}:
+  %same_eq(l, l0, and_l(same(l, l0), same(k, k0), m)) : {has_key(_, k0, r) == True{} : Bool}
+  %same_eq(k, k0, and_r(same(l, l0), same(k, k0), m)) : {has_key(l, _, r) == True{} : Bool}
+  h
+
+def entry_once(+col: +List<Ident>, +p1: Nat, +p2: Nat, +l: Nat, +k: Nat, +hd: {distinct(col) == True{} : Bool}, +h1: {at_entry(col, p1, l, k) == True{} : Bool}, +h2: {at_entry(col, p2, l, k) == True{} : Bool}) -> {same(p1, p2) == True{} : Bool}:
+  match col p1 p2:
     case Nil{} a0 b0:
       Empty.absurd({same(a0, b0) == True{} : Bool}, false_true(h1))
-    case Con{col, r} 0n 0n:
+    case Con{Ident{l0, k0, d}, r} 0n 0n:
       {==}
-    case Con{col, r} 0n 1n+q:
-      Empty.absurd({same(0n, 1n+q) == True{} : Bool}, not_true(shares(col, r), apart_cols(col, r, h), shares_of(col, r, l, k, h1, on_keyed(r, q, l, k, h2))))
-    case Con{col, r} 1n+p 0n:
-      Empty.absurd({same(1n+p, 0n) == True{} : Bool}, not_true(shares(col, r), apart_cols(col, r, h), shares_of(col, r, l, k, h2, on_keyed(r, p, l, k, h1))))
-    case Con{col, r} 1n+p 1n+q:
-      one_column(r, p, q, l, k, and_r(Bool.and(one_digest(col), Bool.not(shares(col, r))), identities_ok(r), h), h1, h2)
+    case Con{Ident{l0, k0, d}, r} 0n 1n+b:
+      Empty.absurd({same(0n, 1n+b) == True{} : Bool}, not_true(has_key(l0, k0, r), and_l(Bool.not(has_key(l0, k0, r)), distinct(r), hd), key_moves(l, k, l0, k0, r, h1, at_entry_key(r, b, l, k, h2))))
+    case Con{Ident{l0, k0, d}, r} 1n+a 0n:
+      Empty.absurd({same(1n+a, 0n) == True{} : Bool}, not_true(has_key(l0, k0, r), and_l(Bool.not(has_key(l0, k0, r)), distinct(r), hd), key_moves(l, k, l0, k0, r, h2, at_entry_key(r, a, l, k, h1))))
+    case Con{Ident{l0, k0, d}, r} 1n+a 1n+b:
+      entry_once(r, a, b, l, k, and_r(Bool.not(has_key(l0, k0, r)), distinct(r), hd), h1, h2)
 
-# (6) In an accepted schema an identity (lib, n) is on one column.
-law an_identity_names_one_column:
+def named_once(+cols: +List<+List<Ident>>, +c1: Nat, +c2: Nat, +p1: Nat, +p2: Nat, +l: Nat, +k: Nat, +h: {identities_ok(cols) == True{} : Bool}, +h1: {at(cols, c1, p1, l, k) == True{} : Bool}, +h2: {at(cols, c2, p2, l, k) == True{} : Bool}) -> {Bool.and(same(c1, c2), same(p1, p2)) == True{} : Bool}:
+  match cols c1 c2:
+    case Nil{} a0 b0:
+      Empty.absurd({Bool.and(same(a0, b0), same(p1, p2)) == True{} : Bool}, false_true(h1))
+    case Con{col, r} 0n 0n:
+      entry_once(col, p1, p2, l, k, col_distinct(col, r, h), h1, h2)
+    case Con{col, r} 0n 1n+b:
+      Empty.absurd({Bool.and(same(0n, 1n+b), same(p1, p2)) == True{} : Bool}, not_true(shares(col, r), col_apart(col, r, h), shares_of(col, r, l, k, at_entry_key(col, p1, l, k, h1), at_keyed(r, b, p2, l, k, h2))))
+    case Con{col, r} 1n+a 0n:
+      Empty.absurd({Bool.and(same(1n+a, 0n), same(p1, p2)) == True{} : Bool}, not_true(shares(col, r), col_apart(col, r, h), shares_of(col, r, l, k, at_entry_key(col, p2, l, k, h2), at_keyed(r, a, p1, l, k, h1))))
+    case Con{col, r} 1n+a 1n+b:
+      named_once(r, a, b, p1, p2, l, k, ok_rest(col, r, h), h1, h2)
+
+# (6) An accepted schema names an identity (lib, n) at one entry of one column: twice in a column
+# and on two columns are both refused.
+law an_identity_is_named_once:
   for +cols: +List<+List<Ident>>
   for +c1: Nat
+  for +p1: Nat
   for +c2: Nat
+  for +p2: Nat
   for +l: Nat
   for +k: Nat
   for h: {identities_ok(cols) == True{} : Bool}
-  for h1: {on(cols, c1, l, k) == True{} : Bool}
-  for h2: {on(cols, c2, l, k) == True{} : Bool}
-  {same(c1, c2) == True{} : Bool}
+  for h1: {at(cols, c1, p1, l, k) == True{} : Bool}
+  for h2: {at(cols, c2, p2, l, k) == True{} : Bool}
+  {Bool.and(same(c1, c2), same(p1, p2)) == True{} : Bool}
 
-def an_identity_names_one_column(cols, c1, c2, l, k, h, h1, h2):
-  one_column(cols, c1, c2, l, k, h, h1, h2)
+def an_identity_is_named_once(cols, c1, p1, c2, p2, l, k, h, h1, h2):
+  named_once(cols, c1, c2, p1, p2, l, k, h, h1, h2)
 
-# Definedness: two columns of distinct identities are accepted; a column of two type digests and
-# one identity on two columns are refused.
+# Definedness: two columns of distinct identities are accepted; a column of two type digests, one
+# identity twice in a column and one identity on two columns are refused.
 law identity_check_decides:
   Sigma<&2, &2,
     {identities_ok([[Ident{1n, 1n, 7n}], [Ident{1n, 2n, 7n}]]) == True{} : Bool},
     u => Sigma<&2, &2,
       {identities_ok([[Ident{1n, 1n, 7n}, Ident{1n, 2n, 8n}]]) == False{} : Bool},
-      v => {identities_ok([[Ident{1n, 1n, 7n}], [Ident{1n, 1n, 7n}]]) == False{} : Bool}>>
+      v => Sigma<&2, &2,
+        {identities_ok([[Ident{1n, 1n, 7n}, Ident{1n, 1n, 7n}]]) == False{} : Bool},
+        w => {identities_ok([[Ident{1n, 1n, 7n}], [Ident{1n, 1n, 7n}]]) == False{} : Bool}>>>
 
 def identity_check_decides():
-  ({==}, ({==}, {==}))
+  ({==}, ({==}, ({==}, {==})))

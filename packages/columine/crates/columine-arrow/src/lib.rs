@@ -18,23 +18,26 @@ pub mod ipc;
 pub mod record_batch;
 pub mod schema;
 
+pub use arrow_schema::TimeUnit;
 pub use columns::PlaneOutOfMemory;
 pub use columns::{
     ColumnStorage, DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_STRING_BYTES, MAX_VALUE_BYTES,
     ParseError, VariableValueError, VariableValueReservation,
 };
 pub use ipc::{
-    EOS_MARKER, IpcError, MIN_ARROW_OUTPUT_CAPACITY, required_arrow_ipc_len,
+    EOS_MARKER, IpcError, MIN_ARROW_OUTPUT_CAPACITY, StreamDictionaryDelta, required_arrow_ipc_len,
     write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
 };
 pub use record_batch::{
-    BufferDesc, CONTINUATION_MARKER, DynamicBodyBuilder, DynamicColumn, FieldNode, MetadataError,
-    MetadataLimits, MetadataStorage, align_to_8, encode_record_batch_dynamic,
-    record_batch_metadata_size,
+    BufferDesc, CONTINUATION_MARKER, DictionaryValues, DynamicBodyBuilder, DynamicColumn,
+    FieldNode, MetadataOutOfMemory, MetadataStorage, align_to_8, dictionary_batch_len,
+    encode_dictionary_batch, encode_record_batch_dynamic, record_batch_metadata_size,
 };
 pub use schema::{
-    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, DynamicSchemaConfig,
+    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, CELL_ENCODING_KEY, DictionaryEncoding,
+    DictionarySlot, DynamicSchemaConfig, FIELD_DESCRIPTOR_BYTES, FIELD_IDENTITY_KEY, IndexWidth,
     MAX_FIXED_SIZE_BINARY_WIDTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, PlaneKind,
-    SchemaError, SignalSchemaField, compute_buffer_count, logical_schema_ipc_bytes,
-    schema_ipc_bytes,
+    RecordMember, SchemaDictionary, SchemaDictionaryTable, SchemaError, SchemaParts,
+    SignalSchemaField, TIME_UNITS, TIMESTAMP_ZONE, TextColumn, compute_buffer_count,
+    logical_schema_ipc_bytes, schema_ipc_bytes, time_unit, time_unit_code, units_per_second,
 };

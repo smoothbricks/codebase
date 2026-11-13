@@ -23,6 +23,9 @@
 //! bigint, a canonical int64, the decimal string) against them. An `array` node
 //! may demand an exact length.
 //!
+//! A `string` node may bound a text's UTF-8 length by `maxBytes`; absent, the
+//! text is unbounded.
+//!
 //! A `key` node admits an `S.key` value: a non-empty string whose routing key
 //! component encodes to at most `maxEncodedLength` characters. Only that length
 //! is computed here, never the encoding: the routing encoder owns both, and the
@@ -49,6 +52,7 @@
 //! unchecked.
 use std::{cmp::Ordering, fmt, marker::PhantomData};
 
+pub use columine_types::value::{NumberValue, ValueKind, ValueView};
 pub use columine_types::vo::{
     UnavailableVoAdmission, VoAdmission, VoAdmissionError, VoCountsRole, VoDefinition, VoFieldLink,
     VoFrameProof, VoMetadata, VoPreparationError, VoProfile, VoProgramMetadata, VoRefusal,
@@ -67,99 +71,6 @@ const MAX_VALUE_DEPTH: usize = 256;
 /// exactly.
 const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
 const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
-
-/// Semantic kinds understood by the signal schema tree and value adapters.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum ValueKind {
-    Unknown,
-    Null,
-    String,
-    Number,
-    Boolean,
-    Binary,
-    BigInt,
-    Array,
-    Object,
-    /// An exact signed integer from a canonical codec that does not retain the
-    /// originating host's number/bigint distinction. Never a JSON number token.
-    CanonicalInt64,
-}
-
-impl ValueKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Null => "null",
-            Self::String => "string",
-            Self::Number => "number",
-            Self::Boolean => "boolean",
-            Self::Binary => "binary",
-            Self::BigInt => "bigint",
-            Self::Array => "array",
-            Self::Object => "object",
-            Self::CanonicalInt64 => "canonical int64",
-        }
-    }
-}
-
-impl fmt::Display for ValueKind {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        output.write_str(self.as_str())
-    }
-}
-
-/// Exact numeric forms exposed by a value adapter.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum NumberValue {
-    Signed(i128),
-    Unsigned(u128),
-    Float(f64),
-}
-
-/// Read-only value-model seam for schema validation.
-///
-/// Object and array traversal is callback-based so implementations can expose
-/// borrowed values without allocating or requiring a common owned tree. A
-/// runtime may implement only the accessors relevant to its [`ValueKind`]. The
-/// default accessors are intentionally empty: a malformed adapter is rejected
-/// as a type/shape violation rather than causing a panic. Reporting
-/// [`ValueKind::CanonicalInt64`] without answering
-/// [`ValueView::as_canonical_i64`] is such an adapter: the kind alone proves no
-/// value, and no numeric schema accepts it.
-pub trait ValueView {
-    fn kind(&self) -> ValueKind;
-
-    fn as_str(&self) -> Option<&str> {
-        None
-    }
-
-    /// The exact number of a [`ValueKind::Number`], or the exact integer of a
-    /// [`ValueKind::BigInt`] whose adapter carries one; a bounded `bigint`
-    /// refuses a bigint that does not answer.
-    fn as_number(&self) -> Option<NumberValue> {
-        None
-    }
-
-    /// The exact signed payload witnessing [`ValueKind::CanonicalInt64`].
-    /// Adapters must not reconstruct it from a floating-point value or infer
-    /// this representation from an ordinary JSON/MessagePack number token.
-    fn as_canonical_i64(&self) -> Option<i64> {
-        None
-    }
-
-    fn as_bytes(&self) -> Option<&[u8]> {
-        None
-    }
-
-    fn object_field(&self, _name: &str) -> Option<&dyn ValueView> {
-        None
-    }
-
-    fn visit_object(&self, _visit: &mut dyn FnMut(&str, &dyn ValueView)) {}
-
-    fn visit_array(&self, _visit: &mut dyn FnMut(usize, &dyn ValueView)) {}
-}
 
 /// A value tree useful to adapters and tests that already have JSON-shaped
 /// data. Binary, bigint, and canonical int64 values remain representable for
@@ -353,6 +264,8 @@ enum Expected<'s> {
     BigInt(IntegerBounds),
     /// An `S.key` value: its routing key component encodes to at most this many characters.
     Key(u32),
+    /// A bounded `string`: a text of at most this many UTF-8 bytes.
+    StringBytes(u32),
     /// An `axId` value the host's grammar refused, with the grammar's reason.
     AxId(&'static str),
     Length(u32),
@@ -380,6 +293,7 @@ impl fmt::Display for Expected<'_> {
             }
             Self::BigInt(bounds) => write!(output, "bigint in [{}, {}]", bounds.min, bounds.max),
             Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
+            Self::StringBytes(bound) => write!(output, "string of at most {bound} bytes"),
             Self::AxId(reason) => write!(output, "axId: {reason}"),
             Self::Length(length) => write!(output, "array of length {length}"),
             Self::Declared(fields) => {
@@ -414,6 +328,8 @@ enum Observed {
     Kind(ValueKind),
     Text(&'static str),
     Length(u64),
+    /// A text's UTF-8 length.
+    Bytes(u64),
 }
 
 impl fmt::Display for Observed {
@@ -422,6 +338,7 @@ impl fmt::Display for Observed {
             Self::Kind(kind) => output.write_str(kind.as_str()),
             Self::Text(text) => output.write_str(text),
             Self::Length(length) => write!(output, "array of length {length}"),
+            Self::Bytes(length) => write!(output, "string of {length} bytes"),
         }
     }
 }
@@ -704,7 +621,11 @@ impl ExactInteger {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SemanticSchema {
     Unknown,
-    String,
+    /// A text, of at most `max_bytes` UTF-8 bytes when the node names a bound.
+    /// The tree spells it `{"kind":"string"}` or `{"kind":"string","maxBytes":N}`.
+    String {
+        max_bytes: Option<u32>,
+    },
     /// An `S.key` value: a non-empty string whose routing key component encodes to at most
     /// `max_encoded_length` characters. Only that length is computed, never the encoding: the
     /// routing encoder owns both, and the node's producer derives the bound. The decoder
@@ -809,7 +730,7 @@ impl SemanticSchema {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
-            Self::String => "string",
+            Self::String { .. } => "string",
             Self::Key { .. } => "key",
             Self::AxId => "axId",
             Self::Number => "number",
@@ -942,7 +863,7 @@ pub(crate) fn collect_open_paths(
             }
         }
         SemanticSchema::Unknown
-        | SemanticSchema::String
+        | SemanticSchema::String { .. }
         | SemanticSchema::Key { .. }
         | SemanticSchema::AxId
         | SemanticSchema::Number
@@ -980,7 +901,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
             }
         }
         SemanticSchema::Unknown
-        | SemanticSchema::String
+        | SemanticSchema::String { .. }
         | SemanticSchema::Key { .. }
         | SemanticSchema::AxId
         | SemanticSchema::Number
@@ -1219,7 +1140,9 @@ impl SemanticSchema {
         let node = |child: &Self| Node::new(child.try_clone()?);
         Ok(match self {
             Self::Unknown => Self::Unknown,
-            Self::String => Self::String,
+            Self::String { max_bytes } => Self::String {
+                max_bytes: *max_bytes,
+            },
             Self::Key { max_encoded_length } => Self::Key {
                 max_encoded_length: *max_encoded_length,
             },
@@ -1415,7 +1338,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
         SemanticSchema::Map { key, value } => count_vo_metadata(key) + count_vo_metadata(value),
         SemanticSchema::Union(variants) => variants.iter().map(count_vo_metadata).sum(),
         SemanticSchema::Unknown
-        | SemanticSchema::String
+        | SemanticSchema::String { .. }
         | SemanticSchema::Key { .. }
         | SemanticSchema::AxId
         | SemanticSchema::Number
@@ -1644,7 +1567,7 @@ fn validate_at<'s, G: AddressGrammar>(
     }
     match schema {
         SemanticSchema::Unknown => Ok(()),
-        SemanticSchema::String => require_kind(value, ValueKind::String),
+        SemanticSchema::String { max_bytes } => validate_string(*max_bytes, value),
         SemanticSchema::Key { max_encoded_length } => validate_key(*max_encoded_length, value),
         SemanticSchema::AxId => validate_ax_id::<G>(value),
         SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
@@ -1877,6 +1800,29 @@ fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), St
     }
 }
 
+/// A `string` value: a text, no longer than `max_bytes` UTF-8 bytes when the
+/// node bounds it. A value that is not a string is refused as `string`
+/// refuses it.
+fn validate_string<'s>(max_bytes: Option<u32>, value: &dyn ValueView) -> Result<(), Stop<'s>> {
+    require_kind(value, ValueKind::String)?;
+    let Some(bound) = max_bytes else {
+        return Ok(());
+    };
+    let Some(text) = value.as_str() else {
+        return Err(Fault::shape(ValueKind::String.as_str(), value).into());
+    };
+    let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    if length <= u64::from(bound) {
+        Ok(())
+    } else {
+        Err(Fault {
+            expected: Expected::StringBytes(bound),
+            observed: Observed::Bytes(length),
+            vo: None,
+        }
+        .into())
+    }
+}
 /// An `S.key` value: a non-empty string whose [`encoded_key_len`] is at most
 /// `max_encoded_length`. A value that is not a string is refused as `string` refuses it.
 fn validate_key<'s>(max_encoded_length: u32, value: &dyn ValueView) -> Result<(), Stop<'s>> {
@@ -2112,7 +2058,15 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
     let kind = string_field(fields, "kind")?;
     match kind {
         "unknown" => Ok(SemanticSchema::Unknown),
-        "string" => Ok(SemanticSchema::String),
+        "string" => {
+            const MEMBERS: &[&str] = &["kind", "maxBytes"];
+            let members = exact_members(value, &["kind"], MEMBERS)?;
+            let max_bytes = match field(members, "maxBytes") {
+                None => None,
+                bound @ Some(_) => Some(unsigned::<u32>(bound)?),
+            };
+            Ok(SemanticSchema::String { max_bytes })
+        }
         "key" => {
             const MEMBERS: &[&str] = &["kind", "maxEncodedLength"];
             let members = exact_members(value, MEMBERS, MEMBERS)?;
@@ -2726,7 +2680,7 @@ fn one_more<T>(buf: &mut Vec<T>) -> Result<(), ValueParseError> {
 /// payloads point into the batch, so the judgment copies nothing and a
 /// value-object frame is admitted as the wire bytes themselves.
 #[derive(Clone, Debug, PartialEq)]
-enum MsgpackValue<'a> {
+pub(crate) enum MsgpackValue<'a> {
     Unknown,
     Null,
     String(&'a str),
@@ -2840,7 +2794,7 @@ fn parse_msgpack_event<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, 
     Ok(MsgpackValue::Object(event))
 }
 
-fn parse_msgpack_value<'a>(
+pub(crate) fn parse_msgpack_value<'a>(
     reader: &mut Reader<'a>,
     depth: usize,
 ) -> Result<MsgpackValue<'a>, ValueParseError> {
@@ -4623,8 +4577,10 @@ mod tests {
                 crate::build_extraction_config_with_semantic_schemas(
                     &[],
                     &[],
+                    &[],
                     Some(prepared.schemas()),
                     None,
+                    crate::CellLayout::default(),
                 )
                 .map_err(Refusal::Config)?;
                 prepared
@@ -4998,4 +4954,92 @@ mod tests {
             ("value.line", "unknown", None)
         );
     }
+
+    //#region smoo/columine!n/vocab-bounded-string
+    #[test]
+    fn a_string_node_takes_an_optional_u32_byte_bound_and_nothing_else() {
+        assert_eq!(
+            schema(r#"{"kind":"string"}"#),
+            SemanticSchema::String { max_bytes: None }
+        );
+        assert_eq!(
+            schema(r#"{"kind":"string","maxBytes":4294967295}"#),
+            SemanticSchema::String {
+                max_bytes: Some(u32::MAX)
+            }
+        );
+        for bound in ["-1", "1.5", "4294967296", "\"4\"", "null"] {
+            let tree = format!(r#"{{"kind":"string","maxBytes":{bound}}}"#);
+            assert_eq!(
+                SemanticSchema::from_tree_bytes(tree.as_bytes()),
+                Err(SchemaParseError::InvalidOperand),
+                "{tree}"
+            );
+        }
+        // A member the node does not define is refused, not ignored.
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(br#"{"kind":"string","maxLength":4}"#),
+            Err(SchemaParseError::InvalidOperand)
+        );
+    }
+
+    /// `{"type":"hi","value":{"note":<text>}}`, one MessagePack event of a
+    /// text under 32 bytes.
+    fn note_event(text: &str) -> Vec<u8> {
+        let mut event = vec![
+            0x82, 0xa4, b't', b'y', b'p', b'e', 0xa2, b'h', b'i', 0xa5, b'v', b'a', b'l', b'u',
+            b'e', 0x81, 0xa4, b'n', b'o', b't', b'e',
+        ];
+        event.push(0xa0 | u8::try_from(text.len()).unwrap());
+        event.extend(text.as_bytes());
+        event
+    }
+
+    #[test]
+    fn a_text_at_its_byte_bound_is_admitted_and_one_byte_over_is_refused_on_both_lanes() {
+        let schemas = parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"string","maxBytes":4}}}}"#,
+        )
+        .unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
+        // "née" is three characters in four UTF-8 bytes: the bound counts bytes.
+        assert_eq!(
+            prepared.validate_json_batch(r#"[{"type":"hi","value":{"note":"née"}}]"#.as_bytes()),
+            Ok(())
+        );
+        assert_eq!(
+            prepared
+                .validate_msgpack_batch(&note_event("née"), true)
+                .map(|_| ()),
+            Ok(())
+        );
+        let refusal = |result: Result<(), BatchValidationError>| match result {
+            Err(BatchValidationError::Violation { violation, .. }) => (
+                violation.path.clone(),
+                violation.expected.clone(),
+                violation.observed.clone(),
+            ),
+            other => panic!("a text past its bound is refused: {other:?}"),
+        };
+        let over = (
+            "value.note".to_owned(),
+            "string of at most 4 bytes".to_owned(),
+            "string of 5 bytes".to_owned(),
+        );
+        assert_eq!(
+            refusal(prepared.validate_json_batch(br#"[{"type":"hi","value":{"note":"notes"}}]"#)),
+            over
+        );
+        assert_eq!(
+            refusal(
+                prepared
+                    .validate_msgpack_batch(&note_event("notes"), true)
+                    .map(|_| ())
+            ),
+            over
+        );
+    }
+    //#endregion smoo/columine!n/vocab-bounded-string
 }

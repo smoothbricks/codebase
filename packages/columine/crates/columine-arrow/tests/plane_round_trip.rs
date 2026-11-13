@@ -14,17 +14,19 @@ mod memory;
 use std::io::Cursor;
 
 use arrow_array::{
-    Array, Date32Array, Date64Array, Decimal128Array, Decimal256Array, DurationNanosecondArray,
-    FixedSizeBinaryArray, Float16Array, Float32Array, Int8Array, Int16Array, Int32Array,
-    IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray,
-    LargeStringArray, RecordBatch, Time32MillisecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, Date32Array, Date64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray,
+    DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray,
+    Float16Array, Float32Array, Int8Array, Int16Array, Int32Array, IntervalDayTimeArray,
+    IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeStringArray,
+    RecordBatch, Time32MillisecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 use columine_arrow::{
     ArrowType, DynamicColumns, DynamicSchemaConfig, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES,
-    MetadataLimits, MetadataStorage, SchemaError, SignalSchemaField, logical_schema_ipc_bytes,
+    MetadataStorage, SchemaError, SignalSchemaField, TIME_UNITS, logical_schema_ipc_bytes,
     write_arrow_ipc_from_dynamic_columns,
 };
 
@@ -43,12 +45,17 @@ fn round_trip(
     write(&mut columns);
     assert_eq!(columns.count, rows, "producer wrote the wrong row count");
 
-    let mut metadata =
-        MetadataStorage::for_fields(fields, MetadataLimits::default()).expect("size metadata");
+    let mut metadata = MetadataStorage::for_fields(fields).expect("size metadata");
     let mut output = vec![0u8; 1 << 16];
-    let written =
-        write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut output, &mut metadata, &[])
-            .expect("emit arrow ipc");
+    let written = write_arrow_ipc_from_dynamic_columns(
+        &columns,
+        &config,
+        &mut output,
+        &mut metadata,
+        &[],
+        None,
+    )
+    .expect("emit arrow ipc");
 
     let mut reader =
         StreamReader::try_new(Cursor::new(&output[..written]), None).expect("read arrow ipc");
@@ -512,31 +519,19 @@ fn temporal_logical_types_round_trip_on_the_shared_integer_planes() {
         &[3_600_000, 0]
     );
 
-    // Date64, Time64, Timestamp and Duration ride the eight-byte signed plane.
+    // Date64 and Time64 ride the eight-byte signed plane. A Timestamp and a
+    // Duration have planes of their own, below.
     let batch = round_trip(
-        &[
-            plane(ArrowType::Int64),
-            plane(ArrowType::Int64),
-            plane(ArrowType::Int64),
-            plane(ArrowType::Int64),
-        ],
+        &[plane(ArrowType::Int64), plane(ArrowType::Int64)],
         vec![
             Field::new("date64", DataType::Date64, true),
             Field::new("time64", DataType::Time64(TimeUnit::Nanosecond), true),
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                true,
-            ),
-            Field::new("duration", DataType::Duration(TimeUnit::Nanosecond), true),
         ],
         1,
         |columns| {
             assert!(columns.begin_row());
             columns.append_int(0, 1_700_000_000_000).unwrap();
             columns.append_int(1, 86_399_999_999_999).unwrap();
-            columns.append_int(2, 1_700_000_000_000_000).unwrap();
-            columns.append_int(3, -1).unwrap();
             columns.end_row();
         },
     );
@@ -545,12 +540,97 @@ fn temporal_logical_types_round_trip_on_the_shared_integer_planes() {
         column::<Time64NanosecondArray>(&batch, 1).value(0),
         86_399_999_999_999
     );
-    assert_eq!(
-        column::<TimestampMicrosecondArray>(&batch, 2).value(0),
-        1_700_000_000_000_000
-    );
-    assert_eq!(column::<DurationNanosecondArray>(&batch, 3).value(0), -1);
 }
+
+//#region smoo/columine!n/vocab-temporal-planes
+
+/// A Timestamp and a Duration are planes of their own, one per unit: a reader
+/// of each column gets its declared unit (and, for an instant, the UTC zone)
+/// and the exact counts that were written, boundaries and nulls included.
+#[test]
+fn timestamp_and_duration_planes_round_trip_every_unit() {
+    let mut fields = Vec::new();
+    let mut logical = Vec::new();
+    for unit in TIME_UNITS {
+        fields.push(SignalSchemaField::new_timestamp(unit, true));
+        logical.push(Field::new(
+            format!("timestamp_{unit:?}"),
+            DataType::Timestamp(unit, Some("UTC".into())),
+            true,
+        ));
+    }
+    for unit in TIME_UNITS {
+        fields.push(SignalSchemaField::new_duration(unit, true));
+        logical.push(Field::new(
+            format!("duration_{unit:?}"),
+            DataType::Duration(unit),
+            true,
+        ));
+    }
+    let declared: Vec<DataType> = logical
+        .iter()
+        .map(|field| field.data_type().clone())
+        .collect();
+
+    let values = [i64::MIN, -1, 0, i64::MAX];
+    let columns_written = u32::try_from(fields.len()).unwrap();
+    let batch = round_trip(&fields, logical, 5, |columns| {
+        for value in values {
+            assert!(columns.begin_row());
+            for index in 0..columns_written {
+                columns.append_int(index, value).unwrap();
+            }
+            columns.end_row();
+        }
+        // A null instant and a null span.
+        assert!(columns.begin_row());
+        for index in 0..columns_written {
+            columns.append_null(index).unwrap();
+        }
+        columns.end_row();
+    });
+
+    for (index, expected) in declared.iter().enumerate() {
+        let array = batch.column(index);
+        assert_eq!(array.data_type(), expected, "column {index}");
+        assert_eq!(array.null_count(), 1, "column {index}");
+        assert!(array.is_null(4), "column {index}");
+    }
+    assert_eq!(
+        &column::<TimestampSecondArray>(&batch, 0).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<TimestampMillisecondArray>(&batch, 1).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<TimestampMicrosecondArray>(&batch, 2).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<TimestampNanosecondArray>(&batch, 3).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<DurationSecondArray>(&batch, 4).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<DurationMillisecondArray>(&batch, 5).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<DurationMicrosecondArray>(&batch, 6).values()[..4],
+        &values
+    );
+    assert_eq!(
+        &column::<DurationNanosecondArray>(&batch, 7).values()[..4],
+        &values
+    );
+}
+
+//#endregion smoo/columine!n/vocab-temporal-planes
 
 #[test]
 fn shared_planes_reject_logical_types_of_the_same_width() {
@@ -570,6 +650,21 @@ fn shared_planes_reject_logical_types_of_the_same_width() {
         (ArrowType::Int64, DataType::Interval(IntervalUnit::DayTime)),
         // Arrow allows Time64 only in microseconds or nanoseconds.
         (ArrowType::Int64, DataType::Time64(TimeUnit::Second)),
+        // An instant and a span have planes of their own.
+        (
+            ArrowType::Int64,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ),
+        (ArrowType::Int64, DataType::Duration(TimeUnit::Millisecond)),
+        // Each has its own tag, and neither stands in for the other or for the
+        // plain integer.
+        (ArrowType::Timestamp, DataType::Int64),
+        (ArrowType::Duration, DataType::Int64),
+        (ArrowType::Timestamp, DataType::Duration(TimeUnit::Second)),
+        (
+            ArrowType::Duration,
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+        ),
         (ArrowType::UInt32, DataType::Int32),
         (ArrowType::Float64, DataType::Int64),
         (ArrowType::Float16, DataType::UInt16),
@@ -594,12 +689,14 @@ fn shared_planes_reject_logical_types_of_the_same_width() {
 #[test]
 fn every_plane_emits_a_readable_stream_in_one_schema() {
     // One schema over the whole table: proves the buffer vector and the field
-    // node vector stay in agreement across all twenty-three planes at once,
+    // node vector stay in agreement across every plane at once,
     // which per-plane tests cannot show.
     let fields: Vec<SignalSchemaField> = ArrowType::ALL
         .iter()
         .map(|arrow_type| match arrow_type {
             ArrowType::FixedSizeBinary => SignalSchemaField::new_fixed_size_binary(4, true),
+            ArrowType::Timestamp => SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, true),
+            ArrowType::Duration => SignalSchemaField::new_duration(TimeUnit::Millisecond, true),
             other => SignalSchemaField::new(*other, true),
         })
         .collect();
@@ -623,6 +720,8 @@ fn every_plane_emits_a_readable_stream_in_one_schema() {
                     | ArrowType::Int16
                     | ArrowType::Int32
                     | ArrowType::Int64
+                    | ArrowType::Timestamp
+                    | ArrowType::Duration
                     | ArrowType::IntervalYearMonth => columns.append_int(index, value).unwrap(),
                     ArrowType::UInt8
                     | ArrowType::UInt16
@@ -690,7 +789,7 @@ fn schema_decode_at_the_message_cap_stays_bounded() {
     }
     let widest = schema(name_len);
     let metadata: Vec<u8> = (0..MAX_SCHEMA_FIELDS)
-        .flat_map(|_| [ArrowType::Utf8 as u8, 1, 0, 0])
+        .flat_map(|_| SignalSchemaField::new(ArrowType::Utf8, true).to_wire())
         .collect();
     let (config, peak) = memory::peak_bytes(|| DynamicSchemaConfig::from_wire(&widest, &metadata));
     config.expect("the widest schema under the cap is admitted");

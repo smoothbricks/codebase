@@ -31,6 +31,9 @@ arrow-ipc = { version = "56", default-features = false }
 arrow-schema = { version = "56", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "error-context", "usage"] }
 criterion = { version = "0.5", default-features = false }
+# The generated flatbuffer builders arrow-ipc ships need it to write a Schema
+# message arrow's own writer never produces (columine-arrow's tests only).
+flatbuffers = { version = "25", default-features = false }
 napi = { version = "2", default-features = false, features = ["napi6", "tokio_rt"] }
 napi-build = "2"
 napi-derive = "2"

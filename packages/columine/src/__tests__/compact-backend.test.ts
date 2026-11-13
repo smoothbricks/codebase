@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'bun:test';
 
+import { COMPACT_MAX_KIND_TAG, compactKindTag } from '../arrow-planes.js';
+import {
+  COMPACT,
+  DICTIONARY_SLOT,
+  FIELD_DESCRIPTOR,
+  FIELD_DESCRIPTOR_BYTES,
+  MAX_SCHEMA_FIELDS,
+  TIME_UNIT,
+} from '../event-processor-abi.generated.js';
 import {
   CompactEncodingError,
   createParseCompactWasmBackend,
   type EventProcessorWasmExports,
+  encodeFieldDescriptor,
 } from '../parse-backend.js';
 import type { CompactBatch, CompactColumn, EncodedArrowSchema } from '../pipeline.js';
 
@@ -51,7 +61,7 @@ function createCompactMock(options: CompactMockOptions = {}) {
   ): number {
     createCalls.push({
       schema: new Uint8Array(memory.buffer, schemaPtr, schemaLen).slice(),
-      metadata: new Uint8Array(memory.buffer, metadataPtr, fieldCount * 4).slice(),
+      metadata: new Uint8Array(memory.buffer, metadataPtr, fieldCount * FIELD_DESCRIPTOR_BYTES).slice(),
       fieldCount,
     });
     return nextHandle++;
@@ -62,6 +72,7 @@ function createCompactMock(options: CompactMockOptions = {}) {
     ep_version: () => 1,
     ep_create_with_schema: createHandle,
     ep_create_with_schema_and_names: createHandle,
+    ep_create_with_schema_and_dictionaries: createHandle,
     ep_destroy: (handle) => destroyCalls.push(handle),
     ep_create_log_entry: (_handle, _inputPtr, _inputLen, _format, outputPtr) => {
       const view = new DataView(memory.buffer);
@@ -135,19 +146,36 @@ function requiredAt<T>(values: readonly T[], index: number, label: string): T {
   return value;
 }
 
+/** `descriptors` joined: a schema's `fieldMetadata` is one descriptor per field. */
+function fieldMetadata(descriptors: readonly Uint8Array[]): Uint8Array {
+  const metadata = new Uint8Array(descriptors.length * FIELD_DESCRIPTOR_BYTES);
+  for (let index = 0; index < descriptors.length; index += 1) {
+    metadata.set(requiredAt(descriptors, index, 'field descriptor'), index * FIELD_DESCRIPTOR_BYTES);
+  }
+  return metadata;
+}
+
+function schemaOf(descriptor: Uint8Array): EncodedArrowSchema {
+  return { schemaBytes: new Uint8Array(), fieldMetadata: descriptor };
+}
+
+/** One nullable Null field whose descriptor has `value` written over the byte at `offset`. */
+function nullFieldWithByte(offset: number, value: number): EncodedArrowSchema {
+  const descriptor = encodeFieldDescriptor({ plane: compactKindTag('null'), nullable: true });
+  descriptor[offset] = value;
+  return schemaOf(descriptor);
+}
+
 function schema(
   ...fields: ReadonlyArray<readonly [tag: number, nullable: 0 | 1, typeParam?: number]>
 ): EncodedArrowSchema {
-  const metadata = new Uint8Array(fields.length * 4);
-  for (let index = 0; index < fields.length; index += 1) {
-    const field = requiredAt(fields, index, 'schema field');
-    const typeParam = field[2] ?? 0;
-    metadata[index * 4] = field[0];
-    metadata[index * 4 + 1] = field[1];
-    metadata[index * 4 + 2] = typeParam & 0xff;
-    metadata[index * 4 + 3] = (typeParam >>> 8) & 0xff;
-  }
-  return { schemaBytes: new Uint8Array([0xff, 0xff, 0xff, 0xff, fields.length]), fieldMetadata: metadata };
+  const descriptors = fields.map(([plane, nullable, typeParam]) =>
+    encodeFieldDescriptor({ plane, nullable: nullable === 1, typeParam: typeParam ?? 0 }),
+  );
+  return {
+    schemaBytes: new Uint8Array([0xff, 0xff, 0xff, 0xff, fields.length]),
+    fieldMetadata: fieldMetadata(descriptors),
+  };
 }
 
 function batch(rowCount: number, encodedSchema: EncodedArrowSchema, columns: readonly CompactColumn[]): CompactBatch {
@@ -344,21 +372,31 @@ describe('Compact validation', () => {
       ['rowCount fractional', batch(1.5, schema(), [])],
       ['rowCount too large', batch(65_537, schema(), [])],
       [
-        'metadata not four-byte records',
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([1]) }, []),
+        'metadata not whole descriptors',
+        batch(
+          0,
+          schemaOf(
+            encodeFieldDescriptor({ plane: compactKindTag('null'), nullable: true }).subarray(
+              0,
+              FIELD_DESCRIPTOR_BYTES - 1,
+            ),
+          ),
+          [],
+        ),
       ],
       ['field count mismatch', batch(0, schema([1, 0]), [])],
       [
         'unknown physical type',
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([23, 0, 0, 0]) }, [{ kind: 'null' }]),
+        batch(0, schemaOf(encodeFieldDescriptor({ plane: COMPACT_MAX_KIND_TAG + 1, nullable: false })), [
+          { kind: 'null' },
+        ]),
       ],
+      ['invalid nullable byte', batch(0, nullFieldWithByte(FIELD_DESCRIPTOR.nullable, 2), [{ kind: 'null' }])],
       [
-        'invalid nullable byte',
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([0, 2, 0, 0]) }, [{ kind: 'null' }]),
-      ],
-      [
-        'nonzero metadata padding',
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([0, 1, 1, 0]) }, [{ kind: 'null' }]),
+        'type parameter on a plane without one',
+        batch(0, schemaOf(encodeFieldDescriptor({ plane: compactKindTag('null'), nullable: true, typeParam: 1 })), [
+          { kind: 'null' },
+        ]),
       ],
       ['kind mismatch', batch(0, schema([2, 0]), [{ kind: 'i32', data: new Int32Array() }])],
       ['non-nullable Null', batch(0, schema([0, 0]), [{ kind: 'null' }])],
@@ -445,27 +483,27 @@ describe('Compact validation', () => {
   });
 
   it('rejects field and packed-batch bounds before calling native code', () => {
-    const overCapacity = 513;
-    const tooManyFields = new Uint8Array(overCapacity * 4);
-    for (let index = 0; index < overCapacity; index += 1) {
-      tooManyFields[index * 4 + 1] = 1;
-    }
+    const overCapacity = MAX_SCHEMA_FIELDS + 1;
+    const tooManyFields = fieldMetadata(
+      Array.from({ length: overCapacity }, () =>
+        encodeFieldDescriptor({ plane: compactKindTag('null'), nullable: true }),
+      ),
+    );
     const tooManyColumns = Array.from({ length: overCapacity }, (): CompactColumn => ({ kind: 'null' }));
     const fieldMock = createCompactMock();
     expect(() =>
       createParseCompactWasmBackend(fieldMock.exports).encode(
         batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: tooManyFields }, tooManyColumns),
       ),
-    ).toThrow(/more than 512 fields/);
+    ).toThrow(new RegExp(`more than ${MAX_SCHEMA_FIELDS} fields`));
     expect(fieldMock.compactCalls).toHaveLength(0);
 
     const data = new Uint8Array(16 * 1024 * 1024);
     const offsets = new Uint32Array([0, data.byteLength]);
     const oversizedColumns = Array.from({ length: 5 }, (): CompactColumn => ({ kind: 'binary', offsets, data }));
-    const oversizedMetadata = new Uint8Array(oversizedColumns.length * 4);
-    for (let index = 0; index < oversizedColumns.length; index += 1) {
-      oversizedMetadata[index * 4] = 3;
-    }
+    const oversizedMetadata = fieldMetadata(
+      oversizedColumns.map(() => encodeFieldDescriptor({ plane: compactKindTag('binary'), nullable: false })),
+    );
     const sizeMock = createCompactMock();
     expect(() =>
       createParseCompactWasmBackend(sizeMock.exports).encode(
@@ -479,9 +517,11 @@ describe('Compact validation', () => {
     const mock = createCompactMock();
     expect(() =>
       createParseCompactWasmBackend(mock.exports).encode(
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([23, 0, 0, 0]) }, [{ kind: 'null' }]),
+        batch(0, schemaOf(encodeFieldDescriptor({ plane: COMPACT_MAX_KIND_TAG + 1, nullable: false })), [
+          { kind: 'null' },
+        ]),
       ),
-    ).toThrow(/unknown physical type 23 \(max 22\)/);
+    ).toThrow(new RegExp(`unknown physical type ${COMPACT_MAX_KIND_TAG + 1} \\(max ${COMPACT_MAX_KIND_TAG}\\)`));
     expect(mock.compactCalls).toHaveLength(0);
 
     expect(() =>
@@ -595,9 +635,14 @@ describe('Compact native results and lifecycle', () => {
       },
       [{ kind: 'i32', data: new Int32Array([2]) }],
     );
-    const changed = batch(1, { schemaBytes: new Uint8Array([9]), fieldMetadata: new Uint8Array([1, 0, 0, 0]) }, [
-      { kind: 'i32', data: new Int32Array([3]) },
-    ]);
+    const changed = batch(
+      1,
+      {
+        schemaBytes: new Uint8Array([9]),
+        fieldMetadata: encodeFieldDescriptor({ plane: compactKindTag('i32'), nullable: false }),
+      },
+      [{ kind: 'i32', data: new Int32Array([3]) }],
+    );
 
     backend.encode(first);
     backend.encode(identical);
@@ -624,3 +669,144 @@ describe('Compact native results and lifecycle', () => {
     expect(mock.compactCalls).toHaveLength(1);
   });
 });
+
+//#region smoo/columine!n/vocab-host-table
+describe('Compact field descriptors', () => {
+  const timestampPlane = compactKindTag('timestamp');
+  const durationPlane = compactKindTag('duration');
+  const utf8Plane = compactKindTag('utf8');
+  const u8Plane = compactKindTag('u8');
+
+  it('creates the handle with one field per eight-byte descriptor', () => {
+    const mock = createCompactMock();
+    const backend = createParseCompactWasmBackend(mock.exports);
+    const config = schema([compactKindTag('i32'), 0], [utf8Plane, 1]);
+
+    backend.parse('[]', config);
+
+    const created = requiredAt(mock.createCalls, 0, 'create call');
+    expect(created.fieldCount).toBe(2);
+    expect(created.metadata).toEqual(config.fieldMetadata);
+  });
+
+  it('packs a Timestamp and a Duration as i64 values in their own planes', () => {
+    const mock = createCompactMock();
+    const backend = createParseCompactWasmBackend(mock.exports);
+    const instants = new BigInt64Array([0n, 1_700_000_000_000n]);
+    const spans = new BigInt64Array([-5_000n, 5_000n]);
+
+    backend.encode(
+      batch(2, schema([timestampPlane, 0, TIME_UNIT.ms], [durationPlane, 0, TIME_UNIT.ms]), [
+        { kind: 'timestamp', data: instants },
+        { kind: 'duration', data: spans },
+      ]),
+    );
+
+    const call = requiredAt(mock.compactCalls, 0, 'Compact invocation');
+    const planes = [timestampPlane, durationPlane];
+    const sources = [new Uint8Array(instants.buffer), new Uint8Array(spans.buffer)];
+    for (let index = 0; index < sources.length; index += 1) {
+      const descriptor = new DataView(
+        call.request.buffer,
+        call.request.byteOffset + COMPACT.headerSize + index * COMPACT.descriptorSize,
+        COMPACT.descriptorSize,
+      );
+      expect(descriptor.getUint8(0)).toBe(requiredAt(planes, index, 'plane'));
+      const dataOffset = descriptor.getUint32(20, true);
+      const source = requiredAt(sources, index, 'source');
+      expect(descriptor.getUint32(24, true)).toBe(source.byteLength);
+      expect(call.request.subarray(dataOffset, dataOffset + source.byteLength)).toEqual(source);
+    }
+  });
+
+  it('refuses a Timestamp or Duration whose unit is no TIME_UNIT value before any native call', () => {
+    const unitPastTheLast = Math.max(...Object.values(TIME_UNIT)) + 1;
+    for (const kind of ['timestamp', 'duration'] as const) {
+      const mock = createCompactMock();
+      const backend = createParseCompactWasmBackend(mock.exports);
+      const invalid = batch(0, schema([compactKindTag(kind), 0, unitPastTheLast]), [
+        { kind, data: new BigInt64Array() },
+      ]);
+      expect(() => backend.encode(invalid), kind).toThrow(/TIME_UNIT/);
+      expect(mock.createCalls, kind).toHaveLength(0);
+      expect(mock.compactCalls, kind).toHaveLength(0);
+    }
+  });
+
+  it('takes the index plane column for a dictionary-encoded field', () => {
+    const mock = createCompactMock();
+    const backend = createParseCompactWasmBackend(mock.exports);
+    const field = encodeFieldDescriptor({
+      plane: utf8Plane,
+      nullable: false,
+      dictionary: DICTIONARY_SLOT.stream,
+      indexPlane: u8Plane,
+    });
+
+    backend.encode(batch(3, schemaOf(field), [{ kind: 'u8', data: new Uint8Array([0, 1, 0]) }]));
+
+    const call = requiredAt(mock.compactCalls, 0, 'Compact invocation');
+    expect(call.request[COMPACT.headerSize]).toBe(u8Plane);
+    expect(requiredAt(mock.createCalls, 0, 'create call').metadata).toEqual(field);
+  });
+
+  it('refuses a descriptor that contradicts itself or its column before any native call', () => {
+    const encoded = encodeFieldDescriptor({
+      plane: utf8Plane,
+      nullable: false,
+      dictionary: DICTIONARY_SLOT.stream,
+      indexPlane: u8Plane,
+    });
+    const cases: ReadonlyArray<readonly [label: string, invalid: CompactBatch]> = [
+      [
+        'a utf8 column for a dictionary-encoded field',
+        batch(1, schemaOf(encoded), [{ kind: 'utf8', offsets: new Uint32Array([0, 0]), data: new Uint8Array() }]),
+      ],
+      [
+        'an index plane that holds no indexes',
+        batch(
+          1,
+          schemaOf(
+            encodeFieldDescriptor({
+              plane: utf8Plane,
+              nullable: false,
+              dictionary: DICTIONARY_SLOT.stream,
+              indexPlane: compactKindTag('i32'),
+            }),
+          ),
+          [{ kind: 'i32', data: new Int32Array(1) }],
+        ),
+      ],
+      [
+        'dictionary values that are not utf8',
+        batch(
+          1,
+          schemaOf(
+            encodeFieldDescriptor({
+              plane: compactKindTag('i32'),
+              nullable: false,
+              dictionary: DICTIONARY_SLOT.stream,
+              indexPlane: u8Plane,
+            }),
+          ),
+          [{ kind: 'u8', data: new Uint8Array(1) }],
+        ),
+      ],
+      [
+        'an index plane on a plain column',
+        batch(1, schemaOf(encodeFieldDescriptor({ plane: u8Plane, nullable: false, indexPlane: u8Plane })), [
+          { kind: 'u8', data: new Uint8Array(1) },
+        ]),
+      ],
+      ['a reserved byte that is set', batch(0, nullFieldWithByte(FIELD_DESCRIPTOR.reserved, 1), [{ kind: 'null' }])],
+    ];
+
+    for (const [label, invalid] of cases) {
+      const mock = createCompactMock();
+      expect(() => createParseCompactWasmBackend(mock.exports).encode(invalid), label).toThrow();
+      expect(mock.createCalls, label).toHaveLength(0);
+      expect(mock.compactCalls, label).toHaveLength(0);
+    }
+  });
+});
+//#endregion smoo/columine!n/vocab-host-table

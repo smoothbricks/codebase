@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { tableFromArrays, tableFromIPC, tableToIPC, utf8 } from '@uwdata/flechette';
-import { loadParseBackend } from '../parse-backend.js';
+import { compactKindTag } from '../arrow-planes.js';
+import { encodeFieldDescriptor, loadParseBackend } from '../parse-backend.js';
 import type { CompactBatch, EncodedArrowSchema } from '../pipeline.js';
 import { encodeProgramHeader } from '../reducer-bytecode.js';
 import { ErrorCode, HEADER_SIZE, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, SlotType } from '../types.js';
@@ -102,8 +103,8 @@ function utf8Schema(): EncodedArrowSchema {
   const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
   return {
     schemaBytes: stream.slice(0, 8 + view.getUint32(4, true)),
-    // UTF8 is compact kind tag 4; the field is nullable.
-    fieldMetadata: new Uint8Array([4, 1, 0, 0]),
+    // The field is a nullable utf8 column.
+    fieldMetadata: encodeFieldDescriptor({ plane: compactKindTag('utf8'), nullable: true }),
   };
 }
 

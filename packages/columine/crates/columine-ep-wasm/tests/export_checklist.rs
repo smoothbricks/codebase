@@ -1,10 +1,9 @@
 //! Audits the `event_processor.wasm` export surface against
-//! `columine_types::wasm_abi::COLUMINE_EP_EXPORTS`.
-//!
-//! There used to be two lists here — a five-name "baseline" and the real
-//! six-name surface — plus a third in the TypeScript host. A list that omits a
-//! shipped export (`ep_compact`) cannot audit anything, so there is now one
-//! table and both sides are checked against it.
+//! `columine_types::wasm_abi::COLUMINE_EP_EXPORTS`: the seven `ep_*`
+//! functions (`ep_compact`, `ep_create_log_entry`, `ep_create_with_schema`,
+//! `ep_create_with_schema_and_dictionaries`, `ep_create_with_schema_and_names`,
+//! `ep_destroy`, `ep_version`). That table is the one list: the built artifact
+//! and the TypeScript host are each checked against it.
 //!
 //! `built_wasm_matches_the_export_table` needs the compiled artifact and says
 //! so out loud when it is missing rather than reporting success: the nx
@@ -30,17 +29,15 @@ fn artifact() -> String {
     manifest_path("/../../.cache/wasm-dev/event_processor.wasm")
 }
 
-fn parse_backend_ts() -> String {
-    manifest_path("/../../src/parse-backend.ts")
-}
+/// The host's backend source, compiled in: Nx keys the test on a file a literal `include_str!` names
+/// (packages/nx-plugin/README.md), not on one the test opens at run time.
+const PARSE_BACKEND_TS: &str = include_str!("../../../src/parse-backend.ts");
 
 /// The host declares these as members of `EventProcessorWasmExports` rather
 /// than as a name array, so the audit looks for each member declaration.
 #[test]
 fn typescript_host_declares_every_ep_export() {
-    let path = parse_backend_ts();
-    let source =
-        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let source = PARSE_BACKEND_TS;
     let missing: Vec<&str> = COLUMINE_EP_EXPORTS
         .iter()
         .copied()

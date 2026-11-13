@@ -1,0 +1,163 @@
+//! Dictionary binding bound to its proven model (specs/columine/laws/dictionary_binding.bend;
+//! specs/columine/10-physical-vocabulary.md §3 "The field descriptor" and §4 "Schema
+//! dictionaries"): generated fields run through the model's `bind`, emitted into
+//! `dictionary_binding_model.rs`, and through `DynamicSchemaConfig::from_parts` alike, and both
+//! accept the same schemas with the same Arrow ids under each slot.
+
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use columine_arrow::{
+    ArrowType, DictionarySlot, DynamicSchemaConfig, IndexWidth, SchemaDictionaryTable, SchemaError,
+    SchemaParts, SignalSchemaField,
+};
+use proptest::prelude::*;
+use sha2::{Digest, Sha256};
+
+mod common;
+#[path = "dictionary_binding_model.rs"]
+mod model;
+
+use common::schema_message_declaring;
+use model::{Binding, Field, List};
+
+/// Each bound slot's wire value with its Arrow ids, ascending.
+type Bound = BTreeMap<u16, Vec<i64>>;
+
+fn list<T>(items: impl DoubleEndedIterator<Item = T>) -> Rc<List<T>> {
+    items.rev().fold(Rc::new(List::Nil), |tail, head| {
+        Rc::new(List::Con(head, tail))
+    })
+}
+
+fn items<T: Clone>(list: &Rc<List<T>>) -> Vec<T> {
+    std::iter::successors(Some(list), |cell| match &***cell {
+        List::Con(_, tail) => Some(tail),
+        List::Nil => None,
+    })
+    .filter_map(|cell| match &**cell {
+        List::Con(head, _) => Some(head.clone()),
+        List::Nil => None,
+    })
+    .collect()
+}
+
+/// A generated field: `None` plain, else its (slot, Arrow id).
+type Generated = Option<(u16, i64)>;
+
+/// The model's answer: `None` when refused, else every slot whose bitmap sets an id, with the
+/// ids it sets.
+fn modelled(fields: &[Generated], table: usize) -> Option<Bound> {
+    let fields = list(fields.iter().map(|field| match *field {
+        None => Field::Plain,
+        Some((slot, id)) => {
+            Field::Encoded(u64::from(slot), u64::try_from(id).expect("a generated id"))
+        }
+    }));
+    let Binding::Bound(slots) = model::bind(fields, u64::try_from(table).expect("a table length"))
+    else {
+        return None;
+    };
+    Some(
+        items(&slots)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, bits)| {
+                let ids: Vec<i64> = items(&bits)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, set)| set)
+                    .map(|(id, _)| i64::try_from(id).expect("a generated id"))
+                    .collect();
+                (!ids.is_empty()).then(|| (u16::try_from(slot).expect("a generated slot"), ids))
+            })
+            .collect(),
+    )
+}
+
+/// Creation's answer for the same fields, each a nullable Utf8 field, plain or dictionary-encoded
+/// over UInt8 indexes, and a table of `table` one-value schema dictionaries.
+fn created(fields: &[Generated], table: usize) -> Option<Bound> {
+    let descriptors: Vec<SignalSchemaField> = fields
+        .iter()
+        .map(|field| match *field {
+            None => SignalSchemaField::new(ArrowType::Utf8, true),
+            Some((slot, _)) => SignalSchemaField::new_dictionary(
+                DictionarySlot::from_wire(slot).expect("a generated slot is nonzero"),
+                IndexWidth::U8,
+                true,
+            ),
+        })
+        .collect();
+    let names: Vec<String> = (0..fields.len()).map(|index| format!("f{index}")).collect();
+    let declared: Vec<(&str, Option<i64>)> = names
+        .iter()
+        .zip(fields)
+        .map(|(name, field)| (name.as_str(), field.map(|(_, id)| id)))
+        .collect();
+    let message = schema_message_declaring(&declared);
+    let values: Vec<Vec<Option<String>>> = (0..table)
+        .map(|entry| vec![Some(format!("v{entry}"))])
+        .collect();
+    let parts = SchemaParts {
+        schema_message: &message,
+        dictionaries: SchemaDictionaryTable::Typed(&values),
+        ..SchemaParts::default()
+    };
+    match DynamicSchemaConfig::from_parts(&descriptors, parts) {
+        Ok(config) => Some(
+            config
+                .dictionaries
+                .iter()
+                .map(|dictionary| (dictionary.slot.wire(), dictionary.arrow_ids.clone()))
+                .collect(),
+        ),
+        Err(SchemaError::DictionaryMismatch { .. } | SchemaError::InvalidDictionaryTable) => None,
+        Err(other) => panic!("creation refused for a reason the model does not state: {other:?}"),
+    }
+}
+
+/// The model module names the law file it was emitted from by its sha256, so a law file that
+/// moved since fails here, naming the command that emits the module again.
+#[test]
+fn the_model_is_emitted_from_the_law_file_in_the_tree() {
+    let module = include_str!("dictionary_binding_model.rs");
+    let header = |prefix: &str| {
+        module
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the model module's header has no `{prefix}` line"))
+    };
+    let generator = header("// GENERATED by ");
+    let recorded = header("// model sha256: ");
+    // Compiled in, so the law file is an input of this test's build and of its cache key.
+    let law = include_bytes!("../../../../../specs/columine/laws/dictionary_binding.bend");
+    let actual: String = Sha256::digest(law)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        actual, recorded,
+        "specs/columine/laws/dictionary_binding.bend moved since the model was emitted: from the \
+         repository root run `{generator}`, and put its module at \
+         packages/columine/crates/columine-arrow/tests/dictionary_binding_model.rs under the two \
+         header lines, with this sha256"
+    );
+}
+
+//#region smoo/columine!n/vocab-enum-dictionary
+
+proptest! {
+    /// Creation accepts exactly the schemas the model binds, and binds each slot to the Arrow
+    /// ids the model does: no id under two slots, every encoded field's id under its slot, the
+    /// table's entries each named, whatever the fields' order.
+    #[test]
+    fn creation_binds_dictionaries_as_the_model_does(
+        fields in prop::collection::vec(prop::option::of((1_u16..=4, 0_i64..=4)), 0..6),
+        table in 0_usize..=3,
+    ) {
+        prop_assert_eq!(created(&fields, table), modelled(&fields, table));
+    }
+}
+
+//#endregion smoo/columine!n/vocab-enum-dictionary

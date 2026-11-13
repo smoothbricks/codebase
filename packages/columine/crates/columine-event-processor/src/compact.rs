@@ -5,10 +5,11 @@
 //! descriptor are relative to the beginning of the CPB1 request.
 
 use columine_arrow::{
-    ArrowType, DynamicColumn, DynamicSchemaConfig, IpcError, MAX_EVENTS_PER_BATCH,
-    MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES, PlaneKind,
+    ArrowType, DictionarySlot, DynamicColumn, DynamicSchemaConfig, IndexWidth, IpcError,
+    MAX_EVENTS_PER_BATCH, MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES, PlaneKind,
 };
 use columine_parsing::json_extractor::diagnostic_stage;
+use columine_types::category::CategoryImage;
 
 use crate::{ResultCode, ResultDiagnostic};
 
@@ -77,6 +78,12 @@ impl CompactValidationError {
     pub fn output_overlap() -> Self {
         Self::invalid(compact_detail::OUTPUT_OVERLAP, usize::MAX, 0)
     }
+
+    /// The caller's mark is past the stream dictionary's image: the batch
+    /// claims values the image does not hold.
+    pub fn mark_past_image() -> Self {
+        Self::invalid(compact_detail::BAD_DICTIONARY_INDEX, usize::MAX, 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -100,9 +107,16 @@ pub struct CompactBatchView<'a> {
 }
 
 impl<'a> CompactBatchView<'a> {
+    /// Validate the structure of one CPB1 request against `schema`: header,
+    /// descriptors, and each column's buffers in the column's storage plane
+    /// (an encoded column's index plane). `ranges` is the caller's retained
+    /// table of the buffer ranges the batch names; it is cleared and filled
+    /// here, and its capacity is backed once by its owner for the schema's
+    /// buffer count, so no batch allocates.
     pub fn parse(
         bytes: &'a [u8],
         schema: &DynamicSchemaConfig,
+        ranges: &mut Vec<(usize, usize)>,
     ) -> Result<Self, CompactValidationError> {
         if bytes.len() < COMPACT_HEADER_SIZE
             || read_u32(bytes, 0) != Some(COMPACT_BATCH_MAGIC)
@@ -165,15 +179,14 @@ impl<'a> CompactBatchView<'a> {
             ));
         }
 
-        let mut ranges = [(0usize, 0usize); MAX_SCHEMA_FIELDS * 3];
-        let mut range_count = 0usize;
+        ranges.clear();
         for (field_index, field) in schema.field_metadata.iter().enumerate() {
             let descriptor = decode_descriptor(bytes, field_index)?;
-            if descriptor.tag != field.arrow_type {
+            if descriptor.tag != field.storage_type() {
                 return Err(CompactValidationError::schema(
                     compact_detail::TYPE_MISMATCH,
                     field_index,
-                    field.arrow_type as u8,
+                    field.storage_type() as u8,
                     descriptor.tag as u8,
                 ));
             }
@@ -216,8 +229,7 @@ impl<'a> CompactBatchView<'a> {
                     descriptor.validity_offset,
                     descriptor.validity_len,
                     table_end,
-                    &mut ranges,
-                    &mut range_count,
+                    ranges,
                     field_index,
                 )?;
                 if !unused_bits_are_zero(validity, row_count) {
@@ -275,8 +287,7 @@ impl<'a> CompactBatchView<'a> {
                         descriptor.data_offset,
                         descriptor.data_len,
                         table_end,
-                        &mut ranges,
-                        &mut range_count,
+                        ranges,
                         field_index,
                     )?;
                 }
@@ -288,8 +299,7 @@ impl<'a> CompactBatchView<'a> {
                         descriptor.data_offset,
                         descriptor.data_len,
                         table_end,
-                        &mut ranges,
-                        &mut range_count,
+                        ranges,
                         field_index,
                     )?;
                     if !unused_bits_are_zero(data, row_count) {
@@ -331,8 +341,7 @@ impl<'a> CompactBatchView<'a> {
                         descriptor.offsets_offset,
                         descriptor.offsets_len,
                         table_end,
-                        &mut ranges,
-                        &mut range_count,
+                        ranges,
                         field_index,
                     )?;
                     let data = checked_range(
@@ -340,8 +349,7 @@ impl<'a> CompactBatchView<'a> {
                         descriptor.data_offset,
                         descriptor.data_len,
                         table_end,
-                        &mut ranges,
-                        &mut range_count,
+                        ranges,
                         field_index,
                     )?;
                     validate_variable(
@@ -356,12 +364,83 @@ impl<'a> CompactBatchView<'a> {
                 }
             }
         }
+        // No two buffers share a byte: sorted by start, each range ends at
+        // or before the next one begins.
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+            return Err(CompactValidationError::invalid(
+                compact_detail::BAD_DESCRIPTOR,
+                usize::MAX,
+                0,
+            ));
+        }
 
         Ok(Self {
             bytes,
             row_count,
             column_count,
         })
+    }
+
+    /// Check every valid index of each encoded column against its
+    /// dictionary (specs/columine/10-physical-vocabulary.md §8): a
+    /// schema-dictionary index names a non-null value of that dictionary, a
+    /// stream-dictionary index an ordinal `image` holds. Runs on a view
+    /// [`CompactBatchView::parse`] accepted, whose index buffers are exactly
+    /// `row_count` cells of the column's index plane.
+    pub fn check_dictionary_indexes(
+        self,
+        schema: &DynamicSchemaConfig,
+        image: &dyn CategoryImage,
+    ) -> Result<(), CompactValidationError> {
+        for (field_index, field) in schema.field_metadata.iter().enumerate() {
+            let Some(encoding) = field.dictionary else {
+                continue;
+            };
+            let descriptor = decode_descriptor(self.bytes, field_index)?;
+            let data = buffer(self.bytes, descriptor.data_offset, descriptor.data_len);
+            let validity = validity(self.bytes, descriptor);
+            let width = match encoding.index {
+                IndexWidth::U8 => 1,
+                IndexWidth::U16 => 2,
+                IndexWidth::U32 => 4,
+            };
+            let schema_values = match encoding.slot {
+                DictionarySlot::Stream => None,
+                DictionarySlot::Schema(_) => Some(
+                    schema
+                        .dictionary(encoding.slot)
+                        .map_or(&[][..], |dictionary| dictionary.values.as_slice()),
+                ),
+            };
+            for (row, cell) in data.chunks_exact(width).enumerate() {
+                let is_null = validity.is_some_and(|bits| {
+                    bits.get(row / 8)
+                        .is_some_and(|byte| byte & (1 << (row % 8)) == 0)
+                });
+                if is_null {
+                    continue;
+                }
+                let mut raw = [0u8; 4];
+                raw[..width].copy_from_slice(cell);
+                let index = u32::from_le_bytes(raw);
+                let held = match schema_values {
+                    None => index < image.len(),
+                    Some(values) => usize::try_from(index)
+                        .ok()
+                        .and_then(|index| values.get(index))
+                        .is_some_and(Option::is_some),
+                };
+                if !held {
+                    return Err(CompactValidationError::invalid(
+                        compact_detail::BAD_DICTIONARY_INDEX,
+                        field_index,
+                        row,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn row_count(self) -> u32 {
@@ -471,8 +550,7 @@ fn checked_range<'a>(
     offset: u32,
     length: u32,
     table_end: usize,
-    ranges: &mut [(usize, usize); MAX_SCHEMA_FIELDS * 3],
-    range_count: &mut usize,
+    ranges: &mut Vec<(usize, usize)>,
     field_index: usize,
 ) -> Result<&'a [u8], CompactValidationError> {
     let offset = offset as usize;
@@ -497,18 +575,10 @@ fn checked_range<'a>(
             0,
         ));
     }
-    if ranges[..*range_count]
-        .iter()
-        .any(|(other_start, other_end)| offset < *other_end && *other_start < end)
-    {
-        return Err(CompactValidationError::invalid(
-            compact_detail::BAD_DESCRIPTOR,
-            field_index,
-            0,
-        ));
-    }
-    ranges[*range_count] = (offset, end);
-    *range_count += 1;
+    ranges.try_reserve(1).map_err(|_| {
+        CompactValidationError::new(ResultCode::MemoryExhausted, 0, field_index, 0, 0, 0)
+    })?;
+    ranges.push((offset, end));
     bytes.get(offset..end).ok_or_else(|| {
         CompactValidationError::invalid(compact_detail::BAD_DESCRIPTOR, field_index, 0)
     })
@@ -703,7 +773,7 @@ mod tests {
     }
 
     fn assert_error(batch: &[u8], schema: &DynamicSchemaConfig, code: ResultCode, detail: u8) {
-        let error = CompactBatchView::parse(batch, schema).unwrap_err();
+        let error = CompactBatchView::parse(batch, schema, &mut Vec::new()).unwrap_err();
         assert_eq!(error.code, code);
         assert_eq!(error.diagnostic.stage, COMPACT_DIAGNOSTIC_STAGE);
         assert_eq!(error.diagnostic.detail, detail);
@@ -713,7 +783,7 @@ mod tests {
     fn valid_nullable_utf8_is_borrowed_without_repacking() {
         let schema = schema(true);
         let batch = nullable_utf8_batch();
-        let view = CompactBatchView::parse(&batch, &schema).unwrap();
+        let view = CompactBatchView::parse(&batch, &schema, &mut Vec::new()).unwrap();
         assert_eq!(view.row_count(), 2);
         assert_eq!(view.column_count(), 1);
         assert_eq!(view.null_count(0), 1);
@@ -739,7 +809,7 @@ mod tests {
         put_u32(&mut batch, 28, 48);
         put_u32(&mut batch, 32, 4);
 
-        let view = CompactBatchView::parse(&batch, &schema).unwrap();
+        let view = CompactBatchView::parse(&batch, &schema, &mut Vec::new()).unwrap();
         let column = view.column(0, &schema).unwrap();
         assert_eq!(column.validity, Some(&[][..]));
         assert_eq!(column.offsets, Some(&batch[48..52]));

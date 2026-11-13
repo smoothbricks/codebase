@@ -1,4 +1,4 @@
-//! columine's `event_processor.wasm` — the required six-function `ep_*`
+//! columine's `event_processor.wasm` — the required seven-function `ep_*`
 //! export layer over `columine-event-processor`.
 //!
 //! Parse and CPB1 Compact share the same retained, validated Arrow schema
@@ -16,10 +16,14 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use columine_arrow::schema::{DynamicSchemaConfig, MAX_SCHEMA_FIELDS};
+use columine_arrow::schema::{
+    DynamicSchemaConfig, FIELD_DESCRIPTOR_BYTES, MAX_SCHEMA_FIELDS, SchemaDictionaryTable,
+    SchemaParts,
+};
 use columine_event_processor::{
-    CompactValidationError, CreateFailure, EventProcessor, InputFormat, ParseOptions,
-    RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
+    CategoryImage, CompactValidationError, CreateFailure, EventProcessor, InputFormat, ListImage,
+    ParseOptions, RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, WASM_CATEGORY_LIMIT,
+    WASM_CATEGORY_VALUE_BYTES, write_compact_result_header,
 };
 
 /// Same wire version as the consumer EP artifact (one event_processor lineage).
@@ -39,6 +43,10 @@ pub const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {
     ep: EventProcessor,
+    /// The handle's stream dictionary (specs/columine/10-physical-vocabulary.md
+    /// §5): every batch the handle parses shares it, and a refused batch's
+    /// values are dropped from it again.
+    categories: ListImage,
 }
 
 const NO_INSTANCE: Option<Slot> = None;
@@ -98,13 +106,16 @@ fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Result<Slo
     storage
         .try_reserve_exact(1)
         .map_err(|_| CreateFailure::MemoryExhausted)?;
-    storage.push(EpInstance { ep });
+    storage.push(EpInstance {
+        ep,
+        categories: ListImage::new(WASM_CATEGORY_LIMIT, WASM_CATEGORY_VALUE_BYTES),
+    });
     let slot: Result<Slot, _> = storage.into_boxed_slice().try_into();
     Ok(slot.unwrap_or_else(|_| unreachable!("one pushed instance boxes as one")))
 }
 
 // =============================================================================
-// Exports — exact six-function production ABI (tests/export_checklist.rs)
+// Exports — exact seven-function production ABI (tests/export_checklist.rs)
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -119,23 +130,37 @@ pub extern "C" fn ep_destroy(handle: u32) {
     }
 }
 
-/// Validate the caller's pointer triple and decode the retained schema.
-/// `field_names` is `None` on the no-names path.
+/// The caller's `(ptr, len)` byte span: empty for length 0, refused when a
+/// nonzero length comes with a null pointer.
+unsafe fn lent<'a>((ptr, len): (*const u8, u32)) -> Result<&'a [u8], CreateFailure> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(CreateFailure::BadRequest);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+}
+
+/// Validate the caller's pointers and decode the retained schema. A null
+/// `field_names` or `dictionaries` span of length 0 is none.
 unsafe fn wire_schema(
     schema_ptr: *const u8,
     schema_len: u32,
     field_meta_ptr: *const u8,
     field_count: u32,
-    field_names: Option<(*const u8, u32)>,
+    field_names: (*const u8, u32),
+    dictionaries: (*const u8, u32),
 ) -> Result<DynamicSchemaConfig, CreateFailure> {
     // A count past the capacity is refused before a slice is formed over the
     // caller's pointer: no table that long was lent, and on wasm32 the byte
-    // length `count * 4` would wrap. Native and wasm refuse it alike.
+    // length `count * FIELD_DESCRIPTOR_BYTES` would wrap. Native and wasm
+    // refuse it alike.
     let field_count = field_count as usize;
     if field_count > MAX_SCHEMA_FIELDS {
         return Err(CreateFailure::SchemaTooManyFields);
     }
-    let field_meta_len = field_count * 4;
+    let field_meta_len = field_count * FIELD_DESCRIPTOR_BYTES;
     if schema_ptr.is_null() || (field_meta_len != 0 && field_meta_ptr.is_null()) {
         return Err(CreateFailure::BadRequest);
     }
@@ -145,20 +170,17 @@ unsafe fn wire_schema(
     } else {
         unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
     };
-    let Some((names_ptr, names_len)) = field_names else {
-        return DynamicSchemaConfig::from_wire(schema_bytes, field_meta)
-            .map_err(CreateFailure::from);
-    };
-    if names_len != 0 && names_ptr.is_null() {
-        return Err(CreateFailure::BadRequest);
-    }
-    let names: &[u8] = if names_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(names_ptr, names_len as usize) }
-    };
-    DynamicSchemaConfig::from_wire_with_field_names(schema_bytes, field_meta, names)
-        .map_err(CreateFailure::from)
+    let field_names = unsafe { lent(field_names) }?;
+    let dictionaries = unsafe { lent(dictionaries) }?;
+    DynamicSchemaConfig::from_wire_parts(
+        field_meta,
+        SchemaParts {
+            schema_message: schema_bytes,
+            field_names,
+            dictionaries: SchemaDictionaryTable::Wire(dictionaries),
+        },
+    )
+    .map_err(CreateFailure::from)
 }
 
 /// The whole creation pipeline, in refusal order: the scalar precondition
@@ -172,7 +194,8 @@ unsafe fn create_handle(
     schema_len: u32,
     field_meta_ptr: *const u8,
     field_count: u32,
-    field_names: Option<(*const u8, u32)>,
+    field_names: (*const u8, u32),
+    dictionaries: (*const u8, u32),
 ) -> Result<u32, CreateFailure> {
     if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
         return Err(CreateFailure::Capacity);
@@ -184,6 +207,7 @@ unsafe fn create_handle(
             field_meta_ptr,
             field_count,
             field_names,
+            dictionaries,
         )
     }?;
     alloc_handle(new_instance(capacity, config)?)
@@ -217,7 +241,8 @@ pub unsafe extern "C" fn ep_create_with_schema(
             schema_len,
             field_meta_ptr,
             field_count,
-            None,
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 0),
         )
     })
 }
@@ -242,7 +267,41 @@ pub unsafe extern "C" fn ep_create_with_schema_and_names(
             schema_len,
             field_meta_ptr,
             field_count,
-            Some((field_names_ptr, field_names_len)),
+            (field_names_ptr, field_names_len),
+            (std::ptr::null(), 0),
+        )
+    })
+}
+
+/// Field names and the schema dictionary table
+/// (specs/columine/10-physical-vocabulary.md §4): `[count u32]`, then per
+/// dictionary `[values u32]`, then per value `[length u32][UTF-8 bytes]`,
+/// little-endian, length `0xFFFF_FFFF` for a null entry. Slot `2 + k` of a
+/// field descriptor names dictionary `k`.
+///
+/// Returns a handle in `1..=255`, or a [`CreateFailure`] code.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn ep_create_with_schema_and_dictionaries(
+    capacity: u32,
+    schema_ptr: *const u8,
+    schema_len: u32,
+    field_meta_ptr: *const u8,
+    field_count: u32,
+    field_names_ptr: *const u8,
+    field_names_len: u32,
+    dictionaries_ptr: *const u8,
+    dictionaries_len: u32,
+) -> u32 {
+    create_result(unsafe {
+        create_handle(
+            capacity,
+            schema_ptr,
+            schema_len,
+            field_meta_ptr,
+            field_count,
+            (field_names_ptr, field_names_len),
+            (dictionaries_ptr, dictionaries_len),
         )
     })
 }
@@ -276,7 +335,17 @@ pub unsafe extern "C" fn ep_create_log_entry(
     };
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
     let output = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_len as usize) };
-    instance.ep.create_log_entry(input, format, output, &[]) as u32
+    // A refused batch's stream values are dropped again: the image holds
+    // only values some emitted batch defined.
+    let mark = instance.categories.len();
+    let code =
+        instance
+            .ep
+            .create_log_entry_with(input, format, output, &[], &mut instance.categories);
+    if code != ResultCode::Ok {
+        instance.categories.truncate(mark);
+    }
+    code as u32
 }
 
 /// Encode one CPB1 typed column batch into `[ResultHeader][Arrow IPC]`.
@@ -327,5 +396,10 @@ pub unsafe extern "C" fn ep_compact(
     } else {
         unsafe { std::slice::from_raw_parts(batch_ptr, batch_len as usize) }
     };
-    instance.ep.compact(batch, output, &[]) as u32
+    // A compact caller of this artifact has no way to add stream values, so
+    // its batch brings none: the mark is the image's whole length.
+    let mark = instance.categories.len();
+    instance
+        .ep
+        .compact_with(batch, output, &[], &instance.categories, mark) as u32
 }

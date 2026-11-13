@@ -1,10 +1,12 @@
-//! Dynamic RecordBatch encoder.
+//! Dynamic RecordBatch and DictionaryBatch encoders.
 //!
-//! The RecordBatch FlatBuffer is hand-emitted in place, field by field; no
-//! FlatBuffer library or intermediate model is needed. The emitted bytes are
-//! the contract consumed by Flechette and arrow-js, so every offset is explicit.
+//! Both FlatBuffers are hand-emitted in place, field by field; no FlatBuffer
+//! library or intermediate model is needed. The emitted bytes are the
+//! contract consumed by Flechette, arrow-js and arrow-ipc, so every offset is
+//! explicit.
 
-use crate::schema::{MAX_SCHEMA_FIELDS, PlaneKind, SignalSchemaField};
+use crate::ipc::IpcError;
+use crate::schema::{PlaneKind, SignalSchemaField};
 
 pub use crate::schema::compute_buffer_count;
 
@@ -53,32 +55,13 @@ fn align_to_4(size: usize) -> usize {
     (size + 3) & !3usize
 }
 
-/// Retained-metadata limits (`MetadataLimits`).
-#[derive(Clone, Copy, Debug)]
-pub struct MetadataLimits {
-    pub max_fields: usize,
-    pub max_buffers: usize,
-}
-
-impl Default for MetadataLimits {
-    fn default() -> Self {
-        Self {
-            max_fields: MAX_SCHEMA_FIELDS,
-            max_buffers: MAX_SCHEMA_FIELDS * 3,
-        }
-    }
-}
-
+/// The retained storage could not be backed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MetadataError {
-    TooManyFields,
-    TooManyBuffers,
-    /// The storage could not be backed.
-    OutOfMemory,
-}
+pub struct MetadataOutOfMemory;
 
-/// Schema-sized retained storage for field nodes and buffer descriptors
-/// (`MetadataStorage`): allocated once per processor, reused per batch.
+/// Retained storage for one record batch's field nodes and buffer
+/// descriptors (`MetadataStorage`): allocated once per processor at exactly
+/// the counts its schema's layout gives, reused per batch.
 #[derive(Clone, Debug)]
 pub struct MetadataStorage {
     pub field_nodes: Vec<FieldNode>,
@@ -86,29 +69,21 @@ pub struct MetadataStorage {
 }
 
 impl MetadataStorage {
-    pub fn for_fields(
-        fields: &[SignalSchemaField],
-        limits: MetadataLimits,
-    ) -> Result<Self, MetadataError> {
-        Self::for_counts(fields.len(), compute_buffer_count(fields) as usize, limits)
+    /// Storage for one record batch of `fields`: one node per field and the
+    /// buffers each field's own layout declares.
+    pub fn for_fields(fields: &[SignalSchemaField]) -> Result<Self, MetadataOutOfMemory> {
+        Self::for_counts(fields.len(), compute_buffer_count(fields) as usize)
     }
 
     pub fn for_counts(
         field_count: usize,
         buffer_count: usize,
-        limits: MetadataLimits,
-    ) -> Result<Self, MetadataError> {
-        if field_count > limits.max_fields {
-            return Err(MetadataError::TooManyFields);
-        }
-        if buffer_count > limits.max_buffers {
-            return Err(MetadataError::TooManyBuffers);
-        }
+    ) -> Result<Self, MetadataOutOfMemory> {
         Ok(Self {
             field_nodes: crate::fallible::filled(FieldNode::default(), field_count)
-                .ok_or(MetadataError::OutOfMemory)?,
+                .ok_or(MetadataOutOfMemory)?,
             buffer_descs: crate::fallible::filled(BufferDesc::default(), buffer_count)
-                .ok_or(MetadataError::OutOfMemory)?,
+                .ok_or(MetadataOutOfMemory)?,
         })
     }
 }
@@ -455,10 +430,190 @@ pub fn encode_record_batch_dynamic(
     write_offset + body_length
 }
 
+/// The values of one dictionary message, in index order.
+///
+/// Read twice by the writer, once to size the message and once to write it,
+/// so it is a lookup and not an iterator.
+pub trait DictionaryValues {
+    /// How many values the message carries.
+    fn len(&self) -> u32;
+
+    /// Whether the message carries no value.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The UTF-8 bytes of value `index`, or `None` for a null entry.
+    fn value(&self, index: u32) -> Option<&[u8]>;
+}
+
+/// Metadata bytes of one DictionaryBatch message of Utf8 values: the fixed
+/// FlatBuffer [`encode_dictionary_batch`] emits.
+const DICTIONARY_METADATA_SIZE: usize = 176;
+
+/// The three body buffers of a Utf8 dictionary: validity, offsets, data.
+struct DictionaryBody {
+    validity_len: usize,
+    offsets_len: usize,
+    data_len: usize,
+    null_count: i64,
+}
+
+impl DictionaryBody {
+    fn of(values: &(impl DictionaryValues + ?Sized)) -> Result<Self, IpcError> {
+        let count = values.len();
+        let mut data_len = 0usize;
+        let mut null_count = 0i64;
+        for index in 0..count {
+            match values.value(index) {
+                Some(value) => {
+                    data_len = data_len
+                        .checked_add(value.len())
+                        .ok_or(IpcError::SizeOverflow)?;
+                }
+                None => null_count += 1,
+            }
+        }
+        // Utf8 offsets are `i32`: a dictionary whose text passes that is not
+        // a Utf8 array.
+        if i32::try_from(data_len).is_err() {
+            return Err(IpcError::SizeOverflow);
+        }
+        Ok(Self {
+            // No null entry, no bitmap: an empty validity buffer says every
+            // value is valid.
+            validity_len: if null_count == 0 {
+                0
+            } else {
+                (count as usize).div_ceil(8)
+            },
+            offsets_len: (count as usize + 1) * 4,
+            data_len,
+            null_count,
+        })
+    }
+
+    fn len(&self) -> usize {
+        align_to_8(self.validity_len) + align_to_8(self.offsets_len) + align_to_8(self.data_len)
+    }
+}
+
+/// Exact byte length of the DictionaryBatch message [`encode_dictionary_batch`]
+/// writes for `values`.
+pub fn dictionary_batch_len(values: &(impl DictionaryValues + ?Sized)) -> Result<usize, IpcError> {
+    Ok(8 + DICTIONARY_METADATA_SIZE + DictionaryBody::of(values)?.len())
+}
+
+/// Write one continuation-prefixed DictionaryBatch message of Utf8 values
+/// for the Arrow dictionary `id` at the start of `output`, and return its
+/// length. `is_delta` appends the values to the dictionary a reader holds;
+/// otherwise the message defines it.
+///
+/// Layout: `[continuation][metadata_size u32][FlatBuffer][body]`, the body
+/// being the values' validity, offsets and data buffers, each padded to
+/// eight bytes.
+pub fn encode_dictionary_batch(
+    output: &mut [u8],
+    id: i64,
+    is_delta: bool,
+    values: &(impl DictionaryValues + ?Sized),
+) -> Result<usize, IpcError> {
+    let body = DictionaryBody::of(values)?;
+    let total = 8 + DICTIONARY_METADATA_SIZE + body.len();
+    if output.len() < total {
+        return Err(IpcError::BufferTooSmall { required: total });
+    }
+    let count = values.len();
+    output[..total].fill(0);
+    put_u32(output, 0, CONTINUATION_MARKER);
+    put_u32(output, 4, DICTIONARY_METADATA_SIZE as u32);
+    let m = 8usize;
+
+    // Message: version, header_type, header, bodyLength.
+    put_u32(output, m, 20);
+    for (index, value) in [12, 22, 20, 19, 12, 4].into_iter().enumerate() {
+        put_u16(output, m + 8 + index * 2, value);
+    }
+    put_i32(output, m + 20, 12);
+    put_i64(output, m + 24, body.len() as i64);
+    put_u32(output, m + 32, 20);
+    output[m + 39] = 2; // MessageHeader::DictionaryBatch
+    put_u16(output, m + 40, 4); // MetadataVersion::V5
+
+    // DictionaryBatch: id, data, isDelta.
+    for (index, value) in [10, 17, 4, 12, 16].into_iter().enumerate() {
+        put_u16(output, m + 42 + index * 2, value);
+    }
+    put_i32(output, m + 52, 10);
+    put_i64(output, m + 56, id);
+    put_u32(output, m + 64, 16);
+    output[m + 68] = u8::from(is_delta);
+
+    // RecordBatch: length, nodes, buffers.
+    for (index, value) in [10, 20, 8, 16, 4].into_iter().enumerate() {
+        put_u16(output, m + 70 + index * 2, value);
+    }
+    put_i32(output, m + 80, 10);
+    put_u32(output, m + 84, 16);
+    put_i64(output, m + 88, i64::from(count));
+    put_u32(output, m + 96, 60);
+
+    // Buffers: validity, offsets, data, at their padded body positions.
+    let offsets_at = align_to_8(body.validity_len);
+    let data_at = offsets_at + align_to_8(body.offsets_len);
+    put_u32(output, m + 100, 3);
+    for (index, (offset, length)) in [
+        (0, body.validity_len),
+        (offsets_at, body.offsets_len),
+        (data_at, body.data_len),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put_i64(output, m + 104 + index * 16, offset as i64);
+        put_i64(output, m + 112 + index * 16, length as i64);
+    }
+
+    // Nodes: the one values array.
+    put_u32(output, m + 156, 1);
+    put_i64(output, m + 160, i64::from(count));
+    put_i64(output, m + 168, body.null_count);
+
+    let body_at = m + DICTIONARY_METADATA_SIZE;
+    let mut written = 0usize;
+    for index in 0..count {
+        put_u32(
+            output,
+            body_at + offsets_at + index as usize * 4,
+            written as u32,
+        );
+        if let Some(value) = values.value(index) {
+            let at = body_at + data_at + written;
+            output[at..at + value.len()].copy_from_slice(value);
+            written += value.len();
+            if body.validity_len != 0 {
+                output[body_at + index as usize / 8] |= 1u8 << (index % 8);
+            }
+        }
+    }
+    put_u32(
+        output,
+        body_at + offsets_at + count as usize * 4,
+        written as u32,
+    );
+    // A value that changed between the sizing read and this one would leave
+    // the offsets describing bytes the body does not hold.
+    if written != body.data_len {
+        return Err(IpcError::InvalidColumn);
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrowType, SignalSchemaField};
+    use crate::schema::{ArrowType, DictionarySlot, IndexWidth, SignalSchemaField};
+    use arrow_schema::TimeUnit;
 
     fn field(arrow_type: ArrowType, nullable: bool) -> SignalSchemaField {
         SignalSchemaField::new(arrow_type, nullable)
@@ -470,7 +625,7 @@ mod tests {
         let fields = [
             field(ArrowType::Utf8, false),
             field(ArrowType::Utf8, false),
-            field(ArrowType::Int64, false),
+            SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
             field(ArrowType::Binary, true),
         ];
         assert_eq!(compute_buffer_count(&fields), 11);
@@ -530,7 +685,7 @@ mod tests {
     #[test]
     fn body_builder_utf8() {
         let mut buffer = [0u8; 256];
-        let mut metadata = MetadataStorage::for_counts(1, 3, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(1, 3).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0]; // [0, 5] as u32 LE
         let data = b"hello";
@@ -558,7 +713,7 @@ mod tests {
     #[test]
     fn body_builder_int64() {
         let mut buffer = [0u8; 256];
-        let mut metadata = MetadataStorage::for_counts(1, 2, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(1, 2).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let data = 12345i64.to_le_bytes();
         assert!(builder.add_column(
@@ -580,7 +735,7 @@ mod tests {
     #[test]
     fn body_builder_alignment() {
         let mut buffer = [0u8; 256];
-        let mut metadata = MetadataStorage::for_counts(2, 6, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(2, 6).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
@@ -615,7 +770,7 @@ mod tests {
     #[test]
     fn body_builder_80_fields() {
         let mut output = [0u8; 4096];
-        let mut metadata = MetadataStorage::for_counts(80, 240, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(80, 240).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut output, &mut metadata);
         let validity = [1u8];
         let offsets = [0u8; 8];
@@ -637,29 +792,11 @@ mod tests {
         assert_eq!(builder.buffer_descs().len(), 240);
     }
 
-    // test "MetadataStorage enforces configured exact boundaries"
-    #[test]
-    fn metadata_limits() {
-        let limits = MetadataLimits {
-            max_fields: 80,
-            max_buffers: 240,
-        };
-        assert!(MetadataStorage::for_counts(80, 240, limits).is_ok());
-        assert_eq!(
-            MetadataStorage::for_counts(81, 240, limits).unwrap_err(),
-            MetadataError::TooManyFields
-        );
-        assert_eq!(
-            MetadataStorage::for_counts(80, 241, limits).unwrap_err(),
-            MetadataError::TooManyBuffers
-        );
-    }
-
     // test "encodeRecordBatchDynamic basic"
     #[test]
     fn encode_basic() {
         let mut body_buffer = [0u8; 256];
-        let mut metadata = MetadataStorage::for_counts(1, 3, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(1, 3).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut body_buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
@@ -700,7 +837,7 @@ mod tests {
     fn encode_4_field_in_place() {
         let mut output = [0u8; 2048];
         let body_start = 8 + record_batch_metadata_size(4, 11, &[]);
-        let mut metadata = MetadataStorage::for_counts(4, 11, MetadataLimits::default()).unwrap();
+        let mut metadata = MetadataStorage::for_counts(4, 11).unwrap();
         let (body_length, nodes, descs) = {
             let mut builder = DynamicBodyBuilder::new(&mut output[body_start..], &mut metadata);
             let id_offsets = [0, 0, 0, 0, 7, 0, 0, 0];
@@ -727,11 +864,11 @@ mod tests {
                 1,
                 0
             ));
-            let ts = 1_705_315_800_000_000_i64.to_le_bytes();
+            let ts = 1_705_315_800_000_000_000_i64.to_le_bytes();
             assert!(builder.add_column(
                 DynamicColumn::fixed(
                     2,
-                    SignalSchemaField::new(ArrowType::Int64, false),
+                    SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
                     None,
                     &ts
                 ),
@@ -890,4 +1027,68 @@ mod tests {
         assert_eq!(written, expected.len());
         assert_eq!(output, expected);
     }
+
+    //#region smoo/columine!n/vocab-buffer-budget
+
+    /// A field is one node and the buffers its own layout declares. An encoded
+    /// column's are its index plane's, never its values'.
+    #[test]
+    fn retained_metadata_is_sized_by_each_fields_own_buffers() {
+        let fields = [
+            field(ArrowType::Null, true),
+            SignalSchemaField::new_dictionary(DictionarySlot::Schema(0), IndexWidth::U8, true),
+            SignalSchemaField::new_dictionary(DictionarySlot::Stream, IndexWidth::U32, false),
+            field(ArrowType::Utf8, true),
+            SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, false),
+            SignalSchemaField::new_duration(TimeUnit::Second, true),
+        ];
+        // Null has none; an encoded column has validity and indexes; Utf8 has
+        // validity, offsets and data; each temporal plane has validity and data.
+        assert_eq!(compute_buffer_count(&fields), 11);
+        let storage = MetadataStorage::for_fields(&fields).unwrap();
+        assert_eq!(storage.field_nodes.len(), 6);
+        assert_eq!(storage.buffer_descs.len(), 11);
+    }
+
+    /// A dictionary's values travel in their own message, exactly as long as
+    /// it is sized, with a null entry or none, and a short output names the
+    /// length it needs.
+    #[test]
+    fn a_dictionary_batch_is_exactly_as_long_as_it_is_sized() {
+        let with_a_null: Vec<Option<String>> =
+            vec![Some("open".into()), None, Some("closed".into())];
+        let empty: Vec<Option<String>> = Vec::new();
+        for values in [with_a_null, empty] {
+            let required = dictionary_batch_len(values.as_slice()).unwrap();
+            assert_eq!(required % 8, 0, "an Arrow message is eight-byte aligned");
+            let mut output = vec![0xaa; required + 16];
+            assert_eq!(
+                encode_dictionary_batch(&mut output, 3, true, values.as_slice()),
+                Ok(required)
+            );
+            assert!(
+                output[required..].iter().all(|byte| *byte == 0xaa),
+                "nothing is written past the message"
+            );
+            assert_eq!(output[..4], CONTINUATION_MARKER.to_le_bytes());
+            let metadata_len = u32::from_le_bytes(output[4..8].try_into().unwrap()) as usize;
+            let message = arrow_ipc::root_as_message(&output[8..8 + metadata_len]).unwrap();
+            let batch = message
+                .header_as_dictionary_batch()
+                .expect("a DictionaryBatch message");
+            assert_eq!(batch.id(), 3);
+            assert!(batch.isDelta());
+            assert_eq!(
+                batch.data().unwrap().length(),
+                i64::try_from(values.len()).unwrap()
+            );
+
+            assert_eq!(
+                encode_dictionary_batch(&mut output[..required - 1], 3, true, values.as_slice()),
+                Err(IpcError::BufferTooSmall { required })
+            );
+        }
+    }
+
+    //#endregion smoo/columine!n/vocab-buffer-budget
 }

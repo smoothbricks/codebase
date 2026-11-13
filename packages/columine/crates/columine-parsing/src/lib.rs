@@ -13,6 +13,8 @@ mod cross_format;
 #[path = "../../columine-vm/tests/common/memory.rs"]
 mod memory;
 
+pub mod identity;
+pub mod instant;
 pub mod json_extractor;
 pub mod json_parser;
 pub mod json_scanner;
@@ -26,6 +28,14 @@ pub use columine_arrow::{
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, DynamicColumns,
     MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, PlaneKind, SignalSchemaField,
 };
+use columine_arrow::{
+    DictionaryEncoding, DictionarySlot, RecordMember, SchemaDictionary, TextColumn,
+};
+use columine_types::category::CategoryImage;
+use columine_types::cells::{
+    CellRefusal, CellTarget, NoValueCells, RecordRow, TEXT_HASH_BYTES, TextPlace, ValueCells,
+};
+use columine_types::value::{ValueKind, ValueView};
 
 /// Column indices of the base event log, matching
 /// [`BASE_EVENT_LOG_FIELDS`] by position.
@@ -44,7 +54,7 @@ pub(crate) fn commit_base_event(
     columns: &mut DynamicColumns,
     id: &[u8],
     event_type: &[u8],
-    timestamp_micros: i64,
+    timestamp_nanos: i64,
     value: Option<&[u8]>,
 ) -> Result<(), ParseError> {
     if !columns.begin_row() {
@@ -53,7 +63,7 @@ pub(crate) fn commit_base_event(
     let result = (|| {
         columns.append_variable(base_column::ID, id)?;
         columns.append_variable(base_column::TYPE, event_type)?;
-        columns.append_int(base_column::TIMESTAMP, timestamp_micros)?;
+        columns.append_int(base_column::TIMESTAMP, timestamp_nanos)?;
         match value {
             Some(bytes) => columns.append_variable(base_column::VALUE, bytes),
             None => columns.append_null(base_column::VALUE),
@@ -81,7 +91,7 @@ pub(crate) fn base_columns(capacity: u32) -> DynamicColumns {
 pub struct ParsedEvent {
     pub id: String,
     pub event_type: String,
-    pub timestamp_micros: i64,
+    pub timestamp_nanos: i64,
     pub value: Option<Vec<u8>>,
 }
 
@@ -96,7 +106,7 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
     Some(ParsedEvent {
         id: text(base_column::ID)?,
         event_type: text(base_column::TYPE)?,
-        timestamp_micros: columns.get_column(base_column::TIMESTAMP)?.read_int(row)?,
+        timestamp_nanos: columns.get_column(base_column::TIMESTAMP)?.read_int(row)?,
         value: (!columns.is_null(base_column::VALUE, row))
             .then(|| {
                 columns
@@ -224,15 +234,24 @@ pub struct ExtractionConfig {
     /// and an admitted nested payload must land in that same column or the
     /// member is silently lost to the carrier.
     pub(crate) variant_map: MemberTable<FieldLookup>,
-    /// `(discriminant, payload member)` → the enum's variants in ordinal
-    /// order, from the semantic schema armed under that discriminant. The
-    /// admission wire spells an enum as its string; the column holds the
-    /// ordinal, which is the variant's index in the declared list.
-    pub(crate) enum_variants: MemberTable<Vec<String>>,
+    /// The values of every dictionary of the creation call's table, in table
+    /// order; a stream dictionary's values are empty, they are its owner's.
+    pub(crate) dictionaries: Vec<Vec<Option<String>>>,
+    /// Each column's position in [`Self::dictionaries`] when the column is
+    /// encoded against a schema dictionary, by column: a lane stores a text's
+    /// index among that dictionary's values.
+    pub(crate) column_dictionaries: Vec<Option<usize>>,
     /// `(event type, payload member)` for every member its event's schema
     /// declares dynamic, under an object root or any arm of a union root:
     /// an explicit null in that member's cell is data, never the empty state.
     pub(crate) dynamic_members: MemberTable<()>,
+    /// Who writes each column's cells, by column ([`CellRole`]).
+    pub(crate) cell_roles: Vec<CellRole>,
+    /// The [`DECLARED_RECORD_COLUMN_NAME`] column, when the schema has one.
+    pub(crate) record_column: Option<usize>,
+    /// `(discriminant, payload member)` → the routing row of a declared
+    /// member that lives in the row's declared record.
+    pub(crate) record_routes: MemberTable<RecordRoute>,
 }
 
 /// Values keyed by `(discriminant or event type, payload member)`, held sorted so a lookup
@@ -281,6 +300,11 @@ impl<T> MemberTable<T> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Every bound value, in key order.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, _, value)| value)
     }
 }
 
@@ -412,23 +436,545 @@ impl ExtractionConfig {
         self.lookup_field(column_name)
     }
 
-    /// The enum variants an admitted string must be one of, for this
-    /// discriminant's member; `None` when the member is not a declared enum.
-    pub(crate) fn enum_ordinals(
+    /// The values of the schema dictionary `column` is encoded against;
+    /// `None` for a plain or stream-dictionary column.
+    pub(crate) fn schema_dictionary(&self, column: usize) -> Option<&[Option<String>]> {
+        let position = self.column_dictionaries.get(column).copied().flatten()?;
+        self.dictionaries.get(position).map(Vec::as_slice)
+    }
+
+    /// How a member resolved to `column` is written, or `None` for a column
+    /// only the lane itself writes: the carrier, the declared record and a
+    /// text's inline column (specs/columine/10-physical-vocabulary.md §7). A
+    /// member named after one of them is not that cell.
+    pub(crate) fn member_write(&self, column: usize) -> Option<MemberWrite> {
+        if Some(column) == self.fallback_column || Some(column) == self.record_column {
+            return None;
+        }
+        match self
+            .cell_roles
+            .get(column)
+            .copied()
+            .unwrap_or(CellRole::Lane)
+        {
+            CellRole::Lane => Some(MemberWrite::Lane),
+            CellRole::Seam(cell) => Some(MemberWrite::Seam(cell)),
+            CellRole::TextInline => None,
+        }
+    }
+
+    /// Who writes the carrier of undeclared members.
+    pub(crate) fn carrier(&self) -> Carrier {
+        let Some(column) = self.fallback_column else {
+            return Carrier::Absent;
+        };
+        match self.cell_roles.get(column).copied() {
+            Some(CellRole::Seam(SeamCell::Embedder)) => Carrier::Embedder(column),
+            Some(CellRole::Seam(SeamCell::Raw)) => Carrier::Raw,
+            Some(
+                CellRole::Lane | CellRole::TextInline | CellRole::Seam(SeamCell::TextHash { .. }),
+            )
+            | None => Carrier::Native(column),
+        }
+    }
+
+    /// The carrier column the lane writes as MessagePack itself.
+    pub(crate) fn native_carrier(&self) -> Option<usize> {
+        match self.carrier() {
+            Carrier::Native(column) => Some(column),
+            Carrier::Absent | Carrier::Embedder(_) | Carrier::Raw => None,
+        }
+    }
+
+    /// The record column, when the embedder writes it.
+    fn embedder_record(&self) -> Option<usize> {
+        self.record_column.filter(|column| {
+            self.cell_roles.get(*column) == Some(&CellRole::Seam(SeamCell::Embedder))
+        })
+    }
+
+    /// The routing row of `member` under `discriminant`, when the member
+    /// lives in the declared record.
+    pub(crate) fn record_route(
         &self,
         discriminant: Option<&str>,
         member: &str,
-    ) -> Option<&[String]> {
-        let discriminant = discriminant?;
-        if self.enum_variants.is_empty() {
-            return None;
+    ) -> Option<RecordRow<'_>> {
+        let route = self.record_routes.get(discriminant?, member)?;
+        Some(RecordRow {
+            path: &route.path,
+            descriptor_position: route.descriptor_position,
+        })
+    }
+
+    /// Ask `cells` once for every value cell this configuration hands it
+    /// (specs/columine/10-physical-vocabulary.md §7): each embedder-written
+    /// member column, the carrier, each text and each record routing row.
+    pub fn prepare_cells(&self, cells: &mut dyn ValueCells) -> Result<(), CellRefusal> {
+        for (column, role) in self.cell_roles.iter().enumerate() {
+            match *role {
+                CellRole::Seam(SeamCell::Embedder) if Some(column) == self.fallback_column => {
+                    cells.prepare(CellTarget::Carrier {
+                        column: seam_column(column),
+                    })?;
+                }
+                CellRole::Seam(SeamCell::Embedder) if Some(column) == self.record_column => {}
+                CellRole::Seam(SeamCell::Embedder) => cells.prepare(CellTarget::Member {
+                    column: seam_column(column),
+                })?,
+                CellRole::Seam(SeamCell::TextHash { inline }) => {
+                    cells.prepare(CellTarget::Text {
+                        hash_column: seam_column(column),
+                        inline_column: inline.map(seam_column),
+                    })?
+                }
+                CellRole::Lane | CellRole::TextInline | CellRole::Seam(SeamCell::Raw) => {}
+            }
         }
-        self.enum_variants
-            .get(discriminant, member)
-            .map(Vec::as_slice)
+        for route in self.record_routes.values() {
+            cells.prepare(CellTarget::Record {
+                row: RecordRow {
+                    path: &route.path,
+                    descriptor_position: route.descriptor_position,
+                },
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Placement is total (specs/columine/10-physical-vocabulary.md §7):
+    /// where the lanes descend the payload, every top-level member an event's
+    /// object schema declares resolves, as the lanes resolve it, to a column
+    /// a member writes or to a record routing row. A whole-payload `value`
+    /// column places every member, so a schema without `value.<member>`
+    /// columns has nothing to place.
+    fn check_placement(&self) -> Result<(), ConfigError> {
+        let Some(schemas) = self
+            .semantic_schemas
+            .as_ref()
+            .filter(|_| self.has_value_fields)
+        else {
+            return Ok(());
+        };
+        for (event_type, schema) in schemas {
+            let crate::validate::SemanticSchema::Object { fields, .. } = schema else {
+                continue;
+            };
+            for (member, _) in fields {
+                let column = self
+                    .variant_map
+                    .get(event_type, member)
+                    .or_else(|| self.payload_map.get(member.as_str()));
+                let placed = column
+                    .is_some_and(|lookup| self.member_write(lookup.column).is_some())
+                    || self.record_routes.get(event_type, member).is_some();
+                if !placed {
+                    return Err(ConfigError::UnplacedMember);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
+/// Who computes the value cells of a parse (specs/columine/10-physical-vocabulary.md
+/// §7): columine's native MessagePack writer, or an embedder's
+/// [`ValueCells`]. It matches the [`CellLayout`] the configuration was built
+/// with; a cell the configuration hands an embedder that a `Native` writer
+/// cannot write refuses as [`CellRefusal::Unsupported`].
+pub enum CellWriter<'a> {
+    Native,
+    Embedder(&'a mut dyn ValueCells),
+}
+
+impl CellWriter<'_> {
+    /// The embedder, or `Unsupported` for the native writer.
+    fn embedder(&mut self) -> Result<&mut dyn ValueCells, json_extractor::ExtractionError> {
+        match self {
+            Self::Native => Err(json_extractor::ExtractionError::Cell(
+                CellRefusal::Unsupported,
+            )),
+            Self::Embedder(cells) => Ok(&mut **cells),
+        }
+    }
+}
+
+/// The creation facts that decide who writes each value cell
+/// (specs/columine/10-physical-vocabulary.md §7): each field's `sb.cell`
+/// metadata, the record routing rows, the text rows, and the encoding of the
+/// embedder's writer. `encoding: None` is the native path; the default is
+/// the native path over a schema with no cell metadata.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CellLayout<'a> {
+    pub cell_metadata: &'a [Option<String>],
+    pub record_members: &'a [RecordMember],
+    pub text_columns: &'a [TextColumn],
+    pub encoding: Option<&'a str>,
+}
+
+/// Who writes one column's cells, decided once at configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CellRole {
+    /// The lane's own coercion: every typed plane, and with no embedder a
+    /// Binary plane as columine's MessagePack.
+    Lane,
+    /// A cell the value-cell seam rules.
+    Seam(SeamCell),
+    /// A text's inline Utf8 column, written only beside its hash.
+    TextInline,
+}
+
+/// A column whose cells the value-cell seam rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeamCell {
+    /// A Binary plane without `sb.cell` beside an embedder: raw bytes only.
+    Raw,
+    /// A Binary plane whose `sb.cell` names the embedder's encoding.
+    Embedder,
+    /// A text's content-hash column, and its inline column when it has one.
+    TextHash { inline: Option<usize> },
+}
+
+/// How a member resolved to a column is written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemberWrite {
+    Lane,
+    Seam(SeamCell),
+}
+
+/// Who writes the carrier of undeclared members.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Carrier {
+    /// The schema has no carrier column.
+    Absent,
+    /// The lane writes it as columine's MessagePack.
+    Native(usize),
+    /// The embedder writes it.
+    Embedder(usize),
+    /// A Binary column without `sb.cell` beside an embedder: it takes no
+    /// captured member.
+    Raw,
+}
+
+/// A declared member's place in the row's declared record.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordRoute {
+    path: Vec<u16>,
+    descriptor_position: u32,
+}
+
+/// A column index as the value-cell seam spells it. Every column index is
+/// below the schema's `u32` field count.
+fn seam_column(column: usize) -> u32 {
+    u32::try_from(column).unwrap_or(u32::MAX)
+}
+
+/// Start one row's embedder-written record and carrier.
+pub(crate) fn begin_cells(
+    config: &ExtractionConfig,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    let record = config.embedder_record().is_some();
+    let carrier = matches!(config.carrier(), Carrier::Embedder(_));
+    if record || carrier {
+        let writer = cells.embedder()?;
+        if record {
+            writer.begin_record();
+        }
+        if carrier {
+            writer.begin_undeclared();
+        }
+    }
+    Ok(())
+}
+
+/// Store one row's embedder-written record and carrier; a writer that put
+/// nothing leaves its cell null.
+pub(crate) fn finish_cells(
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), json_extractor::ExtractionError> {
+    if let Some(column) = config.embedder_record() {
+        scratch.clear();
+        if cells
+            .embedder()?
+            .finish_record(scratch)
+            .map_err(json_extractor::ExtractionError::Cell)?
+        {
+            json_extractor::append(
+                columns,
+                column,
+                Some(ColumnValue::Binary(Cow::Borrowed(scratch))),
+            )?;
+        }
+    }
+    if let Carrier::Embedder(column) = config.carrier() {
+        scratch.clear();
+        if cells
+            .embedder()?
+            .finish_undeclared(scratch)
+            .map_err(json_extractor::ExtractionError::Cell)?
+        {
+            json_extractor::append(
+                columns,
+                column,
+                Some(ColumnValue::Binary(Cow::Borrowed(scratch))),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A structured member's own embedder-written cell. An explicit null that
+/// is the member's empty state stays the null cell. Below an open object of
+/// the member's declared `schema`, each undeclared key goes to the carrier
+/// under its payload path, by the rule the native writer filters with.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one member cell: its column, its value and null rule, its open-path capture, the writer and its scratch"
+)]
+pub(crate) fn member_cell(
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    column: usize,
+    value: &dyn ValueView,
+    null: NullCell,
+    capture: Option<(&crate::validate::SemanticSchema, &str)>,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), json_extractor::ExtractionError> {
+    if value.kind() == ValueKind::Null && null == NullCell::Empty {
+        return Ok(());
+    }
+    scratch.clear();
+    cells
+        .embedder()?
+        .member(seam_column(column), value, scratch)
+        .map_err(json_extractor::ExtractionError::Cell)?;
+    json_extractor::append(
+        columns,
+        column,
+        Some(ColumnValue::Binary(Cow::Borrowed(scratch))),
+    )?;
+    if let Some((schema, name)) = capture {
+        let mut path = String::new();
+        crate::validate::push_path_segment(&mut path, name)
+            .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+        undeclared_below(config, schema, value, &mut path, cells)?;
+    }
+    Ok(())
+}
+
+/// Hand every undeclared key below the open objects of `schema` to the
+/// carrier, under `path` extended by each key.
+fn undeclared_below(
+    config: &ExtractionConfig,
+    schema: &crate::validate::SemanticSchema,
+    value: &dyn ValueView,
+    path: &mut String,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    use crate::validate::SemanticSchema;
+    match schema {
+        SemanticSchema::Optional(inner) => undeclared_below(config, inner, value, path, cells),
+        SemanticSchema::Object { fields, open } => {
+            let mut outcome = Ok(());
+            if value.kind() == ValueKind::Object {
+                value.visit_object(&mut |name, child| {
+                    if outcome.is_ok() {
+                        outcome =
+                            undeclared_member(config, fields, *open, name, child, path, cells);
+                    }
+                });
+            }
+            outcome
+        }
+        SemanticSchema::Unknown
+        | SemanticSchema::String { .. }
+        | SemanticSchema::Key { .. }
+        | SemanticSchema::AxId
+        | SemanticSchema::Number
+        | SemanticSchema::Boolean
+        | SemanticSchema::Binary
+        | SemanticSchema::BigInt(_)
+        | SemanticSchema::I32
+        | SemanticSchema::U32
+        | SemanticSchema::Range(_)
+        | SemanticSchema::Enum(_)
+        | SemanticSchema::Array { .. }
+        | SemanticSchema::Union(_)
+        | SemanticSchema::Map { .. }
+        | SemanticSchema::Record(_)
+        | SemanticSchema::Vo(_) => Ok(()),
+    }
+}
+
+/// One key of an object judged by `fields`: a declared key is walked by its
+/// own schema, an undeclared one under an open object is captured, and an
+/// undeclared one under a closed object stays in the member.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one key of the walk: the object's schema, the key and value, the path and the writer"
+)]
+fn undeclared_member(
+    config: &ExtractionConfig,
+    fields: &[(String, crate::validate::SemanticSchema)],
+    open: bool,
+    name: &str,
+    value: &dyn ValueView,
+    path: &mut String,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    let known = fields.iter().find(|(field, _)| field == name);
+    if known.is_none() && !open {
+        return Ok(());
+    }
+    let mark = crate::validate::push_path_segment(path, name)
+        .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+    let result = match known {
+        Some((_, schema)) => undeclared_below(config, schema, value, path, cells),
+        None => undeclared_cell(config, path, value, cells),
+    };
+    path.truncate(mark);
+    result
+}
+
+/// One undeclared member, under its payload path, into an embedder-written
+/// carrier. A schema with no carrier drops it, as the native writer does; a
+/// carrier the embedder does not write takes no structured value.
+pub(crate) fn undeclared_cell(
+    config: &ExtractionConfig,
+    path: &str,
+    value: &dyn ValueView,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    match config.carrier() {
+        Carrier::Embedder(_) => cells
+            .embedder()?
+            .put_undeclared(path, value)
+            .map_err(json_extractor::ExtractionError::Cell),
+        Carrier::Absent => Ok(()),
+        Carrier::Raw | Carrier::Native(_) => Err(json_extractor::ExtractionError::InvalidFieldType),
+    }
+}
+
+/// One declared member without a column, into the row's declared record.
+/// An explicit null that is the member's empty state is not put.
+pub(crate) fn record_cell(
+    row: RecordRow<'_>,
+    value: &dyn ValueView,
+    null: NullCell,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    if value.kind() == ValueKind::Null && null == NullCell::Empty {
+        return Ok(());
+    }
+    cells
+        .embedder()?
+        .put(&row, value)
+        .map_err(json_extractor::ExtractionError::Cell)
+}
+
+/// A text that arrived as its text: its hash column stores the hash the
+/// embedder computes, and its inline column the text when the embedder keeps
+/// it inline. A text answered inline with no inline column is refused.
+pub(crate) fn text_cell(
+    columns: &mut DynamicColumns,
+    hash_column: usize,
+    inline: Option<usize>,
+    text: &str,
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    let mut hash = [0; TEXT_HASH_BYTES];
+    let place = cells
+        .embedder()?
+        .text(seam_column(hash_column), text, &mut hash)
+        .map_err(json_extractor::ExtractionError::Cell)?;
+    json_extractor::append(
+        columns,
+        hash_column,
+        Some(ColumnValue::FixedBytes(Cow::Borrowed(&hash))),
+    )?;
+    match (place, inline) {
+        (TextPlace::Inline, Some(inline)) => {
+            json_extractor::append(
+                columns,
+                inline,
+                Some(ColumnValue::Utf8(Cow::Borrowed(text))),
+            )?;
+            if let Some(seen) = columns.columns_seen.get_mut(inline) {
+                *seen = true;
+            }
+            Ok(())
+        }
+        (TextPlace::Inline, None) => Err(json_extractor::ExtractionError::InvalidFieldType),
+        (TextPlace::HashOnly, _) => Ok(()),
+    }
+}
+
+/// A text that arrived as its content hash: the embedder answers whether it
+/// holds the content, and the hash column stores the hash.
+pub(crate) fn text_hash_cell(
+    columns: &mut DynamicColumns,
+    hash_column: usize,
+    hash: &[u8],
+    cells: &mut CellWriter<'_>,
+) -> Result<(), json_extractor::ExtractionError> {
+    let hash: &[u8; TEXT_HASH_BYTES] = hash
+        .try_into()
+        .map_err(|_| json_extractor::ExtractionError::InvalidFieldType)?;
+    cells
+        .embedder()?
+        .text_by_hash(seam_column(hash_column), hash)
+        .map_err(json_extractor::ExtractionError::Cell)?;
+    json_extractor::append(
+        columns,
+        hash_column,
+        Some(ColumnValue::FixedBytes(Cow::Borrowed(hash))),
+    )
+}
+
+/// The index a dictionary-encoded column stores for `text`
+/// (specs/columine/10-physical-vocabulary.md §4, §5): its position among a
+/// schema dictionary's `values`, or the ordinal `image` answers for the
+/// stream dictionary. A text the schema dictionary does not hold is
+/// `InvalidFieldType`; a text the image refuses is `Category`.
+pub(crate) fn dictionary_index(
+    slot: DictionarySlot,
+    values: Option<&[Option<String>]>,
+    text: &str,
+    image: &mut dyn CategoryImage,
+) -> Result<u64, json_extractor::ExtractionError> {
+    match slot {
+        DictionarySlot::Stream => image
+            .ordinal(text)
+            .map(u64::from)
+            .map_err(json_extractor::ExtractionError::Category),
+        DictionarySlot::Schema(_) => values
+            .and_then(|values| {
+                values
+                    .iter()
+                    .position(|value| value.as_deref() == Some(text))
+            })
+            .and_then(|index| u64::try_from(index).ok())
+            .ok_or(json_extractor::ExtractionError::InvalidFieldType),
+    }
+}
+
+/// The integer an eight-byte signed column takes from a text: a decimal
+/// `i64`, and on a Timestamp column also an RFC 3339 instant converted to
+/// the column's unit. Both lanes coerce a text through this one rule.
+pub(crate) fn signed_text(field: SignalSchemaField, text: &str) -> Option<i64> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(value);
+    }
+    if field.arrow_type != ArrowType::Timestamp {
+        return None;
+    }
+    instant::parse_instant(text, columine_arrow::time_unit(field.type_param)?).ok()
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
     FieldNameCountMismatch,
@@ -438,6 +984,24 @@ pub enum ConfigError {
     InvalidDiscriminatedColumn,
     /// The configuration's storage could not be backed.
     OutOfMemory,
+    /// A column is encoded against a schema dictionary the creation call's
+    /// table does not hold.
+    MissingDictionary,
+    /// An enum member's column is not a schema-dictionary column whose
+    /// non-null values are the enum's variants in order.
+    EnumDictionaryMismatch,
+    /// A Binary field's `sb.cell` names an encoding this processor does not
+    /// write.
+    CellEncodingMismatch,
+    /// A member an event's object schema declares resolves to no column and
+    /// no record routing row.
+    UnplacedMember,
+    /// Record routing rows without a discriminator key, or without a
+    /// [`DECLARED_RECORD_COLUMN_NAME`] Binary column the processor writes.
+    RecordColumnMissing,
+    /// A text row whose hash field is not `FixedSizeBinary(32)` or whose
+    /// inline field is not Utf8.
+    InvalidTextColumn,
 }
 
 /// Back `additional` more elements of `buf`, or refuse as out of memory.
@@ -455,10 +1019,83 @@ fn owned(text: &str) -> Result<String, ConfigError> {
     Ok(out)
 }
 
+/// An owned copy of a dictionary's values in exactly backed storage.
+fn owned_values(values: &[Option<String>]) -> Result<Vec<Option<String>>, ConfigError> {
+    let mut out = Vec::new();
+    room(&mut out, values.len())?;
+    for value in values {
+        out.push(value.as_deref().map(owned).transpose()?);
+    }
+    Ok(out)
+}
+
 const VALUE_PRESENCE_PREFIX: &str = "event_value_present.";
 
 /// The sole Arrow/config/spec spelling for the bounded undeclared-value carrier.
 pub const UNDECLARED_COLUMN_NAME: &str = "value.$undeclared";
+
+/// The Arrow/config spelling of the row's declared record: the declared
+/// members that have no column of their own
+/// (specs/columine/10-physical-vocabulary.md §7).
+pub const DECLARED_RECORD_COLUMN_NAME: &str = "value.$declared";
+
+/// Each column's [`CellRole`] under `layout`
+/// (specs/columine/10-physical-vocabulary.md §7, §8).
+fn cell_roles(
+    fields: &[SignalSchemaField],
+    layout: &CellLayout<'_>,
+) -> Result<Vec<CellRole>, ConfigError> {
+    let native = NoValueCells.encoding();
+    let mut roles = Vec::new();
+    room(&mut roles, fields.len())?;
+    for (column, field) in fields.iter().enumerate() {
+        let named = layout.cell_metadata.get(column).and_then(Option::as_deref);
+        roles.push(match (field.plane_kind(), named, layout.encoding) {
+            (PlaneKind::Bytes { .. }, None, None) => CellRole::Lane,
+            (PlaneKind::Bytes { .. }, None, Some(_)) => CellRole::Seam(SeamCell::Raw),
+            (PlaneKind::Bytes { .. }, Some(named), None) if named == native => CellRole::Lane,
+            (PlaneKind::Bytes { .. }, Some(named), Some(encoding)) if named == encoding => {
+                CellRole::Seam(SeamCell::Embedder)
+            }
+            (PlaneKind::Bytes { .. }, Some(_), _) => return Err(ConfigError::CellEncodingMismatch),
+            (
+                PlaneKind::Empty
+                | PlaneKind::Bool
+                | PlaneKind::SignedInt { .. }
+                | PlaneKind::UnsignedInt { .. }
+                | PlaneKind::Float { .. }
+                | PlaneKind::FixedBytes { .. }
+                | PlaneKind::Text { .. },
+                _,
+                _,
+            ) => CellRole::Lane,
+        });
+    }
+    for text in layout.text_columns {
+        let hash = fields.get(text.hash).is_some_and(|field| {
+            field.dictionary.is_none()
+                && field.arrow_type == ArrowType::FixedSizeBinary
+                && usize::from(field.type_param) == TEXT_HASH_BYTES
+        });
+        let inline = text.inline.is_none_or(|inline| {
+            fields.get(inline).is_some_and(|field| {
+                field.dictionary.is_none() && field.arrow_type == ArrowType::Utf8
+            })
+        });
+        if !hash || !inline {
+            return Err(ConfigError::InvalidTextColumn);
+        }
+        if let Some(role) = roles.get_mut(text.hash) {
+            *role = CellRole::Seam(SeamCell::TextHash {
+                inline: text.inline,
+            });
+        }
+        if let Some(role) = text.inline.and_then(|inline| roles.get_mut(inline)) {
+            *role = CellRole::TextInline;
+        }
+    }
+    Ok(roles)
+}
 
 fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
     let Some(encoded) = name.strip_prefix(VALUE_PRESENCE_PREFIX) else {
@@ -492,14 +1129,23 @@ pub fn build_extraction_config(
     fields: &[SignalSchemaField],
     names: &[&str],
 ) -> Result<ExtractionConfig, ConfigError> {
-    build_extraction_config_with_semantic_schemas(fields, names, None, None)
+    build_extraction_config_with_semantic_schemas(
+        fields,
+        names,
+        &[],
+        None,
+        None,
+        CellLayout::default(),
+    )
 }
 
 pub fn build_extraction_config_with_semantic_schemas(
     fields: &[SignalSchemaField],
     names: &[&str],
+    dictionaries: &[SchemaDictionary],
     semantic_schemas: Option<&crate::validate::SemanticSchemaSet>,
     discriminator: Option<&PayloadDiscriminator>,
+    cells: CellLayout<'_>,
 ) -> Result<ExtractionConfig, ConfigError> {
     if fields.len() != names.len() {
         return Err(ConfigError::FieldNameCountMismatch);
@@ -523,7 +1169,36 @@ pub fn build_extraction_config_with_semantic_schemas(
         open_paths.sort_unstable();
         open_paths.dedup();
     }
+    // Each column encoded against a schema dictionary names that dictionary's
+    // position in the copied table, so a lane resolves a text without a
+    // search by slot.
+    let mut schema_dictionaries = Vec::new();
+    room(&mut schema_dictionaries, dictionaries.len())?;
+    for dictionary in dictionaries {
+        schema_dictionaries.push(owned_values(&dictionary.values)?);
+    }
+    let mut column_dictionaries = Vec::new();
+    room(&mut column_dictionaries, fields.len())?;
+    for field in fields {
+        column_dictionaries.push(match field.dictionary {
+            Some(DictionaryEncoding {
+                slot: slot @ DictionarySlot::Schema(_),
+                ..
+            }) => Some(
+                dictionaries
+                    .iter()
+                    .position(|dictionary| dictionary.slot == slot)
+                    .ok_or(ConfigError::MissingDictionary)?,
+            ),
+            Some(DictionaryEncoding {
+                slot: DictionarySlot::Stream,
+                ..
+            })
+            | None => None,
+        });
+    }
     let mut fallback_column = None;
+    let mut record_column = None;
     for (column, (field, name)) in fields.iter().zip(names).enumerate() {
         if let Some(source_name) = decode_presence_source(name)? {
             if field.arrow_type != ArrowType::Bool {
@@ -547,6 +1222,10 @@ pub fn build_extraction_config_with_semantic_schemas(
         }
         if *name == UNDECLARED_COLUMN_NAME {
             fallback_column = Some(column);
+        }
+
+        if *name == DECLARED_RECORD_COLUMN_NAME {
+            record_column = Some(column);
         }
         field_entries.push((column, *field));
     }
@@ -572,11 +1251,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         }
     }
     let has_value_fields = !payload_map.is_empty();
-    // Discriminated resolution arms only when the caller names the key: the
-    // enum-ordinal table is keyed by discriminant, so without one there is
-    // no way to pick the schema an admitted string is judged against.
     let mut variant_map = MemberTable::default();
-    let mut enum_variants = MemberTable::default();
     let mut dynamic_members = MemberTable::default();
     if let Some(semantic_schemas) = semantic_schemas {
         for (event_type, schema) in semantic_schemas {
@@ -599,20 +1274,64 @@ pub fn build_extraction_config_with_semantic_schemas(
                 },
             )?;
         }
-        if let Some(semantic_schemas) = semantic_schemas {
-            for (discriminant, schema) in semantic_schemas {
-                crate::validate::collect_enum_members(schema, |member, variants| {
-                    let mut ordinals = Vec::new();
-                    room(&mut ordinals, variants.len())?;
-                    for variant in variants {
-                        ordinals.push(owned(variant)?);
-                    }
-                    enum_variants.bind(discriminant, member, ordinals)
-                })?;
-            }
+    }
+    // An enum member's column is a schema-dictionary column whose values are
+    // the enum's variants: the wire spells a variant as its text and the
+    // column stores the text's index. The column is resolved as the lanes
+    // resolve it, its discriminated column first.
+    if let Some(semantic_schemas) = semantic_schemas {
+        for (event_type, schema) in semantic_schemas {
+            crate::validate::collect_enum_members(schema, |member, variants| {
+                let Some(lookup) = variant_map
+                    .get(event_type, member)
+                    .or_else(|| payload_map.get(member))
+                else {
+                    return Ok(());
+                };
+                let values = column_dictionaries
+                    .get(lookup.column)
+                    .copied()
+                    .flatten()
+                    .and_then(|position| schema_dictionaries.get(position));
+                match values {
+                    Some(values) if values.iter().flatten().eq(variants) => Ok(()),
+                    Some(_) | None => Err(ConfigError::EnumDictionaryMismatch),
+                }
+            })?;
         }
     }
-    Ok(ExtractionConfig {
+    let cell_roles = cell_roles(fields, &cells)?;
+    // Record rows need the discriminant that selects them and a record
+    // column this processor writes.
+    if !cells.record_members.is_empty() {
+        let writes_record = record_column.is_some_and(|column| {
+            fields
+                .get(column)
+                .is_some_and(|field| matches!(field.plane_kind(), PlaneKind::Bytes { .. }))
+                && matches!(
+                    cell_roles.get(column),
+                    Some(CellRole::Lane | CellRole::Seam(SeamCell::Embedder))
+                )
+        });
+        if discriminator.is_none() || !writes_record {
+            return Err(ConfigError::RecordColumnMissing);
+        }
+    }
+    let mut record_routes = MemberTable::default();
+    for row in cells.record_members {
+        let mut path = Vec::new();
+        room(&mut path, row.path.len())?;
+        path.extend_from_slice(&row.path);
+        record_routes.bind(
+            &row.discriminant,
+            &row.member,
+            RecordRoute {
+                path,
+                descriptor_position: row.descriptor_position,
+            },
+        )?;
+    }
+    let config = ExtractionConfig {
         field_entries,
         field_map,
         payload_map,
@@ -628,9 +1347,15 @@ pub fn build_extraction_config_with_semantic_schemas(
             .map(|discriminator| owned(&discriminator.key))
             .transpose()?,
         variant_map,
-        enum_variants,
+        dictionaries: schema_dictionaries,
+        column_dictionaries,
         dynamic_members,
-    })
+        cell_roles,
+        record_column,
+        record_routes,
+    };
+    config.check_placement()?;
+    Ok(config)
 }
 
 /// Spell the `value.<member>` column name into `name`, reusing its storage;
@@ -741,7 +1466,7 @@ mod properties {
             let event = parsed_event(&columns, 0).unwrap();
             assert_eq!(event.id, id);
             assert_eq!(event.event_type, event_type);
-            assert_eq!(event.timestamp_micros, timestamp * 1_000);
+            assert_eq!(event.timestamp_nanos, timestamp);
             assert_eq!(event.value.as_deref(), Some(value.to_string().as_bytes()));
         }
 
@@ -775,7 +1500,7 @@ mod properties {
             // capacity and therefore must be accepted.
             let mut typed = DynamicColumns::new(&fields, 2).expect("column plane fits");
             let mut work = [0_u8; 128];
-            assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true).unwrap(), 1);
+            assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true, &mut columine_types::category::NoCategories).unwrap(), 1);
             assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id.into())));
             assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Utf8(event_type.into())));
             assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Int(timestamp)));
@@ -818,7 +1543,7 @@ mod properties {
             let mut typed = DynamicColumns::new(&fields, 2).expect("column plane fits");
             let mut work = [0_u8; 256];
             assert_eq!(
-                json_extractor::extract_json_events(document.as_bytes(), &config, &mut typed, &mut work, &mut json_extractor::ExtractionDiagnostic::default()).unwrap(),
+                json_extractor::extract_json_events(document.as_bytes(), &config, &mut typed, &mut work, &mut json_extractor::ExtractionDiagnostic::default(), &mut columine_types::category::NoCategories, &mut CellWriter::Native, &mut Vec::new()).unwrap(),
                 1
             );
             prop_assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id.into())));

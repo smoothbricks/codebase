@@ -1,8 +1,7 @@
 //! MessagePack scanner for event extraction.
 
-use crate::{DynamicColumns, ParseError};
-
-pub use crate::json_scanner::parse_iso8601_to_micros;
+use crate::{DynamicColumns, ParseError, instant::parse_instant};
+use columine_arrow::TimeUnit;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MsgpackScannerError {
@@ -271,21 +270,30 @@ impl<'a> Reader<'a> {
             _ => None,
         }
     }
-    /// Decode integer or floating-point milliseconds, or an ISO-8601 string,
-    /// into microseconds. Checked and saturating arithmetic keeps overflow
-    /// defined for malformed input.
+    /// Decode the base log's timestamp in nanoseconds: an integer is
+    /// nanoseconds, an integral float is nanoseconds, and a string is an
+    /// RFC 3339 instant. A fractional float or one outside `i64` is refused.
     pub(crate) fn read_timestamp(&mut self) -> Option<i64> {
         let byte = *self.input.get(self.pos)?;
         if Self::is_integer(byte) {
-            return self.read_integer()?.checked_mul(1_000);
+            return self.read_integer();
         }
         if Self::is_float(byte) {
-            let milliseconds = self.read_float()? as i64;
-            return milliseconds.checked_mul(1_000);
+            let nanos = self.read_float()?;
+            // 2^63 is exactly representable and is the first f64 i64 cannot hold.
+            const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+            if !nanos.is_finite() || nanos.fract() != 0.0 || nanos >= LIMIT || nanos < -LIMIT {
+                return None;
+            }
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "integral and range-checked against i64 one line above"
+            )]
+            return Some(nanos as i64);
         }
         if Self::is_string(byte) {
             let text = std::str::from_utf8(self.read_string()?).ok()?;
-            return parse_iso8601_to_micros(text).ok();
+            return parse_instant(text, TimeUnit::Nanosecond).ok();
         }
         None
     }
@@ -465,18 +473,22 @@ mod tests {
         out
     }
     #[test]
-    fn parse_msgpack_stream_single_event_with_int_timestamp() {
+    fn an_integer_base_timestamp_is_nanoseconds() {
         let mut c = crate::base_columns(10);
         parse_msgpack_stream(
-            &event("abc-123", 1_705_315_800_000, Some(&[0x81, 0xa1, b'x', 1])),
+            &event(
+                "abc-123",
+                1_705_315_800_000_000_000,
+                Some(&[0x81, 0xa1, b'x', 1]),
+            ),
             &mut c,
         )
         .unwrap();
         assert_eq!(c.count, 1);
         assert_eq!(crate::parsed_event(&c, 0).unwrap().id, "abc-123");
         assert_eq!(
-            crate::parsed_event(&c, 0).unwrap().timestamp_micros,
-            1_705_315_800_000_000
+            crate::parsed_event(&c, 0).unwrap().timestamp_nanos,
+            1_705_315_800_000_000_000
         );
         assert!(crate::parsed_event(&c, 0).unwrap().value.is_some());
     }
@@ -501,36 +513,44 @@ mod tests {
         assert_eq!(c.count, 2);
     }
     #[test]
-    fn parse_msgpack_stream_float_timestamp() {
-        // Float32 and float64 timestamps are truncated to integer milliseconds;
-        // 1500.7 ms becomes 1500 ms.
-        let mut input = vec![0x83];
-        str_(&mut input, "id");
-        str_(&mut input, "a");
-        str_(&mut input, "type");
-        str_(&mut input, "b");
-        str_(&mut input, "timestamp");
-        input.push(0xcb);
-        input.extend(1500.7_f64.to_bits().to_be_bytes());
+    fn an_integral_float_base_timestamp_is_nanoseconds_and_a_fraction_is_refused() {
+        let event = |nanos: f64| {
+            let mut input = vec![0x83];
+            str_(&mut input, "id");
+            str_(&mut input, "a");
+            str_(&mut input, "type");
+            str_(&mut input, "b");
+            str_(&mut input, "timestamp");
+            input.push(0xcb);
+            input.extend(nanos.to_bits().to_be_bytes());
+            input
+        };
         let mut c = crate::base_columns(1);
-        parse_msgpack_stream(&input, &mut c).unwrap();
+        parse_msgpack_stream(&event(4_294_967_296.0), &mut c).unwrap();
         assert_eq!(
-            crate::parsed_event(&c, 0).unwrap().timestamp_micros,
-            1_500_000
+            crate::parsed_event(&c, 0).unwrap().timestamp_nanos,
+            4_294_967_296
+        );
+        assert_eq!(
+            parse_msgpack_stream(&event(1500.7), &mut crate::base_columns(1)),
+            Err(MsgpackScannerError::InvalidFieldType)
         );
     }
     #[test]
-    fn parse_msgpack_stream_string_timestamp_iso_8601() {
+    fn an_instant_base_timestamp_is_stored_in_nanoseconds() {
         let mut input = vec![0x83];
         str_(&mut input, "id");
         str_(&mut input, "a");
         str_(&mut input, "type");
         str_(&mut input, "b");
         str_(&mut input, "timestamp");
-        str_(&mut input, "1970-01-01T00:00:00Z");
+        str_(&mut input, "1970-01-01T00:00:01.000000002Z");
         let mut c = crate::base_columns(1);
         parse_msgpack_stream(&input, &mut c).unwrap();
-        assert_eq!(crate::parsed_event(&c, 0).unwrap().timestamp_micros, 0);
+        assert_eq!(
+            crate::parsed_event(&c, 0).unwrap().timestamp_nanos,
+            1_000_000_002
+        );
     }
     #[test]
     fn parse_msgpack_stream_missing_required_field() {

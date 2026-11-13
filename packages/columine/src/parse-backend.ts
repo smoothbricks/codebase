@@ -6,6 +6,26 @@
  */
 
 import { COMPACT_MAX_KIND_TAG, compactKindTag } from './arrow-planes.js';
+import {
+  COMPACT,
+  CREATE_FAILURE,
+  DICTIONARY_INDEX_PLANES,
+  DICTIONARY_SLOT,
+  FIELD_DESCRIPTOR,
+  FIELD_DESCRIPTOR_BYTES,
+  FIELD_IDENTITY_KEY,
+  INPUT_FORMAT,
+  MAX_EVENTS_PER_BATCH,
+  MAX_FIXED_SIZE_BINARY_WIDTH,
+  MAX_SCHEMA_FIELDS,
+  MAX_SCHEMA_MESSAGE_BYTES,
+  MAX_VALUE_BYTES,
+  MIN_ARROW_OUTPUT_CAPACITY,
+  RESULT_CODE,
+  RESULT_HEADER_SIZE,
+  TIME_UNIT,
+  WASM_EVENT_CAPACITY,
+} from './event-processor-abi.generated.js';
 
 import type { CompactBatch, CompactColumn, EncodedArrowSchema, ParseConfig, ParseResult } from './pipeline.js';
 import { align8, loadWasmBytes, WasmHostRegion } from './wasm-memory-contract.js';
@@ -36,6 +56,17 @@ export interface EventProcessorWasmExports {
     fieldNamesPtr: number,
     fieldNamesLen: number,
   ): number;
+  ep_create_with_schema_and_dictionaries(
+    capacity: number,
+    schemaPtr: number,
+    schemaLen: number,
+    fieldMetaPtr: number,
+    fieldCount: number,
+    fieldNamesPtr: number,
+    fieldNamesLen: number,
+    dictionariesPtr: number,
+    dictionariesLen: number,
+  ): number;
   ep_destroy(handle: number): void;
   ep_create_log_entry(
     handle: number,
@@ -57,6 +88,7 @@ function parseEventProcessorWasmExports(exports: WebAssembly.Instance['exports']
   const epVersion = exports.ep_version;
   const epCreateWithSchema = exports.ep_create_with_schema;
   const epCreateWithSchemaAndNames = exports.ep_create_with_schema_and_names;
+  const epCreateWithSchemaAndDictionaries = exports.ep_create_with_schema_and_dictionaries;
   const epDestroy = exports.ep_destroy;
   const epCreateLogEntry = exports.ep_create_log_entry;
   const epCompact = exports.ep_compact;
@@ -66,6 +98,9 @@ function parseEventProcessorWasmExports(exports: WebAssembly.Instance['exports']
     !isWasmFunction<EventProcessorWasmExports['ep_version']>(epVersion) ||
     !isWasmFunction<EventProcessorWasmExports['ep_create_with_schema']>(epCreateWithSchema) ||
     !isWasmFunction<EventProcessorWasmExports['ep_create_with_schema_and_names']>(epCreateWithSchemaAndNames) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_create_with_schema_and_dictionaries']>(
+      epCreateWithSchemaAndDictionaries,
+    ) ||
     !isWasmFunction<EventProcessorWasmExports['ep_destroy']>(epDestroy) ||
     !isWasmFunction<EventProcessorWasmExports['ep_create_log_entry']>(epCreateLogEntry) ||
     !isWasmFunction<EventProcessorWasmExports['ep_compact']>(epCompact)
@@ -78,148 +113,95 @@ function parseEventProcessorWasmExports(exports: WebAssembly.Instance['exports']
     ep_version: epVersion,
     ep_create_with_schema: epCreateWithSchema,
     ep_create_with_schema_and_names: epCreateWithSchemaAndNames,
+    ep_create_with_schema_and_dictionaries: epCreateWithSchemaAndDictionaries,
     ep_destroy: epDestroy,
     ep_create_log_entry: epCreateLogEntry,
     ep_compact: epCompact,
   };
 }
 
-const WASM_OUTPUT_HEADER_SIZE = 32;
 const MIN_INPUT_BYTES = 4 * 1024;
 const MIN_OUTPUT_BYTES = 64 * 1024;
 const MAX_BATCH_INPUT_BYTES = 64 * 1024 * 1024;
 const MAX_BATCH_OUTPUT_BYTES = 64 * 1024 * 1024;
-/**
- * Ceiling for `batch.rowCount`, a VALIDATION limit: the native
- * `MAX_EVENTS_PER_BATCH` clamp in columine-arrow. Nothing is allocated for it.
- */
-const MAX_EVENTS_PER_BATCH = 65_536;
 
-/**
- * Event capacity passed to `ep_create_*`, an ALLOCATION SIZE: the native
- * `WASM_EVENT_CAPACITY`. It cannot be `MAX_EVENTS_PER_BATCH` — the native
- * `DynamicColumns::new` allocates the whole column plane eagerly, at
- * `min(MAX_VARIABLE_DATA_BYTES, capacity * 128)` data bytes plus
- * `(capacity + 1) * 4` offset bytes per variable-width column. Measured
- * against the shipped artifact: one utf8 column at capacity 65536 grows the
- * wasm heap 8.06 MiB and the seven-field compact schema needs 26.06 MiB, where
- * the same schema at 256 needs 0.10 MiB; past roughly 32 variable-width
- * columns the eager plane exceeds the artifact's 256 MiB memory maximum and
- * creation is refused as `MEMORY_EXHAUSTED`. Rows beyond it are not lost: `encode` hands the native
- * compact path a caller-owned batch of up to `MAX_EVENTS_PER_BATCH` rows
- * without touching the parse plane.
- */
-const EP_EVENT_CAPACITY = 256;
-
-/** Physical Arrow field capacity: the native `MAX_SCHEMA_FIELDS`, pinned by `parse_backend_abi.rs`. */
-const MAX_FIELDS = 512;
-const MAX_VARIABLE_DATA_BYTES = 16 * 1024 * 1024;
-const MAX_SCHEMA_MESSAGE_BYTES = 256 * 1024;
-const MIN_COMPACT_ARROW_CAPACITY = 4 * 1024;
 const UINT32_MAX = 0xffff_ffff;
-const INPUT_FORMAT_JSON = 0;
-const RESULT_OK = 0;
-const COMPACT_MAGIC = 0x3142_5043;
-const COMPACT_VERSION = 1;
-const COMPACT_HEADER_SIZE = 16;
-const COMPACT_DESCRIPTOR_SIZE = 32;
 const HOST_IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
-const MAX_FIXED_SIZE_BINARY_WIDTH = Math.floor(MAX_VARIABLE_DATA_BYTES / MAX_EVENTS_PER_BATCH);
+const FIXED_SIZE_BINARY_PLANE = compactKindTag('fixedSizeBinary');
+const UTF8_PLANE = compactKindTag('utf8');
+const TEMPORAL_PLANES: readonly number[] = [compactKindTag('timestamp'), compactKindTag('duration')];
+const TIME_UNIT_CODES: readonly number[] = Object.values(TIME_UNIT);
 
-const COMPACT_STATUS_CODE = {
-  1: 'INVALID_HANDLE',
-  2: 'PARSE_ERROR',
-  3: 'ENCODE_ERROR',
-  4: 'OUTPUT_TOO_SMALL',
-  5: 'INVALID_FORMAT',
-  6: 'INVALID_INPUT',
-  7: 'SCHEMA_MISMATCH',
-  8: 'MEMORY_EXHAUSTED',
-} as const;
+/** Each entry of a generated name -> code table by its code, for decoding the codes native code returns. */
+function namesByCode<Table extends Record<string, number>>(
+  table: Table,
+): ReadonlyMap<number, Extract<keyof Table, string>> {
+  const names = new Map<number, Extract<keyof Table, string>>();
+  for (const name in table) {
+    names.set(table[name], name);
+  }
+  return names;
+}
+
+const RESULT_CODE_NAMES = namesByCode(RESULT_CODE);
+const CREATE_FAILURE_NAMES = namesByCode(CREATE_FAILURE);
+
+/** The fields of one field descriptor, laid out as {@link FIELD_DESCRIPTOR} says. */
+export interface FieldDescriptor {
+  /** Tag of the plane of the field's values: `compactKindTag(kind)`. */
+  readonly plane: number;
+  readonly nullable: boolean;
+  /** The FixedSizeBinary width or a Timestamp or Duration unit ({@link TIME_UNIT}); omitted for every other plane. */
+  readonly typeParam?: number;
+  /** A dictionary-encoded field's slot ({@link DICTIONARY_SLOT}); omitted for a plain column. */
+  readonly dictionary?: number;
+  /** A dictionary-encoded field's index plane, one of {@link DICTIONARY_INDEX_PLANES}; omitted for a plain column. */
+  readonly indexPlane?: number;
+}
+
+/** The {@link FIELD_DESCRIPTOR_BYTES} wire bytes of one field descriptor; `fieldMetadata` holds one per field. */
+export function encodeFieldDescriptor(field: FieldDescriptor): Uint8Array {
+  const bytes = new Uint8Array(FIELD_DESCRIPTOR_BYTES);
+  const view = new DataView(bytes.buffer);
+  view.setUint8(FIELD_DESCRIPTOR.plane, field.plane);
+  view.setUint8(FIELD_DESCRIPTOR.nullable, Number(field.nullable));
+  view.setUint16(FIELD_DESCRIPTOR.typeParam, field.typeParam ?? 0, true);
+  view.setUint16(FIELD_DESCRIPTOR.dictionary, field.dictionary ?? DICTIONARY_SLOT.none, true);
+  view.setUint8(FIELD_DESCRIPTOR.indexPlane, field.indexPlane ?? 0);
+  return bytes;
+}
 
 /**
  * Highest handle the wasm handle table can hand out: `HANDLES` is 256 slots
- * and slot 0 is reserved. Every return value outside `1..EP_MAX_HANDLE` is an
- * `EP_CREATE_FAILURE` code.
+ * and slot 0 is reserved. Every return value outside `1..EP_MAX_HANDLE` is a
+ * `CREATE_FAILURE` code.
  */
 const EP_MAX_HANDLE = 255;
 
-/**
- * `ep_create_*` failure codes — the `CreateFailure` enum in
- * columine-event-processor, pinned by `parse_backend_abi.rs`.
- *
- * Creation used to answer every distinct refusal with a bare `0`, so a schema
- * type mismatch read exactly like a capacity refusal, a null pointer, and an
- * exhausted handle table.
- */
-const EP_CREATE_FAILURE = {
-  2147483649: 'BAD_REQUEST',
-  2147483650: 'CAPACITY',
-  2147483651: 'SCHEMA_MESSAGE',
-  2147483652: 'SCHEMA_TOO_MANY_FIELDS',
-  2147483653: 'SCHEMA_FIELD_METADATA',
-  2147483654: 'SCHEMA_FIELD_COUNT',
-  2147483655: 'SCHEMA_TYPE_MISMATCH',
-  2147483656: 'SCHEMA_NULLABILITY',
-  2147483657: 'SCHEMA_FIELD_NAMES',
-  2147483658: 'INIT',
-  2147483659: 'HANDLES_EXHAUSTED',
-  2147483660: 'MEMORY_EXHAUSTED',
-  2147483661: 'SCHEMA_TOO_LARGE',
-} as const;
-
+/** What each `CREATE_FAILURE` means to the caller that met it. */
 const EP_CREATE_FAILURE_DETAIL = {
   BAD_REQUEST: 'a null pointer or an overflowing field count reached the wasm export',
   CAPACITY: 'the requested event capacity is zero or above the instance ceiling',
   SCHEMA_MESSAGE: 'schemaBytes is not one continuation-prefixed Arrow IPC Schema message',
-  SCHEMA_TOO_MANY_FIELDS: `the schema declares more than ${MAX_FIELDS} fields`,
+  SCHEMA_TOO_MANY_FIELDS: `the schema declares more than ${MAX_SCHEMA_FIELDS} fields`,
   SCHEMA_FIELD_COUNT: 'schemaBytes and fieldMetadata declare different field counts',
-  SCHEMA_FIELD_METADATA: 'a fieldMetadata entry is not a valid [tag, nullable, typeParam u16 LE] descriptor',
-  SCHEMA_TYPE_MISMATCH: "a fieldMetadata physical tag disagrees with that field's logical Arrow type in schemaBytes",
+  SCHEMA_FIELD_METADATA: `a fieldMetadata entry is not a valid ${FIELD_DESCRIPTOR_BYTES}-byte field descriptor`,
+  SCHEMA_TYPE_MISMATCH: "a fieldMetadata descriptor disagrees with that field's logical Arrow type in schemaBytes",
   SCHEMA_NULLABILITY: 'a field nullability flag disagrees with schemaBytes, or a Null field is non-nullable',
   SCHEMA_FIELD_NAMES: 'the field-name blob is malformed or does not carry one name per field',
   INIT: 'retained-metadata or extraction-config limits refused the schema',
   HANDLES_EXHAUSTED: `all ${EP_MAX_HANDLE} EventProcessor handle slots are in use`,
   MEMORY_EXHAUSTED: 'the memory to build the handle could not be had; the same call may succeed with more room',
   SCHEMA_TOO_LARGE: `schemaBytes is longer than the ${MAX_SCHEMA_MESSAGE_BYTES}-byte Schema message limit`,
-} as const satisfies Record<(typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE], string>;
+  SCHEMA_DICTIONARY: 'the schema dictionaries and the field descriptors disagree about which dictionary a field uses',
+  SCHEMA_FIELD_IDENTITY: `a field's ${FIELD_IDENTITY_KEY} metadata is malformed, repeats an identity or has two types`,
+} as const satisfies Record<keyof typeof CREATE_FAILURE, string>;
 
-export type EventProcessorCreateErrorCode =
-  | (typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE]
-  | 'UNKNOWN_FAILURE';
+export type EventProcessorCreateErrorCode = keyof typeof CREATE_FAILURE | 'UNKNOWN_FAILURE';
 
 function epCreateFailureCode(status: number): EventProcessorCreateErrorCode {
-  switch (status) {
-    case 0x8000_0001:
-      return EP_CREATE_FAILURE[0x8000_0001];
-    case 0x8000_0002:
-      return EP_CREATE_FAILURE[0x8000_0002];
-    case 0x8000_0003:
-      return EP_CREATE_FAILURE[0x8000_0003];
-    case 0x8000_0004:
-      return EP_CREATE_FAILURE[0x8000_0004];
-    case 0x8000_0005:
-      return EP_CREATE_FAILURE[0x8000_0005];
-    case 0x8000_0006:
-      return EP_CREATE_FAILURE[0x8000_0006];
-    case 0x8000_0007:
-      return EP_CREATE_FAILURE[0x8000_0007];
-    case 0x8000_0008:
-      return EP_CREATE_FAILURE[0x8000_0008];
-    case 0x8000_0009:
-      return EP_CREATE_FAILURE[0x8000_0009];
-    case 0x8000_000a:
-      return EP_CREATE_FAILURE[0x8000_000a];
-    case 0x8000_000b:
-      return EP_CREATE_FAILURE[0x8000_000b];
-    case 0x8000_000c:
-      return EP_CREATE_FAILURE[0x8000_000c];
-    case 0x8000_000d:
-      return EP_CREATE_FAILURE[0x8000_000d];
-    default:
-      return 'UNKNOWN_FAILURE';
-  }
+  return CREATE_FAILURE_NAMES.get(status) ?? 'UNKNOWN_FAILURE';
 }
 
 /**
@@ -263,31 +245,11 @@ function requireEpHandle(returned: number, context: string): number {
   throw new EventProcessorCreateError(handle, context);
 }
 
-export type CompactEncodingErrorCode =
-  | (typeof COMPACT_STATUS_CODE)[keyof typeof COMPACT_STATUS_CODE]
-  | 'UNKNOWN_STATUS';
+export type CompactEncodingErrorCode = Exclude<keyof typeof RESULT_CODE, 'OK'> | 'UNKNOWN_STATUS';
 
 function compactStatusCode(status: number): CompactEncodingErrorCode {
-  switch (status) {
-    case 1:
-      return COMPACT_STATUS_CODE[1];
-    case 2:
-      return COMPACT_STATUS_CODE[2];
-    case 3:
-      return COMPACT_STATUS_CODE[3];
-    case 4:
-      return COMPACT_STATUS_CODE[4];
-    case 5:
-      return COMPACT_STATUS_CODE[5];
-    case 6:
-      return COMPACT_STATUS_CODE[6];
-    case 7:
-      return COMPACT_STATUS_CODE[7];
-    case 8:
-      return COMPACT_STATUS_CODE[8];
-    default:
-      return 'UNKNOWN_STATUS';
-  }
+  const name = RESULT_CODE_NAMES.get(status);
+  return name === undefined || name === 'OK' ? 'UNKNOWN_STATUS' : name;
 }
 
 export interface CompactDiagnostic {
@@ -393,7 +355,7 @@ function planParseMemoryLayout(
   }
 
   const inputLength = Math.max(MIN_INPUT_BYTES, align8(inputLen));
-  const outputLength = Math.max(WASM_OUTPUT_HEADER_SIZE, estimateOutputBytes(inputLen));
+  const outputLength = Math.max(RESULT_HEADER_SIZE, estimateOutputBytes(inputLen));
   const inputOffset = 0;
   const outputOffset = checkedAdd(inputOffset, inputLength, 'parse output offset');
   const schemaOffset = checkedAdd(outputOffset, outputLength, 'parse schema offset');
@@ -523,8 +485,8 @@ function validateVariableColumn(
   if (offsets.length !== rowCount + 1) {
     throw new RangeError(`columns[${fieldIndex}].offsets must contain exactly rowCount + 1 entries`);
   }
-  if (column.data.byteLength > MAX_VARIABLE_DATA_BYTES) {
-    throw new RangeError(`columns[${fieldIndex}].data exceeds the ${MAX_VARIABLE_DATA_BYTES}-byte variable-data limit`);
+  if (column.data.byteLength > MAX_VALUE_BYTES) {
+    throw new RangeError(`columns[${fieldIndex}].data exceeds the ${MAX_VALUE_BYTES}-byte variable-data limit`);
   }
 
   const offsetAt = (index: number): bigint => {
@@ -603,50 +565,74 @@ function validateCompactBatch(batch: CompactBatch): void {
   }
 
   const metadata = batch.schema.fieldMetadata;
-  if (metadata.length % 4 !== 0) {
-    throw new RangeError('fieldMetadata length must be a multiple of four');
+  if (metadata.length % FIELD_DESCRIPTOR_BYTES !== 0) {
+    throw new RangeError(`fieldMetadata length must be a multiple of ${FIELD_DESCRIPTOR_BYTES}`);
   }
-  const fieldCount = metadata.length / 4;
-  if (fieldCount > MAX_FIELDS) {
-    throw new RangeError(`fieldMetadata contains more than ${MAX_FIELDS} fields`);
+  const fieldCount = metadata.length / FIELD_DESCRIPTOR_BYTES;
+  if (fieldCount > MAX_SCHEMA_FIELDS) {
+    throw new RangeError(`fieldMetadata contains more than ${MAX_SCHEMA_FIELDS} fields`);
   }
   if (fieldCount !== batch.columns.length) {
     throw new RangeError(`fieldMetadata field count ${fieldCount} does not match ${batch.columns.length} columns`);
   }
 
+  const descriptors = new DataView(metadata.buffer, metadata.byteOffset, metadata.byteLength);
   for (let fieldIndex = 0; fieldIndex < fieldCount; fieldIndex += 1) {
-    const metadataOffset = fieldIndex * 4;
-    const tag = requiredArrayValue(metadata, metadataOffset, 'fieldMetadata');
-    const nullableByte = requiredArrayValue(metadata, metadataOffset + 1, 'fieldMetadata');
-    const typeParam =
-      requiredArrayValue(metadata, metadataOffset + 2, 'fieldMetadata') |
-      (requiredArrayValue(metadata, metadataOffset + 3, 'fieldMetadata') << 8);
-    if (tag > COMPACT_MAX_KIND_TAG) {
+    const descriptorOffset = fieldIndex * FIELD_DESCRIPTOR_BYTES;
+    const plane = descriptors.getUint8(descriptorOffset + FIELD_DESCRIPTOR.plane);
+    const nullableByte = descriptors.getUint8(descriptorOffset + FIELD_DESCRIPTOR.nullable);
+    const typeParam = descriptors.getUint16(descriptorOffset + FIELD_DESCRIPTOR.typeParam, true);
+    const dictionary = descriptors.getUint16(descriptorOffset + FIELD_DESCRIPTOR.dictionary, true);
+    const indexPlane = descriptors.getUint8(descriptorOffset + FIELD_DESCRIPTOR.indexPlane);
+    if (plane > COMPACT_MAX_KIND_TAG) {
       throw new TypeError(
-        `fieldMetadata field ${fieldIndex} has unknown physical type ${tag} (max ${COMPACT_MAX_KIND_TAG})`,
+        `fieldMetadata field ${fieldIndex} has unknown physical type ${plane} (max ${COMPACT_MAX_KIND_TAG})`,
       );
     }
     if (nullableByte !== 0 && nullableByte !== 1) {
       throw new TypeError(`fieldMetadata field ${fieldIndex} nullable byte must be zero or one`);
     }
-    if (tag === compactKindTag('fixedSizeBinary')) {
+    if (descriptors.getUint8(descriptorOffset + FIELD_DESCRIPTOR.reserved) !== 0) {
+      throw new TypeError(`fieldMetadata field ${fieldIndex} reserved byte must be zero`);
+    }
+    if (plane === FIXED_SIZE_BINARY_PLANE) {
       if (typeParam < 1 || typeParam > MAX_FIXED_SIZE_BINARY_WIDTH) {
         throw new RangeError(
           `fieldMetadata field ${fieldIndex} FixedSizeBinary width must be in 1..${MAX_FIXED_SIZE_BINARY_WIDTH}`,
         );
       }
+    } else if (TEMPORAL_PLANES.includes(plane)) {
+      if (!TIME_UNIT_CODES.includes(typeParam)) {
+        throw new RangeError(`fieldMetadata field ${fieldIndex} unit ${typeParam} is not a TIME_UNIT code`);
+      }
     } else if (typeParam !== 0) {
-      throw new TypeError(`fieldMetadata field ${fieldIndex} padding bytes must be zero`);
+      throw new TypeError(`fieldMetadata field ${fieldIndex} typeParam must be zero for this plane`);
+    }
+
+    // A dictionary-encoded field's own buffers are its index plane's, so the caller supplies that plane's column.
+    let columnPlane = plane;
+    if (dictionary !== DICTIONARY_SLOT.none) {
+      if (!DICTIONARY_INDEX_PLANES.some((candidate) => candidate === indexPlane)) {
+        throw new TypeError(
+          `fieldMetadata field ${fieldIndex} indexPlane ${indexPlane} is not a dictionary index plane`,
+        );
+      }
+      if (plane !== UTF8_PLANE) {
+        throw new TypeError(`fieldMetadata field ${fieldIndex} dictionary values must be utf8`);
+      }
+      columnPlane = indexPlane;
+    } else if (indexPlane !== 0) {
+      throw new TypeError(`fieldMetadata field ${fieldIndex} indexPlane must be zero for a plain column`);
     }
 
     const column = batch.columns[fieldIndex];
     if (typeof column !== 'object' || column === null || !('kind' in column)) {
       throw new TypeError(`columns[${fieldIndex}] must be a CompactColumn`);
     }
-    const expectedTag = compactKindTag(column.kind);
-    if (expectedTag === undefined || expectedTag !== tag) {
+    const columnTag = compactKindTag(column.kind);
+    if (columnTag !== columnPlane) {
       throw new TypeError(
-        `columns[${fieldIndex}] kind ${String(column.kind)} does not match metadata physical type ${tag}`,
+        `columns[${fieldIndex}] kind ${String(column.kind)} does not match metadata physical type ${columnPlane}`,
       );
     }
 
@@ -688,6 +674,8 @@ function validateCompactBatch(batch: CompactBatch): void {
         validateFixedValues(column.data, Int32Array, fieldIndex, rows * 2);
         break;
       case 'i64':
+      case 'timestamp':
+      case 'duration':
         validateFixedValues(column.data, BigInt64Array, fieldIndex, rows);
         break;
       case 'u64':
@@ -737,8 +725,8 @@ function validateCompactBatch(batch: CompactBatch): void {
 
 function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
   let batchLength = checkedAdd(
-    COMPACT_HEADER_SIZE,
-    batch.columns.length * COMPACT_DESCRIPTOR_SIZE,
+    COMPACT.headerSize,
+    batch.columns.length * COMPACT.descriptorSize,
     'Compact descriptor table',
   );
   batchLength = align8(batchLength, 'Compact descriptor table');
@@ -798,6 +786,8 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
         data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
         break;
       case 'i64':
+      case 'timestamp':
+      case 'duration':
       case 'u64':
       case 'f64':
         bufferCount += 2;
@@ -868,8 +858,8 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
       `Compact Arrow output ${formatBytes(exactArrowLength)} exceeds ${formatBytes(MAX_BATCH_OUTPUT_BYTES)}`,
     );
   }
-  const arrowCapacity = Math.max(MIN_COMPACT_ARROW_CAPACITY, exactArrowLength);
-  const outputLength = checkedAdd(WASM_OUTPUT_HEADER_SIZE, arrowCapacity, 'Compact output buffer');
+  const arrowCapacity = Math.max(MIN_ARROW_OUTPUT_CAPACITY, exactArrowLength);
+  const outputLength = checkedAdd(RESULT_HEADER_SIZE, arrowCapacity, 'Compact output buffer');
 
   const schemaOffset = 0;
   const fieldMetaOffset = align8(
@@ -916,15 +906,15 @@ function writeCompactBatch(
 ): void {
   const memory = new Uint8Array(memoryBuffer);
   const view = new DataView(memoryBuffer);
-  view.setUint32(batchPtr, COMPACT_MAGIC, true);
-  view.setUint16(batchPtr + 4, COMPACT_VERSION, true);
-  view.setUint16(batchPtr + 6, COMPACT_DESCRIPTOR_SIZE, true);
+  view.setUint32(batchPtr, COMPACT.magic, true);
+  view.setUint16(batchPtr + 4, COMPACT.version, true);
+  view.setUint16(batchPtr + 6, COMPACT.descriptorSize, true);
   view.setUint32(batchPtr + 8, batch.rowCount, true);
   view.setUint32(batchPtr + 12, batch.columns.length, true);
 
   for (let index = 0; index < layout.columns.length; index += 1) {
     const column = requiredArrayValue(layout.columns, index, 'Compact column layout');
-    const descriptor = batchPtr + COMPACT_HEADER_SIZE + index * COMPACT_DESCRIPTOR_SIZE;
+    const descriptor = batchPtr + COMPACT.headerSize + index * COMPACT.descriptorSize;
     view.setUint8(descriptor, column.tag);
     view.setUint8(descriptor + 1, column.validity === null ? 0 : 1);
     view.setUint16(descriptor + 2, 0, true);
@@ -960,6 +950,11 @@ function readCompactDiagnostic(view: DataView, outputOffset: number): CompactDia
   };
 }
 
+/**
+ * `parse` creates its handle at `WASM_EVENT_CAPACITY` rows, an allocation size. `encode` hands the native compact
+ * path a caller-owned batch of up to `MAX_EVENTS_PER_BATCH` rows without touching the parse plane, so rows beyond
+ * that capacity are not lost.
+ */
 export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): ParseCompactBackend {
   interface CachedHandle {
     readonly handle: number;
@@ -1041,11 +1036,11 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         if (fieldNamesBuffer) {
           memory.set(fieldNamesBuffer, fieldNamesPtr);
         }
-        const fieldCount = config.fieldMetadata.length / 4;
+        const fieldCount = config.fieldMetadata.length / FIELD_DESCRIPTOR_BYTES;
         handle = requireEpHandle(
           fieldNamesBuffer
             ? wasm.ep_create_with_schema_and_names(
-                EP_EVENT_CAPACITY,
+                WASM_EVENT_CAPACITY,
                 schemaPtr,
                 config.schemaBytes.length,
                 fieldMetaPtr,
@@ -1054,7 +1049,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
                 fieldNamesBuffer.length,
               )
             : wasm.ep_create_with_schema(
-                EP_EVENT_CAPACITY,
+                WASM_EVENT_CAPACITY,
                 schemaPtr,
                 config.schemaBytes.length,
                 fieldMetaPtr,
@@ -1072,7 +1067,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
           handle,
           inputPtr,
           inputBytes.length,
-          INPUT_FORMAT_JSON,
+          INPUT_FORMAT.JSON,
           outputPtr,
           layout.outputLength,
         );
@@ -1080,7 +1075,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         destroyCachedHandle();
         throw error;
       }
-      if (result !== RESULT_OK) {
+      if (result !== RESULT_CODE.OK) {
         destroyCachedHandle();
         throw new Error(`ep_create_log_entry failed with code ${result}`);
       }
@@ -1090,7 +1085,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       const arrowOffset = view.getUint32(outputPtr + 4, true);
       const arrowLen = view.getUint32(outputPtr + 8, true);
       const eventsProcessed = view.getUint32(outputPtr + 12, true);
-      if (code !== RESULT_OK) {
+      if (code !== RESULT_CODE.OK) {
         destroyCachedHandle();
         throw new Error(`ep_create_log_entry returned error code ${code}`);
       }
@@ -1128,7 +1123,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         memory.set(batch.schema.fieldMetadata, fieldMetaPtr);
         handle = requireEpHandle(
           wasm.ep_create_with_schema(
-            EP_EVENT_CAPACITY,
+            WASM_EVENT_CAPACITY,
             schemaPtr,
             batch.schema.schemaBytes.length,
             fieldMetaPtr,
@@ -1142,7 +1137,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       writeCompactBatch(wasm.memory.buffer, base + layout.batchOffset, layout, batch);
       const batchPtr = base + layout.batchOffset;
       const outputPtr = base + layout.outputOffset;
-      new Uint8Array(wasm.memory.buffer, outputPtr, WASM_OUTPUT_HEADER_SIZE).fill(0);
+      new Uint8Array(wasm.memory.buffer, outputPtr, RESULT_HEADER_SIZE).fill(0);
       let result: number;
       try {
         result = wasm.ep_compact(handle, batchPtr, layout.batchLength, outputPtr, layout.outputLength);
@@ -1158,7 +1153,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         throw new Error(`ep_compact returned status ${result} but wrote result-header status ${headerStatus}`);
       }
 
-      if (result !== RESULT_OK) {
+      if (result !== RESULT_CODE.OK) {
         throw new CompactEncodingError(result, readCompactDiagnostic(view, outputPtr));
       }
 
@@ -1170,7 +1165,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       const arrowEnd = checkedAdd(arrowStart, arrowLen, 'Compact Arrow end');
       const outputEnd = checkedAdd(outputPtr, layout.outputLength, 'Compact output end');
       if (
-        arrowOffset !== WASM_OUTPUT_HEADER_SIZE ||
+        arrowOffset !== RESULT_HEADER_SIZE ||
         rowsEncoded !== batch.rowCount ||
         duplicates !== 0 ||
         arrowLen > layout.arrowCapacity ||

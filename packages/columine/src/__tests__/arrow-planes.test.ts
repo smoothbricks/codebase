@@ -1,31 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { ARROW_PLANES } from '../arrow-planes.js';
-import { renderRustPlaneDeclarations } from '../arrow-planes-codegen.js';
+import { ARROW_PLANES } from '../event-processor-abi.generated.js';
 
-const SRC = join(import.meta.dir, '..');
-const SCHEMA_RS = join(SRC, '..', 'crates', 'columine-arrow', 'src', 'schema.rs');
-const WRITE = process.env.UPDATE_GENERATED === '1';
-
-/** Committed generated output, refreshed in place when explicitly requested. */
-function expectGenerated(path: string, rendered: string): void {
-  if (WRITE) {
-    if (!existsSync(path) || readFileSync(path, 'utf8') !== rendered) {
-      writeFileSync(path, rendered);
-    }
-    return;
-  }
-  expect(existsSync(path)).toBe(true);
-  expect(readFileSync(path, 'utf8')).toBe(rendered);
-}
-
+//#region smoo/columine!n/vocab-host-table
 describe('arrow plane table', () => {
-  it('generates the committed Rust plane declarations', () => {
-    const source = readFileSync(SCHEMA_RS, 'utf8');
-    expectGenerated(SCHEMA_RS, renderRustPlaneDeclarations(source));
-  });
-
   // Tags are baked into the shipped wasm and every persisted fixture, so a gap
   // means a plane was deleted rather than appended, and a duplicate means two
   // planes decode as one.
@@ -39,7 +16,9 @@ describe('arrow plane table', () => {
     expect(new Set(ARROW_PLANES.map((plane) => plane.variant)).size).toBe(ARROW_PLANES.length);
   });
 });
+//#endregion smoo/columine!n/vocab-host-table
 
+//#region smoo/columine!n/vocab-host-table
 /**
  * The carrier a width-and-signedness name REQUIRES, or `null` when the name
  * does not encode one (`binary`, `bool`, `decimal128`, `intervalDayTime`, …).
@@ -79,7 +58,9 @@ describe('plane names agree with their carriers', () => {
     });
   }
 });
+//#endregion smoo/columine!n/vocab-host-table
 
+//#region smoo/columine!n/vocab-host-table
 /**
  * The TypeScript name a Rust variant REQUIRES, or `null` when the variant name
  * carries no width and signedness (`Binary`, `Bool`, `Decimal128`, …).
@@ -95,11 +76,11 @@ function requiredKind(variant: string): string | null {
 }
 
 /**
- * THE defect, stated as an invariant: tag 1 is `ArrowType::Int32`, a signed
- * plane, and it was named `'u32'` on the TypeScript side. Nothing compared the
- * two names, because each side was internally consistent — `'u32'` did carry a
- * `Uint32Array`. Binding the variant, the tag, the name and the carrier in one
- * row is only half the fix; this is the half that rejects the combination.
+ * Tag 1 is `ArrowType::Int32`, a signed plane, and the name `'u32'` for it
+ * carries a `Uint32Array` that is internally consistent and reads back
+ * sign-flipped. Binding the variant, the tag, the name and the carrier in one
+ * generated row is half the guard; this is the half that rejects the
+ * combination.
  */
 describe('plane names agree across the ABI', () => {
   for (const plane of ARROW_PLANES) {
@@ -113,15 +94,18 @@ describe('plane names agree across the ABI', () => {
     });
   }
 });
+//#endregion smoo/columine!n/vocab-host-table
 
-describe('arrow plane codegen', () => {
-  it('rejects a plane the Rust table does not declare', () => {
-    const source = readFileSync(SCHEMA_RS, 'utf8');
-    expect(() =>
-      renderRustPlaneDeclarations(source, [
-        ...ARROW_PLANES,
-        { kind: 'i128', variant: 'Int128', tag: 23, data: 'BigInt64Array', offsets: null, validity: 'Uint8Array' },
-      ]),
-    ).toThrow(/absent from schema\.rs/);
+//#region smoo/columine!n/vocab-host-table
+describe('temporal planes', () => {
+  // A Timestamp and a Duration are one little-endian i64 per row counting the
+  // field's unit, so the host reads them through the eight-byte signed plane's
+  // typed array.
+  it('are carried by the typed array of the eight-byte signed plane', () => {
+    const carriers = new Map(ARROW_PLANES.map((plane): [string, string | null] => [plane.kind, plane.data]));
+    expect(carriers.get('i64')).toBe('BigInt64Array');
+    expect(carriers.get('timestamp')).toBe(carriers.get('i64'));
+    expect(carriers.get('duration')).toBe(carriers.get('i64'));
   });
 });
+//#endregion smoo/columine!n/vocab-host-table

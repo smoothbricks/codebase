@@ -3,12 +3,16 @@
 use std::borrow::Cow;
 
 use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
-use crate::validate::{encode_segment_into, encoded_segment_len};
-use crate::{
-    ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections, MemberSchema, NullCell,
-    ParseError, PlaneKind, SignalSchemaField, json_extractor::ExtractionError,
-    json_scanner::parse_iso8601_to_micros,
+use crate::validate::{
+    MsgpackValue, SemanticSchema, ValueParseError, encode_segment_into, encoded_segment_len,
+    parse_msgpack_value, push_path_segment,
 };
+use crate::{
+    Carrier, CellWriter, ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections,
+    MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell, SignalSchemaField,
+    json_extractor::ExtractionError,
+};
+use columine_types::category::CategoryImage;
 
 /// Extracts either a concatenated MessagePack map stream or an array of maps.
 pub fn extract_msgpack_events(
@@ -17,6 +21,7 @@ pub fn extract_msgpack_events(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
     stream: bool,
+    image: &mut dyn CategoryImage,
 ) -> Result<usize, ExtractionError> {
     extract_msgpack_events_with_projections(
         input,
@@ -25,6 +30,9 @@ pub fn extract_msgpack_events(
         work_buffer,
         stream,
         FrameProjections::default(),
+        image,
+        &mut CellWriter::Native,
+        &mut Vec::new(),
     )
 }
 
@@ -33,6 +41,10 @@ pub fn extract_msgpack_events(
 /// projection that finds no cell to replace — a frame stored inside a raw
 /// Binary document, say — refuses the batch rather than storing the writer's
 /// layout.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one batch: input, configuration, columns, workspace, framing, projections, the stream image and the value cell writer with its scratch"
+)]
 pub fn extract_msgpack_events_with_projections(
     input: &[u8],
     config: &ExtractionConfig,
@@ -40,6 +52,9 @@ pub fn extract_msgpack_events_with_projections(
     work_buffer: &mut [u8],
     stream: bool,
     projections: FrameProjections<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
 ) -> Result<usize, ExtractionError> {
     if input.is_empty() {
         return Ok(0);
@@ -54,7 +69,16 @@ pub fn extract_msgpack_events_with_projections(
     // follow a full batch.
     if stream {
         while !reader.at_end() {
-            extract_msgpack_event(&mut reader, config, columns, work_buffer, &mut frames)?;
+            extract_msgpack_event(
+                &mut reader,
+                config,
+                columns,
+                work_buffer,
+                &mut frames,
+                image,
+                cells,
+                scratch,
+            )?;
             count += 1;
             if count >= columns.capacity as usize && !reader.at_end() {
                 return Err(ExtractionError::TooManyEvents);
@@ -70,7 +94,16 @@ pub fn extract_msgpack_events_with_projections(
             return Err(ExtractionError::TooManyEvents);
         }
         for _ in 0..size {
-            extract_msgpack_event(&mut reader, config, columns, work_buffer, &mut frames)?;
+            extract_msgpack_event(
+                &mut reader,
+                config,
+                columns,
+                work_buffer,
+                &mut frames,
+                image,
+                cells,
+                scratch,
+            )?;
             count += 1;
         }
     }
@@ -86,12 +119,19 @@ struct FrameWrites<'p> {
     written: usize,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one batch: input, configuration, columns, workspace, framing, projections, the stream image and the value cell writer with its scratch"
+)]
 fn extract_msgpack_event(
     reader: &mut Reader<'_>,
     config: &ExtractionConfig,
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
     frames: &mut FrameWrites<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
     // Parse the map header before opening a row, so an invalid header never
     // leaves a partially initialized row.
@@ -101,7 +141,17 @@ fn extract_msgpack_event(
     if !columns.begin_row() {
         return Err(ExtractionError::TooManyEvents);
     }
-    let result = extract_msgpack_fields(reader, fields, config, columns, work_buffer, frames);
+    let result = extract_msgpack_fields(
+        reader,
+        fields,
+        config,
+        columns,
+        work_buffer,
+        frames,
+        image,
+        cells,
+        scratch,
+    );
     if result.is_err() {
         // Abandon the row on error; failed extraction must not commit it.
         columns.abandon_row();
@@ -109,6 +159,10 @@ fn extract_msgpack_event(
     result
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one batch: input, configuration, columns, workspace, framing, projections, the stream image and the value cell writer with its scratch"
+)]
 fn extract_msgpack_fields(
     reader: &mut Reader<'_>,
     fields: u32,
@@ -116,18 +170,22 @@ fn extract_msgpack_fields(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
     frames: &mut FrameWrites<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
     // Presence is schema-sized state owned by DynamicColumns and allocated
     // once with the column storage. Resetting it per row avoids both the old
     // 64-field ceiling and any per-event allocation.
     columns.columns_seen.fill(false);
+    crate::begin_cells(config, cells)?;
     // A fallback column with an unusably small work buffer (< 5 bytes, where
     // even the MessagePack header cannot fit) is a configuration error. Refuse
     // rather than silently dropping undeclared fields.
-    if config.fallback_column.is_some() && work_buffer.len() < 5 {
+    if config.native_carrier().is_some() && work_buffer.len() < 5 {
         return Err(ExtractionError::WorkBufferTooSmall);
     }
-    let extra_active = config.fallback_column.is_some();
+    let extra_active = config.native_carrier().is_some();
     let mut state = ExtraState {
         count: 0,
         end: 0,
@@ -213,6 +271,9 @@ fn extract_msgpack_fields(
                     member,
                     member_start,
                     member_end,
+                    image,
+                    cells,
+                    scratch,
                 )?;
             }
             continue;
@@ -231,6 +292,9 @@ fn extract_msgpack_fields(
             key,
             key_start,
             key_end,
+            image,
+            cells,
+            scratch,
         )?;
     }
     let extra_count = state.count;
@@ -245,7 +309,7 @@ fn extract_msgpack_fields(
             append(columns, *column, None)?;
         }
     }
-    if let Some(column) = config.fallback_column {
+    if let Some(column) = config.native_carrier() {
         if extra_count == 0 {
             append(columns, column, None)?;
         } else {
@@ -260,6 +324,7 @@ fn extract_msgpack_fields(
             )?;
         }
     }
+    crate::finish_cells(config, columns, cells, scratch)?;
     columns.end_row();
     Ok(())
 }
@@ -347,6 +412,9 @@ fn extract_msgpack_member(
     key: &[u8],
     key_start: usize,
     key_end: usize,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
     let member = std::str::from_utf8(key).ok();
     // A non-UTF-8 member is undeclared by construction: under an open payload
@@ -358,22 +426,74 @@ fn extract_msgpack_member(
             config.lookup_payload_member(discriminant, member.unwrap_or(name), name)
         }),
     }
-    .filter(|lookup| Some(lookup.column) != config.fallback_column);
-    if let Some(lookup) = lookup {
-        let variants = member.and_then(|member| config.enum_ordinals(discriminant, member));
-        extract_typed_value(
-            reader,
-            lookup.field,
-            columns,
-            lookup.column,
-            variants,
-            member.map_or(NullCell::Empty, |member| {
-                config.null_cell(event_type, member)
-            }),
-            frames,
-        )?;
+    .and_then(|lookup| {
+        config
+            .member_write(lookup.column)
+            .map(|write| (lookup, write))
+    });
+    if let Some((lookup, write)) = lookup {
+        let null = member.map_or(NullCell::Empty, |member| {
+            config.null_cell(event_type, member)
+        });
+        match write {
+            MemberWrite::Lane => {
+                let dictionary = config.schema_dictionary(lookup.column);
+                extract_typed_value(
+                    reader,
+                    lookup.field,
+                    columns,
+                    lookup.column,
+                    dictionary,
+                    null,
+                    frames,
+                    image,
+                )?;
+            }
+            MemberWrite::Seam(cell) => {
+                let capture = match member_schema {
+                    MemberSchema::Declared(schema) => member
+                        .filter(|name| config.is_open_payload_path(name))
+                        .map(|name| (schema, name)),
+                    MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
+                };
+                seam_member(
+                    reader,
+                    config,
+                    columns,
+                    lookup.column,
+                    cell,
+                    capture,
+                    null,
+                    frames,
+                    cells,
+                    scratch,
+                )?;
+            }
+        }
         columns.columns_seen[lookup.column] = true;
         return Ok(());
+    }
+    // A declared payload member without a column lives in the row's
+    // declared record, under its routing row.
+    if let MemberSchema::Declared(_) = member_schema
+        && let Some(member) = member
+        && let Some(row) = config.record_route(discriminant, member)
+    {
+        let value = msgpack_value(reader)?;
+        return crate::record_cell(row, &value, config.null_cell(event_type, member), cells);
+    }
+    match config.carrier() {
+        Carrier::Embedder(_) => {
+            // The embedder's carrier is keyed by text paths: a key that is
+            // not UTF-8 has none.
+            let name = member.ok_or(ExtractionError::InvalidFieldType)?;
+            let value = msgpack_value(reader)?;
+            let mut path = String::new();
+            push_path_segment(&mut path, name).map_err(|_| ExtractionError::MemoryExhausted)?;
+            return crate::undeclared_cell(config, &path, &value, cells);
+        }
+        Carrier::Raw => return Err(ExtractionError::InvalidFieldType),
+        Carrier::Absent | Carrier::Native(_) => {}
     }
     if !state.active {
         reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
@@ -433,21 +553,50 @@ fn extract_msgpack_member(
 /// The Arrow-plane coercion table is one contract, shared in spirit with
 /// `json_extractor::extract_typed_value`, and keyed on plane KIND so that
 /// twenty-three planes reduce to eight coercions. MessagePack carries markers
-/// that prove an integer is an integer, so nothing here truncates a float.
+/// that prove an integer is an integer, so nothing here truncates a float. A
+/// dictionary-encoded column is decided by its dictionary before its plane: a
+/// text stores its index, and anything else but nil is refused.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the typed fill of one member: its plane, its schema dictionary, the stream image, its null and the frame projections"
+)]
 fn extract_typed_value(
     reader: &mut Reader<'_>,
     field: SignalSchemaField,
     columns: &mut DynamicColumns,
     column: usize,
-    enum_variants: Option<&[String]>,
+    dictionary: Option<&[Option<String>]>,
     null: NullCell,
     frames: &mut FrameWrites<'_>,
+    image: &mut dyn CategoryImage,
 ) -> Result<(), ExtractionError> {
     let first = *reader
         .input()
         .get(reader.position())
         .ok_or(ExtractionError::InvalidJson)?;
     let kind = field.plane_kind();
+    if let Some(encoding) = field.dictionary {
+        let value = if first == 0xc0 {
+            reader.skip_value();
+            None
+        } else if Reader::is_string(first) {
+            // A text must be UTF-8 before the dictionary or the image sees it.
+            let text = std::str::from_utf8(
+                reader
+                    .read_string()
+                    .ok_or(ExtractionError::InvalidFieldType)?,
+            )
+            .map_err(|_| ExtractionError::InvalidFieldType)?;
+            let index = crate::dictionary_index(encoding.slot, dictionary, text, image)?;
+            if !kind.holds_uint(index) {
+                return Err(ExtractionError::InvalidFieldType);
+            }
+            Some(ColumnValue::UInt(index))
+        } else {
+            return Err(ExtractionError::InvalidFieldType);
+        };
+        return append(columns, column, value);
+    }
     let value = match kind {
         PlaneKind::Text { .. } => {
             if first == 0xc0 {
@@ -465,11 +614,11 @@ fn extract_typed_value(
             }
         }
         // Integer planes take integers only, range-checked to the plane's
-        // width. The eight-byte signed plane additionally takes
-        // bigint-as-string and ISO-8601 instants, because a 64-bit value does
-        // not survive a JSON number and the cross-format contract keeps the
-        // two extractors interchangeable; the eight-byte unsigned plane takes
-        // the string form for the same reason.
+        // width. The eight-byte planes additionally take a decimal string,
+        // because a 64-bit value does not survive a JSON number and the
+        // cross-format contract keeps the two extractors interchangeable; a
+        // Timestamp column also takes an RFC 3339 instant, converted
+        // exactly to its unit.
         PlaneKind::SignedInt { width } => {
             if first == 0xc0 {
                 reader.skip_value();
@@ -493,19 +642,6 @@ fn extract_typed_value(
                     return Err(ExtractionError::InvalidFieldType);
                 }
                 Some(ColumnValue::Int(wide))
-            } else if let Some(variants) = enum_variants.filter(|_| Reader::is_string(first)) {
-                // The admission wire spells an enum as its string; the column
-                // holds the ordinal, which is the variant's declared index.
-                let text = reader
-                    .read_string()
-                    .ok_or(ExtractionError::InvalidFieldType)?;
-                let ordinal = variants
-                    .iter()
-                    .position(|variant| variant.as_bytes() == text)
-                    .ok_or(ExtractionError::InvalidFieldType)?;
-                Some(ColumnValue::Int(
-                    i64::try_from(ordinal).map_err(|_| ExtractionError::InvalidFieldType)?,
-                ))
             } else if width == 8 && Reader::is_ext(first) {
                 // The canonical bigint extension, the bigint spelling on both
                 // wires; a magnitude past i64 does not fit the plane.
@@ -523,12 +659,9 @@ fn extract_typed_value(
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 )
                 .map_err(|_| ExtractionError::InvalidFieldType)?;
-                let micros = match text.parse::<i64>() {
-                    Ok(value) => value,
-                    Err(_) => parse_iso8601_to_micros(text)
-                        .map_err(|_| ExtractionError::InvalidFieldType)?,
-                };
-                Some(ColumnValue::Int(micros))
+                Some(ColumnValue::Int(
+                    crate::signed_text(field, text).ok_or(ExtractionError::InvalidFieldType)?,
+                ))
             } else {
                 return Err(ExtractionError::InvalidFieldType);
             }
@@ -640,14 +773,7 @@ fn extract_typed_value(
                 // second decode after Arrow materialization and preserves raw
                 // bytes. A value-object frame the admission projected into the
                 // reader's layout is stored as its certified bytes instead.
-                let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
-                let payload = match frames.projections.certified(payload) {
-                    Some(certified) => {
-                        frames.written += 1;
-                        certified
-                    }
-                    None => payload,
-                };
+                let payload = certified_bin(reader, frames)?;
                 Some(ColumnValue::Binary(Cow::Borrowed(payload)))
             } else {
                 // External standard MessagePack may provide a structured value
@@ -697,10 +823,137 @@ fn integral_float(reader: &mut Reader<'_>) -> Result<i64, ExtractionError> {
     Ok(value as i64)
 }
 
+/// A `bin` payload, or the certified bytes of the value-object frame the
+/// admission projected from exactly that payload.
+fn certified_bin<'s, 'i: 's, 'p: 's>(
+    reader: &mut Reader<'i>,
+    frames: &mut FrameWrites<'p>,
+) -> Result<&'s [u8], ExtractionError> {
+    let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+    Ok(match frames.projections.certified(payload) {
+        Some(certified) => {
+            frames.written += 1;
+            certified
+        }
+        None => payload,
+    })
+}
+
+/// One member whose column the value-cell seam rules
+/// (specs/columine/10-physical-vocabulary.md §7, §8): the embedder writes a
+/// structured member's cell; a text stores the hash the embedder computes,
+/// from its text or from a 32-byte `bin` hash; and a raw Binary column takes
+/// a `bin` payload or a projected frame's certified bytes, nothing structured.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam cell: its column and kind, its open-path capture and null rule, the frame projections, the writer and its scratch"
+)]
+fn seam_member(
+    reader: &mut Reader<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    column: usize,
+    cell: SeamCell,
+    capture: Option<(&SemanticSchema, &str)>,
+    null: NullCell,
+    frames: &mut FrameWrites<'_>,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    let first = *reader
+        .input()
+        .get(reader.position())
+        .ok_or(ExtractionError::InvalidJson)?;
+    match cell {
+        SeamCell::Embedder => {
+            let value = msgpack_value(reader)?;
+            crate::member_cell(
+                config, columns, column, &value, null, capture, cells, scratch,
+            )
+        }
+        SeamCell::Raw => {
+            let value = if first == 0xc0 {
+                reader.skip_value();
+                None
+            } else if matches!(first, 0xc4..=0xc6) {
+                Some(ColumnValue::Binary(Cow::Borrowed(certified_bin(
+                    reader, frames,
+                )?)))
+            } else {
+                return Err(ExtractionError::InvalidFieldType);
+            };
+            append(columns, column, value)
+        }
+        SeamCell::TextHash { inline } => {
+            if first == 0xc0 {
+                reader.skip_value();
+                Ok(())
+            } else if matches!(first, 0xc4..=0xc6) {
+                let hash = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+                crate::text_hash_cell(columns, column, hash, cells)
+            } else if Reader::is_string(first) {
+                let text = std::str::from_utf8(
+                    reader
+                        .read_string()
+                        .ok_or(ExtractionError::InvalidFieldType)?,
+                )
+                .map_err(|_| ExtractionError::InvalidFieldType)?;
+                crate::text_cell(columns, column, inline, text, cells)
+            } else {
+                Err(ExtractionError::InvalidFieldType)
+            }
+        }
+    }
+}
+
+/// The next MessagePack value, whole, as the borrowed view a value cell
+/// writer reads.
+fn msgpack_value<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, ExtractionError> {
+    parse_msgpack_value(reader, 0).map_err(|error| match error {
+        ValueParseError::OutOfMemory => ExtractionError::MemoryExhausted,
+        ValueParseError::InvalidJson
+        | ValueParseError::InvalidMsgpack
+        | ValueParseError::InvalidNumber
+        | ValueParseError::TooDeep => ExtractionError::InvalidJson,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ArrowType, CellExt, SignalSchemaField, build_extraction_config};
+    use columine_arrow::{DictionarySlot, IndexWidth, SchemaDictionary, TimeUnit};
+    use columine_types::category::{CategoryRefusal, ListImage, NoCategories};
+
+    /// [`extract_msgpack_events`] for a schema with no stream-dictionary column.
+    fn extract(
+        input: &[u8],
+        config: &ExtractionConfig,
+        columns: &mut DynamicColumns,
+        work: &mut [u8],
+        stream: bool,
+    ) -> Result<usize, ExtractionError> {
+        extract_msgpack_events(input, config, columns, work, stream, &mut NoCategories)
+    }
+
+    fn encoded(slot: DictionarySlot) -> SignalSchemaField {
+        SignalSchemaField::new_dictionary(slot, IndexWidth::U8, true)
+    }
+
+    /// `{key: <value>}` with `value` already encoded.
+    fn one_member(key: &str, value: &[u8]) -> Vec<u8> {
+        let mut event = vec![0x81];
+        str_(&mut event, key);
+        event.extend(value);
+        event
+    }
+
+    /// A MessagePack str of `text` (under 32 bytes).
+    fn text(text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        str_(&mut out, text);
+        out
+    }
     fn field(arrow_type: ArrowType) -> SignalSchemaField {
         SignalSchemaField::new(arrow_type, true)
     }
@@ -739,6 +992,9 @@ mod tests {
                 &mut work,
                 true,
                 FrameProjections::new(&pairs),
+                &mut NoCategories,
+                &mut crate::CellWriter::Native,
+                &mut Vec::new(),
             ),
             Ok(1)
         );
@@ -771,6 +1027,9 @@ mod tests {
                 &mut work,
                 true,
                 FrameProjections::new(&pairs),
+                &mut NoCategories,
+                &mut crate::CellWriter::Native,
+                &mut Vec::new(),
             ),
             Err(ExtractionError::UnwrittenProjection)
         );
@@ -793,8 +1052,10 @@ mod tests {
         let config = crate::build_extraction_config_with_semantic_schemas(
             &fields,
             &["type", "value.note", crate::UNDECLARED_COLUMN_NAME],
+            &[],
             Some(&schemas),
             None,
+            crate::CellLayout::default(),
         )
         .unwrap();
         let event = |event_type: &str, type_first: bool| {
@@ -823,7 +1084,7 @@ mod tests {
         for type_first in [true, false] {
             let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
             let mut work = [0; 64];
-            extract_msgpack_events(
+            extract(
                 &event("a", type_first),
                 &config,
                 &mut columns,
@@ -836,14 +1097,14 @@ mod tests {
         }
         let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
-        extract_msgpack_events(&event("b", true), &config, &mut columns, &mut work, true).unwrap();
+        extract(&event("b", true), &config, &mut columns, &mut work, true).unwrap();
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
         assert_eq!(columns.cell(2, 0), None);
     }
 
     /// A JavaScript number above u32 arrives as float64 under standard
     /// MessagePack (the 64-bit integer markers are reserved for BigInt), and
-    /// every microsecond timestamp is such a number.
+    /// every nanosecond timestamp is such a number.
     #[test]
     fn an_integral_float_lands_in_an_integer_plane_and_a_fraction_does_not() {
         let fields = [field(ArrowType::Utf8), field(ArrowType::Int64)];
@@ -857,7 +1118,7 @@ mod tests {
         let mut work = [0; 64];
         let config = config(&fields, &["id", "timestamp"]);
         assert_eq!(
-            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            extract(&input, &config, &mut columns, &mut work, true),
             Ok(1)
         );
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Int(4_294_967_296)));
@@ -870,7 +1131,7 @@ mod tests {
         fraction.extend(1.5_f64.to_be_bytes());
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
-            extract_msgpack_events(&fraction, &config, &mut columns, &mut work, true),
+            extract(&fraction, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
         );
     }
@@ -879,14 +1140,26 @@ mod tests {
     /// discriminated member under its plain name; both must land in the
     /// column the flat lane writes, selected by the discriminant.
     #[test]
-    fn nested_payload_resolves_discriminated_columns_and_enum_ordinals() {
+    fn nested_payload_resolves_discriminated_columns_and_enum_indexes() {
         use crate::validate::parse_schema_envelope;
         let fields = [
             field(ArrowType::Utf8),
             field(ArrowType::Utf8),
-            field(ArrowType::Int32),
-            field(ArrowType::Int32),
+            encoded(DictionarySlot::Schema(0)),
+            encoded(DictionarySlot::Schema(1)),
             field(ArrowType::Utf8),
+        ];
+        let dictionaries = [
+            SchemaDictionary {
+                slot: DictionarySlot::Schema(0),
+                arrow_ids: vec![0],
+                values: vec![Some("achieved".into()), Some("stuck".into())],
+            },
+            SchemaDictionary {
+                slot: DictionarySlot::Schema(1),
+                arrow_ids: vec![1],
+                values: vec![Some("human".into())],
+            },
         ];
         let names = [
             "id",
@@ -917,8 +1190,10 @@ mod tests {
         let config = crate::build_extraction_config_with_semantic_schemas(
             &fields,
             &names,
+            &dictionaries,
             Some(&envelope),
             Some(&discriminator),
+            crate::CellLayout::default(),
         )
         .unwrap();
         // {"id":"e","type":"close","value":{"authorRole":"human","outcome":"stuck"}}
@@ -936,17 +1211,17 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 256];
         assert_eq!(
-            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            extract(&input, &config, &mut columns, &mut work, true),
             Ok(1)
         );
         assert_eq!(
             columns.cell(2, 0),
-            Some(ColumnValue::Int(1)),
-            "enum string became its ordinal"
+            Some(ColumnValue::UInt(1)),
+            "enum string became its dictionary index"
         );
         assert_eq!(
             columns.cell(3, 0),
-            Some(ColumnValue::Int(0)),
+            Some(ColumnValue::UInt(0)),
             "close's authorRole landed in close's column"
         );
         assert_eq!(
@@ -967,13 +1242,13 @@ mod tests {
         str_(&mut other, "agent");
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
-            extract_msgpack_events(&other, &config, &mut columns, &mut work, true),
+            extract(&other, &config, &mut columns, &mut work, true),
             Ok(1)
         );
         assert_eq!(columns.cell(4, 0), Some(ColumnValue::Utf8("agent".into())));
         assert_eq!(columns.cell(3, 0), None);
 
-        // A string outside the declared variants is not an ordinal.
+        // A string outside the enum's dictionary is refused.
         let mut bad = vec![0x83];
         str_(&mut bad, "id");
         str_(&mut bad, "e3");
@@ -985,7 +1260,7 @@ mod tests {
         str_(&mut bad, "abandoned");
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
-            extract_msgpack_events(&bad, &config, &mut columns, &mut work, true),
+            extract(&bad, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
         );
     }
@@ -1004,10 +1279,7 @@ mod tests {
         row.extend([0xc7, 2, 20, 1, 7]);
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         let mut work = [0; 64];
-        assert_eq!(
-            extract_msgpack_events(&row, &config, &mut columns, &mut work, true),
-            Ok(1)
-        );
+        assert_eq!(extract(&row, &config, &mut columns, &mut work, true), Ok(1));
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Int(-7)));
 
         let mut wide = vec![0x82];
@@ -1018,7 +1290,7 @@ mod tests {
         wide.extend([1; 9]);
         let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
         assert_eq!(
-            extract_msgpack_events(&wide, &config, &mut columns, &mut work, true),
+            extract(&wide, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
         );
     }
@@ -1050,7 +1322,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 1024];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", "type", "timestamp", "value.qty"]),
                 &mut columns,
@@ -1096,7 +1368,7 @@ mod tests {
         );
 
         assert_eq!(
-            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            extract(&input, &config, &mut columns, &mut work, true),
             Ok(2)
         );
         assert_eq!(columns.cell(1, 0), None);
@@ -1117,7 +1389,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id"]),
                 &mut columns,
@@ -1130,7 +1402,7 @@ mod tests {
         two.extend_from_slice(&input);
         let mut columns2 = DynamicColumns::new(&fields, 1).expect("column plane fits");
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &two,
                 &config(&fields, &["id"]),
                 &mut columns2,
@@ -1155,7 +1427,7 @@ mod tests {
             let mut work = [0; 64];
 
             assert_eq!(
-                extract_msgpack_events(
+                extract(
                     &input,
                     &config(&fields, &name_refs),
                     &mut columns,
@@ -1194,7 +1466,7 @@ mod tests {
         let mut work = [0; 64];
 
         assert_eq!(
-            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            extract(&input, &config, &mut columns, &mut work, true),
             Ok(2)
         );
         assert_eq!(
@@ -1217,7 +1489,7 @@ mod tests {
         let mut work = [0; 64];
 
         assert_eq!(
-            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            extract(&input, &config, &mut columns, &mut work, true),
             Ok(1)
         );
         assert_eq!(columns.cell(0, 0), Some(ColumnValue::Utf8("last".into())));
@@ -1237,7 +1509,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 4];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut columns,
@@ -1257,7 +1529,7 @@ mod tests {
         input.push(42);
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
-        extract_msgpack_events(
+        extract(
             &input,
             &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
             &mut columns,
@@ -1285,7 +1557,7 @@ mod tests {
         input.push(7);
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
-        extract_msgpack_events(
+        extract(
             &input,
             &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
             &mut columns,
@@ -1314,7 +1586,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", "value.note"]),
                 &mut columns,
@@ -1343,7 +1615,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut columns,
@@ -1374,7 +1646,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 128];
         assert!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", "value.note"]),
                 &mut columns,
@@ -1397,7 +1669,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &input,
                 &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut columns,
@@ -1415,7 +1687,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &[],
                 &config(&fields, &["id"]),
                 &mut columns,
@@ -1432,7 +1704,7 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 10).expect("column plane fits");
         let mut work = [0; 64];
         assert_eq!(
-            extract_msgpack_events(
+            extract(
                 &[0x90],
                 &config(&fields, &["id"]),
                 &mut columns,
@@ -1443,6 +1715,203 @@ mod tests {
             0
         );
     }
+
+    //#region smoo/columine!n/vocab-temporal-instant
+    /// 2024-01-15T10:30:00Z in seconds since the epoch.
+    const BASE_SECONDS: i64 = 19_737 * 86_400 + 37_800;
+
+    /// The one cell of an \`at\` column of \`field\`, from encoded \`value\`.
+    fn temporal(
+        field: SignalSchemaField,
+        value: &[u8],
+    ) -> Result<Option<ColumnValue<'static>>, ExtractionError> {
+        let fields = [field];
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
+        extract(
+            &one_member("at", value),
+            &config(&fields, &["at"]),
+            &mut columns,
+            &mut [0; 64],
+            true,
+        )?;
+        Ok(columns.cell(0, 0))
+    }
+
+    #[test]
+    fn an_instant_is_stored_in_the_timestamp_unit() {
+        let instant = text("2024-01-15T10:30:00.123Z");
+        assert_eq!(
+            temporal(
+                SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, true),
+                &instant
+            ),
+            Ok(Some(ColumnValue::Int(
+                BASE_SECONDS * 1_000_000_000 + 123_000_000
+            )))
+        );
+        assert_eq!(
+            temporal(
+                SignalSchemaField::new_timestamp(TimeUnit::Millisecond, true),
+                &instant
+            ),
+            Ok(Some(ColumnValue::Int(BASE_SECONDS * 1_000 + 123)))
+        );
+        assert_eq!(
+            temporal(
+                SignalSchemaField::new_timestamp(TimeUnit::Second, true),
+                &text("2024-01-15T10:30:00Z")
+            ),
+            Ok(Some(ColumnValue::Int(BASE_SECONDS)))
+        );
+        let mut integer = vec![0xd3];
+        integer.extend(1_705_314_600_i64.to_be_bytes());
+        assert_eq!(
+            temporal(
+                SignalSchemaField::new_timestamp(TimeUnit::Second, true),
+                &integer
+            ),
+            Ok(Some(ColumnValue::Int(1_705_314_600)))
+        );
+    }
+
+    #[test]
+    fn an_instant_finer_than_the_timestamp_unit_is_refused() {
+        assert_eq!(
+            temporal(
+                SignalSchemaField::new_timestamp(TimeUnit::Millisecond, true),
+                &text("2024-01-15T10:30:00.123456789Z")
+            ),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+
+    #[test]
+    fn an_int64_column_refuses_an_instant() {
+        assert_eq!(
+            temporal(field(ArrowType::Int64), &text("2024-01-15T10:30:00Z")),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+    //#endregion smoo/columine!n/vocab-temporal-instant
+
+    //#region smoo/columine!n/vocab-temporal-planes
+    #[test]
+    fn a_duration_column_takes_an_integer_and_refuses_an_instant() {
+        let duration = SignalSchemaField::new_duration(TimeUnit::Microsecond, true);
+        assert_eq!(
+            temporal(duration, &[0xd1, 0xfa, 0x24]),
+            Ok(Some(ColumnValue::Int(-1_500)))
+        );
+        assert_eq!(
+            temporal(duration, &text("2024-01-15T10:30:00Z")),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+    //#endregion smoo/columine!n/vocab-temporal-planes
+
+    //#region smoo/columine!n/vocab-enum-dictionary
+    #[test]
+    fn an_enum_text_stores_its_index_and_an_unknown_one_is_refused() {
+        let fields = [encoded(DictionarySlot::Schema(0))];
+        let dictionaries = [SchemaDictionary {
+            slot: DictionarySlot::Schema(0),
+            arrow_ids: vec![0],
+            values: vec![Some("achieved".into()), None, Some("stuck".into())],
+        }];
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["outcome"],
+            &dictionaries,
+            None,
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let mut input = one_member("outcome", &text("stuck"));
+        input.extend(one_member("outcome", &[0xc0]));
+        let mut columns = DynamicColumns::new(&fields, 4).expect("column plane fits");
+        assert_eq!(
+            extract(&input, &config, &mut columns, &mut [0; 64], true),
+            Ok(2)
+        );
+        assert_eq!(columns.cell(0, 0), Some(ColumnValue::UInt(2)));
+        assert_eq!(columns.cell(0, 1), None);
+        for refused in [
+            text("abandoned"),
+            vec![0x01],
+            // A str that is not UTF-8 never reaches the dictionary.
+            vec![0xa2, 0xff, 0xfe],
+        ] {
+            let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
+            assert_eq!(
+                extract(
+                    &one_member("outcome", &refused),
+                    &config,
+                    &mut columns,
+                    &mut [0; 64],
+                    true
+                ),
+                Err(ExtractionError::InvalidFieldType),
+                "{refused:?}"
+            );
+        }
+    }
+    //#endregion smoo/columine!n/vocab-enum-dictionary
+
+    //#region smoo/columine!n/vocab-stream-dictionary
+    #[test]
+    fn a_stream_dictionary_column_stores_the_image_ordinals() {
+        let fields = [encoded(DictionarySlot::Stream)];
+        let config = config(&fields, &["state"]);
+        let mut input = Vec::new();
+        for state in ["open", "closed", "open"] {
+            input.extend(one_member("state", &text(state)));
+        }
+        let mut columns = DynamicColumns::new(&fields, 4).expect("column plane fits");
+        let mut image = ListImage::new(8, 32);
+        assert_eq!(
+            extract_msgpack_events(
+                &input,
+                &config,
+                &mut columns,
+                &mut [0; 64],
+                true,
+                &mut image
+            ),
+            Ok(3)
+        );
+        assert_eq!(columns.cell(0, 0), Some(ColumnValue::UInt(0)));
+        assert_eq!(columns.cell(0, 1), Some(ColumnValue::UInt(1)));
+        assert_eq!(columns.cell(0, 2), Some(ColumnValue::UInt(0)));
+        assert_eq!(image.len(), 2);
+        assert_eq!(image.value(1), Some("closed"));
+    }
+    //#endregion smoo/columine!n/vocab-stream-dictionary
+
+    //#region smoo/columine!n/vocab-image-limit
+    #[test]
+    fn a_value_past_the_image_limit_is_a_category_refusal() {
+        let fields = [encoded(DictionarySlot::Stream)];
+        let config = config(&fields, &["state"]);
+        let mut input = one_member("state", &text("open"));
+        input.extend(one_member("state", &text("closed")));
+        let mut columns = DynamicColumns::new(&fields, 4).expect("column plane fits");
+        assert_eq!(
+            extract_msgpack_events(
+                &input,
+                &config,
+                &mut columns,
+                &mut [0; 64],
+                true,
+                &mut ListImage::new(1, 32),
+            ),
+            Err(ExtractionError::Category(CategoryRefusal::Full {
+                limit: 1
+            }))
+        );
+        assert_eq!(columns.count(), 1);
+    }
+    //#endregion smoo/columine!n/vocab-image-limit
 }
 
 #[cfg(test)]

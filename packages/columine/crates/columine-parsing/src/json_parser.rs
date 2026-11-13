@@ -732,6 +732,15 @@ impl<'a> JsonParser<'a> {
         }
         Ok(end)
     }
+
+    /// Read the next value whole and answer its bytes: the token that
+    /// starts it through the token that ends it.
+    pub(crate) fn next_value_span(&mut self) -> Result<&'a [u8], ParserError> {
+        let first = self.next_spanned()?;
+        let start = first.start;
+        let end = self.skip_value_from(first)?;
+        self.input.get(start..end).ok_or(ParserError::InvalidJson)
+    }
 }
 
 fn hex(byte: u8) -> Result<u32, ParserError> {

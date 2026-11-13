@@ -29,9 +29,14 @@ export interface EncodedArrowSchema {
   /** One complete framed Arrow IPC Schema message. */
   readonly schemaBytes: Uint8Array;
   /**
-   * Four bytes per field: `[tag u8, nullable u8, typeParam u16 LE]`.
-   * `typeParam` is the FixedSizeBinary byte width for tag 19 and must be 0
-   * for every other tag.
+   * One eight-byte descriptor per field, written by `encodeFieldDescriptor`:
+   * `[plane u8, nullable u8, typeParam u16 LE, dictionary u16 LE, indexPlane u8, 0]`
+   * (`FIELD_DESCRIPTOR` gives the offsets). `plane` is the plane of the field's
+   * values. `typeParam` is the FixedSizeBinary byte width or the unit of a
+   * Timestamp or Duration (`TIME_UNIT`), and must be 0 for every other plane.
+   * `dictionary` is 0 for a plain column; a nonzero slot (`DICTIONARY_SLOT`)
+   * makes a utf8 field dictionary-encoded, and `indexPlane` is then the u8, u16
+   * or u32 plane of its indexes.
    */
   readonly fieldMetadata: Uint8Array;
 }
@@ -44,16 +49,20 @@ export interface ParseConfig extends EncodedArrowSchema {
 /**
  * A physical Arrow column accepted by Compact.
  *
- * Nested and dictionary-encoded types (List, LargeList, FixedSizeList, Struct,
- * Union, Map, RunEndEncoded, Dictionary) are excluded: the retained-metadata
- * contract encodes at most three buffers per field (`max_buffers =
- * MAX_SCHEMA_FIELDS * 3`). Nested types need a different layout contract, not
- * another enum arm.
+ * Nested types (List, LargeList, FixedSizeList, Struct, Union, Map,
+ * RunEndEncoded) are excluded: a nested type owns child fields with their own
+ * buffers, so it needs a recursive descriptor, not another enum arm. A
+ * dictionary-encoded field is supplied as the column of its index plane (`u8`,
+ * `u16` or `u32`); its dictionary's values travel in their own messages. This
+ * backend creates handles with `ep_create_with_schema[_and_names]`, which take
+ * no dictionary table.
  *
  * `kind` names the physical plane and each arm's typed array is the carrier
  * that plane's encoder reads — a kind/carrier disagreement cannot be
- * expressed. Date32/Time32 ride `i32`; Date64/Time64/Timestamp/Duration ride
- * `i64`. Interval does not: its elements are not scalars.
+ * expressed. Date32/Time32 ride `i32` and Date64/Time64 ride `i64`; Timestamp
+ * and Duration have the planes `timestamp` and `duration`, carried by a
+ * `BigInt64Array` like `i64`, with the unit in the descriptor's `typeParam`.
+ * Interval does not ride a scalar plane: its elements are not scalars.
  *
  * `f16` carries raw IEEE-754 half bits in a `Uint16Array` (Float16Array is
  * not baseline). `intervalDayTime` is two `i32` values per row (days,

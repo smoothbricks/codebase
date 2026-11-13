@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 
-import { createParseCompactWasmBackend, type EventProcessorWasmExports } from '../parse-backend.js';
+import { compactKindTag } from '../arrow-planes.js';
+import { FIELD_DESCRIPTOR } from '../event-processor-abi.generated.js';
+import {
+  createParseCompactWasmBackend,
+  type EventProcessorWasmExports,
+  encodeFieldDescriptor,
+} from '../parse-backend.js';
 
 const OUTPUT_HEADER_BYTES = 32;
+const I32_FIELD = encodeFieldDescriptor({ plane: compactKindTag('i32'), nullable: false });
+const F64_FIELD = encodeFieldDescriptor({ plane: compactKindTag('f64'), nullable: false });
 
 interface ParseInvocation {
   handle: number;
@@ -34,6 +42,11 @@ function createMockEventProcessor(options: MockEventProcessorOptions = {}) {
       return handle;
     },
     ep_create_with_schema_and_names: () => {
+      const handle = nextHandle++;
+      createCalls.push(handle);
+      return handle;
+    },
+    ep_create_with_schema_and_dictionaries: () => {
       const handle = nextHandle++;
       createCalls.push(handle);
       return handle;
@@ -82,7 +95,7 @@ describe('parse backend dynamic memory layout', () => {
 
     const result = backend.parse(input, {
       schemaBytes: new Uint8Array([1, 2, 3]),
-      fieldMetadata: new Uint8Array([1, 0, 0, 0]),
+      fieldMetadata: I32_FIELD,
     });
 
     const afterBytes = mock.exports.memory.buffer.byteLength;
@@ -99,7 +112,7 @@ describe('parse backend dynamic memory layout', () => {
     const input = new Uint8Array(1024 * 1024);
     const config = {
       schemaBytes: new Uint8Array([1, 2, 3, 4]),
-      fieldMetadata: new Uint8Array([1, 0, 0, 0, 2, 0, 0, 0]),
+      fieldMetadata: new Uint8Array([...I32_FIELD, ...F64_FIELD]),
       fieldNames: ['id', 'name'],
     };
 
@@ -119,7 +132,7 @@ describe('parse backend dynamic memory layout', () => {
     expect(() => {
       backend.parse(veryLargeInput, {
         schemaBytes: new Uint8Array([1]),
-        fieldMetadata: new Uint8Array([1, 0, 0, 0]),
+        fieldMetadata: I32_FIELD,
       });
     }).toThrow(/configured cap|exceeds max batch input/i);
   });
@@ -133,8 +146,10 @@ describe('parse backend EventProcessor lifecycle', () => {
 
     const schemaA = new Uint8Array([1, 2, 3, 4]);
     const schemaB = new Uint8Array([1, 9, 3, 4]);
-    const metadataA = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-    const metadataB = new Uint8Array([1, 9, 3, 4, 5, 6, 7, 8]);
+    const metadataA = encodeFieldDescriptor({ plane: compactKindTag('i32'), nullable: true });
+    // One descriptor byte apart: the cached handle is keyed by the exact bytes.
+    const metadataB = metadataA.slice();
+    metadataB[FIELD_DESCRIPTOR.nullable] = 0;
 
     backend.parse(input, {
       schemaBytes: schemaA,
@@ -174,7 +189,7 @@ describe('parse backend EventProcessor lifecycle', () => {
     const backend = createParseCompactWasmBackend(mock.exports);
     const config = {
       schemaBytes: new Uint8Array([1, 2, 3]),
-      fieldMetadata: new Uint8Array([1, 0, 0, 0]),
+      fieldMetadata: I32_FIELD,
     };
 
     expect(() => backend.parse(new Uint8Array([1]), config)).toThrow('ep_create_log_entry failed with code 7');
@@ -191,7 +206,7 @@ describe('parse backend EventProcessor lifecycle', () => {
   it('destroys the cached handle for reported header errors and thrown calls', () => {
     const config = {
       schemaBytes: new Uint8Array([1, 2, 3]),
-      fieldMetadata: new Uint8Array([1, 0, 0, 0]),
+      fieldMetadata: I32_FIELD,
     };
     const headerFailure = createMockEventProcessor({ headerCodes: [9] });
     const headerBackend = createParseCompactWasmBackend(headerFailure.exports);
@@ -210,7 +225,7 @@ describe('parse backend EventProcessor lifecycle', () => {
     const backend = createParseCompactWasmBackend(mock.exports);
     const config = {
       schemaBytes: new Uint8Array([1, 2, 3]),
-      fieldMetadata: new Uint8Array([1, 0, 0, 0]),
+      fieldMetadata: I32_FIELD,
     };
 
     backend.parse(new Uint8Array([1]), config);

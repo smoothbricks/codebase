@@ -810,7 +810,8 @@ impl DynamicColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ArrowType, SignalSchemaField};
+    use crate::schema::{ArrowType, DictionarySlot, IndexWidth, SignalSchemaField};
+    use arrow_schema::TimeUnit;
 
     #[test]
     fn parse_error_codes_match_ts() {
@@ -1230,4 +1231,75 @@ mod tests {
             assert_eq!(storage.data_capacity(), expected, "{kind:?}");
         }
     }
+
+    //#region smoo/columine!n/vocab-temporal-planes
+
+    /// A Timestamp or Duration column is an eight-byte signed plane whose unit
+    /// is the descriptor's: the store holds exactly the counts a producer wrote
+    /// and takes no text.
+    #[test]
+    fn a_temporal_column_stores_one_signed_eight_byte_count_per_row() {
+        let fields = [
+            SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, true),
+            SignalSchemaField::new_duration(TimeUnit::Millisecond, true),
+        ];
+        let mut cols = DynamicColumns::new(&fields, 4).expect("column plane fits");
+        for (instant, span) in [(i64::MIN, -1), (0, i64::MAX)] {
+            assert!(cols.begin_row());
+            cols.append_int(0, instant).unwrap();
+            cols.append_int(1, span).unwrap();
+            cols.end_row();
+        }
+        assert_eq!(cols.columns[0].kind, PlaneKind::SignedInt { width: 8 });
+        assert_eq!(cols.columns[1].kind, PlaneKind::SignedInt { width: 8 });
+        assert_eq!(cols.columns[0].read_int(0), Some(i64::MIN));
+        assert_eq!(cols.columns[0].read_int(1), Some(0));
+        assert_eq!(cols.columns[1].read_int(0), Some(-1));
+        assert_eq!(cols.columns[1].read_int(1), Some(i64::MAX));
+        assert_eq!(cols.columns[0].value_bytes(2).len(), 16);
+        assert_eq!(
+            cols.append_variable(0, b"2024-01-01T00:00:00Z"),
+            Err(ParseError::InvalidFieldType)
+        );
+    }
+
+    //#endregion smoo/columine!n/vocab-temporal-planes
+
+    //#region smoo/columine!n/vocab-enum-dictionary
+
+    /// An encoded column's storage is its index plane: the store holds the
+    /// Arrow buffer of indexes and takes an index its width holds, never text.
+    #[test]
+    fn a_dictionary_column_stores_indexes_of_its_declared_width() {
+        for (index, largest, kind) in [
+            (IndexWidth::U8, 255u64, PlaneKind::UnsignedInt { width: 1 }),
+            (IndexWidth::U16, 65_535, PlaneKind::UnsignedInt { width: 2 }),
+            (
+                IndexWidth::U32,
+                4_294_967_295,
+                PlaneKind::UnsignedInt { width: 4 },
+            ),
+        ] {
+            let field = SignalSchemaField::new_dictionary(DictionarySlot::Schema(0), index, true);
+            let mut cols = DynamicColumns::new(&[field], 4).expect("column plane fits");
+            assert_eq!(cols.columns[0].kind, kind);
+            assert!(cols.begin_row());
+            cols.append_uint(0, largest).unwrap();
+            cols.end_row();
+            assert_eq!(cols.columns[0].read_uint(0), Some(largest));
+
+            assert!(cols.begin_row());
+            assert_eq!(
+                cols.append_variable(0, b"open"),
+                Err(ParseError::InvalidFieldType)
+            );
+            // An index past the width is refused, not truncated.
+            assert_eq!(
+                cols.append_uint(0, largest + 1),
+                Err(ParseError::InvalidFieldType)
+            );
+        }
+    }
+
+    //#endregion smoo/columine!n/vocab-enum-dictionary
 }

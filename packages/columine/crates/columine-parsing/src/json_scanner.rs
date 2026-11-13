@@ -1,9 +1,11 @@
-//! Streaming JSON scanner and UTC timestamp conversion.
+//! Streaming JSON scanner for the base event log.
 
+use crate::instant::parse_instant;
 use crate::{
     DynamicColumns, ParseError,
     json_parser::{JsonParser, ParserError, Token},
 };
+use columine_arrow::TimeUnit;
 
 /// Parses a JSON event array into the base event-log columns
 /// (`columine_arrow::BASE_EVENT_LOG_FIELDS`: id, type, timestamp, value).
@@ -30,7 +32,7 @@ fn parse_event_object(
     parser.expect_object_begin().map_err(json_error)?;
     let mut id = None;
     let mut event_type = None;
-    let mut timestamp_micros = None;
+    let mut timestamp_nanos = None;
     let mut value = None;
     while !parser.is_object_end() {
         let field = parser.expect_field_name().map_err(json_error)?;
@@ -51,7 +53,7 @@ fn parse_event_object(
             }
             // The id scratch is free until the event commits.
             _ if field.is("timestamp") => {
-                timestamp_micros = Some(parse_timestamp_token(parser, id_scratch)?)
+                timestamp_nanos = Some(parse_timestamp_token(parser, id_scratch)?)
             }
             _ if field.is("value") => {
                 let token = parser.next_spanned().map_err(json_error)?;
@@ -78,26 +80,26 @@ fn parse_event_object(
         output,
         id.as_bytes(),
         event_type.as_bytes(),
-        timestamp_micros.ok_or(ParseError::MissingField)?,
+        timestamp_nanos.ok_or(ParseError::MissingField)?,
         value,
     )
 }
 
+/// The base log's timestamp in nanoseconds: a number is nanoseconds, a
+/// string an RFC 3339 instant.
 fn parse_timestamp_token(
     parser: &mut JsonParser<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<i64, ParseError> {
     match parser.next_token().map_err(json_error)? {
-        Token::String(value) => parse_iso8601_to_micros(value.text(scratch).map_err(json_error)?)
-            .map_err(|_| ParseError::InvalidFieldType),
+        Token::String(value) => parse_instant(
+            value.text(scratch).map_err(json_error)?,
+            TimeUnit::Nanosecond,
+        )
+        .map_err(|_| ParseError::InvalidFieldType),
         Token::Number(value) => value
             .parse::<i64>()
-            .map_err(|_| ParseError::InvalidFieldType)
-            .and_then(|milliseconds| {
-                milliseconds
-                    .checked_mul(1_000)
-                    .ok_or(ParseError::InvalidFieldType)
-            }),
+            .map_err(|_| ParseError::InvalidFieldType),
         _ => Err(ParseError::InvalidFieldType),
     }
 }
@@ -111,161 +113,16 @@ fn json_error(error: ParserError) -> ParseError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimestampError {
-    InvalidFormat,
-}
-
-/// Parse a UTC ISO-8601 timestamp with millisecond precision into microseconds.
-pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 20 || bytes.last() != Some(&b'Z') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let year = parse_digits(&bytes[0..4])? as i32;
-    if bytes.get(4) != Some(&b'-') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let month = parse_digits(&bytes[5..7])? as u32;
-    if bytes.get(7) != Some(&b'-') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let day = parse_digits(&bytes[8..10])? as u32;
-    if bytes.get(10) != Some(&b'T') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let hour = parse_digits(&bytes[11..13])? as u32;
-    if bytes.get(13) != Some(&b':') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let minute = parse_digits(&bytes[14..16])? as u32;
-    if bytes.get(16) != Some(&b':') {
-        return Err(TimestampError::InvalidFormat);
-    }
-    let second = parse_digits(&bytes[17..19])? as u32;
-    if !(1970..=2099).contains(&year)
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return Err(TimestampError::InvalidFormat);
-    }
-    // Fraction semantics are deliberately uniform: every character must be a
-    // digit, the first three digits are milliseconds (ISO truncation), and an
-    // empty fraction after `.` is invalid.
-    let millis = if bytes.len() > 20 && bytes[19] == b'.' {
-        let fraction = &bytes[20..bytes.len() - 1];
-        if fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
-            return Err(TimestampError::InvalidFormat);
-        }
-        let mut padded = [b'0'; 3];
-        let take = fraction.len().min(3);
-        padded[..take].copy_from_slice(&fraction[..take]);
-        parse_digits(&padded)?
-    } else {
-        0
-    };
-    let seconds = epoch_days(year, month, day) * 86_400
-        + i64::from(hour) * 3_600
-        + i64::from(minute) * 60
-        + i64::from(second);
-    Ok(seconds * 1_000_000 + millis * 1_000)
-}
-/// Parse decimal digits with overflow checking.
-fn parse_digits(bytes: &[u8]) -> Result<i64, TimestampError> {
-    let digits = bytes;
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
-        return Err(TimestampError::InvalidFormat);
-    }
-    digits.iter().try_fold(0_i64, |total, digit| {
-        total
-            .checked_mul(10)
-            .and_then(|n| n.checked_add(i64::from(*digit - b'0')))
-            .ok_or(TimestampError::InvalidFormat)
-    })
-}
-fn epoch_days(year: i32, month: u32, day: u32) -> i64 {
-    let mut y = i64::from(year);
-    let mut m = i64::from(month);
-    if m <= 2 {
-        y -= 1;
-        m += 12;
-    }
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m - 3) + 2) / 5 + i64::from(day) - 1;
-    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     fn columns() -> DynamicColumns {
         DynamicColumns::new(&crate::BASE_EVENT_LOG_FIELDS, 10).expect("column plane fits")
     }
+    /// 2024-01-15T10:30:00Z in seconds since the epoch.
+    const BASE_SECONDS: i64 = 19_737 * 86_400 + 37_800;
     #[test]
-    fn parse_iso8601_to_micros_full_format_with_millis() {
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.123Z").unwrap(),
-            19_737 * 86_400 * 1_000_000 + 37_800 * 1_000_000 + 123_000
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_no_milliseconds() {
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00Z").unwrap(),
-            19_737 * 86_400 * 1_000_000 + 37_800 * 1_000_000
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_epoch() {
-        assert_eq!(parse_iso8601_to_micros("1970-01-01T00:00:00Z").unwrap(), 0);
-    }
-    #[test]
-    fn parse_iso8601_to_micros_rejects_no_z_suffix() {
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00"),
-            Err(TimestampError::InvalidFormat)
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_rejects_invalid_year() {
-        assert_eq!(
-            parse_iso8601_to_micros("1900-01-15T10:30:00Z"),
-            Err(TimestampError::InvalidFormat)
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_single_digit_millis() {
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.1Z").unwrap() % 1_000_000,
-            100_000
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_two_digit_millis() {
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.12Z").unwrap() % 1_000_000,
-            120_000
-        );
-    }
-    #[test]
-    fn parse_iso8601_to_micros_garbage_fraction_rejects() {
-        // A non-digit fraction is rejected rather than interpreted as zero.
-        let base = parse_iso8601_to_micros("2024-01-15T10:30:00Z").unwrap();
-        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.abcZ").is_err());
-        assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.1x3Z").is_err());
-        let _ = base;
-        // Extra fraction digits beyond three are ignored (first three win).
-        assert_eq!(
-            parse_iso8601_to_micros("2024-01-15T10:30:00.123456Z").unwrap(),
-            base + 123_000
-        );
-    }
-    #[test]
-    fn parse_json_events_single_event_with_iso_timestamp() {
+    fn parse_json_events_single_event_with_an_instant_timestamp() {
         let mut c = columns();
         parse_json_events(br#"[{"id":"abc-123","type":"orderPlaced","timestamp":"2024-01-15T10:30:00.000Z","value":{"qty":5}}]"#, &mut c).unwrap();
         assert_eq!(c.count, 1);
@@ -277,16 +134,29 @@ mod tests {
         assert!(crate::parsed_event(&c, 0).unwrap().value.is_some());
     }
     #[test]
-    fn parse_json_events_numeric_timestamp() {
+    fn a_numeric_base_timestamp_is_nanoseconds() {
         let mut c = columns();
         parse_json_events(
-            br#"[{"id":"id-1","type":"test","timestamp":1705315800000}]"#,
+            br#"[{"id":"id-1","type":"test","timestamp":1705315800000000000}]"#,
             &mut c,
         )
         .unwrap();
         assert_eq!(
-            crate::parsed_event(&c, 0).unwrap().timestamp_micros,
-            1_705_315_800_000_000
+            crate::parsed_event(&c, 0).unwrap().timestamp_nanos,
+            1_705_315_800_000_000_000
+        );
+    }
+    #[test]
+    fn an_instant_base_timestamp_is_stored_in_nanoseconds() {
+        let mut c = columns();
+        parse_json_events(
+            br#"[{"id":"id-1","type":"test","timestamp":"2024-01-15T10:30:00.123456789Z"}]"#,
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::parsed_event(&c, 0).unwrap().timestamp_nanos,
+            BASE_SECONDS * 1_000_000_000 + 123_456_789
         );
     }
     #[test]

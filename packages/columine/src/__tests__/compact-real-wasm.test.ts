@@ -12,7 +12,14 @@ import {
   utf8,
 } from '@uwdata/flechette';
 
-import { EventProcessorCreateError, loadParseBackend } from '../parse-backend.js';
+import { compactKindTag } from '../arrow-planes.js';
+import {
+  CREATE_FAILURE,
+  FIELD_DESCRIPTOR,
+  FIELD_DESCRIPTOR_BYTES,
+  MAX_SCHEMA_FIELDS,
+} from '../event-processor-abi.generated.js';
+import { EventProcessorCreateError, encodeFieldDescriptor, loadParseBackend } from '../parse-backend.js';
 import type { CompactBatch, CompactColumn, EncodedArrowSchema } from '../pipeline.js';
 
 const ROW_COUNT = 300;
@@ -20,7 +27,7 @@ const FIELD_NAMES = ['all_null', 'i32_value', 'f64_value', 'i64_value', 'bool_va
 const NULL_ROWS: readonly number[] = [0, 7, 8, 9, 257];
 // The shipped artifact's physical field capacity. The fleet's widest
 // coordinator schema needs 313 physical fields.
-const WIDEST_FIELD_COUNT = 512;
+const WIDEST_FIELD_COUNT = MAX_SCHEMA_FIELDS;
 
 function schemaMessage(): EncodedArrowSchema {
   const table = tableFromArrays(
@@ -47,7 +54,7 @@ function schemaMessage(): EncodedArrowSchema {
   );
   return {
     schemaBytes: schemaBytesOf(table),
-    fieldMetadata: new Uint8Array([0, 1, 0, 0, 1, 1, 0, 0, 2, 1, 0, 0, 6, 1, 0, 0, 5, 1, 0, 0, 3, 1, 0, 0, 4, 1, 0, 0]),
+    fieldMetadata: nullableFields(['null', 'i32', 'f64', 'i64', 'bool', 'binary', 'utf8']),
   };
 }
 
@@ -64,18 +71,26 @@ function schemaBytesOf(table: ReturnType<typeof tableFromArrays>): Uint8Array {
   return stream.slice(0, messageLength);
 }
 
+/** One nullable field of each plane in `kinds`, as eight-byte descriptors. */
+function nullableFields(kinds: ReadonlyArray<CompactColumn['kind']>): Uint8Array {
+  const metadata = new Uint8Array(kinds.length * FIELD_DESCRIPTOR_BYTES);
+  for (const [index, kind] of kinds.entries()) {
+    metadata.set(
+      encodeFieldDescriptor({ plane: compactKindTag(kind), nullable: true }),
+      index * FIELD_DESCRIPTOR_BYTES,
+    );
+  }
+  return metadata;
+}
+
 /** `fieldCount` nullable utf8 fields named `f0`, `f1`, …. */
 function wideSchema(fieldCount: number): EncodedArrowSchema {
   const names = Array.from({ length: fieldCount }, (_, index) => `f${index}`);
   const table = tableFromArrays(Object.fromEntries(names.map((name) => [name, ['']])), {
     types: Object.fromEntries(names.map((name) => [name, utf8()])),
   });
-  const fieldMetadata = new Uint8Array(fieldCount * 4);
-  for (let index = 0; index < fieldCount; index += 1) {
-    fieldMetadata[index * 4] = 4;
-    fieldMetadata[index * 4 + 1] = 1;
-  }
-  return { schemaBytes: schemaBytesOf(table), fieldMetadata };
+  const kinds = Array.from({ length: fieldCount }, (): 'utf8' => 'utf8');
+  return { schemaBytes: schemaBytesOf(table), fieldMetadata: nullableFields(kinds) };
 }
 
 function getAt<T>(values: readonly T[], index: number, label: string): T {
@@ -283,8 +298,8 @@ describe('Compact real event_processor.wasm', () => {
   it('rejects metadata that disagrees with the real logical Arrow schema', async () => {
     const mismatchBackend = await loadParseBackend();
     const fieldMetadata = encodedSchema.fieldMetadata.slice();
-    // Field 1's physical tag becomes Float64 while schemaBytes still says Int32.
-    fieldMetadata[4] = 2;
+    // Field 1's physical plane becomes Float64 while schemaBytes still says Int32.
+    fieldMetadata[FIELD_DESCRIPTOR_BYTES + FIELD_DESCRIPTOR.plane] = compactKindTag('f64');
     try {
       mismatchBackend.encode({
         rowCount: 0,
@@ -306,7 +321,7 @@ describe('Compact real event_processor.wasm', () => {
         throw error;
       }
       expect(error.code).toBe('SCHEMA_TYPE_MISMATCH');
-      expect(error.status).toBe(0x8000_0007);
+      expect(error.status).toBe(CREATE_FAILURE.SCHEMA_TYPE_MISMATCH);
     } finally {
       mismatchBackend.dispose();
     }

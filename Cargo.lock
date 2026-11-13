@@ -683,7 +683,9 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "flatbuffers",
  "proptest",
+ "sha2",
 ]
 
 [[package]]
@@ -717,6 +719,7 @@ dependencies = [
  "columine-arrow",
  "columine-types",
  "proptest",
+ "sha2",
 ]
 
 [[package]]

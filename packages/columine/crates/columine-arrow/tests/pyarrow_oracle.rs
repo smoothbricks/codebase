@@ -15,10 +15,11 @@
 use std::io::Write;
 use std::process::Command;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit};
 use columine_arrow::{
-    ArrowType, DynamicColumns, DynamicSchemaConfig, MetadataLimits, MetadataStorage,
-    SignalSchemaField, logical_schema_ipc_bytes, write_arrow_ipc_from_dynamic_columns,
+    ArrowType, DictionarySlot, DynamicColumns, DynamicSchemaConfig, IndexWidth, MetadataStorage,
+    SchemaDictionaryTable, SchemaParts, SignalSchemaField, logical_schema_ipc_bytes,
+    write_arrow_ipc_from_dynamic_columns,
 };
 
 fn require_pyarrow() {
@@ -44,14 +45,31 @@ fn write_stream(
 ) -> std::path::PathBuf {
     let schema_bytes = logical_schema_ipc_bytes(logical).expect("encode schema message");
     let config = DynamicSchemaConfig::new(&schema_bytes, fields).expect("validate schema");
+    write_stream_of(name, &config, fields, rows, write)
+}
+
+/// Emit the Arrow IPC stream `config` describes for `fields` to a temp file,
+/// and return the path.
+fn write_stream_of(
+    name: &str,
+    config: &DynamicSchemaConfig,
+    fields: &[SignalSchemaField],
+    rows: u32,
+    write: impl FnOnce(&mut DynamicColumns),
+) -> std::path::PathBuf {
     let mut columns = DynamicColumns::new(fields, rows).expect("column plane fits");
     write(&mut columns);
-    let mut metadata =
-        MetadataStorage::for_fields(fields, MetadataLimits::default()).expect("size metadata");
+    let mut metadata = MetadataStorage::for_fields(fields).expect("size metadata");
     let mut output = vec![0u8; 1 << 16];
-    let written =
-        write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut output, &mut metadata, &[])
-            .expect("emit arrow ipc");
+    let written = write_arrow_ipc_from_dynamic_columns(
+        &columns,
+        config,
+        &mut output,
+        &mut metadata,
+        &[],
+        None,
+    )
+    .expect("emit arrow ipc");
 
     let dir = std::env::temp_dir().join("columine-pyarrow-oracle");
     std::fs::create_dir_all(&dir).expect("create oracle directory");
@@ -246,3 +264,116 @@ fn pyarrow_agrees_on_the_remaining_new_planes() {
     // independent reader available in this repo can read them.
     assert_eq!(pyarrow_says(&path, "print(table.num_rows)"), "1");
 }
+
+//#region smoo/columine!n/vocab-temporal-planes
+
+#[test]
+fn pyarrow_agrees_on_the_temporal_planes() {
+    require_pyarrow();
+    let fields = [
+        SignalSchemaField::new_timestamp(TimeUnit::Nanosecond, true),
+        SignalSchemaField::new_timestamp(TimeUnit::Second, true),
+        SignalSchemaField::new_duration(TimeUnit::Millisecond, true),
+        SignalSchemaField::new_duration(TimeUnit::Microsecond, true),
+    ];
+    let logical = vec![
+        Field::new(
+            "ts_ns",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new(
+            "ts_s",
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            true,
+        ),
+        Field::new("dur_ms", DataType::Duration(TimeUnit::Millisecond), true),
+        Field::new("dur_us", DataType::Duration(TimeUnit::Microsecond), true),
+    ];
+    let path = write_stream("temporal", &fields, logical, 1, |columns| {
+        assert!(columns.begin_row());
+        columns.append_int(0, 1_700_000_000_123_456_789).unwrap();
+        columns.append_int(1, 1_700_000_000).unwrap();
+        columns.append_int(2, -86_400_000).unwrap();
+        columns.append_int(3, 5).unwrap();
+        columns.end_row();
+    });
+
+    // The unit and the UTC zone are the type pyarrow reads, not a count of
+    // nanoseconds it has to be told about.
+    assert_eq!(
+        pyarrow_says(&path, "print(','.join(str(f.type) for f in table.schema))"),
+        "timestamp[ns, tz=UTC],timestamp[s, tz=UTC],duration[ms],duration[us]"
+    );
+    // The count each scalar holds is what the plane stored.
+    assert_eq!(
+        pyarrow_says(
+            &path,
+            "print(','.join(str(table.column(i)[0].value) for i in range(table.num_columns)))"
+        ),
+        "1700000000123456789,1700000000,-86400000,5"
+    );
+}
+
+//#endregion smoo/columine!n/vocab-temporal-planes
+
+//#region smoo/columine!n/vocab-enum-dictionary
+
+#[test]
+fn pyarrow_agrees_on_a_schema_dictionary_column() {
+    require_pyarrow();
+    let field = SignalSchemaField::new_dictionary(DictionarySlot::Schema(0), IndexWidth::U8, true);
+    let logical = vec![Field::new(
+        "kind",
+        DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+        true,
+    )];
+    let schema_message = logical_schema_ipc_bytes(logical).expect("encode schema message");
+    // Ordinal 1 is skipped by the declaration.
+    let dictionaries = [vec![
+        Some("open".to_owned()),
+        None,
+        Some("closed".to_owned()),
+    ]];
+    let config = DynamicSchemaConfig::from_parts(
+        &[field],
+        SchemaParts {
+            schema_message: &schema_message,
+            dictionaries: SchemaDictionaryTable::Typed(&dictionaries),
+            ..SchemaParts::default()
+        },
+    )
+    .expect("validate schema");
+    let path = write_stream_of("dictionary", &config, &[field], 3, |columns| {
+        for index in [Some(2u64), Some(0), None] {
+            assert!(columns.begin_row());
+            match index {
+                Some(index) => columns.append_uint(0, index).unwrap(),
+                None => columns.append_null(0).unwrap(),
+            }
+            columns.end_row();
+        }
+    });
+
+    assert_eq!(
+        pyarrow_says(&path, "print(table.schema.field(0).type)"),
+        "dictionary<values=string, indices=uint8, ordered=0>"
+    );
+    // The dictionary pyarrow was given is the declared one, null entry and all.
+    assert_eq!(
+        pyarrow_says(
+            &path,
+            "print(table.column(0).chunk(0).dictionary.to_pylist())"
+        ),
+        "['open', None, 'closed']"
+    );
+    assert_eq!(
+        pyarrow_says(
+            &path,
+            "print(','.join(str(table.column(0)[r].as_py()) for r in range(table.num_rows)))"
+        ),
+        "closed,open,None"
+    );
+}
+
+//#endregion smoo/columine!n/vocab-enum-dictionary
