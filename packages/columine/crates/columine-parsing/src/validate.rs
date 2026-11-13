@@ -831,8 +831,9 @@ impl SemanticSchema {
     }
 
     /// Whether the schema, beneath any `optional`, is a dynamic value: one
-    /// that keeps a null as data rather than as the empty state.
-    pub(crate) fn is_dynamic(&self) -> bool {
+    /// that keeps a null as data rather than as the empty state. Only
+    /// `unknown` is dynamic; every other kind keeps null as empty.
+    pub fn is_dynamic(&self) -> bool {
         match self {
             Self::Optional(inner) => inner.is_dynamic(),
             other => matches!(other, Self::Unknown),
@@ -843,14 +844,19 @@ impl SemanticSchema {
     }
 }
 
-/// Visit every top-level payload member declared as an enum (directly or
-/// under `optional`) with its variants in ordinal order.
 /// Visit every top-level payload member `schema` declares dynamic
 /// ([`SemanticSchema::is_dynamic`]): an object root's fields, or the fields
-/// of every arm of a union root, beneath any `optional`. Extraction does not
-/// know which arm a value conformed to, so a member that any arm declares
-/// dynamic is visited.
-pub(crate) fn collect_dynamic_members<E>(
+/// of every arm of a union root, beneath any `optional`. An explicit null
+/// in such a member's cell is data (MessagePack nil), never the empty
+/// state; every other member's null is the Arrow null.
+///
+/// This is the one rule the JSON and MessagePack extractors key their null
+/// handling on (they collect it once per event type when their
+/// configuration is built); a consumer that fills its own columns from the
+/// same semantic schemas calls it per event type to agree with them.
+/// Extraction does not know which arm of a union a value conformed to, so a
+/// member that any arm declares dynamic is visited, once per declaring arm.
+pub fn collect_dynamic_members<E>(
     schema: &SemanticSchema,
     visit: &mut impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
@@ -873,6 +879,8 @@ pub(crate) fn collect_dynamic_members<E>(
         _ => Ok(()),
     }
 }
+/// Visit every top-level payload member declared as an enum (directly or
+/// under `optional`) with its variants in ordinal order.
 pub(crate) fn collect_enum_members<E>(
     schema: &SemanticSchema,
     mut visit: impl FnMut(&str, &[String]) -> Result<(), E>,
