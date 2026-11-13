@@ -206,6 +206,8 @@
               "statebus-navigation-browser",
               "lmao",
               "arrow-builder",
+              "time",
+              "duration",
               "validation"
             ]
           }

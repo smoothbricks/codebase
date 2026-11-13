@@ -322,7 +322,7 @@ const statebusNames = [
   'statebus-navigation-core',
   'statebus-navigation-browser',
 ];
-const names = [...statebusNames, 'lmao', 'arrow-builder', 'validation'];
+const names = [...statebusNames, 'lmao', 'arrow-builder', 'time', 'duration', 'validation'];
 const manifests = new Map(
   names.map((name) => {
     const path = join(root, 'packages', name, 'package.json');
