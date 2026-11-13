@@ -41,6 +41,7 @@
     "src/runtime-input.test.ts": 1879,
     "src/nx-plugin-load-errors.test.ts": 1856,
     "src/nx-cache-kept-outputs.test.ts": 1780,
+    "src/nx-cache-linked-output.test.ts": 9780,
     "src/nx-cache-restore-mtime.test.ts": 1704,
     "src/managed-files/repo-path.test.ts": 1593,
     "src/nx-skipped-task-exit.test.ts": 1559,

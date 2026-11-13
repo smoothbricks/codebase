@@ -4932,7 +4932,7 @@ index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a6
                  // Deliberately not disabled: unlike the inotify limit above, a socket
                  // owned by someone else stops being there when it is removed or the
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a22717d44f0c 100644
+index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce5770c8a3 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
 @@ -28,6 +28,7 @@ const workspace_root_1 = require("../utils/workspace-root");
@@ -5001,7 +5001,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a227
          });
      }
      temporaryOutputPath(task) {
-@@ -557,6 +573,195 @@ class Cache {
+@@ -557,6 +573,213 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -5061,8 +5061,20 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a227
 + * never wrote: what a run on other inputs left, which the restored task's
 + * consumers then read as its output.
 + */
++/**
++ * The outputs the cache entry at `outputsPath` holds. Native `expandOutputs` follows links, so it drops a literal
++ * output that is a link whose target lies outside the entry (`.runtime/bun -> ../.cache/runtime-bun/bun`): the entry
++ * holds the link, and its target is the workspace's. A literal output is the entry's when the entry holds anything at
++ * its path; a pattern expands as before.
++ */
++function entryOutputs(outputsPath, outputs) {
++    const literal = outputs.filter((output) => !/[!*?[\]{}()]/.test(output));
++    const patterns = outputs.filter((output) => /[!*?[\]{}()]/.test(output));
++    const held = literal.filter((output) => (0, node_fs_1.lstatSync)((0, path_1.join)(outputsPath, output), { throwIfNoEntry: false }) !== undefined);
++    return patterns.length === 0 ? held : [...held, ...(0, native_1.expandOutputs)(outputsPath, patterns)];
++}
 +function removeAbsentOutputs(workspaceRoot, outputsPath, outputs) {
-+    const cached = new Set((0, native_1.expandOutputs)(outputsPath, outputs));
++    const cached = new Set(entryOutputs(outputsPath, outputs));
 +    for (const output of (0, native_1.expandOutputs)(workspaceRoot, outputs)) {
 +        if (!cached.has(output)) {
 +            (0, node_fs_1.rmSync)((0, path_1.join)(workspaceRoot, output), { recursive: true, force: true });
@@ -5094,7 +5106,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a227
 +    removeAbsentOutputs(workspaceRoot, outputsPath, outputs);
 +    const changed = [];
 +    const kept = [];
-+    for (const output of (0, native_1.expandOutputs)(outputsPath, outputs)) {
++    for (const output of entryOutputs(outputsPath, outputs)) {
 +        collectChangedOutputs(outputsPath, workspaceRoot, output, changed, kept);
 +    }
 +    let written = [];
@@ -5123,8 +5135,9 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a227
 +    const present = (0, node_fs_1.lstatSync)(presentPath, { bigint: true, throwIfNoEntry: false });
 +    if (cached.isDirectory()) {
 +        if (!present?.isDirectory()) {
-+            changed.push(output);
-+            return;
++            // Made here and filled entry by entry, so a link inside it is restored as one too.
++            (0, node_fs_1.rmSync)(presentPath, { recursive: true, force: true });
++            (0, node_fs_1.mkdirSync)(presentPath, { recursive: true });
 +        }
 +        const names = (0, node_fs_1.readdirSync)(cachedPath);
 +        const cachedNames = new Set(names);
@@ -5138,9 +5151,14 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..5255c428eea059fc858e4226e6b4a227
 +        }
 +    }
 +    else if (cached.isSymbolicLink()) {
-+        if (!present?.isSymbolicLink() || (0, node_fs_1.readlinkSync)(presentPath) !== (0, node_fs_1.readlinkSync)(cachedPath)) {
-+            changed.push(output);
-+            return;
++        const linked = (0, node_fs_1.readlinkSync)(cachedPath);
++        if (!present?.isSymbolicLink() || (0, node_fs_1.readlinkSync)(presentPath) !== linked) {
++            // The link as the entry holds it. The native copy follows it inside the entry, where a target outside the
++            // outputs (`.runtime/bun -> ../.cache/runtime-bun/bun`) is not, and after removing the workspace's
++            // link it wrote nothing back.
++            (0, node_fs_1.rmSync)(presentPath, { recursive: true, force: true });
++            (0, node_fs_1.mkdirSync)((0, path_1.dirname)(presentPath), { recursive: true });
++            (0, node_fs_1.symlinkSync)(linked, presentPath);
 +        }
 +        // The native copy stamps a link by what it points at, and only a file.
 +        const target = (0, node_fs_1.statSync)(presentPath, { bigint: true, throwIfNoEntry: false });
@@ -6157,7 +6175,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..ff7cd099c7a2092bdba5d1232ee73570
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<NoopChildProcess | RunningTask | SharedRunningTask>;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de875e4986 100644
+index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d8882119b 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -32,6 +32,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -6484,7 +6502,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -2114,22 +2209,28 @@ class TaskOrchestrator {
+@@ -2114,22 +2209,32 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
@@ -6492,8 +6510,13 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de
 +            // A daemon gone under a client that may never start one leaves the
 +            // recorded outputs stamps to verify them, as without one.
 +            const matches = await this.daemon.orWithoutDaemon(() => this.daemon.outputsHashesMatchBatch(tasks), () => (0, outputs_stamp_1.outputsStampsMatch)(tasks));
++            // The daemon matches the hash it recorded of what a run or restore left, so a record of no files matched
++            // outputs that were never there again. A hit keeps outputs only where the workspace holds them, as the
++            // stamps answer without a daemon (outputs-stamp.js).
++            const present = (0, native_1.getFilesForOutputsBatch)(workspace_root_1.workspaceRoot, tasks.map((task) => task.outputs));
              for (let i = 0; i < tasks.length; i++) {
-                 resultMap.set(tasks[i].hash, !matches[i]);
+-                resultMap.set(tasks[i].hash, !matches[i]);
++                resultMap.set(tasks[i].hash, !matches[i] || present[i].length === 0);
              }
          }
          else {
@@ -6518,7 +6541,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de
          }
      }
      // endregion utils
-@@ -2208,6 +2309,8 @@ class TaskOrchestrator {
+@@ -2208,6 +2313,8 @@ class TaskOrchestrator {
          // Waiters must not sit out a probe once the run is stopping
          this.abortAllReadiness();
          this.readySignal?.close();
@@ -6527,7 +6550,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -2277,6 +2380,7 @@ class TaskOrchestrator {
+@@ -2277,6 +2384,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;

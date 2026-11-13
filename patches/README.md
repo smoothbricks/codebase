@@ -668,6 +668,21 @@ workspace whose `nx.json` named a plugin file written after the worker started (
 plugin between two runs of one Bun process. Drop the hunk, and keep the test, once Bun's resolver sees files a directory
 gains, or Nx resolves local plugin paths from the root itself.
 
+## A restore keeps a linked output
+
+A task's declared output can be a relative link to a file outside its outputs (a consumer's runtime Bun,
+`.runtime/bun -> ../.cache/runtime-bun/bun`), and the cache entry holds the link. Native `expandOutputs` follows a link,
+so inside the entry, where that target is not, it dropped the output: `removeAbsentOutputs` (`tasks-runner/cache.js`)
+took the workspace's live link for one the entry lacks and removed it, and the restore wrote nothing back. With a
+daemon, the hash it then recorded was of no files, and every later hit answered "existing outputs match the cache, left
+as is" for an output that was gone; each task that ran the tool failed with `No such file or directory`. `entryOutputs`
+counts a literal output as the entry's when the entry holds anything at its path; a changed link is recreated as the
+entry holds it (`symlinkSync`), never through the native copy; a cached directory the workspace lacks is made and filled
+entry by entry, so a link inside it comes back as one; and a daemon's match keeps outputs only where the workspace holds
+some (`shouldCopyOutputsFromCacheBatch`), as the stamps already answer without a daemon.
+`packages/nx-plugin/src/nx-cache-linked-output.test.ts` removes such a link outside Nx and runs again, with and without
+a daemon, and then removes its directory too: each time the link comes back and the run says `[local cache]`.
+
 ## A cache hit keeps the outputs a run left, without a daemon
 
 Stock Nx keeps a cache hit's on-disk outputs only when its daemon recorded them (`outputsHashesMatchBatch`); a client
