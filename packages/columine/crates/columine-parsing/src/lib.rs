@@ -297,6 +297,29 @@ pub(crate) enum MemberSchema<'a> {
 /// admitted from: `(lent, certified)`. An admission that projected a frame
 /// into the reader's layout hands the pair here, and the extractor writes the
 /// certified bytes wherever it would have written the lent slice. The pairs
+/// What an explicit null in a member's cell is, from the member's declared
+/// semantic schema. A typed or structured member keeps null as its one empty
+/// state; a dynamic value keeps null as data at every depth, its top level
+/// included.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NullCell {
+    /// The cell is the Arrow null, the same as a missing member's.
+    Empty,
+    /// The cell is present and holds the MessagePack nil a Binary plane
+    /// writes for a null inside any other dynamic value.
+    Data,
+}
+
+impl MemberSchema<'_> {
+    /// Only a member its event's schema declares dynamic keeps null as data;
+    /// a member no schema judges keeps null as the empty state.
+    pub(crate) fn null_cell(self) -> NullCell {
+        match self {
+            Self::Declared(schema) if schema.is_dynamic() => NullCell::Data,
+            Self::Declared(_) | Self::Unjudged | Self::UndeclaredOpen => NullCell::Empty,
+        }
+    }
+}
 /// borrow the admission's proofs, so the certified bytes are copied once,
 /// into the column, and nowhere else.
 #[derive(Clone, Copy, Debug, Default)]

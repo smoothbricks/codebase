@@ -1,8 +1,8 @@
 //! JSON extraction and typed-column diagnostics.
 
 use crate::{
-    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, ParseError, PlaneKind,
-    SignalSchemaField,
+    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema, NullCell, ParseError,
+    PlaneKind, SignalSchemaField,
     json_parser::{JsonParser, JsonStr, ParserError, Token},
     validate::{SemanticSchema, encode_segment_into, encoded_segment_len, push_path_segment},
 };
@@ -506,6 +506,7 @@ fn extract_json_event_open(
             while !parser.is_object_end() {
                 let member = owned(parser.expect_field_name().map_err(lex_error)?)?;
                 crate::spell_payload_column(&mut column_name, &member)?;
+                let member_schema = config.payload_member_schema(event_type.as_deref(), &member);
                 extract_named_member(
                     parser,
                     config,
@@ -514,7 +515,8 @@ fn extract_json_event_open(
                     &mut extra,
                     &mut extra_count,
                     discriminant_name,
-                    config.payload_member_schema(event_type.as_deref(), &member),
+                    member_schema,
+                    member_schema.null_cell(),
                     &column_name,
                     &member,
                 )?;
@@ -537,6 +539,9 @@ fn extract_json_event_open(
                 MemberSchema::Declared(schema) => MemberSchema::Declared(schema),
                 MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => MemberSchema::Unjudged,
             },
+            // A top-level key keeps null as the empty state, as the MessagePack
+            // lane's top level does, which judges no member there.
+            NullCell::Empty,
             &name,
             &name,
         )?;
@@ -638,6 +643,7 @@ fn extract_named_member(
     extra_count: &mut u32,
     discriminant: Option<&str>,
     member_schema: MemberSchema<'_>,
+    null: NullCell,
     column_name: &str,
     payload_name: &str,
 ) -> Result<(), ExtractionError> {
@@ -668,6 +674,7 @@ fn extract_named_member(
                     diagnostic,
                     Some((extra_writer, extra_count, &mut path, schema)),
                     variants,
+                    null,
                 )
             }
             _ => extract_typed_value_with_capture(
@@ -678,6 +685,7 @@ fn extract_named_member(
                 diagnostic,
                 None,
                 variants,
+                null,
             ),
         };
         if let Err(err) = extraction_result {
@@ -766,9 +774,22 @@ fn extract_typed_value(
     column: usize,
     diagnostic: &mut ExtractionDiagnostic,
 ) -> Result<(), ExtractionError> {
-    extract_typed_value_with_capture(parser, field, columns, column, diagnostic, None, None)
+    extract_typed_value_with_capture(
+        parser,
+        field,
+        columns,
+        column,
+        diagnostic,
+        None,
+        None,
+        NullCell::Empty,
+    )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the typed fill of one member: its plane, its capture and what its schema says of enums and null"
+)]
 fn extract_typed_value_with_capture(
     parser: &mut JsonParser<'_>,
     field: SignalSchemaField,
@@ -782,6 +803,7 @@ fn extract_typed_value_with_capture(
         &SemanticSchema,
     )>,
     enum_variants: Option<&[String]>,
+    null: NullCell,
 ) -> Result<(), ExtractionError> {
     let arrow_type = field.arrow_type;
     let token = parser.next_token().map_err(lex_error)?;
@@ -933,12 +955,13 @@ fn extract_typed_value_with_capture(
             }
         },
         PlaneKind::Bytes { .. } => match token {
-            Token::Null => None,
+            Token::Null if null == NullCell::Empty => None,
             token @ (Token::String(_)
             | Token::Number(_)
             | Token::True
             | Token::False
             | Token::ObjectBegin
+            | Token::Null
             | Token::ArrayBegin) => {
                 // Encode directly into the column's reserved data buffer.
                 // Growth is retained up to the column byte limit, and commit

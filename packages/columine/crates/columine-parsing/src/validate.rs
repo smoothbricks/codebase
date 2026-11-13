@@ -830,6 +830,14 @@ impl SemanticSchema {
         }
     }
 
+    /// Whether the schema, beneath any `optional`, is a dynamic value: one
+    /// that keeps a null as data rather than as the empty state.
+    pub(crate) fn is_dynamic(&self) -> bool {
+        match self {
+            Self::Optional(inner) => inner.is_dynamic(),
+            other => matches!(other, Self::Unknown),
+        }
+    }
     pub fn is_open_object(&self) -> bool {
         matches!(self, Self::Object { open: true, .. })
     }

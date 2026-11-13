@@ -1855,6 +1855,78 @@ mod tests {
             [Some(ColumnValue::Utf8("x".into())), None, None]
         );
     }
+    /// A dynamic value keeps null as data at every depth, its top level
+    /// included: an `optional(unknown)` member sent as null is a present cell
+    /// holding MessagePack nil, and only a missing member is the Arrow null.
+    /// A structured member keeps null as its one empty state. Both lanes
+    /// store the same bytes.
+    #[test]
+    fn a_dynamic_member_keeps_null_as_data_on_both_lanes() {
+        use columine_parsing::{CellExt, ColumnValue};
+        let envelope = r#"{"hi":{"kind":"object","fields":{"data":{"kind":"optional","value":{"kind":"unknown"}},"shape":{"kind":"optional","value":{"kind":"array","item":{"kind":"number"}}}}}}"#;
+        let fields = [
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new(ArrowType::Binary, true),
+            SignalSchemaField::new(ArrowType::Binary, true),
+        ];
+        let schema = DynamicSchemaConfig {
+            semantic_schema: Some(envelope.as_bytes().to_vec()),
+            ..schema_with_names(&fields, b"id\0type\0timestamp\0value.data\0value.shape\0")
+        };
+        // Each event's payload members as MessagePack bytes; a member not
+        // listed is absent.
+        let payloads: [&[(&str, &[u8])]; 3] = [
+            &[("shape", &[0xc0])],
+            &[("data", &[0xc0])],
+            &[("data", &[0xa2, b'h', b'i'])],
+        ];
+        let json = br#"[{"id":"a","type":"hi","timestamp":1,"value":{"shape":null}},{"id":"b","type":"hi","timestamp":2,"value":{"data":null}},{"id":"c","type":"hi","timestamp":3,"value":{"data":"hi"}}]"#;
+        let text = |out: &mut Vec<u8>, text: &str| {
+            out.push(0xa0 | u8::try_from(text.len()).unwrap());
+            out.extend(text.as_bytes());
+        };
+        let mut msgpack = Vec::new();
+        for (row, members) in payloads.iter().enumerate() {
+            msgpack.push(0x84);
+            text(&mut msgpack, "id");
+            text(&mut msgpack, ["a", "b", "c"][row]);
+            text(&mut msgpack, "type");
+            text(&mut msgpack, "hi");
+            text(&mut msgpack, "timestamp");
+            msgpack.push(u8::try_from(row + 1).unwrap());
+            text(&mut msgpack, "value");
+            msgpack.push(0x80 | u8::try_from(members.len()).unwrap());
+            for (name, value) in members.iter() {
+                text(&mut msgpack, name);
+                msgpack.extend(*value);
+            }
+        }
+        let cells = |input: &[u8], format| {
+            let mut ep = EventProcessor::new(admission_options(), 8, schema.clone()).unwrap();
+            let mut output = vec![0u8; 64 * 1024];
+            assert_eq!(
+                ep.create_log_entry(input, format, &mut output, &[]),
+                ResultCode::Ok
+            );
+            let columns = &ep.plane.dynamic_columns;
+            [3, 4].map(|column| [0, 1, 2].map(|row| columns.cell(column, row)))
+        };
+        let from_json = cells(json, InputFormat::Json);
+        assert_eq!(
+            from_json,
+            [
+                [
+                    None,
+                    Some(ColumnValue::Binary(vec![0xc0].into())),
+                    Some(ColumnValue::Binary(vec![0xa2, b'h', b'i'].into())),
+                ],
+                [None, None, None],
+            ]
+        );
+        assert_eq!(cells(&msgpack, InputFormat::MsgpackStream), from_json);
+    }
     /// The one address the test grammar admits: a host's grammar, named by type.
     struct TestGrammar;
 

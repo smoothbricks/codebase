@@ -5,8 +5,8 @@ use std::borrow::Cow;
 use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
 use crate::validate::{encode_segment_into, encoded_segment_len};
 use crate::{
-    ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections, MemberSchema, ParseError,
-    PlaneKind, SignalSchemaField, json_extractor::ExtractionError,
+    ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections, MemberSchema, NullCell,
+    ParseError, PlaneKind, SignalSchemaField, json_extractor::ExtractionError,
     json_scanner::parse_iso8601_to_micros,
 };
 
@@ -367,6 +367,7 @@ fn extract_msgpack_member(
             columns,
             lookup.column,
             variants,
+            member_schema.null_cell(),
             frames,
         )?;
         columns.columns_seen[lookup.column] = true;
@@ -437,6 +438,7 @@ fn extract_typed_value(
     columns: &mut DynamicColumns,
     column: usize,
     enum_variants: Option<&[String]>,
+    null: NullCell,
     frames: &mut FrameWrites<'_>,
 ) -> Result<(), ExtractionError> {
     let first = *reader
@@ -627,7 +629,7 @@ fn extract_typed_value(
             }
         }
         PlaneKind::Bytes { .. } => {
-            if first == 0xc0 {
+            if first == 0xc0 && null == NullCell::Empty {
                 reader.skip_value();
                 None
             } else if matches!(first, 0xc4..=0xc6) {
