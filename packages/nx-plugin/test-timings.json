@@ -69,6 +69,7 @@
     "src/executors/all-verdicts/executor.test.ts": 536,
     "src/executors/bounded-exec/test-results-run.test.ts": 477,
     "src/nx-local-plugin-hook-env.test.ts": 461,
+    "src/nx-task-env-per-run.test.ts": 462,
     "src/forbidden-spelling-policy.test.ts": 419,
     "src/executors/bounded-exec/runner-hook.test.ts": 417,
     "src/nx-raw-inputs.test.ts": 415,

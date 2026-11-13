@@ -5865,6 +5865,48 @@ index b068c8bb203fd47d11e0d5cdc411b4444fc244fd..851d4428983a7e32aafd059580cfbc82
              return;
          }
          const { outdatedAgents } = await client_1.daemonClient.getConfigureAiAgentsStatus();
+diff --git a/dist/src/tasks-runner/task-env.js b/dist/src/tasks-runner/task-env.js
+index bded0d604f20417f61fdf18bcf62b09966847d43..2aa4f9cde2f677b89032b439ef90c7c7ee68f977 100644
+--- a/dist/src/tasks-runner/task-env.js
++++ b/dist/src/tasks-runner/task-env.js
+@@ -49,29 +49,20 @@ function getEnvVariablesForBatchProcess(skipNxCache, captureStderr) {
+     delete res[ready_signal_1.READY_URL_ENV];
+     return res;
+ }
+-// The orchestrator now calls this eagerly during the coordinator pre-hash
+-// in addition to processTask (and again in hashBatchTasks), so the same
+-// task hits this function multiple times per run. Each call reads 3+ .env
+-// files from disk — memoize by task.id to skip the repeat work.
+-//
+-// Cache lifetime is the current Nx invocation: the function is only called
+-// from CLI/orchestrator code (not the long-lived daemon), so the map is
+-// scoped to a single run. Callers must not mutate the returned env — they
+-// already spread it into new objects before adding task-specific overrides
+-// (see getEnvVariablesForTask).
+-const taskSpecificEnvCache = new Map();
++// The environment a task is hashed and forked with: the ambient env with the root dotenv files Nx loaded on init
++// unloaded, then the task's own dotenv files. It reads `process.env` as it stands, so what a run's preTasksExecution
++// published reaches that run's tasks. A run reads it once per task through its orchestrator
++// (`TaskOrchestrator.taskSpecificEnv`), whose memo lives exactly as long as the run. A module-level memo outlived the
++// invocation in a client that runs several in one process, and hashed and forked a later run's tasks with the first
++// run's environment. Callers must not mutate the returned env — they already spread it into new objects before adding
++// task-specific overrides (see getEnvVariablesForTask).
+ function getTaskSpecificEnv(task, graph) {
+-    const cached = taskSpecificEnvCache.get(task.id);
+-    if (cached)
+-        return cached;
+     // Unload any dot env files at the root of the workspace that were loaded on init of Nx.
+     const taskEnv = unloadDotEnvFiles({ ...process.env });
+-    const env = process.env.NX_LOAD_DOT_ENV_FILES === 'true'
++    return process.env.NX_LOAD_DOT_ENV_FILES === 'true'
+         ? loadDotEnvFilesForTask(task, graph, taskEnv)
+         : // If not loading dot env files, ensure env vars created by system are still loaded
+             taskEnv;
+-    taskSpecificEnvCache.set(task.id, env);
+-    return env;
+ }
+ /**
+  * Reconstructs, at graph-construction time, the env a task would see: the
 diff --git a/dist/src/tasks-runner/task-graph-utils.d.ts b/dist/src/tasks-runner/task-graph-utils.d.ts
 index c808d03befeaa74a79967f03c5a0dcf86685c2e7..024f58d5b865e4080bc6fd47584838567219ec6e 100644
 --- a/dist/src/tasks-runner/task-graph-utils.d.ts
@@ -5962,10 +6004,18 @@ index f9f93ce62eab9448a72ad9d95b962067de113f1c..8657ded47a3b9df09d7a7ee8ed04490e
      }
      return cycles.size ? cycles : null;
 diff --git a/dist/src/tasks-runner/task-orchestrator.d.ts b/dist/src/tasks-runner/task-orchestrator.d.ts
-index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821bbdea4623 100644
+index b0d3c985bc330a54b43df557d3e247e1bf64e060..ff7cd099c7a2092bdba5d1232ee7357028e63ab9 100644
 --- a/dist/src/tasks-runner/task-orchestrator.d.ts
 +++ b/dist/src/tasks-runner/task-orchestrator.d.ts
-@@ -49,6 +49,8 @@ export declare class TaskOrchestrator {
+@@ -42,6 +42,7 @@ export declare class TaskOrchestrator {
+     private reverseTaskDeps;
+     private initializingTaskIds;
+     private processedTasks;
++    private readonly taskSpecificEnvs;
+     private cacheMissedHashes;
+     private copiedOutputFiles;
+     private completedTasks;
+@@ -49,6 +50,8 @@ export declare class TaskOrchestrator {
      private pendingDiscreteWorkers;
      private groups;
      private continuousTasksStarted;
@@ -5974,7 +6024,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      /**
       * How many folds each batch id has rendered. A batch that reports a strict
       * subset of its tasks is re-run under the same id, so one id can produce more
-@@ -58,6 +60,7 @@ export declare class TaskOrchestrator {
+@@ -58,6 +61,7 @@ export declare class TaskOrchestrator {
      private bailed;
      private resolveStopPromise;
      private stopRequested;
@@ -5982,7 +6032,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      private runningContinuousTasks;
      private runningRunCommandsTasks;
      private runningDiscreteTasks;
-@@ -73,6 +76,8 @@ export declare class TaskOrchestrator {
+@@ -73,6 +77,8 @@ export declare class TaskOrchestrator {
      private cleanupPromise;
      private signalHandlers;
      private tasksWithPersistedOutput;
@@ -5991,7 +6041,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      constructor(hasher: TaskHasher, initiatingProject: string | undefined, initiatingTasks: Task[], projectGraph: ProjectGraph, taskGraph: TaskGraph, nxJson: NxJsonConfiguration, options: NxArgs & DefaultTasksRunnerOptions, bail: boolean, daemon: DaemonClient, 
      /** What the user named; undefined means they named nothing. */
      specifiedOutputStyle: OutputStyle | undefined, 
-@@ -84,6 +89,7 @@ export declare class TaskOrchestrator {
+@@ -84,6 +90,7 @@ export declare class TaskOrchestrator {
      run(): Promise<{
          [k: string]: TaskStatus;
      }>;
@@ -5999,7 +6049,15 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      nextBatch(): Batch;
      /**
       * Coordinator loop. All batch operations (hashing, cache resolution)
-@@ -136,12 +142,9 @@ export declare class TaskOrchestrator {
+@@ -99,6 +106,7 @@ export declare class TaskOrchestrator {
+     private executeContinuousTaskLoop;
+     private hasUnresolvedCacheableTask;
+     private scheduleAfterReadiness;
++    private taskSpecificEnv;
+     private processTask;
+     processAllScheduledTasks(): void;
+     processTasks(taskIds: string[]): void;
+@@ -136,12 +144,9 @@ export declare class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -6015,7 +6073,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
       */
      private resolveCachedTasksBulk;
      /**
-@@ -158,6 +161,7 @@ export declare class TaskOrchestrator {
+@@ -158,6 +163,7 @@ export declare class TaskOrchestrator {
      private applyBatchCachedResults;
      private hashBatchTasks;
      applyFromCacheOrRunBatch(doNotSkipCache: boolean, batch: Batch, groupId: number): Promise<TaskResult[]>;
@@ -6023,7 +6081,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      private runBatchWave;
      private runBatch;
      /**
-@@ -252,12 +256,11 @@ export declare class TaskOrchestrator {
+@@ -252,12 +258,11 @@ export declare class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      resolveCachedTasks(doNotSkipCache: boolean, tasks: Task[], groupId: number): Promise<TaskResult[]>;
@@ -6039,7 +6097,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
       */
      private dispatchDiscreteWorker;
      /**
-@@ -269,11 +272,14 @@ export declare class TaskOrchestrator {
+@@ -269,11 +274,14 @@ export declare class TaskOrchestrator {
       */
      private handleDiscreteWorkerFailure;
      /**
@@ -6058,7 +6116,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..30dbf685a4b05ceb19e27b0b262d821b
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<NoopChildProcess | RunningTask | SharedRunningTask>;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd9974939036 100644
+index 9a17f88be6502a302c5f5eab71df646a2f87851c..26afcf9e22db20c232a499a62c0153de875e4986 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -32,6 +32,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -6070,7 +6128,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
  /**
   * Resolve a batch executor's per-task result to a TaskStatus. Prefers an
   * explicit `status` from the executor; falls back to the `success` boolean
-@@ -150,11 +152,9 @@ class TaskOrchestrator {
+@@ -150,11 +152,12 @@ class TaskOrchestrator {
          // underlying real tasks become the anchors.
          this.initializingTaskIds = (0, utils_1.expandInitiatingTasksThroughNoop)(this.initiatingTasks, this.taskGraph, this.projectGraph);
          this.processedTasks = new Map();
@@ -6079,13 +6137,16 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
 -        // schedule — so a missed hash never needs re-querying. Without this, a
 -        // miss waiting for a worker slot is re-queried (including the remote
 -        // retrieval) on every coordinator cycle.
++        // Each task's environment for this run, read once: the coordinator's pre-hash, processTask and a batch's
++        // hashing share it, and it ends with the run (`taskSpecificEnv`).
++        this.taskSpecificEnvs = new Map();
 +        // Probe a queued miss once, not on every coordinator wakeup.
 +        // Output producers recheck after taking their cross-client lease: a
 +        // foreign client can populate the key while this worker is queued.
          this.cacheMissedHashes = new Set();
          // The files the cache just wrote or restored, by task id, for postRunSteps
          // to hand the daemon instead of it walking the outputs again.
-@@ -164,6 +164,9 @@ class TaskOrchestrator {
+@@ -164,6 +167,9 @@ class TaskOrchestrator {
          this.pendingDiscreteWorkers = new Set();
          this.groups = [];
          this.continuousTasksStarted = 0;
@@ -6095,7 +6156,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          /**
           * How many folds each batch id has rendered. A batch that reports a strict
           * subset of its tasks is re-run under the same id, so one id can produce more
-@@ -173,6 +176,7 @@ class TaskOrchestrator {
+@@ -173,6 +179,7 @@ class TaskOrchestrator {
          this.bailed = false;
          this.resolveStopPromise = null;
          this.stopRequested = false;
@@ -6103,7 +6164,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          this.runningContinuousTasks = new Map();
          this.runningRunCommandsTasks = new Map();
          this.runningDiscreteTasks = new Map();
-@@ -195,6 +199,9 @@ class TaskOrchestrator {
+@@ -195,6 +202,9 @@ class TaskOrchestrator {
          // exit, and the paths that never spawn one write it inline. The backstop in
          // postRunSteps consults this so a task's output is written exactly once.
          this.tasksWithPersistedOutput = new Set();
@@ -6113,7 +6174,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
      }
      async init() {
          this.setupSignalHandlers();
-@@ -214,9 +221,24 @@ class TaskOrchestrator {
+@@ -214,9 +224,24 @@ class TaskOrchestrator {
          }
      }
      async run() {
@@ -6138,7 +6199,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          process.stdout.setMaxListeners(total + events_1.defaultMaxListeners);
          process.stderr.setMaxListeners(total + events_1.defaultMaxListeners);
          process.setMaxListeners(total + events_1.defaultMaxListeners);
-@@ -252,8 +274,6 @@ class TaskOrchestrator {
+@@ -252,8 +277,6 @@ class TaskOrchestrator {
              // the native half does not exist.
              (0, cache_1.sweepBatchOutputs)();
          }
@@ -6147,7 +6208,16 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -345,6 +365,18 @@ class TaskOrchestrator {
+@@ -307,7 +330,7 @@ class TaskOrchestrator {
+                 if (unhashed.length > 0) {
+                     const perTaskEnvs = {};
+                     for (const task of unhashed) {
+-                        perTaskEnvs[task.id] = (0, task_env_1.getTaskSpecificEnv)(task, this.projectGraph);
++                        perTaskEnvs[task.id] = this.taskSpecificEnv(task);
+                     }
+                     await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, unhashed);
+                 }
+@@ -345,6 +368,18 @@ class TaskOrchestrator {
                  const groupId = this.closeGroup();
                  this.dispatchDiscreteWorker(doNotSkipCache, task, groupId);
              }
@@ -6166,7 +6236,27 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
              // 6. Nothing left to dispatch and nothing in flight — done.
              if (!this.tasksSchedule.hasTasks() &&
                  this.pendingDiscreteWorkers.size === 0) {
-@@ -581,12 +613,9 @@ class TaskOrchestrator {
+@@ -410,9 +445,18 @@ class TaskOrchestrator {
+         }
+     }
+     // region Processing Scheduled Tasks
++    /** `task`'s environment for this run, read once per task and kept only as long as this orchestrator. */
++    taskSpecificEnv(task) {
++        let env = this.taskSpecificEnvs.get(task.id);
++        if (env === undefined) {
++            env = (0, task_env_1.getTaskSpecificEnv)(task, this.projectGraph);
++            this.taskSpecificEnvs.set(task.id, env);
++        }
++        return env;
++    }
+     async processTask(taskId) {
+         const task = this.taskGraph.tasks[taskId];
+-        const taskSpecificEnv = (0, task_env_1.getTaskSpecificEnv)(task, this.projectGraph);
++        const taskSpecificEnv = this.taskSpecificEnv(task);
+         if (!task.hash) {
+             await (0, hash_task_1.hashTask)(this.hasher, this.projectGraph, this.fullTaskGraph, task, taskSpecificEnv, this.taskDetails);
+         }
+@@ -581,12 +625,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -6182,7 +6272,16 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -709,6 +738,17 @@ class TaskOrchestrator {
+@@ -701,7 +742,7 @@ class TaskOrchestrator {
+         // single-task path.
+         const perTaskEnvs = {};
+         for (const task of tasks) {
+-            perTaskEnvs[task.id] = (0, task_env_1.getTaskSpecificEnv)(task, this.projectGraph);
++            perTaskEnvs[task.id] = this.taskSpecificEnv(task);
+         }
+         await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
+     }
+@@ -709,6 +750,17 @@ class TaskOrchestrator {
          if (this.bailed || this.stopRequested) {
              return [];
          }
@@ -6200,7 +6299,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskIds = Object.keys(batch.taskGraph.tasks);
          this.options.lifeCycle.registerRunningBatch?.(batch.id, {
-@@ -1062,6 +1102,20 @@ class TaskOrchestrator {
+@@ -1062,6 +1114,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -6221,7 +6320,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -1088,10 +1142,8 @@ class TaskOrchestrator {
+@@ -1088,10 +1154,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -6234,7 +6333,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -1125,9 +1177,11 @@ class TaskOrchestrator {
+@@ -1125,9 +1189,11 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -6249,7 +6348,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
       */
      async runTaskDirectly(doNotSkipCache, task, groupId) {
          // Wait for task to be processed
-@@ -1155,6 +1209,18 @@ class TaskOrchestrator {
+@@ -1155,6 +1221,18 @@ class TaskOrchestrator {
                  terminalOutput: waitError.message,
              };
          }
@@ -6268,7 +6367,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
          const temporaryOutputPath = this.cache.temporaryOutputPath(task);
-@@ -1382,8 +1448,22 @@ class TaskOrchestrator {
+@@ -1382,8 +1460,22 @@ class TaskOrchestrator {
          }
      }
      async startContinuousTask(task, groupId) {
@@ -6293,7 +6392,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
              // This branch never reads the hash, so a failure to compute it is dropped
              void this.processedTasks.get(task.id)?.catch(() => { });
              let readyWhen;
-@@ -1432,11 +1512,6 @@ class TaskOrchestrator {
+@@ -1432,11 +1524,6 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -6305,7 +6404,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          let pipeOutput;
          let temporaryOutputPath;
          let streamOutput;
-@@ -1485,7 +1560,11 @@ class TaskOrchestrator {
+@@ -1485,7 +1572,11 @@ class TaskOrchestrator {
              return new noop_child_process_1.NoopChildProcess({ code: 1, terminalOutput: '' });
          }
          let childProcess;
@@ -6317,7 +6416,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
              await this.preRunSteps([task], { groupId });
              this.detectTaskInvocationLoop(task);
              childProcess = await this.runTask(task, streamOutput, env, temporaryOutputPath, pipeOutput);
-@@ -1515,15 +1594,19 @@ class TaskOrchestrator {
+@@ -1515,15 +1606,19 @@ class TaskOrchestrator {
              // release paths (completeContinuousTask, the signal handler) both iterate
              // that map. Drop it here or siblings wait on a task no one is running.
              this.runningTasksService?.removeRunningTask(task.id);
@@ -6344,7 +6443,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -2114,22 +2197,28 @@ class TaskOrchestrator {
+@@ -2114,22 +2209,28 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
@@ -6378,7 +6477,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          }
      }
      // endregion utils
-@@ -2208,6 +2297,8 @@ class TaskOrchestrator {
+@@ -2208,6 +2309,8 @@ class TaskOrchestrator {
          // Waiters must not sit out a probe once the run is stopping
          this.abortAllReadiness();
          this.readySignal?.close();
@@ -6387,7 +6486,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..df1b06c7369aea573df06a3a3d8afd99
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -2277,6 +2368,7 @@ class TaskOrchestrator {
+@@ -2277,6 +2380,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;

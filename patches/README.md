@@ -636,6 +636,24 @@ killed while the first holds its grant, the second is granted by the same endpoi
 once the run has. Before this hunk the second leaf failed with `connect ENOENT` on the endpoint's socket. Drop the hunk,
 and keep the test, once the Nx in use runs task hooks in the run's own process.
 
+## A task's environment lives for one run
+
+Nx 24.0.3 memoized each task's environment (`getTaskSpecificEnv`, `tasks-runner/task-env.js`) in a module-level map
+keyed by task id, whose comment assumed one Nx invocation per process. A long-lived client runs one invocation after
+another in one process: a consumer's Nx worker answers each gate request with `runPreTasksExecution`,
+`invokeTasksRunner` and `runPostTasksExecution`. Every later run of a task it had run once was hashed and forked with
+the first run's environment, so a reserved leaf asked the `MBX_RESERVATIONS_SOCKET` of a run whose post hook had already
+closed it and was ended with `connect ENOENT …/mbx-r-*/r.sock`, and an `{ env }` input or a task's `.env` file never
+re-keyed it. A consumer's coder run lost the test verdicts of four sheds this way on 2026-11-13.
+
+`getTaskSpecificEnv` computes the environment from `process.env` as it stands, and the orchestrator of one run memoizes
+it per task (`TaskOrchestrator.taskSpecificEnv`, the coordinator's pre-hash, `processTask` and a batch's hashing), so
+the memo's lifetime is the run's: no caller can forget to clear it. A caller outside the orchestrator (`hashTasks…`
+before the run, the graph view) computes it once per call. `packages/nx-plugin/src/nx-task-env-per-run.test.ts` runs two
+invocations in one process whose local plugin's pre hook publishes the run's id to a task that keys on it; before the
+hunk the second run replayed the first's cache entry (`local-cache-kept-existing`, saw `run-one`). Drop the hunk, and
+keep the test, once the Nx in use scopes the memo to a run.
+
 ## A cache hit keeps the outputs a run left, without a daemon
 
 Stock Nx keeps a cache hit's on-disk outputs only when its daemon recorded them (`outputsHashesMatchBatch`); a client
