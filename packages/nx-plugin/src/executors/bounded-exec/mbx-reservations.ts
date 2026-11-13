@@ -179,7 +179,15 @@ async function endedWithin(endpoint: Endpoint, ms: number): Promise<string> {
 /** The pool's answer to one reservation: the cores it holds and a promise of why it was lost, or why there are none. */
 export type Granted =
   | { readonly ok: true; readonly cpus: number; readonly lost: Promise<string> }
-  | { readonly ok: false; readonly error: string };
+  | { readonly ok: false; readonly refusal: ReservationRefusal };
+
+/** Why a reservation holds no cores: the endpoint asked, and the connect error's code when it could not be reached. */
+export interface ReservationRefusal {
+  readonly endpoint: string;
+  /** The code of the error that ended the connection (`ENOENT`: the endpoint's socket is gone), else null. */
+  readonly errno: string | null;
+  readonly message: string;
+}
 
 /** One request for cores on a run's endpoint. */
 export interface Reservation {
@@ -219,7 +227,7 @@ class Connection {
   readonly #entries = new Map<number, Entry>();
   #nextId = 1;
   #unread = '';
-  #closed: string | null = null;
+  #closed: ReservationRefusal | null = null;
 
   constructor(
     private readonly endpoint: string,
@@ -230,13 +238,18 @@ class Connection {
     this.#socket.setEncoding('utf8');
     this.#socket.unref();
     this.#socket.on('data', (text: string) => this.#read(text));
-    this.#socket.on('error', (error) => this.#close(`mbx reservation endpoint ${this.endpoint}: ${error.message}`));
+    this.#socket.on('error', (error) =>
+      this.#close(
+        `mbx reservation endpoint ${this.endpoint}: ${error.message}`,
+        'code' in error && typeof error.code === 'string' ? error.code : null,
+      ),
+    );
     this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
   }
 
   reserve(cpus: number, priority: MbxPriority): Reservation {
     if (this.#closed !== null) {
-      return { granted: Promise.resolve({ ok: false, error: this.#closed }), release() {} };
+      return { granted: Promise.resolve({ ok: false, refusal: this.#closed }), release() {} };
     }
     const id = this.#nextId++;
     let answer!: (granted: Granted) => void;
@@ -253,7 +266,8 @@ class Connection {
         const entry = this.#entries.get(id);
         if (entry === undefined) return;
         this.#entries.delete(id);
-        if (entry.kind === 'waiting') entry.answer({ ok: false, error: 'released while it waited' });
+        if (entry.kind === 'waiting')
+          entry.answer({ ok: false, refusal: this.#refusal('released while it waited', null) });
         this.#socket.write(`${stringifyRequest({ type: 'release', id })}\n`);
         if (this.#entries.size === 0) this.#socket.unref();
       },
@@ -295,17 +309,22 @@ class Connection {
       return;
     }
     this.#entries.delete(reply.id);
-    entry.answer({ ok: false, error: reply.error });
+    entry.answer({ ok: false, refusal: this.#refusal(reply.error, null) });
     if (this.#entries.size === 0) this.#socket.unref();
   }
 
-  #close(why: string): void {
+  #refusal(message: string, errno: string | null): ReservationRefusal {
+    return { endpoint: this.endpoint, errno, message };
+  }
+
+  #close(why: string, errno: string | null = null): void {
     if (this.#closed !== null) return;
-    this.#closed = why;
+    const refusal = this.#refusal(why, errno);
+    this.#closed = refusal;
     this.forget();
     for (const entry of this.#entries.values()) {
-      if (entry.kind === 'waiting') entry.answer({ ok: false, error: why });
-      else entry.lose(why);
+      if (entry.kind === 'waiting') entry.answer({ ok: false, refusal });
+      else entry.lose(refusal.message);
     }
     this.#entries.clear();
     this.#socket.destroy();

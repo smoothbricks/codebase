@@ -2089,6 +2089,50 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  it("ends a reserved leaf whose run's endpoint is gone with a verdict naming the refused reservation", async () => {
+    // A long-lived Nx client once forked a later run's leaves with an earlier run's endpoint, closed with that run
+    // (patches/README.md, "A task's environment lives for one run"); each leaf was ended with SIGTERM, recorded as a
+    // bare `failed` with no test, and said it was "killed by SIGTERM" as if from outside.
+    const workspace = await createWorkspace();
+    // A socket path short enough to bind, in an owned directory that is already gone, as a closed run's endpoint is.
+    const gone = await ownedSocketDirectory('mbx-r-gone-', 'r.sock');
+    await rm(gone, { recursive: true });
+    const socket = join(gone, 'r.sock');
+    const directory = join(workspace.root, 'record');
+    const saved = {
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+    };
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env[RESERVATIONS_ENV] = socket;
+    try {
+      const result = await runBoundedExec(
+        { command: 'touch ran.marker', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory } },
+        createProcessTreeKiller(),
+        null,
+      );
+
+      expect(result.success).toBe(false);
+      expect(existsSync(join(workspace.root, 'ran.marker'))).toBe(false);
+      expect((await readRecord(directory))?.verdict).toMatchObject({
+        outcome: 'operational',
+        tests: [],
+        cause: { kind: 'reservation-refused', endpoint: socket, errno: 'ENOENT' },
+      });
+      expect(result.terminalOutput).toContain(
+        'Command was ended by bounded-exec because mbx did not grant the reservation: ',
+      );
+      expect(result.terminalOutput).not.toContain('was killed by');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
   /**
    * A prebuilt nextest leaf whose run's stand-in endpoint records what it was asked for, and whether the fixture had
    * run by then, and grants all it was asked for.
@@ -2960,7 +3004,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.success).toBe(false);
       expect(await exists(join(workspace.root, 'ran.marker'))).toBe(false);
       expect(result.terminalOutput).toContain('cowshed: cpu-pool parent pool refused: ');
-      expect(await readFile(join(workspace.root, 'refused', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"failed"/);
+      const recorded = await readRecord(join(workspace.root, 'refused'));
+      expect(recorded?.verdict).toMatchObject({
+        outcome: 'operational',
+        cause: { kind: 'executor', message: expect.stringContaining('cpu-pool parent pool refused: ') },
+      });
     } finally {
       await new Promise<void>((resolve) => refusing.close(() => resolve()));
     }
@@ -3010,7 +3058,15 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(await readRecord(record.directory)).toEqual({
         task: record.task.id,
         hash: 'h',
-        verdict: { outcome: 'failed', exitCode: 1, tests: [] },
+        verdict: {
+          outcome: 'operational',
+          exitCode: 1,
+          tests: [],
+          cause: {
+            kind: 'executor',
+            message: expect.stringContaining('refusing to run the command: the workspace declares Bun'),
+          },
+        },
         peakBytes: null,
       });
     });

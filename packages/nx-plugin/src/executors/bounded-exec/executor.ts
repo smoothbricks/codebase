@@ -79,6 +79,7 @@ import {
   judgeOperationalFailure,
   judgeRun,
   type NoSpaceSighting,
+  type OperationalCause,
   readJunitReport,
   taskDirectory,
   withJunitReport,
@@ -399,7 +400,7 @@ async function runCommand(
       await writeRecord(recordDirectory, {
         task: task.id,
         hash: task.hash,
-        verdict: judgeOperationalFailure(1, null),
+        verdict: judgeOperationalFailure(1, null, { kind: 'executor', message }),
         peakBytes: null,
       });
     }
@@ -656,7 +657,7 @@ async function runCommand(
     exitCode: number,
     expiry: ExpiredBound | null,
     elapsedMs: number,
-    operational: boolean,
+    operational: OperationalCause | null,
     noSpace: NoSpaceSighting | null,
     lockWaits: readonly LockWait[],
     cpuRising: readonly CpuRise[],
@@ -685,9 +686,11 @@ async function runCommand(
       }
     });
     const admissionQueue = queue.queueWait(reservation !== null);
+    const cause: OperationalCause | null =
+      operational ?? (resultFailure === null ? null : { kind: 'executor', message: resultFailure });
     const verdict =
-      operational || resultFailure !== null
-        ? judgeOperationalFailure(exitCode, report)
+      cause !== null
+        ? judgeOperationalFailure(exitCode, report, cause)
         : judgeRun({
             exitCode,
             elapsedMs,
@@ -717,7 +720,7 @@ async function runCommand(
     await closeProgress();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
-    await recordRun(1, null, Date.now() - asked, false, null, [], [], null);
+    await recordRun(1, null, Date.now() - asked, { kind: 'executor', message: message.trim() }, null, [], [], null);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
@@ -754,8 +757,8 @@ async function runCommand(
       },
       invalid: (detail) => {
         if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
-        lifecycleFailure = `progress channel: ${detail}`;
-        appendStderr(`bounded-exec: ${lifecycleFailure}\n`);
+        lifecycleFailure = { kind: 'executor', message: `progress channel: ${detail}` };
+        appendStderr(`bounded-exec: ${lifecycleFailure.message}\n`);
         termination = terminate();
       },
     });
@@ -797,7 +800,17 @@ async function runCommand(
     process.platform === 'win32' || segment === null ? null : withFixtureLifecycle(segment, command);
   const hooked = process.platform === 'win32' ? null : (fixtureHooked ?? withRunnerLifecycle(command));
   const lifecycle = hooked === null ? null : createRunnerLifecycle(hooked.runners);
-  let lifecycleFailure: string | null = null;
+  let lifecycleFailure: OperationalCause | null = null;
+  /** Why the executor ended or failed the run whatever its command did, if it did: the verdict's operational cause. */
+  /** The cause the executor ended the command for, if it ended it (closures set `lifecycleFailure`). */
+  const endedFor = (): OperationalCause | null => lifecycleFailure;
+  const operationalCause = (): OperationalCause | null =>
+    endedFor() ??
+    (state.poolCloseError !== null
+      ? { kind: 'executor', message: `cpu pool did not close cleanly: ${state.poolCloseError}` }
+      : state.retireError !== null
+        ? { kind: 'executor', message: `could not retire the command's processes: ${state.retireError}` }
+        : null);
   const isTesting = (): boolean => lifecycleFailure !== null || (lifecycle?.isTesting() ?? true);
   const startedAt = Date.now();
   // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
@@ -899,7 +912,7 @@ async function runCommand(
           const error = resultWriter?.append(result) ?? null;
           if (error !== null && resultFailure === null) {
             resultFailure = error;
-            lifecycleFailure ??= error;
+            lifecycleFailure ??= { kind: 'executor', message: error };
             appendStderr(`bounded-exec: ${error}\n`);
             termination = terminate();
           }
@@ -1042,7 +1055,7 @@ async function runCommand(
     updateIdle(progress.scan(stream, text), isTesting());
     const error = progress.error();
     if (error !== null && lifecycleFailure === null) {
-      lifecycleFailure = error;
+      lifecycleFailure = { kind: 'executor', message: error };
       appendStderr(`bounded-exec: ${error}\n`);
       termination = terminate();
     }
@@ -1052,7 +1065,7 @@ async function runCommand(
     if (!(channel instanceof Duplex)) throw new Error('runner lifecycle requires a duplex child descriptor');
     const failLifecycle = (detail: string, wasTesting = isTesting()): void => {
       if (lifecycleFailure !== null || state.expiry !== null) return;
-      lifecycleFailure = detail;
+      lifecycleFailure = { kind: 'executor', message: `runner lifecycle failed: ${detail}` };
       appendStderr(`bounded-exec: runner lifecycle failed: ${detail}\n`);
       updateIdle(false, wasTesting);
     };
@@ -1136,7 +1149,7 @@ async function runCommand(
           signalToExitCode(signal),
           state.expiry,
           Date.now() - startedAt,
-          state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null,
+          operationalCause(),
           state.noSpace === null ? null : await state.noSpace,
           state.lockWaits,
           state.cpuRising,
@@ -1309,13 +1322,17 @@ async function runCommand(
   if (leaf !== null) {
     const channel = child.stdio.at(MBX_GRANT_FD);
     if (!(channel instanceof Duplex)) throw new Error('an mbx leaf requires its mbx descriptor');
-    const failGrant = (detail: string): void => {
+    const descriptorFailure = (detail: string): OperationalCause => ({
+      kind: 'executor',
+      message: `mbx grant descriptor: ${detail}`,
+    });
+    const failGrant = (cause: OperationalCause): void => {
       if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
-      lifecycleFailure ??= `mbx grant descriptor: ${detail}`;
-      appendStderr(`bounded-exec: ${lifecycleFailure}\n`);
+      lifecycleFailure = cause;
+      appendStderr(`bounded-exec: ${cause.message}\n`);
       termination = terminate();
     };
-    channel.on('error', (error) => failGrant(error.message));
+    channel.on('error', (error) => failGrant(descriptorFailure(error.message)));
     if (reserved !== null) {
       // The shell asks for its cores in one line and reads the count granted (mbx-pool.ts, `reservation`). A refusal
       // ends the descriptor unanswered: the shell's read fails, and nothing runs.
@@ -1324,7 +1341,7 @@ async function runCommand(
       channel.setEncoding('utf8');
       channel.on('data', (text: string) => {
         if (reservation !== null) {
-          failGrant(`the command asked for cores a second time: ${JSON.stringify(text)}`);
+          failGrant(descriptorFailure(`the command asked for cores a second time: ${JSON.stringify(text)}`));
           return;
         }
         asked += text;
@@ -1333,7 +1350,11 @@ async function runCommand(
         const line = asked.slice(0, end);
         const cpus = askedCores(line, reservedLeaf.demand.want);
         if (cpus === null) {
-          failGrant(`the command asked for ${JSON.stringify(line)} cores, not 1 to ${reservedLeaf.demand.want}`);
+          failGrant(
+            descriptorFailure(
+              `the command asked for ${JSON.stringify(line)} cores, not 1 to ${reservedLeaf.demand.want}`,
+            ),
+          );
           channel.end();
           return;
         }
@@ -1343,7 +1364,12 @@ async function runCommand(
         reservation = held;
         void held.granted.then((granted) => {
           if (!granted.ok) {
-            failGrant(`mbx did not grant the reservation: ${granted.error}`);
+            failGrant({
+              kind: 'reservation-refused',
+              endpoint: granted.refusal.endpoint,
+              errno: granted.refusal.errno,
+              message: `mbx did not grant the reservation: ${granted.refusal.message}`,
+            });
             channel.end();
             return;
           }
@@ -1376,7 +1402,7 @@ async function runCommand(
           } else if (byte === 114) {
             stepTo({ kind: 'released', at: Date.now() });
           } else {
-            failGrant(`unexpected byte ${byte}`);
+            failGrant(descriptorFailure(`unexpected byte ${byte}`));
             return;
           }
         }
@@ -1420,12 +1446,17 @@ async function runCommand(
 
   const code = exitCode ?? signalToExitCode(exitSignal);
   if (code !== 0 && state.expiry === null) {
-    // No bound of this executor ended it, so a signal it died of came from outside (the kernel's OOM killer sends
-    // SIGKILL): the signal is named, never folded into a bare status.
+    // The executor ended it for a cause of its own, which is said; otherwise no bound of this executor ended it, so a
+    // signal it died of came from outside (the kernel's OOM killer sends SIGKILL): the signal is named, never folded
+    // into a bare status.
+    const signalled = exitCode === null && exitSignal !== null;
+    const endedBy = endedFor();
     const ended =
-      exitCode === null && exitSignal !== null
-        ? `was killed by ${exitSignal} (status ${code})`
-        : `exited with status ${code}`;
+      endedBy !== null
+        ? `was ended by bounded-exec because ${endedBy.message} (${signalled ? `${exitSignal}, ` : ''}status ${code})`
+        : signalled
+          ? `was killed by ${exitSignal} (status ${code})`
+          : `exited with status ${code}`;
     appendStderr(
       fixture !== null && !mainStarted
         ? `Fixture command ${ended}: ${segment ?? fixture.command}\n`
@@ -1472,7 +1503,7 @@ async function runCommand(
   }
   // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
   // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
-  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
+  const operationalFailure = operationalCause();
   await recordRun(
     code,
     state.expiry,
@@ -1490,7 +1521,7 @@ async function runCommand(
     code,
   });
   return {
-    success: !operationalFailure && resultFailure === null && state.expiry === null && code === 0,
+    success: operationalFailure === null && resultFailure === null && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
     ...(killedForMemory ? { killedForMemory: true } : {}),
   };

@@ -2703,8 +2703,18 @@ task id and the hash it ran at:
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived, or why none were read: the
   lease was no longer on its volume (`lost`) or the volume could not be read (`unread`). A passing run that printed such
   a line passed.
+- `operational`: bounded-exec itself ended or refused the run, whatever its command did, and `cause` says why. A
+  `reservation-refused` cause names the run's mbx reservation endpoint the leaf asked, the connect error's code
+  (`ENOENT` when the endpoint's socket is gone) and mbx's message; an `executor` cause names the executor's own failure
+  (a refused or lost CPU pool, a broken progress channel or runner lifecycle, leftovers it could not retire, a refusal
+  before the command started). The output's last line then says `Command was ended by bounded-exec because <cause>`,
+  never a signal as if it came from outside. Its `tests` are the report's failures, never bounds.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.
+
+A consumer reads a task's record through `@smoothbricks/nx-plugin/bounded-exec-verdict` (`readRecord` over
+`taskDirectory(<workspace data>, <task id>)`, the `BoundedExecRecord` and `BoundedExecVerdict` types), never by parsing
+the command's output: an Nx worker that judges a test task from it tells an `operational` refusal from a red.
 
 The record also holds `peakBytes`, the command's memory peak: the exited command's rusage `ru_maxrss`, the largest
 resident set any one process of its tree reached, in bytes. Node reaps a child without its rusage, so the command runs

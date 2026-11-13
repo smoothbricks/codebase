@@ -42,7 +42,14 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
     );
     try {
       const refused = reserveCores(endpoint.socket, 3, 'low');
-      expect(await refused.granted).toEqual({ ok: false, error: '--memory needs scheduler.memory to be configured' });
+      expect(await refused.granted).toEqual({
+        ok: false,
+        refusal: {
+          endpoint: endpoint.socket,
+          errno: null,
+          message: '--memory needs scheduler.memory to be configured',
+        },
+      });
       const next = reserveCores(endpoint.socket, 1, 'low');
       expect(await next.granted).toMatchObject({ ok: true, cpus: 1 });
       next.release();
@@ -58,7 +65,7 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
     const endpoint = await standInReservations((heard) => (heard.cpus === 1 ? 1 : null));
     const held = reserveCores(endpoint.socket, 1, 'low');
     const granted = await held.granted;
-    if (!granted.ok) throw new Error(`the stand-in grants one core: ${granted.error}`);
+    if (!granted.ok) throw new Error(`the stand-in grants one core: ${granted.refusal.message}`);
     const waiting = reserveCores(endpoint.socket, 2, 'low');
 
     await endpoint.close();
@@ -67,7 +74,7 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
     expect(await granted.lost).toContain(endpoint.socket);
     const after = await reserveCores(endpoint.socket, 1, 'low').granted;
     expect(after).toMatchObject({ ok: false });
-    if (!after.ok) expect(after.error).toContain(endpoint.socket);
+    if (!after.ok) expect(after.refusal.message).toContain(endpoint.socket);
   });
 });
 

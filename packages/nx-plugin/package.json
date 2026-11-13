@@ -50,6 +50,11 @@
       "import": "./dist/executors/bounded-exec/test-result-writer.js",
       "default": "./dist/executors/bounded-exec/test-result-writer.js"
     },
+    "./bounded-exec-verdict": {
+      "types": "./dist/executors/bounded-exec/verdict.d.ts",
+      "import": "./dist/executors/bounded-exec/verdict.js",
+      "default": "./dist/executors/bounded-exec/verdict.js"
+    },
     "./build-state-output-policy": {
       "types": "./dist/build-state-output-policy.d.ts",
       "development": "./src/build-state-output-policy.ts",

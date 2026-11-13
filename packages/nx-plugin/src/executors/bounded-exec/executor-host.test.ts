@@ -424,7 +424,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         expect(basename(dirname(stuck)).startsWith('cpu-pool-')).toBe(true);
         expect(unremovable.stderr()).toContain('cowshed: cpu pool did not close cleanly: ');
         const record: unknown = JSON.parse(await readFile(join(root, 'unremovable', VERDICT_FILE), 'utf8'));
-        expect(record).toHaveProperty('verdict', { outcome: 'failed', exitCode: 1, tests: [] });
+        expect(record).toHaveProperty('verdict', {
+          outcome: 'operational',
+          exitCode: 1,
+          tests: [],
+          cause: { kind: 'executor', message: expect.stringContaining('cpu pool did not close cleanly: ') },
+        });
 
         // The failed run gave its one token back, so a sibling on the same one-token pool is admitted.
         const next = await startRunner(

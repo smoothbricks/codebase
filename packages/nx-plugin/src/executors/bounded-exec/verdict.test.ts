@@ -599,24 +599,43 @@ ${abort('t::crash', '11 (SIGSEGV)')}
     ).toMatchObject({ outcome: 'bound', bound: 'total' });
   });
 
-  it('keeps CPU operational failures ordinary even beside test timeouts or a successful command exit', () => {
+  it('keeps operational failures operational, with their cause, even beside test timeouts or a successful exit', () => {
+    const cause = {
+      kind: 'reservation-refused',
+      endpoint: '/run/mbx-r-x/r.sock',
+      errno: 'ENOENT',
+      message: 'mbx did not grant the reservation: mbx reservation endpoint /run/mbx-r-x/r.sock: connect ENOENT',
+    } as const;
     expect(
-      judgeOperationalFailure(0, {
-        failed: ['nt t::assert'],
-        timedOut: ['nt t::slow'],
-        cancelled: ['nt t::cut'],
-      }),
+      judgeOperationalFailure(
+        0,
+        {
+          failed: ['nt t::assert'],
+          timedOut: ['nt t::slow'],
+          cancelled: ['nt t::cut'],
+        },
+        cause,
+      ),
     ).toEqual({
-      outcome: 'failed',
+      outcome: 'operational',
       exitCode: 1,
       tests: ['nt t::assert', 'nt t::slow', 'nt t::cut'],
+      cause,
     });
-    expect(judgeOperationalFailure(143, { failed: [], timedOut: ['nt t::slow'], cancelled: [] })).toEqual({
-      outcome: 'failed',
+    const lost = { kind: 'executor', message: 'cpu pool did not close cleanly: lost' } as const;
+    expect(judgeOperationalFailure(143, { failed: [], timedOut: ['nt t::slow'], cancelled: [] }, lost)).toEqual({
+      outcome: 'operational',
       exitCode: 143,
       tests: ['nt t::slow'],
+      cause: lost,
     });
-    expect(judgeOperationalFailure(0, null)).toEqual({ outcome: 'failed', exitCode: 1, tests: [] });
+    expect(judgeOperationalFailure(0, null, lost)).toEqual({
+      outcome: 'operational',
+      exitCode: 1,
+      tests: [],
+      cause: lost,
+    });
+    expect(describeVerdict(judgeOperationalFailure(143, null, cause))).toBe(cause.message);
   });
 
   it('records a runner that reports its own abort at the total ceiling as a bound, end to end', async () => {

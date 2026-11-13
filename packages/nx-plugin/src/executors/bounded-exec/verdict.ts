@@ -33,6 +33,11 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  * - `queued`: the command failed before any admission after a live task PID was explicitly seen waiting in mbx, or
  *   while its reserved leaf's request waited on its run's mbx reservation endpoint. Its observed wait, and any public
  *   queue positions, describe admission pressure, never a wedged test.
+ * - `operational`: bounded-exec itself ended or refused the run for a cause its command did not make, and `cause` says
+ *   which: its leaf's mbx reservation was refused (`reservation-refused`, naming the endpoint asked and the connect
+ *   error's code, `ENOENT` when the endpoint's socket is gone), or the executor's own machinery failed (`executor`: a
+ *   lost CPU grant or pool, a broken progress channel or runner lifecycle, leftovers it could not retire). The tests the
+ *   report named are failures, never bounds, and the run never records exit 0.
  * - `failed`: anything else that did not pass. That includes an assertion named in the report,
  *   or a non-zero exit with no report to say why.
  */
@@ -57,7 +62,25 @@ export type BoundedExecVerdict =
       readonly cpuRising: readonly CpuRise[];
     }
   | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
-  | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
+  | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] }
+  | {
+      readonly outcome: 'operational';
+      readonly exitCode: number;
+      readonly tests: readonly string[];
+      readonly cause: OperationalCause;
+    };
+
+/** Why bounded-exec ended or refused a run whatever its command did (`operational`). */
+export type OperationalCause =
+  | {
+      readonly kind: 'reservation-refused';
+      /** The run's mbx reservation endpoint the leaf asked. */
+      readonly endpoint: string;
+      /** The code of the error that ended the connection (`ENOENT`: the endpoint's socket is gone), else null. */
+      readonly errno: string | null;
+      readonly message: string;
+    }
+  | { readonly kind: 'executor'; readonly message: string };
 
 /** Observed admission wait, supplied only while the command has never received a grant. */
 export interface AdmissionQueueWait {
@@ -65,6 +88,7 @@ export interface AdmissionQueueWait {
   readonly requests: readonly MbxQueuedRequest[];
 }
 const isQueuedVerdict = typia.createIs<Extract<BoundedExecVerdict, { outcome: 'queued' }>>();
+const isOperationalVerdict = typia.createIs<Extract<BoundedExecVerdict, { outcome: 'operational' }>>();
 const isCpuRising = typia.createIs<readonly CpuRise[]>();
 
 /**
@@ -406,13 +430,17 @@ export function judgeRun(run: RunEnd): BoundedExecVerdict {
 }
 
 /**
- * A run that failed for a reason its command did not cause: its CPU grant was lost, or its sub-pool did not close
- * cleanly. It is an ordinary failure whatever the command exited with and whatever bound also fired, and the tests it
- * reports are failures, never bounds. A failed run never records exit 0.
+ * A run that failed for a reason its command did not cause (`OperationalCause`): its reservation was refused, its CPU
+ * grant was lost, or its sub-pool did not close cleanly. It is operational whatever the command exited with and
+ * whatever bound also fired, and the tests it reports are failures, never bounds. It never records exit 0.
  */
-export function judgeOperationalFailure(exitCode: number, report: JunitFailures | null): BoundedExecVerdict {
+export function judgeOperationalFailure(
+  exitCode: number,
+  report: JunitFailures | null,
+  cause: OperationalCause,
+): BoundedExecVerdict {
   const tests = report === null ? [] : [...report.failed, ...report.timedOut, ...report.cancelled];
-  return { outcome: 'failed', exitCode: exitCode === 0 ? 1 : exitCode, tests };
+  return { outcome: 'operational', exitCode: exitCode === 0 ? 1 : exitCode, tests, cause };
 }
 
 /** Where `task`'s verdict and report live: this checkout's own Nx workspace-data directory. */
@@ -606,6 +634,9 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
         }
         break;
       }
+      case 'operational':
+        if (isOperationalVerdict(value)) return value;
+        break;
       case 'failed':
         if (typeof value.exitCode === 'number' && isStrings(value.tests)) {
           return { outcome: 'failed', exitCode: value.exitCode, tests: value.tests };
@@ -756,6 +787,8 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
       return verdict.tests.length > 0
         ? `failed: ${verdict.tests.join(', ')}`
         : `exited ${verdict.exitCode} with no report naming a timeout`;
+    case 'operational':
+      return `${verdict.cause.message}${verdict.tests.length > 0 ? `; the tests that failed: ${verdict.tests.join(', ')}` : ''}`;
   }
 }
 
