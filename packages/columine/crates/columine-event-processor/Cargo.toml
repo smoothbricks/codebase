@@ -7,6 +7,17 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+# An embedder injects its value cell writer and owns its stream dictionary
+# (specs/columine/10-physical-vocabulary.md §5, §7).
+[[package.metadata.wiring.external]]
+item = "new_with_cells"
+consumer = "private"
+why = "an embedder creates a processor that stores its own encoding in the value cells"
+
+[[package.metadata.wiring.external]]
+item = "category_mark"
+consumer = "private"
+why = "the owner of a stream dictionary truncates it to a batch's mark when it drops the batch"
 [dependencies]
 columine-arrow = { path = "../columine-arrow" }
 columine-parsing = { path = "../columine-parsing" }

@@ -7,6 +7,22 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+# An embedder builds its schema's field descriptors from its own declarations
+# (specs/columine/10-physical-vocabulary.md §3).
+[[package.metadata.wiring.external]]
+item = "new_duration"
+consumer = "private"
+why = "an embedder lowers a declared span of time to its Duration column's descriptor"
+
+[[package.metadata.wiring.external]]
+item = "new_dictionary"
+consumer = "private"
+why = "an embedder lowers a declared enum or category to its dictionary-encoded column's descriptor"
+
+[[package.metadata.wiring.external]]
+item = "to_wire"
+consumer = "private"
+why = "an embedder writes its descriptors as the eight wire bytes a creation call takes"
 [dependencies]
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
