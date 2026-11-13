@@ -277,3 +277,25 @@ warning and hint text only, by the owner's ruling of 2026-10-28. These gaps stay
   warning fires only on the fork that measured it; no record keeps the last measured time, so doctor cannot apply the
   same 4 s decision (`source_clone_is_slow` in `cowshed-core/src/storage/lifecycle.rs`). A record would be a second
   store unless an existing authority (the fork's spans) already answers it. Owner: cowshed doctor, staffed by the lead.
+
+## A waiting install deadlocks with a land that asks for its ref turn
+
+On 2026-11-13 the after-land install of f5026924f6 (`cowshed gateway await-turns -- cowshed --json setup`) and a land in
+flight in another repository waited for each other. The install reported "the install waits for 1 land turn(s) queued
+before it: `<workspace>` holds `<repo>`". The land, its gate green, asked for `<repo>.ref` and reported "land waits for
+the ref turn `<repo>.ref`: parked behind an install that waits for the turns or fences them". Neither could move. An
+operator ended the install's wait after 241 s; the land took the ref turn in the same second and landed. The install
+recorded `install failed: setup exited 143` and has to be run again.
+
+Contract: `specs/cowshed/05_gateway.md`, "The read fences the turns": "While any install waits or any fence holds, an
+ask is parked … So the queues only shrink while an install waits". The same file, "A ref turn": "A land takes its land
+turn first and the ref turn inside it". The two together are the deadlock: the ref ask of a land that already holds a
+ticket is parked behind an install that waits for that ticket.
+
+- Design: an ask from a holder of a ticket the install waits for is numbered, not parked (the ref turn taken inside a
+  held land turn). Only an ask that would start a new land, or a ref writer outside any land, waits behind the install.
+  The queues an install waits for still only shrink: the ref ticket ends before the land turn it sits inside.
+- Law, red first, beside `waiting_install_numbers_no_ask`: with a land holding `<repo>` and an install waiting, that
+  land's ask for `<repo>.ref` is numbered and the install is fenced after the land ends; an unrelated ask stays parked.
+- Bend: the land-turn actor's model gets the nested ask; the theorem "an install that waits is fenced after finitely
+  many steps" must hold with it and fail on today's rule.
