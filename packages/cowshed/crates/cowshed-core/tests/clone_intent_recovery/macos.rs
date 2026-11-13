@@ -27,7 +27,8 @@ use cowshed_core::storage::job_artifact::{
 };
 use cowshed_core::storage::recovery::{
     IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
-    LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord, RetireOptions,
+    LifecycleIntentJournal, LifecycleIntentPhase, LifecycleIntentRecord, RetireContainment,
+    RetireOptions,
 };
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Spawn as _;
@@ -80,6 +81,14 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
         !trash.exists(),
         "clean release never prepares a trash rename"
     );
+    assert!(
+        fixture.intent("landed").is_none(),
+        "the journal write that finished the removal took its record"
+    );
+    fixture
+        .remove(&runtime, "landed")
+        .await
+        .expect("an rm re-issued after a deadline cut off its answer answers it as done");
     runtime.shutdown().await.expect("stop runtime");
     LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Retire {
@@ -102,10 +111,10 @@ async fn clean_landed_source_is_physically_deleted_before_reply_and_crash_replay
         .remove(&restarted, "landed")
         .await
         .expect("idempotent reply");
-    assert!(matches!(
-        fixture.intent("landed").unwrap().completion,
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
+    assert!(
+        fixture.intent("landed").is_none(),
+        "the replay that finished the removal took its record"
+    );
     assert!(!image.exists());
     assert!(!trash.exists());
     restarted.shutdown().await.expect("stop restarted runtime");
@@ -130,14 +139,9 @@ async fn an_interrupted_lane_land_retire_replays_against_the_lane_base() {
         .land_into(&runtime, "landed", &lane, true)
         .await
         .expect("land the first unit and retire it");
-    // What a land journals for its retire, which a cut-off land leaves unfinished.
-    let journaled = fixture.intent("landed").expect("the land's retire request");
     assert!(
-        matches!(
-            journaled.completion,
-            Some(LifecycleIntentCompletion::Retire(_))
-        ),
-        "{journaled:?}"
+        fixture.intent("landed").is_none(),
+        "a land's finished retire leaves no record"
     );
     fixture.lane_unit(&runtime, &lane, "interrupted").await;
     fixture
@@ -145,10 +149,25 @@ async fn an_interrupted_lane_land_retire_replays_against_the_lane_base() {
         .await
         .expect("land the second unit, keeping it");
     runtime.shutdown().await.expect("stop the landing runtime");
-    let mut request = serde_json::to_value(&journaled.operation).expect("retire request JSON");
-    request["workspace"] = json!("interrupted");
-    let request: LifecycleIntent =
-        serde_json::from_value(request).expect("the second unit's retire request");
+    // What a land journals for its retire, which a cut-off land leaves unfinished: the unit,
+    // measured against the branch it landed on in its lane base.
+    let lane_mount = PathBuf::from(lane["info"]["mount"].as_str().expect("lane mount"));
+    let lane_branch = String::from_utf8(git_bytes(
+        &lane_mount,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    ))
+    .expect("branch name")
+    .trim()
+    .to_owned();
+    let request = LifecycleIntent::Retire {
+        workspace: name("interrupted"),
+        options: RetireOptions::default(),
+        containment: Some(RetireContainment {
+            workspace: name("lane"),
+            branch: lane_branch,
+        }),
+        origin: None,
+    };
     LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
         journal.begin(request);
         journal.mark_mutating(&name("interrupted"))
@@ -156,15 +175,15 @@ async fn an_interrupted_lane_land_retire_replays_against_the_lane_base() {
     .expect("cut the land's retire off after its Mutating mark");
 
     let recovered = fixture.gc().await;
-    let record = fixture.intent("interrupted").expect("the replayed request");
     assert!(
-        matches!(
-            record.completion,
-            Some(LifecycleIntentCompletion::Retire(_))
-        ),
-        "the replay finished the retire against the lane base: {record:?}"
+        fixture.intent("interrupted").is_none(),
+        "the replay finished the retire against the lane base and took its record"
     );
     assert_eq!(fixture.listed(&recovered).await, ["lane", "main"]);
+    fixture
+        .remove(&recovered, "interrupted")
+        .await
+        .expect("an rm of the unit the replayed land retired answers it as done");
     recovered
         .shutdown()
         .await
@@ -221,17 +240,29 @@ async fn a_named_rm_abandon_supersedes_its_targets_refused_unfinished_retire() {
         .await
         .expect("--abandon retires the unit whose commits main does not hold");
     assert!(abandoned["abandoned"].is_object(), "{abandoned}");
-    let record = fixture.intent("unit").expect("the superseding request");
     assert!(
-        matches!(
-            record.completion,
-            Some(LifecycleIntentCompletion::Retire(_))
-        ),
-        "{record:?}"
+        fixture.intent("unit").is_none(),
+        "the journal write that finished the abandonment took its record"
     );
+    let bundle = PathBuf::from(
+        abandoned["abandoned"]["bundle"]
+            .as_str()
+            .expect("the abandonment names its bundle"),
+    );
+    fixture
+        .call(
+            &rm,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "unit",
+                "options": RemoveOptions { abandon: true, force: true },
+            }),
+        )
+        .await
+        .expect("the abandonment re-issued after it finished answers it as done");
     assert!(
-        matches!(&record.operation, LifecycleIntent::Retire { options, .. } if options.abandon),
-        "the journal holds the request that ran: {record:?}"
+        bundle.is_file(),
+        "the bundle the re-issue answers from stays in the trash"
     );
     assert_eq!(fixture.listed(&rm).await, ["lane", "main"]);
     rm.shutdown().await.expect("stop the removing runtime");
@@ -2443,12 +2474,10 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
         .remove(&rm, "stranded")
         .await
         .expect("rm retires the bare intent");
-    assert!(matches!(
-        fixture
-            .intent("stranded")
-            .and_then(|record| record.completion),
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
+    assert!(
+        fixture.intent("stranded").is_none(),
+        "the finished retirement of the bare intent leaves no record"
+    );
     rm.shutdown().await.expect("stop the removing runtime");
 
     let next = fixture
@@ -2564,7 +2593,10 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         .to_owned();
     let pending = DetachedWorkspaceMetadata::read_for_image(&image).expect("pending metadata");
     assert_eq!(pending.publication_state, PublicationState::PendingFence);
-    let origin = fixture.intent("wedged").expect("clone intent").operation;
+    assert!(
+        fixture.intent("wedged").is_some(),
+        "the fork's clone intent is pending"
+    );
     fixture
         .remove(&runtime, "source")
         .await
@@ -2592,13 +2624,9 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         !image.exists(),
         "the clean pending image is physically released"
     );
-    let retired = fixture.intent("wedged").expect("retirement record");
-    assert!(matches!(
-        retired.completion,
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
     assert!(
-        matches!(retired.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. } if **retained == origin)
+        fixture.intent("wedged").is_none(),
+        "the finished retirement of the pending fork leaves no record"
     );
     assert_eq!(
         fixture.listed(&rm).await,
@@ -2627,17 +2655,9 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         .remove(&rm, "empty")
         .await
         .expect("retire the image-free intent without its source");
-    assert!(matches!(
-        fixture.intent("empty").and_then(|record| record.completion),
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
-    let empty = fixture
-        .intent("empty")
-        .expect("image-free retirement record");
     assert!(
-        matches!(empty.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. }
-        if matches!(retained.as_ref(), LifecycleIntent::Fork { source, destination, rename: false }
-            if source == &name("source") && destination == &name("empty")))
+        fixture.intent("empty").is_none(),
+        "the finished retirement of the image-free intent leaves no record"
     );
     rm.shutdown()
         .await
@@ -2672,7 +2692,10 @@ async fn store_recovery_retires_an_unfinished_fork_whose_source_is_gone() {
         .expect("pending image")
         .image()
         .to_owned();
-    let origin = fixture.intent("wedged").expect("clone intent").operation;
+    assert!(
+        fixture.intent("wedged").is_some(),
+        "the fork's clone intent is pending"
+    );
     fixture
         .remove(&runtime, "source")
         .await
@@ -2690,18 +2713,14 @@ async fn store_recovery_retires_an_unfinished_fork_whose_source_is_gone() {
 
     let gc = fixture.gc().await;
     assert!(!image.exists(), "the pending clone is physically released");
-    let retired = fixture.intent("wedged").expect("retirement record");
-    assert!(matches!(
-        retired.completion,
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
     assert!(
-        matches!(retired.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. } if **retained == origin)
+        fixture.intent("wedged").is_none(),
+        "gc finished the pending fork's retirement and took its record"
     );
-    assert!(matches!(
-        fixture.intent("empty").and_then(|record| record.completion),
-        Some(LifecycleIntentCompletion::Retire(_))
-    ));
+    assert!(
+        fixture.intent("empty").is_none(),
+        "gc finished the image-free intent's retirement and took its record"
+    );
     assert_eq!(
         fixture.listed(&gc).await,
         ["main"],

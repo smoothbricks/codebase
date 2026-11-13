@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RemoveReport, RevisionTarget};
+use crate::api::dto::{AdoptOptions, ForkOptions, RemoveOptions, RevisionTarget};
 use crate::error::{CowshedError, Result as CowshedResult};
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 use crate::repository::RepoId;
@@ -817,7 +817,11 @@ impl LifecycleIntent {
     }
 }
 
-/// The result needed to make an idempotent re-issue indistinguishable from the first call.
+/// The result needed to make an idempotent re-issue of a create, fork or adopt
+/// indistinguishable from the first call. A retirement records none: the journal write that
+/// finishes it removes its record ([`LifecycleIntentJournal::finish_retirement`]), and a
+/// re-issue answers from the deletion log (02_workspaces.md, "Removal persists its exact
+/// options").
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -827,7 +831,20 @@ impl LifecycleIntent {
 )]
 pub enum LifecycleIntentCompletion {
     Workspace(WorkspaceIncarnation),
-    Retire(RemoveReport),
+}
+
+/// A completion as any build wrote it. A build before finished retirements left the journal
+/// recorded each one's report, which reads as a finished retirement and nothing more.
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "result",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+enum StoredCompletion {
+    Workspace(WorkspaceIncarnation),
+    Retire(serde::de::IgnoredAny),
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -918,18 +935,79 @@ impl LifecycleIntentRecord {
     }
 }
 
-/// Lifecycle entries are bounded to one record per logical workspace; terminal project unbinding
-/// releases this controller journal.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// A record as any build wrote it ([`StoredCompletion`]).
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRecord {
+    operation: LifecycleIntent,
+    #[serde(default)]
+    completion: Option<StoredCompletion>,
+    #[serde(default)]
+    phase: LifecycleIntentPhase,
+    #[serde(default)]
+    fence_steps: Option<FenceSteps>,
+}
+
+/// The journal as any build wrote it. Two things an earlier build kept read and are never
+/// written, so its next write drops them: the custody records of `gc --recover`, which went
+/// with recovery images (02_workspaces.md, `rm` step 5), and a finished retirement, which is
+/// nothing left to finish (00_overview.md).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredJournal {
+    version: u32,
+    entries: BTreeMap<WorkspaceName, StoredRecord>,
+    #[serde(default, rename = "recoveryExports")]
+    _recovery_exports: Option<serde::de::IgnoredAny>,
+}
+
+impl TryFrom<StoredJournal> for LifecycleIntentJournal {
+    type Error = String;
+
+    fn try_from(stored: StoredJournal) -> Result<Self, Self::Error> {
+        let mut entries = BTreeMap::new();
+        for (workspace, record) in stored.entries {
+            let completion = match (&record.operation, record.completion) {
+                (LifecycleIntent::Retire { .. }, Some(StoredCompletion::Retire(_))) => continue,
+                (_, Some(StoredCompletion::Retire(_))) => {
+                    return Err(format!(
+                        "lifecycle intent record {workspace} has an incompatible completion"
+                    ));
+                }
+                (_, Some(StoredCompletion::Workspace(incarnation))) => {
+                    Some(LifecycleIntentCompletion::Workspace(incarnation))
+                }
+                (_, None) => None,
+            };
+            entries.insert(
+                workspace,
+                LifecycleIntentRecord {
+                    operation: record.operation,
+                    completion,
+                    phase: record.phase,
+                    fence_steps: record.fence_steps,
+                },
+            );
+        }
+        Ok(Self {
+            version: stored.version,
+            entries,
+        })
+    }
+}
+
+/// What is pending in one project and what its live names' creations recorded, one record per
+/// logical workspace: a finished retirement leaves it, so the project's live and pending names
+/// bound it (00_overview.md). Terminal project unbinding releases this controller journal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    deny_unknown_fields,
+    try_from = "StoredJournal"
+)]
 pub struct LifecycleIntentJournal {
     version: u32,
     entries: BTreeMap<WorkspaceName, LifecycleIntentRecord>,
-    /// The custody records of `gc --recover`, which a build before recovery images went wrote
-    /// (02_workspaces.md, `rm` step 5): a storage format still read, so such a journal loads, and
-    /// never written, so its next write drops them.
-    #[serde(default, rename = "recoveryExports", skip_serializing)]
-    retired_recovery_exports: Option<serde_json::Value>,
 }
 
 impl Default for LifecycleIntentJournal {
@@ -937,7 +1015,6 @@ impl Default for LifecycleIntentJournal {
         Self {
             version: LIFECYCLE_INTENT_VERSION,
             entries: BTreeMap::new(),
-            retired_recovery_exports: None,
         }
     }
 }
@@ -1225,6 +1302,30 @@ impl LifecycleIntentJournal {
         self.validate()
     }
 
+    /// End `workspace`'s retirement, whose release is committed: nothing is left to finish, so
+    /// its record goes in this same journal write rather than staying as a completion every later
+    /// verb would parse and rewrite. A re-issue answers from the deletion log instead
+    /// (02_workspaces.md, "Removal persists its exact options").
+    pub fn finish_retirement(&mut self, workspace: &WorkspaceName) -> CowshedResult<()> {
+        match self.entries.get(workspace) {
+            Some(record) if matches!(record.operation, LifecycleIntent::Retire { .. }) => {
+                self.entries.remove(workspace);
+                Ok(())
+            }
+            Some(record) => Err(CowshedError::integrity(
+                format!(
+                    "lifecycle intent for {workspace} is a {}, not the retirement that finished",
+                    record.operation.verb()
+                ),
+                "reopen cowshed to reconcile lifecycle state",
+            )),
+            None => Err(CowshedError::integrity(
+                format!("lifecycle intent for {workspace} disappeared before completion"),
+                "reopen cowshed to reconcile lifecycle state",
+            )),
+        }
+    }
+
     /// Replace the Git state an unfinished missing-main re-adoption recorded with `git_before`,
     /// captured again from its plain checkout before a replay copies it (02_workspaces.md,
     /// "Missing main image"). While nothing is published the checkout is the user's live tree,
@@ -1325,10 +1426,6 @@ impl LifecycleIntentJournal {
                             | LifecycleIntent::Create { .. }
                             | LifecycleIntent::Fork { .. },
                         Some(LifecycleIntentCompletion::Workspace(_))
-                    )
-                    | (
-                        LifecycleIntent::Retire { .. },
-                        Some(LifecycleIntentCompletion::Retire(_))
                     )
             );
             if !valid_completion {

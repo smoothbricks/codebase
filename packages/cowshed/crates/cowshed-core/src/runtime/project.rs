@@ -4677,6 +4677,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await
     }
 
+    /// Finish `workspace`'s retirement: its record goes in this journal write
+    /// ([`crate::storage::recovery::LifecycleIntentJournal::finish_retirement`]).
+    async fn finish_retire_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
+        let workspace = workspace.clone();
+        self.update_lifecycle_intents(move |journal| journal.finish_retirement(&workspace))
+            .await
+    }
+
     fn completed_workspace_intent(
         &self,
         operation: &crate::storage::recovery::LifecycleIntent,
@@ -4685,26 +4693,59 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if record.operation != *operation {
             return None;
         }
-        match record.completion.as_ref()? {
-            crate::storage::recovery::LifecycleIntentCompletion::Workspace(incarnation) => {
-                Some(incarnation)
-            }
-            crate::storage::recovery::LifecycleIntentCompletion::Retire(_) => None,
-        }
+        let crate::storage::recovery::LifecycleIntentCompletion::Workspace(incarnation) =
+            record.completion.as_ref()?;
+        Some(incarnation)
     }
 
-    fn completed_retire_intent(
-        &self,
-        operation: &crate::storage::recovery::LifecycleIntent,
-    ) -> Option<&RemoveReport> {
-        let record = self.lifecycle_intents.get(operation.target())?;
-        if record.operation != *operation && !record.operation.retires_same_session(operation) {
-            return None;
+    /// What a removal of `workspace`, absent and unjournaled, re-issues: the newest
+    /// `retire-workspace` line the deletion log holds for it, or `None` when no line names it
+    /// (02_workspaces.md, "Removal persists its exact options"). The line answers that the session
+    /// was retired, when and by which process, and which abandon bundle the trash still holds for
+    /// it; what the first answer measured beyond the line is not answered again, so the report
+    /// carries no abandonment.
+    async fn finished_retirement(&self, workspace: &WorkspaceName) -> Result<Option<RemoveReport>> {
+        let project_root = self.layout.project().project_root.clone();
+        let name = workspace.clone();
+        let found = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::storage::deletion_log::latest_retirement(&project_root, &name).map(|line| {
+                line.map(|line| {
+                    let bundles = line.kept_bundles().filter(|path| path.is_file()).map(Path::to_path_buf).collect::<Vec<_>>();
+                    (line, bundles)
+                })
+            })
+        })
+        .await
+        .map_err(|error| CowshedError::internal(error.to_string()))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot read the deletion log of {} to answer the removal of {workspace}: {error}",
+                    self.layout.project().project_root.display()
+                ),
+                "check the project's store permissions and retry",
+            )
+        })?;
+        let Some((line, bundles)) = found else {
+            return Ok(None);
+        };
+        let by = line
+            .retired_by
+            .as_ref()
+            .map_or_else(String::new, |retired| {
+                format!(" by `{}`", retired.caller.argv.join(" "))
+            });
+        cowshed_os::eprintln!(
+            "cowshed: {workspace} was already retired at {}{by}; nothing is left to remove",
+            line.at
+        );
+        for bundle in bundles {
+            cowshed_os::eprintln!(
+                "cowshed: the abandon bundle {} keeps the work that retirement gave up",
+                bundle.display()
+            );
         }
-        match record.completion.as_ref()? {
-            crate::storage::recovery::LifecycleIntentCompletion::Retire(report) => Some(report),
-            crate::storage::recovery::LifecycleIntentCompletion::Workspace(_) => None,
-        }
+        Ok(Some(RemoveReport::default()))
     }
 
     fn intent_replay(&self, workspace: &WorkspaceName) -> IntentReplay {
@@ -5028,11 +5069,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     // A prepared retirement has not authorized deletion.
                                     self.restore_prepared_clone_intent(&workspace).await?;
                                 } else {
-                                    self.complete_lifecycle_intent(
-                                        &workspace,
-                                        LifecycleIntentCompletion::Retire(RemoveReport::default()),
-                                    )
-                                    .await?;
+self.finish_retire_intent(&workspace).await?;
                                 }
                             }
                             // An unreadable target is not evidence either way. Fail closed rather
@@ -5103,11 +5140,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     "cowshed: {workspace} was retired by an unadopt that has not unbound the project yet; cowshed unadopt finishes it"
                                 );
                             } else {
-                                self.complete_lifecycle_intent(
-                                    &workspace,
-                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
-                                )
-                                .await?;
+self.finish_retire_intent(&workspace).await?;
                             }
                         }
                         Err(error) => return Err(error),
@@ -8858,16 +8891,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // workspace is already gone.
         let was_pending = journaled
             || unfinished.is_some_and(|operation| operation.retires_same_session(&intent));
-        // A restore is never answered from its record: its retry must still unbind the project.
-        if !options.restore
-            && let Some(report) = self.completed_retire_intent(&intent).cloned()
-            && self
-                .current(&workspace)
-                .await
-                .is_err_and(|error| error.code == ErrorCode::NotFound)
-        {
-            return Ok(report);
-        }
 
         let mut current = match self.current(&workspace).await {
             Err(error) if error.code == ErrorCode::NotFound && !workspace.is_main() => {
@@ -8964,22 +8987,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     .await?;
                     self.mark_lifecycle_intent_mutating(&workspace).await?;
                     self.release_slot(&workspace).await?;
-                    let report = RemoveReport::default();
-                    self.complete_lifecycle_intent(
-                        &workspace,
-                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                    )
-                    .await?;
-                    return Ok(report);
+                    self.finish_retire_intent(&workspace).await?;
+                    return Ok(RemoveReport::default());
                 }
                 if was_pending {
-                    let report = RemoveReport::default();
-                    self.complete_lifecycle_intent(
-                        &workspace,
-                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                    )
-                    .await?;
-                    return Ok(report);
+                    self.finish_retire_intent(&workspace).await?;
+                    return Ok(RemoveReport::default());
+                }
+                // Absent, unjournaled and with no clone: a removal re-issued after its retirement
+                // finished answers from what that retirement left; a name nothing names is absent.
+                if let Some(retired) = self.finished_retirement(&workspace).await? {
+                    return Ok(retired);
                 }
                 return Err(error);
             }
@@ -9031,13 +9049,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 return Err(error);
             }
             Err(error) if error.code == ErrorCode::NotFound && was_pending => {
-                let report = RemoveReport::default();
-                self.complete_lifecycle_intent(
-                    &workspace,
-                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-                )
-                .await?;
-                return Ok(report);
+                self.finish_retire_intent(&workspace).await?;
+                return Ok(RemoveReport::default());
             }
             Err(error) => return Err(error),
         };
@@ -9282,11 +9295,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 };
             }
         };
-        self.complete_lifecycle_intent(
-            &workspace,
-            crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-        )
-        .await?;
+        self.finish_retire_intent(&workspace).await?;
         Ok(report)
     }
 
@@ -11015,11 +11024,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await?;
             self.mark_lifecycle_intent_mutating(workspace).await?;
             self.release_slot(workspace).await?;
-            self.complete_lifecycle_intent(
-                workspace,
-                crate::storage::recovery::LifecycleIntentCompletion::Retire(RemoveReport::default()),
-            )
-            .await?;
+            self.finish_retire_intent(workspace).await?;
         }
         cowshed_os::eprintln!(
             "cowshed: retired the unfinished fork of {workspace}: its source {source} no longer exists, so the fork could never finish"
@@ -11263,11 +11268,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 .await?;
             self.release_slot(workspace).await?;
             let report = RemoveReport { abandoned };
-            self.complete_lifecycle_intent(
-                workspace,
-                crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
-            )
-            .await?;
+            self.finish_retire_intent(workspace).await?;
             Ok(report)
         }
         .await;

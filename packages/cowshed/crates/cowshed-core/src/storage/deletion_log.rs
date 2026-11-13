@@ -381,6 +381,44 @@ pub fn classify_missing_companion(
     CompanionAbsence::RemovedExternally
 }
 
+/// The newest `retire-workspace` line naming `workspace`: the evidence a removal re-issued after
+/// that retirement finished answers from, since a finished retirement leaves no journal record
+/// (02_workspaces.md, "Removal persists its exact options"). `None` when the log is absent or names
+/// no retirement of it. A malformed line is skipped, as every reader here skips one, and only a
+/// line that spells the operation is parsed. Of equal timestamps the later line wins.
+pub fn latest_retirement(
+    project_root: &Path,
+    workspace: &WorkspaceName,
+) -> std::io::Result<Option<DeletionLogEntry>> {
+    let bytes = match std::fs::read(project_root.join(DELETION_LOG_FILE)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|line| line.contains(r#""op":"retire-workspace""#))
+        .filter_map(|line| serde_json::from_str::<DeletionLogEntry>(line).ok())
+        .filter(|entry| {
+            entry.op == DeletionOp::RetireWorkspace && entry.workspace == workspace.as_str()
+        })
+        .max_by(|left, right| left.at.cmp(&right.at)))
+}
+
+impl DeletionLogEntry {
+    /// The abandon bundles this line says keep a tip, each once, in tip order.
+    pub fn kept_bundles(&self) -> impl Iterator<Item = &Path> {
+        let mut seen = BTreeSet::new();
+        self.git
+            .iter()
+            .flat_map(|git| &git.tips)
+            .filter_map(|tip| match &tip.kept {
+                KeptBy::Bundle { path } => Some(path.as_path()),
+                KeptBy::Ref { .. } | KeptBy::Target { .. } => None,
+            })
+            .filter(move |path| seen.insert(*path))
+    }
+}
 /// Newest tombstone naming this image's companion, if any. Malformed lines are skipped —
 /// one corrupt line must not blind the reader to the rest of the evidence.
 fn find_companion_removal(project_root: &Path, image: &Path) -> Option<ControllerRemoval> {
@@ -926,6 +964,78 @@ mod tests {
         );
     }
 
+    /// A removal re-issued after its retirement finished answers from the newest retirement line
+    /// naming its workspace, and from the abandon bundle that line names; a line about anything
+    /// else, another workspace's retirement or a malformed line never answers it.
+    #[test]
+    fn the_newest_retirement_line_of_a_workspace_answers_its_reissued_removal() {
+        let project = temp_project("latest-retirement");
+        let raven = WorkspaceName::new("raven").expect("workspace");
+        assert_eq!(
+            latest_retirement(&project, &raven).expect("an absent log reads"),
+            None
+        );
+        let by = || RetiredBy {
+            caller: Caller::this_process(),
+            forced: None,
+        };
+        let head = crate::api::dto::GitOid::new("a".repeat(40)).expect("oid");
+        let bundle = project.join("sessions/.trash/raven-aaaa.bundle");
+        log_retirement(&project, "raven", &project.join("mnt/raven"), None, by());
+        log_deletion(
+            &project,
+            DeletionOp::ReclaimImage,
+            DeletionKind::Image,
+            "raven",
+            None,
+            &project.join("sessions/.deleting/raven.dmg"),
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(project.join(DELETION_LOG_FILE))
+            .and_then(|mut log| {
+                log.write_all(b"{\"op\":\"retire-workspace\",\"workspace\":\"raven\"\n")
+            })
+            .expect("append a malformed line");
+        let tip = |name: &str| KeptTip {
+            name: name.to_owned(),
+            tip: head.clone(),
+            kept: KeptBy::Bundle {
+                path: bundle.clone(),
+            },
+        };
+        log_retirement(
+            &project,
+            "raven",
+            &project.join("mnt/raven"),
+            Some(GitTips {
+                head: head.clone(),
+                tips: vec![tip("HEAD"), tip("cowshed/raven")],
+            }),
+            by(),
+        );
+        log_retirement(&project, "crow", &project.join("mnt/crow"), None, by());
+
+        let newest = latest_retirement(&project, &raven)
+            .expect("the log reads")
+            .expect("raven was retired");
+        assert_eq!(
+            newest.kept_bundles().collect::<Vec<_>>(),
+            [bundle.as_path()],
+            "the newest of raven's two retirements answers, naming its bundle once"
+        );
+        assert_eq!(
+            newest.retired_by.expect("who retired it").caller.pid,
+            std::process::id()
+        );
+        assert_eq!(
+            latest_retirement(&project, &WorkspaceName::new("owl").expect("workspace"))
+                .expect("the log reads"),
+            None,
+            "a name no retirement names is absent"
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
     #[test]
     fn missing_log_means_no_removal() {
         let project = temp_project("missing");

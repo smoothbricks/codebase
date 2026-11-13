@@ -73,7 +73,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     slot-bindings.json               # build slot → workspace bindings (`fork --slot`, 06_cli.md)
     policy.json                      # trusted project policy (standing grants); controller-owned, 0600
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
-    lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
+    lifecycle-intents.json           # persist-before-mutate create/fork/remove recovery journal: pending intents and live names' creations, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
     deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired (naming the process that retired it, what a force overrode and, for an abandonment, the bundle that keeps its tips), with Git tips (storage/deletion_log.rs)
     main.dmg                         # adopted main image (created here behind a PendingFence sidecar)

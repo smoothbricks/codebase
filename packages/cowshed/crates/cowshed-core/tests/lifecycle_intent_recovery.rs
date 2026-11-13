@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cowshed_core::api::{
-    AbandonedPreservation, AdoptOptions, LandingCommits, RemoveReport, UnlandedPaths,
-};
+use cowshed_core::api::AdoptOptions;
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, IntentLeases, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
@@ -118,55 +116,31 @@ fn historical_create_and_fork_tags_remain_readable_without_public_aliases() {
 }
 
 /// Records already on disk are the store's history, so every shape an earlier build wrote reads.
-/// The fixture is two retire records copied verbatim from a project journal a build wrote before
-/// abandonments kept refs and before measurements named files: one plain abandonment, one whose
-/// abandoned branches carry measurements. Each reads as predating both fields — never as "kept
-/// nothing" or "no file unheld" — and the journal written back holds each record as it was, so the
-/// fields a record predates are not invented on its behalf (00_overview.md, 02_workspaces.md).
+/// The fixture is two finished abandonments copied verbatim from a project journal a build wrote
+/// before abandonments kept refs and before measurements named files. A finished retirement is
+/// nothing left to finish, so that journal reads with nothing pending and its next write holds
+/// neither (00_overview.md).
 #[test]
-fn a_journal_an_earlier_build_wrote_reads_as_predating_and_is_written_back_as_it_was() {
+fn a_journal_of_finished_retirements_an_earlier_build_wrote_reads_as_nothing_pending() {
     const FIXTURE: &str = include_str!("fixtures/lifecycle-intents-before-preserved-refs.json");
     let root = TestRoot::new("predating-journal");
     let path = root.path().join(LIFECYCLE_INTENTS_FILE);
     fs::write(&path, FIXTURE).expect("write the captured journal");
 
     let journal = LifecycleIntentJournal::load(&path).expect("an earlier build's journal reads");
-    let mut measured_branches = 0;
-    for name in ["accounting-process-fence-proof", "nx-cache-advisor"] {
-        let record = journal.get(&workspace(name)).expect("captured record");
-        let Some(LifecycleIntentCompletion::Retire(report)) = record.completion.as_ref() else {
-            panic!("{name} is a completed retirement: {record:?}");
-        };
-        let abandoned = report.abandoned.as_ref().expect("an abandonment");
-        assert_eq!(
-            abandoned.preserved,
-            AbandonedPreservation::BundleOnly,
-            "{name}"
-        );
-        for branch in &abandoned.branches {
-            let LandingCommits::Measured { unlanded_paths, .. } = &branch.commits else {
-                panic!(
-                    "{name}'s {} was measured: {:?}",
-                    branch.branch, branch.commits
-                );
-            };
-            assert_eq!(unlanded_paths, &UnlandedPaths::PredatesPaths, "{name}");
-            measured_branches += 1;
-        }
-    }
     assert!(
-        measured_branches > 0,
-        "the fixture carries a branch measurement"
+        journal.records().next().is_none(),
+        "a finished retirement is nothing pending"
     );
 
     LifecycleIntentJournal::update(&census(), &path, |_| Ok(())).expect("write the journal back");
     let written: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("read the written journal"))
             .expect("the written journal is JSON");
-    let captured: serde_json::Value = serde_json::from_str(FIXTURE).expect("captured JSON");
     assert_eq!(
-        written, captured,
-        "a record keeps the shape its build wrote"
+        written,
+        serde_json::json!({ "version": 1, "entries": {} }),
+        "the next write drops the finished retirements"
     );
 }
 
@@ -329,28 +303,35 @@ fn crash_then_recover(operation: &str) {
     assert_eq!(record.operation, intent(operation));
     assert_eq!(record.completion, None);
 
-    let completion = if operation == "remove" {
+    if operation == "remove" {
         assert!(!state.exists(), "retirement reached its publication fence");
-        LifecycleIntentCompletion::Retire(RemoveReport::default())
+        LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
+            journal.finish_retirement(&target)
+        })
+        .expect("reconcile the released workspace");
+        let retried = LifecycleIntentJournal::load(&journal_path).expect("retry reload");
+        assert!(
+            retried.get(&target).is_none(),
+            "a retry finds the retirement finished and nothing left to replay"
+        );
     } else {
         assert!(state.is_dir(), "workspace publication reached its fence");
-        LifecycleIntentCompletion::Workspace(
+        let completion = LifecycleIntentCompletion::Workspace(
             WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
-        )
-    };
-    LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
-        journal.complete(&target, completion.clone())
-    })
-    .expect("reconcile published state");
-
-    let retried = LifecycleIntentJournal::load(&journal_path).expect("retry reload");
-    assert_eq!(
-        retried
-            .get(&target)
-            .and_then(|record| record.completion.clone()),
-        Some(completion),
-        "a retry observes the first operation's exact durable result"
-    );
+        );
+        LifecycleIntentJournal::update(&census(), &journal_path, |journal| {
+            journal.complete(&target, completion.clone())
+        })
+        .expect("reconcile published state");
+        let retried = LifecycleIntentJournal::load(&journal_path).expect("retry reload");
+        assert_eq!(
+            retried
+                .get(&target)
+                .and_then(|record| record.completion.clone()),
+            Some(completion),
+            "a retry observes the first operation's exact durable result"
+        );
+    }
     assert_eq!(
         fs::read_to_string(root.path().join("effects")).expect("read effect log"),
         "effect\n",
@@ -434,6 +415,101 @@ fn prepared_retirement_of_one_workspace_cannot_block_an_unrelated_command() {
         "discarding an unstarted retirement must preserve unrelated lifecycle work"
     );
 }
+
+/// A retirement's record is what lets a crash's next opening finish it. Once it has finished,
+/// nothing is left to finish, so the journal write that ends it removes it (02_workspaces.md,
+/// "Removal persists its exact options"). Kept, every name a project ever retired stayed in the
+/// journal that every lifecycle verb parses and rewrites whole: measured 2026-11-14, 4,548
+/// finished retirements and 6.4 MB in one project.
+#[test]
+fn a_finished_retirement_leaves_no_record() {
+    let name = workspace("retired");
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("retired", RetireOptions::default()));
+    journal
+        .mark_mutating(&name)
+        .expect("cross the retirement mutation fence");
+    journal
+        .finish_retirement(&name)
+        .expect("finish the retirement");
+
+    assert!(
+        journal.get(&name).is_none(),
+        "a finished retirement is nothing a later opening finishes"
+    );
+}
+
+/// A journal an earlier build wrote holds a finished retirement for every name it retired. The
+/// first command that takes the journal's lock drops every one in that single write, keeping what
+/// is still pending and what a live name's creation recorded; the write after it finds none to
+/// drop, and nothing reading the journal sees them before then.
+#[test]
+fn finished_retirements_an_earlier_build_kept_are_dropped_by_the_next_journal_write() {
+    const FINISHED: usize = 1000;
+    let root = TestRoot::new("finished-retirements");
+    let path = root.path().join(LIFECYCLE_INTENTS_FILE);
+    let mut entries = serde_json::Map::new();
+    for index in 0..FINISHED {
+        let name = format!("retired-{index}");
+        entries.insert(
+            name.clone(),
+            serde_json::json!({
+                "operation": { "kind": "retire", "workspace": name,
+                    "options": { "force": false, "restore": false, "abandon": false } },
+                "completion": { "kind": "retire", "result": {} },
+                "phase": "mutating",
+            }),
+        );
+    }
+    let live = serde_json::json!({
+        "operation": { "kind": "fork", "source": "main", "destination": "live" },
+        "completion": { "kind": "workspace", "result": "a".repeat(32) },
+        "phase": "mutating",
+    });
+    let retiring = serde_json::json!({
+        "operation": { "kind": "retire", "workspace": "retiring",
+            "options": { "force": false, "restore": false, "abandon": false } },
+        "phase": "mutating",
+    });
+    entries.insert("live".to_owned(), live.clone());
+    entries.insert("retiring".to_owned(), retiring.clone());
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({ "version": 1, "entries": entries }))
+            .expect("encode the earlier build's journal"),
+    )
+    .expect("write the earlier build's journal");
+
+    let loaded = LifecycleIntentJournal::load(&path).expect("an earlier build's journal reads");
+    let names = |journal: &LifecycleIntentJournal| {
+        journal
+            .records()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&loaded),
+        ["live", "retiring"],
+        "a reader sees no finished retirement"
+    );
+
+    LifecycleIntentJournal::update(&census(), &path, |_| Ok(())).expect("the next journal write");
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read the written journal"))
+            .expect("the written journal is JSON");
+    assert_eq!(
+        written,
+        serde_json::json!({ "version": 1, "entries": { "live": live, "retiring": retiring } }),
+        "one write drops every finished retirement and keeps the rest as it was written"
+    );
+    let first = fs::read(&path).expect("the journal after the first write");
+    LifecycleIntentJournal::update(&census(), &path, |_| Ok(())).expect("the write after it");
+    assert_eq!(
+        fs::read(&path).expect("the journal after the second write"),
+        first,
+        "the write after it has nothing left to drop"
+    );
+}
 #[test]
 fn mutating_retirement_remains_recoverable_after_a_crash() {
     let name = workspace("retiring");
@@ -454,11 +530,13 @@ fn mutating_retirement_remains_recoverable_after_a_crash() {
 fn a_refused_clone_puts_back_the_record_it_superseded() {
     let name = workspace("created");
     let mut journal = LifecycleIntentJournal::default();
-    journal.begin(retire("created", RetireOptions::default()));
+    journal.begin(intent("create"));
     journal
         .complete(
             &name,
-            LifecycleIntentCompletion::Retire(RemoveReport::default()),
+            LifecycleIntentCompletion::Workspace(
+                WorkspaceIncarnation::new("a".repeat(32)).expect("fixture incarnation"),
+            ),
         )
         .expect("an earlier lifecycle of the name finished");
     let earlier = journal.get(&name).cloned();

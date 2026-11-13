@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::ErrorCode;
 use crate::api::GitOid;
-use crate::api::dto::{AdoptOptions, RemoveReport};
+use crate::api::dto::AdoptOptions;
 use crate::build_volume::{BuildVolumeId, BuildVolumeRecord, BuildVolumeRole};
 use crate::git_preservation::{self, GitPreservationSnapshot};
 use crate::metadata::{
@@ -516,17 +516,14 @@ fn re_adopt_completion_with_the_exact_new_incarnation_is_accepted() {
 }
 
 #[test]
-fn re_adopt_retire_completion_is_refused_and_never_reaches_disk() {
+fn re_adopt_finished_as_a_retirement_is_refused_and_never_reaches_disk() {
     let fixture = Fixture::new();
     let journal = fixture.journal_path();
     begin_and_mark_mutating(&journal, fixture.intent(None));
     let before = fs::read(&journal).expect("read journal before refusal");
 
     let error = LifecycleIntentJournal::update(&crate::census::this_test(), &journal, |state| {
-        state.complete(
-            &WorkspaceName::main(),
-            LifecycleIntentCompletion::Retire(RemoveReport::default()),
-        )
+        state.finish_retirement(&WorkspaceName::main())
     })
     .expect_err("a retire result cannot complete a re-adoption");
     assert_eq!(error.code, ErrorCode::Integrity);

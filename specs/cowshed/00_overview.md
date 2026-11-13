@@ -106,13 +106,18 @@ workspace and denied to sandboxes (01_storage.md).
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an
 in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnation. There is **no mutable state
-database**. Each project does have one bounded, controller-owned `lifecycle-intents.json` recovery journal: it persists
-the latest create/fork/remove intent per logical workspace before mutation, but never overrides the inventory. Startup
-reconciles pending intent that no live process is executing against images, mounts, and markers, records the exact
-completed result, and retries only work whose publication is still absent. Its records are the project's history, so
-every shape an earlier build wrote reads: a field a record predates reads as that type's own "predates" state, never as
-an empty value that would claim a fact the record never held, and a record is written back without the field, as its
-build wrote it. A command that reports such a record says once, as a warning, what it does not record.
+database**. Each project does have one bounded, controller-owned `lifecycle-intents.json` recovery journal. It holds
+what is pending, the create/fork/remove intent of a logical workspace persisted before its first mutation, and what a
+live name's creation recorded, so a re-issued create or fork returns its incarnation; it never overrides the inventory,
+and the project's live and pending names bound it. Startup reconciles pending intent that no live process is executing
+against images, mounts, and markers, records the exact completed result, and retries only work whose publication is
+still absent. A finished retirement leaves no record: the journal write that ends it removes it, and its evidence is the
+project's deletion log and, for an abandonment, its bundle (02_workspaces.md, "Removal persists its exact options"). The
+records the journal holds are the project's history, so every shape an earlier build wrote reads: a field a record
+predates reads as that type's own "predates" state, never as an empty value that would claim a fact the record never
+held, and a record is written back without the field, as its build wrote it. A finished retirement an earlier build kept
+reads as nothing pending, and the next journal write drops it. A command that reports such a record says once, as a
+warning, what it does not record.
 
 The persistent processes are the cowshed daemon (one per host, the `dev.cowshed.gateway` LaunchAgent), which serves the
 gateway and the supervisor manager at `/private/cowshed/store/run/manager.sock`; the per-workspace supervisors, which
