@@ -28,6 +28,13 @@ export function EpochMicros(value: bigint): EpochMicros {
   return brandBigint<'EpochMicros'>(value);
 }
 
+/** Bigint nanoseconds since epoch -- the unit of an Arrow `Timestamp(ns)` and of a span's clock */
+export type EpochNanos = Brand<bigint, 'EpochNanos'>;
+
+/** Constructor */
+export function EpochNanos(value: bigint): EpochNanos {
+  return brandBigint<'EpochNanos'>(value);
+}
 /** Number milliseconds since epoch -- JS Date.getTime() domain */
 export type EpochMillis = Brand<number, 'EpochMillis'>;
 

@@ -21,7 +21,7 @@
  */
 
 // Clock + string → same clock domain (Date or EpochMicros)
-export { addDuration, durationToMicros } from './add-duration.js';
+export { addDuration, addDurationNanos, durationToMicros, durationToNanos } from './add-duration.js';
 
 // Core function - string → milliseconds
 export { parseDuration } from './parse-duration.js';

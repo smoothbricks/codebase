@@ -4,9 +4,9 @@
  * Calendar/TZ math uses Date internally; the public contract is µs in / µs out.
  */
 
-import { dateToMicros, microsToDate } from './conversions.js';
+import { dateToMicros, dateToNanos, microsToDate, nanosToDate } from './conversions.js';
 import type { TimeBoundary } from './time-boundaries.js';
-import type { EpochMicros } from './types.js';
+import type { EpochMicros, EpochNanos } from './types.js';
 
 type NormalizedBoundary = 'EOD' | 'EOW' | 'EOM' | 'EOQ' | 'EOY';
 type LocalDate = { year: number; month: number; day: number };
@@ -200,8 +200,21 @@ function computeWithTimezone(now: Date, boundary: NormalizedBoundary, timezone: 
  * @param timezone - Optional IANA timezone. UTC if omitted.
  */
 export function computeTimeBoundary(now: EpochMicros, boundary: TimeBoundary, timezone?: string): EpochMicros {
-  const civil = microsToDate(now);
+  return dateToMicros(boundaryDate(microsToDate(now), boundary, timezone));
+}
+
+/**
+ * Compute an absolute EpochNanos for a civil time boundary.
+ *
+ * @param now - Current time in epoch nanoseconds
+ * @param boundary - EOD / EOW / EOM / EOQ / EOY or long forms
+ * @param timezone - Optional IANA timezone. UTC if omitted.
+ */
+export function computeTimeBoundaryNanos(now: EpochNanos, boundary: TimeBoundary, timezone?: string): EpochNanos {
+  return dateToNanos(boundaryDate(nanosToDate(now), boundary, timezone));
+}
+
+function boundaryDate(civil: Date, boundary: TimeBoundary, timezone?: string): Date {
   const normalized = normalize(boundary);
-  const result = timezone ? computeWithTimezone(civil, normalized, timezone) : computeUTC(civil, normalized);
-  return dateToMicros(result);
+  return timezone ? computeWithTimezone(civil, normalized, timezone) : computeUTC(civil, normalized);
 }
