@@ -125,8 +125,23 @@ fn credential(name: &str, value: Option<&str>) -> bool {
             .iter()
             .any(|suffix| upper.ends_with(suffix))
         || value.is_some_and(|value| {
-            TOKEN_PREFIXES.iter().any(|prefix| value.contains(prefix)) || carries_userinfo(value)
+            TOKEN_PREFIXES
+                .iter()
+                .any(|prefix| starts_a_token(value, prefix))
+                || carries_userinfo(value)
         })
+}
+
+/// Whether `prefix` occurs in `value` where a token starts: at the value's start or after a
+/// character that is not alphanumeric. A token is pasted whole, so `sk-…` or `Bearer sk-…`; a
+/// word that only contains the letters (`nx-task-env`, `BAKIAN`) is not one.
+fn starts_a_token(value: &str, prefix: &str) -> bool {
+    value.match_indices(prefix).any(|(at, _)| {
+        value[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_ascii_alphanumeric())
+    })
 }
 
 /// `scheme://user[:password]@host`: a URL whose authority carries credentials.
@@ -895,6 +910,33 @@ mod tests {
         );
         assert_eq!(withheld("PATH", Some("/a:/b")), None);
         assert_eq!(withheld("DEVENV_ROOT", Some("/a")), None);
+    }
+
+    #[test]
+    fn a_path_whose_words_hold_a_token_prefix_is_carried_and_a_token_is_withheld() {
+        // A shed named `nx-task-env` spells `sk-` inside a word of every path below it; the
+        // activation of that checkout must still carry them (land gate of 2026-11-13).
+        for value in [
+            "/mnt/codebase/nx-task-env/.cowshed/config/shell",
+            "/w/ask-me:/w/dusk-dawn",
+            "/w/BAKIAN/bin",
+        ] {
+            assert_eq!(withheld("PRIVATE_CONFIG", Some(value)), None, "{value}");
+        }
+        for value in [
+            "sk-live-abc",
+            "Bearer sk-abc",
+            "x=ghp_abc",
+            "/run/xoxb-123",
+            "AKIAABCDEFGH",
+            "-----BEGIN PRIVATE KEY-----",
+        ] {
+            assert_eq!(
+                withheld("SOME_SETTING", Some(value)),
+                Some(Withheld::Credential),
+                "{value}"
+            );
+        }
     }
 
     /// One checkout of the tree, with its own per-workspace facts.
