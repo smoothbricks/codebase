@@ -160,7 +160,7 @@ part of the type). A column's type follows from the declaration alone, never fro
 | `S.category()`                                              | `string`                    | Dictionary of the stream, UInt32 index                                                                                                      |
 | `S.text()`                                                  | `string`                    | Utf8                                                                                                                                        |
 | `S.binary()` / `S.fixedBinary(n)`                           | `Uint8Array`                | Binary / FixedSizeBinary(n)                                                                                                                 |
-| `S.timestamp(unit)` / `S.duration(unit)`                    | `bigint`                    | Timestamp(unit, UTC) / Duration(unit); unit is `s`, `ms`, `us` or `ns`                                                                      |
+| `S.timestamp(unit)` / `S.duration(unit)`                    | the unit's brand            | Timestamp(unit, UTC) / Duration(unit); unit is `s`, `ms`, `us` or `ns`                                                                      |
 | `S.optional(field)`                                         | the field's, or `undefined` | the field's column                                                                                                                          |
 
 - **One empty state.** `S.optional(field)` is the same field with `optional` set: the same kind, the same column, and

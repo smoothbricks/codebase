@@ -24,20 +24,18 @@
  * @module nanoseconds
  */
 
+import {
+  EpochMillis,
+  EpochNanos,
+  epochMillisToNanos,
+  epochNanosToMicros,
+  epochNanosToMillis,
+} from '@smoothbricks/time';
+
 /**
- * Nanoseconds branded type.
- *
- * A `bigint` with a compile-time brand that prevents accidental mixing of time units.
- * The brand is erased at runtime - zero overhead.
+ * Nanoseconds since the Unix epoch: `@smoothbricks/time`'s `EpochNanos`, the one nanosecond brand.
  */
-declare const nanosecondsBrand: unique symbol;
-
-export type Nanoseconds = bigint & { readonly [nanosecondsBrand]: 'Nanoseconds' };
-
-function toNanoseconds(value: bigint): Nanoseconds;
-function toNanoseconds(value: bigint): bigint {
-  return value;
-}
+export type Nanoseconds = EpochNanos;
 
 /**
  * Nanoseconds utilities for conversion between time units.
@@ -50,7 +48,7 @@ export namespace Nanoseconds {
    * @returns Nanoseconds (last 6 digits are 000000)
    */
   export function fromMillis(millis: number): Nanoseconds {
-    return toNanoseconds(BigInt(Math.trunc(millis)) * 1_000_000n);
+    return epochMillisToNanos(EpochMillis(Math.trunc(millis)));
   }
 
   /**
@@ -59,26 +57,26 @@ export namespace Nanoseconds {
    * @param value - Raw bigint in nanoseconds
    */
   export function unsafe(value: bigint): Nanoseconds {
-    return toNanoseconds(value);
+    return EpochNanos(value);
   }
 
   /**
    * Convert nanoseconds to milliseconds.
    *
    * @param nanos - Nanoseconds value
-   * @returns Milliseconds as number (truncated, not rounded)
+   * @returns The millisecond the instant lies in
    */
   export function toMillis(nanos: Nanoseconds): number {
-    return Number(nanos / 1_000_000n);
+    return epochNanosToMillis(nanos);
   }
 
   /**
    * Convert nanoseconds to microseconds.
    *
    * @param nanos - Nanoseconds value
-   * @returns Microseconds as bigint (truncated)
+   * @returns The microsecond the instant lies in
    */
   export function toMicros(nanos: Nanoseconds): bigint {
-    return nanos / 1_000n;
+    return epochNanosToMicros(nanos);
   }
 }

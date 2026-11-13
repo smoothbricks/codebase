@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test';
+import { DurationMillis } from '@smoothbricks/duration';
+import { EpochMillis, EpochNanos } from '@smoothbricks/time';
 import {
   composeColumns,
   defineFieldKind,
@@ -53,6 +55,20 @@ describe('a field node', () => {
       ok: false,
       error: { path: 'method', expected: 'one of [GET, POST, PUT]', observed: '"PATCH"' },
     });
+  });
+
+  it('a_time_value_is_its_units_brand_and_its_cell_is_an_int64', () => {
+    const at = S.timestamp('ns');
+    const atMillis = S.timestamp('ms');
+    const took = S.duration('ms');
+    expect(at.codec.encode(at.params, EpochNanos(1_700_000_000_000_000_001n))).toBe(1_700_000_000_000_000_001n);
+    expect(atMillis.codec.encode(atMillis.params, EpochMillis(1_700_000_000_000))).toBe(1_700_000_000_000n);
+    expect(atMillis.codec.decode(atMillis.params, 1_700_000_000_000n)).toBe(EpochMillis(1_700_000_000_000));
+    expect(took.codec.encode(took.params, DurationMillis(250))).toBe(250n);
+    expect(validateField('at', at, 5).ok).toBe(false);
+    expect(validateField('at', atMillis, 5n).ok).toBe(false);
+    expect(validateField('at', atMillis, 1.5).ok).toBe(false);
+    expect(validateField('at', atMillis, 1_700_000_000_000).ok).toBe(true);
   });
 
   it('an_integer_refuses_a_value_outside_its_width', () => {

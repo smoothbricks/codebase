@@ -10,6 +10,8 @@
  * - S.text(): everything else; a plain string column.
  */
 
+import type { DurationMicros, DurationMillis, DurationNanos, DurationSeconds } from '@smoothbricks/duration';
+import type { EpochMicros, EpochMillis, EpochNanos, EpochSeconds } from '@smoothbricks/time';
 import {
   binaryKind,
   booleanKind,
@@ -36,6 +38,30 @@ import {
   withFieldMethods,
 } from './field.js';
 import type { TimeUnit } from './physical.js';
+
+/** The value of a timestamp field: the unit's epoch brand, in the domain JavaScript holds that unit in. */
+export interface TimestampValue {
+  readonly s: EpochSeconds;
+  readonly ms: EpochMillis;
+  readonly us: EpochMicros;
+  readonly ns: EpochNanos;
+}
+
+/** The value of a duration field: the unit's duration brand. */
+export interface DurationValue {
+  readonly s: DurationSeconds;
+  readonly ms: DurationMillis;
+  readonly us: DurationMicros;
+  readonly ns: DurationNanos;
+}
+
+function assertTimeUnit<T extends number | bigint, K extends string, U extends TimeUnit>(
+  field: Field<number | bigint, K, TimeUnit>,
+  unit: U,
+): asserts field is Field<T, K, U> {
+  if (field.params !== unit) throw new TypeError(`expected a '${field.kind}' field of unit ${unit}`);
+}
+
 import type {
   EagerField,
   EnumField,
@@ -193,10 +219,13 @@ export interface FieldBuilder {
   /** Raw bytes of one width. */
   fixedBinary(width: number): Field<Uint8Array, 'fixedBinary', number>;
 
-  /** A point in time: a count of `unit` since the Unix epoch, UTC. */
-  timestamp(unit: TimeUnit): Field<bigint, 'timestamp', TimeUnit>;
-  /** A span of time: a count of `unit`. */
-  duration(unit: TimeUnit): Field<bigint, 'duration', TimeUnit>;
+  /**
+   * A point in time: a count of `unit` since the Unix epoch, UTC. The value is the unit's brand of
+   * `@smoothbricks/time`: bigint for `ns` and `us`, number for `ms` and `s`; the cell is an Int64 for every unit.
+   */
+  timestamp<U extends TimeUnit>(unit: U): Field<TimestampValue[U], 'timestamp', U>;
+  /** A span of time: a count of `unit`. The value is the unit's brand of `@smoothbricks/duration`. */
+  duration<U extends TimeUnit>(unit: U): Field<DurationValue[U], 'duration', U>;
 
   /**
    * The field, optional: the same kind and column; empty is a clear validity bit. There is no other empty state.
@@ -234,7 +263,15 @@ export const S: FieldBuilder = {
       throw new TypeError(`fixedBinary needs a positive integer width, got ${width}`);
     return fixedBinaryKind(width);
   },
-  timestamp: (unit) => timestampKind(unit),
-  duration: (unit) => durationKind(unit),
+  timestamp: <U extends TimeUnit>(unit: U) => {
+    const field = timestampKind(unit);
+    assertTimeUnit<TimestampValue[U], 'timestamp', U>(field, unit);
+    return field;
+  },
+  duration: <U extends TimeUnit>(unit: U) => {
+    const field = durationKind(unit);
+    assertTimeUnit<DurationValue[U], 'duration', U>(field, unit);
+    return field;
+  },
   optional,
 };

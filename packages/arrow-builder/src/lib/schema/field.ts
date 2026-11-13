@@ -322,17 +322,31 @@ export const u64Kind = wideInt('u64', false);
 const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 
+/**
+ * A count of a time unit. JavaScript holds nanoseconds and microseconds as bigint and milliseconds and seconds as
+ * number (the `Date` domain); the cell is an Int64 for every unit.
+ */
 function timeKind<const Id extends string>(id: Id, physical: (unit: TimeUnit) => PhysicalType) {
-  return defineFieldKind<bigint, TimeUnit, Id>({
+  const wide = (unit: TimeUnit) => unit === 'ns' || unit === 'us';
+  return defineFieldKind<number | bigint, TimeUnit, Id>({
     id,
     physical,
     digest: (unit) => unit,
-    validate: (unit, value) =>
-      typeof value === 'bigint' && value >= I64_MIN && value <= I64_MAX
+    validate: (unit, value) => {
+      if (wide(unit)) {
+        return typeof value === 'bigint' && value >= I64_MIN && value <= I64_MAX
+          ? accept(value)
+          : refuse(`bigint of ${unit} in the int64 range`, value);
+      }
+      return typeof value === 'number' && Number.isSafeInteger(value)
         ? accept(value)
-        : refuse(`bigint of ${unit} in the int64 range`, value),
-    encode: identity,
-    decode: decodeAs(isBigint, id),
+        : refuse(`integer number of ${unit}`, value);
+    },
+    encode: (_unit, value) => BigInt(value),
+    decode: (unit, cell) => {
+      if (typeof cell !== 'bigint') throw new TypeError(`a '${id}' cell cannot hold ${observed(cell)}`);
+      return wide(unit) ? cell : Number(cell);
+    },
   });
 }
 

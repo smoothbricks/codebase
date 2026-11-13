@@ -27,6 +27,8 @@
     },
     {
       "path": "../validation/tsconfig.lib.json"
-    }
+    },
+    { "path": "../duration/tsconfig.lib.json" },
+    { "path": "../time/tsconfig.lib.json" }
   ]
 }
