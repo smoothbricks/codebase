@@ -654,6 +654,20 @@ invocations in one process whose local plugin's pre hook publishes the run's id 
 hunk the second run replayed the first's cache entry (`local-cache-kept-existing`, saw `run-one`). Drop the hunk, and
 keep the test, once the Nx in use scopes the memo to a run.
 
+## Local plugin paths
+
+A plugin nx.json names by a relative path (`./tools/plugin.js`) is that file under the workspace root, and
+`resolveNxPlugin` and `getPluginPathAndName` (`project-graph/plugins/resolve-plugin.js`) resolve it as the absolute
+path. Stock Nx passed the relative specifier to `require.resolve` with the workspace among `paths`. Bun 1.4.4's resolver
+keeps a directory's entries for the life of its process once it has looked anything up there, so a relative specifier
+never finds a file written after that lookup while the absolute path is read from the file system. Since a run's task
+hooks run in its own process (above), a long-lived Bun client loads the workspace's plugins itself, and one that runs
+one Nx invocation after another loaded no plugin a writer had added: a consumer's Nx worker refused every run of a
+workspace whose `nx.json` named a plugin file written after the worker started (`Cannot find module './inference.cjs'`).
+`packages/nx-plugin/src/nx-task-env-per-run.test.ts` ("a long-lived Bun client loads a local plugin …") writes the
+plugin between two runs of one Bun process. Drop the hunk, and keep the test, once Bun's resolver sees files a directory
+gains, or Nx resolves local plugin paths from the root itself.
+
 ## A cache hit keeps the outputs a run left, without a daemon
 
 Stock Nx keeps a cache hit's on-disk outputs only when its daemon recorded them (`outputsHashesMatchBatch`); a client

@@ -3157,7 +3157,7 @@ index 3aed2d0e8233491ed17cf2659fc44bd3ed74eac9..cc914c2dd0755a3ee555805b4ed085eb
  function serializeResult(error, serializedProjectGraph, serializedSourceMaps) {
      // We do not want to repeat work `JSON.stringify`ing an object containing the potentially large project graph so merge as strings
 diff --git a/dist/src/daemon/tmp-dir.js b/dist/src/daemon/tmp-dir.js
-index 400e96394bbef2f44ca626a1d9445bd539674068..b7f8eb4b0eaad4519e37b3da6c728e9b79389f4d 100644
+index 400e96394bbef2f44ca626a1d9445bd539674068..f31f54daa6b87d595fdf6384778313e8f5b8ecaf 100644
 --- a/dist/src/daemon/tmp-dir.js
 +++ b/dist/src/daemon/tmp-dir.js
 @@ -224,20 +224,28 @@ function assertWithinBudget(details) {
@@ -3169,7 +3169,7 @@ index 400e96394bbef2f44ca626a1d9445bd539674068..b7f8eb4b0eaad4519e37b3da6c728e9b
 + * reads its configuration from everywhere else. Given none, the native side
 + * reads the C environment, which under Bun an assignment to `process.env` never
 + * reaches: a Bun process that points `process.env.NX_SOCKET_DIR` at another
-+ * workspace (smoo-nx-exec entered from another workspace's shell) would bind its
++ * workspace (a wrapper entered from another workspace's shell) would bind its
 + * plugin workers in the directory it inherited.
 + */
  /** The daemon's own socket. */
@@ -4751,6 +4751,47 @@ index 9014799cfb98f624d9d2b04891c3c9d876c64916..e29dd0e015e0e63ccdd27c2036b0395f
      readonly argv: string[];
  };
  export type PostTasksExecutionContext = {
+diff --git a/dist/src/project-graph/plugins/resolve-plugin.js b/dist/src/project-graph/plugins/resolve-plugin.js
+index 8dcf1f508bd5447f356cab4d63fedd3f24a6e383..3cf40d176ccbef975fa9794901eda3af0157ed3e 100644
+--- a/dist/src/project-graph/plugins/resolve-plugin.js
++++ b/dist/src/project-graph/plugins/resolve-plugin.js
+@@ -19,6 +19,18 @@ const retrieve_workspace_files_1 = require("../utils/retrieve-workspace-files");
+ const TS_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.cts', '.mts']);
+ let projectsWithoutInference;
+ let projectsWithoutInferencePromise = null;
++/**
++ * A plugin nx.json names by a relative path (`./tools/plugin.js`) is that file under the
++ * workspace root, resolved as a path. Bun's resolver keeps a directory's entries for the life of
++ * its process once it has looked anything up there, so a relative specifier never finds a file
++ * written after that lookup, while the absolute path is read from the file system: a long-lived
++ * Bun client (one Nx run after another in one process) then loaded no plugin a writer had added.
++ */
++function fromRoot(moduleName, root) {
++    return moduleName.startsWith('./') || moduleName.startsWith('../')
++        ? path.resolve(root, moduleName)
++        : moduleName;
++}
+ async function resolveNxPlugin(moduleName, root, paths) {
+     // Default plugins (see `getDefaultPlugins` in `get-plugins.ts`) are passed
+     // as absolute file paths to compiled bundles inside `nx` itself; they are
+@@ -28,7 +40,7 @@ async function resolveNxPlugin(moduleName, root, paths) {
+     if (!path.isAbsolute(moduleName)) {
+         let resolvedFromNode;
+         try {
+-            resolvedFromNode = require.resolve(moduleName, { paths });
++            resolvedFromNode = require.resolve(fromRoot(moduleName, root), { paths });
+         }
+         catch { }
+         // Load projects if Node couldn't resolve (so the local fallback can run)
+@@ -95,7 +107,7 @@ function getPluginPathAndName(moduleName, paths, projects, root) {
+     }
+     if (!pluginPath) {
+         try {
+-            pluginPath = require.resolve(moduleName, { paths });
++            pluginPath = require.resolve(fromRoot(moduleName, root), { paths });
+         }
+         catch (e) {
+             if (localPlugin && isPackageResolutionError(e)) {
 diff --git a/dist/src/project-graph/plugins/tasks-execution-hooks.js b/dist/src/project-graph/plugins/tasks-execution-hooks.js
 index 867a717e26592ed291df332083e1aded275dc404..8af158796c275950c11c55953b6deb63ff353c95 100644
 --- a/dist/src/project-graph/plugins/tasks-execution-hooks.js

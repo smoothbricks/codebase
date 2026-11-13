@@ -23,7 +23,7 @@ const HOOK_PLUGIN = `exports.preTasksExecution = async (_options, context) => {
 `;
 
 /** Two Nx invocations in one process, each through the hooks and the tasks runner, as a long-lived client makes them. */
-const TWO_RUNS = `const { readFileSync } = require('node:fs');
+const TWO_RUNS = `const { readFileSync, writeFileSync } = require('node:fs');
 const { createProjectGraphAsync } = require('nx/src/project-graph/project-graph');
 const { readNxJson } = require('nx/src/config/nx-json');
 const { splitArgsIntoNxArgsAndOverrides } = require('nx/src/utils/command-line-utils');
@@ -32,6 +32,11 @@ const { invokeTasksRunner } = require('nx/src/tasks-runner/run-command');
 const { runPreTasksExecution, runPostTasksExecution } = require('nx/src/project-graph/plugins/tasks-execution-hooks');
 
 async function run(id) {
+  // A run named \`later…\` first writes a local plugin the earlier runs never named, and names it.
+  if (id.startsWith('later')) {
+    writeFileSync('later-plugin.js', "exports.preTasksExecution = async (_options, context) => { process.env.HOOK_RUN = 'later-plugin ' + context.id; };\\n");
+    writeFileSync('nx.json', JSON.stringify({ plugins: ['./later-plugin.js'] }));
+  }
   const projectGraph = await createProjectGraphAsync({ exitOnError: false });
   const nxJson = readNxJson();
   const { nxArgs } = splitArgsIntoNxArgsAndOverrides({ targets: ['show'], outputStyle: 'static' }, 'run-many', { printWarnings: false }, nxJson);
@@ -54,10 +59,14 @@ async function run(id) {
 });
 `;
 
-it('each run of a long-lived Nx client hashes and forks its tasks with the environment its own pre hook published', async () => {
-  await withNxFixture('nx-task-env-per-run', async ({ workspace, socketDirectory }) => {
+/** The runs `ids` of one Bun process over a fixture whose local plugin publishes the run's id to a task keyed on it. */
+async function runsInOneProcess(
+  label: string,
+  ids: readonly string[],
+): Promise<{ status: number | null; lines: string[]; output: string }> {
+  return await withNxFixture(label, async ({ workspace, socketDirectory }) => {
     await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-    await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'nx-task-env-per-run', private: true }));
+    await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: label, private: true }));
     await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['./hook-plugin.js'] }));
     await writeFile(join(workspace, 'hook-plugin.js'), HOOK_PLUGIN);
     await writeFile(join(workspace, 'two-runs.cjs'), TWO_RUNS);
@@ -78,12 +87,28 @@ it('each run of a long-lived Nx client hashes and forks its tasks with the envir
     );
     // The job rule, no daemon running: the client runs its hooks and tasks in its own process.
     const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_DAEMON_START: 'never' };
-    const ran = spawnSync('bun', ['two-runs.cjs', 'run-one', 'run-two'], { cwd: workspace, env, encoding: 'utf8' });
-    const output = `${ran.stdout}${ran.stderr}`;
-    expect(ran.status, `the runs: ${output}`).toBe(0);
-    expect(ran.stdout.trim().split('\n'), `the runs: ${output}`).toEqual([
-      'run-one success saw run-one',
-      'run-two success saw run-two',
-    ]);
+    const ran = spawnSync('bun', ['two-runs.cjs', ...ids], { cwd: workspace, env, encoding: 'utf8' });
+    return { status: ran.status, lines: ran.stdout.trim().split('\n'), output: `${ran.stdout}${ran.stderr}` };
   });
+}
+
+it.each([
+  {
+    name: 'each run of a long-lived Nx client hashes and forks its tasks with the environment its own pre hook published',
+    label: 'nx-task-env-per-run',
+    runs: ['run-one', 'run-two'],
+    saw: ['run-one success saw run-one', 'run-two success saw run-two'],
+  },
+  {
+    // Bun's resolver keeps a directory's entries once it has looked anything up there, so the plugin file the second
+    // run writes in the workspace root was invisible to a relative specifier (patches/README.md, "Local plugin paths").
+    name: 'a long-lived Bun client loads a local plugin nx.json names by a relative path, written after its first run',
+    label: 'nx-local-plugin-later',
+    runs: ['run-one', 'later'],
+    saw: ['run-one success saw run-one', 'later success saw later-plugin later'],
+  },
+] as const)('$name', async ({ label, runs, saw }) => {
+  const { status, lines, output } = await runsInOneProcess(label, runs);
+  expect(status, `the runs: ${output}`).toBe(0);
+  expect(lines, `the runs: ${output}`).toEqual([...saw]);
 });
