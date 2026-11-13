@@ -42,3 +42,11 @@ export type EpochMillis = Brand<number, 'EpochMillis'>;
 export function EpochMillis(value: number): EpochMillis {
   return brandNumber<'EpochMillis'>(value);
 }
+
+/** Number seconds since epoch -- the Unix `time_t` domain */
+export type EpochSeconds = Brand<number, 'EpochSeconds'>;
+
+/** Constructor */
+export function EpochSeconds(value: number): EpochSeconds {
+  return brandNumber<'EpochSeconds'>(value);
+}

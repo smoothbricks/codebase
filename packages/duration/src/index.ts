@@ -27,3 +27,4 @@ export { addDuration, addDurationNanos, durationToMicros, durationToNanos } from
 export { parseDuration } from './parse-duration.js';
 // Types
 export type { DurationString, Milliseconds } from './types.js';
+export { DurationMicros, DurationMillis, DurationNanos, DurationSeconds } from './types.js';

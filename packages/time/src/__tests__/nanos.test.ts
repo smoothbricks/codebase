@@ -7,6 +7,7 @@ import {
   EpochMicros,
   EpochMillis,
   EpochNanos,
+  EpochSeconds,
   epochMicrosToMillis,
   epochMicrosToNanos,
   epochMillisToNanos,
@@ -79,5 +80,14 @@ describe('unit brands refuse each other', () => {
     // @ts-expect-error a nanosecond field takes no bare bigint
     const bare: EpochNanos = 1n;
     expect([asMicros, asNanos, bare].length).toBe(3);
+  });
+});
+
+describe('EpochSeconds', () => {
+  it('is its own unit', () => {
+    const seconds: EpochSeconds = EpochSeconds(1_794_601_417);
+    // @ts-expect-error a seconds field takes no millisecond value
+    const fromMillis: EpochSeconds = EpochMillis(1_794_601_417_993);
+    expect([seconds, fromMillis].length).toBe(2);
   });
 });

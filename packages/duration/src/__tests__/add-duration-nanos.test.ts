@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { EpochNanos } from '@smoothbricks/time';
 import { addDurationNanos, durationToMicros, durationToNanos } from '../add-duration.js';
+import { DurationMicros, DurationMillis, DurationNanos, DurationSeconds } from '../types.js';
 
 describe('durationToNanos', () => {
   it('is the microsecond duration scaled by a thousand, for every unit', () => {
@@ -19,5 +20,18 @@ describe('addDurationNanos', () => {
   it('adds in the nanosecond domain and keeps the sub-millisecond digits', () => {
     const now = EpochNanos(1_794_601_417_993_000_123n);
     expect(addDurationNanos(now, '5 minutes')).toBe(EpochNanos(1_794_601_717_993_000_123n));
+  });
+});
+
+describe('duration unit brands', () => {
+  it('refuse each other and a bare value, by type', () => {
+    const nanos: DurationNanos = DurationNanos(1_000n);
+    // @ts-expect-error a microsecond span takes no nanosecond value
+    const asMicros: DurationMicros = nanos;
+    // @ts-expect-error a millisecond span takes no bare number
+    const bare: DurationMillis = 5;
+    // @ts-expect-error a seconds span takes no millisecond value
+    const asSeconds: DurationSeconds = DurationMillis(5);
+    expect([asMicros, bare, asSeconds].length).toBe(3);
   });
 });

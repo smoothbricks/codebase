@@ -32,6 +32,7 @@ describe('package export contract', () => {
       'EpochMicros',
       'EpochMillis',
       'EpochNanos',
+      'EpochSeconds',
       'TIME_BOUNDARIES',
       'computeTimeBoundary',
       'computeTimeBoundaryNanos',

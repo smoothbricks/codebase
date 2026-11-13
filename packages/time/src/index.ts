@@ -40,4 +40,4 @@ export {
   nowNanos,
 } from './conversions.js';
 export { isTimeBoundary, TIME_BOUNDARIES, type TimeBoundary } from './time-boundaries.js';
-export { EpochMicros, EpochMillis, EpochNanos } from './types.js';
+export { EpochMicros, EpochMillis, EpochNanos, EpochSeconds } from './types.js';
