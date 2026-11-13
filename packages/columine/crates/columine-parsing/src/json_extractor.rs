@@ -1255,7 +1255,7 @@ impl<'a> MsgpackValueWriter<'a> {
                 self.buf()[header + 1..header + 5].copy_from_slice(&count.to_be_bytes());
                 Ok(())
             }
-            SemanticSchema::Optional(inner) | SemanticSchema::Nullable(inner) => {
+            SemanticSchema::Optional(inner) => {
                 self.write_value_filtered(parser, token, inner, path, extra, extra_count)
             }
             _ => self.write_value(parser, token),
@@ -1514,7 +1514,7 @@ mod tests {
             "authorRole@open",
         ];
         let envelope = parse_schema_envelope(
-            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"optional","value":{"kind":"string"}}}}}"#,
         )
         .unwrap();
         let config = crate::build_extraction_config_with_semantic_schemas(
@@ -2187,7 +2187,7 @@ mod tests {
         )
         .unwrap();
         let nested = crate::validate::parse_schema_envelope(
-            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"optional","value":{"kind":"string"}}}}}"#,
         )
         .unwrap();
         let undeclared = config(&one, &["id"]);

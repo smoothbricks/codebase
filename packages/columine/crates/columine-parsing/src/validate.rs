@@ -741,8 +741,9 @@ pub enum SemanticSchema {
         value: Node<Self>,
     },
     Record(Node<Self>),
+    /// A value of the inner schema, or the one empty state: a missing
+    /// object member and an explicit `null` are the same emptiness.
     Optional(Node<Self>),
-    Nullable(Node<Self>),
     /// One canonical value-object frame, admitted only through a
     /// [`VoAdmission`] capability prepared for this metadata.
     Vo(Node<VoMetadata>),
@@ -825,7 +826,6 @@ impl SemanticSchema {
             Self::Map { .. } => "map",
             Self::Record(_) => "record",
             Self::Optional(_) => "optional",
-            Self::Nullable(_) => "nullable",
             Self::Vo(_) => "vo",
         }
     }
@@ -836,7 +836,7 @@ impl SemanticSchema {
 }
 
 /// Visit every top-level payload member declared as an enum (directly or
-/// under `optional`/`nullable`) with its variants in ordinal order.
+/// under `optional`) with its variants in ordinal order.
 pub(crate) fn collect_enum_members<E>(
     schema: &SemanticSchema,
     mut visit: impl FnMut(&str, &[String]) -> Result<(), E>,
@@ -846,7 +846,7 @@ pub(crate) fn collect_enum_members<E>(
     };
     for (name, field) in fields {
         let mut inner = field;
-        while let SemanticSchema::Optional(next) | SemanticSchema::Nullable(next) = inner {
+        while let SemanticSchema::Optional(next) = inner {
             inner = next;
         }
         if let SemanticSchema::Enum(variants) = inner {
@@ -887,8 +887,7 @@ pub(crate) fn collect_open_paths(
         }
         SemanticSchema::Array { item, .. }
         | SemanticSchema::Record(item)
-        | SemanticSchema::Optional(item)
-        | SemanticSchema::Nullable(item) => collect_open_paths(item, path, output)?,
+        | SemanticSchema::Optional(item) => collect_open_paths(item, path, output)?,
         SemanticSchema::Map { key, value } => {
             collect_open_paths(key, path, output)?;
             collect_open_paths(value, path, output)?;
@@ -926,8 +925,7 @@ fn collect_vo_metadata<'a>(schema: &'a SemanticSchema, output: &mut Vec<&'a VoMe
         }
         SemanticSchema::Array { item, .. }
         | SemanticSchema::Record(item)
-        | SemanticSchema::Optional(item)
-        | SemanticSchema::Nullable(item) => collect_vo_metadata(item, output),
+        | SemanticSchema::Optional(item) => collect_vo_metadata(item, output),
         SemanticSchema::Map { key, value } => {
             collect_vo_metadata(key, output);
             collect_vo_metadata(value, output);
@@ -1212,7 +1210,6 @@ impl SemanticSchema {
             },
             Self::Record(value) => Self::Record(node(value)?),
             Self::Optional(value) => Self::Optional(node(value)?),
-            Self::Nullable(value) => Self::Nullable(node(value)?),
             Self::Vo(metadata) => Self::Vo(Node::new(try_clone_vo(metadata)?)?),
         })
     }
@@ -1370,8 +1367,7 @@ fn count_vo_metadata(schema: &SemanticSchema) -> usize {
             .sum(),
         SemanticSchema::Array { item, .. }
         | SemanticSchema::Record(item)
-        | SemanticSchema::Optional(item)
-        | SemanticSchema::Nullable(item) => count_vo_metadata(item),
+        | SemanticSchema::Optional(item) => count_vo_metadata(item),
         SemanticSchema::Map { key, value } => count_vo_metadata(key) + count_vo_metadata(value),
         SemanticSchema::Union(variants) => variants.iter().map(count_vo_metadata).sum(),
         SemanticSchema::Unknown
@@ -1767,8 +1763,7 @@ fn validate_at<'s, G: AddressGrammar>(
             });
             stop.map_or(Ok(()), Err)
         }
-        SemanticSchema::Optional(item) => validate_at::<G>(item, value, path, depth + 1, frames),
-        SemanticSchema::Nullable(item) => {
+        SemanticSchema::Optional(item) => {
             if value.kind() == ValueKind::Null {
                 Ok(())
             } else {
@@ -2151,10 +2146,6 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
             depth + 1,
         )?)?)),
         "optional" => Ok(SemanticSchema::Optional(Node::new(parse_schema(
-            field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
-            depth + 1,
-        )?)?)),
-        "nullable" => Ok(SemanticSchema::Nullable(Node::new(parse_schema(
             field(fields, "value").ok_or(SchemaParseError::MissingOperand)?,
             depth + 1,
         )?)?)),
@@ -2978,16 +2969,38 @@ mod tests {
         );
     }
     #[test]
-    fn missing_required_and_optional_fields_are_distinct() {
+    fn an_optional_member_admits_a_value_and_one_empty_state() {
         let required = schema(r#"{"kind":"object","fields":{"name":{"kind":"string"}}}"#);
         let optional = schema(
             r#"{"kind":"object","fields":{"name":{"kind":"optional","value":{"kind":"string"}}}}"#,
         );
-        let empty = json("{}");
-        let required_error = violation_of(validate_value(&required, &empty));
-        assert_eq!(required_error.path, "value.name");
-        assert_eq!(required_error.observed, "absent");
-        assert!(validate_value(&optional, &empty).is_ok());
+        let absent = violation_of(validate_value(&required, &json("{}")));
+        assert_eq!(
+            (absent.path.as_str(), absent.observed.as_str()),
+            ("value.name", "absent")
+        );
+        let null = violation_of(validate_value(&required, &json(r#"{"name":null}"#)));
+        assert_eq!(
+            (null.path.as_str(), null.observed.as_str()),
+            ("value.name", "null")
+        );
+        // A missing key and an explicit null are the one empty state.
+        for admitted in ["{}", r#"{"name":null}"#, r#"{"name":"ok"}"#] {
+            assert_eq!(
+                validate_value(&optional, &json(admitted)),
+                Ok(()),
+                "{admitted}"
+            );
+        }
+        let wrong = violation_of(validate_value(&optional, &json(r#"{"name":1}"#)));
+        assert_eq!(
+            (
+                wrong.path.as_str(),
+                wrong.expected.as_str(),
+                wrong.observed.as_str()
+            ),
+            ("value.name", "string", "number")
+        );
     }
 
     #[test]
@@ -3085,9 +3098,9 @@ mod tests {
     }
 
     #[test]
-    fn nullable_and_nested_collections_are_checked() {
+    fn an_optional_item_and_nested_collections_are_checked() {
         let schema = schema(
-            r#"{"kind":"object","fields":{"items":{"kind":"array","item":{"kind":"nullable","value":{"kind":"string"}}},"labels":{"kind":"record","value":{"kind":"string"}}}}"#,
+            r#"{"kind":"object","fields":{"items":{"kind":"array","item":{"kind":"optional","value":{"kind":"string"}}},"labels":{"kind":"record","value":{"kind":"string"}}}}"#,
         );
         assert!(
             validate_value(
@@ -3113,6 +3126,14 @@ mod tests {
             Err(SchemaParseError::UnknownKind)
         );
         assert!(JsonValue::parse(br#"{"#).is_err());
+    }
+
+    #[test]
+    fn nullable_is_not_a_schema_kind() {
+        assert_eq!(
+            SemanticSchema::from_tree_bytes(br#"{"kind":"nullable","value":{"kind":"string"}}"#),
+            Err(SchemaParseError::UnknownKind)
+        );
     }
 
     #[test]
@@ -3362,7 +3383,7 @@ mod tests {
     #[test]
     fn canonical_int64_is_judged_at_its_path_inside_nested_shapes() {
         let schema = schema(
-            r#"{"kind":"object","fields":{"id":{"kind":"bigint"},"count":{"kind":"optional","value":{"kind":"number"}},"marks":{"kind":"array","item":{"kind":"nullable","value":{"kind":"i32"}}},"limits":{"kind":"map","key":{"kind":"string"},"value":{"kind":"u32"}},"totals":{"kind":"record","value":{"kind":"bigint"}}}}"#,
+            r#"{"kind":"object","fields":{"id":{"kind":"bigint"},"count":{"kind":"optional","value":{"kind":"number"}},"marks":{"kind":"array","item":{"kind":"optional","value":{"kind":"i32"}}},"limits":{"kind":"map","key":{"kind":"string"},"value":{"kind":"u32"}},"totals":{"kind":"record","value":{"kind":"bigint"}}}}"#,
         );
         let exact = JsonValue::CanonicalInt64;
         let payload = |count: Option<i64>, mark: i64, limit: i64| {

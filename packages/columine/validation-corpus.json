@@ -132,17 +132,26 @@
     "observed": "array"
   },
   {
-    "name": "optional-present-null-is-not-nullable",
+    "name": "optional-null-is-empty",
     "schema": { "kind": "optional", "value": { "kind": "string" } },
     "value": null,
-    "verdict": "refuse",
-    "path": "value",
-    "expected": "string",
-    "observed": "null"
+    "verdict": "accept"
   },
   {
-    "name": "nullable-wrong-number",
-    "schema": { "kind": "nullable", "value": { "kind": "string" } },
+    "name": "optional-member-null-is-empty",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "optional", "value": { "kind": "string" } } } },
+    "value": { "greeting": null },
+    "verdict": "accept"
+  },
+  {
+    "name": "optional-member-present-ok",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "optional", "value": { "kind": "string" } } } },
+    "value": { "greeting": "hello" },
+    "verdict": "accept"
+  },
+  {
+    "name": "optional-wrong-number",
+    "schema": { "kind": "optional", "value": { "kind": "string" } },
     "value": 1,
     "verdict": "refuse",
     "path": "value",

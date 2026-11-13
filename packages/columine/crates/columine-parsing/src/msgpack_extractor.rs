@@ -892,7 +892,7 @@ mod tests {
             "authorRole@open",
         ];
         let envelope = parse_schema_envelope(
-            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"optional","value":{"kind":"string"}}}}}"#,
         )
         .unwrap();
         let discriminator = crate::PayloadDiscriminator {

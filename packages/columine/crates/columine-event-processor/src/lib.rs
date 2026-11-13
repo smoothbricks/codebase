@@ -1824,6 +1824,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_optional_typed_member_stores_null_and_absent_as_one_arrow_null() {
+        use columine_parsing::{CellExt, ColumnValue};
+        let envelope = r#"{"hi":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string"}}}}}"#;
+        let fields = [
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new(ArrowType::Utf8, true),
+        ];
+        let schema = DynamicSchemaConfig {
+            semantic_schema: Some(envelope.as_bytes().to_vec()),
+            ..schema_with_names(&fields, b"id\0type\0timestamp\0value.note\0")
+        };
+        let mut ep = EventProcessor::new(admission_options(), 8, schema).unwrap();
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(
+                br#"[{"id":"a","type":"hi","timestamp":1,"value":{"note":"x"}},{"id":"b","type":"hi","timestamp":2,"value":{"note":null}},{"id":"c","type":"hi","timestamp":3,"value":{}}]"#,
+                InputFormat::Json,
+                &mut output,
+                &[]
+            ),
+            ResultCode::Ok
+        );
+        let columns = &ep.plane.dynamic_columns;
+        assert_eq!(
+            [0, 1, 2].map(|row| columns.cell(3, row)),
+            [Some(ColumnValue::Utf8("x".into())), None, None]
+        );
+    }
     /// The one address the test grammar admits: a host's grammar, named by type.
     struct TestGrammar;
 
