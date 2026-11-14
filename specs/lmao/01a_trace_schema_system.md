@@ -165,6 +165,14 @@ part of the type). A column's type follows from the declaration alone, never fro
 
 - **One empty state.** `S.optional(field)` is the same field with `optional` set: the same kind, the same column, and
   empty is a clear validity bit. An eager column has no validity bitmap, so an eager field cannot be optional.
+  - **A time unit fixes the JavaScript value.** <a id="smoo/lmao!n/schema-time-units"></a> A nanosecond instant or span
+    is a `bigint` (`EpochNanos`, `DurationNanos`): nanoseconds since the epoch are about 1.7e18 today, past what a
+    number holds exactly. A microsecond, millisecond or second instant or span is a safe-integer `number`
+    (`EpochMicros`, `DurationMicros`, `EpochMillis`, `DurationMillis`, `EpochSeconds`, `DurationSeconds`): microseconds
+    since the epoch are about 1.7e15 today and stay under 2^53 until the year 2255, and a number adds and compares
+    without the heap value a `bigint` is. The cell is an Int64 for every unit. A business instant (when something
+    happened or is due in the domain) is in microseconds, since some platforms give no nanoseconds; the event and trace
+    clock is in nanoseconds. The brands and their conversions are `@smoothbricks/time`'s and `@smoothbricks/duration`'s.
 - **An enum's variant list is append-only.** A variant's ordinal is its position; a variant no longer written keeps its
   place.
 - **A kind is an extension point.** `defineFieldKind({ id, physical, digest, validate, encode, decode })` gives a

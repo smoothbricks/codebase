@@ -5,8 +5,11 @@ import {
   dateToMillis,
   EpochMicros,
   EpochMillis,
+  EpochNanos,
   epochMicrosToMillis,
+  epochMicrosToNanos,
   epochMillisToMicros,
+  epochNanosToMicros,
   microsToDate,
   microsToISODate,
   microsToISOString,
@@ -15,18 +18,46 @@ import {
   nowMillis,
 } from '../index.js';
 
-describe('EpochMicros constructor', () => {
-  it('wraps a bigint value', () => {
-    const us = EpochMicros(1_000_000n);
-    expect(us).toBe(EpochMicros(1_000_000n));
+// 2024-06-15T12:30:45.123456Z: a current instant with every microsecond digit set.
+const INSTANT = 1_718_454_645_123_456;
+
+//#region smoo/lmao!n/schema-time-units
+describe('EpochMicros', () => {
+  it('a_microsecond_instant_is_a_safe_integer_number', () => {
+    const us = EpochMicros(INSTANT);
+    expect(typeof us).toBe('number');
+    expect(Number.isSafeInteger(us)).toBe(true);
+    expect(us).toBe(EpochMicros(INSTANT));
+    expect(EpochMicros(0)).toBe(EpochMicros(0));
+    expect(EpochMicros(-1_000_000)).toBe(EpochMicros(-1_000_000));
   });
 
-  it('works with zero', () => {
-    expect(EpochMicros(0n)).toBe(EpochMicros(0n));
+  it('holds_the_whole_safe_range', () => {
+    expect(EpochMicros(Number.MAX_SAFE_INTEGER)).toBe(EpochMicros(Number.MAX_SAFE_INTEGER));
+    expect(EpochMicros(Number.MIN_SAFE_INTEGER)).toBe(EpochMicros(Number.MIN_SAFE_INTEGER));
   });
 
-  it('works with negative (pre-epoch)', () => {
-    expect(EpochMicros(-1_000_000n)).toBe(EpochMicros(-1_000_000n));
+  it('refuses_a_value_that_counts_no_whole_microsecond', () => {
+    expect(() => EpochMicros(1.5)).toThrow(RangeError);
+    expect(() => EpochMicros(Number.NaN)).toThrow(RangeError);
+    expect(() => EpochMicros(Number.POSITIVE_INFINITY)).toThrow(RangeError);
+    expect(() => EpochMicros(Number.MAX_SAFE_INTEGER + 1)).toThrow(RangeError);
+    expect(() => EpochMicros(Number.MIN_SAFE_INTEGER - 1)).toThrow(RangeError);
+    expect(() => EpochMicros(1.5)).toThrow('EpochMicros: 1.5 is not a safe integer count of microseconds');
+  });
+
+  it('reads_negative_zero_as_the_epoch', () => {
+    expect(Object.is(EpochMicros(-0), 0)).toBe(true);
+  });
+
+  it('refuses_a_value_of_another_unit_by_type', () => {
+    // @ts-expect-error a microsecond instant takes no millisecond value
+    const fromMillis: EpochMicros = EpochMillis(1);
+    // @ts-expect-error a microsecond instant takes no bare number
+    const bare: EpochMicros = 1;
+    // @ts-expect-error a microsecond instant takes no bigint
+    const wide: EpochMicros = EpochNanos(1n);
+    expect([fromMillis, bare, wide].length).toBe(3);
   });
 });
 
@@ -45,170 +76,128 @@ describe('EpochMillis constructor', () => {
 });
 
 describe('epochMillisToMicros', () => {
-  it('converts milliseconds to microseconds', () => {
-    const us = epochMillisToMicros(EpochMillis(1000));
-    expect(us).toBe(EpochMicros(1_000_000n));
+  it('is_exact', () => {
+    expect(epochMillisToMicros(EpochMillis(1000))).toBe(EpochMicros(1_000_000));
+    expect(epochMillisToMicros(EpochMillis(0))).toBe(EpochMicros(0));
+    expect(epochMillisToMicros(EpochMillis(-500))).toBe(EpochMicros(-500_000));
+    // 2024-01-01T00:00:00.000Z
+    expect(epochMillisToMicros(EpochMillis(1_704_067_200_000))).toBe(EpochMicros(1_704_067_200_000_000));
   });
 
-  it('converts zero', () => {
-    expect(epochMillisToMicros(EpochMillis(0))).toBe(EpochMicros(0n));
-  });
-
-  it('converts negative (pre-epoch)', () => {
-    expect(epochMillisToMicros(EpochMillis(-500))).toBe(EpochMicros(-500_000n));
-  });
-
-  it('converts a realistic timestamp', () => {
-    // 2024-01-01T00:00:00.000Z = 1704067200000 ms
-    const us = epochMillisToMicros(EpochMillis(1_704_067_200_000));
-    expect(us).toBe(EpochMicros(1_704_067_200_000_000n));
+  it('refuses_a_millisecond_past_the_microsecond_range', () => {
+    // The last millisecond whose microseconds a number holds exactly, and the one after it (year 2255).
+    expect(epochMillisToMicros(EpochMillis(9_007_199_254_740))).toBe(EpochMicros(9_007_199_254_740_000));
+    expect(() => epochMillisToMicros(EpochMillis(9_007_199_254_741))).toThrow(RangeError);
   });
 });
 
 describe('epochMicrosToMillis', () => {
-  it('converts microseconds to milliseconds', () => {
-    const ms = epochMicrosToMillis(EpochMicros(1_000_000n));
-    expect(ms).toBe(EpochMillis(1000));
+  it('floors_to_the_millisecond_the_instant_lies_in', () => {
+    expect(epochMicrosToMillis(EpochMicros(1_000_000))).toBe(EpochMillis(1000));
+    expect(epochMicrosToMillis(EpochMicros(1_500))).toBe(EpochMillis(1));
+    expect(epochMicrosToMillis(EpochMicros(0))).toBe(EpochMillis(0));
+    expect(epochMicrosToMillis(EpochMicros(-500_000))).toBe(EpochMillis(-500));
+    expect(epochMicrosToMillis(EpochMicros(-1))).toBe(EpochMillis(-1));
+    expect(epochMicrosToMillis(EpochMicros(-1_001))).toBe(EpochMillis(-2));
   });
 
-  it('truncates sub-millisecond precision', () => {
-    // 1500 microseconds = 1.5 milliseconds, truncated to 1
-    const ms = epochMicrosToMillis(EpochMicros(1_500n));
-    expect(ms).toBe(EpochMillis(1));
+  it('floors_exactly_at_the_top_of_the_range', () => {
+    // One microsecond before a millisecond, where the quotient's distance to the next integer is smallest.
+    expect(epochMicrosToMillis(EpochMicros(9_007_199_254_739_999))).toBe(EpochMillis(9_007_199_254_739));
+    expect(epochMicrosToMillis(EpochMicros(Number.MAX_SAFE_INTEGER))).toBe(EpochMillis(9_007_199_254_740));
+    expect(epochMicrosToMillis(EpochMicros(Number.MIN_SAFE_INTEGER))).toBe(EpochMillis(-9_007_199_254_741));
   });
 
-  it('converts zero', () => {
-    expect(epochMicrosToMillis(EpochMicros(0n))).toBe(EpochMillis(0));
-  });
-
-  it('converts negative (pre-epoch)', () => {
-    expect(epochMicrosToMillis(EpochMicros(-500_000n))).toBe(EpochMillis(-500));
-  });
-});
-
-describe('round-trip: millis -> micros -> millis', () => {
-  it('preserves integer milliseconds', () => {
-    const original = EpochMillis(1_704_067_200_000);
-    const roundTripped = epochMicrosToMillis(epochMillisToMicros(original));
-    expect(roundTripped).toBe(original);
-  });
-
-  it('preserves zero', () => {
-    const original = EpochMillis(0);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(0));
-  });
-
-  it('preserves negative timestamps', () => {
-    const original = EpochMillis(-86_400_000);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(-86_400_000));
-  });
-
-  it('preserves large timestamps (year 2100+)', () => {
-    // 2100-01-01T00:00:00Z = 4102444800000 ms
-    const original = EpochMillis(4_102_444_800_000);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(4_102_444_800_000));
+  it('round_trips_every_millisecond', () => {
+    for (const ms of [1_704_067_200_000, 0, -86_400_000, 4_102_444_800_000]) {
+      expect(epochMicrosToMillis(epochMillisToMicros(EpochMillis(ms)))).toBe(EpochMillis(ms));
+    }
   });
 });
 
-describe('dateToMicros / microsToDate round-trip', () => {
-  it('preserves millisecond precision through round-trip', () => {
+describe('epochMicrosToNanos / epochNanosToMicros', () => {
+  it('scales_up_exactly_over_the_whole_range', () => {
+    expect(epochMicrosToNanos(EpochMicros(INSTANT))).toBe(EpochNanos(1_718_454_645_123_456_000n));
+    expect(epochMicrosToNanos(EpochMicros(Number.MAX_SAFE_INTEGER))).toBe(EpochNanos(9_007_199_254_740_991_000n));
+    expect(epochMicrosToNanos(EpochMicros(-1))).toBe(EpochNanos(-1_000n));
+  });
+
+  it('floors_nanoseconds_to_the_microsecond_they_lie_in', () => {
+    expect(epochNanosToMicros(EpochNanos(1_718_454_645_123_456_999n))).toBe(EpochMicros(INSTANT));
+    expect(epochNanosToMicros(EpochNanos(-1n))).toBe(EpochMicros(-1));
+    expect(epochNanosToMicros(EpochNanos(-1_001n))).toBe(EpochMicros(-2));
+  });
+
+  it('refuses_a_nanosecond_instant_past_the_microsecond_range', () => {
+    expect(() => epochNanosToMicros(EpochNanos(9_007_199_254_740_992_000n))).toThrow(RangeError);
+    expect(() => epochNanosToMicros(EpochNanos(-9_007_199_254_740_992_000n))).toThrow(RangeError);
+  });
+});
+
+describe('dateToMicros / microsToDate', () => {
+  it('scales_a_date_exactly', () => {
     const original = new Date('2024-06-15T12:30:45.123Z');
-    const us = dateToMicros(original);
-    const roundTripped = microsToDate(us);
-    expect(roundTripped.getTime()).toBe(original.getTime());
-  });
-
-  it('handles epoch (1970-01-01)', () => {
-    const epoch = new Date(0);
-    const us = dateToMicros(epoch);
-    expect(us).toBe(EpochMicros(0n));
-    expect(microsToDate(us).getTime()).toBe(0);
-  });
-
-  it('handles pre-epoch dates', () => {
+    expect(dateToMicros(original)).toBe(EpochMicros(1_718_454_645_123_000));
+    expect(microsToDate(dateToMicros(original)).getTime()).toBe(original.getTime());
+    expect(dateToMicros(new Date(0))).toBe(EpochMicros(0));
     const preEpoch = new Date('1969-07-20T20:17:00.000Z');
-    const us = dateToMicros(preEpoch);
-    expect(us < 0n).toBe(true);
-    expect(microsToDate(us).getTime()).toBe(preEpoch.getTime());
+    expect(dateToMicros(preEpoch) < 0).toBe(true);
+    expect(microsToDate(dateToMicros(preEpoch)).getTime()).toBe(preEpoch.getTime());
+  });
+
+  it('floors_to_the_millisecond_a_date_holds', () => {
+    expect(microsToDate(EpochMicros(INSTANT)).toISOString()).toBe('2024-06-15T12:30:45.123Z');
+    expect(microsToDate(EpochMicros(-1)).getTime()).toBe(-1);
+  });
+
+  it('refuses_a_date_past_the_microsecond_range_or_invalid', () => {
+    expect(() => dateToMicros(new Date(8_640_000_000_000_000))).toThrow(RangeError);
+    expect(() => dateToMicros(new Date(Number.NaN))).toThrow(RangeError);
   });
 });
 
 describe('dateToMillis / millisToDate round-trip', () => {
   it('preserves exact millisecond timestamp', () => {
     const original = new Date('2024-06-15T12:30:45.123Z');
-    const ms = dateToMillis(original);
-    const roundTripped = millisToDate(ms);
-    expect(roundTripped.getTime()).toBe(original.getTime());
+    expect(millisToDate(dateToMillis(original)).getTime()).toBe(original.getTime());
   });
 
   it('handles epoch', () => {
-    const epoch = new Date(0);
-    const ms = dateToMillis(epoch);
-    expect(ms).toBe(EpochMillis(0));
-    expect(millisToDate(ms).getTime()).toBe(0);
+    expect(dateToMillis(new Date(0))).toBe(EpochMillis(0));
+    expect(millisToDate(EpochMillis(0)).getTime()).toBe(0);
   });
 });
 
 describe('nowMicros', () => {
-  it('returns a bigint', () => {
+  it('reads_the_wall_clock_as_a_safe_integer_number', () => {
+    const before = Date.now() * 1000;
     const us = nowMicros();
-    expect(typeof us).toBe('bigint');
-  });
-
-  it('returns a plausible timestamp (after 2024-01-01, before 2100-01-01)', () => {
-    const us = nowMicros();
-    const min = 1_704_067_200_000_000n; // 2024-01-01
-    const max = 4_102_444_800_000_000n; // 2100-01-01
-    expect(us >= min).toBe(true);
-    expect(us <= max).toBe(true);
+    expect(typeof us).toBe('number');
+    expect(Number.isSafeInteger(us)).toBe(true);
+    expect(us >= before).toBe(true);
+    expect(us <= Date.now() * 1000).toBe(true);
   });
 });
 
 describe('nowMillis', () => {
   it('returns a number', () => {
-    const ms = nowMillis();
-    expect(typeof ms).toBe('number');
-  });
-
-  it('returns a plausible timestamp (after 2024-01-01, before 2100-01-01)', () => {
-    const ms = nowMillis();
-    const min = 1_704_067_200_000; // 2024-01-01
-    const max = 4_102_444_800_000; // 2100-01-01
-    expect(ms >= min).toBe(true);
-    expect(ms <= max).toBe(true);
+    expect(typeof nowMillis()).toBe('number');
   });
 });
 
-describe('microsToISODate', () => {
-  it('produces correct YYYY-MM-DD for a known timestamp', () => {
-    // 2024-06-15T12:30:45.123Z
-    const d = new Date('2024-06-15T12:30:45.123Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2024-06-15');
+describe('microsToISOString / microsToISODate', () => {
+  it('writes_every_microsecond_digit_of_an_instant', () => {
+    expect(microsToISOString(EpochMicros(INSTANT))).toBe('2024-06-15T12:30:45.123456Z');
+    expect(microsToISOString(EpochMicros(0))).toBe('1970-01-01T00:00:00.000000Z');
+    expect(microsToISOString(EpochMicros(-1))).toBe('1969-12-31T23:59:59.999999Z');
+    expect(microsToISOString(EpochMicros(Number.MAX_SAFE_INTEGER))).toBe('2255-06-05T23:47:34.740991Z');
   });
 
-  it('handles epoch', () => {
-    expect(microsToISODate(EpochMicros(0n))).toBe('1970-01-01');
-  });
-
-  it('handles end-of-day boundary (UTC)', () => {
-    // 2024-12-31T23:59:59.999Z -- still Dec 31 in UTC
-    const d = new Date('2024-12-31T23:59:59.999Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2024-12-31');
-  });
-
-  it('handles very large timestamps', () => {
-    // 2099-12-31T00:00:00.000Z
-    const d = new Date('2099-12-31T00:00:00.000Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2099-12-31');
+  it('names_the_utc_date_an_instant_lies_in', () => {
+    expect(microsToISODate(EpochMicros(INSTANT))).toBe('2024-06-15');
+    expect(microsToISODate(EpochMicros(0))).toBe('1970-01-01');
+    expect(microsToISODate(EpochMicros(-1))).toBe('1969-12-31');
+    expect(microsToISODate(dateToMicros(new Date('2024-12-31T23:59:59.999Z')))).toBe('2024-12-31');
   });
 });
-
-describe('microsToISOString', () => {
-  it('preserves the full UTC timestamp', () => {
-    const d = new Date('2024-06-15T12:30:45.123Z');
-    expect(microsToISOString(dateToMicros(d))).toBe('2024-06-15T12:30:45.123Z');
-  });
-});
+//#endregion smoo/lmao!n/schema-time-units

@@ -9,7 +9,6 @@ export * from './lib/buffer/columnBufferGenerator.js';
 export * from './lib/buffer/columnWriterGenerator.js';
 export * from './lib/buffer/createBuilders.js';
 export * from './lib/buffer/createColumnBuffer.js';
-export * from './lib/buffer/microseconds.js';
 export * from './lib/buffer/Nanoseconds.js';
 export * from './lib/buffer/scopeFill.js';
 export * from './lib/buffer/types.js';

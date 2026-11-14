@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { dateToMicros, EpochMicros } from '@smoothbricks/time';
 import { addDuration, durationToMicros } from '../add-duration.js';
+import { DurationMicros } from '../types.js';
 
 describe('addDuration', () => {
   // Use a fixed base date for consistent testing
@@ -82,21 +83,49 @@ describe('addDuration', () => {
     });
   });
 
+  //#region smoo/lmao!n/schema-time-units
   describe('EpochMicros clock', () => {
     const base = dateToMicros(baseDate);
 
-    it('adds minutes in the microsecond domain', () => {
-      expect(addDuration(base, '5 minutes')).toBe(EpochMicros(base + 5n * 60n * 1_000_000n));
+    it('adds_minutes_in_the_microsecond_domain', () => {
+      expect(addDuration(base, '5 minutes')).toBe(EpochMicros(base + 5 * 60 * 1_000_000));
     });
 
-    it('preserves leftover sub-millisecond micros', () => {
-      const odd = EpochMicros(base + 250n);
-      expect(addDuration(odd, '1 second')).toBe(EpochMicros(odd + 1_000_000n));
+    it('keeps_the_sub_millisecond_digits', () => {
+      const odd = EpochMicros(base + 250);
+      expect(addDuration(odd, '1 second')).toBe(EpochMicros(odd + 1_000_000));
     });
 
-    it('scales fractional milliseconds to micros', () => {
-      expect(durationToMicros('0.5 ms')).toBe(500n);
-      expect(addDuration(base, '0.5 ms')).toBe(EpochMicros(base + 500n));
+    it('scales_fractional_milliseconds_to_whole_micros', () => {
+      expect(durationToMicros('0.5 ms')).toBe(DurationMicros(500));
+      expect(addDuration(base, '0.5 ms')).toBe(EpochMicros(base + 500));
+    });
+
+    it('stays_exact_at_the_top_of_the_range_and_refuses_past_it', () => {
+      const last = EpochMicros(Number.MAX_SAFE_INTEGER - 1_000_000);
+      expect(addDuration(last, '1 second')).toBe(EpochMicros(Number.MAX_SAFE_INTEGER));
+      expect(() => addDuration(last, '2 seconds')).toThrow(RangeError);
     });
   });
 });
+
+describe('DurationMicros', () => {
+  it('a_microsecond_span_is_a_safe_integer_number', () => {
+    const span = durationToMicros('5 minutes');
+    expect(typeof span).toBe('number');
+    expect(span).toBe(DurationMicros(300_000_000));
+  });
+
+  it('refuses_a_value_that_counts_no_whole_microsecond', () => {
+    expect(() => DurationMicros(1.5)).toThrow(RangeError);
+    expect(() => DurationMicros(Number.NaN)).toThrow(RangeError);
+    expect(() => DurationMicros(Number.MAX_SAFE_INTEGER + 1)).toThrow(RangeError);
+    expect(Object.is(DurationMicros(-0), 0)).toBe(true);
+  });
+
+  it('refuses_a_duration_string_past_the_microsecond_range', () => {
+    // 2^53 µs is about 285 years.
+    expect(() => durationToMicros('20000 weeks')).toThrow(RangeError);
+  });
+});
+//#endregion smoo/lmao!n/schema-time-units

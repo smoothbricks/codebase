@@ -15,19 +15,30 @@ function floorDiv(value: bigint, unit: bigint): bigint {
   const quotient = value / unit;
   return value % unit < 0n ? quotient - 1n : quotient;
 }
-/** Convert EpochMillis to EpochMicros: millis * 1000 */
+
+/**
+ * Convert EpochMillis to EpochMicros: millis * 1000, exact for every whole millisecond whose microseconds a number holds
+ * (up to the year 2255). Throws a RangeError past that range, or for a millisecond fraction finer than a microsecond.
+ */
 export function epochMillisToMicros(ms: EpochMillis): EpochMicros {
-  return EpochMicros(BigInt(ms) * 1000n);
+  return EpochMicros(ms * 1000);
 }
 
-/** Convert EpochMicros to EpochMillis: the millisecond the instant lies in (floors, before the epoch too) */
+/**
+ * Convert EpochMicros to EpochMillis: the millisecond the instant lies in (floors, before the epoch too). Total and
+ * exact: a safe-integer quotient by 1000 lies below 2^44, where a double's spacing (at most 2^-9) is finer than the
+ * 0.001 that a non-zero remainder leaves to the next integer, so the rounded quotient never reaches it.
+ */
 export function epochMicrosToMillis(us: EpochMicros): EpochMillis {
-  return EpochMillis(Number(floorDiv(us, 1000n)));
+  return EpochMillis(Math.floor(us / 1000));
 }
 
-/** Convert Date to EpochMicros */
+/**
+ * Convert Date to EpochMicros, exact. Throws a RangeError for an invalid Date or one past the microsecond range (a
+ * Date reaches the year 275760, a microsecond instant the year 2255).
+ */
 export function dateToMicros(d: Date): EpochMicros {
-  return EpochMicros(BigInt(d.getTime()) * 1000n);
+  return EpochMicros(d.getTime() * 1000);
 }
 
 /** Convert Date to EpochMillis */
@@ -35,9 +46,9 @@ export function dateToMillis(d: Date): EpochMillis {
   return EpochMillis(d.getTime());
 }
 
-/** Convert EpochMicros to Date */
+/** Convert EpochMicros to Date: the millisecond the instant lies in (floors). Total. */
 export function microsToDate(us: EpochMicros): Date {
-  return new Date(Number(floorDiv(us, 1000n)));
+  return new Date(epochMicrosToMillis(us));
 }
 
 /** Convert EpochMillis to Date */
@@ -45,9 +56,9 @@ export function millisToDate(ms: EpochMillis): Date {
   return new Date(ms);
 }
 
-/** Current time as EpochMicros -- replaces `BigInt(Date.now()) * 1000n` */
+/** Current time as EpochMicros, at the wall clock's millisecond resolution -- replaces `Date.now() * 1000` */
 export function nowMicros(): EpochMicros {
-  return EpochMicros(BigInt(Date.now()) * 1000n);
+  return EpochMicros(Date.now() * 1000);
 }
 
 /** Current time as EpochMillis -- replaces bare `Date.now()` for timestamps */
@@ -60,9 +71,11 @@ export function microsToISODate(us: EpochMicros): string {
   return microsToDate(us).toISOString().slice(0, 10);
 }
 
-/** Convert EpochMicros to a full ISO-8601 timestamp — display edge only. */
+/** Convert EpochMicros to an RFC 3339 instant with all six fraction digits, so the text names the instant exactly. */
 export function microsToISOString(us: EpochMicros): string {
-  return microsToDate(us).toISOString();
+  const ms = epochMicrosToMillis(us);
+  const micros = String(us - ms * 1000).padStart(3, '0');
+  return `${new Date(ms).toISOString().slice(0, 23)}${micros}Z`;
 }
 
 /** Convert EpochMillis to EpochNanos: millis * 1_000_000 */
@@ -70,14 +83,17 @@ export function epochMillisToNanos(ms: EpochMillis): EpochNanos {
   return EpochNanos(BigInt(ms) * 1_000_000n);
 }
 
-/** Convert EpochMicros to EpochNanos: micros * 1000 */
+/** Convert EpochMicros to EpochNanos: micros * 1000. Total and exact. */
 export function epochMicrosToNanos(us: EpochMicros): EpochNanos {
-  return EpochNanos(us * 1000n);
+  return EpochNanos(BigInt(us) * 1000n);
 }
 
-/** Convert EpochNanos to EpochMicros: the microsecond the instant lies in (floors) */
+/**
+ * Convert EpochNanos to EpochMicros: the microsecond the instant lies in (floors, dropping the three nanosecond
+ * digits). Throws a RangeError for an instant past the microsecond range (after the year 2255).
+ */
 export function epochNanosToMicros(ns: EpochNanos): EpochMicros {
-  return EpochMicros(floorDiv(ns, 1000n));
+  return EpochMicros(Number(floorDiv(ns, 1000n)));
 }
 
 /** Convert EpochNanos to EpochMillis: the millisecond the instant lies in (floors) */

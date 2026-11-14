@@ -3,16 +3,17 @@ import { EpochNanos } from '@smoothbricks/time';
 import { addDurationNanos, durationToMicros, durationToNanos } from '../add-duration.js';
 import { DurationMicros, DurationMillis, DurationNanos, DurationSeconds } from '../types.js';
 
+//#region smoo/lmao!n/schema-time-units
 describe('durationToNanos', () => {
-  it('is the microsecond duration scaled by a thousand, for every unit', () => {
+  it('is_the_microsecond_duration_scaled_by_a_thousand_for_every_unit', () => {
     for (const duration of ['1 ms', '500 ms', '30 seconds', '5 minutes', '2 hours', '7 days', '2 weeks'] as const) {
-      expect(durationToNanos(duration)).toBe(durationToMicros(duration) * 1000n);
+      expect(durationToNanos(duration)).toBe(DurationNanos(BigInt(durationToMicros(duration)) * 1000n));
     }
   });
 
   it('stays exact past the span a number holds in nanoseconds', () => {
     // 2^53 ns is about 104 days; 520 weeks is 35 times that.
-    expect(durationToNanos('520 weeks')).toBe(520n * 7n * 86_400n * 1_000_000_000n);
+    expect(durationToNanos('520 weeks')).toBe(DurationNanos(520n * 7n * 86_400n * 1_000_000_000n));
   });
 });
 
@@ -32,6 +33,9 @@ describe('duration unit brands', () => {
     const bare: DurationMillis = 5;
     // @ts-expect-error a seconds span takes no millisecond value
     const asSeconds: DurationSeconds = DurationMillis(5);
-    expect([asMicros, bare, asSeconds].length).toBe(3);
+    // @ts-expect-error a microsecond span takes no bare number
+    const bareMicros: DurationMicros = 5;
+    expect([asMicros, bare, asSeconds, bareMicros].length).toBe(4);
   });
 });
+//#endregion smoo/lmao!n/schema-time-units

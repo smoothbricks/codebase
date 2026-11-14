@@ -2,20 +2,21 @@
  * Add Duration - add a duration string to a clock value.
  *
  * Date and EpochMicros overloads share parseDuration. The micros arm stays in
- * the µs domain (duration ms × 1000) so decide clocks never drop to Date.
+ * the µs domain (duration ms × 1000, a safe-integer number) so decide clocks never drop to Date.
  */
 
 import { EpochMicros, EpochNanos } from '@smoothbricks/time';
 import { parseDuration } from './parse-duration.js';
-import type { DurationString } from './types.js';
+import { DurationMicros, DurationNanos, type DurationString } from './types.js';
 
 /**
- * Convert a duration string to microseconds.
+ * Convert a duration string to whole microseconds, rounding a finer fraction to the nearest one.
  *
- * parseDuration is millisecond-valued; this scales the duration, not a timestamp.
+ * parseDuration is millisecond-valued; this scales the duration, not a timestamp. Throws a RangeError for a duration
+ * past the safe-integer range (about 285 years).
  */
-export function durationToMicros(duration: DurationString): bigint {
-  return BigInt(Math.round(parseDuration(duration) * 1000));
+export function durationToMicros(duration: DurationString): DurationMicros {
+  return DurationMicros(Math.round(parseDuration(duration) * 1000));
 }
 
 /**
@@ -24,8 +25,8 @@ export function durationToMicros(duration: DurationString): bigint {
  * The duration is scaled in bigint from its microsecond value: a number holds nanoseconds exactly only up to about
  * 104 days.
  */
-export function durationToNanos(duration: DurationString): bigint {
-  return durationToMicros(duration) * 1000n;
+export function durationToNanos(duration: DurationString): DurationNanos {
+  return DurationNanos(BigInt(durationToMicros(duration)) * 1000n);
 }
 /**
  * Parse a duration string and add it to a clock value.
@@ -54,12 +55,12 @@ export function addDuration(date: Date, duration: DurationString): Date;
  * @throws Error if duration format is invalid or negative
  *
  * @example
- * addDuration(EpochMicros(1_704_067_200_000_000n), '5 minutes');
- * // Returns EpochMicros(1_704_067_500_000_000n)
+ * addDuration(EpochMicros(1_704_067_200_000_000), '5 minutes');
+ * // Returns EpochMicros(1_704_067_500_000_000)
  */
 export function addDuration(now: EpochMicros, duration: DurationString): EpochMicros;
 export function addDuration(base: Date | EpochMicros, duration: DurationString): Date | EpochMicros {
-  if (typeof base === 'bigint') {
+  if (typeof base === 'number') {
     return EpochMicros(base + durationToMicros(duration));
   }
   return new Date(base.getTime() + parseDuration(duration));
@@ -68,8 +69,8 @@ export function addDuration(base: Date | EpochMicros, duration: DurationString):
 /**
  * Add a duration to a branded nanosecond clock, staying in the ns domain.
  *
- * WHY its own function: a microsecond and a nanosecond clock are both a bigint at runtime, so an overload of
- * `addDuration` could not tell which unit to scale the duration to.
+ * WHY its own function: the call names the clock's unit. A microsecond clock is a number and a nanosecond clock a
+ * bigint, so each scales the duration in its own domain.
  */
 export function addDurationNanos(now: EpochNanos, duration: DurationString): EpochNanos {
   return EpochNanos(now + durationToNanos(duration));

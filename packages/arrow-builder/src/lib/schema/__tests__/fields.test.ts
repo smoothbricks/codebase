@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { DurationMillis } from '@smoothbricks/duration';
-import { EpochMillis, EpochNanos } from '@smoothbricks/time';
+import { DurationMicros, DurationMillis } from '@smoothbricks/duration';
+import { EpochMicros, EpochMillis, EpochNanos } from '@smoothbricks/time';
 import {
   composeColumns,
   defineFieldKind,
@@ -289,3 +289,55 @@ describe('a published field list', () => {
   });
 });
 //#endregion smoo/lmao!n/schema-field-numbers
+
+//#region smoo/lmao!n/schema-time-units
+describe('a microsecond time field', () => {
+  // 2024-06-15T12:30:45.123456Z, the last safe-integer microsecond before the epoch, and one before it.
+  const instants = [1_718_454_645_123_456, -1, Number.MIN_SAFE_INTEGER];
+
+  function int64Hex(cells: readonly unknown[]): string {
+    const words = new BigInt64Array(cells.length);
+    cells.forEach((cell, i) => {
+      if (typeof cell !== 'bigint') throw new TypeError(`an Int64 cell must be a bigint, got ${typeof cell}`);
+      words[i] = cell;
+    });
+    return Buffer.from(words.buffer).toString('hex');
+  }
+
+  it('holds_a_safe_integer_number', () => {
+    const at = S.timestamp('us');
+    const took = S.duration('us');
+    for (const accepts of [
+      (value: unknown) => validateField('at', at, value).ok,
+      (value: unknown) => validateField('took', took, value).ok,
+    ]) {
+      expect(accepts(1_718_454_645_123_456)).toBe(true);
+      expect(accepts(1_718_454_645_123_456n)).toBe(false);
+      expect(accepts(1.5)).toBe(false);
+      expect(accepts(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+    }
+  });
+
+  it('writes_the_int64_bytes_a_bigint_microsecond_wrote', () => {
+    const at = S.timestamp('us');
+    const took = S.duration('us');
+    const expected = '8069afe6ec1a0600' + 'ffffffffffffffff' + '010000000000e0ff';
+    expect(int64Hex(instants.map((us) => at.codec.encode(at.params, EpochMicros(us))))).toBe(expected);
+    expect(int64Hex(instants.map((us) => took.codec.encode(took.params, DurationMicros(us))))).toBe(expected);
+  });
+
+  it('reads_a_number_back', () => {
+    const at = S.timestamp('us');
+    const read = at.codec.decode(at.params, 1_718_454_645_123_456n);
+    expect(typeof read).toBe('number');
+    expect(read).toBe(EpochMicros(1_718_454_645_123_456));
+  });
+
+  it('keeps_nanoseconds_a_bigint', () => {
+    const at = S.timestamp('ns');
+    expect(validateField('at', at, 1_718_454_645_123_456_789n).ok).toBe(true);
+    expect(validateField('at', at, 1_718_454_645_123_456).ok).toBe(false);
+    expect(at.codec.decode(at.params, 1_718_454_645_123_456_789n)).toBe(EpochNanos(1_718_454_645_123_456_789n));
+  });
+});
+//#endregion smoo/lmao!n/schema-time-units

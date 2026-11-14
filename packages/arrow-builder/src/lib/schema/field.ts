@@ -323,11 +323,12 @@ const I64_MIN = -(2n ** 63n);
 const I64_MAX = 2n ** 63n - 1n;
 
 /**
- * A count of a time unit. JavaScript holds nanoseconds and microseconds as bigint and milliseconds and seconds as
- * number (the `Date` domain); the cell is an Int64 for every unit.
+ * A count of a time unit. JavaScript holds nanoseconds as bigint and microseconds, milliseconds and seconds as a
+ * safe-integer number (specs/lmao/01a_trace_schema_system.md#smoo/lmao!n/schema-time-units); the cell is an Int64 for
+ * every unit.
  */
 function timeKind<const Id extends string>(id: Id, physical: (unit: TimeUnit) => PhysicalType) {
-  const wide = (unit: TimeUnit) => unit === 'ns' || unit === 'us';
+  const wide = (unit: TimeUnit) => unit === 'ns';
   return defineFieldKind<number | bigint, TimeUnit, Id>({
     id,
     physical,
