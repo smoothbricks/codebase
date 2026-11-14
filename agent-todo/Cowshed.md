@@ -340,3 +340,20 @@ ticket is parked behind an install that waits for that ticket.
 - A `fork <src> <name>` that matches a recorded completion answers NotFound (`runtime/project.rs`,
   `current(&destination)?`) instead of forking, when the name was removed outside the journal.
 - A recorded creation whose workspace is absent is not a completion. Red first: remove outside the journal, fork.
+
+## `cowshed rebase --continue` refuses the rebase it stopped, and `adopt` refuses the result
+
+Observed 2026-11-14 on a stacked workspace (`cowshed rebase <ws> --into <parent workspace>`, 117 commits).
+
+- The rebase stopped at a conflict and said: resolve, "then run `cowshed rebase --continue`", "Never finish it with
+  `git rebase` by hand".
+- Every `cowshed rebase --continue` then refused: "repository has an in-progress rebase-merge operation; next: finish or
+  abort the git operation, then run: cowshed adopt <ws>". With and without the workspace name, before and after staging
+  the resolution. The command's own stop is the in-progress operation it refuses.
+- Following that second instruction, `git rebase --continue` completed (117 of 117). `cowshed adopt <ws>` then refused
+  twice: "no Git remote yields a repository identity ... retry with --repo-id", and with `--repo-id` "workspace mount
+  identity mismatch ... carries the <repo>/<ws> marker ... not <repo>/main".
+
+Red first: a `rebase --into` that stops at a conflict is finished by `cowshed rebase --continue` after the conflict is
+resolved and staged, and cowshed's record of the workspace names the new base. The two messages must not contradict each
+other, and `adopt` of a workspace must accept that workspace's own marker.
