@@ -28,6 +28,12 @@ two shapes for one declaration; three Arrow readers in use reject or mishandle t
   per dictionary column (or per schema), and a stated rule for which string kinds are dictionaries at all.
 - Red first: two flushes of one declaration with 5 and with 70,000 distinct category values have byte-identical Schema
   messages.
+- The rule for text is stated three ways, and the code follows none of them: `specs/lmao/01a_trace_schema_system.md:161`
+  says `S.text()` is Utf8, `specs/lmao/01f_arrow_table_structure.md` §3 "String Types (text)" makes it a dictionary when
+  that saves more than 128 bytes, and arrow-builder's `text` kind declares `physical: utf8`
+  (`packages/arrow-builder/src/lib/schema/field.ts:361`), while `convertToArrow.ts` always builds a dictionary
+  (`buildTextDictionary`, `:1034`) and its header (`:7`) says text columns are plain strings. Settle one rule in the
+  specs, then make the writer follow it.
 
 ## The JSON trace rows and the SQLite table leave `thread_id` out of a row's key
 
@@ -88,3 +94,17 @@ flush: torn for no reason.
   contract: state its value and its bound in `specs/lmao/05_span_writer_lanes.md`; no spec states it today.
 - Red first: a span opened just before a flush and ended just after it is emitted once, whole, with no row announced
   early; a span open across two flushes is announced at the second.
+
+## A user timestamp field is declared and never written
+
+Need: a span attribute that holds an instant (the instant a sleep's timer fires) is exact only as an integer of
+nanoseconds; a double holds a multiple of 256 ns at current instants. On main `@smoothbricks/arrow-builder`'s `S` has
+`S.timestamp(unit)` and `S.duration(unit)` (`packages/arrow-builder/src/lib/schema/builder.ts`), and lmao's `S` spreads
+it (`packages/lmao/src/lib/schema/builder.ts:67-68`), but nothing writes them: `storageLaneOf` answers `undefined` for
+both kinds (`packages/arrow-builder/src/lib/schema/typeGuards.ts:14-29`), `convertToArrow.ts` has no branch for them,
+and `lmao-core` has no user timestamp field kind and no tagging call for one.
+
+- Red first: a span attribute declared `S.timestamp('ns')` and tagged `1_763_000_000_123_456_789` reads back exactly as
+  an Arrow `Timestamp(Nanosecond, "UTC")` cell, from the TypeScript and the Rust tracer.
+- The field is an i64 in the span buffer; the Rust side gains the field kind and `tag_timestamp(field, nanos: i64)`;
+  `S.duration(unit)` follows the same lowering as an Arrow `Duration`.
