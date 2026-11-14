@@ -717,8 +717,9 @@ fn a_named_dynamic_member_keeps_null_as_data_without_a_semantic_schema() {
                 // other member's null is the empty cell.
                 [bytes("member 1 null"), None],
                 [bytes("member 1 null"), None],
-                // Another event type's member of that name is not dynamic.
-                [None, None],
+                // The column `order.data` places is dynamic for every row: another
+                // event type's member in it keeps its null too.
+                [bytes("member 1 null"), None],
             ],
             "{format:?}"
         );

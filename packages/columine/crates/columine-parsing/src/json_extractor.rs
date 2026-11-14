@@ -710,6 +710,9 @@ fn lookahead_event_type(parser: &JsonParser<'_>) -> Result<Option<String>, Extra
 /// (`value.<member>` inside the payload); `member` is the payload member
 /// whose discriminated column and routing row place it; `payload_name` is
 /// the payload-relative path segment the carrier and open-path checks key on.
+/// `record_null` is what an explicit null is in the declared record, as the
+/// caller's spelling of the member resolves it; a column's null is the
+/// column's own.
 ///
 /// A member literally named after the carrier column routes to CAPTURE, never
 /// to the carrier's own cell: the carrier is a projection artifact, and a
@@ -727,7 +730,7 @@ fn extract_named_member(
     extra_count: &mut u32,
     discriminant: Option<&str>,
     member_schema: MemberSchema<'_>,
-    null: NullCell,
+    record_null: NullCell,
     column_name: &str,
     member: &str,
     payload_name: &str,
@@ -752,6 +755,9 @@ fn extract_named_member(
             .map(|write| (lookup, write))
     });
     if let Some((lookup, write)) = lookup {
+        // A column's cell is one form for every row: the column decides its
+        // null, whichever member or spelling reached it.
+        let null = config.column_null(lookup.column);
         let capture_schema = match member_schema {
             MemberSchema::Declared(schema) => Some(schema),
             MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
@@ -823,7 +829,7 @@ fn extract_named_member(
     // schema judged it.
     if placed && let Some(row) = config.record_route(discriminant, member) {
         let value = json_value(parser)?;
-        return crate::record_cell(row, &value, null, cells);
+        return crate::record_cell(row, &value, record_null, cells);
     }
     match config.carrier() {
         Carrier::Embedder(_) => {

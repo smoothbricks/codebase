@@ -241,11 +241,16 @@ pub struct ExtractionConfig {
     /// encoded against a schema dictionary, by column: a lane stores a text's
     /// index among that dictionary's values.
     pub(crate) column_dictionaries: Vec<Option<usize>>,
-    /// `(event type, payload member)` for every dynamic member: those an
-    /// event's schema declares dynamic, under an object root or any arm of a
-    /// union root, and those the schema's owner names. An explicit null in
-    /// such a member's cell is data, never the empty state.
+    /// `(event type, payload member)` for every dynamic member no column
+    /// places: those an event's schema declares dynamic, under an object root
+    /// or any arm of a union root, and those the schema's owner names. An
+    /// explicit null in such a member's place in the declared record is data,
+    /// never the empty state. A dynamic member a column places is not here:
+    /// it marks its column in [`Self::dynamic_columns`].
     pub(crate) dynamic_members: MemberTable<()>,
+    /// Whether each column's cell is a dynamic value, by column: an explicit
+    /// null in it is data whichever member or spelling reached it.
+    pub(crate) dynamic_columns: Vec<bool>,
     /// Who writes each column's cells, by column ([`CellRole`]).
     pub(crate) cell_roles: Vec<CellRole>,
     /// The [`DECLARED_RECORD_COLUMN_NAME`] column, when the schema has one.
@@ -307,6 +312,12 @@ impl<T> MemberTable<T> {
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|(_, _, value)| value)
     }
+
+    /// Keep the bindings `keep` answers true for.
+    fn retain(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
+        self.entries
+            .retain(|(discriminant, member, _)| keep(discriminant, member));
+    }
 }
 
 /// A nested payload member as its event's own schema declares it.
@@ -366,10 +377,11 @@ impl<'p> FrameProjections<'p> {
 }
 
 impl ExtractionConfig {
-    /// What an explicit null in `member`'s cell is for an event of
-    /// `event_type`: data when that event's schema declares the member
-    /// dynamic, else the empty state. An event of no known type judges no
-    /// member, so its nulls are empty.
+    /// What an explicit null in `member`'s place in the declared record is
+    /// for an event of `event_type`: data when the member is dynamic, else
+    /// the empty state. A member a column places is not judged here: its
+    /// column decides ([`Self::column_null`]). An event of no known type
+    /// judges no member, so its nulls are empty.
     pub(crate) fn null_cell(&self, event_type: Option<&str>, member: &str) -> NullCell {
         match event_type {
             Some(event_type)
@@ -383,12 +395,39 @@ impl ExtractionConfig {
     }
 
     /// What an explicit null under the top-level `key` of an event of
-    /// `event_type` is. The flat spelling `value.<member>` is that payload
-    /// member, whose null is the one the nested spelling gives it; any other
-    /// top-level key is a system member, whose null is empty.
+    /// `event_type` is in the declared record. The flat spelling
+    /// `value.<member>` is that payload member, whose null is the one the
+    /// nested spelling gives it; any other top-level key is a system member,
+    /// whose null is empty.
     pub(crate) fn top_level_null_cell(&self, event_type: Option<&str>, key: &str) -> NullCell {
         key.strip_prefix("value.")
             .map_or(NullCell::Empty, |member| self.null_cell(event_type, member))
+    }
+
+    /// What an explicit null in `column`'s cell is: data when the column's
+    /// cell is a dynamic value, else the empty state. A column's cell is one
+    /// form for every row (specs/columine/10-physical-vocabulary.md §7).
+    pub(crate) fn column_null(&self, column: usize) -> NullCell {
+        if self
+            .dynamic_columns
+            .get(column)
+            .is_some_and(|dynamic| *dynamic)
+        {
+            NullCell::Data
+        } else {
+            NullCell::Empty
+        }
+    }
+
+    /// The column the lanes write `member` of an event of `event_type` to:
+    /// its discriminated column, else its `value.<member>` column, when a
+    /// member writes that column.
+    fn placed_column(&self, event_type: &str, member: &str) -> Option<usize> {
+        self.variant_map
+            .get(event_type, member)
+            .or_else(|| self.payload_map.get(member))
+            .map(|lookup| lookup.column)
+            .filter(|column| self.member_write(*column).is_some())
     }
 
     /// Whether a lane reads an event's `type`: its schema routes and judges
@@ -604,12 +643,7 @@ impl ExtractionConfig {
                 continue;
             };
             for (member, _) in fields {
-                let column = self
-                    .variant_map
-                    .get(event_type, member)
-                    .or_else(|| self.payload_map.get(member.as_str()));
-                let placed = column
-                    .is_some_and(|lookup| self.member_write(lookup.column).is_some())
+                let placed = self.placed_column(event_type, member).is_some()
                     || self.record_routes.get(event_type, member).is_some();
                 if !placed {
                     return Err(ConfigError::UnplacedMember);
@@ -654,6 +688,9 @@ pub struct CellLayout<'a> {
     pub text_columns: &'a [TextColumn],
     /// Members whose explicit null is data, named by the schema's owner.
     pub dynamic_members: &'a [DynamicMember],
+    /// Binary columns whose cell is a dynamic value, named by the schema's
+    /// owner.
+    pub dynamic_columns: &'a [usize],
     pub encoding: Option<&'a str>,
 }
 
@@ -1047,6 +1084,8 @@ pub enum ConfigError {
     /// A text row whose hash field is not `FixedSizeBinary(32)` or whose
     /// inline field is not Utf8.
     InvalidTextColumn,
+    /// A dynamic column the schema lacks, or one that is not Binary.
+    InvalidDynamicColumn,
 }
 
 /// Back `additional` more elements of `buf`, or refuse as out of memory.
@@ -1308,6 +1347,19 @@ pub fn build_extraction_config_with_semantic_schemas(
     for named in cells.dynamic_members {
         dynamic_members.bind(&named.event_type, &named.member, ())?;
     }
+    // A dynamic value's cell is Binary.
+    let mut dynamic_columns = Vec::new();
+    room(&mut dynamic_columns, fields.len())?;
+    dynamic_columns.resize(fields.len(), false);
+    for column in cells.dynamic_columns {
+        let binary = fields
+            .get(*column)
+            .is_some_and(|field| matches!(field.plane_kind(), PlaneKind::Bytes { .. }));
+        if !binary {
+            return Err(ConfigError::InvalidDynamicColumn);
+        }
+        dynamic_columns[*column] = true;
+    }
     if let Some(discriminator) = discriminator {
         for member in &discriminator.members {
             let field = fields
@@ -1379,7 +1431,7 @@ pub fn build_extraction_config_with_semantic_schemas(
             },
         )?;
     }
-    let config = ExtractionConfig {
+    let mut config = ExtractionConfig {
         field_entries,
         field_map,
         payload_map,
@@ -1398,10 +1450,28 @@ pub fn build_extraction_config_with_semantic_schemas(
         dictionaries: schema_dictionaries,
         column_dictionaries,
         dynamic_members,
+        dynamic_columns,
         cell_roles,
         record_column,
         record_routes,
     };
+    // One authority per member (specs/columine/10-physical-vocabulary.md §7):
+    // a dynamic member a column places makes that column dynamic, and only a
+    // member no column places stays keyed by `(event type, member)`, for the
+    // declared record.
+    let mut dynamic_members = core::mem::take(&mut config.dynamic_members);
+    let mut dynamic_columns = core::mem::take(&mut config.dynamic_columns);
+    dynamic_members.retain(
+        |event_type, member| match config.placed_column(event_type, member) {
+            Some(column) => {
+                dynamic_columns[column] = true;
+                false
+            }
+            None => true,
+        },
+    );
+    config.dynamic_members = dynamic_members;
+    config.dynamic_columns = dynamic_columns;
     config.check_placement()?;
     Ok(config)
 }

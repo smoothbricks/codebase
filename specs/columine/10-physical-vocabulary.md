@@ -137,16 +137,21 @@ record and no text: a schema with a routing row or a text column is refused at c
 holds any other value, so an explicit null in a dynamic member's cell is a present cell, written like every other value
 of that member; a null in any other member is the empty cell, the same as a missing member. Both payload spellings store
 the same cell: a member nested in the event's `value` object and the same member spelled as a top-level `value.<member>`
-key. A member is dynamic when its event's semantic schema declares it so, or when the schema's owner names it at
-creation as `(event type, member)` (`DynamicSchemaConfig::dynamic_members`), which lets a processor created without a
-semantic schema keep the rule. **Placement is total.** Where a schema gives payload members columns of their own (a
-`value.<member>` column exists), every top-level member a semantic schema declares has a column or a routing row, or
-creation refuses the schema. A declared member is never dropped and never falls to the carrier. A schema that stores the
-whole payload in one `value` column places every member there. A routing row's discriminant is the event's `type`, and a
-schema with routing rows has a `value.$declared` column the embedder writes. A routing row places its member whether or
-not the processor holds a semantic schema, in either payload spelling and whichever side of the payload `type` is
-spelled on: a flat `value.<member>` key takes the member's discriminated column and routing row as the nested member
-does, and a member nothing places keeps its key as its carrier path.
+key. A dynamic value's cell is Binary, and a column's cell is one form for every row: a column is dynamic when the
+schema's owner names it at creation (`DynamicSchemaConfig::dynamic_columns`), or when it places a member that its
+event's semantic schema declares dynamic or that the owner names as `(event type, member)`
+(`DynamicSchemaConfig::dynamic_members`). An explicit null in a dynamic column is present whichever member or spelling
+reached it. A member a column places is dynamic by its column alone; a member the declared record holds is dynamic by
+its `(event type, member)` alone. Naming either lets a processor created without a semantic schema keep the rule, and
+naming the column reaches a column no `(event type, member)` reaches, such as a subtype's column spelled only as a flat
+key. **Placement is total.** Where a schema gives payload members columns of their own (a `value.<member>` column
+exists), every top-level member a semantic schema declares has a column or a routing row, or creation refuses the
+schema. A declared member is never dropped and never falls to the carrier. A schema that stores the whole payload in one
+`value` column places every member there. A routing row's discriminant is the event's `type`, and a schema with routing
+rows has a `value.$declared` column the embedder writes. A routing row places its member whether or not the processor
+holds a semantic schema, in either payload spelling and whichever side of the payload `type` is spelled on: a flat
+`value.<member>` key takes the member's discriminated column and routing row as the nested member does, and a member
+nothing places keeps its key as its carrier path.
 
 An embedder processor takes the extraction path only. A value-object frame certified by the admission capability is
 written to a raw Binary column as its certified bytes; a frame nested inside a member the embedder writes has no cell of

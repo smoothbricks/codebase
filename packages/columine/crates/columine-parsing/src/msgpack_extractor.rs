@@ -422,10 +422,10 @@ struct ExtraState {
 /// carrier (path-keyed, `%`/`.` re-encoded via `encode_path_segment`),
 /// otherwise the value is skipped. A member named after the carrier column
 /// routes to capture, never to the carrier's own cell.
-/// `null` is what an explicit null in the member's cell is, as the caller's
-/// spelling of the member resolves it. `member` is the payload member whose
-/// discriminated column and routing row place it; `key` is the path the
-/// carrier keys it by.
+/// `record_null` is what an explicit null is in the declared record, as the
+/// caller's spelling of the member resolves it; a column's null is the
+/// column's own. `member` is the payload member whose discriminated column
+/// and routing row place it; `key` is the path the carrier keys it by.
 #[allow(
     clippy::too_many_arguments,
     reason = "one seam, two call shapes: top-level and payload descent"
@@ -439,7 +439,7 @@ fn extract_msgpack_member(
     frames: &mut FrameWrites<'_>,
     discriminant: Option<&str>,
     event_type: Option<&str>,
-    null: NullCell,
+    record_null: NullCell,
     lookup_name: Option<&str>,
     member: Option<&str>,
     key: &[u8],
@@ -472,6 +472,9 @@ fn extract_msgpack_member(
             .map(|write| (lookup, write))
     });
     if let Some((lookup, write)) = lookup {
+        // A column's cell is one form for every row: the column decides its
+        // null, whichever member or spelling reached it.
+        let null = config.column_null(lookup.column);
         match write {
             MemberWrite::Lane => {
                 let dictionary = config.schema_dictionary(lookup.column);
@@ -518,7 +521,7 @@ fn extract_msgpack_member(
         && let Some(row) = config.record_route(discriminant, member)
     {
         let value = msgpack_value(reader)?;
-        return crate::record_cell(row, &value, null, cells);
+        return crate::record_cell(row, &value, record_null, cells);
     }
     match config.carrier() {
         Carrier::Embedder(_) => {

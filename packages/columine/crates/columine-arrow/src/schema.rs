@@ -896,8 +896,13 @@ pub struct DynamicSchemaConfig {
     /// The schema's text members; empty when it has none.
     pub text_columns: Vec<TextColumn>,
     /// Payload members whose explicit null is data, named by the schema's
-    /// owner; a semantic schema's own dynamic members need no entry.
+    /// owner; a semantic schema's own dynamic members need no entry. A member
+    /// a column places makes that column dynamic for every row.
     pub dynamic_members: Vec<DynamicMember>,
+    /// Binary columns whose cell is a dynamic value, named by the schema's
+    /// owner: an explicit null in any of them is data, whichever member or
+    /// spelling reached it.
+    pub dynamic_columns: Vec<usize>,
 }
 
 impl DynamicSchemaConfig {
@@ -1082,6 +1087,7 @@ impl DynamicSchemaConfig {
             record_members: Vec::new(),
             text_columns: Vec::new(),
             dynamic_members: Vec::new(),
+            dynamic_columns: Vec::new(),
             schema_bytes: preamble(schema_bytes, &dictionaries)?,
             schema_message_len: schema_bytes.len(),
             field_metadata,
