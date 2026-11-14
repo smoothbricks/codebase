@@ -57,3 +57,20 @@ every flush, earlier log rows are not, and the slot index stays inside the store
 
 - Design to settle with the owner before a patch: whether the thread lanes write the row number as a column or order
   their output so that position gives it. A reader must get the same number for a row from both tracers.
+
+## A start row is sent once; a tag after a flush is a row of its own
+
+Decided by the owner for the two preceding sections' open design. A span's rows are facts that are never replaced, so a
+reader that identifies a row by `(trace_id, thread_id, span_id, row)` can keep one bit per row.
+
+- The thread lanes write each row's number within its span as a `row` column (0 the start row, 1 the completion row, 2
+  and up the log rows, as `specs/lmao/01c_context_flow_and_op_wrappers.md` numbers them).
+- Once a span's start row has left in a flush while the span is still open, `tag()` no longer overwrites row 0
+  (`specs/lmao/01h_entry_types_and_logging_primitives.md`: "Row 0: span-start | tag writes HERE (overwrites)"); it
+  appends a tag row, a new entry type, in the current buffers. The start row is sent once and never again; lmao 05's "A
+  reader takes the latest start row of a span" becomes "a reader folds the span's tag rows over its start row". A span
+  that ends before any flush behaves as today.
+- The same holds for a host that hands spans over as they happen (`convertSpanStartToArrowTable`,
+  `specs/lmao/01k_tree_walker_and_arrow_conversion.md`): after the start row was handed over, a tag is a row.
+- Red first: an open span flushed twice with a `tag()` between the flushes emits its start row once, the tag as its own
+  row with the next row number, and no row whose `(trace_id, thread_id, span_id, row)` repeats.
