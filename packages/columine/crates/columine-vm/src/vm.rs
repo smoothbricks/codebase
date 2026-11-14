@@ -1234,12 +1234,13 @@ impl<I: KeyIndex> Vm<I> {
     }
 
     /// Map an aggregate kernel's refusal to its status word, naming the slot
-    /// of an i64 sum that overflowed.
+    /// of an i64 sum that overflowed, or the slot that asked for growth.
     fn refuse_aggregate(&mut self, slot: u32, result: ErrorCode) -> u32 {
         if result == ErrorCode::SumOverflow {
             self.sum_overflow = Some(slot);
+            return result as u32;
         }
-        result as u32
+        self.signal_growth(slot, result)
     }
 
     /// Record that `slot` refused for capacity. A layer that writes this VM's
@@ -8560,11 +8561,12 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         &meta,
                         cell_u32(cols, outer_key_col, child_idx),
-                        cell_f64(cols, val_col, child_idx).to_bits(),
+                        // The value's eight bytes, at the inner aggregate's lane.
+                        bytes::read_u64(col_at(cols, val_col as usize), child_idx * 8),
                         &mut self.nested_scratch,
                     ) {
                         Ok(plan) => plan,
-                        Err(error) => return self.signal_growth(slot, error),
+                        Err(error) => return self.refuse_aggregate(slot, error),
                     };
                     let capture = match self.undo.begin_capture(plan.state(), || plan.ranges()) {
                         Ok(capture) => capture,

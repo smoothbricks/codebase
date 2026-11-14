@@ -5,18 +5,21 @@
 //! patterns because lane order and NaN/tie behavior are part of the FP profile.
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{AggType, ErrorCode, Opcode};
+use columine_types::types::{AggType, CmpType, ErrorCode, Opcode, SlotType};
 use columine_vm::aggregates::{
     AggKind, TypeMask, agg_count, agg_set_count, agg_set_value_f64, agg_set_value_i64,
     agg_slot_byte_size, agg_value_f64, agg_value_i64, batch_agg_max, batch_agg_min, batch_agg_sum,
     init_agg_slot, masked_agg_count, masked_agg_max, masked_agg_min, masked_agg_sum,
     reduce_col_f64, reduce_col_i64,
 };
+use columine_vm::column_uses::{ColumnUse, ReduceRead, ReduceReads};
 use columine_vm::meta::SlotMetaView;
+use columine_vm::nested::get_inner_offset;
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::temporal::TEMPORAL_MAGIC;
 use columine_vm::vm::{Vm, i64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
+use std::collections::BTreeMap;
 
 fn approx(a: f64, b: f64) {
     assert!((a - b).abs() < 0.001, "expected ~{b}, got {a}");
@@ -425,14 +428,10 @@ fn for_each(body: &[u8]) -> Vec<u8> {
     reduce
 }
 
-/// Slot 0 is an i64 sum of the value column, run at `site`.
-fn sum_program(site: SumSite) -> Vec<u8> {
-    let init = [0x10, 0, 2, AggType::SumI64 as u8, 0, 0];
-    let sum = [Opcode::BatchAggSumI64 as u8, 0, VAL_COL];
-    let reduce = match site {
-        SumSite::TopLevel | SumSite::RowAtATime => [&sum[..], &[0]].concat(),
-        SumSite::ForEach => for_each(&sum),
-    };
+/// A refused batch's status and the slot the VM named for it.
+type Refusal = (u32, Option<u32>);
+/// One slot and three columns: `init`, then `reduce`, then `trailer`.
+fn program(init: &[u8], reduce: &[u8], trailer: &[u8]) -> Vec<u8> {
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());
     prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
@@ -446,36 +445,61 @@ fn sum_program(site: SumSite) -> Vec<u8> {
     );
     prog.extend(init);
     prog.extend(reduce);
-    if let SumSite::RowAtATime = site {
-        // A temporal table of no expiries: the reduce section runs one row at a time.
-        prog.extend(TEMPORAL_MAGIC.to_le_bytes());
-        prog.extend(8u32.to_le_bytes());
-        prog.extend(u32::from(CLOCK_COL).to_le_bytes());
-        prog.extend(0u32.to_le_bytes());
-    }
+    prog.extend(trailer);
     prog
 }
 
-/// The host's view of a sum: each batch of `cut` sizes runs under an undo
-/// checkpoint, and a refused batch is rolled back, as the wasm host does.
-/// Answers the first refusal (its status and the slot the VM named), and the
-/// slot's total after it.
+/// Slot 0 is an i64 sum of the value column, run at `site`.
+fn sum_program(site: SumSite) -> Vec<u8> {
+    let init = [0x10, 0, 2, AggType::SumI64 as u8, 0, 0];
+    let sum = [Opcode::BatchAggSumI64 as u8, 0, VAL_COL];
+    match site {
+        SumSite::TopLevel => program(&init, &[&sum[..], &[0]].concat(), &[]),
+        SumSite::ForEach => program(&init, &for_each(&sum), &[]),
+        SumSite::RowAtATime => {
+            // A temporal table of no expiries: the reduce section runs one row at a time.
+            let mut temporal = TEMPORAL_MAGIC.to_le_bytes().to_vec();
+            temporal.extend(8u32.to_le_bytes());
+            temporal.extend(u32::from(CLOCK_COL).to_le_bytes());
+            temporal.extend(0u32.to_le_bytes());
+            program(&init, &[&sum[..], &[0]].concat(), &temporal)
+        }
+    }
+}
+
+/// The host's view of a program: each batch runs under an undo checkpoint,
+/// and a refused batch is rolled back, as the wasm host does. Answers the
+/// first refusal (its status and the slot the VM named) and the state after it.
+fn host_run(
+    prog: &[u8],
+    batches: impl IntoIterator<Item = (u32, [Vec<u8>; 3])>,
+) -> (Option<Refusal>, Vec<u8>) {
+    let size = calculate_state_size(prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+        .expect("valid program admission");
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    vm.undo_enable(&state).expect("undo window");
+    for (rows, cols) in batches {
+        let cols: [&[u8]; 3] = [&cols[0], &cols[1], &cols[2]];
+        let checkpoint = vm.undo_checkpoint();
+        let status = vm.execute_batch(&mut state, prog, &cols, rows);
+        if status != OK {
+            vm.undo_rollback(&mut state, checkpoint).expect("rollback");
+            return (Some((status, vm.sum_overflow_slot())), state);
+        }
+    }
+    (None, state)
+}
+
+/// A slot sum's first refusal and its total after it.
 struct Folded {
-    refusal: Option<(u32, Option<u32>)>,
+    refusal: Option<Refusal>,
     total: i64,
 }
 
 fn host_fold(site: SumSite, vals: &[i64], cut: usize) -> Folded {
-    let prog = sum_program(site);
-    let size = calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
-        .expect("valid program admission");
-    let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
-    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
-    vm.undo_enable(&state).expect("undo window");
-    let offset = SlotMetaView::read(&state, 0).offset;
-    let mut refusal = None;
-    for batch in vals.chunks(cut.max(1)) {
+    let batches = vals.chunks(cut.max(1)).map(|batch| {
         // A `FOR_EACH` batch interleaves a row of another type holding
         // `i64::MAX`: the mask must keep it out of the sum.
         let (types, values): (Vec<u32>, Vec<i64>) = match site {
@@ -489,22 +513,19 @@ fn host_fold(site: SumSite, vals: &[i64], cut: usize) -> Folded {
         };
         let rows = u32::try_from(types.len()).expect("small batch");
         let clocks: Vec<i64> = (0..i64::from(rows)).collect();
-        let cols: [&[u8]; 3] = [
-            u32s_as_bytes(&types),
-            i64s_as_bytes(&values),
-            i64s_as_bytes(&clocks),
-        ];
-        let checkpoint = vm.undo_checkpoint();
-        let status = vm.execute_batch(&mut state, &prog, &cols, rows);
-        if status != OK {
-            vm.undo_rollback(&mut state, checkpoint).expect("rollback");
-            refusal = Some((status, vm.sum_overflow_slot()));
-            break;
-        }
-    }
+        (
+            rows,
+            [
+                u32s_as_bytes(&types).to_vec(),
+                i64s_as_bytes(&values).to_vec(),
+                i64s_as_bytes(&clocks).to_vec(),
+            ],
+        )
+    });
+    let (refusal, state) = host_run(&sum_program(site), batches);
     Folded {
         refusal,
-        total: agg_value_i64(&state, offset),
+        total: agg_value_i64(&state, SlotMetaView::read(&state, 0).offset),
     }
 }
 
@@ -583,3 +604,114 @@ proptest! {
     }
 }
 //#endregion smoo/columine!n/wide-i64-sum-refuses
+
+//#region smoo/columine!n/wide-keyed-i64-sum
+// An exact i64 total per key: `NESTED_AGG_UPDATE` into a nested slot whose
+// inner aggregate is `SUM_I64`, keyed by the row's whole u32 cell.
+
+/// Columns of the keyed sum: 0 type, 1 key, 2 value.
+const KEY_COL: u8 = 1;
+const KEYED_VAL_COL: u8 = 2;
+
+/// Keys a money column might carry: two currency ids, one of them again
+/// under another scale variant (bits 24..30 of its cell), and a fourth id.
+const KEYS: [u32; 4] = [840, 978, 840 | (2 << 24), 1000];
+
+fn keyed_sum_program() -> Vec<u8> {
+    let init = [
+        Opcode::SlotNested as u8,
+        0,
+        SlotType::Nested as u8,
+        8,
+        0,
+        SlotType::Aggregate as u8,
+        0,
+        0,
+        AggType::SumI64 as u8,
+        0,
+    ];
+    program(
+        &init,
+        &for_each(&[Opcode::NestedAggUpdate as u8, 0, KEY_COL, KEYED_VAL_COL]),
+        &[],
+    )
+}
+
+/// The keyed sum's first refusal and each key's total after it.
+fn keyed_fold(rows: &[(u32, i64)], cut: usize) -> (Option<Refusal>, BTreeMap<u32, i64>) {
+    let batches = rows.chunks(cut.max(1)).map(|batch| {
+        let (keys, values): (Vec<u32>, Vec<i64>) = batch.iter().copied().unzip();
+        let types = vec![ORDER_TYPE; batch.len()];
+        (
+            u32::try_from(batch.len()).expect("small batch"),
+            [
+                u32s_as_bytes(&types).to_vec(),
+                u32s_as_bytes(&keys).to_vec(),
+                i64s_as_bytes(&values).to_vec(),
+            ],
+        )
+    });
+    let (refusal, state) = host_run(&keyed_sum_program(), batches);
+    let meta = SlotMetaView::read(&state, 0);
+    let totals = KEYS
+        .iter()
+        .filter_map(|&key| {
+            let inner = get_inner_offset(&state, &meta, key);
+            (inner != 0).then(|| (key, agg_value_i64(&state, inner)))
+        })
+        .collect();
+    (refusal, totals)
+}
+
+#[test]
+fn an_overflow_in_one_key_refuses_and_leaves_every_key_as_it_was() {
+    let rows = [(840, i64::MAX), (978, 5), (978, 7), (840, 1)];
+    let (refusal, totals) = keyed_fold(&rows, 2);
+    assert_eq!(refusal, Some((SUM_OVERFLOW, Some(0))));
+    assert_eq!(totals, BTreeMap::from([(840, i64::MAX), (978, 5)]));
+    let (refusal, totals) = keyed_fold(&rows, 4);
+    assert_eq!(refusal, Some((SUM_OVERFLOW, Some(0))));
+    assert_eq!(totals, BTreeMap::new());
+}
+
+#[test]
+fn a_keyed_sum_reads_its_value_at_the_i64_lane() {
+    let reads = ReduceReads::of(&keyed_sum_program()).expect("the reduce reads derive");
+    assert!(reads.reads().contains(&ReduceRead {
+        column: u32::from(KEYED_VAL_COL),
+        usage: ColumnUse::Read,
+        lane: Some(CmpType::I64),
+    }));
+}
+
+proptest! {
+    #[test]
+    fn per_key_i64_sums_equal_a_reference_or_refuse(
+        rows in prop::collection::vec((prop::sample::select(KEYS.to_vec()), i64_row()), 0..12),
+        cut in 1usize..6,
+    ) {
+        let mut totals: BTreeMap<u32, i128> = BTreeMap::new();
+        let mut first_out = None;
+        for (row, &(key, v)) in rows.iter().enumerate() {
+            let total = totals.entry(key).or_default();
+            *total += i128::from(v);
+            if i64::try_from(*total).is_err() {
+                first_out = Some(row);
+                break;
+            }
+        }
+        let kept = match first_out {
+            Some(row) => &rows[..row - row % cut],
+            None => &rows[..],
+        };
+        let mut expected: BTreeMap<u32, i64> = BTreeMap::new();
+        for &(key, v) in kept {
+            let total = expected.entry(key).or_default();
+            *total = total.checked_add(v).expect("an accepted prefix stays in i64");
+        }
+        let (refusal, totals) = keyed_fold(&rows, cut);
+        prop_assert_eq!(refusal, first_out.map(|_| (SUM_OVERFLOW, Some(0))));
+        prop_assert_eq!(totals, expected);
+    }
+}
+//#endregion smoo/columine!n/wide-keyed-i64-sum

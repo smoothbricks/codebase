@@ -495,6 +495,11 @@ enum InnerMutation {
         kind: AggType,
         value_bits: u64,
     },
+    /// An inner `SUM_I64`'s total after the row, checked at preparation.
+    SumI64 {
+        offset: u32,
+        total: i64,
+    },
 }
 
 /// A mutation retains the original image and its paid probe/rehash plan.
@@ -674,6 +679,11 @@ impl<'state, 'work> NestedMutation<'state, 'work> {
                 }
                 _ => columine_types::die!("unsupported nested aggregate passed preparation"),
             },
+            InnerMutation::SumI64 { offset, total } => {
+                let count = bytes::read_u64(state, offset + 8);
+                bytes::write_i64(state, offset, total);
+                bytes::write_u64(state, offset + 8, count + 1);
+            }
         }
         if self.flags != 0 {
             self.meta.mark(state, self.flags);
@@ -966,15 +976,35 @@ pub fn prepare_nested_agg_update<'state, 'work>(
 ) -> Result<NestedMutation<'state, 'work>, ErrorCode> {
     let prefix = read_nested_prefix(state, meta.offset);
     let kind = match AggType::from_u8(prefix.inner_agg_type_byte) {
-        Some(kind @ (AggType::Count | AggType::Sum | AggType::Min | AggType::Max)) => kind,
+        Some(
+            kind @ (AggType::Count | AggType::Sum | AggType::Min | AggType::Max | AggType::SumI64),
+        ) => kind,
         _ => return Err(ErrorCode::InvalidProgram),
     };
     let mut plan = prepare_outer(state, meta, outer_key, scratch, SlotType::Aggregate)?;
     let len = aggregates::agg_slot_byte_size(prefix.inner_agg_type_byte);
-    plan.mutation = InnerMutation::Aggregate {
-        offset: plan.inner_offset,
-        kind,
-        value_bits,
+    plan.mutation = if kind == AggType::SumI64 {
+        // A new key's aggregate is zeroed when the plan applies: its total
+        // starts at zero. A total that would leave i64 refuses the row
+        // before anything is written (specs/columine/07-wide-row-cells.md,
+        // "A keyed i64 sum").
+        let total = if plan.outer_new {
+            0
+        } else {
+            bytes::read_i64(plan.state, plan.inner_offset)
+        };
+        InnerMutation::SumI64 {
+            offset: plan.inner_offset,
+            total: total
+                .checked_add(value_bits.cast_signed())
+                .ok_or(ErrorCode::SumOverflow)?,
+        }
+    } else {
+        InnerMutation::Aggregate {
+            offset: plan.inner_offset,
+            kind,
+            value_bits,
+        }
     };
     if !plan.outer_new {
         plan.push_range(plan.inner_offset, len);

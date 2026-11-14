@@ -96,6 +96,10 @@ pub(crate) enum OperandLane {
     Element {
         slot: u32,
     },
+    /// The value of a nested slot's inner aggregate.
+    NestedAggregate {
+        slot: u32,
+    },
     /// The value of a scalar aggregate.
     Scalar {
         slot: u32,
@@ -120,6 +124,12 @@ impl OperandLane {
                     .get(usize::from(field))?,
             ),
             Self::Element { slot } => field_lane(slot_record(init, slot).ok()?.element?),
+            Self::NestedAggregate { slot } => {
+                match AggType::from_u8(slot_record(init, slot).ok()?.inner_agg?) {
+                    Some(AggType::SumI64) => Some(CmpType::I64),
+                    _ => Some(CmpType::F64),
+                }
+            }
             Self::Scalar { slot } => {
                 let record = slot_record(init, slot).ok()?;
                 if record.op != Opcode::SlotDef
@@ -588,9 +598,9 @@ fn walk_op(
             reads(ops, 2, visit)?;
         }
         Opcode::NestedAggUpdate => {
-            ops.index()?;
+            let slot = ops.index()?;
             reads(ops, 1, visit)?;
-            read(ops, F64, visit)?;
+            read(ops, OperandLane::NestedAggregate { slot }, visit)?;
         }
         Opcode::BatchSetInsertIf => {
             let slot = ops.index()?;
@@ -779,6 +789,9 @@ struct SlotRecord<'a> {
     fields: &'a [u8],
     /// The element kind of a scalar list.
     element: Option<u8>,
+    /// A nested slot's inner aggregate byte, when its inner container is an
+    /// aggregate.
+    inner_agg: Option<u8>,
 }
 
 /// The definition of `slot` in `init`. Program admission validates the init
@@ -810,6 +823,7 @@ fn slot_record(init: &[u8], slot: u32) -> Result<SlotRecord<'_>, ErrorCode> {
             timestamp_col: None,
             fields: &[],
             element: None,
+            inner_agg: None,
         };
         match op {
             Opcode::SlotDef if flags.has_ttl() => {
@@ -840,7 +854,10 @@ fn slot_record(init: &[u8], slot: u32) -> Result<SlotRecord<'_>, ErrorCode> {
                 }
             }
             Opcode::SlotNested => {
-                r.bytes(4).ok_or(ErrorCode::InvalidProgram)?;
+                let nested = r.bytes(4).ok_or(ErrorCode::InvalidProgram)?;
+                if SlotType::from_u8(nested[0] & 0x0f) == Some(SlotType::Aggregate) {
+                    record.inner_agg = Some(nested[3]);
+                }
             }
             _ => return Err(ErrorCode::InvalidProgram),
         }

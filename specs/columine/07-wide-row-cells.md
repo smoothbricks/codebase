@@ -64,15 +64,15 @@ of every column operand:
 
 - **Fixed by the instruction.** `BATCH_AGG_SUM`, `BATCH_AGG_MIN`, `BATCH_AGG_MAX` and their `_IF` forms read f64 values.
   `BATCH_AGG_SUM_I64`, `BATCH_AGG_MIN_I64` and `BATCH_AGG_MAX_I64` read i64 values. A TTL timestamp, whether a TTL
-  slot's timestamp column, `BATCH_MAP_UPSERT_LAST_TTL`'s or `BATCH_SET_INSERT_TTL`'s, reads f64. So do
-  `BATCH_SCALAR_LATEST`'s comparison and `NESTED_AGG_UPDATE`'s value. The two-key tuple max and min upserts compare i64
-  columns. Keys, hash-map values, set elements, predicates, offsets, scatter route and op columns, and the `FOR_EACH`
-  type column read u32.
+  slot's timestamp column, `BATCH_MAP_UPSERT_LAST_TTL`'s or `BATCH_SET_INSERT_TTL`'s, reads f64. So does
+  `BATCH_SCALAR_LATEST`'s comparison. The two-key tuple max and min upserts compare i64 columns. Keys, hash-map values,
+  set elements, predicates, offsets, scatter route and op columns, and the `FOR_EACH` type column read u32.
 - **Named by the instruction.** A comparing map upsert's timestamp or comparison column reads at its `cmp_type`.
 - **Declared by the slot.** A struct-map, two-key struct-map or struct-list field value reads at its field's lane: INT64
   is i64, FLOAT64 is f64, and UINT32, STRING and BOOL are u32. This covers the struct-map upserts, the guarded upsert, a
   scatter's kind-0 value, a guarded scatter's guards and `LIST_APPEND_STRUCT`. A scalar list's element reads at its
-  element kind, and `BATCH_SCALAR_LATEST`'s value at its slot's scalar kind.
+  element kind, `BATCH_SCALAR_LATEST`'s value at its slot's scalar kind, and `NESTED_AGG_UPDATE`'s value at its slot's
+  inner aggregate: i64 for `SUM_I64`, f64 for every other.
 
 A `FLAT_MAP` body's timestamp operands read the parent timestamp column instead of their own, at their own lanes, so the
 walk names the parent timestamp column at each of them.
@@ -94,6 +94,12 @@ it takes to the slot's total in row order, and the first row whose running total
 (`Vm::sum_overflow_slot`, on the wasm ABI `vm_get_sum_overflow_slot`, to a TypeScript host `sumOverflowSlot`). The host
 rolls the batch back as it does every refused batch. A wrapped total is never stored. Because the total runs in row
 order, the same rows refuse however the host cuts them into batches.
+
+**A keyed i64 sum.** <a id="smoo/columine!n/wide-keyed-i64-sum"></a> A nested slot whose inner aggregate is `SUM_I64`
+keeps one exact i64 total per outer key: `NESTED_AGG_UPDATE` adds each row's value to its key's total under the same
+rule, so the row whose key's running total leaves `i64` refuses the batch with `SUM_OVERFLOW` before it writes anything,
+naming the nested slot, and every key keeps the total it held. A key is the row's whole u32 cell, so cells that differ
+in any bit sum apart. The inner `MIN_I64` and `MAX_I64` are refused with `INVALID_PROGRAM`, as before.
 
 ## 5. Live entries
 
@@ -117,6 +123,9 @@ the zero placeholder like any live column.
 - a warmed wide bind that allocates nothing.
 - <a id="smoo/columine!n/wide-i64-sum-refuses"></a> in `columine-vm/tests/aggregates.rs`, an i64 sum of `[i64::MAX, 1]`
   and of `[i64::MIN, -1]` refused naming its slot, at the top level, under a `FOR_EACH` type mask and row at a time
-  under a temporal table, element, folded as one batch and as one batch per row, the slot keeping its total; an in-range
-  sum unchanged; and for any rows and any cut, a sum equal to the exact total exactly when no running total leaves
-  `i64`.
+  under a temporal table, folded as one batch and as one batch per row, the slot keeping its total; an in-range sum
+  unchanged; and for any rows and any cut, a sum equal to the exact total exactly when no running total leaves `i64`.
+- <a id="smoo/columine!n/wide-keyed-i64-sum"></a> in `columine-vm/tests/aggregates.rs`, per-key `SUM_I64` totals of any
+  keyed rows under any cut equal a per-key reference exactly when no key's running total leaves `i64`, and otherwise the
+  batch holding the first such row is refused naming the nested slot with every key as the batches before it left it; an
+  i64 derived or host column feeding the keyed sum is read at the i64 lane.
