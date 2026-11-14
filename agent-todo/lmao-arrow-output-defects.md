@@ -74,3 +74,17 @@ reader that identifies a row by `(trace_id, thread_id, span_id, row)` can keep o
   `specs/lmao/01k_tree_walker_and_arrow_conversion.md`): after the start row was handed over, a tag is a row.
 - Red first: an open span flushed twice with a `tag()` between the flushes emits its start row once, the tag as its own
   row with the next row number, and no row whose `(trace_id, thread_id, span_id, row)` repeats.
+
+## An open span is announced at the second flush it is open across
+
+Decided by the owner with the tag row above ("good solution, does need reasonable flush intervals"). A flush fires on a
+timer, so a short span that happens to be open at that instant is announced by its start row and completed in the next
+flush: torn for no reason.
+
+- A flush announces an open span only if the previous flush already found it open. A span shorter than one interval is
+  never torn: it leaves whole in the flush after it ends. A tag set right after a span opens is in its start row before
+  the row is ever sent.
+- A span that hangs is visible after at most two intervals instead of one. The flush interval is therefore part of the
+  contract: state its value and its bound in `specs/lmao/05_span_writer_lanes.md`; no spec states it today.
+- Red first: a span opened just before a flush and ended just after it is emitted once, whole, with no row announced
+  early; a span open across two flushes is announced at the second.
