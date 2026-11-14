@@ -357,3 +357,43 @@ Observed 2026-11-14 on a stacked workspace (`cowshed rebase <ws> --into <parent 
 Red first: a `rebase --into` that stops at a conflict is finished by `cowshed rebase --continue` after the conflict is
 resolved and staged, and cowshed's record of the workspace names the new base. The two messages must not contradict each
 other, and `adopt` of a workspace must accept that workspace's own marker.
+
+## Four changes were written and never landed
+
+Found 2026-11-14 when every workspace was checked against main before removal. Each was committed in a workspace that is
+now removed; its commits are kept as a patch series outside this repository (the shed audit of 2026-11-14), and each
+applied to main on that day unless noted.
+
+### Node and Bun name the same external node
+
+`fix(nx-plugin): Node and Bun name the same external node for a package whose exports map hides its package.json`. A
+graph built in Bun keys 340 of 1,028 gate tasks differently from the Node daemon's, so a re-gate of an unchanged tree
+does not run nothing (`specs/cowshed/03_caches.md` "What a land re-runs"). It changes the carried Nx patch, which is a
+global cache key: it lands alone. Its `packages/nx-plugin/test-timings.json` hunk no longer applies and is regenerated.
+Red first: the two runtimes give one hash for the same task of a package whose exports map hides its `package.json`.
+
+### A declared land pushes outside main's blocked shell
+
+`fix(cowshed): a declared land pushes outside main's shell and never hands main a shell nobody approved`, with its test.
+`declared_land.rs` runs the declared command, the push included, as `direnv exec <main>`, and
+`specs/cowshed/02_workspaces.md` (near "declared land") says so; a land whose main `.envrc` is blocked then fails at the
+push and at the after-steps. Decide first whether the spec's sentence or the fix is the rule; nothing on main supersedes
+the fix. Red first: a land with a blocked main `.envrc` pushes, and refuses an unapproved shell change before its gate.
+
+### A workspace stores each executed result worth its bytes
+
+`feat(cowshed): a shed's Nx stores each executed result worth its bytes`. The Nx half is on main (`patches/README.md` "A
+shed stores what is worth its bytes" says every workspace sets `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1`);
+the cowshed half is not: `workspace_environment.rs` still exports `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`,
+`specs/cowshed/05_gateway.md` still reads "Sheds read; a land writes", and the cache server's already-stored answer
+before staging is absent. Main's README and spec contradict each other until it lands. A consumer must take the
+Nx-plugin release that carries the Nx half first, or its workspaces store every result with no bound.
+
+### A declared land frees its turn at the fast-forward
+
+`feat(cowshed): a declared land frees its turn at the fast-forward`, unfinished: the committed part and an uncommitted
+reconciliation with the install queue (the post-turn `land.lock` composed with the install turn, so an install fenced
+after the queue empties is not refused; `gateway_service.rs`, `specs/cowshed/laws/land_turn.bend`, text in specs 02 and
+05). `specs/cowshed/02_workspaces.md` still reads "The turn ends once the fast-forward's retire has". No test was run on
+the saved state. The nearest item, [the install and land deadlock](./cowshed-install-land-deadlock.md), is another
+defect on the same paths: design the two together.

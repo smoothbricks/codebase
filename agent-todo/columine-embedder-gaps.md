@@ -159,7 +159,11 @@ written and not on main: `9ad6790813` (a one-key struct map keyed by a text) and
 holds frames and is keyed by texts; its upserts 0x83/0x87/0x89 carry the array tail with `num_arrays` always present),
 on `d7acb489f8`. Governing: `specs/columine/04-key-index.md` §3, §5.
 
-1. Land those two commits.
+1. Land those two commits. They do not pass the land gate alone (tried 2026-11-14 on main `f69e739a1c`): the wiring
+   check refuses five public items of `columine-vm/src/key_index.rs` that no production code calls yet (`TEXT_STORED`,
+   `key1_frame_field`, `key2_frame_field`, `rows_of`, `text_frame`), so they land with the first of the items below that
+   calls them. Their workspace is removed; the two commits are kept as a patch series outside this repository (the shed
+   audit of 2026-11-14).
 2. A text key in logical export and import: `columine-vm/src/logical_export.rs` decodes and encodes every key lane as a
    u32 through the interner (`decode_u32` `:527`, `encode_u32` `:548`, `key_u32` `:571`).
 3. The change feed's prior value of a two-key row whose leading fields are frames: `struct_map2_value`
