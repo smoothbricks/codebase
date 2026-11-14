@@ -499,12 +499,9 @@ fn extract_json_event_open(
     // The discriminant, once its key has been read: discriminated columns and
     // enum ordinals resolve against it. Canonical encoders sort keys, so a
     // discriminator key that sorts before `value` is always seen first; a
-    // producer that spells `value` earlier resolves undiscriminated.
+    // producer that spells `value` earlier resolves undiscriminated, unless
+    // the discriminator is `type`, which is looked ahead for.
     let mut discriminant: Option<String> = None;
-    // A discriminator spelled `type` is the signal type itself: its string is
-    // owned once, in `event_type`, and this flag marks the discriminant as that
-    // same string rather than a second copy of it.
-    let mut discriminant_is_event_type = false;
     // The signal type, which selects the schema nested payload members are
     // routed by. A producer that spells `value` before `type` is looked ahead
     // for it, so routing never depends on key order.
@@ -517,8 +514,9 @@ fn extract_json_event_open(
             // peek settles the discriminant and, spelled `type`, the signal type.
             if let Ok(Token::String(value)) = parser.peek_token() {
                 if is_type {
+                    // A discriminator spelled `type` is the signal type
+                    // itself, owned once in `event_type`.
                     event_type = Some(owned(value)?);
-                    discriminant_is_event_type = true;
                 } else {
                     discriminant = Some(owned(value)?);
                 }
@@ -549,7 +547,7 @@ fn extract_json_event_open(
         if !saw_flat_value_key
             && name.starts_with("value.")
             && event_type.is_none()
-            && !config.dynamic_members.is_empty()
+            && config.reads_event_type()
         {
             event_type = lookahead_event_type(parser)?;
         }
@@ -571,11 +569,8 @@ fn extract_json_event_open(
                 event_type = lookahead_event_type(parser)?;
             }
             parser.expect_object_begin().map_err(lex_error)?;
-            let discriminant_name = if discriminant_is_event_type {
-                event_type.as_deref()
-            } else {
-                discriminant.as_deref()
-            };
+            let discriminant_name =
+                config.event_discriminant(discriminant.as_deref(), event_type.as_deref());
             let mut column_name = String::new();
             while !parser.is_object_end() {
                 let member = owned(parser.expect_field_name().map_err(lex_error)?)?;
@@ -592,6 +587,7 @@ fn extract_json_event_open(
                     config.null_cell(event_type.as_deref(), &member),
                     &column_name,
                     &member,
+                    &member,
                     image,
                     cells,
                     scratch,
@@ -600,6 +596,10 @@ fn extract_json_event_open(
             parser.next_token().map_err(lex_error)?;
             continue;
         }
+        // A flat `value.<member>` key is that payload member: it takes the
+        // member's discriminated column and routing row, as the nested
+        // descent gives them. Any other top-level key is a system member.
+        let flat_member = name.strip_prefix("value.");
         extract_named_member(
             parser,
             config,
@@ -607,7 +607,8 @@ fn extract_json_event_open(
             diagnostic,
             &mut extra,
             &mut extra_count,
-            None,
+            flat_member
+                .and(config.event_discriminant(discriminant.as_deref(), event_type.as_deref())),
             // A top-level key may be a system member (`id`, `type`, ...), so
             // the event's schema only lends a declared member its capture
             // schema here; it never diverts a top-level key to the carrier.
@@ -619,6 +620,7 @@ fn extract_json_event_open(
             // it spells a payload member flat (`value.<member>`).
             config.top_level_null_cell(event_type.as_deref(), &name),
             &name,
+            flat_member.unwrap_or(&name),
             &name,
             image,
             cells,
@@ -701,11 +703,13 @@ fn lookahead_event_type(parser: &JsonParser<'_>) -> Result<Option<String>, Extra
 }
 
 /// Handle one named member of the event or its nested payload: a declared
-/// column extracts typed (with deep carrier capture below open paths), an
-/// unknown member captures into the bounded carrier when one is declared, and
+/// column extracts typed (with deep carrier capture below open paths), a
+/// member the layout routes to the declared record is put there, an unknown
+/// member captures into the bounded carrier when one is declared, and
 /// otherwise the value is skipped. `column_name` is the column-map spelling
-/// (`value.<member>` inside the payload); `payload_name` is the payload-
-/// relative path segment the carrier and open-path checks key on.
+/// (`value.<member>` inside the payload); `member` is the payload member
+/// whose discriminated column and routing row place it; `payload_name` is
+/// the payload-relative path segment the carrier and open-path checks key on.
 ///
 /// A member literally named after the carrier column routes to CAPTURE, never
 /// to the carrier's own cell: the carrier is a projection artifact, and a
@@ -725,16 +729,22 @@ fn extract_named_member(
     member_schema: MemberSchema<'_>,
     null: NullCell,
     column_name: &str,
+    member: &str,
     payload_name: &str,
     image: &mut dyn CategoryImage,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
-    let lookup = match member_schema {
-        MemberSchema::UndeclaredOpen => None,
-        MemberSchema::Unjudged | MemberSchema::Declared(_) => {
-            config.lookup_payload_member(discriminant, payload_name, column_name)
-        }
+    // An open schema's undeclared member is the carrier's: it is never
+    // written to another type's column, nor placed by a routing row.
+    let placed = match member_schema {
+        MemberSchema::UndeclaredOpen => false,
+        MemberSchema::Unjudged | MemberSchema::Declared(_) => true,
+    };
+    let lookup = if placed {
+        config.lookup_payload_member(discriminant, member, column_name)
+    } else {
+        None
     }
     .and_then(|lookup| {
         config
@@ -808,11 +818,10 @@ fn extract_named_member(
         columns.columns_seen[lookup.column] = true;
         return Ok(());
     }
-    // A declared payload member without a column lives in the row's
-    // declared record, under its routing row.
-    if let MemberSchema::Declared(_) = member_schema
-        && let Some(row) = config.record_route(discriminant, payload_name)
-    {
+    // A payload member without a column that the layout routes lives in the
+    // row's declared record, under its routing row, whether or not a semantic
+    // schema judged it.
+    if placed && let Some(row) = config.record_route(discriminant, member) {
         let value = json_value(parser)?;
         return crate::record_cell(row, &value, null, cells);
     }

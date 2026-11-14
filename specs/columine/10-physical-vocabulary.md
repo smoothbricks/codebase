@@ -143,7 +143,10 @@ semantic schema keep the rule. **Placement is total.** Where a schema gives payl
 `value.<member>` column exists), every top-level member a semantic schema declares has a column or a routing row, or
 creation refuses the schema. A declared member is never dropped and never falls to the carrier. A schema that stores the
 whole payload in one `value` column places every member there. A routing row's discriminant is the event's `type`, and a
-schema with routing rows has a `value.$declared` column the embedder writes.
+schema with routing rows has a `value.$declared` column the embedder writes. A routing row places its member whether or
+not the processor holds a semantic schema, in either payload spelling and whichever side of the payload `type` is
+spelled on: a flat `value.<member>` key takes the member's discriminated column and routing row as the nested member
+does, and a member nothing places keeps its key as its carrier path.
 
 An embedder processor takes the extraction path only. A value-object frame certified by the admission capability is
 written to a raw Binary column as its certified bytes; a frame nested inside a member the embedder writes has no cell of

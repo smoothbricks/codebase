@@ -392,10 +392,36 @@ impl ExtractionConfig {
     }
 
     /// Whether a lane reads an event's `type`: its schema routes and judges
-    /// the event's members, and a named dynamic member is keyed by it. A
-    /// configuration with neither never decodes it.
+    /// the event's members, a named dynamic member is keyed by it, and a
+    /// discriminator spelled `type` selects columns and routing rows by it. A
+    /// configuration with none of these never decodes it.
     pub(crate) fn reads_event_type(&self) -> bool {
-        self.semantic_schemas.is_some() || !self.dynamic_members.is_empty()
+        self.semantic_schemas.is_some()
+            || !self.dynamic_members.is_empty()
+            || self.discriminates_by_type()
+    }
+
+    /// Whether the discriminator is the event's `type`
+    /// (specs/columine/10-physical-vocabulary.md §7: "A routing row's
+    /// discriminant is the event's `type`").
+    fn discriminates_by_type(&self) -> bool {
+        self.discriminator_key.as_deref() == Some("type")
+    }
+
+    /// The discriminant of an event whose discriminator key spelled
+    /// `discriminant` and whose signal type is `event_type`: a discriminator
+    /// spelled `type` is the signal type itself, wherever the lane learned it,
+    /// a look-ahead past the payload included.
+    pub(crate) fn event_discriminant<'a>(
+        &self,
+        discriminant: Option<&'a str>,
+        event_type: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.discriminates_by_type() {
+            event_type
+        } else {
+            discriminant
+        }
     }
     pub(crate) fn is_open_payload_path(&self, path: &str) -> bool {
         self.open_paths.iter().any(|open| open == path)

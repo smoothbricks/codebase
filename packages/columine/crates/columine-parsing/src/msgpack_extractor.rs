@@ -197,7 +197,8 @@ fn extract_msgpack_fields(
     // The discriminant, once its key has been read: discriminated columns and
     // enum ordinals resolve against it. Canonical encoders sort keys, so a
     // discriminator key that sorts before `value` is always seen first; a
-    // producer that spells `value` earlier resolves undiscriminated.
+    // producer that spells `value` earlier resolves undiscriminated, unless
+    // the discriminator is `type`, which is looked ahead for.
     let mut discriminant: Option<&str> = None;
     // The signal type, which selects the schema nested payload members are
     // routed by. A producer that spells `value` before `type` is looked ahead
@@ -233,7 +234,7 @@ fn extract_msgpack_fields(
         if !saw_flat_value_key
             && key.starts_with(b"value.")
             && event_type.is_none()
-            && !config.dynamic_members.is_empty()
+            && config.reads_event_type()
         {
             event_type = lookahead_event_type(reader, fields - field_index - 1);
         }
@@ -260,16 +261,17 @@ fn extract_msgpack_fields(
                 let member_start = reader.position();
                 let member = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
                 let member_end = reader.position();
-                let (lookup_name, null) = match std::str::from_utf8(member) {
+                let (lookup_name, member_name, null) = match std::str::from_utf8(member) {
                     Ok(name) => {
                         crate::spell_payload_column(&mut column_name, name)?;
                         (
                             Some(column_name.as_str()),
+                            Some(name),
                             config.null_cell(event_type, name),
                         )
                     }
                     // A non-UTF-8 member is undeclared by construction.
-                    Err(_) => (None, NullCell::Empty),
+                    Err(_) => (None, None, NullCell::Empty),
                 };
                 extract_msgpack_member(
                     reader,
@@ -278,10 +280,11 @@ fn extract_msgpack_fields(
                     work_buffer,
                     &mut state,
                     frames,
-                    discriminant,
+                    config.event_discriminant(discriminant, event_type),
                     event_type,
                     null,
                     lookup_name,
+                    member_name,
                     member,
                     member_start,
                     member_end,
@@ -296,6 +299,10 @@ fn extract_msgpack_fields(
         let null = lookup_name.map_or(NullCell::Empty, |key| {
             config.top_level_null_cell(event_type, key)
         });
+        // A flat `value.<member>` key is that payload member: it takes the
+        // member's discriminated column and routing row, as the nested
+        // descent gives them. Any other top-level key is a system member.
+        let flat_member = lookup_name.and_then(|key| key.strip_prefix("value."));
         extract_msgpack_member(
             reader,
             config,
@@ -303,10 +310,11 @@ fn extract_msgpack_fields(
             work_buffer,
             &mut state,
             frames,
-            None,
+            flat_member.and(config.event_discriminant(discriminant, event_type)),
             None,
             null,
             lookup_name,
+            flat_member.or(lookup_name),
             key,
             key_start,
             key_end,
@@ -409,12 +417,15 @@ struct ExtraState {
 
 /// Handle one named member of the event or its nested payload, the msgpack
 /// twin of the JSON extractor's `extract_named_member`: a declared column
-/// extracts typed, an unknown member captures raw key/value slices into the
-/// bounded carrier (path-keyed, `%`/`.` re-encoded via `encode_path_segment`),
+/// extracts typed, a member the layout routes to the declared record is put
+/// there, an unknown member captures raw key/value slices into the bounded
+/// carrier (path-keyed, `%`/`.` re-encoded via `encode_path_segment`),
 /// otherwise the value is skipped. A member named after the carrier column
 /// routes to capture, never to the carrier's own cell.
 /// `null` is what an explicit null in the member's cell is, as the caller's
-/// spelling of the member resolves it.
+/// spelling of the member resolves it. `member` is the payload member whose
+/// discriminated column and routing row place it; `key` is the path the
+/// carrier keys it by.
 #[allow(
     clippy::too_many_arguments,
     reason = "one seam, two call shapes: top-level and payload descent"
@@ -430,6 +441,7 @@ fn extract_msgpack_member(
     event_type: Option<&str>,
     null: NullCell,
     lookup_name: Option<&str>,
+    member: Option<&str>,
     key: &[u8],
     key_start: usize,
     key_end: usize,
@@ -437,15 +449,22 @@ fn extract_msgpack_member(
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
-    let member = std::str::from_utf8(key).ok();
-    // A non-UTF-8 member is undeclared by construction: under an open payload
+    // A non-UTF-8 key is undeclared by construction: under an open payload
     // object it is captured like any other undeclared member.
+    let path = std::str::from_utf8(key).ok();
     let member_schema = config.payload_member_schema(event_type, member.unwrap_or_default());
-    let lookup = match member_schema {
-        MemberSchema::UndeclaredOpen => None,
-        MemberSchema::Unjudged | MemberSchema::Declared(_) => lookup_name.and_then(|name| {
+    // An open schema's undeclared member is the carrier's: it is never
+    // written to another type's column, nor placed by a routing row.
+    let placed = match member_schema {
+        MemberSchema::UndeclaredOpen => false,
+        MemberSchema::Unjudged | MemberSchema::Declared(_) => true,
+    };
+    let lookup = if placed {
+        lookup_name.and_then(|name| {
             config.lookup_payload_member(discriminant, member.unwrap_or(name), name)
-        }),
+        })
+    } else {
+        None
     }
     .and_then(|lookup| {
         config
@@ -469,7 +488,7 @@ fn extract_msgpack_member(
             }
             MemberWrite::Seam(cell) => {
                 let capture = match member_schema {
-                    MemberSchema::Declared(schema) => member
+                    MemberSchema::Declared(schema) => path
                         .filter(|name| config.is_open_payload_path(name))
                         .map(|name| (schema, name)),
                     MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
@@ -491,9 +510,10 @@ fn extract_msgpack_member(
         columns.columns_seen[lookup.column] = true;
         return Ok(());
     }
-    // A declared payload member without a column lives in the row's
-    // declared record, under its routing row.
-    if let MemberSchema::Declared(_) = member_schema
+    // A payload member without a column that the layout routes lives in the
+    // row's declared record, under its routing row, whether or not a semantic
+    // schema judged it.
+    if placed
         && let Some(member) = member
         && let Some(row) = config.record_route(discriminant, member)
     {
@@ -504,7 +524,7 @@ fn extract_msgpack_member(
         Carrier::Embedder(_) => {
             // The embedder's carrier is keyed by text paths: a key that is
             // not UTF-8 has none.
-            let name = member.ok_or(ExtractionError::InvalidFieldType)?;
+            let name = path.ok_or(ExtractionError::InvalidFieldType)?;
             let value = msgpack_value(reader)?;
             let mut path = String::new();
             push_path_segment(&mut path, name).map_err(|_| ExtractionError::MemoryExhausted)?;
