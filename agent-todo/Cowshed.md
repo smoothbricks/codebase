@@ -299,3 +299,44 @@ ticket is parked behind an install that waits for that ticket.
   land's ask for `<repo>.ref` is numbered and the install is fenced after the land ends; an unrelated ask stays parked.
 - Bend: the land-turn actor's model gets the nested ask; the theorem "an install that waits is fenced after finitely
   many steps" must hold with it and fail on today's rule.
+
+## The deletion-log append is best-effort
+
+- `storage/deletion_log.rs:9-11` and `append_entry` swallow every error. The `retire-workspace` line is a retirement's
+  only lasting record, and a re-issued removal answers from it.
+- A failed append fails the retirement before it finishes. Red first: an append that cannot write.
+
+## Gateway inventory fails on a project that vanishes mid-walk
+
+- `sidecar_images` (`gateway_inventory.rs:1064-1074`) checks the directory exists, then lists it in a separate step. A
+  directory removed in between becomes an I/O error for an unrelated command: `port_claims_blocking` (`:1948`) runs on
+  every port allocation across all projects.
+- A directory that is gone is a project that is gone: list once and treat "not found" as empty. `typed_children`
+  (`apfs/native.rs:545-562`) has the same gap.
+
+## A retirement leaves its name's lock files
+
+- One project held 12,302 lock files in `sessions/` (`.intent.lock`, `.dmg.lock`, `.land.lock`, `.asif.lock`).
+  Store-wide recovery stats every one, and every port allocation lists the directory.
+- A retirement removes the lock files of the name it retires. Red first: the directory's entry count after a fork and
+  its removal equals the count before.
+
+## A fork fsyncs once per parent directory of a repointed link
+
+- `inherited_links::apply` issues one `F_FULLFSYNC` per changed parent (`inherited_links.rs:468-478`, through
+  `cowshed-os/src/fsio.rs:332`) on the fork's own unpublished clone, which spec 01a already flushes before activation. A
+  sampled fork spent 2,319 of 2,417 samples there and took 205 s.
+- No barrier on the pending-clone path; one flush on the migration path (`migrate_owned_links`), which no activation
+  flush follows.
+
+## The trash, the compacting directory and the deletion log only grow
+
+- `sessions/.trash` shrinks only on an explicit `gc --abandoned`; `build/.compacting` is cleared by no pass that is
+  named; `deletion-log.jsonl` reached 11.7 MB in one project and each re-issued removal reads it whole.
+- Each gets a bound and the pass that enforces it.
+
+## A creation record for a name that no longer exists refuses a fork of that name
+
+- A `fork <src> <name>` that matches a recorded completion answers NotFound (`runtime/project.rs`,
+  `current(&destination)?`) instead of forking, when the name was removed outside the journal.
+- A recorded creation whose workspace is absent is not a completion. Red first: remove outside the journal, fork.
