@@ -44,69 +44,28 @@ describe('EpochMillis constructor', () => {
   });
 });
 
-describe('epochMillisToMicros', () => {
-  it('converts milliseconds to microseconds', () => {
-    const us = epochMillisToMicros(EpochMillis(1000));
-    expect(us).toBe(EpochMicros(1_000_000n));
-  });
+// [milliseconds, the same instant in microseconds]: a second, zero, before the epoch, 2024-01-01, 2100-01-01.
+const MILLIS_AND_MICROS = [
+  [1000, 1_000_000n],
+  [0, 0n],
+  [-500, -500_000n],
+  [-86_400_000, -86_400_000_000n],
+  [1_704_067_200_000, 1_704_067_200_000_000n],
+  [4_102_444_800_000, 4_102_444_800_000_000n],
+] as const;
 
-  it('converts zero', () => {
-    expect(epochMillisToMicros(EpochMillis(0))).toBe(EpochMicros(0n));
-  });
-
-  it('converts negative (pre-epoch)', () => {
-    expect(epochMillisToMicros(EpochMillis(-500))).toBe(EpochMicros(-500_000n));
-  });
-
-  it('converts a realistic timestamp', () => {
-    // 2024-01-01T00:00:00.000Z = 1704067200000 ms
-    const us = epochMillisToMicros(EpochMillis(1_704_067_200_000));
-    expect(us).toBe(EpochMicros(1_704_067_200_000_000n));
-  });
-});
-
-describe('epochMicrosToMillis', () => {
-  it('converts microseconds to milliseconds', () => {
-    const ms = epochMicrosToMillis(EpochMicros(1_000_000n));
-    expect(ms).toBe(EpochMillis(1000));
+describe('epochMillisToMicros and epochMicrosToMillis', () => {
+  it('convert whole milliseconds both ways exactly', () => {
+    for (const [ms, us] of MILLIS_AND_MICROS) {
+      expect([ms, epochMillisToMicros(EpochMillis(ms))]).toEqual([ms, EpochMicros(us)]);
+      expect([us, epochMicrosToMillis(EpochMicros(us))]).toEqual([us, EpochMillis(ms)]);
+      expect(epochMicrosToMillis(epochMillisToMicros(EpochMillis(ms)))).toBe(EpochMillis(ms));
+    }
   });
 
   it('truncates sub-millisecond precision', () => {
     // 1500 microseconds = 1.5 milliseconds, truncated to 1
-    const ms = epochMicrosToMillis(EpochMicros(1_500n));
-    expect(ms).toBe(EpochMillis(1));
-  });
-
-  it('converts zero', () => {
-    expect(epochMicrosToMillis(EpochMicros(0n))).toBe(EpochMillis(0));
-  });
-
-  it('converts negative (pre-epoch)', () => {
-    expect(epochMicrosToMillis(EpochMicros(-500_000n))).toBe(EpochMillis(-500));
-  });
-});
-
-describe('round-trip: millis -> micros -> millis', () => {
-  it('preserves integer milliseconds', () => {
-    const original = EpochMillis(1_704_067_200_000);
-    const roundTripped = epochMicrosToMillis(epochMillisToMicros(original));
-    expect(roundTripped).toBe(original);
-  });
-
-  it('preserves zero', () => {
-    const original = EpochMillis(0);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(0));
-  });
-
-  it('preserves negative timestamps', () => {
-    const original = EpochMillis(-86_400_000);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(-86_400_000));
-  });
-
-  it('preserves large timestamps (year 2100+)', () => {
-    // 2100-01-01T00:00:00Z = 4102444800000 ms
-    const original = EpochMillis(4_102_444_800_000);
-    expect(epochMicrosToMillis(epochMillisToMicros(original))).toBe(EpochMillis(4_102_444_800_000));
+    expect(epochMicrosToMillis(EpochMicros(1_500n))).toBe(EpochMillis(1));
   });
 });
 
@@ -180,29 +139,16 @@ describe('nowMillis', () => {
 });
 
 describe('microsToISODate', () => {
-  it('produces correct YYYY-MM-DD for a known timestamp', () => {
-    // 2024-06-15T12:30:45.123Z
-    const d = new Date('2024-06-15T12:30:45.123Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2024-06-15');
-  });
-
-  it('handles epoch', () => {
+  it('names the UTC calendar day of an instant', () => {
+    // A known instant, the last millisecond of a year, and a far year.
+    for (const [iso, day] of [
+      ['2024-06-15T12:30:45.123Z', '2024-06-15'],
+      ['2024-12-31T23:59:59.999Z', '2024-12-31'],
+      ['2099-12-31T00:00:00.000Z', '2099-12-31'],
+    ] as const) {
+      expect([iso, microsToISODate(dateToMicros(new Date(iso)))]).toEqual([iso, day]);
+    }
     expect(microsToISODate(EpochMicros(0n))).toBe('1970-01-01');
-  });
-
-  it('handles end-of-day boundary (UTC)', () => {
-    // 2024-12-31T23:59:59.999Z -- still Dec 31 in UTC
-    const d = new Date('2024-12-31T23:59:59.999Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2024-12-31');
-  });
-
-  it('handles very large timestamps', () => {
-    // 2099-12-31T00:00:00.000Z
-    const d = new Date('2099-12-31T00:00:00.000Z');
-    const us = dateToMicros(d);
-    expect(microsToISODate(us)).toBe('2099-12-31');
   });
 });
 
