@@ -382,6 +382,15 @@ impl ExtractionConfig {
         }
     }
 
+    /// What an explicit null under the top-level `key` of an event of
+    /// `event_type` is. The flat spelling `value.<member>` is that payload
+    /// member, whose null is the one the nested spelling gives it; any other
+    /// top-level key is a system member, whose null is empty.
+    pub(crate) fn top_level_null_cell(&self, event_type: Option<&str>, key: &str) -> NullCell {
+        key.strip_prefix("value.")
+            .map_or(NullCell::Empty, |member| self.null_cell(event_type, member))
+    }
+
     /// Whether a lane reads an event's `type`: its schema routes and judges
     /// the event's members, and a named dynamic member is keyed by it. A
     /// configuration with neither never decodes it.

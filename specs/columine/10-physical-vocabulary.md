@@ -135,14 +135,15 @@ record and no text: a schema with a routing row or a text column is refused at c
 
 **A dynamic member's null is data.** <a id="smoo/columine!n/vocab-dynamic-null"></a> A dynamic value holds a null as it
 holds any other value, so an explicit null in a dynamic member's cell is a present cell, written like every other value
-of that member; a null in any other member is the empty cell, the same as a missing member. A member is dynamic when its
-event's semantic schema declares it so, or when the schema's owner names it at creation as `(event type, member)`
-(`DynamicSchemaConfig::dynamic_members`), which lets a processor created without a semantic schema keep the rule.
-**Placement is total.** Where a schema gives payload members columns of their own (a `value.<member>` column exists),
-every top-level member a semantic schema declares has a column or a routing row, or creation refuses the schema. A
-declared member is never dropped and never falls to the carrier. A schema that stores the whole payload in one `value`
-column places every member there. A routing row's discriminant is the event's `type`, and a schema with routing rows has
-a `value.$declared` column the embedder writes.
+of that member; a null in any other member is the empty cell, the same as a missing member. Both payload spellings store
+the same cell: a member nested in the event's `value` object and the same member spelled as a top-level `value.<member>`
+key. A member is dynamic when its event's semantic schema declares it so, or when the schema's owner names it at
+creation as `(event type, member)` (`DynamicSchemaConfig::dynamic_members`), which lets a processor created without a
+semantic schema keep the rule. **Placement is total.** Where a schema gives payload members columns of their own (a
+`value.<member>` column exists), every top-level member a semantic schema declares has a column or a routing row, or
+creation refuses the schema. A declared member is never dropped and never falls to the carrier. A schema that stores the
+whole payload in one `value` column places every member there. A routing row's discriminant is the event's `type`, and a
+schema with routing rows has a `value.$declared` column the embedder writes.
 
 An embedder processor takes the extraction path only. A value-object frame certified by the admission capability is
 written to a raw Binary column as its certified bytes; a frame nested inside a member the embedder writes has no cell of

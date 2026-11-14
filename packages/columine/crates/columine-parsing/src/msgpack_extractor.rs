@@ -227,6 +227,16 @@ fn extract_msgpack_fields(
             // bytes and the stored bytes diverge.
             return Err(ExtractionError::InvalidJson);
         }
+        // A flat `value.<member>` key's null is its member's, and a dynamic
+        // member is keyed by the signal type: the first flat key looks ahead
+        // for a `type` spelled after it, as the nested descent does.
+        if !saw_flat_value_key
+            && key.starts_with(b"value.")
+            && event_type.is_none()
+            && !config.dynamic_members.is_empty()
+        {
+            event_type = lookahead_event_type(reader, fields - field_index - 1);
+        }
         saw_flat_value_key |= key.starts_with(b"value.");
         // The nested-envelope descent, the msgpack twin of the JSON
         // extractor's: payload members resolve their `value.<member>`
@@ -250,13 +260,16 @@ fn extract_msgpack_fields(
                 let member_start = reader.position();
                 let member = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
                 let member_end = reader.position();
-                let lookup_name = match std::str::from_utf8(member) {
+                let (lookup_name, null) = match std::str::from_utf8(member) {
                     Ok(name) => {
                         crate::spell_payload_column(&mut column_name, name)?;
-                        Some(column_name.as_str())
+                        (
+                            Some(column_name.as_str()),
+                            config.null_cell(event_type, name),
+                        )
                     }
                     // A non-UTF-8 member is undeclared by construction.
-                    Err(_) => None,
+                    Err(_) => (None, NullCell::Empty),
                 };
                 extract_msgpack_member(
                     reader,
@@ -267,6 +280,7 @@ fn extract_msgpack_fields(
                     frames,
                     discriminant,
                     event_type,
+                    null,
                     lookup_name,
                     member,
                     member_start,
@@ -279,6 +293,9 @@ fn extract_msgpack_fields(
             continue;
         }
         let lookup_name = std::str::from_utf8(key).ok();
+        let null = lookup_name.map_or(NullCell::Empty, |key| {
+            config.top_level_null_cell(event_type, key)
+        });
         extract_msgpack_member(
             reader,
             config,
@@ -288,6 +305,7 @@ fn extract_msgpack_fields(
             frames,
             None,
             None,
+            null,
             lookup_name,
             key,
             key_start,
@@ -395,6 +413,8 @@ struct ExtraState {
 /// bounded carrier (path-keyed, `%`/`.` re-encoded via `encode_path_segment`),
 /// otherwise the value is skipped. A member named after the carrier column
 /// routes to capture, never to the carrier's own cell.
+/// `null` is what an explicit null in the member's cell is, as the caller's
+/// spelling of the member resolves it.
 #[allow(
     clippy::too_many_arguments,
     reason = "one seam, two call shapes: top-level and payload descent"
@@ -408,6 +428,7 @@ fn extract_msgpack_member(
     frames: &mut FrameWrites<'_>,
     discriminant: Option<&str>,
     event_type: Option<&str>,
+    null: NullCell,
     lookup_name: Option<&str>,
     key: &[u8],
     key_start: usize,
@@ -432,9 +453,6 @@ fn extract_msgpack_member(
             .map(|write| (lookup, write))
     });
     if let Some((lookup, write)) = lookup {
-        let null = member.map_or(NullCell::Empty, |member| {
-            config.null_cell(event_type, member)
-        });
         match write {
             MemberWrite::Lane => {
                 let dictionary = config.schema_dictionary(lookup.column);
@@ -480,7 +498,7 @@ fn extract_msgpack_member(
         && let Some(row) = config.record_route(discriminant, member)
     {
         let value = msgpack_value(reader)?;
-        return crate::record_cell(row, &value, config.null_cell(event_type, member), cells);
+        return crate::record_cell(row, &value, null, cells);
     }
     match config.carrier() {
         Carrier::Embedder(_) => {
@@ -1100,6 +1118,66 @@ mod tests {
         extract(&event("b", true), &config, &mut columns, &mut work, true).unwrap();
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
         assert_eq!(columns.cell(2, 0), None);
+    }
+
+    /// A dynamic member's explicit nil is a present null in either payload
+    /// spelling: the flat `value.<member>` key stores the cell the nested
+    /// `value` map stores, whichever side of it `type` is spelled on, and an
+    /// absent member stays empty in both.
+    #[test]
+    fn a_dynamic_members_nil_is_data_in_flat_and_nested_spellings() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"data":{"kind":"unknown"}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.data"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let event = |pairs: &[(&str, &[u8])]| {
+            let mut out = vec![0x80 | pairs.len() as u8];
+            for (key, value) in pairs {
+                str_(&mut out, key);
+                out.extend(*value);
+            }
+            out
+        };
+        let hi = text("hi");
+        let nil_map = one_member("data", &[0xc0]);
+        let rows = [
+            event(&[("type", &hi), ("value", &nil_map)]),
+            event(&[("type", &hi), ("value.data", &[0xc0])]),
+            event(&[("value.data", &[0xc0]), ("type", &hi)]),
+            event(&[("type", &hi), ("value", &[0x80])]),
+            event(&[("type", &hi)]),
+        ];
+        let mut columns = DynamicColumns::new(&fields, 5).expect("column plane fits");
+        let mut work = [0; 64];
+        assert_eq!(
+            extract(&rows.concat(), &config, &mut columns, &mut work, true),
+            Ok(rows.len())
+        );
+        let present_null = Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![0xc0])));
+        for row in 0..3 {
+            assert_eq!(
+                columns.cell(1, row),
+                present_null,
+                "row {row} keeps its nil"
+            );
+        }
+        for row in 3..5 {
+            assert_eq!(
+                columns.cell(1, row),
+                None,
+                "row {row}'s absent member is empty"
+            );
+        }
     }
 
     /// A JavaScript number above u32 arrives as float64 under standard

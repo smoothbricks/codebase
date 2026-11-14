@@ -543,6 +543,16 @@ fn extract_json_event_open(
             );
             return Err(ExtractionError::InvalidJson);
         }
+        // A flat `value.<member>` key's null is its member's, and a dynamic
+        // member is keyed by the signal type: the first flat key looks ahead
+        // for a `type` spelled after it, as the nested descent does.
+        if !saw_flat_value_key
+            && name.starts_with("value.")
+            && event_type.is_none()
+            && !config.dynamic_members.is_empty()
+        {
+            event_type = lookahead_event_type(parser)?;
+        }
         saw_flat_value_key |= name.starts_with("value.");
         // The nested-envelope descent: an ingest event carries its payload as
         // one nested `value` object, and each member resolves against its
@@ -605,9 +615,9 @@ fn extract_json_event_open(
                 MemberSchema::Declared(schema) => MemberSchema::Declared(schema),
                 MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => MemberSchema::Unjudged,
             },
-            // A top-level key keeps null as the empty state, as the MessagePack
-            // lane's top level does, which judges no member there.
-            NullCell::Empty,
+            // A top-level key is a system member, whose null is empty, unless
+            // it spells a payload member flat (`value.<member>`).
+            config.top_level_null_cell(event_type.as_deref(), &name),
             &name,
             &name,
             image,
@@ -2650,6 +2660,55 @@ mod tests {
         .unwrap();
         assert_eq!(columns.cell(1, 0), Some(ColumnValue::Utf8("x".into())));
         assert_eq!(columns.cell(2, 0), None);
+    }
+
+    /// A dynamic member's explicit null is a present null in either payload
+    /// spelling: the flat `value.<member>` key stores the cell the nested
+    /// `value` object stores, whichever side of it `type` is spelled on, and
+    /// an absent member stays empty in both.
+    #[test]
+    fn a_dynamic_members_null_is_data_in_flat_and_nested_spellings() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"data":{"kind":"unknown"}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.data"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 5).expect("column plane fits");
+        let mut work = [0; 512];
+        assert_eq!(
+            extract(
+                br#"[{"type":"hi","value":{"data":null}},{"type":"hi","value.data":null},{"value.data":null,"type":"hi"},{"type":"hi","value":{}},{"type":"hi"}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            ),
+            Ok(5)
+        );
+        let present_null = Some(ColumnValue::Binary(std::borrow::Cow::Owned(vec![0xc0])));
+        for row in 0..3 {
+            assert_eq!(
+                columns.cell(1, row),
+                present_null,
+                "row {row} keeps its null"
+            );
+        }
+        for row in 3..5 {
+            assert_eq!(
+                columns.cell(1, row),
+                None,
+                "row {row}'s absent member is empty"
+            );
+        }
     }
 
     /// A malformed `type` value is refused on every route. A failed read consumes
