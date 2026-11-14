@@ -184,3 +184,14 @@ answered `InvalidState` (4) at their first `execute_batch`, the failing set vary
 Change: each runtime is an explicit instance behind a handle, and the mutex goes.
 
 Red first: the smoke tests without `SERIAL`, run in parallel, pass on every run.
+
+## An undeclared event type is refused with a detail of its own
+
+Need: a sender that addresses a type its receiver does not declare reads `msgpack/invalid_json`, the same detail a
+malformed body gets, so the refusal cannot say that a type was refused or which. On main
+`columine-event-processor/src/lib.rs:1343-1347` maps
+`ExtractionError::{InvalidJson, InvalidFieldType, MsgpackError, UnwrittenProjection}` to
+`diagnostic_detail::INVALID_JSON`, and a type absent from the schema's `type` dictionary arrives there as one of them.
+
+Red first: a processor whose `type` dictionary is `{a}` refuses a row of type `b` with a detail that names an undeclared
+type and the row index; a malformed body still answers `invalid_json`.
