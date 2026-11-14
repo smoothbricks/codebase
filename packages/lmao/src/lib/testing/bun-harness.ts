@@ -277,9 +277,11 @@ function createRootTracer<B extends OpContextBinding>({
   if (sqlite) {
     // Every test process opens this one sink at once; it must already be WAL when its path appears.
     const db = openWalDatabase(sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, (path) => new Database(path));
+    // liveChildRows: a test's start row is in the sink before its body runs, so a killed run names the test that hung.
     const sqliteTracer = new SQLiteTracer(binding, {
       ...tracerOptions,
       db,
+      liveChildRows: true,
     });
 
     if (verbose) {

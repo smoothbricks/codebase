@@ -109,7 +109,7 @@ describe('buildInsertSql', () => {
   it('omits the user-column clause entirely when there are no active fields', () => {
     const sql = buildInsertSql([]);
     expect(sql).toContain(
-      'INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message)',
+      'INSERT OR REPLACE INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message)',
     );
   });
 

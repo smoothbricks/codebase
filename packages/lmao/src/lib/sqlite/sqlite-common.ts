@@ -294,7 +294,9 @@ export function buildInsertSql(activeUserFields: readonly string[]): string {
   // list must too, or `near "check": syntax error` at flush time.
   const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.map(quoteSqlIdentifier).join(', ')}` : '';
   const userPlaceholders = activeUserFields.length > 0 ? `, ${activeUserFields.map(() => '?').join(', ')}` : '';
-  return `INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
+  // OR REPLACE: a tracer that writes a span's rows while the trace runs (SQLiteTracer `liveChildRows`) writes them
+  // again, final, when the trace ends; the key (trace_id, span_id, row_index) makes the second write the row.
+  return `INSERT OR REPLACE INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
    VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`;
 }
 

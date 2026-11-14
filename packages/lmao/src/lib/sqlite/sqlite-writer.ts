@@ -145,6 +145,26 @@ export class SQLiteTraceWriter {
     }
   }
 
+  /**
+   * Write one row of a span's first buffer now, in its own transaction, while its trace still runs.
+   *
+   * Row 0 is the span's start and row 1 its completion (specs/lmao/01h). A process that is killed before its trace
+   * ends has then left the spans it started and the ones it finished; `flush` writes every row again when the trace
+   * ends, so a tag set after the start replaces the early row.
+   */
+  writeRow(buffer: AnySpanBuffer, row: 0 | 1): void {
+    this.ensureColumns(buffer._logSchema);
+    const activeUserFields = getActiveUserFields(buffer._logSchema, this.knownColumns);
+    const segment: SpanSegment = {
+      buffer,
+      traceId: buffer.trace_id,
+      spanId: buffer.span_id,
+      parentSpanId: buffer.parent_span_id,
+      rowOffset: 0,
+    };
+    this.getInsertStatement(activeUserFields).run(...buildInsertParams(segment, row, activeUserFields));
+  }
+
   private getInsertStatement(activeUserFields: readonly string[]): SyncSQLiteStatement {
     const key = getInsertStatementCacheKey(activeUserFields);
     const cached = this.insertStmtCache.get(key);
