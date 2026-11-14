@@ -1,69 +1,39 @@
 /**
- * Proportional allocation using the largest remainder method (Hamilton method).
- *
- * Guarantees: sum(parts) === total for all inputs.
- * Remainder cents are distributed to entries with the largest fractional parts,
- * ensuring the most mathematically fair distribution.
+ * Proportional allocation by the largest-remainder (Hamilton) method (specs/money/00-money.md §4): the parts sum to
+ * the total exactly, and ties go to the earlier weight.
  */
 
-import { Amount, type Amount as AmountValue } from './types.js';
+import { canonical, integer, toBig } from './integer.js';
+import { type Amount, brandAmount } from './types.js';
 
 /**
- * Distribute a total amount proportionally across weights.
- *
- * Uses the Hamilton/largest-remainder method:
- * 1. Compute each share's floor allocation: floor(total * weight / totalWeight)
- * 2. Distribute remaining units one-at-a-time to entries with largest fractional remainders
- *
- * @throws if weights array is empty or all weights sum to 0n (invariant -- programmer bug)
+ * Split `total` by non-negative integer weights.
+ * @throws RangeError for no weights, a negative weight or weights summing to zero (programmer errors).
  */
 export function allocateProportional<C extends string>(
-  total: AmountValue<C>,
-  weights: readonly bigint[],
-): AmountValue<C>[] {
-  if (weights.length === 0) {
-    throw new Error('Cannot allocate to empty weights array');
+  total: Amount<C>,
+  weights: readonly (number | bigint)[],
+): Amount<C>[] {
+  if (weights.length === 0) throw new RangeError('allocateProportional: no weights');
+  const w = weights.map((weight) => toBig(integer(weight, 'allocateProportional')));
+  if (w.some((weight) => weight < 0n)) throw new RangeError('allocateProportional: a weight is negative');
+  const whole = w.reduce((a, b) => a + b, 0n);
+  if (whole === 0n) throw new RangeError('allocateProportional: the weights sum to zero');
+  const t = toBig(total);
+  const parts = w.map((weight) => (t * weight) / whole);
+  const remainders = w.map((weight) => {
+    const r = (t * weight) % whole;
+    return r < 0n ? -r : r;
+  });
+  let left = t - parts.reduce((a, b) => a + b, 0n);
+  const step = left < 0n ? -1n : 1n;
+  const order = parts
+    .map((_, i) => i)
+    .sort((a, b) => (remainders[b] > remainders[a] ? 1 : remainders[b] < remainders[a] ? -1 : a - b));
+  for (const i of order) {
+    if (left === 0n) break;
+    parts[i] += step;
+    left -= step;
   }
-
-  const totalWeight = weights.reduce((sum, w) => sum + w, 0n);
-  if (totalWeight === 0n) {
-    throw new Error('Total weight must not be zero');
-  }
-
-  // Step 1: floor allocation for each weight
-  const parts: bigint[] = new Array(weights.length);
-  const remainders: bigint[] = new Array(weights.length);
-
-  let allocated = 0n;
-  for (let i = 0; i < weights.length; i++) {
-    // Floor allocation: total * weight / totalWeight (BigInt truncates toward zero)
-    const share = (total * weights[i]) / totalWeight;
-    parts[i] = share;
-    // Remainder is how much the "true" fractional value exceeds the floor
-    // remainder_i = (total * weight_i) % totalWeight
-    remainders[i] = (total * weights[i]) % totalWeight;
-    allocated += share;
-  }
-
-  // Step 2: distribute leftover units to entries with largest remainders
-  let leftover = total - allocated;
-
-  if (leftover > 0n) {
-    // Build index array sorted by remainder descending, then by original index ascending for stability
-    const indices = Array.from({ length: weights.length }, (_, i) => i);
-    indices.sort((a, b) => {
-      const cmp = remainders[b] - remainders[a];
-      if (cmp > 0n) return 1;
-      if (cmp < 0n) return -1;
-      return a - b; // stable: earlier index wins ties
-    });
-
-    for (const idx of indices) {
-      if (leftover <= 0n) break;
-      parts[idx] += 1n;
-      leftover -= 1n;
-    }
-  }
-
-  return parts.map((part) => Amount<C>(part));
+  return parts.map((part) => brandAmount<C>(canonical(part)));
 }

@@ -1,156 +1,89 @@
 /**
- * Parse and format monetary values to/from canonical decimal strings.
- *
- * These functions handle the conversion between human-readable decimal
- * strings ("1.50") and branded bigint types (Amount<'USD'>(150n)).
- *
- * For display purposes (locale-aware formatting with currency symbols),
- * use formatAmountDisplay which delegates to Intl.NumberFormat.
+ * Exact decimal text (specs/money/00-money.md §3, §5): one formatter and its parser, driven by the currency list.
  */
 
-import type { CurrencyDef } from './currency-registry.js';
-import { Amount, type Amount as AmountValue, Basis, type Basis as BasisValue } from './types.js';
+import type { Currency } from './currencies.js';
+import type { MoneyViolation } from './errors.js';
+import { canonical, toBig } from './integer.js';
+import { err, ok, type Result } from './result.js';
+import { divideRounded, RoundingMode } from './rounding.js';
+import { type Amount, brandAmount } from './types.js';
 
-/**
- * Parse a canonical decimal string into an Amount<C>.
- *
- * Handles integers ("100"), decimals ("1.50"), and negatives ("-1.50").
- * Does NOT parse locale-specific formats (commas, spaces) -- use canonical format only.
- *
- * @throws if the string is empty, contains non-numeric characters, or has too many decimal points
- */
-export function parseAmount<C extends string>(str: string, currency: CurrencyDef): AmountValue<C> {
-  return Amount<C>(parseDecimalToBigInt(str, currency.decimals));
+/** `value / 10^scale` as decimal text with at least `minFraction` fraction digits and no other trailing zero. */
+export function decimalText(value: number | bigint, scale: number, minFraction: number): string {
+  const n = toBig(value);
+  const negative = n < 0n;
+  const digits = (negative ? -n : n).toString().padStart(scale + 1, '0');
+  const whole = digits.slice(0, digits.length - scale);
+  let fraction = digits.slice(digits.length - scale);
+  let end = fraction.length;
+  while (end > minFraction && fraction[end - 1] === '0') end--;
+  fraction = fraction.slice(0, end);
+  return `${negative ? '-' : ''}${whole}${fraction.length > 0 ? `.${fraction}` : ''}`;
+}
+
+/** The exact amount: at least the currency's minor digits, and every nonzero digit to its runtime scale. */
+export function formatAmount<C extends string>(amount: Amount<C>, currency: Currency<C>): string {
+  return decimalText(amount, currency.runtimeDecimals, currency.minorDecimals);
 }
 
 /**
- * Format an Amount<C> as a canonical decimal string.
- *
- * Always produces exact decimal places per currency (e.g., "1.50" for USD, "100" for JPY).
+ * The amount's identity text (spec §5): every trailing fraction zero removed, so it does not depend on any scale.
+ * Equality, dedup keys and content hashes use it with the currency id.
  */
-export function formatAmount<C extends string>(amount: AmountValue<C>, currency: CurrencyDef): string {
-  return formatBigIntToDecimal(amount, currency.decimals);
+export function identityText<C extends string>(amount: Amount<C>, currency: Currency<C>): string {
+  return decimalText(amount, currency.runtimeDecimals, 0);
+}
+
+const DECIMAL = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/;
+
+/** Exact decimal text of C into an amount; refuses other text and a nonzero digit past the runtime scale. */
+export function parseAmount<C extends string>(text: string, currency: Currency<C>): Result<Amount<C>, MoneyViolation> {
+  const match = DECIMAL.exec(text);
+  if (match === null) return err({ code: 'INVALID_TEXT', op: 'parseAmount', text });
+  const [, sign, whole, given = ''] = match;
+  const scale = currency.runtimeDecimals;
+  const extra = given.slice(scale);
+  if (/[1-9]/.test(extra)) {
+    return err({
+      code: 'FINER_THAN_RUNTIME',
+      op: 'parseAmount',
+      currency: currency.code,
+      text,
+      runtimeDecimals: scale,
+    });
+  }
+  const n = BigInt(whole + given.slice(0, scale).padEnd(scale, '0'));
+  return ok(brandAmount<C>(canonical(sign === '-' ? -n : n)));
 }
 
 /**
- * Parse a canonical decimal string into a Basis<C>.
- *
- * Same rules as parseAmount but uses basisDecimals for scale.
- */
-export function parseBasis<C extends string>(str: string, currency: CurrencyDef): BasisValue<C> {
-  return Basis<C>(parseDecimalToBigInt(str, currency.basisDecimals));
-}
-
-/**
- * Format a Basis<C> as a canonical decimal string.
- */
-export function formatBasis<C extends string>(basis: BasisValue<C>, currency: CurrencyDef): string {
-  return formatBigIntToDecimal(basis, currency.basisDecimals);
-}
-
-/**
- * Format an Amount<C> for display using Intl.NumberFormat.
- * NOT for round-tripping -- output is locale-dependent and may include symbols.
- *
- * @example
- * ```ts
- * formatAmountDisplay(Amount<'USD'>(150n), getCurrency('USD')) // "$1.50"
- * formatAmountDisplay(Amount<'USD'>(150n), getCurrency('USD'), 'de-DE') // "1,50\xa0$"
- * ```
+ * The amount for a person: rounded to the minor unit by `mode` and formatted by `Intl` for the locale. A currency
+ * `Intl` does not know (a crypto asset) is formatted as a number followed by its code. Exact: the digits never pass
+ * through a float.
  */
 export function formatAmountDisplay<C extends string>(
-  amount: AmountValue<C>,
-  currency: CurrencyDef,
+  amount: Amount<C>,
+  currency: Currency<C>,
   locale?: string,
+  mode: RoundingMode = RoundingMode.HalfUp,
 ): string {
-  // Convert via canonical decimal string to avoid BigInt->Number precision loss.
-  // Number() on a decimal string like "92000000000.50" loses precision beyond
-  // ~15 significant digits, but that's inherent to Intl.NumberFormat accepting
-  // only number. For amounts > Number.MAX_SAFE_INTEGER minor units, the
-  // trailing digits may be wrong — acceptable for a display-only function.
-  const numericValue = Number(formatAmount(amount, currency));
-
-  return new Intl.NumberFormat(locale, {
-    style: 'currency',
-    currency: currency.code,
-    minimumFractionDigits: currency.decimals,
-    maximumFractionDigits: currency.decimals,
-  }).format(numericValue);
-}
-
-// --- Internal helpers ---
-
-/**
- * Parse a decimal string to bigint at the given scale (number of decimal places).
- */
-function parseDecimalToBigInt(str: string, decimals: number): bigint {
-  if (!str || str.trim().length === 0) {
-    throw new Error('Cannot parse empty string as monetary value');
-  }
-
-  const trimmed = str.trim();
-
-  // Handle negative sign
-  const isNegative = trimmed.startsWith('-');
-  const unsigned = isNegative ? trimmed.slice(1) : trimmed;
-
-  // Validate: only digits and at most one decimal point
-  if (!/^\d+(\.\d+)?$/.test(unsigned)) {
-    throw new Error(`Invalid monetary string: "${str}"`);
-  }
-
-  const dotIndex = unsigned.indexOf('.');
-
-  let intPart: string;
-  let fracPart: string;
-
-  if (dotIndex === -1) {
-    intPart = unsigned;
-    fracPart = '';
-  } else {
-    intPart = unsigned.slice(0, dotIndex);
-    fracPart = unsigned.slice(dotIndex + 1);
-  }
-
-  // Pad or truncate fractional part to exactly `decimals` digits
-  if (fracPart.length > decimals) {
-    // Truncate excess digits (caller should not provide excess, but handle gracefully)
-    fracPart = fracPart.slice(0, decimals);
-  } else {
-    fracPart = fracPart.padEnd(decimals, '0');
-  }
-
-  // For zero-decimal currencies, fracPart will be empty
-  const combined = decimals === 0 ? intPart : intPart + fracPart;
-  const value = BigInt(combined);
-
-  return isNegative ? -value : value;
-}
-
-/**
- * Format a bigint at the given scale to a canonical decimal string.
- */
-function formatBigIntToDecimal(value: bigint, decimals: number): string {
-  if (decimals === 0) {
-    return value.toString();
-  }
-
-  const isNegative = value < 0n;
-  const abs = isNegative ? -value : value;
-  const absStr = abs.toString();
-
-  let intPart: string;
-  let fracPart: string;
-
-  if (absStr.length <= decimals) {
-    // Value is less than 1.0 -- pad with leading zeros
-    intPart = '0';
-    fracPart = absStr.padStart(decimals, '0');
-  } else {
-    intPart = absStr.slice(0, absStr.length - decimals);
-    fracPart = absStr.slice(absStr.length - decimals);
-  }
-
-  const result = `${intPart}.${fracPart}`;
-  return isNegative ? `-${result}` : result;
+  const scale = currency.minorDecimals;
+  const minorUnits = divideRounded(toBig(amount), currency.runtimeDecimals - scale, mode).quotient;
+  const negative = minorUnits < 0n;
+  const magnitude = negative ? -minorUnits : minorUnits;
+  const whole = magnitude / 10n ** BigInt(scale);
+  const fraction = (magnitude % 10n ** BigInt(scale)).toString().padStart(scale, '0');
+  const fiat = currency.type === 'fiat';
+  const format = new Intl.NumberFormat(locale, {
+    ...(fiat ? { style: 'currency', currency: currency.code } : { style: 'decimal' }),
+    minimumFractionDigits: scale,
+    maximumFractionDigits: scale,
+  });
+  const signed: number | bigint = negative ? (whole === 0n ? -0 : -whole) : whole;
+  const text = format
+    .formatToParts(signed)
+    .map((part) => (part.type === 'fraction' ? fraction : part.value))
+    .join('');
+  return fiat ? text : `${text} ${currency.code}`;
 }

@@ -1,130 +1,93 @@
 /**
- * Rounding modes and Basis -> Amount conversion with explicit rounding.
- *
- * This is the single boundary where high-precision Basis values become
- * settled Amount values. No implicit truncation -- callers must choose
- * a rounding mode explicitly.
+ * The one rounding step (specs/money/00-money.md §6): a named mode, and the remainder returned beside the value.
  */
 
-import type { CurrencyDef } from './currency-registry.js';
-import { Amount, type Basis } from './types.js';
+import { scaleUp } from './amount.js';
+import type { Currency } from './currencies.js';
+import { canonical, integer, pow10, toBig } from './integer.js';
+import { type Amount, type Basis, brandAmount, brandBasis, brandMinor, type Minor } from './types.js';
 
-//#region smoo/money!n/rounding #explicit-rounding-mode
-/**
- * Explicit rounding modes for Basis -> Amount conversion.
- * Matches IEEE 754 / financial standard terminology.
- *
- * Spec 14 §Conversion-Boundary requires the Basis -> settled-Amount boundary to
- * use an EXPLICIT rounding mode (no implicit truncation), so the rounding choice
- * is part of the conversion audit. `convertFx` (money-conversion) rounds through
- * `roundBasisToAmount`.
- */
 export const RoundingMode = {
+  /** Toward negative infinity. */
   Floor: 'floor',
+  /** Toward positive infinity. */
   Ceil: 'ceil',
-  HalfEven: 'half-even',
+  /** Truncation. */
+  TowardZero: 'toward-zero',
+  /** To nearest; a tie goes away from zero. */
   HalfUp: 'half-up',
+  /** To nearest; a tie goes to the even neighbour. */
+  HalfEven: 'half-even',
 } as const;
 
 export type RoundingMode = (typeof RoundingMode)[keyof typeof RoundingMode];
 
-/**
- * Absolute value for BigInt (not provided by JS stdlib).
- */
-function bigAbs(n: bigint): bigint {
-  return n < 0n ? -n : n;
+/** `n / 10^k` rounded by `mode`, with `n = quotient × 10^k + remainder` exactly. */
+export function divideRounded(n: bigint, k: number, mode: RoundingMode): { quotient: bigint; remainder: bigint } {
+  if (k === 0) return { quotient: n, remainder: 0n };
+  const d = pow10(k);
+  let q = n / d;
+  const r = n - q * d;
+  if (r !== 0n) {
+    const twice = (r < 0n ? -r : r) * 2n;
+    let away: boolean;
+    switch (mode) {
+      case 'floor':
+        away = n < 0n;
+        break;
+      case 'ceil':
+        away = n > 0n;
+        break;
+      case 'toward-zero':
+        away = false;
+        break;
+      case 'half-up':
+        away = twice >= d;
+        break;
+      case 'half-even':
+        away = twice > d || (twice === d && (q & 1n) !== 0n);
+        break;
+      default: {
+        const unknown: never = mode;
+        throw new TypeError(`unknown rounding mode ${String(unknown)}`);
+      }
+    }
+    if (away) q += n < 0n ? -1n : 1n;
+  }
+  return { quotient: q, remainder: n - q * d };
+}
+
+/** A minor-unit amount from a payment rail or a document, in its one spelling. */
+export function minor<C extends string>(value: number | bigint): Minor<C> {
+  return brandMinor<C>(integer(value, 'minor'));
 }
 
 /**
- * Convert a Basis<C> value to Amount<C> using the specified rounding mode.
- *
- * The scale difference between Basis and Amount precision determines the divisor:
- *   divisor = 10^(basisDecimals - decimals)
- *
- * For USD: basisDecimals=10, decimals=2 -> divisor=10^8
- *   Basis(15000000000n) / 10^8 = 150 -> Amount(150n)
+ * The amount in C's minor units, rounded by `mode`; the remainder is in runtime units, so
+ * `fromMinor(minor) + remainder = amount`.
  */
-export function roundBasisToAmount<C extends string>(
-  basis: Basis<C>,
-  currency: CurrencyDef,
+export function toMinor<C extends string>(
+  amount: Amount<C>,
+  currency: Currency<C>,
   mode: RoundingMode,
-): Amount<C> {
-  const scaleDiff = BigInt(currency.basisDecimals - currency.decimals);
-  const divisor = 10n ** scaleDiff;
-
-  if (divisor === 1n) {
-    // No rounding needed when scales are identical
-    return Amount<C>(basis);
-  }
-
-  // BigInt division truncates toward zero
-  const truncated = basis / divisor;
-  const remainder = basis - truncated * divisor;
-
-  // Exact division -- no rounding needed
-  if (remainder === 0n) {
-    return Amount<C>(truncated);
-  }
-
-  const absRemainder = bigAbs(remainder);
-  const halfDivisor = divisor / 2n;
-  // Whether divisor is even (needed for exact-half detection)
-  const divisorIsEven = divisor % 2n === 0n;
-  const isNegative = basis < 0n;
-
-  switch (mode) {
-    case RoundingMode.Floor: {
-      // Floor: toward negative infinity
-      if (isNegative && remainder !== 0n) {
-        return Amount<C>(truncated - 1n);
-      }
-      return Amount<C>(truncated);
-    }
-
-    case RoundingMode.Ceil: {
-      // Ceil: toward positive infinity
-      if (!isNegative && remainder !== 0n) {
-        return Amount<C>(truncated + 1n);
-      }
-      return Amount<C>(truncated);
-    }
-
-    case RoundingMode.HalfUp: {
-      // HalfUp: round away from zero on 0.5
-      if (divisorIsEven && absRemainder === halfDivisor) {
-        // Exactly half -- round away from zero
-        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
-      }
-      if (absRemainder > halfDivisor) {
-        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
-      }
-      return Amount<C>(truncated);
-    }
-
-    case RoundingMode.HalfEven: {
-      // Banker's rounding: on exactly 0.5, round to nearest even
-      if (divisorIsEven && absRemainder === halfDivisor) {
-        // Exactly half -- round to even
-        const absTruncated = bigAbs(truncated);
-        if (absTruncated % 2n === 0n) {
-          // Already even -- stay
-          return Amount<C>(truncated);
-        }
-        // Odd -- round away from zero to make even
-        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
-      }
-      // Not exactly half -- round to nearest
-      if (absRemainder > halfDivisor) {
-        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
-      }
-      return Amount<C>(truncated);
-    }
-
-    default: {
-      // Exhaustive check -- should be unreachable
-      const _exhaustive: never = mode;
-      throw new Error(`Unknown rounding mode: ${_exhaustive}`);
-    }
-  }
+): { readonly minor: Minor<C>; readonly remainder: Amount<C> } {
+  const { quotient, remainder } = divideRounded(toBig(amount), currency.runtimeDecimals - currency.minorDecimals, mode);
+  return { minor: brandMinor<C>(canonical(quotient)), remainder: brandAmount<C>(canonical(remainder)) };
 }
-//#endregion smoo/money!n/rounding
+
+/** A minor-unit amount in runtime units: exact. */
+export function fromMinor<C extends string>(value: Minor<C>, currency: Currency<C>): Amount<C> {
+  return brandAmount<C>(scaleUp(value, currency.runtimeDecimals - currency.minorDecimals));
+}
+
+/** A basis value rounded to the runtime scale by `mode`; the remainder stays in basis units. */
+export function roundBasis<C extends string>(
+  basis: Basis<C>,
+  mode: RoundingMode,
+): { readonly amount: Amount<C>; readonly remainder: Basis<C> } {
+  const { quotient, remainder } = divideRounded(basis, BASIS_EXTRA_DECIMALS, mode);
+  return { amount: brandAmount<C>(canonical(quotient)), remainder: brandBasis<C>(remainder) };
+}
+
+/** How much finer a basis is than an amount: `basisDecimals = runtimeDecimals + 4`. */
+export const BASIS_EXTRA_DECIMALS = 4;

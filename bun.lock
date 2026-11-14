@@ -271,7 +271,14 @@
       },
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
+        "typia": "15.2.1",
       },
+      "peerDependencies": {
+        "typia": "15.2.1",
+      },
+      "optionalPeers": [
+        "typia",
+      ],
     },
     "packages/nextest-extract": {
       "name": "@smoothbricks/nextest-extract",

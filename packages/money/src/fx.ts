@@ -1,95 +1,63 @@
 /**
- * FX (foreign exchange) conversion with explicit remainder and audit trail.
- *
- * Phase 43 scope: function signature and minimal implementation.
- * Full FX integration (rate feeds, cross-currency Basis alignment) deferred to Phase 46.
- *
- * The audit trail ensures every conversion is traceable -- amount in, rate applied,
- * rounding mode used, remainder captured.
+ * FX conversion (specs/money/00-money.md §7): a rate per whole unit, one rounding, the remainder and the audit returned.
  */
 
-import type { CurrencyDef } from './currency-registry.js';
-import type { RoundingMode } from './rounding.js';
-import { roundBasisToAmount } from './rounding.js';
-import { type Amount, Basis, type Basis as BasisValue } from './types.js';
+import type { Currency } from './currencies.js';
+import { canonical, integer, pow10, toBig } from './integer.js';
+import { divideRounded, type RoundingMode } from './rounding.js';
+import { type Amount, brandAmount } from './types.js';
 
-//#region smoo/money!n/conversion #basis-to-amount-remainder
-/**
- * Audit trail for an FX conversion. Captures all inputs for traceability.
- *
- * Spec 14 §Conversion-Boundary: keep intermediate math in high-precision Basis,
- * convert Basis -> settled Amount at the boundary with an explicit rounding mode,
- * and never silently absorb the residual. `convertFx` returns the settled Amount,
- * the explicit `remainder`, and the rate/mode audit. The richer settlement tuple
- * the spec lists (`source_amount`/`settled_amount`/`rate_source`/`rate_as_of_date`/
- * `fx_delta_classification`) is assembled around this primitive by the consuming
- * system's FX Op; this is the pure math foundation.
- */
-export interface FxAudit<From extends string, To extends string> {
-  readonly fromAmount: Amount<From>;
-  readonly rate: BasisValue<To>;
-  readonly mode: RoundingMode;
+/** `basis / 10^scale` units of `To` per one unit of `From`. */
+export interface FxRate<From extends string, To extends string> {
+  readonly from: From;
+  readonly to: To;
+  readonly basis: bigint;
+  readonly scale: number;
 }
 
 /**
- * Result of an FX conversion including the remainder for reconciliation.
+ * A rate: `basis / 10^scale` units of `to` per one unit of `from` (0.92 is basis 92, scale 2).
+ * @throws TypeError for a non-integer basis or a scale that is not a non-negative integer (programmer errors).
  */
+export function fxRate<From extends string, To extends string>(
+  from: From,
+  to: To,
+  basis: number | bigint,
+  scale: number,
+): FxRate<From, To> {
+  if (!Number.isInteger(scale) || scale < 0)
+    throw new TypeError(`fxRate: scale ${scale} is not a non-negative integer`);
+  return { from, to, basis: toBig(integer(basis, 'fxRate')), scale };
+}
+
+/** An exact decimal residual: `units / 10^scale` of the target currency. */
+export interface Residual {
+  readonly units: bigint;
+  readonly scale: number;
+}
+
 export interface FxResult<From extends string, To extends string> {
   readonly result: Amount<To>;
-  readonly remainder: BasisValue<To>;
-  readonly audit: FxAudit<From, To>;
+  /** What rounding left out, exactly: `amount × rate = result + remainder`. */
+  readonly remainder: Residual;
+  readonly audit: { readonly amount: Amount<From>; readonly rate: FxRate<From, To>; readonly mode: RoundingMode };
 }
 
-/**
- * Convert an amount from one currency to another using an FX rate.
- *
- * The rate is expressed as Basis<To> per one minor unit of From.
- * The conversion multiplies fromAmount by the rate in Basis precision,
- * then rounds to the target currency's Amount precision.
- *
- * The remainder captures what was lost in rounding, enabling reconciliation.
- *
- * @example
- * ```ts
- * // Convert 100 USD cents to EUR at rate 0.92 (expressed in EUR basis)
- * const result = convertFx(
- *   Amount<'USD'>(100n),
- *   Basis<'EUR'>(9200000000n), // 0.92 in EUR basis (10 decimals)
- *   getCurrency('USD'),
- *   getCurrency('EUR'),
- *   RoundingMode.HalfUp
- * );
- * // result.result: Amount<'EUR'>(92n) -- 0.92 EUR
- * // result.remainder: Basis<'EUR'>(...) -- rounding remainder
- * ```
- */
+/** Convert at a rate: one exact multiplication, one rounding to `to`'s runtime scale. */
 export function convertFx<From extends string, To extends string>(
   amount: Amount<From>,
-  rate: BasisValue<To>,
-  _fromCurrency: CurrencyDef,
-  toCurrency: CurrencyDef,
+  rate: FxRate<From, To>,
+  from: Currency<From>,
+  to: Currency<To>,
   mode: RoundingMode,
 ): FxResult<From, To> {
-  // Multiply amount by rate in Basis precision
-  const basisTotal = Basis<To>(amount * rate);
-
-  // Round to target Amount
-  const settled = roundBasisToAmount(basisTotal, toCurrency, mode);
-
-  // Compute remainder: what was lost in rounding
-  const scaleDiff = BigInt(toCurrency.basisDecimals - toCurrency.decimals);
-  const divisor = 10n ** scaleDiff;
-  const settledInBasis = settled * divisor;
-  const remainder = Basis<To>(basisTotal - settledInBasis);
-
-  return {
-    result: settled,
-    remainder,
-    audit: {
-      fromAmount: amount,
-      rate,
-      mode,
-    },
-  };
+  const product = toBig(amount) * rate.basis;
+  const scale = from.runtimeDecimals + rate.scale;
+  const audit = { amount, rate, mode };
+  if (scale <= to.runtimeDecimals) {
+    const result = brandAmount<To>(canonical(product * pow10(to.runtimeDecimals - scale)));
+    return { result, remainder: { units: 0n, scale: to.runtimeDecimals }, audit };
+  }
+  const { quotient, remainder } = divideRounded(product, scale - to.runtimeDecimals, mode);
+  return { result: brandAmount<To>(canonical(quotient)), remainder: { units: remainder, scale }, audit };
 }
-//#endregion smoo/money!n/conversion

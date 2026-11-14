@@ -28,10 +28,10 @@ describe('package export contract', () => {
     const manifest = await readPackageManifest(packageUrl);
     const mod = await importDeclaredModule(manifest, packageUrl, '.');
 
-    expect(typeof mod.Amount).toBe('function');
+    expect(typeof mod.amount).toBe('function');
     expect(typeof mod.add).toBe('function');
-    expect(typeof mod.allocateProportional).toBe('function');
-    expect(typeof mod.getCurrency).toBe('function');
-    expect(typeof mod.roundBasisToAmount).toBe('function');
+    expect(typeof mod.defineCurrencies).toBe('function');
+    expect(typeof mod.encodeCells).toBe('function');
+    expect(typeof mod.toMinor).toBe('function');
   });
 });

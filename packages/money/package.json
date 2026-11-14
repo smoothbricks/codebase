@@ -7,7 +7,8 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "nx run money:test --outputStyle=stream"
+    "test": "nx run money:test --outputStyle=stream",
+    "publish:currencies": "bun scripts/publish-currencies.ts"
   },
   "nx": {
     "targets": {
@@ -34,6 +35,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./wire": {
+      "types": "./dist/wire.d.ts",
+      "import": "./dist/wire.js",
+      "default": "./dist/wire.js"
     }
   },
   "files": [
@@ -44,8 +50,17 @@
   "dependencies": {
     "tslib": "^2.8.1"
   },
+  "peerDependencies": {
+    "typia": "15.2.1"
+  },
+  "peerDependenciesMeta": {
+    "typia": {
+      "optional": true
+    }
+  },
   "devDependencies": {
-    "@smoothbricks/validation": "workspace:*"
+    "@smoothbricks/validation": "workspace:*",
+    "typia": "15.2.1"
   },
   "license": "MIT",
   "publishConfig": {
