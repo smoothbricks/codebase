@@ -738,3 +738,30 @@ fn json_and_messagepack_produce_one_stream_for_one_logical_batch() {
     assert_eq!(texts(batch.column(5)), owned(&["red", "blue", "red"]));
 }
 //#endregion smoo/columine!n/vocab-lanes-agree
+
+#[test]
+fn a_parsed_batch_lends_its_columns_beside_the_image_its_ordinals_name() {
+    let mut ep = processor(tag_schema());
+    let mut image = ListImage::new(16, 64);
+    let input = tag_events(&["red", "blue"]);
+    let mut batch = ep
+        .parse_with(&input, InputFormat::Json, &mut image)
+        .unwrap();
+    let (columns, image) = batch.columns_and_image();
+    let names: Vec<Option<&str>> = (0..columns.count)
+        .map(|row| {
+            let ordinal = columns.columns[1].read_uint(row)?;
+            image.value(u32::try_from(ordinal).ok()?)
+        })
+        .collect();
+    assert_eq!(names, [Some("red"), Some("blue")]);
+    let input = br#"[{"id":"0"}]"#;
+    let mut plain = ep
+        .parse(input, InputFormat::Json)
+        .expect("a row with no category value parses with no image");
+    assert_eq!(
+        plain.columns_and_image().1.len(),
+        0,
+        "a batch parsed with no image lends none"
+    );
+}

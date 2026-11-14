@@ -945,6 +945,18 @@ impl ParsedBatch<'_> {
         self.columns
     }
 
+    /// The extracted columns beside the stream dictionary's image they were
+    /// parsed against, for an owner that judges a row by the name a
+    /// stream-dictionary cell's ordinal stands for while it filters the
+    /// columns. A batch parsed with no image answers [`NoCategories`].
+    pub fn columns_and_image(&mut self) -> (&mut DynamicColumns, &dyn CategoryImage) {
+        let image: &dyn CategoryImage = match self.image.as_deref() {
+            Some(image) => image,
+            None => &NoCategories,
+        };
+        (self.columns, image)
+    }
+
     /// Rows currently in the columns.
     pub fn row_count(&self) -> u32 {
         self.columns.count
