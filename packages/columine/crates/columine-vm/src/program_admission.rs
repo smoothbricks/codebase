@@ -26,6 +26,7 @@ use crate::row_exprs::{
     LiveColumns, RowColumns, RowExpression, RowPlan, bind_row_columns, row_table,
 };
 use crate::state_init;
+use crate::struct_map::Validity;
 use crate::vm::Vm;
 use core::cell::OnceCell;
 use core::marker::PhantomData;
@@ -130,7 +131,15 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         batch_len: u32,
         scratch: &mut ProgramScratch,
     ) -> Result<u32, InputAdmissionError> {
-        self.execute_batch_in(vm, state, cols, batch_len, scratch, &NoStrings)
+        self.execute_batch_in(
+            vm,
+            state,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            scratch,
+            &NoStrings,
+        )
     }
 
     /// The same admission boundary on the paired undo/redo execution lane.
@@ -142,7 +151,15 @@ impl<A: VoProgramAdmission> AdmittedProgram<A> {
         batch_len: u32,
         scratch: &mut ProgramScratch,
     ) -> Result<u32, InputAdmissionError> {
-        self.execute_batch_delta_in(vm, state, cols, batch_len, scratch, &NoStrings)
+        self.execute_batch_delta_in(
+            vm,
+            state,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            scratch,
+            &NoStrings,
+        )
     }
 }
 
@@ -429,33 +446,38 @@ impl<A: VoProgramAdmission, I: KeyIndex> AdmittedProgram<A, I> {
     }
 
     /// [`AdmittedProgram::execute_batch`] on a VM of the program's family,
-    /// resolving interned key lanes through `strings`.
+    /// resolving interned key lanes through `strings`, over a batch whose
+    /// columns carry `validity`.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_batch_in<S: InternBytes + ?Sized>(
         &self,
         vm: &mut Vm<I>,
         state: &mut [u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         scratch: &mut ProgramScratch,
         strings: &S,
     ) -> Result<u32, InputAdmissionError> {
         self.execute_with(cols, batch_len, scratch, |bytecode, cols| {
-            vm.execute_batch_in(state, bytecode, cols, batch_len, strings)
+            vm.execute_batch_in(state, bytecode, cols, validity, batch_len, strings)
         })
     }
 
     /// [`AdmittedProgram::execute_batch_delta`] on a VM of the program's family.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_batch_delta_in<S: InternBytes + ?Sized>(
         &self,
         vm: &mut Vm<I>,
         state: &mut [u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         scratch: &mut ProgramScratch,
         strings: &S,
     ) -> Result<u32, InputAdmissionError> {
         self.execute_with(cols, batch_len, scratch, |bytecode, cols| {
-            vm.execute_batch_delta_in(state, bytecode, cols, batch_len, strings)
+            vm.execute_batch_delta_in(state, bytecode, cols, validity, batch_len, strings)
         })
     }
 }

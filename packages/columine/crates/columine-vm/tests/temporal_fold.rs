@@ -8,6 +8,7 @@ use columine_vm::{
     key_index::NoStrings,
     meta::SlotMetaView,
     state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state},
+    struct_map::Validity,
     temporal::TEMPORAL_MAGIC,
     undo_log::FLAT_UNDO_ENTRY_SIZE,
     vm::{CheckedStructMap, Vm, i64s_as_bytes, u32s_as_bytes},
@@ -445,6 +446,7 @@ fn explicit_mutation_program_writes_without_advancing_due_deadlines() {
             &mut state,
             &mutation,
             &[u32s_as_bytes(&[9]), u32s_as_bytes(&[99])],
+            Validity::ALL_VALID,
             1,
             None,
             &NoStrings

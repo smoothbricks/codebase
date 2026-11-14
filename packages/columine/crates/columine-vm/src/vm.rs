@@ -37,8 +37,8 @@ use crate::row_exprs::{LiveColumns, StoredBinding, StoredRow};
 use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE, GrowthRoom};
 use crate::struct_map::{
-    ArenaRegion, StructMap2Slot, StructMapSlot, scalar_cell_encoded, scalar_cell_order_key,
-    scalar_order_key,
+    ArenaRegion, ColumnValidity, StructMap2Slot, StructMapSlot, Validity, scalar_cell_encoded,
+    scalar_cell_order_key, scalar_order_key,
 };
 use crate::temporal::{NO_COMPANION, Temporal};
 use crate::ttl_plan::{TtlBatchPlan, TtlBatchScratch, consume_ttl_batch, prepare_ttl_batch};
@@ -1748,11 +1748,12 @@ pub fn rollback_entry(state: &mut [u8], entry: &FlatUndoEntry) -> Result<(), Err
 // Struct-map row writes: one physical capture per row mutation
 // =============================================================================
 
-/// One batch's input columns and its row count, as the reduce section reads
-/// them.
+/// One batch's input columns, each column's validity and its row count, as
+/// the reduce section reads them.
 #[derive(Clone, Copy)]
 struct BatchColumns<'c> {
     cols: &'c [&'c [u8]],
+    validity: Validity<'c>,
     len: u32,
 }
 /// Most ranges one struct-map capture names besides its index plan's writes.
@@ -2251,11 +2252,37 @@ impl ScalarOperands {
         &self.fields[..self.len]
     }
 
+    /// Each pair's source column validity, resolved once for the
+    /// instruction rather than per cell.
+    pub(crate) fn validity<'a>(&self, batch: Validity<'a>) -> FieldValidity<'a> {
+        let mut valid = FieldValidity {
+            cols: [ColumnValidity::ALL_VALID; MAX_STRUCT_SCALAR_OPERANDS],
+            len: self.len,
+        };
+        for (slot, &col) in valid.cols.iter_mut().zip(self.cols()) {
+            *slot = batch.column(col);
+        }
+        valid
+    }
+
     /// Append one pair past the decoded ones (room was reserved at decode).
     fn push(&mut self, col: u32, field: u8) {
         self.cols[self.len] = col;
         self.fields[self.len] = field;
         self.len += 1;
+    }
+}
+
+/// The source validity of each pair of a [`ScalarOperands`], in pair order.
+#[derive(Clone, Copy)]
+pub(crate) struct FieldValidity<'a> {
+    cols: [ColumnValidity<'a>; MAX_STRUCT_SCALAR_OPERANDS],
+    len: usize,
+}
+
+impl<'a> FieldValidity<'a> {
+    pub(crate) fn as_slice(&self) -> &[ColumnValidity<'a>] {
+        &self.cols[..self.len]
     }
 }
 
@@ -2550,6 +2577,15 @@ impl StructMap2TupleOperands {
         self.cmp2_field = operands.byte()?;
         self.end = operands.pos();
         Some(())
+    }
+
+    /// The row's pairs and its two comparison lanes, which the row writes
+    /// too; room for the lanes was reserved at decode.
+    fn vals(&self) -> ScalarOperands {
+        let mut vals = self.row.vals;
+        vals.push(self.cmp1_col, self.cmp1_field);
+        vals.push(self.cmp2_col, self.cmp2_field);
+        vals
     }
 }
 
@@ -2898,6 +2934,7 @@ struct PreparedRow<'a, I: KeyIndex> {
     val_cols: &'a [u32],
     field_idxs: &'a [u8],
     cols: &'a [&'a [u8]],
+    valid: &'a [ColumnValidity<'a>],
     element_idx: u32,
 }
 
@@ -2911,6 +2948,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
         val_cols: &'a [u32],
         field_idxs: &'a [u8],
         cols: &'a [&'a [u8]],
+        valid: &'a [ColumnValidity<'a>],
         element_idx: u32,
         cx: &mut KeyCx<'_, I, S>,
     ) -> Result<Self, ErrorCode> {
@@ -2924,6 +2962,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
             val_cols,
             field_idxs,
             cols,
+            valid,
             element_idx,
         )?;
         let target = RowTarget::of(map.plan_upsert(state, key, cx)?);
@@ -2960,6 +2999,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
             val_cols,
             field_idxs,
             cols,
+            valid,
             element_idx,
         })
     }
@@ -2974,12 +3014,14 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
         }
         let pos = self.target.pos();
         self.map.clear_bitset(state, self.map.row_off(pos));
-        for (&val_col, &field_idx) in self.val_cols.iter().zip(self.field_idxs) {
+        let pairs = self.val_cols.iter().zip(self.field_idxs).zip(self.valid);
+        for ((&val_col, &field_idx), &valid) in pairs {
             self.map.write_scalar_field(
                 state,
                 pos,
                 field_idx,
                 self.cols,
+                valid,
                 val_col,
                 self.element_idx,
             );
@@ -3076,6 +3118,7 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     val_cols: &[u32],
     field_idxs: &[u8],
     cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
@@ -3089,6 +3132,7 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
         val_cols,
         field_idxs,
         cols,
+        valid,
         element_idx,
     ) {
         return err;
@@ -3128,7 +3172,15 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     }
     smap.clear_bitset(state, row);
     for (index, &val_col) in val_cols.iter().enumerate() {
-        smap.write_scalar_field(state, pos, field_idxs[index], cols, val_col, element_idx);
+        smap.write_scalar_field(
+            state,
+            pos,
+            field_idxs[index],
+            cols,
+            valid[index],
+            val_col,
+            element_idx,
+        );
     }
     mark_meta(
         state,
@@ -3179,6 +3231,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
     key1: u32,
     key2: u32,
     cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> ErrorCode {
@@ -3199,10 +3252,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
         Err(error) => return error,
     }
 
-    // Room for the two comparison lanes was reserved at decode.
-    let mut vals = operands.row.vals;
-    vals.push(operands.cmp1_col, operands.cmp1_field);
-    vals.push(operands.cmp2_col, operands.cmp2_field);
+    let vals = operands.vals();
     single_struct_map2_upsert_last(
         undo,
         rec,
@@ -3215,6 +3265,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
         vals.cols(),
         vals.fields(),
         cols,
+        valid,
         element_idx,
         cx,
     )
@@ -3459,6 +3510,7 @@ fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     key: u32,
     guard_key: u32,
     cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
@@ -3495,6 +3547,7 @@ fn single_struct_map_guarded_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
         operands.row.vals.fields(),
         operands.row.array_fields(),
         cols,
+        valid,
         element_idx,
         cx,
     );
@@ -3774,8 +3827,11 @@ fn single_struct_map_upsert_from_probe<I: KeyIndex, S: InternBytes + ?Sized>(
 }
 //#endregion reduce-typed-state.probe-upsert
 
-/// Validate scalar source geometry without writing or allocating. Arena-backed
-/// logical scalars must enter through CSR operands, never through scalar cells.
+/// Validate scalar source geometry without writing or allocating: each value
+/// cell, and each validity bitmap the batch carries for a value column, covers
+/// the element. Arena-backed logical scalars must enter through CSR operands,
+/// never through scalar cells.
+#[allow(clippy::too_many_arguments)]
 fn validate_scalar_fields(
     state: &[u8],
     descriptor_off: u32,
@@ -3783,9 +3839,11 @@ fn validate_scalar_fields(
     val_cols: &[u32],
     field_idxs: &[u8],
     cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
     element_idx: u32,
 ) -> Result<(), ErrorCode> {
-    for (&col_idx, &field_idx) in val_cols.iter().zip(field_idxs) {
+    let pairs = val_cols.iter().zip(field_idxs).zip(valid);
+    for ((&col_idx, &field_idx), &valid) in pairs {
         if field_idx >= num_fields {
             return Err(ErrorCode::InvalidProgram);
         }
@@ -3808,6 +3866,9 @@ fn validate_scalar_fields(
             .get(col_idx as usize)
             .is_none_or(|col| end as usize > col.len())
         {
+            return Err(ErrorCode::ColumnUnderrun);
+        }
+        if !valid.covers(element_idx) {
             return Err(ErrorCode::ColumnUnderrun);
         }
     }
@@ -3948,6 +4009,7 @@ fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     field_idxs: &[u8],
     array_fields: &[ArrayField],
     cols: &[&[u8]],
+    valid: &[ColumnValidity<'_>],
     element_idx: u32,
     cx: &mut KeyCx<'_, I, S>,
 ) -> u32 {
@@ -3962,6 +4024,7 @@ fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
         val_cols,
         field_idxs,
         cols,
+        valid,
         element_idx,
         cx,
     ) {
@@ -4443,7 +4506,7 @@ const OUT_OF_MEMORY: u32 = ErrorCode::OutOfMemory as u32;
 /// no resolver is passed.
 impl Vm {
     /// Execute one batch using the VM's normal mutation lane, over a batch
-    /// with no live derived columns (`row_exprs`).
+    /// with no live derived columns (`row_exprs`) and no null cell.
     pub fn execute_batch(
         &mut self,
         state: &mut [u8],
@@ -4451,11 +4514,18 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_batch_in(state, program, cols, batch_len, &NoStrings)
+        self.execute_batch_in(
+            state,
+            program,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            &NoStrings,
+        )
     }
 
     /// Execute one batch using the VM's delta mutation lane, over a batch
-    /// with no live derived columns (`row_exprs`).
+    /// with no live derived columns (`row_exprs`) and no null cell.
     pub fn execute_batch_delta(
         &mut self,
         state: &mut [u8],
@@ -4463,12 +4533,19 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_batch_delta_in(state, program, cols, batch_len, &NoStrings)
+        self.execute_batch_delta_in(
+            state,
+            program,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            &NoStrings,
+        )
     }
 
-    /// Execute one batch using the VM's normal mutation lane; the conditional
-    /// per-element opcodes read `live` columns at their row, against the
-    /// state the rows before it left.
+    /// Execute one batch with no null cell using the VM's normal mutation lane;
+    /// the conditional per-element opcodes read `live` columns at their row,
+    /// against the state the rows before it left.
     pub fn execute_batch_live(
         &mut self,
         state: &mut [u8],
@@ -4477,7 +4554,15 @@ impl Vm {
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
     ) -> u32 {
-        self.execute_batch_live_in(state, program, cols, batch_len, live, &NoStrings)
+        self.execute_batch_live_in(
+            state,
+            program,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            live,
+            &NoStrings,
+        )
     }
 
     /// [`Self::execute_batch_live`] on the delta mutation lane.
@@ -4489,36 +4574,52 @@ impl Vm {
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
     ) -> u32 {
-        self.execute_batch_delta_live_in(state, program, cols, batch_len, live, &NoStrings)
+        self.execute_batch_delta_live_in(
+            state,
+            program,
+            cols,
+            Validity::ALL_VALID,
+            batch_len,
+            live,
+            &NoStrings,
+        )
     }
 }
 
 impl<I: KeyIndex> Vm<I> {
     /// Execute an explicit non-row mutation program without advancing an event clock or running expiry.
     /// RETE relation programs use this entry; event reducers use `execute_batch_in` with their clock binding.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_mutations_in<S: InternBytes + ?Sized>(
         &mut self,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(false, false, state, program, cols, batch_len, live, strings)
+        self.execute_impl(
+            false, false, state, program, cols, validity, batch_len, live, strings,
+        )
     }
 
     /// The paired-recording counterpart of [`Self::execute_mutations_in`], without advancing an event clock.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_mutations_delta_in<S: InternBytes + ?Sized>(
         &mut self,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(true, false, state, program, cols, batch_len, live, strings)
+        self.execute_impl(
+            true, false, state, program, cols, validity, batch_len, live, strings,
+        )
     }
 
     /// [`Vm::execute_batch`] for key-index family `I`, resolving interned key
@@ -4528,10 +4629,13 @@ impl<I: KeyIndex> Vm<I> {
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(false, true, state, program, cols, batch_len, None, strings)
+        self.execute_impl(
+            false, true, state, program, cols, validity, batch_len, None, strings,
+        )
     }
 
     /// [`Vm::execute_batch_delta`] for key-index family `I`.
@@ -4540,18 +4644,23 @@ impl<I: KeyIndex> Vm<I> {
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         strings: &S,
     ) -> u32 {
-        self.execute_impl(true, true, state, program, cols, batch_len, None, strings)
+        self.execute_impl(
+            true, true, state, program, cols, validity, batch_len, None, strings,
+        )
     }
 
     /// [`Vm::execute_batch_live`] for key-index family `I`.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_batch_live_in<S: InternBytes + ?Sized>(
         &mut self,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
         strings: &S,
@@ -4562,6 +4671,7 @@ impl<I: KeyIndex> Vm<I> {
             state,
             program,
             cols,
+            validity,
             batch_len,
             Some(live),
             strings,
@@ -4569,11 +4679,13 @@ impl<I: KeyIndex> Vm<I> {
     }
 
     /// [`Vm::execute_batch_delta_live`] for key-index family `I`.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_batch_delta_live_in<S: InternBytes + ?Sized>(
         &mut self,
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: &mut LiveColumns<'_, '_>,
         strings: &S,
@@ -4584,6 +4696,7 @@ impl<I: KeyIndex> Vm<I> {
             state,
             program,
             cols,
+            validity,
             batch_len,
             Some(live),
             strings,
@@ -4661,6 +4774,7 @@ impl<I: KeyIndex> Vm<I> {
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
         strings: &S,
@@ -4672,6 +4786,7 @@ impl<I: KeyIndex> Vm<I> {
             state,
             program,
             cols,
+            validity,
             batch_len,
             live,
             &mut KeyCx::new(strings, &mut scratch),
@@ -4688,6 +4803,7 @@ impl<I: KeyIndex> Vm<I> {
         state: &mut [u8],
         program: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         live: Option<&mut LiveColumns<'_, '_>>,
         cx: &mut KeyCx<'_, I, S>,
@@ -4875,6 +4991,7 @@ impl<I: KeyIndex> Vm<I> {
                     sections.reduce_code,
                     BatchColumns {
                         cols,
+                        validity,
                         len: batch_len,
                     },
                     live.as_deref_mut(),
@@ -4894,6 +5011,7 @@ impl<I: KeyIndex> Vm<I> {
             vm.seal_scratch();
             let batch = BatchColumns {
                 cols,
+                validity,
                 len: batch_len,
             };
             let result = if let Some(table) = temporal {
@@ -5383,6 +5501,7 @@ impl<I: KeyIndex> Vm<I> {
                     state,
                     &code,
                     batch.cols,
+                    batch.validity,
                     row,
                     row,
                     row,
@@ -5438,6 +5557,7 @@ impl<I: KeyIndex> Vm<I> {
     ) -> u32 {
         let BatchColumns {
             cols,
+            validity,
             len: batch_len,
         } = batch;
         // The batch's cuts are its own: a dry run and the run after it each
@@ -5928,6 +6048,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_len
                     ));
                     let cuts = self.removal_cuts.of(operands.slot);
+                    let valid = operands.vals.validity(validity);
                     for i in 0..batch_len {
                         let key = keys[i as usize];
                         if cuts.covers(CutKey::Unary(key), i) {
@@ -5960,6 +6081,7 @@ impl<I: KeyIndex> Vm<I> {
                             operands.vals.fields(),
                             operands.array_fields(),
                             cols,
+                            valid.as_slice(),
                             i,
                             cx,
                         );
@@ -6013,6 +6135,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_len
                     ));
                     let cuts = self.removal_cuts.of(operands.slot);
+                    let valid = operands.vals.validity(validity);
                     for i in 0..batch_len {
                         let index = i as usize;
                         if cuts.covers_pair(keys1[index], keys2[index], i) {
@@ -6030,6 +6153,7 @@ impl<I: KeyIndex> Vm<I> {
                             operands.vals.cols(),
                             operands.vals.fields(),
                             cols,
+                            valid.as_slice(),
                             i,
                             cx,
                         );
@@ -6061,6 +6185,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_len
                     ));
                     let cuts = self.removal_cuts.of(operands.row.slot);
+                    let valid = operands.vals().validity(validity);
                     for i in 0..batch_len {
                         let index = i as usize;
                         if cuts.covers_pair(keys1[index], keys2[index], i) {
@@ -6076,6 +6201,7 @@ impl<I: KeyIndex> Vm<I> {
                             keys1[index],
                             keys2[index],
                             cols,
+                            valid.as_slice(),
                             i,
                             cx,
                         );
@@ -6212,6 +6338,7 @@ impl<I: KeyIndex> Vm<I> {
                         batch_len
                     ));
                     let cuts = self.removal_cuts.of(operands.row.slot);
+                    let valid = operands.row.vals.validity(validity);
                     for i in 0..batch_len {
                         if cuts.covers(CutKey::Unary(keys[i as usize]), i) {
                             continue;
@@ -6227,6 +6354,7 @@ impl<I: KeyIndex> Vm<I> {
                             keys[i as usize],
                             guard_keys[i as usize],
                             cols,
+                            valid.as_slice(),
                             i,
                             cx,
                         );
@@ -6266,6 +6394,7 @@ impl<I: KeyIndex> Vm<I> {
                             body,
                             &mut plan,
                             cols,
+                            validity,
                             batch_len,
                             col_at(cols, col_idx as usize),
                             match_ids,
@@ -6300,6 +6429,7 @@ impl<I: KeyIndex> Vm<I> {
         body: &[u8],
         plan: &mut BodyPlan,
         cols: &[&[u8]],
+        validity: Validity<'_>,
         batch_len: u32,
         type_col: &[u8],
         match_ids: &[u8],
@@ -6347,6 +6477,7 @@ impl<I: KeyIndex> Vm<I> {
                 state,
                 &plan.wide,
                 cols,
+                validity,
                 ei,
                 ei,
                 ei,
@@ -6536,6 +6667,7 @@ impl<I: KeyIndex> Vm<I> {
         state: &mut [u8],
         body: &[u8],
         cols: &[&[u8]],
+        validity: Validity<'_>,
         child_idx: u32,
         parent_idx: u32,
         // The batch row the element belongs to: its log position, which a
@@ -6606,6 +6738,7 @@ impl<I: KeyIndex> Vm<I> {
                             state,
                             inner,
                             cols,
+                            validity,
                             child_idx,
                             parent_idx,
                             row,
@@ -7319,6 +7452,7 @@ impl<I: KeyIndex> Vm<I> {
                             operands.vals.fields(),
                             operands.array_fields(),
                             cols,
+                            operands.vals.validity(validity).as_slice(),
                             child_idx,
                             cx,
                         );
@@ -7382,6 +7516,7 @@ impl<I: KeyIndex> Vm<I> {
                         operands.vals.cols(),
                         operands.vals.fields(),
                         cols,
+                        operands.vals.validity(validity).as_slice(),
                         child_idx,
                         cx,
                     );
@@ -7421,6 +7556,7 @@ impl<I: KeyIndex> Vm<I> {
                         cell_u32(cols, operands.row.key1_col, child_idx),
                         cell_u32(cols, operands.row.key2_col, child_idx),
                         cols,
+                        operands.vals().validity(validity).as_slice(),
                         child_idx,
                         cx,
                     );
@@ -7553,6 +7689,7 @@ impl<I: KeyIndex> Vm<I> {
                         cell_u32(cols, operands.row.key_col, child_idx),
                         cell_u32(cols, operands.guard_key_col, child_idx),
                         cols,
+                        operands.row.vals.validity(validity).as_slice(),
                         child_idx,
                         cx,
                     );
@@ -8012,6 +8149,7 @@ impl<I: KeyIndex> Vm<I> {
                                 &[v_col],
                                 &[dest_field_idx],
                                 cols,
+                                &[validity.column(v_col)],
                                 child_idx,
                             ) {
                                 return error as u32;
@@ -8327,6 +8465,7 @@ impl<I: KeyIndex> Vm<I> {
                     }
                     bpc = r.pos();
                     let (vc, fi) = (vals.cols(), vals.fields());
+                    let valid = vals.validity(validity);
                     if slot >= state_num_slots(state)
                         || SlotMetaView::read(state, slot).slot_type() != SlotType::OrderedList
                     {
@@ -8352,6 +8491,7 @@ impl<I: KeyIndex> Vm<I> {
                         vc,
                         fi,
                         cols,
+                        valid.as_slice(),
                         child_idx,
                     ) {
                         return error as u32;
@@ -8400,6 +8540,10 @@ impl<I: KeyIndex> Vm<I> {
                             state_init::struct_field_offset(num_fields, descriptor, field_idx)
                         };
 
+                        if !valid.as_slice()[vi].holds(child_idx) {
+                            bytes::zero(state, f_offset, struct_field_size(field_type));
+                            continue;
+                        }
                         state[(row_off + u32::from(field_idx) / 8) as usize] |=
                             1 << (field_idx % 8);
 
@@ -8467,6 +8611,7 @@ impl<I: KeyIndex> Vm<I> {
                             state,
                             inner_body,
                             cols,
+                            validity,
                             j,
                             child_idx,
                             row,

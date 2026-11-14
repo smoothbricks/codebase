@@ -94,6 +94,48 @@ pub struct Upsert {
     pub is_new: bool,
 }
 
+/// Each batch column's Arrow validity bitmap, by column index: one bit per
+/// cell, LSB first, bit offset 0: a column's null is a clear validity bit,
+/// which the producer writes and every reader checks. A column the list does
+/// not reach, or whose entry is `None`, has every cell valid, so a batch
+/// without nulls passes [`Validity::ALL_VALID`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Validity<'a>(pub &'a [Option<&'a [u8]>]);
+
+impl<'a> Validity<'a> {
+    /// A batch with no null cell.
+    pub const ALL_VALID: Self = Self(&[]);
+
+    /// Column `col`'s validity. An instruction resolves it once for each
+    /// column it reads, never per cell.
+    pub fn column(self, col: u32) -> ColumnValidity<'a> {
+        ColumnValidity(self.0.get(col as usize).copied().flatten())
+    }
+}
+
+/// One column's validity bitmap, or `None` when every cell is valid, so a
+/// column without nulls costs a writer one branch on `None` per cell.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColumnValidity<'a>(pub Option<&'a [u8]>);
+
+impl ColumnValidity<'_> {
+    /// A column with no null cell.
+    pub const ALL_VALID: Self = Self(None);
+
+    /// Whether the bitmap reaches cell `cell`; a column without one reaches
+    /// every cell.
+    pub fn covers(self, cell: u32) -> bool {
+        self.0.is_none_or(|bits| ((cell / 8) as usize) < bits.len())
+    }
+
+    /// Whether cell `cell` holds a value. The caller has checked
+    /// [`Self::covers`].
+    pub fn holds(self, cell: u32) -> bool {
+        self.0
+            .is_none_or(|bits| bits[(cell / 8) as usize] & (1 << (cell % 8)) != 0)
+    }
+}
+
 fn write_scalar_cell(
     state: &mut [u8],
     f_off: u32,
@@ -410,23 +452,33 @@ impl StructRows {
             .map(Some)
     }
 
-    /// Write one scalar field from a raw little-endian column into the row,
-    /// setting its bitset bit. Array fields are handled by the arena path.
-    /// Unjournaled; the caller owns or has captured the row bytes.
+    /// Write one scalar field from a raw little-endian column into the row.
+    /// Its bitset bit is set only when the source cell is valid in
+    /// `valid`; an invalid cell leaves the bit clear and the field's cell
+    /// zeroed, so the row's bytes are a function of its present values
+    /// and a clear bit is an absent field. Array fields are handled by the arena path.
+    /// Unjournaled; the caller owns or has captured the row bytes and has
+    /// checked that `valid` covers the cell.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],
         pos: u32,
         field_idx: u8,
         cols: &[&[u8]],
+        valid: ColumnValidity<'_>,
         val_col: u32,
         element_idx: u32,
     ) {
         let row = self.row_off(pos);
         let ft = self.field_type(state, field_idx);
         let f_off = row + self.field_offset(state, field_idx);
-        StructMapSlot::set_field_bit(state, row, field_idx);
-        write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
+        if valid.holds(element_idx) {
+            StructMapSlot::set_field_bit(state, row, field_idx);
+            write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
+        } else {
+            bytes::zero(state, f_off, struct_field_size(ft));
+        }
     }
 }
 
@@ -622,19 +674,21 @@ impl<I: KeyIndex> StructMapSlot<I> {
         self.rows().arena_field(state, pos, field_idx)
     }
 
-    /// Write one scalar field and its presence bit without journaling; see
-    /// [`StructRows::write_scalar_field`].
+    /// Write one scalar field and, when its source cell is valid, its
+    /// presence bit without journaling; see [`StructRows::write_scalar_field`].
+    #[allow(clippy::too_many_arguments)]
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],
         pos: u32,
         field_idx: u8,
         cols: &[&[u8]],
+        valid: ColumnValidity<'_>,
         val_col: u32,
         element_idx: u32,
     ) {
         self.rows()
-            .write_scalar_field(state, pos, field_idx, cols, val_col, element_idx);
+            .write_scalar_field(state, pos, field_idx, cols, valid, val_col, element_idx);
     }
 }
 
@@ -942,18 +996,21 @@ impl<I: KeyIndex> StructMap2Slot<I> {
         self.rows().clear_bitset(state, row_off);
     }
 
-    /// Write a scalar field and its presence bit without journaling.
+    /// Write a scalar field and, when its source cell is valid, its presence
+    /// bit without journaling; see [`StructRows::write_scalar_field`].
+    #[allow(clippy::too_many_arguments)]
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],
         pos: u32,
         field_idx: u8,
         cols: &[&[u8]],
+        valid: ColumnValidity<'_>,
         val_col: u32,
         element_idx: u32,
     ) {
         self.rows()
-            .write_scalar_field(state, pos, field_idx, cols, val_col, element_idx);
+            .write_scalar_field(state, pos, field_idx, cols, valid, val_col, element_idx);
     }
 }
 

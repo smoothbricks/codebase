@@ -23,6 +23,7 @@ use columine_vm::key_index::NoStrings;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::removal_cut::SlotCuts;
 use columine_vm::slot_growth::slot_data_size;
+use columine_vm::struct_map::Validity;
 use columine_vm::vm::{UNDO_CAPACITY, UNDO_POSITION_OVERFLOWED, Vm};
 use proptest::prelude::*;
 // The `hashmap_ops::Strategy` ENUM above shadows the prelude's `Strategy`
@@ -2893,9 +2894,25 @@ fn execute_one_map_element(
         columine_vm::vm::f64s_as_bytes(&timestamps),
     ];
     let result = if delta {
-        vm.execute_mutations_delta_in(state, program, &columns, 1, None, &NoStrings)
+        vm.execute_mutations_delta_in(
+            state,
+            program,
+            &columns,
+            Validity::ALL_VALID,
+            1,
+            None,
+            &NoStrings,
+        )
     } else {
-        vm.execute_mutations_in(state, program, &columns, 1, None, &NoStrings)
+        vm.execute_mutations_in(
+            state,
+            program,
+            &columns,
+            Validity::ALL_VALID,
+            1,
+            None,
+            &NoStrings,
+        )
     };
     ErrorCode::from_u32(result).expect("real VM returns a registered status")
 }

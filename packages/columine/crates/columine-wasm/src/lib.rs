@@ -46,6 +46,7 @@ use columine_types::types::{ErrorCode, STATE_HEADER_SIZE};
 use columine_vm::bytes;
 use columine_vm::key_index::NoStrings;
 use columine_vm::state_init::{self, GrowthRoom, SIZING_RECORD_LEN, sizing_record};
+use columine_vm::struct_map::Validity;
 use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap2, Vm};
 
 // =============================================================================
@@ -569,8 +570,15 @@ pub unsafe extern "C" fn vm_execute_mutations(
         Ok(inputs) => inputs,
         Err(error) => return error as u32,
     };
-    rt().vm
-        .execute_mutations_in(state, program, &cols, batch_len, None, &NoStrings)
+    rt().vm.execute_mutations_in(
+        state,
+        program,
+        &cols,
+        Validity::ALL_VALID,
+        batch_len,
+        None,
+        &NoStrings,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -602,8 +610,15 @@ pub unsafe extern "C" fn vm_execute_mutations_delta(
         Ok(inputs) => inputs,
         Err(error) => return error as u32,
     };
-    rt().vm
-        .execute_mutations_delta_in(state, program, &cols, batch_len, None, &NoStrings)
+    rt().vm.execute_mutations_delta_in(
+        state,
+        program,
+        &cols,
+        Validity::ALL_VALID,
+        batch_len,
+        None,
+        &NoStrings,
+    )
 }
 
 #[unsafe(no_mangle)]

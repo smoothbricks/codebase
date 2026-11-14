@@ -27,7 +27,7 @@ use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, compute_struct_row_layout_padded,
     init_state,
 };
-use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
+use columine_vm::struct_map::{ColumnValidity, StructMap2Slot, StructMapSlot};
 use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap, CheckedStructMap2};
 use proptest::prelude::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -192,9 +192,33 @@ fn struct_map_row_byte_image() {
     let cols: Vec<&[u8]> = vec![&u32_col, &bool_col, &f64_col];
 
     smap.clear_bitset(&mut state, smap.row_off(up.pos));
-    smap.write_scalar_field(&mut state, up.pos, 0, &cols, 0, 0);
-    smap.write_scalar_field(&mut state, up.pos, 1, &cols, 1, 0);
-    smap.write_scalar_field(&mut state, up.pos, 2, &cols, 2, 0);
+    smap.write_scalar_field(
+        &mut state,
+        up.pos,
+        0,
+        &cols,
+        ColumnValidity::ALL_VALID,
+        0,
+        0,
+    );
+    smap.write_scalar_field(
+        &mut state,
+        up.pos,
+        1,
+        &cols,
+        ColumnValidity::ALL_VALID,
+        1,
+        0,
+    );
+    smap.write_scalar_field(
+        &mut state,
+        up.pos,
+        2,
+        &cols,
+        ColumnValidity::ALL_VALID,
+        2,
+        0,
+    );
 
     let row = smap.row_off(up.pos) as usize;
     // [bitset=0b111][u32 7 LE][bool 1][f64 2.5 LE][2 pad bytes]
@@ -630,7 +654,7 @@ proptest! {
             }).collect();
             let cols: Vec<&[u8]> = cells.iter().map(Vec::as_slice).collect();
             for f in 0..num_fields {
-                smap.write_scalar_field(&mut state, up.pos, f, &cols, u32::from(f), 0);
+                smap.write_scalar_field(&mut state, up.pos, f, &cols, ColumnValidity::ALL_VALID, u32::from(f), 0);
             }
         }
 
@@ -915,11 +939,11 @@ proptest! {
             let cell = value.to_le_bytes();
             if let Some(up) = struct_result {
                 struct_map.clear_bitset(&mut struct_state, struct_map.row_off(up.pos));
-                struct_map.write_scalar_field(&mut struct_state, up.pos, 0, &[&cell], 0, 0);
+                struct_map.write_scalar_field(&mut struct_state, up.pos, 0, &[&cell], ColumnValidity::ALL_VALID, 0, 0);
             }
             if let Some(up) = struct2_result {
                 struct_map2.clear_bitset(&mut struct2_state, struct_map2.row_off(up.pos));
-                struct_map2.write_scalar_field(&mut struct2_state, up.pos, 0, &[&cell], 0, 0);
+                struct_map2.write_scalar_field(&mut struct2_state, up.pos, 0, &[&cell], ColumnValidity::ALL_VALID, 0, 0);
             }
             if !refused {
                 model.insert(key, value);

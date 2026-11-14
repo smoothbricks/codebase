@@ -29,6 +29,7 @@ use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size, calculate_state_size,
     init_state,
 };
+use columine_vm::struct_map::Validity;
 use columine_vm::vm::{Vm, f64s_as_bytes, u32s_as_bytes};
 use columine_vm::watch_log::{NetAnswer, NetChanges};
 use common::memory::with_allocations;
@@ -689,7 +690,14 @@ fn a_row_image_decodes_after_growth_and_an_interner_release() {
     let rows = batch(&[row(10, 0, 0)]);
     assert_eq!(
         OK,
-        vm.execute_batch_in(&mut state, &remove, &rows.slices(), rows.rows, &strings)
+        vm.execute_batch_in(
+            &mut state,
+            &remove,
+            &rows.slices(),
+            Validity::ALL_VALID,
+            rows.rows,
+            &strings
+        )
     );
     let map = columine_vm::struct_map::StructMapSlot::bind(&state, 0);
     let row_size = map.row_size as usize;
@@ -1405,7 +1413,14 @@ fn a_struct_row_image_with_text_array_and_value_object_round_trips() {
     let rows = batch(&[row(10, 0, 0)]);
     assert_eq!(
         OK,
-        vm.execute_batch_in(&mut state, &remove, &rows.slices(), rows.rows, &strings)
+        vm.execute_batch_in(
+            &mut state,
+            &remove,
+            &rows.slices(),
+            Validity::ALL_VALID,
+            rows.rows,
+            &strings
+        )
     );
     let mut record = Vec::new();
     vm.log_export(&state, 0, 0, &mut record).unwrap();
