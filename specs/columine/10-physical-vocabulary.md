@@ -120,11 +120,14 @@ schema has judged that value, and stores the bytes it writes:
   alone. Which columns are a text's is a creation fact, rows of `(hash column, inline column?)`; nothing reads it from a
   column's name.
 
-`ValueCells::encoding()` names the encoding of the Binary cells, and every Binary field the embedder writes says the
-same name in its `sb.cell` field metadata. A Binary field without `sb.cell` holds raw bytes. A reader learns a cell's
-encoding from the schema and never from its bytes; creation refuses a Binary field whose `sb.cell` names an encoding the
-processor does not write. `prepare(target)` is called once per target at creation, so a schema the embedder cannot serve
-yields no processor.
+<a id="smoo/columine!n/vocab-value-view"></a> A `ValueView` names a value's kind and answers the value through the
+accessor of that kind: `as_str`, `as_number`, `as_canonical_i64`, `as_bytes`, `as_bool`, and the object and array
+visitors. A kind alone proves no value: a view that reports a boolean without answering `as_bool` is refused by a
+`boolean` schema as a type violation, so every boolean an embedder is handed has its value. `ValueCells::encoding()`
+names the encoding of the Binary cells, and every Binary field the embedder writes says the same name in its `sb.cell`
+field metadata. A Binary field without `sb.cell` holds raw bytes. A reader learns a cell's encoding from the schema and
+never from its bytes; creation refuses a Binary field whose `sb.cell` names an encoding the processor does not write.
+`prepare(target)` is called once per target at creation, so a schema the embedder cannot serve yields no processor.
 
 **With no embedder**, columine's native path writes MessagePack into a structured member's column and the carrier
 (`sb.cell` absent or `msgpack`). This is columine's own standalone form, not any embedder's stored form. It has no

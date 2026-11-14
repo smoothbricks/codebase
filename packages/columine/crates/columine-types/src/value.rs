@@ -86,6 +86,13 @@ pub trait ValueView {
         None
     }
 
+    /// The value of a [`ValueKind::Boolean`]. The kind alone names no value:
+    /// an adapter that reports the kind without answering is refused by a
+    /// `boolean` schema as a type violation, never a panic.
+    fn as_bool(&self) -> Option<bool> {
+        None
+    }
+
     fn object_field(&self, _name: &str) -> Option<&dyn ValueView> {
         None
     }

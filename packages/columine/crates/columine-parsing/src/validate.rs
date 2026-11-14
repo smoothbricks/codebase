@@ -124,6 +124,13 @@ impl ValueView for JsonValue {
         }
     }
 
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
@@ -1570,7 +1577,7 @@ fn validate_at<'s, G: AddressGrammar>(
         SemanticSchema::String { max_bytes } => validate_string(*max_bytes, value),
         SemanticSchema::Key { max_encoded_length } => validate_key(*max_encoded_length, value),
         SemanticSchema::AxId => validate_ax_id::<G>(value),
-        SemanticSchema::Boolean => require_kind(value, ValueKind::Boolean),
+        SemanticSchema::Boolean => validate_boolean(value),
         SemanticSchema::Binary => require_kind(value, ValueKind::Binary),
         SemanticSchema::BigInt(bounds) => validate_bigint(*bounds, value),
         SemanticSchema::Number => validate_number(value),
@@ -1792,6 +1799,16 @@ fn validate_range<'s>(range: NumericRange, value: &dyn ValueView) -> Result<(), 
     }
 }
 
+/// A `boolean` value: the kind and the value it names. A view that reports
+/// the kind without answering [`ValueView::as_bool`] proves no value and is
+/// refused as `boolean` refuses any other kind.
+fn validate_boolean<'s>(value: &dyn ValueView) -> Result<(), Stop<'s>> {
+    require_kind(value, ValueKind::Boolean)?;
+    match value.as_bool() {
+        Some(_) => Ok(()),
+        None => Err(Fault::shape(ValueKind::Boolean.as_str(), value).into()),
+    }
+}
 fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), Stop<'s>> {
     if value.kind() == expected {
         Ok(())
@@ -2708,6 +2725,13 @@ impl ValueView for MsgpackValue<'_> {
         }
     }
 
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
@@ -3225,6 +3249,39 @@ mod tests {
         }
     }
 
+    //#region smoo/columine!n/vocab-value-view
+    /// Claims the boolean kind without a value.
+    struct UnansweredBoolean;
+
+    impl ValueView for UnansweredBoolean {
+        fn kind(&self) -> ValueKind {
+            ValueKind::Boolean
+        }
+    }
+
+    #[test]
+    fn every_view_answers_a_booleans_value_and_an_unanswered_one_is_refused() {
+        let boolean = schema(r#"{"kind":"boolean"}"#);
+        for (text, marker, expected) in [("true", 0xc3_u8, true), ("false", 0xc2, false)] {
+            let from_json = json(text);
+            assert_eq!(from_json.kind(), ValueKind::Boolean);
+            assert_eq!(from_json.as_bool(), Some(expected));
+            assert_eq!(validate_value(&boolean, &from_json), Ok(()));
+
+            let input = [marker];
+            let from_msgpack = parse_msgpack_value(&mut Reader::new(&input), 0).unwrap();
+            assert_eq!(from_msgpack.kind(), ValueKind::Boolean);
+            assert_eq!(from_msgpack.as_bool(), Some(expected));
+            assert_eq!(validate_value(&boolean, &from_msgpack), Ok(()));
+        }
+        // No other kind answers a boolean.
+        assert_eq!(json("1").as_bool(), None);
+        assert_eq!(json(r#""true""#).as_bool(), None);
+        assert_eq!(json("null").as_bool(), None);
+        // The kind without the value is a type violation, not a panic.
+        assert!(validate_value(&boolean, &UnansweredBoolean).is_err());
+    }
+    //#endregion smoo/columine!n/vocab-value-view
     #[test]
     fn canonical_int64_is_judged_by_each_schemas_exact_bounds() {
         let accepted: [(&str, &[i64]); 4] = [

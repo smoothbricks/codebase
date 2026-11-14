@@ -49,6 +49,9 @@ fn render(value: &dyn ValueView) -> String {
             Some(NumberValue::Float(number)) => number.to_string(),
             None => "number".to_owned(),
         },
+        ValueKind::Boolean => value
+            .as_bool()
+            .map_or_else(|| "boolean".to_owned(), |flag| flag.to_string()),
         kind => kind.as_str().to_owned(),
     }
 }
@@ -237,6 +240,7 @@ fn native(config: DynamicSchemaConfig) -> Result<EventProcessor, EpInitError> {
 enum Mp<'a> {
     Str(&'a str),
     Int(i64),
+    Bool(bool),
     Bin(&'a [u8]),
     Map(Vec<(&'a str, Mp<'a>)>),
 }
@@ -252,6 +256,7 @@ fn msgpack(out: &mut Vec<u8>, value: &Mp<'_>) {
             out.push(0xd3);
             out.extend(value.to_be_bytes());
         }
+        Mp::Bool(flag) => out.push(if *flag { 0xc3 } else { 0xc2 }),
         Mp::Bin(bytes) => {
             out.push(0xc4);
             out.push(u8::try_from(bytes.len()).unwrap());
@@ -450,6 +455,76 @@ fn an_embedder_written_member_and_carrier_hold_the_embedders_bytes() {
                 // The undeclared key below the open member keeps its payload
                 // path, `.` in a key spelled `%2E`.
                 bytes(r#"meta.extra%2Ekey="x";loose=1"#),
+            ],
+            "{format:?}"
+        );
+    }
+}
+
+/// `type`, a dynamic member's cell, the declared record and the carrier, with
+/// the boolean `ok` routed to the record at field path `[4]`, descriptor 9.
+fn boolean_schema() -> DynamicSchemaConfig {
+    DynamicSchemaConfig {
+        record_members: vec![RecordMember {
+            discriminant: "order".into(),
+            member: "ok".into(),
+            path: vec![4],
+            descriptor_position: 9,
+        }],
+        ..schema(
+            &[
+                utf8("type"),
+                binary("value.meta", Some(ENCODING)),
+                binary("value.$declared", Some(ENCODING)),
+                binary("value.$undeclared", Some(ENCODING)),
+            ],
+            r#"{"order":{"kind":"object","open":true,"fields":{"meta":{"kind":"unknown"},"ok":{"kind":"boolean"}}}}"#,
+        )
+    }
+}
+
+#[test]
+fn a_boolean_reaches_the_embedder_with_its_value_in_every_cell() {
+    let batches = [
+        (
+            InputFormat::Json,
+            br#"[{"type":"order","value":{"meta":{"on":true,"off":false},"ok":true,"loose":false}},{"type":"order","value":{"meta":false,"ok":false,"loose":true}}]"#
+                .to_vec(),
+        ),
+        (
+            InputFormat::Msgpack,
+            orders(vec![
+                Mp::Map(vec![
+                    (
+                        "meta",
+                        Mp::Map(vec![("on", Mp::Bool(true)), ("off", Mp::Bool(false))]),
+                    ),
+                    ("ok", Mp::Bool(true)),
+                    ("loose", Mp::Bool(false)),
+                ]),
+                Mp::Map(vec![
+                    ("meta", Mp::Bool(false)),
+                    ("ok", Mp::Bool(false)),
+                    ("loose", Mp::Bool(true)),
+                ]),
+            ]),
+        ),
+    ];
+    for (format, input) in batches {
+        let mut ep = embedded(boolean_schema()).unwrap();
+        assert_eq!(
+            cells(&mut ep, &input, format, &[1, 2, 3]),
+            [
+                [
+                    bytes("member 1 {on=true,off=false}"),
+                    bytes("[4]@9=true"),
+                    bytes("loose=false"),
+                ],
+                [
+                    bytes("member 1 false"),
+                    bytes("[4]@9=false"),
+                    bytes("loose=true"),
+                ],
             ],
             "{format:?}"
         );
