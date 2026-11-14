@@ -18,6 +18,12 @@ why = "an embedder creates a processor that stores its own encoding in the value
 item = "category_mark"
 consumer = "private"
 why = "the owner of a stream dictionary truncates it to a batch's mark when it drops the batch"
+
+[[package.metadata.wiring.external]]
+item = "columns_and_image"
+consumer = "private"
+why = "an owner judges a row by the name a stream-dictionary cell stands for while it filters the batch's columns"
+
 [dependencies]
 columine-arrow = { path = "../columine-arrow" }
 columine-parsing = { path = "../columine-parsing" }
