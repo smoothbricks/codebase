@@ -67,19 +67,36 @@ function contributor(field: ComposedField, depNames: readonly string[]): string 
 }
 
 function describeConflict(refusal: CompositionRefusal, depNames: readonly string[]): string {
-  const [a, b] = refusal.fields;
   const who = (field: ComposedField) => `field '${field.name}' of ${contributor(field, depNames)}`;
-  if (refusal.code === 'two-types-one-column') {
-    return (
-      `Schema conflict: column '${refusal.column}' would hold two types: ` +
-      `${who(a)} is ${refusal.types[0]}, ${who(b)} is ${refusal.types[1]}. ` +
-      'A shared column needs equal field types; use .prefix() or .mapColumns() to give each its own column.'
-    );
+  switch (refusal.code) {
+    case 'two-types-one-column': {
+      const [a, b] = refusal.fields;
+      return (
+        `Schema conflict: column '${refusal.column}' would hold two types: ` +
+        `${who(a)} is ${refusal.types[0]}, ${who(b)} is ${refusal.types[1]}. ` +
+        'A shared column needs equal field types; use .prefix() or .mapColumns() to give each its own column.'
+      );
+    }
+    case 'unmapped-shared-name': {
+      const [a, b] = refusal.fields;
+      return (
+        `Schema conflict: column '${refusal.column}' is reached by ${who(a)} and ${who(b)}, and not both were mapped there. ` +
+        'Use .prefix() to keep them apart, or .mapColumns() on each dep to share the column.'
+      );
+    }
+    case 'money-without-currency':
+      return (
+        `Schema conflict: money column '${refusal.column}' of ${who(refusal.field)} names currency field ` +
+        `'${refusal.currencyField}', which has no column. Give the currency field a column.`
+      );
+    case 'money-currency-columns-differ': {
+      const [a, b] = refusal.fields;
+      return (
+        `Schema conflict: money column '${refusal.column}' is shared by ${who(a)} and ${who(b)}, whose currency ` +
+        'fields are in different columns. Map their currency fields to one column, or keep the money columns apart.'
+      );
+    }
   }
-  return (
-    `Schema conflict: column '${refusal.column}' is reached by ${who(a)} and ${who(b)}, and not both were mapped there. ` +
-    'Use .prefix() to keep them apart, or .mapColumns() on each dep to share the column.'
-  );
 }
 
 /**

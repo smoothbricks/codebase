@@ -4,7 +4,7 @@
  */
 
 import { intern } from '../arrow/interner.js';
-import { type EnumParams, type Field, isField, type MaskTransform } from './field.js';
+import { type EnumParams, type Field, isField, type MaskTransform, type MoneyParams } from './field.js';
 import type { BinaryEncoder, EnumField, EnumUtf8Precomputed, StorageLane } from './types.js';
 
 /**
@@ -97,4 +97,13 @@ function bytesOf(field: Field, value: unknown): Uint8Array {
 export function getBinaryEncoder(value: unknown): BinaryEncoder | undefined {
   if (!isField(value) || value.kind === 'binary' || value.physical.type !== 'binary') return undefined;
   return { encode: (cell) => bytesOf(value, cell) };
+}
+
+function isMoneyParams(params: unknown): params is MoneyParams {
+  return typeof params === 'object' && params !== null && typeof Reflect.get(params, 'currency') === 'string';
+}
+
+/** Whether a value is a money field, with the currency field it names. */
+export function isMoneyField(value: unknown): value is Field<number | bigint, 'money', MoneyParams> {
+  return isField(value) && value.kind === 'money' && isMoneyParams(value.params);
 }

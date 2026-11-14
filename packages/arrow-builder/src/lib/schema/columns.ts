@@ -15,6 +15,7 @@ import type { SchemaResult } from './core.js';
 import { type Field, isField, typeDigest, typeText } from './field.js';
 import type { PhysicalType } from './physical.js';
 import { checkPublishedFields, type FieldListViolation, type PublishedFields } from './published.js';
+import { isMoneyField } from './typeGuards.js';
 
 /** A library's fields: local name → field. One name, one type, by construction. */
 export type FieldRecord = Readonly<Record<string, Field>>;
@@ -170,6 +171,15 @@ export function defineFields<const L extends string, const F extends FieldRecord
     assertName(`a field name of library '${library}'`, name);
     if (!isField(field)) throw new TypeError(`field '${name}' of library '${library}' is not a field node`);
   }
+  for (const [name, field] of Object.entries(fields)) {
+    if (!isMoneyField(field)) continue;
+    const currency = fields[field.params.currency];
+    if (currency === undefined || currency.kind !== 'currency' || currency.optional) {
+      throw new TypeError(
+        `money field '${name}' of library '${library}' names '${field.params.currency}', which is not a required currency field of the library`,
+      );
+    }
+  }
   return schemaOf(library, Object.freeze({ ...fields }), null);
 }
 
@@ -200,6 +210,8 @@ export interface ComposedColumn {
   readonly typeDigest: string;
   /** The fields this column holds; two or more make it a shared column. */
   readonly fields: readonly ComposedField[];
+  /** The Arrow extension type the column carries in its field metadata; `null` for none. */
+  readonly extension: ArrowExtension | null;
 }
 
 /** The columns of a composition, sorted by name. */
@@ -220,6 +232,19 @@ export type CompositionRefusal =
       readonly code: 'unmapped-shared-name';
       readonly column: string;
       readonly fields: readonly [ComposedField, ComposedField];
+    }
+  /** A money field placed in a column while the currency field it names has none. */
+  | {
+      readonly code: 'money-without-currency';
+      readonly column: string;
+      readonly field: ComposedField;
+      readonly currencyField: string;
+    }
+  /** Two money fields share a column, but their currency fields are in different columns. */
+  | {
+      readonly code: 'money-currency-columns-differ';
+      readonly column: string;
+      readonly fields: readonly [ComposedField, ComposedField];
     };
 
 export interface ComposeOptions {
@@ -235,6 +260,7 @@ interface Placed {
   readonly node: Field;
   readonly text: string;
   readonly named: boolean;
+  readonly extension: ArrowExtension | null;
 }
 
 /**
@@ -259,11 +285,26 @@ export function composeColumns(
     for (const [name, node] of Object.entries(schema.fields)) {
       const column = columns[name];
       if (column === null || column === undefined) continue;
+      let extension: ArrowExtension | null = null;
+      if (isMoneyField(node)) {
+        const currencyColumn = columns[node.params.currency];
+        if (currencyColumn === null || currencyColumn === undefined) {
+          refusals.push({
+            code: 'money-without-currency',
+            column,
+            field: { library: schema.library, name, number: schema.numbers?.[name] ?? null, part },
+            currencyField: node.params.currency,
+          });
+          continue;
+        }
+        extension = { name: MONEY_EXTENSION, metadata: JSON.stringify({ currency: currencyColumn }) };
+      }
       const placed: Placed = {
         field: { library: schema.library, name, number: schema.numbers?.[name] ?? null, part },
         node,
         text: typeText(node),
         named: named === 'all' || named.has(name),
+        extension,
       };
       const held = byColumn.get(column);
       if (held === undefined) {
@@ -278,6 +319,10 @@ export function composeColumns(
           fields: [first.field, placed.field],
           types: [first.text, placed.text],
         });
+        continue;
+      }
+      if (first.extension?.metadata !== placed.extension?.metadata) {
+        refusals.push({ code: 'money-currency-columns-differ', column, fields: [first.field, placed.field] });
         continue;
       }
       const unnamed = placed.named ? held.find((other) => !other.named) : first;
@@ -305,6 +350,7 @@ export function composeColumns(
         typeText: held[0].text,
         typeDigest: typeDigest(held[0].node),
         fields: held.map((placed) => placed.field),
+        extension: held[0].extension,
       }),
     );
   return { ok: true, value: { columns } };
@@ -332,3 +378,23 @@ export function fieldsMetadata(
   }
   return { ok: true, value: JSON.stringify(entries) };
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Arrow extension types
+// ---------------------------------------------------------------------------------------------------------------
+
+/** An Arrow extension type: a name and its metadata, written in the column's Arrow field metadata. */
+export interface ArrowExtension {
+  readonly name: string;
+  readonly metadata: string;
+}
+
+/** The Arrow field metadata keys of an extension type (Arrow columnar format, "Extension Types"). */
+export const ARROW_EXTENSION_NAME_KEY = 'ARROW:extension:name';
+export const ARROW_EXTENSION_METADATA_KEY = 'ARROW:extension:metadata';
+
+/**
+ * The extension type of a money column (specs/money/00-money.md §9): its metadata `{"currency":"<column>"}` names the
+ * column of the currency cells its rows are written under. A standard reader sees the Int64 storage.
+ */
+export const MONEY_EXTENSION = 'smoothbricks.money';

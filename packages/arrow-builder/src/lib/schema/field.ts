@@ -428,3 +428,50 @@ export const fixedBinaryKind = defineFieldKind<Uint8Array, number, 'fixedBinary'
   encode: identity,
   decode: decodeAs(isBytes, 'fixedBinary'),
 });
+
+/** The largest currency cell: its bit 31 is zero (specs/money/00-money.md §8). */
+const CURRENCY_CELL_MAX = 0x7fff_ffff;
+
+/**
+ * A row's currency cell (specs/money/00-money.md §8): a u32 naming a currency and the scale of the row's amount cells
+ * that name this field. `@smoothbricks/money` writes and reads it (`encodeCells`, `decodeCell`).
+ */
+export const currencyKind = defineFieldKind<number, null, 'currency'>({
+  id: 'currency',
+  physical: () => ({ type: 'int', bits: 32, signed: false }),
+  digest: none,
+  validate: (_params, value) =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= CURRENCY_CELL_MAX
+      ? accept(value)
+      : refuse(`currency cell in [0, ${CURRENCY_CELL_MAX}]`, value),
+  encode: identity,
+  decode: decodeAs(isNumber, 'currency'),
+});
+
+/** A money field's declaration: the sibling field that holds its row's currency cell. */
+export interface MoneyParams {
+  readonly currency: string;
+}
+
+const SAFE_CELL = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * An amount cell (specs/money/00-money.md §9): the integer of its row's currency at the scale the currency cell
+ * declares, read as a number while it is a safe integer and as a bigint beyond. The currency field it names is its
+ * declaration, not its type: two money fields share a column only when their currency fields share one.
+ */
+export const moneyKind = defineFieldKind<number | bigint, MoneyParams, 'money'>({
+  id: 'money',
+  physical: () => ({ type: 'int', bits: 64, signed: true }),
+  digest: none,
+  validate: (_params, value) =>
+    (typeof value === 'number' && Number.isSafeInteger(value)) ||
+    (typeof value === 'bigint' && value >= I64_MIN && value <= I64_MAX)
+      ? accept(value)
+      : refuse('integer in the int64 range', value),
+  encode: (_params, value) => BigInt(value),
+  decode: (_params, cell) => {
+    if (typeof cell !== 'bigint') throw new TypeError(`a 'money' cell cannot hold ${observed(cell)}`);
+    return cell <= SAFE_CELL && cell >= -SAFE_CELL ? Number(cell) : cell;
+  },
+});

@@ -16,6 +16,7 @@ import {
   binaryKind,
   booleanKind,
   categoryKind,
+  currencyKind,
   durationKind,
   type EnumParams,
   enumKind,
@@ -27,6 +28,8 @@ import {
   i32Kind,
   i64Kind,
   type MaskTransform,
+  type MoneyParams,
+  moneyKind,
   type OptionalField,
   optional,
   textKind,
@@ -220,6 +223,16 @@ export interface FieldBuilder {
   fixedBinary(width: number): Field<Uint8Array, 'fixedBinary', number>;
 
   /**
+   * A row's currency cell (specs/money/00-money.md §8): the column a money field names. It is never optional.
+   */
+  currency(): Field<number, 'currency', null>;
+  /**
+   * An amount cell of the row's currency, held by the sibling field `currency` (specs/money/00-money.md §9).
+   * `defineFields` refuses a money field whose `currency` is not a required currency field of the same library.
+   */
+  money(currency: string): Field<number | bigint, 'money', MoneyParams>;
+
+  /**
    * A point in time: a count of `unit` since the Unix epoch, UTC. The value is the unit's brand of
    * `@smoothbricks/time`: bigint for `ns` and `us`, number for `ms` and `s`; the cell is an Int64 for every unit.
    */
@@ -262,6 +275,11 @@ export const S: FieldBuilder = {
     if (!Number.isInteger(width) || width <= 0)
       throw new TypeError(`fixedBinary needs a positive integer width, got ${width}`);
     return fixedBinaryKind(width);
+  },
+  currency: () => currencyKind(null),
+  money: (currency) => {
+    if (currency.length === 0) throw new TypeError('money needs the name of its currency field');
+    return moneyKind(Object.freeze({ currency }));
   },
   timestamp: <U extends TimeUnit>(unit: U) => {
     const field = timestampKind(unit);
