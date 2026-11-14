@@ -1146,6 +1146,9 @@ pub struct Vm<I: KeyIndex = HashIndex> {
     /// owns its register, so VMs that run on different threads never read each
     /// other's refusals.
     needs_growth: Option<(u32, GrowthRoom)>,
+    /// The slot whose i64 sum refused the last batch with `SUM_OVERFLOW`, or
+    /// `None` when no sum refused it.
+    sum_overflow: Option<u32>,
     row_code: Vec<u8>,
 }
 
@@ -1182,6 +1185,7 @@ impl<I: KeyIndex> Vm<I> {
             capacity: CapacityScratch::default(),
             scratch_sealed: false,
             needs_growth: None,
+            sum_overflow: None,
             row_code: Vec::new(),
         }
     }
@@ -1221,6 +1225,21 @@ impl<I: KeyIndex> Vm<I> {
     /// map's arena. A host grows the slot for exactly this room.
     pub fn needs_growth_room(&self) -> Option<GrowthRoom> {
         self.needs_growth.map(|(_, room)| room)
+    }
+
+    /// The slot whose i64 sum's running total left `i64` when the last batch
+    /// returned `SUM_OVERFLOW`, or `None` when it did not.
+    pub fn sum_overflow_slot(&self) -> Option<u32> {
+        self.sum_overflow
+    }
+
+    /// Map an aggregate kernel's refusal to its status word, naming the slot
+    /// of an i64 sum that overflowed.
+    fn refuse_aggregate(&mut self, slot: u32, result: ErrorCode) -> u32 {
+        if result == ErrorCode::SumOverflow {
+            self.sum_overflow = Some(slot);
+        }
+        result as u32
     }
 
     /// Record that `slot` refused for capacity. A layer that writes this VM's
@@ -4177,7 +4196,8 @@ fn exec_agg_f64(
     ErrorCode::Ok
 }
 
-/// Execute an aggregate on i64 slots.
+/// Execute an aggregate on i64 slots. A sum whose running total leaves `i64`
+/// refuses with `SumOverflow` before it writes the slot.
 #[allow(clippy::too_many_arguments)]
 fn exec_agg_i64(
     undo: &mut UndoState,
@@ -4187,12 +4207,13 @@ fn exec_agg_i64(
     kind: AggKind,
     vals: &[i64],
     type_mask: Option<TypeMask<'_>>,
-    pred_col: Option<&[u32]>,
     watch: &mut WatchLog,
 ) -> ErrorCode {
     let meta = SlotMetaView::read(state, slot);
     let old_val = bytes::read_i64(state, meta.offset);
-    let new_val = aggregates::reduce_col_i64(kind, vals, old_val, type_mask, pred_col);
+    let Some(new_val) = aggregates::reduce_col_i64(kind, vals, old_val, type_mask) else {
+        return ErrorCode::SumOverflow;
+    };
     if new_val != old_val {
         let prior = watch
             .watches(slot)
@@ -4671,6 +4692,7 @@ impl<I: KeyIndex> Vm<I> {
         cx: &mut KeyCx<'_, I, S>,
     ) -> u32 {
         self.needs_growth = None;
+        self.sum_overflow = None;
         if state.len() < columine_types::types::STATE_HEADER_SIZE as usize
             || bytes::read_u32(state, 0) != I::STATE_MAGIC
             || state[StateHeaderOffset::FORMAT_VERSION as usize] != I::FORMAT_VERSION
@@ -5848,11 +5870,10 @@ impl<I: KeyIndex> Vm<I> {
                         kind,
                         batch_col!(col_i64_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
-                        None,
                         &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        return self.refuse_aggregate(slot, result);
                     }
                 }
 
@@ -6494,11 +6515,10 @@ impl<I: KeyIndex> Vm<I> {
                             data: type_data,
                             id: type_id,
                         }),
-                        None,
                         &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        return self.refuse_aggregate(slot, result);
                     }
                 }
                 _ => return INVALID_PROGRAM,
@@ -6677,11 +6697,10 @@ impl<I: KeyIndex> Vm<I> {
                         kind,
                         &[bytes::read_i64(col_at(cols, col as usize), child_idx * 8)],
                         None,
-                        None,
                         &mut self.rec.watch,
                     );
                     if result != ErrorCode::Ok {
-                        return result as u32;
+                        return self.refuse_aggregate(slot, result);
                     }
                 }
                 Opcode::BatchScalarLatest => {

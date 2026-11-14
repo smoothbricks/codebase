@@ -36,10 +36,10 @@ use columine_types::types::{
 };
 use core::mem::size_of;
 
-/// The `vm_get_needs_growth_slot` ABI value for a VM whose last batch did not
-/// ask for growth ([`crate::vm::Vm::needs_growth_slot`] is `None`): no slot
-/// has this index.
-pub const NO_GROWTH_SLOT: u32 = u32::MAX;
+/// The ABI value of a slot register that names no slot: `vm_get_needs_growth_slot`
+/// when the last batch did not ask for growth, `vm_get_sum_overflow_slot` when
+/// no i64 sum refused it. No slot has this index.
+pub const NO_SLOT: u32 = u32::MAX;
 
 pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
 /// Closed-form capacity of the optional evicted-row side buffer.

@@ -1003,7 +1003,7 @@ pub enum Opcode {
     BatchAggMaxIf = 0x47,
     /// slot:index, val_col:index, cmp_col:index (AggType subtype lives in slot metadata)
     BatchScalarLatest = 0x48,
-    /// slot:index, val_col:index (lossless i64 accumulation)
+    /// slot:index, val_col:index (exact i64 total; refused with `SumOverflow` past i64)
     BatchAggSumI64 = 0x49,
     /// slot:index, val_col:index
     BatchAggMinI64 = 0x4a,
@@ -1230,6 +1230,9 @@ pub enum ErrorCode {
     /// stand as an exact accepted prefix, and the batch may run again only
     /// after the window is rolled back past it.
     OutOfMemory = 15,
+    /// An i64 sum's running total left `i64`. The refusing instruction wrote
+    /// nothing; the VM names its slot (`Vm::sum_overflow_slot`).
+    SumOverflow = 16,
 }
 
 impl ErrorCode {
@@ -1253,6 +1256,7 @@ impl ErrorCode {
             13 => Self::DeltaLaneMismatch,
             14 => Self::SpeculationActive,
             15 => Self::OutOfMemory,
+            16 => Self::SumOverflow,
             _ => return None,
         })
     }

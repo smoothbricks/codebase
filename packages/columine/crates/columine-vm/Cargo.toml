@@ -157,3 +157,9 @@ harness = false
 [[bench]]
 name = "map_upsert_scale"
 harness = false
+
+# An i64 sum through the VM's execute entry, top level and under FOR_EACH.
+# Run: `cargo bench -p columine-vm --bench aggregates`
+[[bench]]
+name = "aggregates"
+harness = false

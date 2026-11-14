@@ -88,6 +88,13 @@ against the last entry targeting each column (the one spliced), and no bind is r
 when some operand reads it plainly, the type column refuses when it is live, and a table that does not parse refuses the
 plan. A u32 entry is read exactly as before.
 
+**An i64 sum is exact or refused.** <a id="smoo/columine!n/wide-i64-sum-refuses"></a> `BATCH_AGG_SUM_I64` adds the rows
+it takes to the slot's total in row order, and the first row whose running total leaves `i64` refuses the batch with
+`SUM_OVERFLOW`: the refusing instruction writes nothing, so the slot keeps the total it found, and the VM names the slot
+(`Vm::sum_overflow_slot`, on the wasm ABI `vm_get_sum_overflow_slot`, to a TypeScript host `sumOverflowSlot`). The host
+rolls the batch back as it does every refused batch. A wrapped total is never stored. Because the total runs in row
+order, the same rows refuse however the host cuts them into batches.
+
 ## 5. Live entries
 
 The live-column handle answers u32 predicate cells to the `*_IF` family and to the stored-row sweep. A predicate is a
@@ -108,3 +115,8 @@ the zero placeholder like any live column.
   predicate reading a wide column, a wide type column and an unknown lane byte, each leaving every column as the host
   passed it;
 - a warmed wide bind that allocates nothing.
+- <a id="smoo/columine!n/wide-i64-sum-refuses"></a> in `columine-vm/tests/aggregates.rs`, an i64 sum of `[i64::MAX, 1]`
+  and of `[i64::MIN, -1]` refused naming its slot, at the top level, under a `FOR_EACH` type mask and row at a time
+  under a temporal table, element, folded as one batch and as one batch per row, the slot keeping its total; an in-range
+  sum unchanged; and for any rows and any cut, a sum equal to the exact total exactly when no running total leaves
+  `i64`.

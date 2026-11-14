@@ -328,6 +328,8 @@ export enum ErrorCode {
    * after the window is rolled back past it.
    */
   OUT_OF_MEMORY = 15,
+  /** An i64 sum's running total left i64; the refusing instruction wrote nothing. `sumOverflowSlot` names the slot. */
+  SUM_OVERFLOW = 16,
 }
 
 /** The undo position `undoCheckpoint` answers while the window is overflowed: no rollback can restore it. */
@@ -578,6 +580,12 @@ export interface ColumineBackend {
    * the complete window under newly enabled undo.
    */
   growState(state: StateHandle, program: ReducerProgram): number;
+
+  /**
+   * The slot whose i64 sum refused the last batch with SUM_OVERFLOW, or
+   * undefined when no sum refused it.
+   */
+  sumOverflowSlot(program: ReducerProgram): number | undefined;
 
   // ===========================================================================
   // Execution

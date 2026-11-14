@@ -4,13 +4,18 @@
 //! Approximate assertions use a 0.001 tolerance. Probe tests assert exact bit
 //! patterns because lane order and NaN/tie behavior are part of the FP profile.
 
-use columine_types::types::AggType;
+use columine_types::PROGRAM_MAGIC;
+use columine_types::types::{AggType, ErrorCode, Opcode};
 use columine_vm::aggregates::{
     AggKind, TypeMask, agg_count, agg_set_count, agg_set_value_f64, agg_set_value_i64,
     agg_slot_byte_size, agg_value_f64, agg_value_i64, batch_agg_max, batch_agg_min, batch_agg_sum,
     init_agg_slot, masked_agg_count, masked_agg_max, masked_agg_min, masked_agg_sum,
     reduce_col_f64, reduce_col_i64,
 };
+use columine_vm::meta::SlotMetaView;
+use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::temporal::TEMPORAL_MAGIC;
+use columine_vm::vm::{Vm, i64s_as_bytes, u32s_as_bytes};
 use proptest::prelude::*;
 
 fn approx(a: f64, b: f64) {
@@ -58,7 +63,7 @@ fn masked_agg_count_simd() {
 fn reduce_col_i64_sum_simd() {
     //
     let data = [100i64, 200, 300, 400, 500];
-    assert_eq!(reduce_col_i64(AggKind::Sum, &data, 0, None, None), 1500);
+    assert_eq!(reduce_col_i64(AggKind::Sum, &data, 0, None), Some(1500));
 }
 
 #[test]
@@ -210,8 +215,8 @@ fn reduce_col_i64_sum_parametric() {
         let n_i64 = n as i64;
         let expected = n_i64 * (n_i64 + 1) / 2;
         assert_eq!(
-            reduce_col_i64(AggKind::Sum, &vals[..n], 0, None, None),
-            expected
+            reduce_col_i64(AggKind::Sum, &vals[..n], 0, None),
+            Some(expected)
         );
     }
 }
@@ -320,16 +325,6 @@ proptest! {
         prop_assert_eq!(kernel.to_bits(), acc.to_bits());
     }
 
-    /// i64 sum: batch (2-lane wrapping) vs naive sequential wrapping fold —
-    /// exact equivalence for all inputs, wrapping arithmetic is associative.
-    #[test]
-    fn i64_sum_batch_vs_sequential(vals in prop::collection::vec(any::<i64>(), 0..64), current in any::<i64>()) {
-        let batch = reduce_col_i64(AggKind::Sum, &vals, current, None, None);
-        let mut acc = current;
-        for &v in &vals { acc = acc.wrapping_add(v); }
-        prop_assert_eq!(batch, acc);
-    }
-
     /// Masked sum == unmasked sum over the filtered-and-REPACKED rows is NOT
     /// an identity (lane assignment differs); the honest property is against
     /// the masked reference model.
@@ -397,3 +392,194 @@ fn init_sentinels_are_kernel_identities() {
     );
     approx(got, 1.0 + 4.0 + 5.0);
 }
+
+//#region smoo/columine!n/wide-i64-sum-refuses
+// An i64 sum through the VM's execute entry: the three places a
+// `BATCH_AGG_SUM_I64` runs (the top level, a `FOR_EACH` type mask, a
+// row at a time under a temporal table), each cut into batches the way a host
+// cuts them.
+
+/// Columns: 0 type, 1 value, 2 the temporal table's clock.
+const TYPE_COL: u8 = 0;
+const VAL_COL: u8 = 1;
+const CLOCK_COL: u8 = 2;
+const ORDER_TYPE: u32 = 7;
+const OK: u32 = ErrorCode::Ok as u32;
+const SUM_OVERFLOW: u32 = ErrorCode::SumOverflow as u32;
+
+#[derive(Clone, Copy, Debug)]
+enum SumSite {
+    TopLevel,
+    ForEach,
+    RowAtATime,
+}
+
+const SITES: [SumSite; 3] = [SumSite::TopLevel, SumSite::ForEach, SumSite::RowAtATime];
+
+fn for_each(body: &[u8]) -> Vec<u8> {
+    let mut reduce = vec![Opcode::ForEach as u8, TYPE_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend(u16::try_from(body.len()).expect("small body").to_le_bytes());
+    reduce.extend_from_slice(body);
+    reduce.push(0);
+    reduce
+}
+
+/// Slot 0 is an i64 sum of the value column, run at `site`.
+fn sum_program(site: SumSite) -> Vec<u8> {
+    let init = [0x10, 0, 2, AggType::SumI64 as u8, 0, 0];
+    let sum = [Opcode::BatchAggSumI64 as u8, 0, VAL_COL];
+    let reduce = match site {
+        SumSite::TopLevel | SumSite::RowAtATime => [&sum[..], &[0]].concat(),
+        SumSite::ForEach => for_each(&sum),
+    };
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([2, 0, 0, 0]); // version 2, no callbacks, no flags
+    prog.extend(1u32.to_le_bytes());
+    prog.extend(3u32.to_le_bytes());
+    prog.extend(u32::try_from(init.len()).expect("small init").to_le_bytes());
+    prog.extend(
+        u32::try_from(reduce.len())
+            .expect("small reduce")
+            .to_le_bytes(),
+    );
+    prog.extend(init);
+    prog.extend(reduce);
+    if let SumSite::RowAtATime = site {
+        // A temporal table of no expiries: the reduce section runs one row at a time.
+        prog.extend(TEMPORAL_MAGIC.to_le_bytes());
+        prog.extend(8u32.to_le_bytes());
+        prog.extend(u32::from(CLOCK_COL).to_le_bytes());
+        prog.extend(0u32.to_le_bytes());
+    }
+    prog
+}
+
+/// The host's view of a sum: each batch of `cut` sizes runs under an undo
+/// checkpoint, and a refused batch is rolled back, as the wasm host does.
+/// Answers the first refusal (its status and the slot the VM named), and the
+/// slot's total after it.
+struct Folded {
+    refusal: Option<(u32, Option<u32>)>,
+    total: i64,
+}
+
+fn host_fold(site: SumSite, vals: &[i64], cut: usize) -> Folded {
+    let prog = sum_program(site);
+    let size = calculate_state_size(&prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+        .expect("valid program admission");
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    vm.undo_enable(&state).expect("undo window");
+    let offset = SlotMetaView::read(&state, 0).offset;
+    let mut refusal = None;
+    for batch in vals.chunks(cut.max(1)) {
+        // A `FOR_EACH` batch interleaves a row of another type holding
+        // `i64::MAX`: the mask must keep it out of the sum.
+        let (types, values): (Vec<u32>, Vec<i64>) = match site {
+            SumSite::ForEach => batch
+                .iter()
+                .flat_map(|&v| [(ORDER_TYPE, v), (ORDER_TYPE + 1, i64::MAX)])
+                .unzip(),
+            SumSite::TopLevel | SumSite::RowAtATime => {
+                (vec![ORDER_TYPE; batch.len()], batch.to_vec())
+            }
+        };
+        let rows = u32::try_from(types.len()).expect("small batch");
+        let clocks: Vec<i64> = (0..i64::from(rows)).collect();
+        let cols: [&[u8]; 3] = [
+            u32s_as_bytes(&types),
+            i64s_as_bytes(&values),
+            i64s_as_bytes(&clocks),
+        ];
+        let checkpoint = vm.undo_checkpoint();
+        let status = vm.execute_batch(&mut state, &prog, &cols, rows);
+        if status != OK {
+            vm.undo_rollback(&mut state, checkpoint).expect("rollback");
+            refusal = Some((status, vm.sum_overflow_slot()));
+            break;
+        }
+    }
+    Folded {
+        refusal,
+        total: agg_value_i64(&state, offset),
+    }
+}
+
+#[test]
+fn an_overflowing_i64_sum_is_refused() {
+    for site in SITES {
+        for (rows, kept) in [([i64::MAX, 1], i64::MAX), ([i64::MIN, -1], i64::MIN)] {
+            let one_batch = host_fold(site, &rows, 2);
+            assert_eq!(
+                one_batch.refusal,
+                Some((SUM_OVERFLOW, Some(0))),
+                "{site:?} {rows:?} as one batch"
+            );
+            assert_eq!(one_batch.total, 0, "{site:?} {rows:?} as one batch");
+            let per_row = host_fold(site, &rows, 1);
+            assert_eq!(
+                per_row.refusal,
+                Some((SUM_OVERFLOW, Some(0))),
+                "{site:?} {rows:?} per row"
+            );
+            assert_eq!(per_row.total, kept, "{site:?} {rows:?} per row");
+        }
+    }
+}
+
+#[test]
+fn an_in_range_i64_sum_is_exact() {
+    for site in SITES {
+        for cut in [1, 3] {
+            let folded = host_fold(site, &[i64::MAX - 1, 1, -5, 5], cut);
+            assert_eq!(folded.refusal, None, "{site:?} cut {cut}");
+            assert_eq!(folded.total, i64::MAX, "{site:?} cut {cut}");
+        }
+    }
+}
+
+/// Any rows and any cut: the sum is the exact total when no running total
+/// leaves `i64`, and otherwise the batch holding the first row that leaves
+/// it is refused, the slot keeping the total of the batches before it.
+fn i64_row() -> impl Strategy<Value = i64> {
+    prop_oneof![
+        any::<i64>(),
+        -1_000i64..1_000,
+        Just(i64::MAX),
+        Just(i64::MIN),
+        (i64::MAX - 8)..=i64::MAX,
+        i64::MIN..=(i64::MIN + 8),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn an_i64_sum_is_exact_or_refused_under_any_cut(
+        vals in prop::collection::vec(i64_row(), 0..12),
+        cut in 1usize..6,
+    ) {
+        let mut total = 0i128;
+        let mut first_out = None;
+        for (row, &v) in vals.iter().enumerate() {
+            total += i128::from(v);
+            if i64::try_from(total).is_err() {
+                first_out = Some(row);
+                break;
+            }
+        }
+        let kept: i128 = match first_out {
+            Some(row) => vals[..row - row % cut].iter().copied().map(i128::from).sum(),
+            None => total,
+        };
+        for site in SITES {
+            let folded = host_fold(site, &vals, cut);
+            let refusal = first_out.map(|_| (SUM_OVERFLOW, Some(0)));
+            prop_assert_eq!(folded.refusal, refusal, "{:?}", site);
+            prop_assert_eq!(i128::from(folded.total), kept, "{:?}", site);
+        }
+    }
+}
+//#endregion smoo/columine!n/wide-i64-sum-refuses

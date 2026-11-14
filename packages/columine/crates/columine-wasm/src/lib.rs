@@ -362,23 +362,28 @@ pub unsafe extern "C" fn vm_validate_state(state_ptr: *const u8, state_len: u32)
 }
 
 /// The slot that asked for growth when the runtime VM's last batch returned
-/// `NEEDS_GROWTH`, or `NO_GROWTH_SLOT`.
+/// `NEEDS_GROWTH`, or `NO_SLOT`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_get_needs_growth_slot() -> u32 {
-    rt().vm
-        .needs_growth_slot()
-        .unwrap_or(state_init::NO_GROWTH_SLOT)
+    rt().vm.needs_growth_slot().unwrap_or(state_init::NO_SLOT)
 }
 
 /// The room the slot that asked for growth lacked, as `GrowthRoom::abi`
-/// words (0 its rows, 1 a struct map's arena), or `NO_GROWTH_SLOT` when the
+/// words (0 its rows, 1 a struct map's arena), or `NO_SLOT` when the
 /// runtime VM's last batch asked for none. The host passes it to sizing and
 /// growth.
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_get_needs_growth_room() -> u32 {
     rt().vm
         .needs_growth_room()
-        .map_or(state_init::NO_GROWTH_SLOT, GrowthRoom::abi)
+        .map_or(state_init::NO_SLOT, GrowthRoom::abi)
+}
+
+/// The slot whose i64 sum's running total left `i64` when the runtime VM's
+/// last batch returned `SUM_OVERFLOW`, or `NO_SLOT`.
+#[unsafe(no_mangle)]
+pub extern "C" fn vm_get_sum_overflow_slot() -> u32 {
+    rt().vm.sum_overflow_slot().unwrap_or(state_init::NO_SLOT)
 }
 
 #[unsafe(no_mangle)]

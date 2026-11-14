@@ -409,61 +409,66 @@ pub fn reduce_col_f64(
     acc
 }
 
-/// Reduce an i64 column. Sum uses wrapping adds; min/max use the scalar path
-/// because their operation is not lane-vectorized here.
+/// Reduce an i64 column, or `None` when a sum's running total leaves `i64`
+/// (specs/columine/07-wide-row-cells.md, "An i64 sum is exact or refused").
 pub fn reduce_col_i64(
     kind: AggKind,
     vals: &[i64],
     current: i64,
     type_mask: Option<TypeMask<'_>>,
-    pred_col: Option<&[u32]>,
-) -> i64 {
-    if kind == AggKind::Sum && pred_col.is_none() {
-        let mut lanes = [0i64; 2];
-        let mut i = 0;
-        while i + 2 <= vals.len() {
-            for (k, lane) in lanes.iter_mut().enumerate() {
-                let include = match type_mask {
-                    Some(m) => m.data[i + k] == m.id,
-                    None => true,
-                };
-                if include {
-                    *lane = lane.wrapping_add(vals[i + k]);
-                }
+) -> Option<i64> {
+    let fold = |pick: fn(i64, i64) -> i64| {
+        let mut acc = current;
+        for (i, &v) in vals.iter().enumerate() {
+            if type_mask.is_none_or(|m| m.data[i] == m.id) {
+                acc = pick(acc, v);
             }
-            i += 2;
         }
-        let mut acc = current.wrapping_add(lanes[0].wrapping_add(lanes[1]));
-        while i < vals.len() {
-            let include = match type_mask {
-                Some(m) => m.data[i] == m.id,
-                None => true,
-            };
-            if include {
-                acc = acc.wrapping_add(vals[i]);
-            }
-            i += 1;
-        }
-        return acc;
+        acc
+    };
+    match kind {
+        AggKind::Sum => sum_col_i64(vals, current, type_mask),
+        AggKind::Min => Some(fold(i64::min)),
+        AggKind::Max => Some(fold(i64::max)),
     }
+}
 
+/// The exact i64 sum of the rows `type_mask` takes, added to `current` in row
+/// order, or `None` at the first row whose running total leaves `i64`.
+///
+/// One vectorizable pass folds the wrapping total and the OR of every taken
+/// row's magnitude (`|v|` as a `u64`), so every row's magnitude is below
+/// `2^k`, `k` the OR's bit length,
+/// and every running total lies within `n · 2^k` of `current`. When that
+/// interval fits `i64`, no running total left it and the wrapping total is
+/// the exact one. Otherwise a second, ordered pass with checked adds finds
+/// whether one did, so a refusal never depends on how the rows were cut.
+fn sum_col_i64(vals: &[i64], current: i64, type_mask: Option<TypeMask<'_>>) -> Option<i64> {
+    let (mut total, mut bits) = (0i64, 0u64);
+    let mut take = |v: i64| {
+        total = total.wrapping_add(v);
+        bits |= v.unsigned_abs();
+    };
+    match type_mask {
+        None => vals.iter().for_each(|&v| take(v)),
+        Some(m) => vals
+            .iter()
+            .zip(m.data)
+            .for_each(|(&v, &id)| take(if id == m.id { v } else { 0 })),
+    }
+    let rows = i128::try_from(vals.len()).unwrap_or(i128::MAX);
+    let reach = rows.saturating_mul(1i128 << (64 - bits.leading_zeros()));
+    let base = i128::from(current);
+    if base.saturating_sub(reach) >= i128::from(i64::MIN)
+        && base.saturating_add(reach) <= i128::from(i64::MAX)
+    {
+        return Some(current.wrapping_add(total));
+    }
     let mut acc = current;
     for (i, &v) in vals.iter().enumerate() {
-        if let Some(m) = type_mask
-            && m.data[i] != m.id
-        {
-            continue;
-        }
-        if let Some(p) = pred_col
-            && p[i] == 0
-        {
-            continue;
-        }
-        match kind {
-            AggKind::Sum => acc = acc.wrapping_add(v),
-            AggKind::Min => acc = acc.min(v),
-            AggKind::Max => acc = acc.max(v),
+        if type_mask.is_none_or(|m| m.data[i] == m.id) {
+            acc = acc.checked_add(v)?;
         }
     }
-    acc
+    Some(acc)
 }

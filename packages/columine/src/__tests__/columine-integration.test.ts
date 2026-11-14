@@ -54,6 +54,7 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
     createState: () => ({ _brand: 'ColumineStateHandle' }),
     resetState: () => {},
     growState: () => ErrorCode.OK,
+    sumOverflowSlot: () => undefined,
     executeBatch: () => ErrorCode.OK,
     executeBatchDelta: () => ErrorCode.OK,
     executeMutations: () => ErrorCode.OK,

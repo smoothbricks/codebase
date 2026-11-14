@@ -115,6 +115,8 @@ interface VmExports {
   vm_reset_state(statePtr: number, programPtr: number, programLen: number): number;
   vm_validate_state(statePtr: number, stateLen: number): number;
   vm_get_needs_growth_slot(): number;
+  /** The slot whose i64 sum refused the last batch, or a value past every slot. */
+  vm_get_sum_overflow_slot(): number;
   /** The room the slot lacked: 0 its rows, 1 a struct map's arena. */
   vm_get_needs_growth_room(): number;
   vm_calculate_grown_state_size(
@@ -254,6 +256,7 @@ const VM_EXPORT_NAMES = [
   'vm_validate_state',
   'vm_get_needs_growth_slot',
   'vm_get_needs_growth_room',
+  'vm_get_sum_overflow_slot',
   'vm_calculate_grown_state_size',
   'vm_grow_state',
   'vm_execute_batch',
@@ -373,6 +376,8 @@ function vmErrorCode(status: number): ErrorCode {
       return ErrorCode.SPECULATION_ACTIVE;
     case ErrorCode.OUT_OF_MEMORY:
       return ErrorCode.OUT_OF_MEMORY;
+    case ErrorCode.SUM_OVERFLOW:
+      return ErrorCode.SUM_OVERFLOW;
     default:
       throw new Error(
         `WASM VM returned unknown status ${status}: the TypeScript ErrorCode enum is out of sync ` +
@@ -693,6 +698,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
   const backend: ColumineBackend = {
     growState(stateHandle, program) {
       return growFromAuthority(assertWasmStateHandle(stateHandle), program);
+    },
+
+    sumOverflowSlot(program) {
+      const slot = wasmInstance.exports.vm_get_sum_overflow_slot() >>> 0;
+      return slot < program.numSlots ? slot : undefined;
     },
 
     backend: 'wasm',
