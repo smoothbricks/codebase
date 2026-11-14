@@ -24,6 +24,27 @@ pub enum LockMode {
     Try,
 }
 
+/// What taking image locks that must already exist found ([`acquire_existing_image_locks`]).
+#[derive(Debug)]
+pub enum ExistingLocks<G = ImageLockGuard> {
+    /// Every lock, granted and recorded.
+    Held(G),
+    /// A lock another holds, asked for under [`LockMode::Try`].
+    Busy,
+    /// The lock at this path is gone, or went while it was waited for: a retirement or an
+    /// unbinding removed it with what it guarded, and nothing was created in its place.
+    Absent(PathBuf),
+}
+
+/// Whether taking a lock may create its file and directories.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Opening {
+    /// The lock of an operation that may bring what it guards into existence.
+    CreateMissing,
+    /// The lock of a pass that only serves what exists; it never recreates what went.
+    ExistingOnly,
+}
+
 /// Why a store lock could not be taken. A busy lock under [`LockMode::Try`] is not an error.
 #[derive(Debug)]
 pub enum StoreLockError {
@@ -266,14 +287,55 @@ fn open_or_create_lock_at(
         })
 }
 
-/// The lock file at `path` below `root`, created with its directories if it does not exist yet.
-fn open_lock_file(root: &Path, path: &Path) -> Result<File, StoreLockError> {
-    match walk_to_parent(root, path, Directories::Create)? {
-        Some((directory, name)) => open_or_create_lock_at(&directory, &name, path),
-        None => Err(StoreLockError::InvalidPath(
-            "a lock directory vanished while it was created",
-        )),
+/// The lock file at `path` below `root`: created with its directories if it does not exist yet
+/// under [`Opening::CreateMissing`], and `None` under [`Opening::ExistingOnly`] when it or a
+/// directory above it is gone.
+fn open_lock_file(
+    root: &Path,
+    path: &Path,
+    opening: Opening,
+) -> Result<Option<File>, StoreLockError> {
+    let directories = match opening {
+        Opening::CreateMissing => Directories::Create,
+        Opening::ExistingOnly => Directories::Existing,
+    };
+    let Some((directory, name)) = walk_to_parent(root, path, directories)? else {
+        return match opening {
+            Opening::CreateMissing => Err(StoreLockError::InvalidPath(
+                "a lock directory vanished while it was created",
+            )),
+            Opening::ExistingOnly => Ok(None),
+        };
+    };
+    match opening {
+        Opening::CreateMissing => open_or_create_lock_at(&directory, &name, path).map(Some),
+        Opening::ExistingOnly => open_existing_lock_at(&directory, &name, path),
     }
+}
+
+/// The lock file `name` in `directory` if it exists; never created.
+fn open_existing_lock_at(
+    directory: &File,
+    name: &CString,
+    path: &Path,
+) -> Result<Option<File>, StoreLockError> {
+    // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that outlives the
+    // call. The flags include `O_NOFOLLOW | O_CLOEXEC` and no `O_CREAT`.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), LOCK_FILE_OPEN_FLAGS) };
+    if fd_failed(fd) {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(io_error(
+            "open lifecycle lock without following symlinks",
+            path,
+            error,
+        ));
+    }
+    // SAFETY: `fd` is a live descriptor we exclusively own from a successful `openat`; `File`
+    // takes ownership and will close it.
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
 }
 
 /// A file's device and inode as the kernel's `stat` gives them.
@@ -445,13 +507,44 @@ fn walk_to_parent(
 /// and its path proven to still name the inode locked. A lock another holds answers busy under
 /// [`LockMode::Try`] (releasing, and emptying the record of, every lock already taken) and is
 /// waited for under [`LockMode::Wait`], said as a span. A lock whose path names another inode
-/// once granted is refused ([`StoreLockError::Replaced`]) and released unrecorded.
+/// once granted is refused ([`StoreLockError::Replaced`]) and released unrecorded. A missing
+/// lock file is created, with its directories.
 pub fn acquire_image_locks(
     root: &Path,
     paths: &[PathBuf],
     mode: LockMode,
     taker: &dyn Taker,
 ) -> Result<Option<ImageLockGuard>, StoreLockError> {
+    match acquire(root, paths, mode, taker, Opening::CreateMissing)? {
+        ExistingLocks::Held(guard) => Ok(Some(guard)),
+        ExistingLocks::Busy => Ok(None),
+        ExistingLocks::Absent(_) => Err(StoreLockError::InvalidPath(
+            "a created lock was gone once granted",
+        )),
+    }
+}
+
+/// [`acquire_image_locks`] for a pass that only serves what exists, a heal or a remount, which
+/// must never bring back a lock that a retirement or an unbinding removed with what it guarded:
+/// created by such a pass, the file (and the project directory above it) outlived the project as
+/// residue no verb reaches. A lock that is gone, or that goes while it is waited for, answers
+/// [`ExistingLocks::Absent`]; nothing is created.
+pub fn acquire_existing_image_locks(
+    root: &Path,
+    paths: &[PathBuf],
+    mode: LockMode,
+    taker: &dyn Taker,
+) -> Result<ExistingLocks, StoreLockError> {
+    acquire(root, paths, mode, taker, Opening::ExistingOnly)
+}
+
+fn acquire(
+    root: &Path,
+    paths: &[PathBuf],
+    mode: LockMode,
+    taker: &dyn Taker,
+    opening: Opening,
+) -> Result<ExistingLocks, StoreLockError> {
     let mut paths = paths.to_vec();
     paths.sort();
     paths.dedup();
@@ -459,17 +552,29 @@ pub fn acquire_image_locks(
         held: Vec::with_capacity(paths.len()),
     };
     for path in paths {
-        let file = cowshed_os::fork_lock::Fenced::new(open_lock_file(root, &path)?);
+        let Some(file) = open_lock_file(root, &path, opening)? else {
+            return Ok(ExistingLocks::Absent(path));
+        };
+        let file = cowshed_os::fork_lock::Fenced::new(file);
         match flock(&file, TRY_LOCK_OPERATION) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => match mode {
-                LockMode::Try => return Ok(None),
+                LockMode::Try => return Ok(ExistingLocks::Busy),
                 LockMode::Wait => wait_for(&file, &path, taker)
                     .map_err(|error| io_error("acquire lifecycle lock", &path, error))?,
             },
             Err(error) => return Err(io_error("acquire lifecycle lock", &path, error)),
         }
-        require_named(root, &path, &file)?;
+        match require_named(root, &path, &file) {
+            Ok(()) => {}
+            // Removed while it was waited for, by the holder that retired what it guarded.
+            Err(StoreLockError::Replaced { named: None, .. })
+                if opening == Opening::ExistingOnly =>
+            {
+                return Ok(ExistingLocks::Absent(path));
+            }
+            Err(error) => return Err(error),
+        }
         // The guard owns the lock before a failed record is returned, so dropping it empties
         // whatever part of the record was written.
         let failed = taker
@@ -481,7 +586,7 @@ pub fn acquire_image_locks(
             return Err(error);
         }
     }
-    Ok(Some(guard))
+    Ok(ExistingLocks::Held(guard))
 }
 
 /// Refuse `candidate` unless it is a plain descendant of the lexically canonical `root` and no
@@ -578,5 +683,95 @@ mod tests {
         ] {
             assert_eq!(should_retry_lock(kind), retry);
         }
+    }
+
+    /// A taker that records nothing and says when its wait begins: `holders` is asked exactly
+    /// once, just before the waiting `flock`.
+    struct WaitSignal(std::sync::mpsc::Sender<()>);
+
+    impl Taker for WaitSignal {
+        fn record(&self, _: &File) -> io::Result<()> {
+            Ok(())
+        }
+        fn holders(&self, _: &Path) -> String {
+            self.0.send(()).expect("the test listens");
+            "the test's holder".to_owned()
+        }
+    }
+
+    fn scratch_store(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-store-lock-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("scratch store");
+        root.canonicalize().expect("canonical scratch store")
+    }
+
+    /// A pass that serves only what exists never brings back a lock an unbinding removed, nor
+    /// the project directory it sat in: such a file outlived its project as residue no verb
+    /// reaches (a scratch project's disposal refused on one, 2026-11-14).
+    #[test]
+    fn a_gone_lock_is_absent_and_nothing_is_created() {
+        let store = scratch_store("absent");
+        let (signal, _) = std::sync::mpsc::channel();
+        let project = store.join("acme/widget");
+        let lock = project.join("main.dmg.lock");
+        for mode in [LockMode::Try, LockMode::Wait] {
+            let taken = acquire_existing_image_locks(
+                &store,
+                std::slice::from_ref(&lock),
+                mode,
+                &WaitSignal(signal.clone()),
+            )
+            .expect("a gone project's lock answers");
+            assert!(matches!(taken, ExistingLocks::Absent(ref path) if *path == lock));
+            assert!(!store.join("acme").exists(), "no directory was created");
+        }
+        std::fs::create_dir_all(&project).expect("a project that still holds its policy");
+        let taken = acquire_existing_image_locks(
+            &store,
+            std::slice::from_ref(&lock),
+            LockMode::Try,
+            &WaitSignal(signal),
+        )
+        .expect("a gone lock answers");
+        assert!(matches!(taken, ExistingLocks::Absent(_)));
+        assert!(!lock.exists(), "no lock file was created");
+        std::fs::remove_dir_all(&store).expect("remove the scratch store");
+    }
+
+    /// The race the gateway's remount loses to `unadopt`: it waits for main's lock while the
+    /// unbinding holds it, and the holder removes the file before it lets go. The waiter is
+    /// granted a lock on an inode no path names, which is the lock's absence, not a fault.
+    #[test]
+    fn a_lock_removed_while_it_is_waited_for_is_absent() {
+        let store = scratch_store("removed-while-waited");
+        let project = store.join("acme/widget");
+        std::fs::create_dir_all(&project).expect("project");
+        let lock = project.join("main.dmg.lock");
+        let (signal, waiting) = std::sync::mpsc::channel();
+        let held = acquire_image_locks(
+            &store,
+            std::slice::from_ref(&lock),
+            LockMode::Try,
+            &WaitSignal(signal.clone()),
+        )
+        .expect("the unbinding's lock")
+        .expect("granted");
+        let waiter = {
+            let store = store.clone();
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                acquire_existing_image_locks(&store, &[lock], LockMode::Wait, &WaitSignal(signal))
+            })
+        };
+        waiting.recv().expect("the waiter is waiting");
+        std::fs::remove_file(&lock).expect("the unbinding removes the lock");
+        drop(held);
+        let taken = waiter.join().expect("the waiter ends").expect("its answer");
+        assert!(matches!(taken, ExistingLocks::Absent(ref path) if *path == lock));
+        assert!(!lock.exists(), "the waiter recreated nothing");
+        std::fs::remove_dir_all(&store).expect("remove the scratch store");
     }
 }

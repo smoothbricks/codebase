@@ -5062,6 +5062,86 @@ mod tests {
         layout
     }
 
+    /// The gateway's lost-mount watch opens a project while it is bound, and its remount of main
+    /// can run after `unadopt` has unbound it: unadopt's own unmount of main is the event that
+    /// starts the pass (02_workspaces.md, "Checkout layouts"; 05_gateway.md, "Lost mounts").
+    /// That remount takes no lock the unbinding removed, so the project's directory ends gone,
+    /// not recreated holding a `main.dmg.lock` that no verb reaches again. Measured 2026-11-14:
+    /// a consumer's scratch project disposal refused on exactly that residue.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_remount_after_the_unbinding_recreates_no_lock_and_no_project_directory() {
+        let fixture = Fixture::new("remount-after-unbinding");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let (published, _) = fixture.workspace(
+            &repo,
+            WorkspaceName::main(),
+            "00000000000000000000000000000001",
+            1,
+            false,
+        );
+        let main = published.workspace;
+        let main_image = layout
+            .canonical_image(main.name())
+            .expect("main's image")
+            .image()
+            .to_path_buf();
+        fs::write(
+            layout
+                .canonical_image(main.name())
+                .expect("main's image")
+                .lock(),
+            b"",
+        )
+        .expect("main's image lock, as adoption leaves it");
+
+        // The pass opens the project while it is bound...
+        let mounts = DirectoryHealSource
+            .open(&fixture.storage, &repo)
+            .await
+            .expect("the bound project opens for heal");
+        // unadopt retires main's image (and with it its records) before it unbinds the project.
+        for entry in fs::read_dir(&layout.project().project_root).expect("project entries") {
+            let path = entry.expect("project entry").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if name.starts_with("main.dmg") && !name.ends_with(".lock") {
+                fs::remove_file(&path).expect("retire main's image");
+            }
+        }
+        assert!(!main_image.exists());
+        // ...and the unbinding finishes before the pass reaches main.
+        let binding: RepositoryBinding =
+            crate::metadata::read_json(&layout.project().repository_binding).expect("binding");
+        crate::runtime::project::finish_restored_project_unbinding(
+            layout.project(),
+            &binding,
+            None,
+            &mut |_| Ok(()),
+        )
+        .expect("the unbinding");
+        assert!(
+            !layout.project().project_root.exists(),
+            "the unbinding removed the project"
+        );
+
+        let remount = mounts
+            .remount_lost(&main)
+            .await
+            .expect("the remount answers");
+        assert!(
+            matches!(remount, crate::storage::apfs::Remount::Standing),
+            "nothing is left to remount"
+        );
+        assert!(
+            !layout.project().project_root.exists(),
+            "the remount recreated the unbound project's directory"
+        );
+    }
     /// A new inventory instance follows the exact lookup used by the original restore command.
     #[cfg(target_os = "macos")]
     #[tokio::test]

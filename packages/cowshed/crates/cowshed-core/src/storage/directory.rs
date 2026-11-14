@@ -48,7 +48,9 @@ use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
 use cowshed_apfs::image::{ImageCapacity, is_image_path};
-use cowshed_apfs::store_lock::{ImageLockGuard, LockMode, acquire_image_locks};
+use cowshed_apfs::store_lock::{
+    ExistingLocks, ImageLockGuard, LockMode, acquire_existing_image_locks, acquire_image_locks,
+};
 
 use super::apfs::native::{
     checkout_mountpoint_staging_path, clone_lineage_from, empty_mountpoint, grants_sidecar_missing,
@@ -1108,6 +1110,24 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         holding: &crate::api::held_lock::LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
         acquire_image_locks(
+            &self.config.store_root,
+            images,
+            mode,
+            &crate::held_lock::ImageLockTaker {
+                holding,
+                census: &self.census,
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    fn lock_existing_images(
+        &self,
+        images: &[PathBuf],
+        mode: LockMode,
+        holding: &crate::api::held_lock::LockHolding,
+    ) -> Result<ExistingLocks<Self::LockGuard>, ApfsStorageError> {
+        acquire_existing_image_locks(
             &self.config.store_root,
             images,
             mode,

@@ -217,6 +217,16 @@ impl ApfsExecutionHost for FakeHost {
         Ok(Some(()))
     }
 
+    fn lock_existing_images(
+        &self,
+        paths: &[PathBuf],
+        _: LockMode,
+        _: &cowshed_core::api::held_lock::LockHolding,
+    ) -> Result<cowshed_apfs::store_lock::ExistingLocks<Self::LockGuard>, ApfsStorageError> {
+        self.record(format!("lock-existing:{}", paths.len()));
+        Ok(cowshed_apfs::store_lock::ExistingLocks::Held(()))
+    }
+
     type Attachment = FakeAttachment;
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError> {

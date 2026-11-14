@@ -386,7 +386,7 @@ pub struct RetiredImage {
     pub retired: RetiredRef,
     pub image: PathBuf,
 }
-use cowshed_apfs::store_lock::LockMode;
+use cowshed_apfs::store_lock::{ExistingLocks, LockMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationDisposition {
@@ -470,6 +470,15 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         mode: LockMode,
         holding: &LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError>;
+    /// [`Self::lock_images`] for a pass that serves only what exists (a heal, a remount, a
+    /// supervisor's mount): a lock file that is gone answers [`ExistingLocks::Absent`] and is
+    /// never recreated, since a retirement or an unbinding removed it with what it guarded.
+    fn lock_existing_images(
+        &self,
+        images: &[PathBuf],
+        mode: LockMode,
+        holding: &LockHolding,
+    ) -> Result<ExistingLocks<Self::LockGuard>, ApfsStorageError>;
     type Attachment: Send + 'static;
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
@@ -844,6 +853,10 @@ pub enum ApfsStorageError {
     /// (01_storage.md, "Lock order"). `held` names each lock it asked for with who has it open.
     #[error("image locks are held by another operation: {}", held_locks(.held))]
     ImageLocksHeld { held: Vec<HeldImageLock> },
+    /// A pass that serves only what exists found the workspace's image lock gone: a retirement or
+    /// an unbinding took the workspace away with it.
+    #[error("workspace image lock {0} is gone: the workspace was retired or its project unbound")]
+    WorkspaceGone(PathBuf),
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
@@ -1919,13 +1932,14 @@ where
         self.lane
             .dispatch(move || {
                 let locks = std::slice::from_ref(&lock);
-                match host.lock_images(locks, LockMode::Try, &holding)? {
-                    Some(_guard) => {
+                match host.lock_existing_images(locks, LockMode::Try, &holding)? {
+                    ExistingLocks::Held(_guard) => {
                         host.recover_pending(&config, locks)?;
                         settle_mount(host.as_ref(), &config, &workspace, MountIntent::default())
                             .map(Some)
                     }
-                    None => {
+                    ExistingLocks::Absent(lock) => Err(ApfsStorageError::WorkspaceGone(lock)),
+                    ExistingLocks::Busy => {
                         let mount_point = mount_point(&config, &workspace)?;
                         if !host.mount_settled(&workspace, &mount_point)? {
                             return Ok(None);
@@ -1960,7 +1974,12 @@ where
             .dispatch(move || {
                 let locks = std::slice::from_ref(&lock);
                 let mount_point = mount_point(&config, &workspace)?;
-                let guard = host.lock_images(locks, LockMode::Try, &holding)?;
+                // A lock that is gone went with the workspace: nothing is left to remount.
+                let guard = match host.lock_existing_images(locks, LockMode::Try, &holding)? {
+                    ExistingLocks::Held(guard) => Some(guard),
+                    ExistingLocks::Busy => None,
+                    ExistingLocks::Absent(_) => return Ok(Remount::Standing),
+                };
                 let Some(device) = host.lost_mount(&workspace, &mount_point)? else {
                     return Ok(Remount::Standing);
                 };
@@ -2004,13 +2023,14 @@ where
         let host = Arc::clone(&self.host);
         self.lane
             .dispatch(move || {
-                lock_images_in(
-                    host.as_ref(),
-                    std::slice::from_ref(&lock),
-                    LockMode::Wait,
-                    &holding,
-                )
-                .map(drop)
+                // A lock that is gone has no holder to wait for.
+                host.lock_existing_images(std::slice::from_ref(&lock), LockMode::Wait, &holding)
+                    .and_then(|taken| match taken {
+                        ExistingLocks::Held(_) | ExistingLocks::Absent(_) => Ok(()),
+                        ExistingLocks::Busy => Err(ApfsStorageError::InvalidPlan(
+                            "blocking image lock unexpectedly unavailable",
+                        )),
+                    })
             })
             .await
     }
@@ -2044,9 +2064,17 @@ where
                     workspace.name(),
                     lock.display()
                 );
-                let _guard = host.lock_images(locks, LockMode::Wait, &holding)?.ok_or(
-                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
-                )?;
+                let _guard = match host.lock_existing_images(locks, LockMode::Wait, &holding)? {
+                    ExistingLocks::Held(guard) => guard,
+                    ExistingLocks::Absent(lock) => {
+                        return Err(ApfsStorageError::WorkspaceGone(lock));
+                    }
+                    ExistingLocks::Busy => {
+                        return Err(ApfsStorageError::InvalidPlan(
+                            "blocking image lock unexpectedly unavailable",
+                        ));
+                    }
+                };
                 host.recover_pending(&config, locks)?;
                 settle_mount(host.as_ref(), &config, &workspace, MountIntent::default())
             })

@@ -4262,8 +4262,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 let mut guards = Vec::with_capacity(publication_locks.len());
                 if repairs {
                     for lock in &publication_locks {
-                        if let Some(guard) = host
-                            .lock_images(
+                        // A lock that is gone guards nothing left to recover: a retirement or an
+                        // unbinding removed it, and an opening never brings it back.
+                        if let cowshed_apfs::store_lock::ExistingLocks::Held(guard) = host
+                            .lock_existing_images(
                                 std::slice::from_ref(lock),
                                 cowshed_apfs::store_lock::LockMode::Try,
                                 &crate::api::held_lock::LockHolding::store(

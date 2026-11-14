@@ -63,7 +63,7 @@ pub use build_volumes::{
     CompactionSource, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
 };
 use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
-use cowshed_apfs::store_lock::{ImageLockGuard, acquire_image_locks};
+use cowshed_apfs::store_lock::{ImageLockGuard, acquire_existing_image_locks, acquire_image_locks};
 
 /// One payload rename commits retirement for both physical images and directory payloads.
 /// Callers prove store authority, unmounted payload state and the private CA companion first.
@@ -286,6 +286,7 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         | ApfsStorageError::Io { .. }
         | ApfsStorageError::BuildVolumeHeld { .. }
         | ApfsStorageError::ImageLocksHeld { .. }
+        | ApfsStorageError::WorkspaceGone(_)
         | ApfsStorageError::Host(_)
         | ApfsStorageError::MountIdentity(_)
         | ApfsStorageError::Quarantined { .. } => false,
@@ -3659,6 +3660,24 @@ where
         holding: &crate::api::held_lock::LockHolding,
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError> {
         acquire_image_locks(
+            &self.config.store_root,
+            paths,
+            mode,
+            &crate::held_lock::ImageLockTaker {
+                census: &self.census,
+                holding,
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    fn lock_existing_images(
+        &self,
+        paths: &[PathBuf],
+        mode: LockMode,
+        holding: &crate::api::held_lock::LockHolding,
+    ) -> Result<cowshed_apfs::store_lock::ExistingLocks<Self::LockGuard>, ApfsStorageError> {
+        acquire_existing_image_locks(
             &self.config.store_root,
             paths,
             mode,

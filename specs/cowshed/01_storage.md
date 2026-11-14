@@ -293,6 +293,14 @@ held (`storage::recovery::Unleased`), which only letting go of every lease yield
 intent leases of nine unfinished forks, then waited 18 minutes for `main.dmg.lock` behind another process, and every
 fork of those names was refused as running in another process.
 
+Only an operation that may bring a workspace into existence (adopt, a fork's destination, a create) creates an image
+lock file and the directories above it. A pass that serves only what exists (an opening's recovery, the gateway's heals
+and lost-mount remounts and their waits, a supervisor's mount) takes only a lock that exists
+(`store_lock::acquire_existing_image_locks`): a lock file that is gone, or that its holder removes while the pass waits
+for it, names a workspace that a retirement or an unbinding took away, and the pass leaves it gone. Recreated, it
+outlived its project: on 2026-11-14 the gateway's remount of main, started by `unadopt`'s own unmount, ran after the
+unbinding had emptied the project and left a `main.dmg.lock` in a directory no verb reaches again.
+
 ### In-image marker: `.cowshed/workspace.json`
 
 Written at adopt/fork, at the volume root; travels with every clone:

@@ -2635,12 +2635,14 @@ no lease, as a startup heal left to a holder waits ("Startup contract", step 3),
 lost then. The watch is the one owner of those waits, one per workspace. When it starts, it makes one pass over every
 workspace of every recorded project, for a mount lost while no gateway watched.
 
-The mount table decides, because it is the authority for what is mounted where (01_storage.md, "Runtime state: derived,
-never stored"). Disk Arbitration's disappeared callback fires when a disk leaves, not when a volume of a disk that stays
-attached unmounts; its description-changed callback reports the volume path only once `diskarbitrationd`, which
-serializes every client on the host (01c_macos.md), has processed the change, and cowshed's mounts are `mount_apfs`
-mounts Disk Arbitration did not make. Nor is the session table the ledger: it is a cache of host inventory, never an
-authority ("Control plane"), and holds no main.
+A workspace whose image lock is gone has nothing to remount: the remount, and the wait for a holder, take only a lock
+that exists (01_storage.md, "Lock order"), so a pass that runs after `unadopt` unbound the project recreates neither the
+lock nor the project's directory. The mount table decides, because it is the authority for what is mounted where
+(01_storage.md, "Runtime state: derived, never stored"). Disk Arbitration's disappeared callback fires when a disk
+leaves, not when a volume of a disk that stays attached unmounts; its description-changed callback reports the volume
+path only once `diskarbitrationd`, which serializes every client on the host (01c_macos.md), has processed the change,
+and cowshed's mounts are `mount_apfs` mounts Disk Arbitration did not make. Nor is the session table the ledger: it is a
+cache of host inventory, never an authority ("Control plane"), and holds no main.
 
 The gateway says every lost mount on its stderr:
 `cowshed: <repo>: <ws> lost its mount while its image stayed attached as <device>; remounted at <mountpoint>`, or that
