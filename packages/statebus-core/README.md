@@ -118,7 +118,7 @@ source-path aliases or application-specific ambient schema are required.
 
 Flechette 2.7.0's unpatched registry declarations remain broken upstream. Until the owner fixes them, real consumer
 roots must declare the reviewed `@uwdata/flechette@2.7.0` patch in `patchedDependencies` and copy
-`patches/@uwdata%2Fflechette@2.7.0.patch` (SHA-256 `5d5afe8a8df9f19b991c23809df690fa63992d093131f123a3584fd178304abc`)
+`patches/@uwdata%2Fflechette@2.7.0.patch` (SHA-256 `6c1ab8f580b3541dbf5f8b877685d84b1f6de30652c2385117223e335c37463a`)
 into that root before installation. The gate does exactly this for both disposable consumer layouts, without source
 aliases, global-store links or `skipLibCheck` relaxation, and records the patch requirement and digest in
 `validation.json`. Its claim is that **patched 2.7 passes**, not that the unpatched registry declarations pass.

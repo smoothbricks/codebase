@@ -303,7 +303,7 @@ function assertPinnedConsumerLock(lockfile, allowed) {
 const flechettePatch = {
   package: '@uwdata/flechette@2.7.0',
   path: 'patches/@uwdata%2Fflechette@2.7.0.patch',
-  sha256: '5d5afe8a8df9f19b991c23809df690fa63992d093131f123a3584fd178304abc',
+  sha256: '6c1ab8f580b3541dbf5f8b877685d84b1f6de30652c2385117223e335c37463a',
 };
 // Registry Flechette 2.7.0 has broken owner declarations. Model the real consumer-root
 // patch recipe, never a source alias or skipLibCheck, and retain its exact bytes in evidence.
