@@ -36,6 +36,11 @@ pub enum ExtractionError {
     Category(CategoryRefusal),
     /// The embedder's value cell writer refused a cell.
     Cell(CellRefusal),
+    /// A value of the embedder's reserved opaque extension type outside a
+    /// cell that takes it whole; `path` names the cell.
+    OpaqueValue {
+        path: String,
+    },
 }
 
 /// A lexer refusal at the extraction boundary: memory the lexer could not
@@ -138,6 +143,9 @@ pub mod diagnostic_detail {
     /// The embedder's value cell writer refused a member's cell, the row's
     /// record or carrier, or a text.
     pub const CELL_REFUSED: u8 = 12;
+    /// A value of the embedder's reserved opaque extension type outside a
+    /// cell that takes it whole.
+    pub const OPAQUE_VALUE: u8 = 13;
 }
 
 /// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
@@ -238,6 +246,7 @@ impl ExtractionDiagnostic {
             ExtractionError::WorkBufferTooSmall => diagnostic_stage::MSGPACK,
             ExtractionError::UnwrittenProjection => diagnostic_stage::VALIDATION,
             ExtractionError::Cell(_) => diagnostic_stage::VALUE,
+            ExtractionError::OpaqueValue { .. } => diagnostic_stage::VALUE,
         };
         self.detail = match failure {
             ExtractionError::InvalidJson => diagnostic_detail::INVALID_JSON,
@@ -250,6 +259,7 @@ impl ExtractionDiagnostic {
             ExtractionError::UnwrittenProjection => diagnostic_detail::PAYLOAD_VIOLATION,
             ExtractionError::Category(_) => diagnostic_detail::DICTIONARY_VALUE,
             ExtractionError::Cell(_) => diagnostic_detail::CELL_REFUSED,
+            ExtractionError::OpaqueValue { .. } => diagnostic_detail::OPAQUE_VALUE,
         };
     }
 }
@@ -1687,6 +1697,8 @@ fn json_value(parser: &mut JsonParser<'_>) -> Result<JsonValue, ExtractionError>
         | ValueParseError::InvalidMsgpack
         | ValueParseError::InvalidNumber
         | ValueParseError::TooDeep => ExtractionError::InvalidJson,
+        // JSON has no extension types, so no JSON value is opaque.
+        ValueParseError::Opaque => ExtractionError::InvalidJson,
     })
 }
 

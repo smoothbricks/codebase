@@ -251,6 +251,9 @@ pub struct ExtractionConfig {
     /// Whether each column's cell is a dynamic value, by column: an explicit
     /// null in it is data whichever member or spelling reached it.
     pub(crate) dynamic_columns: Vec<bool>,
+    /// The MessagePack extension type the embedder reserves for values it
+    /// encodes itself, when it reserves one.
+    pub(crate) opaque_ext: Option<i8>,
     /// Who writes each column's cells, by column ([`CellRole`]).
     pub(crate) cell_roles: Vec<CellRole>,
     /// The [`DECLARED_RECORD_COLUMN_NAME`] column, when the schema has one.
@@ -402,6 +405,26 @@ impl ExtractionConfig {
     pub(crate) fn top_level_null_cell(&self, event_type: Option<&str>, key: &str) -> NullCell {
         key.strip_prefix("value.")
             .map_or(NullCell::Empty, |member| self.null_cell(event_type, member))
+    }
+
+    /// Whether `column`'s cell takes the reserved opaque extension whole: a
+    /// dynamic column's does. Which cells take it is a per-column fact, so
+    /// another kind of cell joins by marking its columns here, not by
+    /// changing the seam.
+    pub(crate) fn takes_opaque(&self, column: usize) -> bool {
+        self.dynamic_columns
+            .get(column)
+            .is_some_and(|dynamic| *dynamic)
+    }
+
+    /// How a cell that does or does not take the reserved opaque extension
+    /// reads it.
+    pub(crate) fn opaque_read(&self, takes: bool) -> crate::validate::OpaqueRead {
+        match self.opaque_ext {
+            None => crate::validate::OpaqueRead::Unreserved,
+            Some(ext) if takes => crate::validate::OpaqueRead::Taken(ext),
+            Some(ext) => crate::validate::OpaqueRead::Refused(ext),
+        }
     }
 
     /// What an explicit null in `column`'s cell is: data when the column's
@@ -691,6 +714,9 @@ pub struct CellLayout<'a> {
     /// Binary columns whose cell is a dynamic value, named by the schema's
     /// owner.
     pub dynamic_columns: &'a [usize],
+    /// The MessagePack extension type the embedder reserves for values it
+    /// encodes itself.
+    pub opaque_ext: Option<i8>,
     pub encoding: Option<&'a str>,
 }
 
@@ -1086,6 +1112,10 @@ pub enum ConfigError {
     InvalidTextColumn,
     /// A dynamic column the schema lacks, or one that is not Binary.
     InvalidDynamicColumn,
+    /// A reserved opaque extension type that is the bigint extension, or one
+    /// reserved by a processor with no embedder to hand its values to, or
+    /// beside a carrier columine writes itself.
+    InvalidOpaqueExt,
 }
 
 /// Back `additional` more elements of `buf`, or refuse as out of memory.
@@ -1451,6 +1481,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         column_dictionaries,
         dynamic_members,
         dynamic_columns,
+        opaque_ext: cells.opaque_ext,
         cell_roles,
         record_column,
         record_routes,
@@ -1472,6 +1503,17 @@ pub fn build_extraction_config_with_semantic_schemas(
     );
     config.dynamic_members = dynamic_members;
     config.dynamic_columns = dynamic_columns;
+    // The reserved opaque extension is the embedder's alone: it never shadows
+    // the bigint extension, a processor with no embedder has no seam to hand
+    // its values to, and a carrier columine writes itself would capture one
+    // inside an undeclared value unread.
+    if let Some(ext) = config.opaque_ext
+        && (ext == crate::msgpack_scanner::BIGINT_EXTENSION
+            || cells.encoding.is_none()
+            || matches!(config.carrier(), Carrier::Native(_)))
+    {
+        return Err(ConfigError::InvalidOpaqueExt);
+    }
     config.check_placement()?;
     Ok(config)
 }

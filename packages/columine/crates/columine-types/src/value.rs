@@ -82,6 +82,14 @@ pub trait ValueView {
         None
     }
 
+    /// The payload of a value the lane handed over unread: a value of the
+    /// MessagePack extension type the embedder reserves, in a cell that takes
+    /// it (specs/columine/10-physical-vocabulary.md §7). Its kind is
+    /// [`ValueKind::Unknown`], so an embedder that reads no opaque value
+    /// refuses it rather than storing it as another kind.
+    fn as_opaque(&self) -> Option<&[u8]> {
+        None
+    }
     fn as_bytes(&self) -> Option<&[u8]> {
         None
     }

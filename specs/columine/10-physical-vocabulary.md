@@ -153,6 +153,17 @@ holds a semantic schema, in either payload spelling and whichever side of the pa
 `value.<member>` key takes the member's discriminated column and routing row as the nested member does, and a member
 nothing places keeps its key as its carrier path.
 
+**An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
+(`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
+at the top of a cell that takes it reaches the seam unread, as its payload bytes: its view's kind is `unknown` and
+`as_opaque` answers the payload, so an embedder that reads no opaque value refuses it. Columine neither judges nor
+re-encodes it. A dynamic column and a dynamic member the declared record holds take it; which cells take it is a fact of
+each cell, decided at creation. Anywhere else (another column, a declared member that is not dynamic, the carrier, or
+inside a value the lane parses) it is refused by name (`OPAQUE_VALUE`) with the cell's path. An explicit nil in a
+dynamic cell stays a present null. Creation refuses the bigint extension's type and a reservation by a processor with no
+embedder or beside a carrier columine writes itself. The JSON lane has no opaque form, since JSON has no extension
+types; without a reservation every extension but the bigint one is an unknown value, as before.
+
 An embedder processor takes the extraction path only. A value-object frame certified by the admission capability is
 written to a raw Binary column as its certified bytes; a frame nested inside a member the embedder writes has no cell of
 its own and refuses the row.

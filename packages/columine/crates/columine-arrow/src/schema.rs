@@ -903,6 +903,10 @@ pub struct DynamicSchemaConfig {
     /// owner: an explicit null in any of them is data, whichever member or
     /// spelling reached it.
     pub dynamic_columns: Vec<usize>,
+    /// The MessagePack extension type the embedder reserves for values it
+    /// encodes itself: a value of that type in a dynamic cell is handed to the
+    /// embedder unread; anywhere else it is refused. `None` reserves none.
+    pub opaque_ext: Option<i8>,
 }
 
 impl DynamicSchemaConfig {
@@ -1088,6 +1092,7 @@ impl DynamicSchemaConfig {
             text_columns: Vec::new(),
             dynamic_members: Vec::new(),
             dynamic_columns: Vec::new(),
+            opaque_ext: None,
             schema_bytes: preamble(schema_bytes, &dictionaries)?,
             schema_message_len: schema_bytes.len(),
             field_metadata,

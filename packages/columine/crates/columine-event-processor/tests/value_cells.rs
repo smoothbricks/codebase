@@ -29,6 +29,9 @@ const KNOWN_HASH: [u8; TEXT_HASH_BYTES] = [0xab; TEXT_HASH_BYTES];
 /// A value as text: strings quoted, numbers as their integer or float,
 /// objects and arrays by their members, every other value by its kind.
 fn render(value: &dyn ValueView) -> String {
+    if let Some(payload) = value.as_opaque() {
+        return format!("opaque {payload:?}");
+    }
     match value.kind() {
         ValueKind::Object => {
             let mut members = Vec::new();
@@ -243,6 +246,8 @@ enum Mp<'a> {
     Bool(bool),
     Nil,
     Bin(&'a [u8]),
+    /// An extension value: its type and payload.
+    Ext(i8, &'a [u8]),
     Map(Vec<(&'a str, Mp<'a>)>),
 }
 
@@ -259,6 +264,14 @@ fn msgpack(out: &mut Vec<u8>, value: &Mp<'_>) {
         }
         Mp::Bool(flag) => out.push(if *flag { 0xc3 } else { 0xc2 }),
         Mp::Nil => out.push(0xc0),
+        Mp::Ext(kind, payload) => {
+            out.extend([
+                0xc7,
+                u8::try_from(payload.len()).unwrap(),
+                kind.to_be_bytes()[0],
+            ]);
+            out.extend(*payload);
+        }
         Mp::Bin(bytes) => {
             out.push(0xc4);
             out.push(u8::try_from(bytes.len()).unwrap());
@@ -724,5 +737,46 @@ fn a_named_dynamic_member_keeps_null_as_data_without_a_semantic_schema() {
             "{format:?}"
         );
     }
+}
+
+/// `type`, the dynamic column `value.data` and the member cell `value.meta`,
+/// with extension type 7 reserved for values the embedder encodes itself.
+fn opaque_schema() -> DynamicSchemaConfig {
+    DynamicSchemaConfig {
+        semantic_schema: None,
+        payload_discriminator: None,
+        dynamic_columns: vec![1],
+        opaque_ext: Some(7),
+        ..schema(
+            &[
+                utf8("type"),
+                binary("value.data", Some(ENCODING)),
+                binary("value.meta", Some(ENCODING)),
+            ],
+            "{}",
+        )
+    }
+}
+
+#[test]
+fn an_opaque_value_reaches_a_dynamic_column_unread_and_is_refused_by_name_elsewhere() {
+    let mut ep = embedded(opaque_schema()).unwrap();
+    let accepted = orders(vec![Mp::Map(vec![("data", Mp::Ext(7, &[1, 2]))])]);
+    assert_eq!(
+        cells(&mut ep, &accepted, InputFormat::Msgpack, &[1, 2]),
+        [[bytes("member 1 opaque [1, 2]"), None]]
+    );
+    let refused = orders(vec![Mp::Map(vec![("meta", Mp::Ext(7, &[1, 2]))])]);
+    let error = ep.parse(&refused, InputFormat::Msgpack).err().unwrap();
+    assert_eq!(
+        (
+            error.code,
+            error.diagnostic.map(|diagnostic| diagnostic.detail)
+        ),
+        (
+            ResultCode::ParseError,
+            Some(diagnostic_detail::OPAQUE_VALUE)
+        )
+    );
 }
 //#endregion smoo/columine!n/vocab-value-cells

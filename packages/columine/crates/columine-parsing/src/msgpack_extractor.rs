@@ -4,8 +4,8 @@ use std::borrow::Cow;
 
 use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
 use crate::validate::{
-    MsgpackValue, SemanticSchema, ValueParseError, encode_segment_into, encoded_segment_len,
-    parse_msgpack_value, push_path_segment,
+    MsgpackValue, OpaqueRead, SemanticSchema, ValueParseError, encode_segment_into,
+    encoded_segment_len, parse_msgpack_value, push_path_segment,
 };
 use crate::{
     Carrier, CellWriter, ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections,
@@ -452,6 +452,15 @@ fn extract_msgpack_member(
     // A non-UTF-8 key is undeclared by construction: under an open payload
     // object it is captured like any other undeclared member.
     let path = std::str::from_utf8(key).ok();
+    // The reserved opaque extension at the cell's top is judged here, by the
+    // cell it reaches, before any lane reads it; inside a parsed value the
+    // parse judges it by the same cell.
+    let cell_path = lookup_name.unwrap_or(NON_UTF8_KEY);
+    let opaque_here = config.opaque_ext.is_some_and(|ext| holds_ext(reader, ext));
+    let opaque = |takes: bool| OpaqueCell {
+        read: config.opaque_read(takes),
+        path: cell_path,
+    };
     let member_schema = config.payload_member_schema(event_type, member.unwrap_or_default());
     // An open schema's undeclared member is the carrier's: it is never
     // written to another type's column, nor placed by a routing row.
@@ -472,6 +481,11 @@ fn extract_msgpack_member(
             .map(|write| (lookup, write))
     });
     if let Some((lookup, write)) = lookup {
+        let takes = matches!(write, MemberWrite::Seam(SeamCell::Embedder))
+            && config.takes_opaque(lookup.column);
+        if opaque_here && !takes {
+            return Err(opaque_refusal(cell_path));
+        }
         // A column's cell is one form for every row: the column decides its
         // null, whichever member or spelling reached it.
         let null = config.column_null(lookup.column);
@@ -504,6 +518,7 @@ fn extract_msgpack_member(
                     cell,
                     capture,
                     null,
+                    opaque(takes),
                     frames,
                     cells,
                     scratch,
@@ -520,15 +535,20 @@ fn extract_msgpack_member(
         && let Some(member) = member
         && let Some(row) = config.record_route(discriminant, member)
     {
-        let value = msgpack_value(reader)?;
+        // A record member takes the opaque extension exactly when it is
+        // dynamic, which is when its null is data.
+        let value = msgpack_value(reader, opaque(record_null == NullCell::Data))?;
         return crate::record_cell(row, &value, record_null, cells);
+    }
+    if opaque_here {
+        return Err(opaque_refusal(cell_path));
     }
     match config.carrier() {
         Carrier::Embedder(_) => {
             // The embedder's carrier is keyed by text paths: a key that is
             // not UTF-8 has none.
             let name = path.ok_or(ExtractionError::InvalidFieldType)?;
-            let value = msgpack_value(reader)?;
+            let value = msgpack_value(reader, opaque(false))?;
             let mut path = String::new();
             push_path_segment(&mut path, name).map_err(|_| ExtractionError::MemoryExhausted)?;
             return crate::undeclared_cell(config, &path, &value, cells);
@@ -897,6 +917,7 @@ fn seam_member(
     cell: SeamCell,
     capture: Option<(&SemanticSchema, &str)>,
     null: NullCell,
+    opaque: OpaqueCell<'_>,
     frames: &mut FrameWrites<'_>,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
@@ -907,7 +928,7 @@ fn seam_member(
         .ok_or(ExtractionError::InvalidJson)?;
     match cell {
         SeamCell::Embedder => {
-            let value = msgpack_value(reader)?;
+            let value = msgpack_value(reader, opaque)?;
             crate::member_cell(
                 config, columns, column, &value, null, capture, cells, scratch,
             )
@@ -947,11 +968,47 @@ fn seam_member(
     }
 }
 
+/// The spelling a refusal gives the path of a key that is not UTF-8.
+const NON_UTF8_KEY: &str = "<non-UTF-8 key>";
+
+/// The reserved opaque extension as one cell reads it, and the cell's path a
+/// refusal names.
+#[derive(Clone, Copy)]
+struct OpaqueCell<'p> {
+    read: OpaqueRead,
+    path: &'p str,
+}
+
+/// Whether the reader is at a value of extension type `ext`.
+fn holds_ext(reader: &Reader<'_>, ext: i8) -> bool {
+    let input = &reader.input()[reader.position()..];
+    input.first().is_some_and(|first| Reader::is_ext(*first))
+        && Reader::new(input)
+            .read_ext()
+            .is_some_and(|(kind, _)| kind == ext)
+}
+
+/// The refusal of the reserved opaque extension outside a cell that takes
+/// it, naming the cell's `path`.
+fn opaque_refusal(path: &str) -> ExtractionError {
+    let mut owned = String::new();
+    if owned.try_reserve_exact(path.len()).is_err() {
+        return ExtractionError::MemoryExhausted;
+    }
+    owned.push_str(path);
+    ExtractionError::OpaqueValue { path: owned }
+}
+
 /// The next MessagePack value, whole, as the borrowed view a value cell
-/// writer reads.
-fn msgpack_value<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, ExtractionError> {
-    parse_msgpack_value(reader, 0).map_err(|error| match error {
+/// writer reads, with the reserved opaque extension read as `opaque`'s cell
+/// takes it.
+fn msgpack_value<'a>(
+    reader: &mut Reader<'a>,
+    opaque: OpaqueCell<'_>,
+) -> Result<MsgpackValue<'a>, ExtractionError> {
+    parse_msgpack_value(reader, 0, opaque.read).map_err(|error| match error {
         ValueParseError::OutOfMemory => ExtractionError::MemoryExhausted,
+        ValueParseError::Opaque => opaque_refusal(opaque.path),
         ValueParseError::InvalidJson
         | ValueParseError::InvalidMsgpack
         | ValueParseError::InvalidNumber

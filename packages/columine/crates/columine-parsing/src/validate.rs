@@ -2674,6 +2674,24 @@ pub enum ValueParseError {
     TooDeep,
     /// The value tree could not be backed.
     OutOfMemory,
+    /// A value of the reserved opaque extension type where the cell being
+    /// read does not take it whole.
+    Opaque,
+}
+
+/// How a MessagePack parse reads the extension type an embedder reserves for
+/// values it encodes itself (specs/columine/10-physical-vocabulary.md §7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpaqueRead {
+    /// No type is reserved: any extension but the bigint one is unknown to
+    /// the judgment.
+    Unreserved,
+    /// The type is reserved and the cell being read takes it whole: at the
+    /// cell's top it is the opaque value, below it a refusal.
+    Taken(i8),
+    /// The type is reserved and the cell being read does not take it: a
+    /// refusal anywhere in the value.
+    Refused(i8),
 }
 
 impl From<ParserError> for ValueParseError {
@@ -2706,6 +2724,8 @@ pub(crate) enum MsgpackValue<'a> {
     Binary(&'a [u8]),
     /// The bigint extension, with its value when that fits `i64`.
     BigInt(Option<i64>),
+    /// The payload of the reserved opaque extension, handed over unread.
+    Opaque(&'a [u8]),
     Array(Vec<Self>),
     Object(Vec<(&'a str, Self)>),
 }
@@ -2713,7 +2733,7 @@ pub(crate) enum MsgpackValue<'a> {
 impl ValueView for MsgpackValue<'_> {
     fn kind(&self) -> ValueKind {
         match self {
-            Self::Unknown => ValueKind::Unknown,
+            Self::Unknown | Self::Opaque(_) => ValueKind::Unknown,
             Self::Null => ValueKind::Null,
             Self::String(_) => ValueKind::String,
             Self::Number(_) => ValueKind::Number,
@@ -2750,6 +2770,13 @@ impl ValueView for MsgpackValue<'_> {
     fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Binary(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_opaque(&self) -> Option<&[u8]> {
+        match self {
+            Self::Opaque(payload) => Some(payload),
             _ => None,
         }
     }
@@ -2808,7 +2835,7 @@ fn parse_msgpack_event<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, 
             .ok_or(ValueParseError::InvalidMsgpack)?;
         let key = std::str::from_utf8(key).map_err(|_| ValueParseError::InvalidMsgpack)?;
         let value = if key == "type" || key == "value" {
-            parse_msgpack_value(reader, 0)?
+            parse_msgpack_value(reader, 0, OpaqueRead::Unreserved)?
         } else {
             reader.skip_value().ok_or(ValueParseError::InvalidMsgpack)?;
             MsgpackValue::Unknown
@@ -2821,6 +2848,7 @@ fn parse_msgpack_event<'a>(reader: &mut Reader<'a>) -> Result<MsgpackValue<'a>, 
 pub(crate) fn parse_msgpack_value<'a>(
     reader: &mut Reader<'a>,
     depth: usize,
+    opaque: OpaqueRead,
 ) -> Result<MsgpackValue<'a>, ValueParseError> {
     if depth > MAX_SCHEMA_DEPTH {
         return Err(ValueParseError::TooDeep);
@@ -2843,8 +2871,21 @@ pub(crate) fn parse_msgpack_value<'a>(
     }
     if Reader::is_ext(first) {
         // A bigint travels as the canonical bigint extension on both wires;
-        // any other extension is opaque to the judgment.
+        // the reserved opaque extension is the embedder's; any other
+        // extension is opaque to the judgment.
         let (kind, payload) = reader.read_ext().ok_or(ValueParseError::InvalidMsgpack)?;
+        let reserved = match opaque {
+            OpaqueRead::Unreserved => None,
+            OpaqueRead::Taken(ext) | OpaqueRead::Refused(ext) => Some(ext),
+        };
+        if reserved == Some(kind) {
+            return match opaque {
+                OpaqueRead::Taken(_) if depth == 0 => Ok(MsgpackValue::Opaque(payload)),
+                OpaqueRead::Taken(_) | OpaqueRead::Refused(_) | OpaqueRead::Unreserved => {
+                    Err(ValueParseError::Opaque)
+                }
+            };
+        }
         return Ok(if kind == crate::msgpack_scanner::BIGINT_EXTENSION {
             MsgpackValue::BigInt(crate::msgpack_scanner::bigint_ext_i64(payload))
         } else {
@@ -2891,7 +2932,7 @@ pub(crate) fn parse_msgpack_value<'a>(
                     .read_string()
                     .ok_or(ValueParseError::InvalidMsgpack)?;
                 let key = std::str::from_utf8(key).map_err(|_| ValueParseError::InvalidMsgpack)?;
-                fields.push((key, parse_msgpack_value(reader, depth + 1)?));
+                fields.push((key, parse_msgpack_value(reader, depth + 1, opaque)?));
             }
             Ok(MsgpackValue::Object(fields))
         }
@@ -2901,7 +2942,7 @@ pub(crate) fn parse_msgpack_value<'a>(
                 .ok_or(ValueParseError::InvalidMsgpack)?;
             let mut values = backed_values(reader, count)?;
             for _ in 0..count {
-                values.push(parse_msgpack_value(reader, depth + 1)?);
+                values.push(parse_msgpack_value(reader, depth + 1, opaque)?);
             }
             Ok(MsgpackValue::Array(values))
         }
@@ -3269,7 +3310,8 @@ mod tests {
             assert_eq!(validate_value(&boolean, &from_json), Ok(()));
 
             let input = [marker];
-            let from_msgpack = parse_msgpack_value(&mut Reader::new(&input), 0).unwrap();
+            let from_msgpack =
+                parse_msgpack_value(&mut Reader::new(&input), 0, OpaqueRead::Unreserved).unwrap();
             assert_eq!(from_msgpack.kind(), ValueKind::Boolean);
             assert_eq!(from_msgpack.as_bool(), Some(expected));
             assert_eq!(validate_value(&boolean, &from_msgpack), Ok(()));
@@ -4996,7 +5038,8 @@ mod tests {
             line_tree()
         ));
         let input = [0x81, 0xa4, b'l', b'i', b'n', b'e', 0xa2, 0xff, 0xfe];
-        let value = parse_msgpack_value(&mut Reader::new(&input), 0).unwrap();
+        let value =
+            parse_msgpack_value(&mut Reader::new(&input), 0, OpaqueRead::Unreserved).unwrap();
         let violation = violation_of(validate_value_with_admission(
             &tree,
             &value,

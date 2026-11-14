@@ -531,6 +531,7 @@ impl<A: VoAdmission, G: AddressGrammar, C: ValueCells> EventProcessor<A, G, C> {
                         text_columns: &schema_config.text_columns,
                         dynamic_members: &schema_config.dynamic_members,
                         dynamic_columns: &schema_config.dynamic_columns,
+                        opaque_ext: schema_config.opaque_ext,
                         encoding: cells.as_ref().map(ValueCells::encoding),
                     },
                 )
@@ -1297,7 +1298,8 @@ impl Plane {
                 | json_extractor::ExtractionError::TooManyEvents
                 | json_extractor::ExtractionError::UnwrittenProjection
                 | json_extractor::ExtractionError::Category(_)
-                | json_extractor::ExtractionError::Cell(_) => ResultCode::ParseError,
+                | json_extractor::ExtractionError::Cell(_)
+                | json_extractor::ExtractionError::OpaqueValue { .. } => ResultCode::ParseError,
             };
             // JSON carries a per-field diagnostic; MessagePack derives
             // stage/detail from its error at this level.
@@ -1331,6 +1333,9 @@ impl Plane {
                     ),
                     json_extractor::ExtractionError::Category(_) => {
                         (diagnostic_detail::DICTIONARY_VALUE, 0)
+                    }
+                    json_extractor::ExtractionError::OpaqueValue { .. } => {
+                        (diagnostic_detail::OPAQUE_VALUE, 0)
                     }
                     json_extractor::ExtractionError::Cell(_) => {
                         (diagnostic_detail::CELL_REFUSED, 0)
