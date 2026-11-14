@@ -2722,8 +2722,9 @@ pub(crate) enum MsgpackValue<'a> {
     Number(NumberValue),
     Boolean(bool),
     Binary(&'a [u8]),
-    /// The bigint extension, with its value when that fits `i64`.
-    BigInt(Option<i64>),
+    /// The bigint extension, with its exact value when that fits `i64` or
+    /// `u64`.
+    BigInt(Option<NumberValue>),
     /// The payload of the reserved opaque extension, handed over unread.
     Opaque(&'a [u8]),
     Array(Vec<Self>),
@@ -2762,7 +2763,7 @@ impl ValueView for MsgpackValue<'_> {
     fn as_number(&self) -> Option<NumberValue> {
         match self {
             Self::Number(value) => Some(*value),
-            Self::BigInt(value) => value.map(|value| NumberValue::Signed(i128::from(value))),
+            Self::BigInt(value) => *value,
             _ => None,
         }
     }
@@ -2887,7 +2888,14 @@ pub(crate) fn parse_msgpack_value<'a>(
             };
         }
         return Ok(if kind == crate::msgpack_scanner::BIGINT_EXTENSION {
-            MsgpackValue::BigInt(crate::msgpack_scanner::bigint_ext_i64(payload))
+            MsgpackValue::BigInt(
+                crate::msgpack_scanner::bigint_ext_i64(payload)
+                    .map(|value| NumberValue::Signed(i128::from(value)))
+                    .or_else(|| {
+                        crate::msgpack_scanner::bigint_ext_u64(payload)
+                            .map(|value| NumberValue::Unsigned(u128::from(value)))
+                    }),
+            )
         } else {
             MsgpackValue::Unknown
         });
@@ -3000,7 +3008,7 @@ mod tests {
         bigint_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xd5, 20, 0, 5]);
         assert_eq!(
             msgpack_event_value(&bigint_row),
-            MsgpackValue::BigInt(Some(5))
+            MsgpackValue::BigInt(Some(NumberValue::Signed(5)))
         );
 
         let mut number_row = vec![0x81];
