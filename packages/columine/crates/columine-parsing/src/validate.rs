@@ -24,8 +24,9 @@
 //! may demand an exact length.
 //!
 //! A `string` node may bound a text's UTF-8 length by `maxBytes`; absent, the
-//! text is unbounded. A bounded string is never empty: it holds from one byte
-//! to its bound, and under `optional` an empty text is the empty state.
+//! text is unbounded. A bounded string holds from `minBytes` to its bound,
+//! the minimum one byte unless the node states it; where the minimum is at
+//! least one, an empty text under `optional` is the empty state.
 //!
 //! A `key` node admits an `S.key` value: a non-empty string whose routing key
 //! component encodes to at most `maxEncodedLength` characters. Only that length
@@ -346,8 +347,9 @@ enum Expected<'s> {
     BigInt(IntegerBounds),
     /// An `S.key` value: its routing key component encodes to at most this many characters.
     Key(u32),
-    /// A bounded `string`: a text of one to this many UTF-8 bytes.
-    StringBytes(u32),
+    /// A bounded `string`: a text of this minimum to this maximum of UTF-8
+    /// bytes.
+    StringBytes(u32, u32),
     /// An `axId` value the host's grammar refused, with the grammar's reason.
     AxId(&'static str),
     Length(u32),
@@ -375,7 +377,7 @@ impl fmt::Display for Expected<'_> {
             }
             Self::BigInt(bounds) => write!(output, "bigint in [{}, {}]", bounds.min, bounds.max),
             Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
-            Self::StringBytes(bound) => write!(output, "string of 1 to {bound} bytes"),
+            Self::StringBytes(min, max) => write!(output, "string of {min} to {max} bytes"),
             Self::AxId(reason) => write!(output, "axId: {reason}"),
             Self::Length(length) => write!(output, "array of length {length}"),
             Self::Declared(fields) => {
@@ -703,10 +705,13 @@ impl ExactInteger {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SemanticSchema {
     Unknown,
-    /// A text, of at most `max_bytes` UTF-8 bytes when the node names a bound.
-    /// The tree spells it `{"kind":"string"}` or `{"kind":"string","maxBytes":N}`.
+    /// A text. With a bound, `max_bytes`, it holds from `min_bytes` to that
+    /// many UTF-8 bytes; with none it holds any text and `min_bytes` is zero.
+    /// The tree spells it `{"kind":"string"}`, `{"kind":"string","maxBytes":N}`
+    /// (a minimum of one byte) or `{"kind":"string","maxBytes":N,"minBytes":M}`.
     String {
         max_bytes: Option<u32>,
+        min_bytes: u32,
     },
     /// An `S.key` value: a non-empty string whose routing key component encodes to at most
     /// `max_encoded_length` characters. Only that length is computed, never the encoding: the
@@ -843,12 +848,12 @@ impl SemanticSchema {
         }
     }
 
-    /// Whether the schema, beneath any `optional`, is a bounded string: a
-    /// text of one byte to its bound, never empty.
+    /// Whether the schema, beneath any `optional`, is a string that holds at
+    /// least one byte: one whose empty text is no value.
     fn is_bounded_string(&self) -> bool {
         match self {
             Self::Optional(inner) => inner.is_bounded_string(),
-            other => matches!(other, Self::String { max_bytes: Some(_) }),
+            other => matches!(other, Self::String { min_bytes: 1.., .. }),
         }
     }
 
@@ -1326,8 +1331,12 @@ impl SemanticSchema {
         let node = |child: &Self| Node::new(child.try_clone()?);
         Ok(match self {
             Self::Unknown => Self::Unknown,
-            Self::String { max_bytes } => Self::String {
+            Self::String {
+                max_bytes,
+                min_bytes,
+            } => Self::String {
                 max_bytes: *max_bytes,
+                min_bytes: *min_bytes,
             },
             Self::Key { max_encoded_length } => Self::Key {
                 max_encoded_length: *max_encoded_length,
@@ -1753,7 +1762,10 @@ fn validate_at<'s, G: AddressGrammar>(
     }
     match schema {
         SemanticSchema::Unknown => Ok(()),
-        SemanticSchema::String { max_bytes } => validate_string(*max_bytes, value),
+        SemanticSchema::String {
+            max_bytes,
+            min_bytes,
+        } => validate_string(*max_bytes, *min_bytes, value),
         SemanticSchema::Key { max_encoded_length } => validate_key(*max_encoded_length, value),
         SemanticSchema::AxId => validate_ax_id::<G>(value),
         SemanticSchema::Boolean => validate_boolean(value),
@@ -2002,11 +2014,15 @@ fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), St
     }
 }
 
-/// A `string` value: a text, of one byte to `max_bytes` UTF-8 bytes when the
-/// node bounds it. A bounded string is never empty: an empty text is refused
-/// as one past the bound is. A value that is not a string is refused as
-/// `string` refuses it.
-fn validate_string<'s>(max_bytes: Option<u32>, value: &dyn ValueView) -> Result<(), Stop<'s>> {
+/// A `string` value: a text, of `min_bytes` to `max_bytes` UTF-8 bytes when
+/// the node bounds it. A text shorter than the minimum is refused as one past
+/// the bound is. A value that is not a string is refused as `string` refuses
+/// it.
+fn validate_string<'s>(
+    max_bytes: Option<u32>,
+    min_bytes: u32,
+    value: &dyn ValueView,
+) -> Result<(), Stop<'s>> {
     require_kind(value, ValueKind::String)?;
     let Some(bound) = max_bytes else {
         return Ok(());
@@ -2015,11 +2031,11 @@ fn validate_string<'s>(max_bytes: Option<u32>, value: &dyn ValueView) -> Result<
         return Err(Fault::shape(ValueKind::String.as_str(), value).into());
     };
     let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    if (1..=u64::from(bound)).contains(&length) {
+    if (u64::from(min_bytes)..=u64::from(bound)).contains(&length) {
         Ok(())
     } else {
         Err(Fault {
-            expected: Expected::StringBytes(bound),
+            expected: Expected::StringBytes(min_bytes, bound),
             observed: Observed::Bytes(length),
             vo: None,
         }
@@ -2262,13 +2278,30 @@ fn parse_schema(value: &JsonValue, depth: usize) -> Result<SemanticSchema, Schem
     match kind {
         "unknown" => Ok(SemanticSchema::Unknown),
         "string" => {
-            const MEMBERS: &[&str] = &["kind", "maxBytes"];
+            const MEMBERS: &[&str] = &["kind", "maxBytes", "minBytes"];
             let members = exact_members(value, &["kind"], MEMBERS)?;
             let max_bytes = match field(members, "maxBytes") {
                 None => None,
                 bound @ Some(_) => Some(unsigned::<u32>(bound)?),
             };
-            Ok(SemanticSchema::String { max_bytes })
+            // A minimum belongs to a bounded string and is at most its bound;
+            // unstated, a bounded string holds at least one byte.
+            let min_bytes = match (field(members, "minBytes"), max_bytes) {
+                (None, None) => 0,
+                (None, Some(_)) => 1,
+                (Some(_), None) => return Err(SchemaParseError::InvalidOperand),
+                (minimum @ Some(_), Some(bound)) => {
+                    let minimum = unsigned::<u32>(minimum)?;
+                    if minimum > bound {
+                        return Err(SchemaParseError::InvalidOperand);
+                    }
+                    minimum
+                }
+            };
+            Ok(SemanticSchema::String {
+                max_bytes,
+                min_bytes,
+            })
         }
         "key" => {
             const MEMBERS: &[&str] = &["kind", "maxEncodedLength"];
@@ -5276,12 +5309,16 @@ mod tests {
     fn a_string_node_takes_an_optional_u32_byte_bound_and_nothing_else() {
         assert_eq!(
             schema(r#"{"kind":"string"}"#),
-            SemanticSchema::String { max_bytes: None }
+            SemanticSchema::String {
+                max_bytes: None,
+                min_bytes: 0
+            }
         );
         assert_eq!(
             schema(r#"{"kind":"string","maxBytes":4294967295}"#),
             SemanticSchema::String {
-                max_bytes: Some(u32::MAX)
+                max_bytes: Some(u32::MAX),
+                min_bytes: 1
             }
         );
         for bound in ["-1", "1.5", "4294967296", "\"4\"", "null"] {
@@ -5422,6 +5459,86 @@ mod tests {
                 "string of 5 bytes".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn a_bounded_string_holds_its_declared_minimum_and_a_minimum_of_zero_keeps_the_empty_text_a_value()
+     {
+        let schemas = parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"string","maxBytes":4,"minBytes":2}}},"ho":{"kind":"object","fields":{"note":{"kind":"string","maxBytes":4,"minBytes":0}}}}"#,
+        )
+        .unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
+        let zero_minimum_event = |text: &str| {
+            let mut event = note_event(text);
+            event[8] = b'o';
+            event
+        };
+        let refusal = |result: Result<(), BatchValidationError>| match result {
+            Err(BatchValidationError::Violation { violation, .. }) => (
+                violation.path.clone(),
+                violation.expected.clone(),
+                violation.observed.clone(),
+            ),
+            other => panic!("a text outside its range is refused: {other:?}"),
+        };
+        let short = (
+            "value.note".to_owned(),
+            "string of 2 to 4 bytes".to_owned(),
+            "string of 1 bytes".to_owned(),
+        );
+        assert_eq!(
+            refusal(prepared.validate_json_batch(br#"[{"type":"hi","value":{"note":"a"}}]"#)),
+            short
+        );
+        assert_eq!(
+            refusal(
+                prepared
+                    .validate_msgpack_batch(&note_event("a"), true)
+                    .map(|_| ())
+            ),
+            short
+        );
+        assert_eq!(
+            prepared.validate_json_batch(br#"[{"type":"hi","value":{"note":"ab"}}]"#),
+            Ok(())
+        );
+        assert_eq!(
+            prepared.validate_json_batch(br#"[{"type":"ho","value":{"note":""}}]"#),
+            Ok(())
+        );
+        assert_eq!(
+            prepared
+                .validate_msgpack_batch(&zero_minimum_event(""), true)
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            refusal(
+                prepared
+                    .validate_msgpack_batch(&zero_minimum_event("notes"), true)
+                    .map(|_| ())
+            ),
+            (
+                "value.note".to_owned(),
+                "string of 0 to 4 bytes".to_owned(),
+                "string of 5 bytes".to_owned(),
+            )
+        );
+        // A minimum needs a maximum, and is at most it.
+        for tree in [
+            r#"{"kind":"string","minBytes":0}"#,
+            r#"{"kind":"string","maxBytes":4,"minBytes":5}"#,
+            r#"{"kind":"string","maxBytes":4,"minBytes":-1}"#,
+        ] {
+            assert_eq!(
+                SemanticSchema::from_tree_bytes(tree.as_bytes()),
+                Err(SchemaParseError::InvalidOperand),
+                "{tree}"
+            );
+        }
     }
     //#endregion smoo/columine!n/vocab-bounded-string
 }

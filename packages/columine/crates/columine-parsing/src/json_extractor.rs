@@ -2794,6 +2794,41 @@ mod tests {
         }
     }
 
+    /// With a minimum of zero the empty text is a value: an optional such
+    /// string stores it, and only a missing member is the empty cell.
+    #[test]
+    fn an_optional_string_with_a_minimum_of_zero_stores_its_empty_text() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4,"minBytes":0}}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 3).expect("column plane fits");
+        let mut work = [0; 512];
+        assert_eq!(
+            extract(
+                br#"[{"type":"hi","value":{"note":""}},{"type":"hi","value.note":""},{"type":"hi","value":{}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            ),
+            Ok(3)
+        );
+        let empty = Some(ColumnValue::Utf8(std::borrow::Cow::Owned(String::new())));
+        assert_eq!(columns.cell(1, 0), empty);
+        assert_eq!(columns.cell(1, 1), empty);
+        assert_eq!(columns.cell(1, 2), None);
+    }
     /// Extraction does not know a union's arm: a member's empty text is the
     /// empty cell only when no arm holds an empty text under its name as data.
     #[test]

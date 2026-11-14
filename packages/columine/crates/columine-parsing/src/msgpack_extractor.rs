@@ -1341,6 +1341,48 @@ mod tests {
             assert_eq!(columns.cell(2, row), utf8(""), "row {row} keeps its text");
         }
     }
+
+    /// With a minimum of zero the empty text is a value: an optional such
+    /// string stores it, and only a missing member is the empty cell.
+    #[test]
+    fn an_optional_string_with_a_minimum_of_zero_stores_its_empty_text() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4,"minBytes":0}}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let hi = text("hi");
+        let mut rows = vec![0x82];
+        str_(&mut rows, "type");
+        rows.extend(&hi);
+        str_(&mut rows, "value");
+        rows.extend(one_member("note", &[0xa0]));
+        rows.push(0x82);
+        str_(&mut rows, "type");
+        rows.extend(&hi);
+        str_(&mut rows, "value");
+        rows.push(0x80);
+        let mut columns = DynamicColumns::new(&fields, 2).expect("column plane fits");
+        let mut work = [0; 64];
+        assert_eq!(
+            extract(&rows, &config, &mut columns, &mut work, true),
+            Ok(2)
+        );
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Utf8(std::borrow::Cow::Owned(String::new())))
+        );
+        assert_eq!(columns.cell(1, 1), None);
+    }
     //#endregion smoo/columine!n/vocab-bounded-string
     /// A JavaScript number above u32 arrives as float64 under standard
     /// MessagePack (the 64-bit integer markers are reserved for BigInt), and

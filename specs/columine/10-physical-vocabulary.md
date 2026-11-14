@@ -190,13 +190,16 @@ One table for both lanes; a value of another kind is refused naming the column.
 | text hash column         | a text, stored as the hash the embedder computes; on a wire with bytes also a 32-byte hash     |
 
 **A bounded string.** <a id="smoo/columine!n/vocab-bounded-string"></a> A semantic `string` node may bound a text's
-UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A bounded string is never empty: it
-holds from one byte to `N`. An empty or a longer text is a payload violation judged before extraction on every lane,
-expected `string of 1 to N bytes`, observed `string of M bytes`; a member the node does not define refuses the schema.
-An empty text under an `optional` bounded string is the empty state, as a null is: it is admitted, and every lane stores
-it as a missing member. A payload member's cell is the empty cell, in both payload spellings; inside a structured value
-the embedder writes (a member's cell or a declared-record member) an object, map or record member is left out and an
-array item is null. Extraction does not know which arm of a union a value conformed to: under a union root the empty
+UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A bounded string holds from its minimum
+to `N` bytes: the minimum is one byte unless the node states it, `{"kind":"string","maxBytes":N,"minBytes":M}`, `M` a
+`u32` from zero to `N`; a `minBytes` with no `maxBytes`, or past it, refuses the schema. A shorter or a longer text is a
+payload violation judged before extraction on every lane, expected `string of M to N bytes`, observed
+`string of L bytes`; a member the node does not define refuses the schema. Where the minimum is at least one the empty
+text is no value, so an empty text under an `optional` such string is the empty state, as a null is; with a minimum of
+zero the empty text is a value, stored as given, also under `optional`. The empty state is admitted, and every lane
+stores it as a missing member. A payload member's cell is the empty cell, in both payload spellings; inside a structured
+value the embedder writes (a member's cell or a declared-record member) an object, map or record member is left out and
+an array item is null. Extraction does not know which arm of a union a value conformed to: under a union root the empty
 cell is stored only when no arm holds an empty text under that member's name as data, and beneath a union inside a
 structured value the text stays as given. With no embedder, a structured member's MessagePack cell keeps the value as
 the producer spelled it. The Utf8 plane itself has no bound. **The instant grammar.**
