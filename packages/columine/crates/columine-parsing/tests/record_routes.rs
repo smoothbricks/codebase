@@ -33,6 +33,18 @@ fn render(value: &dyn ValueView) -> String {
             Some(NumberValue::Float(number)) => number.to_string(),
             None => "number".to_owned(),
         },
+        ValueKind::Object => {
+            let mut members = Vec::new();
+            value.visit_object(&mut |name, member| {
+                members.push(format!("{name}:{}", render(member)))
+            });
+            format!("{{{}}}", members.join(","))
+        }
+        ValueKind::Array => {
+            let mut items = Vec::new();
+            value.visit_array(&mut |_, item| items.push(render(item)));
+            format!("[{}]", items.join(","))
+        }
         kind => kind.as_str().to_owned(),
     }
 }
@@ -180,6 +192,7 @@ enum Mp<'a> {
     Str(&'a str),
     Int(u8),
     Map(Vec<(&'a str, Mp<'a>)>),
+    Arr(Vec<Mp<'a>>),
 }
 
 fn msgpack(out: &mut Vec<u8>, value: &Mp<'_>) {
@@ -194,6 +207,12 @@ fn msgpack(out: &mut Vec<u8>, value: &Mp<'_>) {
             for (key, value) in entries {
                 msgpack(out, &Mp::Str(key));
                 msgpack(out, value);
+            }
+        }
+        Mp::Arr(items) => {
+            out.push(0x90 | u8::try_from(items.len()).unwrap());
+            for item in items {
+                msgpack(out, item);
             }
         }
     }
@@ -454,3 +473,103 @@ fn a_routed_member_reaches_the_declared_record_in_every_spelling_with_or_without
     );
 }
 //#endregion smoo/columine!n/vocab-value-cells
+
+//#region smoo/columine!n/vocab-bounded-string
+/// `box` has a structured column the embedder writes and `meta` is routed to
+/// the declared record; each holds optional bounded strings at depth.
+fn card_config() -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConfig) {
+    let fields = vec![
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+    ];
+    let schemas = parse_schema_envelope(
+        br#"{"card":{"kind":"object","fields":{"box":{"kind":"object","fields":{"tag":{"kind":"optional","value":{"kind":"string","maxBytes":4}},"free":{"kind":"optional","value":{"kind":"string"}},"items":{"kind":"array","item":{"kind":"object","fields":{"tag":{"kind":"optional","value":{"kind":"string","maxBytes":4}}}}}}},"meta":{"kind":"optional","value":{"kind":"object","fields":{"tag":{"kind":"optional","value":{"kind":"string","maxBytes":4}},"by":{"kind":"record","value":{"kind":"optional","value":{"kind":"string","maxBytes":4}}}}}}}}}"#,
+    )
+    .unwrap();
+    let cell = Some(ENCODING.to_owned());
+    let config = build_extraction_config_with_semantic_schemas(
+        &fields,
+        &["type", "value.box", "value.$declared", "value.$undeclared"],
+        &[],
+        Some(&schemas),
+        Some(&PayloadDiscriminator {
+            key: "type".into(),
+            members: Vec::new(),
+        }),
+        CellLayout {
+            cell_metadata: &[None, cell.clone(), cell.clone(), cell],
+            record_members: &[RecordMember {
+                discriminant: "card".into(),
+                member: "meta".into(),
+                path: vec![4],
+                descriptor_position: 9,
+            }],
+            encoding: Some(ENCODING),
+            ..CellLayout::default()
+        },
+    )
+    .unwrap();
+    (fields, config)
+}
+
+/// An empty text under an optional bounded string inside a structured value
+/// is the empty state there too: the cell and the record member the embedder
+/// writes hold no such member, in both spellings and on both lanes; an
+/// unbounded string keeps its empty text.
+#[test]
+fn a_structured_cell_holds_no_empty_text_of_an_optional_bounded_string() {
+    const JSON: &[u8] = br#"[
+        {"type":"card","value":{"box":{"tag":"","free":"","items":[{"tag":""},{"tag":"t"}]},"meta":{"tag":"","by":{"a":"","b":"x"}}}},
+        {"value.box":{"tag":"","free":"","items":[{"tag":""},{"tag":"t"}]},"value.meta":{"tag":"","by":{"a":"","b":"x"}},"type":"card"}
+    ]"#;
+    use Mp::{Arr, Map, Str};
+    let card_box = || {
+        Map(vec![
+            ("tag", Str("")),
+            ("free", Str("")),
+            (
+                "items",
+                Arr(vec![
+                    Map(vec![("tag", Str(""))]),
+                    Map(vec![("tag", Str("t"))]),
+                ]),
+            ),
+        ])
+    };
+    let meta = || {
+        Map(vec![
+            ("tag", Str("")),
+            ("by", Map(vec![("a", Str("")), ("b", Str("x"))])),
+        ])
+    };
+    let events = [
+        Map(vec![
+            ("type", Str("card")),
+            ("value", Map(vec![("box", card_box()), ("meta", meta())])),
+        ]),
+        Map(vec![
+            ("value.box", card_box()),
+            ("value.meta", meta()),
+            ("type", Str("card")),
+        ]),
+    ];
+    let mut packed = vec![0x90 | u8::try_from(events.len()).unwrap()];
+    for event in &events {
+        msgpack(&mut packed, event);
+    }
+    let (fields, config) = card_config();
+    let row = [
+        r#"member 1 {free:"",items:[{},{tag:"t"}]}"#.to_owned(),
+        r#"[4]@9={by:{b:"x"}}"#.to_owned(),
+    ];
+    for lane in ["json", "msgpack"] {
+        assert_eq!(
+            extract(lane, &fields, &config, JSON, &packed, [1, 2]),
+            vec![row.clone(), row.clone()],
+            "{lane}: [value.box, value.$declared] per row"
+        );
+    }
+}
+//#endregion smoo/columine!n/vocab-bounded-string

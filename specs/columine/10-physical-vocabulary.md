@@ -193,10 +193,13 @@ One table for both lanes; a value of another kind is refused naming the column.
 UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A bounded string is never empty: it
 holds from one byte to `N`. An empty or a longer text is a payload violation judged before extraction on every lane,
 expected `string of 1 to N bytes`, observed `string of M bytes`; a member the node does not define refuses the schema.
-An empty text under an `optional` bounded string is the empty state, as a null is: it is admitted, and for a payload
-member every lane stores the empty cell, the same as a missing member, in both payload spellings. Under a union root the
-empty cell is stored only when no arm holds an empty text under that member's name as data, because extraction does not
-know the arm. The Utf8 plane itself has no bound. **The instant grammar.**
+An empty text under an `optional` bounded string is the empty state, as a null is: it is admitted, and every lane stores
+it as a missing member. A payload member's cell is the empty cell, in both payload spellings; inside a structured value
+the embedder writes (a member's cell or a declared-record member) an object, map or record member is left out and an
+array item is null. Extraction does not know which arm of a union a value conformed to: under a union root the empty
+cell is stored only when no arm holds an empty text under that member's name as data, and beneath a union inside a
+structured value the text stays as given. With no embedder, a structured member's MessagePack cell keeps the value as
+the producer spelled it. The Utf8 plane itself has no bound. **The instant grammar.**
 <a id="smoo/columine!n/vocab-instant-grammar"></a> One reader, `columine_parsing::instant`, reads an instant's text for
 every lane and for any host that names it: RFC 3339 with an uppercase `T`, a four-digit year 0000 to 9999, a real
 calendar date, hours 00 to 23, minutes and seconds 00 to 59 (no leap second), an optional fraction of one or more

@@ -109,6 +109,80 @@ impl JsonValue {
     }
 }
 
+/// An owned value tree a lane parsed, as [`drop_empty_texts`] edits it.
+pub(crate) trait ValueTree: Sized {
+    /// An object member's name.
+    type Name: AsRef<str>;
+    /// The null a dropped array item leaves in its place.
+    const NULL: Self;
+    fn is_empty_text(&self) -> bool;
+    fn members_mut(&mut self) -> Option<&mut Vec<(Self::Name, Self)>>;
+    fn items_mut(&mut self) -> Option<&mut Vec<Self>>;
+}
+
+/// Leave `tree`, a value `schema` admitted, without the empty texts that are
+/// empty states beneath it ([`SemanticSchema::empty_text_is_empty`]): an
+/// object, map or record member is dropped, as a missing one, and an array
+/// item becomes null. Beneath a union nothing is dropped: the arm a value
+/// conformed to is not known here.
+pub(crate) fn drop_empty_texts<T: ValueTree>(schema: &SemanticSchema, tree: &mut T) {
+    fn keep<T: ValueTree>(schema: &SemanticSchema, tree: &mut T) -> bool {
+        if schema.empty_text_is_empty() && tree.is_empty_text() {
+            return false;
+        }
+        drop_empty_texts(schema, tree);
+        true
+    }
+    match schema {
+        SemanticSchema::Optional(inner) => drop_empty_texts(inner, tree),
+        SemanticSchema::Object { fields, .. } => {
+            if let Some(members) = tree.members_mut() {
+                members.retain_mut(|(name, member)| {
+                    fields
+                        .iter()
+                        .find(|(field, _)| field.as_str() == name.as_ref())
+                        .is_none_or(|(_, field)| keep(field, member))
+                });
+            }
+        }
+        SemanticSchema::Record(item) | SemanticSchema::Map { value: item, .. } => {
+            if let Some(members) = tree.members_mut() {
+                members.retain_mut(|(_, member)| keep(item, member));
+            }
+        }
+        SemanticSchema::Array { item, .. } => {
+            for element in tree.items_mut().into_iter().flatten() {
+                if !keep(item, element) {
+                    *element = T::NULL;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ValueTree for JsonValue {
+    type Name = String;
+    const NULL: Self = Self::Null;
+
+    fn is_empty_text(&self) -> bool {
+        matches!(self, Self::String(text) if text.is_empty())
+    }
+
+    fn members_mut(&mut self) -> Option<&mut Vec<(String, Self)>> {
+        match self {
+            Self::Object(members) => Some(members),
+            _ => None,
+        }
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Self>> {
+        match self {
+            Self::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+}
 impl ValueView for JsonValue {
     fn kind(&self) -> ValueKind {
         match self {
@@ -785,6 +859,20 @@ impl SemanticSchema {
         matches!(self, Self::Optional(inner) if inner.is_bounded_string())
     }
 
+    /// Whether a value of this schema can hold, at any depth beneath it, an
+    /// empty text that is an empty state. Beneath a union none is counted:
+    /// the arm a value conformed to is not known at extraction.
+    pub(crate) fn states_empty_text_below(&self) -> bool {
+        let states = |inner: &Self| inner.empty_text_is_empty() || inner.states_empty_text_below();
+        match self {
+            Self::Optional(inner) => inner.states_empty_text_below(),
+            Self::Object { fields, .. } => fields.iter().any(|(_, field)| states(field)),
+            Self::Array { item, .. } | Self::Record(item) => states(item),
+            Self::Map { value, .. } => states(value),
+            _ => false,
+        }
+    }
+
     /// Whether an event that conforms to this union arm holds no empty text
     /// as data under `member`: an object that declares `member` with an empty
     /// text as its empty state, or a closed object that does not declare it.
@@ -849,22 +937,37 @@ pub fn collect_dynamic_members<E>(
     }
 }
 
-/// Visit every top-level payload member of `schema` whose empty text is its
-/// empty state ([`SemanticSchema::empty_text_is_empty`]): an object root's
-/// fields, beneath any `optional`. The extractors collect it once per event
-/// type and store the empty cell for such a member's empty text, as for a
-/// missing member. Extraction does not know which arm of a union a value
-/// conformed to, so a union root's member is visited only when no arm holds
-/// an empty text under that name as data.
+/// Where a payload member states an empty text as an empty state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmptyText {
+    /// The member is an optional bounded string: its own empty text is its
+    /// empty state.
+    Member,
+    /// The member's structured value holds such a string beneath it
+    /// ([`SemanticSchema::states_empty_text_below`]).
+    Below,
+}
+
+/// Visit every top-level payload member of `schema` that states an empty
+/// text as an empty state ([`SemanticSchema::empty_text_is_empty`]), itself
+/// or beneath it: an object root's fields, beneath any `optional`. The
+/// extractors collect it once per event type; they store the empty cell for
+/// such a member's empty text, as for a missing member, and drop such a text
+/// from a structured value ([`drop_empty_texts`]). Extraction does not know
+/// which arm of a union a value conformed to, so a union root's member is
+/// visited only for its own empty text, and only when no arm holds an empty
+/// text under that name as data.
 pub(crate) fn collect_empty_text_members<E>(
     schema: &SemanticSchema,
-    visit: &mut impl FnMut(&str) -> Result<(), E>,
+    visit: &mut impl FnMut(&str, EmptyText) -> Result<(), E>,
 ) -> Result<(), E> {
     match schema {
         SemanticSchema::Object { fields, .. } => {
             for (name, field) in fields {
                 if field.empty_text_is_empty() {
-                    visit(name)?;
+                    visit(name, EmptyText::Member)?;
+                } else if field.states_empty_text_below() {
+                    visit(name, EmptyText::Below)?;
                 }
             }
             Ok(())
@@ -874,7 +977,7 @@ pub(crate) fn collect_empty_text_members<E>(
                 if field.empty_text_is_empty()
                     && variants.iter().all(|arm| arm.holds_no_empty_text(name))
                 {
-                    visit(name)?;
+                    visit(name, EmptyText::Member)?;
                 }
             }
             Ok(())
@@ -2814,6 +2917,28 @@ pub(crate) enum MsgpackValue<'a> {
     Object(Vec<(&'a str, Self)>),
 }
 
+impl<'a> ValueTree for MsgpackValue<'a> {
+    type Name = &'a str;
+    const NULL: Self = Self::Null;
+
+    fn is_empty_text(&self) -> bool {
+        matches!(self, Self::String(""))
+    }
+
+    fn members_mut(&mut self) -> Option<&mut Vec<(&'a str, Self)>> {
+        match self {
+            Self::Object(members) => Some(members),
+            _ => None,
+        }
+    }
+
+    fn items_mut(&mut self) -> Option<&mut Vec<Self>> {
+        match self {
+            Self::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+}
 impl ValueView for MsgpackValue<'_> {
     fn kind(&self) -> ValueKind {
         match self {

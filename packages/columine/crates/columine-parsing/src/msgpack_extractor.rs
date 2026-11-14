@@ -439,7 +439,7 @@ fn extract_msgpack_member(
     frames: &mut FrameWrites<'_>,
     discriminant: Option<&str>,
     event_type: Option<&str>,
-    empty: EmptyCell,
+    empty: EmptyCell<'_>,
     lookup_name: Option<&str>,
     member: Option<&str>,
     key: &[u8],
@@ -523,6 +523,7 @@ fn extract_msgpack_member(
                     lookup.column,
                     cell,
                     capture,
+                    empty,
                     null,
                     opaque(takes),
                     frames,
@@ -543,7 +544,8 @@ fn extract_msgpack_member(
     {
         // A record member takes the opaque extension exactly when it is
         // dynamic, which is when its null is data.
-        let value = msgpack_value(reader, opaque(empty.null == NullCell::Data))?;
+        let mut value = msgpack_value(reader, opaque(empty.null == NullCell::Data))?;
+        empty.state(&mut value);
         return crate::record_cell(row, &value, empty.null, cells);
     }
     if opaque_here {
@@ -922,6 +924,7 @@ fn seam_member(
     column: usize,
     cell: SeamCell,
     capture: Option<(&SemanticSchema, &str)>,
+    empty: EmptyCell<'_>,
     null: NullCell,
     opaque: OpaqueCell<'_>,
     frames: &mut FrameWrites<'_>,
@@ -934,7 +937,8 @@ fn seam_member(
         .ok_or(ExtractionError::InvalidJson)?;
     match cell {
         SeamCell::Embedder => {
-            let value = msgpack_value(reader, opaque)?;
+            let mut value = msgpack_value(reader, opaque)?;
+            empty.state(&mut value);
             crate::member_cell(
                 config, columns, column, &value, null, capture, cells, scratch,
             )

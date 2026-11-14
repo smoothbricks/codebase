@@ -252,7 +252,7 @@ pub struct ExtractionConfig {
     /// its empty state: an optional bounded string, in a column or in the
     /// declared record. Such a member's empty text is stored as a missing
     /// member is.
-    pub(crate) empty_text_members: MemberTable<()>,
+    pub(crate) empty_text_members: MemberTable<crate::validate::EmptyText>,
     /// Whether each column's cell is a dynamic value, by column: an explicit
     /// null in it is data whichever member or spelling reached it.
     pub(crate) dynamic_columns: Vec<bool>,
@@ -357,21 +357,34 @@ pub(crate) enum NullCell {
 /// A member's empty states beyond a missing key, from its declared semantic
 /// schema ([`ExtractionConfig::empty_cell`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EmptyCell {
+pub(crate) struct EmptyCell<'a> {
     /// What an explicit null in the member's place in the declared record is.
     pub(crate) null: NullCell,
     /// Whether an empty text is the member's empty state, in a column or in
     /// the declared record: an optional bounded string's is.
     pub(crate) empty_text: bool,
+    /// The member's schema when its structured value can hold, beneath it,
+    /// an empty text that is an empty state: the value is handed to the
+    /// embedder without those ([`Self::state`]).
+    pub(crate) below: Option<&'a crate::validate::SemanticSchema>,
 }
 
-impl EmptyCell {
+impl EmptyCell<'_> {
     /// A member no semantic schema judges: its null is empty and its empty
     /// text is data.
     pub(crate) const NULL: Self = Self {
         null: NullCell::Empty,
         empty_text: false,
+        below: None,
     };
+
+    /// Leave a structured value of the member without the empty texts that
+    /// are empty states beneath it, as the embedder is to write it.
+    pub(crate) fn state<T: crate::validate::ValueTree>(&self, value: &mut T) {
+        if let Some(schema) = self.below {
+            crate::validate::drop_empty_texts(schema, value);
+        }
+    }
 }
 
 /// Certified value-object frames, each paired with the batch slice it was
@@ -413,9 +426,14 @@ impl ExtractionConfig {
     /// optional bounded string, wherever the member is placed. An event of no
     /// known type judges no member, so its nulls are empty and its empty
     /// texts data.
-    pub(crate) fn empty_cell(&self, event_type: Option<&str>, member: &str) -> EmptyCell {
+    pub(crate) fn empty_cell(&self, event_type: Option<&str>, member: &str) -> EmptyCell<'_> {
         let Some(event_type) = event_type else {
             return EmptyCell::NULL;
+        };
+        let stated = if self.empty_text_members.is_empty() {
+            None
+        } else {
+            self.empty_text_members.get(event_type, member)
         };
         EmptyCell {
             null: if !self.dynamic_members.is_empty()
@@ -425,8 +443,16 @@ impl ExtractionConfig {
             } else {
                 NullCell::Empty
             },
-            empty_text: !self.empty_text_members.is_empty()
-                && self.empty_text_members.get(event_type, member).is_some(),
+            empty_text: stated == Some(&crate::validate::EmptyText::Member),
+            below: match stated {
+                Some(crate::validate::EmptyText::Below) => {
+                    match self.payload_member_schema(Some(event_type), member) {
+                        MemberSchema::Declared(schema) => Some(schema),
+                        MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
+                    }
+                }
+                _ => None,
+            },
         }
     }
 
@@ -434,7 +460,11 @@ impl ExtractionConfig {
     /// `event_type`. The flat spelling `value.<member>` is that payload
     /// member, whose empty states are the ones the nested spelling gives it;
     /// any other top-level key is a system member, whose null is empty.
-    pub(crate) fn top_level_empty_cell(&self, event_type: Option<&str>, key: &str) -> EmptyCell {
+    pub(crate) fn top_level_empty_cell(
+        &self,
+        event_type: Option<&str>,
+        key: &str,
+    ) -> EmptyCell<'_> {
         key.strip_prefix("value.")
             .map_or(EmptyCell::NULL, |member| {
                 self.empty_cell(event_type, member)
@@ -1427,8 +1457,8 @@ pub fn build_extraction_config_with_semantic_schemas(
             crate::validate::collect_dynamic_members(schema, &mut |member| {
                 dynamic_members.bind(event_type, member, ())
             })?;
-            crate::validate::collect_empty_text_members(schema, &mut |member| {
-                empty_text_members.bind(event_type, member, ())
+            crate::validate::collect_empty_text_members(schema, &mut |member, stated| {
+                empty_text_members.bind(event_type, member, stated)
             })?;
         }
     }

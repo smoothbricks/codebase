@@ -740,7 +740,7 @@ fn extract_named_member(
     extra_count: &mut u32,
     discriminant: Option<&str>,
     member_schema: MemberSchema<'_>,
-    empty: EmptyCell,
+    empty: EmptyCell<'_>,
     column_name: &str,
     member: &str,
     payload_name: &str,
@@ -787,6 +787,7 @@ fn extract_named_member(
                 lookup.column,
                 cell,
                 capture_schema.map(|schema| (schema, payload_name)),
+                empty,
                 null,
                 cells,
                 scratch,
@@ -844,7 +845,8 @@ fn extract_named_member(
     // row's declared record, under its routing row, whether or not a semantic
     // schema judged it.
     if placed && let Some(row) = config.record_route(discriminant, member) {
-        let value = json_value(parser)?;
+        let mut value = json_value(parser)?;
+        empty.state(&mut value);
         return crate::record_cell(row, &value, empty.null, cells);
     }
     match config.carrier() {
@@ -1675,11 +1677,13 @@ fn seam_member(
     column: usize,
     cell: SeamCell,
     capture: Option<(&SemanticSchema, &str)>,
+    empty: EmptyCell<'_>,
     null: NullCell,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
-    let value = json_value(parser)?;
+    let mut value = json_value(parser)?;
+    empty.state(&mut value);
     match cell {
         SeamCell::Embedder => crate::member_cell(
             config, columns, column, &value, null, capture, cells, scratch,
