@@ -29,7 +29,7 @@ pub use columine_arrow::{
     MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, PlaneKind, SignalSchemaField,
 };
 use columine_arrow::{
-    DictionaryEncoding, DictionarySlot, RecordMember, SchemaDictionary, TextColumn,
+    DictionaryEncoding, DictionarySlot, DynamicMember, RecordMember, SchemaDictionary, TextColumn,
 };
 use columine_types::category::CategoryImage;
 use columine_types::cells::{
@@ -241,9 +241,10 @@ pub struct ExtractionConfig {
     /// encoded against a schema dictionary, by column: a lane stores a text's
     /// index among that dictionary's values.
     pub(crate) column_dictionaries: Vec<Option<usize>>,
-    /// `(event type, payload member)` for every member its event's schema
-    /// declares dynamic, under an object root or any arm of a union root:
-    /// an explicit null in that member's cell is data, never the empty state.
+    /// `(event type, payload member)` for every dynamic member: those an
+    /// event's schema declares dynamic, under an object root or any arm of a
+    /// union root, and those the schema's owner names. An explicit null in
+    /// such a member's cell is data, never the empty state.
     pub(crate) dynamic_members: MemberTable<()>,
     /// Who writes each column's cells, by column ([`CellRole`]).
     pub(crate) cell_roles: Vec<CellRole>,
@@ -379,6 +380,13 @@ impl ExtractionConfig {
             }
             _ => NullCell::Empty,
         }
+    }
+
+    /// Whether a lane reads an event's `type`: its schema routes and judges
+    /// the event's members, and a named dynamic member is keyed by it. A
+    /// configuration with neither never decodes it.
+    pub(crate) fn reads_event_type(&self) -> bool {
+        self.semantic_schemas.is_some() || !self.dynamic_members.is_empty()
     }
     pub(crate) fn is_open_payload_path(&self, path: &str) -> bool {
         self.open_paths.iter().any(|open| open == path)
@@ -609,6 +617,8 @@ pub struct CellLayout<'a> {
     pub cell_metadata: &'a [Option<String>],
     pub record_members: &'a [RecordMember],
     pub text_columns: &'a [TextColumn],
+    /// Members whose explicit null is data, named by the schema's owner.
+    pub dynamic_members: &'a [DynamicMember],
     pub encoding: Option<&'a str>,
 }
 
@@ -1259,6 +1269,9 @@ pub fn build_extraction_config_with_semantic_schemas(
                 dynamic_members.bind(event_type, member, ())
             })?;
         }
+    }
+    for named in cells.dynamic_members {
+        dynamic_members.bind(&named.event_type, &named.member, ())?;
     }
     if let Some(discriminator) = discriminator {
         for member in &discriminator.members {

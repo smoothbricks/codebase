@@ -7,8 +7,8 @@
 use arrow_schema::{DataType, Field};
 use columine_arrow::schema::PayloadDiscriminator;
 use columine_arrow::{
-    ArrowType, CELL_ENCODING_KEY, DynamicSchemaConfig, RecordMember, SignalSchemaField, TextColumn,
-    logical_schema_ipc_bytes,
+    ArrowType, CELL_ENCODING_KEY, DynamicMember, DynamicSchemaConfig, RecordMember,
+    SignalSchemaField, TextColumn, logical_schema_ipc_bytes,
 };
 use columine_event_processor::{
     CellRefusal, CellTarget, EpInitError, EventProcessor, InputFormat, NoValueCells, ParseOptions,
@@ -241,6 +241,7 @@ enum Mp<'a> {
     Str(&'a str),
     Int(i64),
     Bool(bool),
+    Nil,
     Bin(&'a [u8]),
     Map(Vec<(&'a str, Mp<'a>)>),
 }
@@ -257,6 +258,7 @@ fn msgpack(out: &mut Vec<u8>, value: &Mp<'_>) {
             out.extend(value.to_be_bytes());
         }
         Mp::Bool(flag) => out.push(if *flag { 0xc3 } else { 0xc2 }),
+        Mp::Nil => out.push(0xc0),
         Mp::Bin(bytes) => {
             out.push(0xc4);
             out.push(u8::try_from(bytes.len()).unwrap());
@@ -651,6 +653,73 @@ fn a_raw_binary_field_takes_bytes_and_refuses_a_structured_value_beside_an_embed
         assert_eq!(
             ep.parse(&input, format).err().map(|error| error.code),
             Some(ResultCode::ParseError),
+            "{format:?}"
+        );
+    }
+}
+/// A schema with no semantic schema and no discriminator whose owner names
+/// `order.data` dynamic: `type`, the member's cell and a plain member's.
+fn unjudged_dynamic_schema() -> DynamicSchemaConfig {
+    DynamicSchemaConfig {
+        semantic_schema: None,
+        payload_discriminator: None,
+        dynamic_members: vec![DynamicMember {
+            event_type: "order".into(),
+            member: "data".into(),
+        }],
+        ..schema(
+            &[
+                utf8("type"),
+                binary("value.data", Some(ENCODING)),
+                binary("value.other", Some(ENCODING)),
+            ],
+            "{}",
+        )
+    }
+}
+
+#[test]
+fn a_named_dynamic_member_keeps_null_as_data_without_a_semantic_schema() {
+    let batches = [
+        (
+            InputFormat::Json,
+            // The second event spells `value` before `type`.
+            br#"[{"type":"order","value":{"data":null,"other":null}},{"value":{"data":null},"type":"order"},{"type":"note","value":{"data":null}}]"#
+                .to_vec(),
+        ),
+        (InputFormat::Msgpack, {
+            let event = |kind, payload| Mp::Map(vec![("type", Mp::Str(kind)), ("value", payload)]);
+            let mut out = vec![0x93];
+            msgpack(
+                &mut out,
+                &event(
+                    "order",
+                    Mp::Map(vec![("data", Mp::Nil), ("other", Mp::Nil)]),
+                ),
+            );
+            msgpack(
+                &mut out,
+                &Mp::Map(vec![
+                    ("value", Mp::Map(vec![("data", Mp::Nil)])),
+                    ("type", Mp::Str("order")),
+                ]),
+            );
+            msgpack(&mut out, &event("note", Mp::Map(vec![("data", Mp::Nil)])));
+            out
+        }),
+    ];
+    for (format, input) in batches {
+        let mut ep = embedded(unjudged_dynamic_schema()).unwrap();
+        assert_eq!(
+            cells(&mut ep, &input, format, &[1, 2]),
+            [
+                // The dynamic member's null is the embedder's cell; any
+                // other member's null is the empty cell.
+                [bytes("member 1 null"), None],
+                [bytes("member 1 null"), None],
+                // Another event type's member of that name is not dynamic.
+                [None, None],
+            ],
             "{format:?}"
         );
     }

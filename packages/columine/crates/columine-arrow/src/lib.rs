@@ -35,9 +35,9 @@ pub use record_batch::{
 };
 pub use schema::{
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, CELL_ENCODING_KEY, DictionaryEncoding,
-    DictionarySlot, DynamicSchemaConfig, FIELD_DESCRIPTOR_BYTES, FIELD_IDENTITY_KEY, IndexWidth,
-    MAX_FIXED_SIZE_BINARY_WIDTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES, PlaneKind,
-    RecordMember, SchemaDictionary, SchemaDictionaryTable, SchemaError, SchemaParts,
+    DictionarySlot, DynamicMember, DynamicSchemaConfig, FIELD_DESCRIPTOR_BYTES, FIELD_IDENTITY_KEY,
+    IndexWidth, MAX_FIXED_SIZE_BINARY_WIDTH, MAX_SCHEMA_FIELDS, MAX_SCHEMA_MESSAGE_BYTES,
+    PlaneKind, RecordMember, SchemaDictionary, SchemaDictionaryTable, SchemaError, SchemaParts,
     SignalSchemaField, TIME_UNITS, TIMESTAMP_ZONE, TextColumn, compute_buffer_count,
     logical_schema_ipc_bytes, schema_ipc_bytes, time_unit, time_unit_code, units_per_second,
 };

@@ -529,6 +529,7 @@ impl<A: VoAdmission, G: AddressGrammar, C: ValueCells> EventProcessor<A, G, C> {
                         cell_metadata: &schema_config.cell_metadata,
                         record_members: &schema_config.record_members,
                         text_columns: &schema_config.text_columns,
+                        dynamic_members: &schema_config.dynamic_members,
                         encoding: cells.as_ref().map(ValueCells::encoding),
                     },
                 )

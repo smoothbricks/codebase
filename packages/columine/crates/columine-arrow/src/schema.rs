@@ -842,6 +842,15 @@ pub struct RecordMember {
     pub descriptor_position: u32,
 }
 
+/// One payload member whose explicit null is data: a dynamic value, which
+/// holds a null as it holds any other value, so its cell is present where
+/// every other member's null is the empty cell. `event_type` is the value of
+/// the event's `type` member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicMember {
+    pub event_type: String,
+    pub member: String,
+}
 /// One text member's columns: its content hash, a `FixedSizeBinary(32)`
 /// column, and the Utf8 column that holds the bytes of a text stored inline,
 /// when the schema has one.
@@ -886,6 +895,9 @@ pub struct DynamicSchemaConfig {
     pub record_members: Vec<RecordMember>,
     /// The schema's text members; empty when it has none.
     pub text_columns: Vec<TextColumn>,
+    /// Payload members whose explicit null is data, named by the schema's
+    /// owner; a semantic schema's own dynamic members need no entry.
+    pub dynamic_members: Vec<DynamicMember>,
 }
 
 impl DynamicSchemaConfig {
@@ -1069,6 +1081,7 @@ impl DynamicSchemaConfig {
             payload_discriminator: None,
             record_members: Vec::new(),
             text_columns: Vec::new(),
+            dynamic_members: Vec::new(),
             schema_bytes: preamble(schema_bytes, &dictionaries)?,
             schema_message_len: schema_bytes.len(),
             field_metadata,

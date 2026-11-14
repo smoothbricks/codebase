@@ -240,7 +240,7 @@ fn extract_msgpack_fields(
             )
         {
             saw_nested_value = true;
-            if event_type.is_none() && config.semantic_schemas.is_some() {
+            if event_type.is_none() && config.reads_event_type() {
                 event_type = lookahead_event_type(reader, fields - field_index - 1);
             }
             let members = reader

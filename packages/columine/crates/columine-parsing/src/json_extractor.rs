@@ -524,7 +524,7 @@ fn extract_json_event_open(
                 }
             }
         } else if is_type
-            && config.semantic_schemas.is_some()
+            && config.reads_event_type()
             && let Ok(Token::String(value)) = parser.peek_token()
         {
             // Only armed routing reads the signal type, so unarmed parsing never decodes it.
@@ -557,7 +557,7 @@ fn extract_json_event_open(
             && matches!(parser.peek_token(), Ok(Token::ObjectBegin))
         {
             saw_nested_value = true;
-            if event_type.is_none() && config.semantic_schemas.is_some() {
+            if event_type.is_none() && config.reads_event_type() {
                 event_type = lookahead_event_type(parser)?;
             }
             parser.expect_object_begin().map_err(lex_error)?;

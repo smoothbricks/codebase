@@ -133,6 +133,11 @@ never from its bytes; creation refuses a Binary field whose `sb.cell` names an e
 (`sb.cell` absent or `msgpack`). This is columine's own standalone form, not any embedder's stored form. It has no
 record and no text: a schema with a routing row or a text column is refused at creation.
 
+**A dynamic member's null is data.** <a id="smoo/columine!n/vocab-dynamic-null"></a> A dynamic value holds a null as it
+holds any other value, so an explicit null in a dynamic member's cell is a present cell, written like every other value
+of that member; a null in any other member is the empty cell, the same as a missing member. A member is dynamic when its
+event's semantic schema declares it so, or when the schema's owner names it at creation as `(event type, member)`
+(`DynamicSchemaConfig::dynamic_members`), which lets a processor created without a semantic schema keep the rule.
 **Placement is total.** Where a schema gives payload members columns of their own (a `value.<member>` column exists),
 every top-level member a semantic schema declares has a column or a routing row, or creation refuses the schema. A
 declared member is never dropped and never falls to the carrier. A schema that stores the whole payload in one `value`
