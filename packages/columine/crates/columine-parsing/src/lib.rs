@@ -248,6 +248,11 @@ pub struct ExtractionConfig {
     /// never the empty state. A dynamic member a column places is not here:
     /// it marks its column in [`Self::dynamic_columns`].
     pub(crate) dynamic_members: MemberTable<()>,
+    /// `(event type, payload member)` for every member whose empty text is
+    /// its empty state: an optional bounded string, in a column or in the
+    /// declared record. Such a member's empty text is stored as a missing
+    /// member is.
+    pub(crate) empty_text_members: MemberTable<()>,
     /// Whether each column's cell is a dynamic value, by column: an explicit
     /// null in it is data whichever member or spelling reached it.
     pub(crate) dynamic_columns: Vec<bool>,
@@ -337,7 +342,7 @@ pub(crate) enum MemberSchema<'a> {
 }
 
 /// What an explicit null in a member's cell is, from the member's declared
-/// semantic schema ([`ExtractionConfig::null_cell`]). A typed or structured
+/// semantic schema ([`ExtractionConfig::empty_cell`]). A typed or structured
 /// member keeps null as its one empty state; a dynamic value keeps null as
 /// data at every depth, its top level included.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +352,26 @@ pub(crate) enum NullCell {
     /// The cell is present and holds the MessagePack nil a Binary plane
     /// writes for a null inside any other dynamic value.
     Data,
+}
+
+/// A member's empty states beyond a missing key, from its declared semantic
+/// schema ([`ExtractionConfig::empty_cell`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EmptyCell {
+    /// What an explicit null in the member's place in the declared record is.
+    pub(crate) null: NullCell,
+    /// Whether an empty text is the member's empty state, in a column or in
+    /// the declared record: an optional bounded string's is.
+    pub(crate) empty_text: bool,
+}
+
+impl EmptyCell {
+    /// A member no semantic schema judges: its null is empty and its empty
+    /// text is data.
+    pub(crate) const NULL: Self = Self {
+        null: NullCell::Empty,
+        empty_text: false,
+    };
 }
 
 /// Certified value-object frames, each paired with the batch slice it was
@@ -380,31 +405,40 @@ impl<'p> FrameProjections<'p> {
 }
 
 impl ExtractionConfig {
-    /// What an explicit null in `member`'s place in the declared record is
-    /// for an event of `event_type`: data when the member is dynamic, else
-    /// the empty state. A member a column places is not judged here: its
-    /// column decides ([`Self::column_null`]). An event of no known type
-    /// judges no member, so its nulls are empty.
-    pub(crate) fn null_cell(&self, event_type: Option<&str>, member: &str) -> NullCell {
-        match event_type {
-            Some(event_type)
-                if !self.dynamic_members.is_empty()
-                    && self.dynamic_members.get(event_type, member).is_some() =>
+    /// The empty states of `member` for an event of `event_type`. An
+    /// explicit null in its place in the declared record is data when the
+    /// member is dynamic, else the empty state; a member a column places is
+    /// not judged for its null here: its column decides
+    /// ([`Self::column_null`]). An empty text is the empty state of an
+    /// optional bounded string, wherever the member is placed. An event of no
+    /// known type judges no member, so its nulls are empty and its empty
+    /// texts data.
+    pub(crate) fn empty_cell(&self, event_type: Option<&str>, member: &str) -> EmptyCell {
+        let Some(event_type) = event_type else {
+            return EmptyCell::NULL;
+        };
+        EmptyCell {
+            null: if !self.dynamic_members.is_empty()
+                && self.dynamic_members.get(event_type, member).is_some()
             {
                 NullCell::Data
-            }
-            _ => NullCell::Empty,
+            } else {
+                NullCell::Empty
+            },
+            empty_text: !self.empty_text_members.is_empty()
+                && self.empty_text_members.get(event_type, member).is_some(),
         }
     }
 
-    /// What an explicit null under the top-level `key` of an event of
-    /// `event_type` is in the declared record. The flat spelling
-    /// `value.<member>` is that payload member, whose null is the one the
-    /// nested spelling gives it; any other top-level key is a system member,
-    /// whose null is empty.
-    pub(crate) fn top_level_null_cell(&self, event_type: Option<&str>, key: &str) -> NullCell {
+    /// The empty states under the top-level `key` of an event of
+    /// `event_type`. The flat spelling `value.<member>` is that payload
+    /// member, whose empty states are the ones the nested spelling gives it;
+    /// any other top-level key is a system member, whose null is empty.
+    pub(crate) fn top_level_empty_cell(&self, event_type: Option<&str>, key: &str) -> EmptyCell {
         key.strip_prefix("value.")
-            .map_or(NullCell::Empty, |member| self.null_cell(event_type, member))
+            .map_or(EmptyCell::NULL, |member| {
+                self.empty_cell(event_type, member)
+            })
     }
 
     /// Whether `column`'s cell takes the reserved opaque extension whole: a
@@ -1387,10 +1421,14 @@ pub fn build_extraction_config_with_semantic_schemas(
     let has_value_fields = !payload_map.is_empty();
     let mut variant_map = MemberTable::default();
     let mut dynamic_members = MemberTable::default();
+    let mut empty_text_members = MemberTable::default();
     if let Some(semantic_schemas) = semantic_schemas {
         for (event_type, schema) in semantic_schemas {
             crate::validate::collect_dynamic_members(schema, &mut |member| {
                 dynamic_members.bind(event_type, member, ())
+            })?;
+            crate::validate::collect_empty_text_members(schema, &mut |member| {
+                empty_text_members.bind(event_type, member, ())
             })?;
         }
     }
@@ -1500,6 +1538,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         dictionaries: schema_dictionaries,
         column_dictionaries,
         dynamic_members,
+        empty_text_members,
         dynamic_columns,
         opaque_ext: cells.opaque_ext,
         cell_roles,

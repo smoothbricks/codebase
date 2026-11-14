@@ -1,8 +1,8 @@
 //! JSON extraction and typed-column diagnostics.
 
 use crate::{
-    ArrowType, Carrier, CellWriter, ColumnValue, DynamicColumns, ExtractionConfig, MemberSchema,
-    MemberWrite, NullCell, ParseError, PlaneKind, SeamCell, SignalSchemaField,
+    ArrowType, Carrier, CellWriter, ColumnValue, DynamicColumns, EmptyCell, ExtractionConfig,
+    MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell, SignalSchemaField,
     json_parser::{JsonParser, JsonStr, ParserError, Token},
     validate::{
         JsonValue, SemanticSchema, ValueKind, ValueParseError, ValueView, encode_segment_into,
@@ -594,7 +594,7 @@ fn extract_json_event_open(
                     &mut extra_count,
                     discriminant_name,
                     config.payload_member_schema(event_type.as_deref(), &member),
-                    config.null_cell(event_type.as_deref(), &member),
+                    config.empty_cell(event_type.as_deref(), &member),
                     &column_name,
                     &member,
                     &member,
@@ -628,7 +628,7 @@ fn extract_json_event_open(
             },
             // A top-level key is a system member, whose null is empty, unless
             // it spells a payload member flat (`value.<member>`).
-            config.top_level_null_cell(event_type.as_deref(), &name),
+            config.top_level_empty_cell(event_type.as_deref(), &name),
             &name,
             flat_member.unwrap_or(&name),
             &name,
@@ -740,7 +740,7 @@ fn extract_named_member(
     extra_count: &mut u32,
     discriminant: Option<&str>,
     member_schema: MemberSchema<'_>,
-    record_null: NullCell,
+    empty: EmptyCell,
     column_name: &str,
     member: &str,
     payload_name: &str,
@@ -748,6 +748,12 @@ fn extract_named_member(
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
+    // An optional bounded string's empty text is its empty state: the member
+    // is stored as a missing one is.
+    if empty.empty_text && matches!(parser.peek_token(), Ok(Token::String(text)) if text == "") {
+        parser.next_token().map_err(lex_error)?;
+        return Ok(());
+    }
     // An open schema's undeclared member is the carrier's: it is never
     // written to another type's column, nor placed by a routing row.
     let placed = match member_schema {
@@ -839,7 +845,7 @@ fn extract_named_member(
     // schema judged it.
     if placed && let Some(row) = config.record_route(discriminant, member) {
         let value = json_value(parser)?;
-        return crate::record_cell(row, &value, record_null, cells);
+        return crate::record_cell(row, &value, empty.null, cells);
     }
     match config.carrier() {
         Carrier::Embedder(_) => {
@@ -2738,6 +2744,93 @@ mod tests {
         }
     }
 
+    //#region smoo/columine!n/vocab-bounded-string
+    /// An optional bounded string's empty text is the empty cell in either
+    /// payload spelling, whichever side of it `type` is spelled on, as a
+    /// missing member is; an unbounded string keeps its empty text.
+    #[test]
+    fn an_optional_bounded_strings_empty_text_is_the_empty_cell_in_flat_and_nested_spellings() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4}},"free":{"kind":"optional","value":{"kind":"string"}}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note", "value.free"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 5).expect("column plane fits");
+        let mut work = [0; 512];
+        assert_eq!(
+            extract(
+                br#"[{"type":"hi","value":{"note":"","free":""}},{"type":"hi","value.note":"","value.free":""},{"value.note":"","type":"hi"},{"type":"hi","value":{}},{"type":"hi","value":{"note":"a"}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            ),
+            Ok(5)
+        );
+        let text = |text: &str| Some(ColumnValue::Utf8(std::borrow::Cow::Owned(text.to_owned())));
+        for row in 0..4 {
+            assert_eq!(columns.cell(1, row), None, "row {row}'s note is empty");
+        }
+        assert_eq!(columns.cell(1, 4), text("a"));
+        for row in 0..2 {
+            assert_eq!(columns.cell(2, row), text(""), "row {row} keeps its text");
+        }
+    }
+
+    /// Extraction does not know a union's arm: a member's empty text is the
+    /// empty cell only when no arm holds an empty text under its name as data.
+    #[test]
+    fn a_union_roots_empty_text_is_the_empty_cell_only_when_no_arm_holds_it_as_data() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"union","variants":[{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4}},"name":{"kind":"optional","value":{"kind":"string","maxBytes":4}}}},{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":8}},"name":{"kind":"string"}}}]}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note", "value.name"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 1).expect("column plane fits");
+        let mut work = [0; 512];
+        assert_eq!(
+            extract(
+                br#"[{"type":"hi","value":{"note":"","name":""}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut ExtractionDiagnostic::default(),
+            ),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(1, 0), None);
+        assert_eq!(
+            columns.cell(2, 0),
+            Some(ColumnValue::Utf8(std::borrow::Cow::Owned(String::new())))
+        );
+    }
+    //#endregion smoo/columine!n/vocab-bounded-string
     /// A malformed `type` value is refused on every route. A failed read consumes
     /// nothing, so the read after it meets the same token: skipped, typed, or
     /// discriminated, each reports `InvalidJson`.

@@ -8,9 +8,9 @@ use crate::validate::{
     encoded_segment_len, parse_msgpack_value, push_path_segment,
 };
 use crate::{
-    Carrier, CellWriter, ColumnValue, DynamicColumns, ExtractionConfig, FrameProjections,
-    MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell, SignalSchemaField,
-    json_extractor::ExtractionError,
+    Carrier, CellWriter, ColumnValue, DynamicColumns, EmptyCell, ExtractionConfig,
+    FrameProjections, MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell,
+    SignalSchemaField, json_extractor::ExtractionError,
 };
 use columine_types::category::CategoryImage;
 
@@ -267,11 +267,11 @@ fn extract_msgpack_fields(
                         (
                             Some(column_name.as_str()),
                             Some(name),
-                            config.null_cell(event_type, name),
+                            config.empty_cell(event_type, name),
                         )
                     }
                     // A non-UTF-8 member is undeclared by construction.
-                    Err(_) => (None, None, NullCell::Empty),
+                    Err(_) => (None, None, EmptyCell::NULL),
                 };
                 extract_msgpack_member(
                     reader,
@@ -296,8 +296,8 @@ fn extract_msgpack_fields(
             continue;
         }
         let lookup_name = std::str::from_utf8(key).ok();
-        let null = lookup_name.map_or(NullCell::Empty, |key| {
-            config.top_level_null_cell(event_type, key)
+        let null = lookup_name.map_or(EmptyCell::NULL, |key| {
+            config.top_level_empty_cell(event_type, key)
         });
         // A flat `value.<member>` key is that payload member: it takes the
         // member's discriminated column and routing row, as the nested
@@ -439,7 +439,7 @@ fn extract_msgpack_member(
     frames: &mut FrameWrites<'_>,
     discriminant: Option<&str>,
     event_type: Option<&str>,
-    record_null: NullCell,
+    empty: EmptyCell,
     lookup_name: Option<&str>,
     member: Option<&str>,
     key: &[u8],
@@ -449,6 +449,12 @@ fn extract_msgpack_member(
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), ExtractionError> {
+    // An optional bounded string's empty text is its empty state: the member
+    // is stored as a missing one is.
+    if empty.empty_text && holds_empty_str(reader) {
+        reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+        return Ok(());
+    }
     // A non-UTF-8 key is undeclared by construction: under an open payload
     // object it is captured like any other undeclared member.
     let path = std::str::from_utf8(key).ok();
@@ -537,8 +543,8 @@ fn extract_msgpack_member(
     {
         // A record member takes the opaque extension exactly when it is
         // dynamic, which is when its null is data.
-        let value = msgpack_value(reader, opaque(record_null == NullCell::Data))?;
-        return crate::record_cell(row, &value, record_null, cells);
+        let value = msgpack_value(reader, opaque(empty.null == NullCell::Data))?;
+        return crate::record_cell(row, &value, empty.null, cells);
     }
     if opaque_here {
         return Err(opaque_refusal(cell_path));
@@ -988,6 +994,14 @@ fn holds_ext(reader: &Reader<'_>, ext: i8) -> bool {
             .is_some_and(|(kind, _)| kind == ext)
 }
 
+/// Whether the reader is at an empty str, in any of its forms.
+fn holds_empty_str(reader: &Reader<'_>) -> bool {
+    matches!(
+        reader.input().get(reader.position()..),
+        Some([0xa0, ..] | [0xd9, 0, ..] | [0xda, 0, 0, ..] | [0xdb, 0, 0, 0, 0, ..])
+    )
+}
+
 /// The refusal of the reserved opaque extension outside a cell that takes
 /// it, naming the cell's `path`.
 fn opaque_refusal(path: &str) -> ExtractionError {
@@ -1260,6 +1274,70 @@ mod tests {
         }
     }
 
+    //#region smoo/columine!n/vocab-bounded-string
+    /// An optional bounded string's empty text is the empty cell in either
+    /// payload spelling, whichever side of it `type` is spelled on and
+    /// whichever str form spells it, as a missing member is; an unbounded
+    /// string keeps its empty text.
+    #[test]
+    fn an_optional_bounded_strings_empty_text_is_the_empty_cell_in_flat_and_nested_spellings() {
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+        ];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4}},"free":{"kind":"optional","value":{"kind":"string"}}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["type", "value.note", "value.free"],
+            &[],
+            Some(&schemas),
+            None,
+            crate::CellLayout::default(),
+        )
+        .unwrap();
+        let event = |pairs: &[(&str, &[u8])]| {
+            let mut out = vec![0x80 | pairs.len() as u8];
+            for (key, value) in pairs {
+                str_(&mut out, key);
+                out.extend(*value);
+            }
+            out
+        };
+        let hi = text("hi");
+        let rows = [
+            event(&[
+                ("type", &hi),
+                ("value", &event(&[("note", &[0xa0]), ("free", &[0xa0])])),
+            ]),
+            event(&[
+                ("type", &hi),
+                ("value.note", &[0xa0]),
+                ("value.free", &[0xa0]),
+            ]),
+            event(&[("value.note", &[0xd9, 0x00]), ("type", &hi)]),
+            event(&[("type", &hi), ("value", &[0x80])]),
+            event(&[("type", &hi), ("value", &one_member("note", &text("a")))]),
+        ];
+        let mut columns = DynamicColumns::new(&fields, 5).expect("column plane fits");
+        let mut work = [0; 64];
+        assert_eq!(
+            extract(&rows.concat(), &config, &mut columns, &mut work, true),
+            Ok(rows.len())
+        );
+        let utf8 = |text: &str| Some(ColumnValue::Utf8(std::borrow::Cow::Owned(text.to_owned())));
+        for row in 0..4 {
+            assert_eq!(columns.cell(1, row), None, "row {row}'s note is empty");
+        }
+        assert_eq!(columns.cell(1, 4), utf8("a"));
+        for row in 0..2 {
+            assert_eq!(columns.cell(2, row), utf8(""), "row {row} keeps its text");
+        }
+    }
+    //#endregion smoo/columine!n/vocab-bounded-string
     /// A JavaScript number above u32 arrives as float64 under standard
     /// MessagePack (the 64-bit integer markers are reserved for BigInt), and
     /// every nanosecond timestamp is such a number.

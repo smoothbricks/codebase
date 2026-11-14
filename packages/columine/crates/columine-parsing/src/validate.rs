@@ -24,7 +24,8 @@
 //! may demand an exact length.
 //!
 //! A `string` node may bound a text's UTF-8 length by `maxBytes`; absent, the
-//! text is unbounded.
+//! text is unbounded. A bounded string is never empty: it holds from one byte
+//! to its bound, and under `optional` an empty text is the empty state.
 //!
 //! A `key` node admits an `S.key` value: a non-empty string whose routing key
 //! component encodes to at most `maxEncodedLength` characters. Only that length
@@ -271,7 +272,7 @@ enum Expected<'s> {
     BigInt(IntegerBounds),
     /// An `S.key` value: its routing key component encodes to at most this many characters.
     Key(u32),
-    /// A bounded `string`: a text of at most this many UTF-8 bytes.
+    /// A bounded `string`: a text of one to this many UTF-8 bytes.
     StringBytes(u32),
     /// An `axId` value the host's grammar refused, with the grammar's reason.
     AxId(&'static str),
@@ -300,7 +301,7 @@ impl fmt::Display for Expected<'_> {
             }
             Self::BigInt(bounds) => write!(output, "bigint in [{}, {}]", bounds.min, bounds.max),
             Self::Key(bound) => write!(output, "key: encodes to at most {bound} characters"),
-            Self::StringBytes(bound) => write!(output, "string of at most {bound} bytes"),
+            Self::StringBytes(bound) => write!(output, "string of 1 to {bound} bytes"),
             Self::AxId(reason) => write!(output, "axId: {reason}"),
             Self::Length(length) => write!(output, "array of length {length}"),
             Self::Declared(fields) => {
@@ -767,6 +768,46 @@ impl SemanticSchema {
             other => matches!(other, Self::Unknown),
         }
     }
+
+    /// Whether the schema, beneath any `optional`, is a bounded string: a
+    /// text of one byte to its bound, never empty.
+    fn is_bounded_string(&self) -> bool {
+        match self {
+            Self::Optional(inner) => inner.is_bounded_string(),
+            other => matches!(other, Self::String { max_bytes: Some(_) }),
+        }
+    }
+
+    /// Whether an empty text under this schema is the empty state, as a null
+    /// is: an `optional` bounded string's is, since a bounded string has no
+    /// empty value.
+    pub(crate) fn empty_text_is_empty(&self) -> bool {
+        matches!(self, Self::Optional(inner) if inner.is_bounded_string())
+    }
+
+    /// Whether an event that conforms to this union arm holds no empty text
+    /// as data under `member`: an object that declares `member` with an empty
+    /// text as its empty state, or a closed object that does not declare it.
+    fn holds_no_empty_text(&self, member: &str) -> bool {
+        match self {
+            Self::Optional(inner) => inner.holds_no_empty_text(member),
+            Self::Object { fields, open } => fields
+                .iter()
+                .find(|(name, _)| name == member)
+                .map_or(!*open, |(_, field)| field.empty_text_is_empty()),
+            _ => false,
+        }
+    }
+
+    /// The fields of an object, beneath any `optional`; none for any other
+    /// kind.
+    fn object_fields(&self) -> &[(String, Self)] {
+        match self {
+            Self::Optional(inner) => inner.object_fields(),
+            Self::Object { fields, .. } => fields,
+            _ => &[],
+        }
+    }
     pub fn is_open_object(&self) -> bool {
         matches!(self, Self::Object { open: true, .. })
     }
@@ -804,6 +845,41 @@ pub fn collect_dynamic_members<E>(
             Ok(())
         }
         SemanticSchema::Optional(inner) => collect_dynamic_members(inner, visit),
+        _ => Ok(()),
+    }
+}
+
+/// Visit every top-level payload member of `schema` whose empty text is its
+/// empty state ([`SemanticSchema::empty_text_is_empty`]): an object root's
+/// fields, beneath any `optional`. The extractors collect it once per event
+/// type and store the empty cell for such a member's empty text, as for a
+/// missing member. Extraction does not know which arm of a union a value
+/// conformed to, so a union root's member is visited only when no arm holds
+/// an empty text under that name as data.
+pub(crate) fn collect_empty_text_members<E>(
+    schema: &SemanticSchema,
+    visit: &mut impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    match schema {
+        SemanticSchema::Object { fields, .. } => {
+            for (name, field) in fields {
+                if field.empty_text_is_empty() {
+                    visit(name)?;
+                }
+            }
+            Ok(())
+        }
+        SemanticSchema::Union(variants) => {
+            for (name, field) in variants.iter().flat_map(SemanticSchema::object_fields) {
+                if field.empty_text_is_empty()
+                    && variants.iter().all(|arm| arm.holds_no_empty_text(name))
+                {
+                    visit(name)?;
+                }
+            }
+            Ok(())
+        }
+        SemanticSchema::Optional(inner) => collect_empty_text_members(inner, visit),
         _ => Ok(()),
     }
 }
@@ -1738,7 +1814,13 @@ fn validate_at<'s, G: AddressGrammar>(
             stop.map_or(Ok(()), Err)
         }
         SemanticSchema::Optional(item) => {
-            if value.kind() == ValueKind::Null {
+            // An empty text under a bounded string is the empty state, as a
+            // null is: a bounded string has no empty value.
+            if value.kind() == ValueKind::Null
+                || schema.empty_text_is_empty()
+                    && value.kind() == ValueKind::String
+                    && value.as_str().is_some_and(str::is_empty)
+            {
                 Ok(())
             } else {
                 validate_at::<G>(item, value, path, depth + 1, frames)
@@ -1817,9 +1899,10 @@ fn require_kind<'s>(value: &dyn ValueView, expected: ValueKind) -> Result<(), St
     }
 }
 
-/// A `string` value: a text, no longer than `max_bytes` UTF-8 bytes when the
-/// node bounds it. A value that is not a string is refused as `string`
-/// refuses it.
+/// A `string` value: a text, of one byte to `max_bytes` UTF-8 bytes when the
+/// node bounds it. A bounded string is never empty: an empty text is refused
+/// as one past the bound is. A value that is not a string is refused as
+/// `string` refuses it.
 fn validate_string<'s>(max_bytes: Option<u32>, value: &dyn ValueView) -> Result<(), Stop<'s>> {
     require_kind(value, ValueKind::String)?;
     let Some(bound) = max_bytes else {
@@ -1829,7 +1912,7 @@ fn validate_string<'s>(max_bytes: Option<u32>, value: &dyn ValueView) -> Result<
         return Err(Fault::shape(ValueKind::String.as_str(), value).into());
     };
     let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    if length <= u64::from(bound) {
+    if (1..=u64::from(bound)).contains(&length) {
         Ok(())
     } else {
         Err(Fault {
@@ -5133,7 +5216,7 @@ mod tests {
         };
         let over = (
             "value.note".to_owned(),
-            "string of at most 4 bytes".to_owned(),
+            "string of 1 to 4 bytes".to_owned(),
             "string of 5 bytes".to_owned(),
         );
         assert_eq!(
@@ -5147,6 +5230,72 @@ mod tests {
                     .map(|_| ())
             ),
             over
+        );
+    }
+
+    #[test]
+    fn an_empty_text_is_refused_under_a_bounded_string_and_is_an_optional_ones_empty_state_on_both_lanes()
+     {
+        let schemas = parse_schema_envelope(
+            br#"{"hi":{"kind":"object","fields":{"note":{"kind":"string","maxBytes":4}}},"ho":{"kind":"object","fields":{"note":{"kind":"optional","value":{"kind":"string","maxBytes":4}}}}}"#,
+        )
+        .unwrap();
+        let prepared =
+            PreparedSchemas::<_, NoAddressGrammar>::prepare(schemas, UnavailableVoAdmission)
+                .unwrap();
+        // The same event under the type `ho`, whose `note` is optional.
+        let optional_note_event = |text: &str| {
+            let mut event = note_event(text);
+            event[8] = b'o';
+            event
+        };
+        let refusal = |result: Result<(), BatchValidationError>| match result {
+            Err(BatchValidationError::Violation { violation, .. }) => (
+                violation.path.clone(),
+                violation.expected.clone(),
+                violation.observed.clone(),
+            ),
+            other => panic!("an empty text under a bounded string is refused: {other:?}"),
+        };
+        let empty = (
+            "value.note".to_owned(),
+            "string of 1 to 4 bytes".to_owned(),
+            "string of 0 bytes".to_owned(),
+        );
+        assert_eq!(
+            refusal(prepared.validate_json_batch(br#"[{"type":"hi","value":{"note":""}}]"#)),
+            empty
+        );
+        assert_eq!(
+            refusal(
+                prepared
+                    .validate_msgpack_batch(&note_event(""), true)
+                    .map(|_| ())
+            ),
+            empty
+        );
+        assert_eq!(
+            prepared.validate_json_batch(br#"[{"type":"ho","value":{"note":""}}]"#),
+            Ok(())
+        );
+        assert_eq!(
+            prepared
+                .validate_msgpack_batch(&optional_note_event(""), true)
+                .map(|_| ()),
+            Ok(())
+        );
+        // The optional member's text keeps its bound.
+        assert_eq!(
+            refusal(
+                prepared
+                    .validate_msgpack_batch(&optional_note_event("notes"), true)
+                    .map(|_| ())
+            ),
+            (
+                "value.note".to_owned(),
+                "string of 1 to 4 bytes".to_owned(),
+                "string of 5 bytes".to_owned(),
+            )
         );
     }
     //#endregion smoo/columine!n/vocab-bounded-string

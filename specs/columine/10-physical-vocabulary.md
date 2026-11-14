@@ -190,9 +190,13 @@ One table for both lanes; a value of another kind is refused naming the column.
 | text hash column         | a text, stored as the hash the embedder computes; on a wire with bytes also a 32-byte hash     |
 
 **A bounded string.** <a id="smoo/columine!n/vocab-bounded-string"></a> A semantic `string` node may bound a text's
-UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A longer text is a payload violation
-judged before extraction on every lane, expected `string of at most N bytes`, observed `string of M bytes`; a member the
-node does not define refuses the schema. The Utf8 plane itself has no bound. **The instant grammar.**
+UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A bounded string is never empty: it
+holds from one byte to `N`. An empty or a longer text is a payload violation judged before extraction on every lane,
+expected `string of 1 to N bytes`, observed `string of M bytes`; a member the node does not define refuses the schema.
+An empty text under an `optional` bounded string is the empty state, as a null is: it is admitted, and for a payload
+member every lane stores the empty cell, the same as a missing member, in both payload spellings. Under a union root the
+empty cell is stored only when no arm holds an empty text under that member's name as data, because extraction does not
+know the arm. The Utf8 plane itself has no bound. **The instant grammar.**
 <a id="smoo/columine!n/vocab-instant-grammar"></a> One reader, `columine_parsing::instant`, reads an instant's text for
 every lane and for any host that names it: RFC 3339 with an uppercase `T`, a four-digit year 0000 to 9999, a real
 calendar date, hours 00 to 23, minutes and seconds 00 to 59 (no leap second), an optional fraction of one or more
