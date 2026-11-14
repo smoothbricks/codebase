@@ -1311,7 +1311,8 @@ impl Plane {
                 | json_extractor::ExtractionError::UnwrittenProjection
                 | json_extractor::ExtractionError::Category(_)
                 | json_extractor::ExtractionError::Cell(_)
-                | json_extractor::ExtractionError::OpaqueValue { .. } => ResultCode::ParseError,
+                | json_extractor::ExtractionError::OpaqueValue { .. }
+                | json_extractor::ExtractionError::UnplacedMember { .. } => ResultCode::ParseError,
             };
             // JSON carries a per-field diagnostic; MessagePack derives
             // stage/detail from its error at this level.
@@ -1348,6 +1349,9 @@ impl Plane {
                     }
                     json_extractor::ExtractionError::OpaqueValue { .. } => {
                         (diagnostic_detail::OPAQUE_VALUE, 0)
+                    }
+                    json_extractor::ExtractionError::UnplacedMember { .. } => {
+                        (diagnostic_detail::UNPLACED_MEMBER, 0)
                     }
                     json_extractor::ExtractionError::Cell(_) => {
                         (diagnostic_detail::CELL_REFUSED, 0)

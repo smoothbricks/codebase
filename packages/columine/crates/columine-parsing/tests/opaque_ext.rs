@@ -172,12 +172,14 @@ fn config(opaque_ext: Option<i8>) -> ([SignalSchemaField; 6], ExtractionConfig) 
             record_members: &[
                 RecordMember {
                     discriminant: "order".into(),
+                    subtype: None,
                     member: "extra".into(),
                     path: vec![5],
                     descriptor_position: 9,
                 },
                 RecordMember {
                     discriminant: "order".into(),
+                    subtype: None,
                     member: "note".into(),
                     path: vec![6],
                     descriptor_position: 10,

@@ -341,6 +341,7 @@ fn record_schema(cell: Option<&'static str>, envelope: &str) -> DynamicSchemaCon
     DynamicSchemaConfig {
         record_members: vec![RecordMember {
             discriminant: "order".into(),
+            subtype: None,
             member: "qty".into(),
             path: vec![3],
             descriptor_position: 7,
@@ -482,6 +483,7 @@ fn boolean_schema() -> DynamicSchemaConfig {
     DynamicSchemaConfig {
         record_members: vec![RecordMember {
             discriminant: "order".into(),
+            subtype: None,
             member: "ok".into(),
             path: vec![4],
             descriptor_position: 9,

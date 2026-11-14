@@ -41,6 +41,11 @@ pub enum ExtractionError {
     OpaqueValue {
         path: String,
     },
+    /// A payload member no column, routing row or carrier places, in a schema
+    /// with a declared record, where placement is total; `path` names it.
+    UnplacedMember {
+        path: String,
+    },
 }
 
 /// A lexer refusal at the extraction boundary: memory the lexer could not
@@ -146,6 +151,8 @@ pub mod diagnostic_detail {
     /// A value of the embedder's reserved opaque extension type outside a
     /// cell that takes it whole.
     pub const OPAQUE_VALUE: u8 = 13;
+    /// A payload member nothing places, in a schema whose placement is total.
+    pub const UNPLACED_MEMBER: u8 = 14;
 }
 
 /// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
@@ -246,7 +253,9 @@ impl ExtractionDiagnostic {
             ExtractionError::WorkBufferTooSmall => diagnostic_stage::MSGPACK,
             ExtractionError::UnwrittenProjection => diagnostic_stage::VALIDATION,
             ExtractionError::Cell(_) => diagnostic_stage::VALUE,
-            ExtractionError::OpaqueValue { .. } => diagnostic_stage::VALUE,
+            ExtractionError::OpaqueValue { .. } | ExtractionError::UnplacedMember { .. } => {
+                diagnostic_stage::VALUE
+            }
         };
         self.detail = match failure {
             ExtractionError::InvalidJson => diagnostic_detail::INVALID_JSON,
@@ -260,6 +269,7 @@ impl ExtractionDiagnostic {
             ExtractionError::Category(_) => diagnostic_detail::DICTIONARY_VALUE,
             ExtractionError::Cell(_) => diagnostic_detail::CELL_REFUSED,
             ExtractionError::OpaqueValue { .. } => diagnostic_detail::OPAQUE_VALUE,
+            ExtractionError::UnplacedMember { .. } => diagnostic_detail::UNPLACED_MEMBER,
         };
     }
 }
@@ -497,6 +507,13 @@ fn extract_json_event_open(
         return Err(json_refusal(diagnostic, error, NO_FIELD, 0, columns.count));
     }
     crate::begin_cells(config, cells)?;
+    // A subtype routing row's key member is read from the row itself, so the
+    // row is kept from its opening when the schema routes by subtype.
+    let row = if config.routes_subtypes() {
+        Some(parser.try_clone().map_err(lex_error)?)
+    } else {
+        None
+    };
     // Track presence across the declared schema. A schema-sized tracker avoids
     // rejecting schemas wider than a fixed implementation limit.
     columns.columns_seen.fill(false);
@@ -598,6 +615,8 @@ fn extract_json_event_open(
                     &column_name,
                     &member,
                     &member,
+                    true,
+                    row.as_ref(),
                     image,
                     cells,
                     scratch,
@@ -632,6 +651,8 @@ fn extract_json_event_open(
             &name,
             flat_member.unwrap_or(&name),
             &name,
+            flat_member.is_some(),
+            row.as_ref(),
             image,
             cells,
             scratch,
@@ -712,6 +733,59 @@ fn lookahead_event_type(parser: &JsonParser<'_>) -> Result<Option<String>, Extra
     Ok(None)
 }
 
+/// The text of payload member `key` of the event whose opening `row` was
+/// kept at, spelled flat (`value.<key>`) or in the nested `value` object,
+/// read from a copy so no parser moves. Input the copy cannot follow holds no
+/// text there; memory it cannot back is refused.
+fn row_payload_text(row: &JsonParser<'_>, key: &str) -> Result<Option<String>, ExtractionError> {
+    let unread = |error| match error {
+        ParserError::OutOfMemory => Err(ExtractionError::MemoryExhausted),
+        ParserError::InvalidJson
+        | ParserError::UnexpectedToken
+        | ParserError::EndOfInput
+        | ParserError::InvalidNumber => Ok(None),
+    };
+    let text = |ahead: &mut JsonParser<'_>| match ahead.next_token() {
+        Ok(Token::String(value)) => owned(value).map(Some),
+        Ok(_) => Ok(None),
+        Err(error) => unread(error),
+    };
+    let mut ahead = row.try_clone().map_err(lex_error)?;
+    while !ahead.is_object_end() {
+        let name = match ahead.expect_field_name() {
+            Ok(name) => owned(name)?,
+            Err(error) => return unread(error),
+        };
+        if name.strip_prefix("value.") == Some(key) {
+            return text(&mut ahead);
+        }
+        if name == "value" && matches!(ahead.peek_token(), Ok(Token::ObjectBegin)) {
+            if let Err(error) = ahead.expect_object_begin() {
+                return unread(error);
+            }
+            while !ahead.is_object_end() {
+                let member = match ahead.expect_field_name() {
+                    Ok(member) => member,
+                    Err(error) => return unread(error),
+                };
+                if member.is(key) {
+                    return text(&mut ahead);
+                }
+                if let Err(error) = ahead.skip_value() {
+                    return unread(error);
+                }
+            }
+            if let Err(error) = ahead.next_token() {
+                return unread(error);
+            }
+            continue;
+        }
+        if let Err(error) = ahead.skip_value() {
+            return unread(error);
+        }
+    }
+    Ok(None)
+}
 /// Handle one named member of the event or its nested payload: a declared
 /// column extracts typed (with deep carrier capture below open paths), a
 /// member the layout routes to the declared record is put there, an unknown
@@ -744,6 +818,8 @@ fn extract_named_member(
     column_name: &str,
     member: &str,
     payload_name: &str,
+    payload: bool,
+    row: Option<&JsonParser<'_>>,
     image: &mut dyn CategoryImage,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
@@ -844,7 +920,11 @@ fn extract_named_member(
     // A payload member without a column that the layout routes lives in the
     // row's declared record, under its routing row, whether or not a semantic
     // schema judged it.
-    if placed && let Some(row) = config.record_route(discriminant, member) {
+    let subtype = match (row, config.subtype_key(discriminant, member)) {
+        (Some(row), Some(key)) if placed => row_payload_text(row, key)?,
+        _ => None,
+    };
+    if placed && let Some(row) = config.record_route(discriminant, member, subtype.as_deref()) {
         let mut value = json_value(parser)?;
         empty.state(&mut value);
         return crate::record_cell(row, &value, empty.null, cells);
@@ -859,6 +939,24 @@ fn extract_named_member(
         }
         Carrier::Raw => return Err(ExtractionError::InvalidFieldType),
         Carrier::Absent | Carrier::Native(_) => {}
+    }
+    // Placement is total where the schema has a declared record: a payload
+    // member no column, routing row or carrier places is refused by name,
+    // never dropped.
+    if payload && placed && config.refuses_unplaced() {
+        let mut path = String::new();
+        path.try_reserve_exact(column_name.len())
+            .map_err(|_| ExtractionError::MemoryExhausted)?;
+        path.push_str(column_name);
+        diagnostic.set(
+            diagnostic_stage::VALUE,
+            diagnostic_detail::UNPLACED_MEMBER,
+            NO_FIELD,
+            0,
+            json_value_type::UNKNOWN,
+            columns.count,
+        );
+        return Err(ExtractionError::UnplacedMember { path });
     }
     if let Carrier::Native(fallback) = config.carrier() {
         let row = columns.count;

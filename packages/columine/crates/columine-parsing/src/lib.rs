@@ -264,8 +264,13 @@ pub struct ExtractionConfig {
     /// The [`DECLARED_RECORD_COLUMN_NAME`] column, when the schema has one.
     pub(crate) record_column: Option<usize>,
     /// `(discriminant, payload member)` → the routing row of a declared
-    /// member that lives in the row's declared record.
+    /// member that lives in the row's declared record on every row that no
+    /// subtype row places it on.
     pub(crate) record_routes: MemberTable<RecordRoute>,
+    /// `(discriminant, payload member)` → the routing rows of a declared
+    /// member that lives in the declared record of rows of the subtypes they
+    /// name, the subtype read from the row's own key member.
+    pub(crate) subtype_routes: MemberTable<SubtypeRoutes>,
 }
 
 /// Values keyed by `(discriminant or event type, payload member)`, held sorted so a lookup
@@ -306,6 +311,27 @@ impl<T> MemberTable<T> {
         Ok(())
     }
 
+    /// The value bound to `(discriminant, member)`, bound first to what `make`
+    /// answers when the pair has none. Growing the table is fallible.
+    fn entry(
+        &mut self,
+        discriminant: &str,
+        member: &str,
+        make: impl FnOnce() -> Result<T, ConfigError>,
+    ) -> Result<&mut T, ConfigError> {
+        let index = match self.position(discriminant, member) {
+            Ok(index) => index,
+            Err(index) => {
+                self.entries
+                    .try_reserve(1)
+                    .map_err(|_| ConfigError::OutOfMemory)?;
+                self.entries
+                    .insert(index, (owned(discriminant)?, owned(member)?, make()?));
+                index
+            }
+        };
+        Ok(&mut self.entries[index].2)
+    }
     pub(crate) fn get(&self, discriminant: &str, member: &str) -> Option<&T> {
         self.position(discriminant, member)
             .ok()
@@ -530,6 +556,34 @@ impl ExtractionConfig {
     /// (specs/columine/10-physical-vocabulary.md §7).
     fn routes_to_record(&self, discriminant: &str, member: &str) -> bool {
         !self.record_routes.is_empty() && self.record_routes.get(discriminant, member).is_some()
+            || !self.subtype_routes.is_empty()
+                && self.subtype_routes.get(discriminant, member).is_some()
+    }
+
+    /// The payload member whose text names the subtype that places `member`
+    /// of `discriminant`, when subtype rows route it: a lane reads that
+    /// member's text from the row to pick the routing row.
+    pub(crate) fn subtype_key(&self, discriminant: Option<&str>, member: &str) -> Option<&str> {
+        if self.subtype_routes.is_empty() {
+            return None;
+        }
+        self.subtype_routes
+            .get(discriminant?, member)
+            .map(|routes| routes.key.as_str())
+    }
+
+    /// Whether any routing row names a subtype: a lane then keeps each row's
+    /// opening to read its subtype key from.
+    pub(crate) fn routes_subtypes(&self) -> bool {
+        !self.subtype_routes.is_empty()
+    }
+
+    /// Whether a payload member nothing places is refused by name rather than
+    /// dropped: the schema has a declared record, so placement is total, and
+    /// no carrier holds a member nothing else places
+    /// (specs/columine/10-physical-vocabulary.md §7).
+    pub(crate) fn refuses_unplaced(&self) -> bool {
+        self.record_column.is_some() && matches!(self.carrier(), Carrier::Absent)
     }
 
     /// Whether a lane reads an event's `type`: its schema routes and judges
@@ -682,14 +736,19 @@ impl ExtractionConfig {
         })
     }
 
-    /// The routing row of `member` under `discriminant`, when the member
-    /// lives in the declared record.
+    /// The routing row of `member` under `discriminant` on a row whose
+    /// subtype key names `subtype`, when the member lives in the declared
+    /// record there: the row of that subtype, else the row of no subtype.
     pub(crate) fn record_route(
         &self,
         discriminant: Option<&str>,
         member: &str,
+        subtype: Option<&str>,
     ) -> Option<RecordRow<'_>> {
-        let route = self.record_routes.get(discriminant?, member)?;
+        let discriminant = discriminant?;
+        let route = subtype
+            .and_then(|subtype| self.subtype_routes.get(discriminant, member)?.get(subtype))
+            .or_else(|| self.record_routes.get(discriminant, member))?;
         Some(RecordRow {
             path: &route.path,
             descriptor_position: route.descriptor_position,
@@ -720,7 +779,11 @@ impl ExtractionConfig {
                 CellRole::Lane | CellRole::TextInline | CellRole::Seam(SeamCell::Raw) => {}
             }
         }
-        for route in self.record_routes.values() {
+        let subtype_routes = self
+            .subtype_routes
+            .values()
+            .flat_map(|routes| routes.routes.iter().map(|(_, route)| route));
+        for route in self.record_routes.values().chain(subtype_routes) {
             cells.prepare(CellTarget::Record {
                 row: RecordRow {
                     path: &route.path,
@@ -751,7 +814,8 @@ impl ExtractionConfig {
             };
             for (member, _) in fields {
                 let placed = self.placed_column(event_type, member).is_some()
-                    || self.record_routes.get(event_type, member).is_some();
+                    || self.record_routes.get(event_type, member).is_some()
+                    || self.subtype_routes.get(event_type, member).is_some();
                 if !placed {
                     return Err(ConfigError::UnplacedMember);
                 }
@@ -848,6 +912,42 @@ pub(crate) enum Carrier {
     Raw,
 }
 
+/// The routing rows of one `(discriminant, member)` that name a subtype: the
+/// payload member whose text names a row's subtype, and each subtype's place,
+/// held sorted by the subtype's text.
+#[derive(Clone, Debug)]
+pub(crate) struct SubtypeRoutes {
+    key: String,
+    routes: Vec<(String, RecordRoute)>,
+}
+
+impl SubtypeRoutes {
+    /// Place the member on rows of `subtype` at `route`; a later row of the
+    /// same subtype replaces the earlier one, as a routing row does.
+    fn place(&mut self, subtype: &str, route: RecordRoute) -> Result<(), ConfigError> {
+        match self.position(subtype) {
+            Ok(index) => self.routes[index].1 = route,
+            Err(index) => {
+                self.routes
+                    .try_reserve(1)
+                    .map_err(|_| ConfigError::OutOfMemory)?;
+                self.routes.insert(index, (owned(subtype)?, route));
+            }
+        }
+        Ok(())
+    }
+
+    fn position(&self, subtype: &str) -> Result<usize, usize> {
+        self.routes
+            .binary_search_by(|(held, _)| held.as_str().cmp(subtype))
+    }
+
+    fn get(&self, subtype: &str) -> Option<&RecordRoute> {
+        self.position(subtype)
+            .ok()
+            .map(|index| &self.routes[index].1)
+    }
+}
 /// A declared member's place in the row's declared record.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordRoute {
@@ -1191,6 +1291,9 @@ pub enum ConfigError {
     /// Record routing rows without a discriminator key, or without a
     /// [`DECLARED_RECORD_COLUMN_NAME`] Binary column the processor writes.
     RecordColumnMissing,
+    /// Two routing rows of one `(discriminant, member)` read the subtype from
+    /// different key members.
+    SubtypeKeysDisagree,
     /// A text row whose hash field is not `FixedSizeBinary(32)` or whose
     /// inline field is not Utf8.
     InvalidTextColumn,
@@ -1536,18 +1639,29 @@ pub fn build_extraction_config_with_semantic_schemas(
         }
     }
     let mut record_routes = MemberTable::default();
+    let mut subtype_routes: MemberTable<SubtypeRoutes> = MemberTable::default();
     for row in cells.record_members {
         let mut path = Vec::new();
         room(&mut path, row.path.len())?;
         path.extend_from_slice(&row.path);
-        record_routes.bind(
-            &row.discriminant,
-            &row.member,
-            RecordRoute {
-                path,
-                descriptor_position: row.descriptor_position,
-            },
-        )?;
+        let route = RecordRoute {
+            path,
+            descriptor_position: row.descriptor_position,
+        };
+        let Some(subtype) = &row.subtype else {
+            record_routes.bind(&row.discriminant, &row.member, route)?;
+            continue;
+        };
+        let routes = subtype_routes.entry(&row.discriminant, &row.member, || {
+            Ok(SubtypeRoutes {
+                key: owned(&subtype.key)?,
+                routes: Vec::new(),
+            })
+        })?;
+        if routes.key != subtype.key {
+            return Err(ConfigError::SubtypeKeysDisagree);
+        }
+        routes.place(&subtype.value, route)?;
     }
     let mut config = ExtractionConfig {
         field_entries,
@@ -1574,6 +1688,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         cell_roles,
         record_column,
         record_routes,
+        subtype_routes,
     };
     // One authority per member (specs/columine/10-physical-vocabulary.md §7):
     // a dynamic member a column places makes that column dynamic, and only a

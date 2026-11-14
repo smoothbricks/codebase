@@ -112,8 +112,8 @@ schema has judged that value, and stores the bytes it writes:
 
 - `member(column, value, out)` writes a structured member's cell;
 - `begin_record`, `put(row, value)` per declared member without a column, `finish_record(out)` write the row's record,
-  null when no member was put. `row` is the routing row creation received for `(event type, member)`: the member's
-  field-number path and its descriptor position;
+  null when no member was put. `row` is the routing row creation received for `(event type, subtype, member)`: the
+  member's field-number path and its descriptor position;
 - `begin_undeclared`, `put_undeclared(path, value)`, `finish_undeclared(out)` write the row's carrier;
 - `text(hash_column, text, hash)` computes a text's 32-byte content hash and answers whether its bytes are also stored
   inline, in the text's Utf8 column; `text_by_hash(hash_column, hash)` answers for a text that arrived as its hash
@@ -148,12 +148,19 @@ key. **Placement is total.** Where a schema gives payload members columns of the
 exists), every top-level member a semantic schema declares has a column or a routing row, or creation refuses the
 schema. A declared member is never dropped and never falls to the carrier. A schema that stores the whole payload in one
 `value` column places every member there. A routing row's discriminant is the event's `type`, and a schema with routing
-rows has a `value.$declared` column the embedder writes. A routing row places its member whether or not the processor
-holds a semantic schema, in either payload spelling and whichever side of the payload `type` is spelled on: a flat
-`value.<member>` key takes the member's discriminated column and routing row as the nested member does, and a member
-nothing places keeps its key as its carrier path. A routing row places its member before a plain `value.<member>` column
-of the same name: the plain column belongs to a member no row places. A placement is per `(event type, member)` and a
-column is per schema, so one type's member never lands in the column another type's member of the same name has.
+rows has a `value.$declared` column the embedder writes. <a id="smoo/columine!n/vocab-subtype-routes"></a> A routing row
+may also name a subtype: the payload member whose text names a row's subtype (its key) and that text. Such a row places
+its member only on rows whose key member holds that text, read from the row itself, wherever the row spells it (nested
+or flat, before or after the member); a row of no subtype places the member on every row of its type that no subtype row
+places it on. Every subtype row of one `(event type, member)` reads the same key, or creation refuses the schema. A
+routing row places its member whether or not the processor holds a semantic schema, in either payload spelling and
+whichever side of the payload `type` is spelled on: a flat `value.<member>` key takes the member's discriminated column
+and routing row as the nested member does, and a member nothing places keeps its key as its carrier path. Where the
+schema has a declared record and no carrier, a payload member no column and no routing row places is refused by name
+(`UNPLACED_MEMBER`, with the member's path), never dropped. A routing row places its member before a plain
+`value.<member>` column of the same name: the plain column belongs to a member no row places. A placement is per
+`(event type, subtype, member)` and a column is per schema, so one type's member never lands in the column another
+type's member of the same name has, and one subtype's member never lands in another subtype's record.
 
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type

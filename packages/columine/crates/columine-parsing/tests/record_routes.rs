@@ -5,8 +5,10 @@
 //! flat `value.<member>` keys) and whichever side of the payload `type` is
 //! spelled on, on both lanes.
 
-use columine_arrow::RecordMember;
-use columine_parsing::json_extractor::{ExtractionDiagnostic, extract_json_events};
+use columine_arrow::{RecordMember, RecordSubtype};
+use columine_parsing::json_extractor::{
+    ExtractionDiagnostic, ExtractionError, extract_json_events,
+};
 use columine_parsing::msgpack_extractor::extract_msgpack_events_with_projections;
 use columine_parsing::validate::{NumberValue, ValueKind, ValueView, parse_schema_envelope};
 use columine_parsing::{
@@ -163,6 +165,7 @@ fn record_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing::E
             cell_metadata: &[None, None, cell.clone(), cell],
             record_members: &[RecordMember {
                 discriminant: "order".into(),
+                subtype: None,
                 member: "qty".into(),
                 path: vec![3],
                 descriptor_position: 7,
@@ -261,6 +264,42 @@ fn msgpack_orders() -> Vec<u8> {
     out
 }
 
+/// The rows a lane stores from `json` or its MessagePack twin `msgpack`
+/// into `columns`, or its refusal of the batch.
+fn run(
+    lane: &str,
+    config: &columine_parsing::ExtractionConfig,
+    columns: &mut DynamicColumns,
+    json: &[u8],
+    msgpack: &[u8],
+) -> Result<usize, ExtractionError> {
+    let mut embedder = TextCells::default();
+    let mut work = [0; 512];
+    match lane {
+        "json" => extract_json_events(
+            json,
+            config,
+            columns,
+            &mut work,
+            &mut ExtractionDiagnostic::default(),
+            &mut NoCategories,
+            &mut CellWriter::Embedder(&mut embedder),
+            &mut Vec::new(),
+        ),
+        _ => extract_msgpack_events_with_projections(
+            msgpack,
+            config,
+            columns,
+            &mut work,
+            false,
+            FrameProjections::default(),
+            &mut NoCategories,
+            &mut CellWriter::Embedder(&mut embedder),
+            &mut Vec::new(),
+        ),
+    }
+}
+
 /// The cells at `cells` of every row a lane stores from `json` or its
 /// MessagePack twin `msgpack`, as text: `-` is the empty cell.
 fn extract<const N: usize>(
@@ -272,32 +311,8 @@ fn extract<const N: usize>(
     cells: [usize; N],
 ) -> Vec<[String; N]> {
     let mut columns = DynamicColumns::new(fields, 8).expect("column plane fits");
-    let mut embedder = TextCells::default();
-    let mut work = [0; 512];
-    let rows = match lane {
-        "json" => extract_json_events(
-            json,
-            config,
-            &mut columns,
-            &mut work,
-            &mut ExtractionDiagnostic::default(),
-            &mut NoCategories,
-            &mut CellWriter::Embedder(&mut embedder),
-            &mut Vec::new(),
-        ),
-        _ => extract_msgpack_events_with_projections(
-            msgpack,
-            config,
-            &mut columns,
-            &mut work,
-            false,
-            FrameProjections::default(),
-            &mut NoCategories,
-            &mut CellWriter::Embedder(&mut embedder),
-            &mut Vec::new(),
-        ),
-    }
-    .unwrap_or_else(|error| panic!("{lane}: the batch is accepted: {error:?}"));
+    let rows = run(lane, config, &mut columns, json, msgpack)
+        .unwrap_or_else(|error| panic!("{lane}: the batch is accepted: {error:?}"));
     (0..rows)
         .map(|row| {
             cells.map(|column| match read_cell(&columns, column, row) {
@@ -363,6 +378,7 @@ fn shadowed_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing:
             cell_metadata: &[None, None, cell.clone(), cell, None],
             record_members: &[RecordMember {
                 discriminant: "order".into(),
+                subtype: None,
                 member: "qty".into(),
                 path: vec![3],
                 descriptor_position: 7,
@@ -474,6 +490,147 @@ fn a_routed_member_reaches_the_declared_record_in_every_spelling_with_or_without
 }
 //#endregion smoo/columine!n/vocab-value-cells
 
+/// `type`, `value.kind` and the declared record, with no carrier: `step`'s
+/// `detail` lives in the record at `[1]`, descriptor 3, on rows whose `kind`
+/// is `a`, and at `[2]`, descriptor 4, on rows whose `kind` is `b`.
+fn subtype_config() -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConfig) {
+    let fields = vec![
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+    ];
+    let schemas = parse_schema_envelope(
+        br#"{"step":{"kind":"object","fields":{"kind":{"kind":"string"},"detail":{"kind":"number"}}}}"#,
+    )
+    .unwrap();
+    let row = |subtype: &str, field: u16, descriptor_position: u32| RecordMember {
+        discriminant: "step".into(),
+        subtype: Some(RecordSubtype {
+            key: "kind".into(),
+            value: subtype.into(),
+        }),
+        member: "detail".into(),
+        path: vec![field],
+        descriptor_position,
+    };
+    let config = build_extraction_config_with_semantic_schemas(
+        &fields,
+        &["type", "value.kind", "value.$declared"],
+        &[],
+        Some(&schemas),
+        Some(&PayloadDiscriminator {
+            key: "type".into(),
+            members: Vec::new(),
+        }),
+        CellLayout {
+            cell_metadata: &[None, None, Some(ENCODING.to_owned())],
+            record_members: &[row("a", 1, 3), row("b", 2, 4)],
+            encoding: Some(ENCODING),
+            ..CellLayout::default()
+        },
+    )
+    .unwrap();
+    (fields, config)
+}
+
+/// One `step` of each subtype in each spelling: nested and flat, the subtype
+/// key before and after the member, `type` before and after the payload.
+const JSON_STEPS: &[u8] = br#"[
+    {"type":"step","value":{"kind":"a","detail":5}},
+    {"type":"step","value":{"detail":6,"kind":"b"}},
+    {"type":"step","value.kind":"a","value.detail":7},
+    {"value.detail":8,"type":"step","value.kind":"b"}
+]"#;
+
+/// [`JSON_STEPS`] as a MessagePack array.
+fn msgpack_steps() -> Vec<u8> {
+    use Mp::{Int, Map, Str};
+    let events = [
+        Map(vec![
+            ("type", Str("step")),
+            ("value", Map(vec![("kind", Str("a")), ("detail", Int(5))])),
+        ]),
+        Map(vec![
+            ("type", Str("step")),
+            ("value", Map(vec![("detail", Int(6)), ("kind", Str("b"))])),
+        ]),
+        Map(vec![
+            ("type", Str("step")),
+            ("value.kind", Str("a")),
+            ("value.detail", Int(7)),
+        ]),
+        Map(vec![
+            ("value.detail", Int(8)),
+            ("type", Str("step")),
+            ("value.kind", Str("b")),
+        ]),
+    ];
+    let mut out = vec![0x90 | u8::try_from(events.len()).unwrap()];
+    for event in &events {
+        msgpack(&mut out, event);
+    }
+    out
+}
+
+#[test]
+fn a_subtype_routing_row_places_its_member_in_the_record_on_rows_of_its_subtype() {
+    let (fields, config) = subtype_config();
+    for lane in ["json", "msgpack"] {
+        assert_eq!(
+            extract(lane, &fields, &config, JSON_STEPS, &msgpack_steps(), [1, 2]),
+            [
+                ["a", "[1]@3=5"],
+                ["b", "[2]@4=6"],
+                ["a", "[1]@3=7"],
+                ["b", "[2]@4=8"]
+            ]
+            .map(|row| row.map(str::to_owned)),
+            "{lane}: [value.kind, value.$declared] per row, the subtype key before or after its member"
+        );
+    }
+}
+
+#[test]
+fn a_payload_member_nothing_places_is_refused_by_name_where_the_schema_has_a_record() {
+    use Mp::{Int, Map, Str};
+    let (fields, config) = subtype_config();
+    let one = |payload: Mp<'static>| {
+        let mut out = vec![0x91];
+        msgpack(
+            &mut out,
+            &Map(vec![("type", Str("step")), ("value", payload)]),
+        );
+        out
+    };
+    let cases: [(&[u8], Vec<u8>, &str); 2] = [
+        (
+            br#"[{"type":"step","value":{"kind":"c","detail":9}}]"#,
+            one(Map(vec![("kind", Str("c")), ("detail", Int(9))])),
+            "value.detail",
+        ),
+        (
+            br#"[{"type":"step","value":{"kind":"a","detail":1,"stray":2}}]"#,
+            one(Map(vec![
+                ("kind", Str("a")),
+                ("detail", Int(1)),
+                ("stray", Int(2)),
+            ])),
+            "value.stray",
+        ),
+    ];
+    for (json, packed, path) in &cases {
+        for lane in ["json", "msgpack"] {
+            let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
+            assert_eq!(
+                run(lane, &config, &mut columns, json, packed),
+                Err(ExtractionError::UnplacedMember {
+                    path: (*path).to_owned()
+                }),
+                "{lane}: {path}, which no column, routing row or carrier places"
+            );
+        }
+    }
+}
 //#region smoo/columine!n/vocab-bounded-string
 /// `box` has a structured column the embedder writes and `meta` is routed to
 /// the declared record; each holds optional bounded strings at depth.
@@ -502,6 +659,7 @@ fn card_config() -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConfig)
             cell_metadata: &[None, cell.clone(), cell.clone(), cell],
             record_members: &[RecordMember {
                 discriminant: "card".into(),
+                subtype: None,
                 member: "meta".into(),
                 path: vec![4],
                 descriptor_position: 9,

@@ -194,6 +194,11 @@ fn extract_msgpack_fields(
     let mut saw_nested_value = false;
     let mut saw_flat_value_key = false;
     let mut column_name = String::new();
+    let row = RowStart {
+        input: reader.input(),
+        at: reader.position(),
+        fields,
+    };
     // The discriminant, once its key has been read: discriminated columns and
     // enum ordinals resolve against it. Canonical encoders sort keys, so a
     // discriminator key that sorts before `value` is always seen first; a
@@ -288,6 +293,8 @@ fn extract_msgpack_fields(
                     member,
                     member_start,
                     member_end,
+                    true,
+                    row,
                     image,
                     cells,
                     scratch,
@@ -318,6 +325,8 @@ fn extract_msgpack_fields(
             key,
             key_start,
             key_end,
+            flat_member.is_some(),
+            row,
             image,
             cells,
             scratch,
@@ -445,6 +454,8 @@ fn extract_msgpack_member(
     key: &[u8],
     key_start: usize,
     key_end: usize,
+    payload: bool,
+    row: RowStart<'_>,
     image: &mut dyn CategoryImage,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
@@ -540,7 +551,13 @@ fn extract_msgpack_member(
     // schema judged it.
     if placed
         && let Some(member) = member
-        && let Some(row) = config.record_route(discriminant, member)
+        && let Some(row) = config.record_route(
+            discriminant,
+            member,
+            config
+                .subtype_key(discriminant, member)
+                .and_then(|key| row.payload_text(key)),
+        )
     {
         // A record member takes the opaque extension exactly when it is
         // dynamic, which is when its null is data.
@@ -563,6 +580,12 @@ fn extract_msgpack_member(
         }
         Carrier::Raw => return Err(ExtractionError::InvalidFieldType),
         Carrier::Absent | Carrier::Native(_) => {}
+    }
+    // Placement is total where the schema has a declared record: a payload
+    // member no column, routing row or carrier places is refused by name,
+    // never dropped.
+    if payload && placed && config.refuses_unplaced() {
+        return Err(unplaced_refusal(cell_path));
     }
     if !state.active {
         reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
@@ -1015,6 +1038,59 @@ fn opaque_refusal(path: &str) -> ExtractionError {
     }
     owned.push_str(path);
     ExtractionError::OpaqueValue { path: owned }
+}
+
+/// The refusal of a payload member nothing places, naming its `path`.
+fn unplaced_refusal(path: &str) -> ExtractionError {
+    let mut owned = String::new();
+    if owned.try_reserve_exact(path.len()).is_err() {
+        return ExtractionError::MemoryExhausted;
+    }
+    owned.push_str(path);
+    ExtractionError::UnplacedMember { path: owned }
+}
+
+/// One event's map as the lane met it: where its first key starts and how
+/// many keys it holds. A subtype routing row's key member is read from it
+/// (specs/columine/10-physical-vocabulary.md §7), wherever the row spells it.
+#[derive(Clone, Copy)]
+struct RowStart<'a> {
+    input: &'a [u8],
+    at: usize,
+    fields: u32,
+}
+
+impl<'a> RowStart<'a> {
+    /// The text of payload member `key`, spelled flat (`value.<key>`) or in
+    /// the nested `value` map, read from a probe so no reader moves; none
+    /// when the row holds no text there.
+    fn payload_text(self, key: &str) -> Option<&'a str> {
+        let mut probe = Reader::new(self.input.get(self.at..)?);
+        for _ in 0..self.fields {
+            let name = probe.read_string()?;
+            if name.strip_prefix(b"value.") == Some(key.as_bytes()) {
+                return std::str::from_utf8(probe.read_string()?).ok();
+            }
+            if name == b"value"
+                && matches!(
+                    probe.input().get(probe.position()),
+                    Some(0x80..=0x8f | 0xde | 0xdf)
+                )
+            {
+                let members = probe.read_map_header()?;
+                for _ in 0..members {
+                    let member = probe.read_string()?;
+                    if member == key.as_bytes() {
+                        return std::str::from_utf8(probe.read_string()?).ok();
+                    }
+                    probe.skip_value()?;
+                }
+                continue;
+            }
+            probe.skip_value()?;
+        }
+        None
+    }
 }
 
 /// The next MessagePack value, whole, as the borrowed view a value cell

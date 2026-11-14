@@ -833,13 +833,26 @@ impl Default for SchemaDictionaryTable<'_> {
 /// declared record: under which discriminant, its field-number path into the
 /// record, and the position of its field descriptor in the schema its owner
 /// derived the routing from. The discriminant is the value of the
-/// [`PayloadDiscriminator`]'s key member.
+/// [`PayloadDiscriminator`]'s key member. A row with a `subtype` places the
+/// member only on rows of that subtype; a row without one places it on every
+/// row of its discriminant that no subtype row places it on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordMember {
     pub discriminant: String,
+    pub subtype: Option<RecordSubtype>,
     pub member: String,
     pub path: Vec<u16>,
     pub descriptor_position: u32,
+}
+
+/// The subtype a routing row places its member for: `key` is the payload
+/// member whose text names a row's subtype, read from the row itself, and
+/// `value` the text it names. Every subtype row of one `(discriminant,
+/// member)` reads the same key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordSubtype {
+    pub key: String,
+    pub value: String,
 }
 
 /// One payload member whose explicit null is data: a dynamic value, which
