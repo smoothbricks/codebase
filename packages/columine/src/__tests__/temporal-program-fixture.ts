@@ -10,4 +10,4 @@ export function rowClockTable(column: number): Uint8Array {
 }
 
 /** Manual-eviction fixtures author this clock so only their explicit evictExpired calls advance expiry. */
-export const MANUAL_EVICTION_CLOCK_MICROS = -(1n << 63n);
+export const MANUAL_EVICTION_CLOCK = -(1n << 63n);

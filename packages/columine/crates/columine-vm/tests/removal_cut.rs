@@ -75,7 +75,7 @@ const ONES: u8 = 15;
 /// `1000 * key + value`: the probe source row an add reads.
 const PROBE_ID: u8 = 16;
 const GUARD: u8 = 17;
-/// Logical row clock in i64 microseconds, not the element-sized f64 comparison lane.
+/// Logical row clock in i64 nanoseconds, not the element-sized f64 comparison lane.
 const CLOCK: u8 = 18;
 const COLUMNS: usize = 19;
 

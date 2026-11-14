@@ -57,7 +57,7 @@ fn program_fields(stored: bool) -> Vec<u8> {
     program.extend(0u32.to_le_bytes());
     program.extend(4u32.to_le_bytes());
     program.extend(1u32.to_le_bytes());
-    program.extend([0, 1, 0, 0]);
+    program.extend([0, 3, 0, 0]); // field 0, declared in nanoseconds
     program.extend(0i64.to_le_bytes());
     program
 }
@@ -168,7 +168,7 @@ fn high_time_erasure_survives_earlier_irrelevant_or_inactive_rows() {
     }
 }
 #[test]
-fn adjacent_micros_past_f64_precision_expire_at_their_own_inclusive_boundaries() {
+fn adjacent_nanos_past_f64_precision_expire_at_their_own_inclusive_boundaries() {
     let base = (1i64 << 53) + 1;
     check(&[
         Row {
@@ -537,6 +537,87 @@ fn overflowing_deadline_is_a_typed_refusal_and_exactly_rolls_back() {
     assert_eq!(state, before);
 }
 
+/// `program()` with its one expiry's field declared in `unit` (the time-unit code: 0 seconds, 1 milliseconds,
+/// 2 microseconds, 3 nanoseconds) and its age in nanoseconds.
+fn program_unit(unit: u8, age: i64) -> Vec<u8> {
+    let mut p = program();
+    let entry = p.len() - 24;
+    p[entry + 13] = unit;
+    p[entry + 16..].copy_from_slice(&age.to_le_bytes());
+    p
+}
+/// One stored row whose deadline field holds `field`, then an idle row at `now`: is the row still stored?
+fn stored_at(p: &[u8], field: i64, now: i64) -> Result<bool, u32> {
+    let mut state = image(p);
+    let mut vm = Vm::default();
+    let rows = [
+        Row {
+            kind: 1,
+            key: 1,
+            deadline: field,
+            now: i64::MIN,
+            guard: 1,
+        },
+        Row {
+            kind: 2,
+            key: 2,
+            deadline: 0,
+            now,
+            guard: 1,
+        },
+    ];
+    match run(&mut vm, &mut state, p, &rows) {
+        0 => Ok(projection(&state) == [1]),
+        refusal => Err(refusal),
+    }
+}
+#[test]
+fn a_field_in_each_unit_expires_at_its_exact_nanosecond_and_not_one_earlier() {
+    const SECOND: i64 = 1_000_000_000;
+    for (unit, nanos_per_unit) in [(0, SECOND), (1, 1_000_000), (2, 1_000), (3, 1)] {
+        let p = program_unit(unit, SECOND);
+        // A field value whose nanoseconds lie past 2^53 in every unit but the seconds'.
+        let field = 1_794_601_417_993_000_123 / nanos_per_unit;
+        let due = field * nanos_per_unit + SECOND;
+        assert_eq!(
+            stored_at(&p, field, due - 1),
+            Ok(true),
+            "unit {unit}: one nanosecond before the deadline the row is stored"
+        );
+        assert_eq!(
+            stored_at(&p, field, due),
+            Ok(false),
+            "unit {unit}: at the deadline the row is erased"
+        );
+    }
+}
+#[test]
+fn a_field_whose_nanoseconds_overflow_is_refused_and_never_wraps() {
+    for (unit, nanos_per_unit) in [(0, 1_000_000_000), (1, 1_000_000), (2, 1_000)] {
+        let p = program_unit(unit, 0);
+        let last = i64::MAX / nanos_per_unit;
+        assert_eq!(stored_at(&p, last, i64::MIN + 1), Ok(true), "unit {unit}");
+        assert_eq!(
+            stored_at(&p, last + 1, i64::MIN + 1),
+            Err(ErrorCode::InvalidCellValue as u32),
+            "unit {unit}: one past the last instant its nanoseconds hold"
+        );
+        assert_eq!(
+            stored_at(&p, i64::MIN / nanos_per_unit - 1, i64::MIN + 1),
+            Err(ErrorCode::InvalidCellValue as u32),
+            "unit {unit}: one before the first"
+        );
+    }
+}
+#[test]
+fn an_unknown_field_unit_is_an_invalid_program() {
+    let p = program_unit(4, 0);
+    let mut state = image(&program());
+    assert_eq!(
+        run(&mut Vm::default(), &mut state, &p, &[]),
+        ErrorCode::InvalidProgram as u32
+    );
+}
 fn legacy_ttl_program(trigger: bool) -> Vec<u8> {
     use columine_types::types::{PROGRAM_FORMAT_VERSION, ProgramHeader};
     let mut init = vec![0x10, 0, if trigger { 0x30 } else { 0x10 }, 16, 0];
@@ -576,7 +657,7 @@ fn run_legacy(vm: &mut Vm, state: &mut [u8], p: &[u8], rows: &[Row]) -> u32 {
     let keys: Vec<u32> = rows.iter().map(|r| r.key).collect();
     let ages: Vec<f64> = rows.iter().map(|r| r.deadline as f64).collect();
     let values: Vec<u32> = rows.iter().map(|r| r.guard).collect();
-    let clocks: Vec<i64> = rows.iter().map(|r| r.now * 1_000_000).collect();
+    let clocks: Vec<i64> = rows.iter().map(|r| r.now * 1_000_000_000).collect();
     vm.execute_batch_delta(
         state,
         p,

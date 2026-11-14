@@ -459,7 +459,7 @@ fn ttl_bitmaps_program(capacity: u16, reduce: &[u8]) -> Vec<u8> {
     program.extend(PROGRAM_MAGIC.to_le_bytes());
     program.extend([2, 0, 0, 0]);
     program.extend(2u32.to_le_bytes());
-    program.extend(3u32.to_le_bytes()); // keys, f64 ages, independent i64-micros event clock
+    program.extend(3u32.to_le_bytes()); // keys, f64 ages, independent i64-nanos event clock
     program.extend((init.len() as u32).to_le_bytes());
     program.extend((reduce.len() as u32).to_le_bytes());
     program.extend(init);

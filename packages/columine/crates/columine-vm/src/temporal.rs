@@ -7,6 +7,9 @@ const ENTRY_BYTES: usize = 24;
 /// No companion: evaluate the static predicate on changed stored keys.
 pub const NO_COMPANION: u32 = u32::MAX;
 
+/// Nanoseconds in one unit of a deadline field, by the field's time-unit code: 0 seconds, 1 milliseconds,
+/// 2 microseconds, 3 nanoseconds, the codes of the Timestamp plane's `type_param`.
+const NANOS_PER_UNIT: [i64; 4] = [1_000_000_000, 1_000_000, 1_000, 1];
 /// A stored expiry's compile-time classification; its predicate contains no clock reads.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Expiry {
@@ -14,7 +17,9 @@ pub(crate) struct Expiry {
     pub predicate: u32,
     pub companion: u32,
     pub field: u8,
-    pub micros: bool,
+    /// Nanoseconds in one unit of the deadline field.
+    pub nanos_per_unit: i64,
+    /// The age added to the field's instant, in nanoseconds.
     pub age: i64,
 }
 
@@ -49,17 +54,18 @@ impl<'a> Temporal<'a> {
             clock: word(bytes, 0),
             entries: &bytes[8..],
         };
+        // An entry's unit is validated before any entry is decoded: decoding indexes the unit table.
+        for entry in table.entries.as_chunks::<ENTRY_BYTES>().0 {
+            if usize::from(entry[13]) >= NANOS_PER_UNIT.len() || entry[14] != 0 || entry[15] != 0 {
+                return Err(ErrorCode::InvalidProgram);
+            }
+        }
         let mut previous = None;
         for entry in table.iter() {
             if previous.is_some_and(|slot| slot >= entry.slot) {
                 return Err(ErrorCode::InvalidProgram);
             }
             previous = Some(entry.slot);
-        }
-        for entry in table.entries.as_chunks::<ENTRY_BYTES>().0 {
-            if entry[13] > 1 || entry[14] != 0 || entry[15] != 0 {
-                return Err(ErrorCode::InvalidProgram);
-            }
         }
         Ok(Some(table))
     }
@@ -70,7 +76,7 @@ impl<'a> Temporal<'a> {
             predicate: word(bytes, 4),
             companion: word(bytes, 8),
             field: bytes[12],
-            micros: bytes[13] == 1,
+            nanos_per_unit: NANOS_PER_UNIT[usize::from(bytes[13])],
             age: i64::from_le_bytes(bytes[16..24].try_into().expect("validated deadline age")),
         }
     }

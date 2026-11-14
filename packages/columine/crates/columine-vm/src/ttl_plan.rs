@@ -1232,7 +1232,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn integer_deadlines_preserve_adjacent_micros_beyond_float_precision() {
+    fn integer_deadlines_preserve_adjacent_nanos_beyond_float_precision() {
         let base = 1i64 << 53;
         let entries = [(base + 1, 1, 10), (base + 3, 3, 30)];
         let mutations = [TtlMutation::UpsertI64 {

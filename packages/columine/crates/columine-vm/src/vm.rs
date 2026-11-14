@@ -5081,6 +5081,8 @@ impl<I: KeyIndex> Vm<I> {
         self.rec.watch.net_changes(state, slot, since, strings, out)
     }
 
+    /// The row clock's nanoseconds in one second of a floating age lane.
+    const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
     fn temporal_minimum(&self, state: &[u8], table: Temporal<'_>) -> Option<i64> {
         let mut next = None;
         for slot in 0..state_num_slots(state) {
@@ -5105,7 +5107,7 @@ impl<I: KeyIndex> Vm<I> {
                         state,
                         meta.meta_base + SlotMetaOffset::GRACE_SECONDS,
                     )))
-                    * 1_000_000.0;
+                    * Self::NANOS_PER_SECOND;
                 if threshold.is_nan() || threshold < i64::MIN as f64 {
                     Some(i64::MIN)
                 } else if threshold >= 9_223_372_036_854_775_808.0 {
@@ -5128,7 +5130,7 @@ impl<I: KeyIndex> Vm<I> {
         let Some(cell) = stored.field(expiry.field)? else {
             return Ok(None);
         };
-        let scale = if expiry.micros { 1 } else { 1000 };
+        let scale = expiry.nanos_per_unit;
         let value = match stored.field_type(expiry.field)? {
             StructFieldType::Int64 => bytes::read_i64(cell, 0).checked_mul(scale),
             StructFieldType::UInt32 => i64::from(bytes::read_u32(cell, 0)).checked_mul(scale),
@@ -5345,7 +5347,7 @@ impl<I: KeyIndex> Vm<I> {
                                 &mut self.bitmap_env,
                                 state,
                                 &meta,
-                                now as f64 / 1_000_000.0,
+                                now as f64 / Self::NANOS_PER_SECOND,
                             )
                         {
                             return error as u32;

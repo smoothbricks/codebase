@@ -123,7 +123,7 @@ fn ttl_bitmap_program_flags(requested: u16, flags: u8) -> Vec<u8> {
     let mut prog = program(1, 3, &def, &[Opcode::BatchSetInsert as u8, 0, 0]);
     prog.extend(TEMPORAL_MAGIC.to_le_bytes());
     prog.extend(8u32.to_le_bytes());
-    prog.extend(2u32.to_le_bytes()); // i64 micros, independent of timestamp column 1
+    prog.extend(2u32.to_le_bytes()); // i64 nanos, independent of timestamp column 1
     prog.extend(0u32.to_le_bytes());
     prog
 }

@@ -58,7 +58,7 @@ once. After warm-up a bind allocates nothing: an entry's words grow to the longe
 
 A host `ColumnInput` carries its raw typed-array view only. It has no duplicate element-type label: the bytecode's
 operand and slot declarations are the authority for interpreting those bytes, including the temporal table's i64
-microsecond clock. An integer clock is never labeled as a float to satisfy a host wrapper. The reduce section reads a
+nanosecond clock. An integer clock is never labeled as a float to satisfy a host wrapper. The reduce section reads a
 wide derived column exactly as it reads a host column of the same lane. The operand walk (`column_uses`) names the lane
 of every column operand:
 

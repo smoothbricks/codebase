@@ -96,7 +96,7 @@ fn build_ttl_map_program(cap_lo: u8, cap_hi: u8, has_evict_trigger: bool) -> Vec
     let mut prog = program(1, 4, &init, &reduce);
     prog.extend(TEMPORAL_MAGIC.to_le_bytes());
     prog.extend(8u32.to_le_bytes());
-    prog.extend(3u32.to_le_bytes()); // explicit i64-micros event clock, separate from f64 age
+    prog.extend(3u32.to_le_bytes()); // explicit i64-nanos event clock, separate from f64 age
     prog.extend(0u32.to_le_bytes());
     prog
 }
@@ -108,7 +108,7 @@ fn build_ttl_set_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     let mut prog = program(1, 3, &init, &reduce);
     prog.extend(TEMPORAL_MAGIC.to_le_bytes());
     prog.extend(8u32.to_le_bytes());
-    prog.extend(2u32.to_le_bytes()); // explicit i64-micros event clock, separate from f64 age
+    prog.extend(2u32.to_le_bytes()); // explicit i64-nanos event clock, separate from f64 age
     prog.extend(0u32.to_le_bytes());
     prog
 }

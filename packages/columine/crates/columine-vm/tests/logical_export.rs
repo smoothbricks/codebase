@@ -336,7 +336,7 @@ fn hashmap_round_trip_with_timestamps_ttl_and_encodings() {
 }
 
 #[test]
-fn integer_deadline_comparison_and_index_round_trip_exact_micros() {
+fn integer_deadline_comparison_and_index_round_trip_exact_nanos() {
     let mut init = slot_def(0, SlotType::HashMap as u8 | 0x90, 8);
     init.extend(0.0f32.to_le_bytes());
     init.extend(0.0f32.to_le_bytes());

@@ -5,12 +5,12 @@
 A struct-map expiry evaluates the values the map stores, not only incoming values. One batch folds exactly as its rows
 one batch per row, in log order. Before each row, TTL evicts against that row's event clock. After all that row's
 writes, stored-row expiry runs, including when the row is inactive or its type writes no slot. The clock is the event's
-own i64 timestamp in microseconds, never a batch maximum, a slot's custom age column, or the wall clock. A batch crosses
+own i64 timestamp in nanoseconds, never a batch maximum, a slot's custom age column, or the wall clock. A batch crosses
 the embedder boundary once; the VM borrows its original columns throughout the row fold.
 
 The embedder classifies stored predicates. A time-independent predicate is evaluated only on changed stored keys. A
 time-independent guard conjoined with a monotone field deadline schedules a hidden HASHMAP companion identified by its
-owner and the role `expiry`. Its comparison lane and the existing TTL expiry index hold exact i64 microseconds. After
+owner and the role `expiry`. Its comparison lane and the existing TTL expiry index hold exact i64 nanoseconds. After
 each row's writes, the next-deadline minimum is compared once with that row's clock; only due entries are drained. An
 expiry remains an erasure if a later row has an earlier timestamp. Other time-dependent predicates are refused by the
 embedder's compiler: they never fall back to a full stored-row scan per row.
@@ -43,7 +43,7 @@ operands. The opcode is a reduce-section instruction, not an init declaration or
 ### Integer deadline index
 
 On a TTL HASHMAP slot, flag `0x80` declares `integer_deadline`: both its comparison lane and each expiry entry's first
-eight bytes are little-endian i64 microseconds. Other TTL slots retain their existing f64 timestamp lane. The existing
+eight bytes are little-endian i64 nanoseconds. Other TTL slots retain their existing f64 timestamp lane. The existing
 TTL tail remains present; an expiry companion declares zero TTL and grace. `TtlMutation::UpsertI64` supplies an exact
 integer timestamp, and a mutation of the wrong lane is `InvalidCellValue` before any write. Remove-only plans select the
 lane from the slot flag. Integer and floating timestamps share the existing retained placement planner, captures and
@@ -52,13 +52,16 @@ index geometry; there is no second schedule. Raw integer bytes are never interpr
 ### Temporal program table
 
 The `TMP1` extension (`0x31504d54`) carries `clock_col:u32le, count:u32le`, then `count` fixed 24-byte entries:
-`slot:u32le, predicate_col:u32le, companion:u32le, field:u8, field_unit:u8, reserved:u16le=0, age_micros:i64le`. The
-clock column is always i64 microseconds. `companion=0xffffffff` means a time-independent predicate; otherwise it names
-the owner's integer-deadline HASHMAP. `field_unit=0` converts a millisecond field to microseconds; `1` reads a
-microsecond field directly. The predicate is the static guard for an indexed expiry, or the whole static predicate.
-Constants must convert exactly to an i64 age; checked field scaling and deadline addition refuse `InvalidCellValue` on
-nonintegral, nonfinite or overflowing values. `STRUCT_MAP_SWEEP` names the table's slot/predicate pair, once at the
-reduce section's top level, after its writes. The table, not a second host clock argument, binds the row clock.
+`slot:u32le, predicate_col:u32le, companion:u32le, field:u8, field_unit:u8, reserved:u16le=0, age_nanos:i64le`. The
+clock column is always i64 nanoseconds. `companion=0xffffffff` means a time-independent predicate; otherwise it names
+the owner's integer-deadline HASHMAP. `field_unit` is the deadline field's time-unit code, the one the Timestamp plane's
+`type_param` uses: `0` seconds, `1` milliseconds, `2` microseconds, `3` nanoseconds; the field's value is scaled to
+nanoseconds, and any other code is `InvalidProgram`. A floating TTL slot's age, TTL and grace stay seconds and are
+compared with the row clock's nanoseconds divided by 10^9. The predicate is the static guard for an indexed expiry, or
+the whole static predicate. Constants must convert exactly to an i64 age; checked field scaling and deadline addition
+refuse `InvalidCellValue` on nonintegral, nonfinite or overflowing values. `STRUCT_MAP_SWEEP` names the table's
+slot/predicate pair, once at the reduce section's top level, after its writes. The table, not a second host clock
+argument, binds the row clock.
 
 The predicate column uses the existing row-expression table and live-column binding. A live expression receives the
 unchanged input batch and a borrowed `StoredRow` view of one live row through

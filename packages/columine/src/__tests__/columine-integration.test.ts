@@ -30,7 +30,7 @@ import {
   SlotTypeFlag,
 } from '../index.js';
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
-import { MANUAL_EVICTION_CLOCK_MICROS, rowClockTable } from './temporal-program-fixture.js';
+import { MANUAL_EVICTION_CLOCK, rowClockTable } from './temporal-program-fixture.js';
 
 // =============================================================================
 // WASM Binary
@@ -444,7 +444,7 @@ describe('SC1: Reduce stage for aggregation', () => {
           { data: keys },
           { data: values },
           { data: timestamps },
-          { data: new BigInt64Array(4).fill(MANUAL_EVICTION_CLOCK_MICROS) },
+          { data: new BigInt64Array(4).fill(MANUAL_EVICTION_CLOCK) },
         ],
         4,
       ),

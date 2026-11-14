@@ -16,7 +16,7 @@ import {
 } from '../types.js';
 import { loadColumineWasm, VmStateAdmissionError } from '../wasm-backend.js';
 import { WasmHostRegion } from '../wasm-memory-contract.js';
-import { MANUAL_EVICTION_CLOCK_MICROS, rowClockTable } from './temporal-program-fixture.js';
+import { MANUAL_EVICTION_CLOCK, rowClockTable } from './temporal-program-fixture.js';
 
 const WASM_PATH = new URL('../../.cache/wasm-dev/columine.wasm', import.meta.url);
 
@@ -381,7 +381,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
           { data: new Uint32Array(values.length).fill(7) },
           { data: values },
           { data: new Float64Array(values.length).fill(1) },
-          { data: new BigInt64Array(values.length).fill(MANUAL_EVICTION_CLOCK_MICROS) },
+          { data: new BigInt64Array(values.length).fill(MANUAL_EVICTION_CLOCK) },
         ];
         return delta
           ? backend.executeBatchDelta(state, reducer, columns, values.length)
@@ -457,13 +457,13 @@ describe('real wasm state geometry and committed-boundary growth', () => {
         { data: new Uint32Array([7]) },
         { data: new Uint32Array([30]) },
         { data: new Float64Array([1]) },
-        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]) },
+        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK]) },
       ];
       const updateColumns = [
         { data: new Uint32Array([7]) },
         { data: new Uint32Array([70]) },
         { data: new Float64Array([1]) },
-        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]) },
+        { data: new BigInt64Array([MANUAL_EVICTION_CLOCK]) },
       ];
       expect(backend.executeBatch(state, reducer, insertColumns, 1)).toBe(ErrorCode.OK);
       const beforeBegin = backend.serialize(state, reducer);
@@ -539,7 +539,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
     new Uint8Array(memory.buffer, statePtr, size).fill(0);
     expect(invoke(exports, 'vm_init_state', statePtr, programPtr, bytecode.length)).toBe(ErrorCode.OK);
 
-    // Columns are key, value, f64 TTL age and i64-micros row clock; each starts on an 8-byte boundary.
+    // Columns are key, value, f64 TTL age and i64-nanos row clock; each starts on an 8-byte boundary.
     const execute = (delta: boolean, columns: readonly ArrayBufferView[], batchLen: number) => {
       const view = new DataView(memory.buffer);
       let at = dataStart;
@@ -570,7 +570,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
           new Uint32Array([7]),
           new Uint32Array([30]),
           new Float64Array([1]),
-          new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]),
+          new BigInt64Array([MANUAL_EVICTION_CLOCK]),
         ],
         1,
       ),
@@ -584,7 +584,7 @@ describe('real wasm state geometry and committed-boundary growth', () => {
           new Uint32Array([7]),
           new Uint32Array([70]),
           new Float64Array([1]),
-          new BigInt64Array([MANUAL_EVICTION_CLOCK_MICROS]),
+          new BigInt64Array([MANUAL_EVICTION_CLOCK]),
         ],
         1,
       ),
