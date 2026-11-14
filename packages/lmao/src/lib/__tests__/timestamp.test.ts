@@ -444,7 +444,7 @@ describe('Nanoseconds utilities', () => {
 
   it('toMicros converts correctly', () => {
     const ns = Nanoseconds.fromMillis(1);
-    expect<number>(Nanoseconds.toMicros(ns)).toBe(1000);
+    expect(Nanoseconds.toMicros(ns)).toBe(1000n);
   });
 
   it('unsafe casts bigint', () => {

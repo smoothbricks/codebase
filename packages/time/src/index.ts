@@ -1,16 +1,15 @@
 /**
  * @smoothbricks/time
  *
- * Branded time types and named conversion functions for compile-time safety between precision domains. A nanosecond
- * instant (`EpochNanos`, the event and trace clock) is a `bigint`; a microsecond instant (`EpochMicros`, a business
- * instant), a millisecond (`EpochMillis`, the `Date` domain) and a second (`EpochSeconds`) are safe-integer numbers.
+ * Branded timestamp types and named conversion functions for compile-time
+ * safety between microsecond and millisecond precision domains.
  * Zero runtime dependencies. Works on all runtimes (Bun, Node, browser, Expo, AWS, Cloudflare).
  *
  * @example
  * ```typescript
  * import { EpochMicros, EpochMillis, epochMicrosToMillis, nowMicros } from '@smoothbricks/time';
  *
- * const now = nowMicros();                   // branded number microseconds
+ * const now = nowMicros();                   // branded bigint microseconds
  * const ms = epochMicrosToMillis(now);       // branded number milliseconds
  * const date = new Date(ms);                 // JS Date from branded millis
  * ```

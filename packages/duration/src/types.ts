@@ -52,18 +52,10 @@ export function DurationNanos(value: bigint): DurationNanos {
   return brandBigint<'ns'>(value);
 }
 
-/**
- * A span of time in whole microseconds as a safe-integer number -- an Arrow `Duration(us)`. Throws a RangeError for a
- * value that counts no whole microsecond or lies past the safe-integer range (about 285 years); negative zero reads as
- * no span.
- */
-export type DurationMicros = DurationBrand<number, 'us'>;
-export function DurationMicros(value: number): DurationMicros {
-  if (!Number.isSafeInteger(value)) {
-    throw new RangeError(`DurationMicros: ${value} is not a safe integer count of microseconds`);
-  }
-  // `+ 0` turns -0 into 0 and leaves every other integer as it is.
-  return brandNumber<'us'>(value + 0);
+/** A span of time in bigint microseconds -- an Arrow `Duration(us)` */
+export type DurationMicros = DurationBrand<bigint, 'us'>;
+export function DurationMicros(value: bigint): DurationMicros {
+  return brandBigint<'us'>(value);
 }
 
 /** A span of time in number milliseconds -- an Arrow `Duration(ms)` */

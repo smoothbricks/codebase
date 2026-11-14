@@ -25,7 +25,6 @@
  */
 
 import {
-  EpochMicros,
   EpochMillis,
   EpochNanos,
   epochMillisToNanos,
@@ -77,7 +76,7 @@ export namespace Nanoseconds {
    * @param nanos - Nanoseconds value
    * @returns The microsecond the instant lies in
    */
-  export function toMicros(nanos: Nanoseconds): EpochMicros {
+  export function toMicros(nanos: Nanoseconds): bigint {
     return epochNanosToMicros(nanos);
   }
 }

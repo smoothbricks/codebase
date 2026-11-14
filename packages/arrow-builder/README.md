@@ -199,9 +199,28 @@ const columns = createAttributeColumns(schema, 1000);
 
 ### Type Utilities
 
-Time values are the brands of `@smoothbricks/time` (`EpochNanos`, `EpochMicros`, `EpochMillis`, `EpochSeconds`) and
-`@smoothbricks/duration`: a nanosecond value is a `bigint`, every coarser unit a safe-integer `number`. `Nanoseconds` is
-`EpochNanos` with the conversions a buffer's clock needs.
+#### `Microseconds`
+
+Branded type for microsecond-precision timestamps.
+
+```typescript
+import { Microseconds } from '@smoothbricks/arrow-builder';
+
+// Convert from milliseconds
+const timestamp = Microseconds.fromMillis(Date.now());
+
+// Convert from nanoseconds (Node.js)
+const precise = Microseconds.fromNanos(process.hrtime.bigint());
+
+// Use in buffer
+buffer.timestamp[idx] = timestamp;
+```
+
+**Benefits:**
+
+- Type-safe time unit handling
+- Prevents mixing milliseconds and microseconds
+- Zero runtime overhead (compile-time only)
 
 ## Performance Characteristics
 

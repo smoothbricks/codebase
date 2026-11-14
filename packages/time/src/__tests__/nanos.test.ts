@@ -30,18 +30,18 @@ describe('EpochNanos', () => {
 
   it('converts up from coarser units without loss', () => {
     expect(epochMillisToNanos(EpochMillis(1_794_601_417_993))).toBe(EpochNanos(1_794_601_417_993_000_000n));
-    expect(epochMicrosToNanos(EpochMicros(1_794_601_417_993_000))).toBe(EpochNanos(1_794_601_417_993_000_000n));
+    expect(epochMicrosToNanos(EpochMicros(1_794_601_417_993_000n))).toBe(EpochNanos(1_794_601_417_993_000_000n));
     expect(dateToNanos(new Date(1_794_601_417_993))).toBe(EpochNanos(1_794_601_417_993_000_000n));
   });
 
   it('converts down by flooring, before the epoch too', () => {
-    expect(epochNanosToMicros(INSTANT)).toBe(EpochMicros(1_794_601_417_993_000));
+    expect(epochNanosToMicros(INSTANT)).toBe(EpochMicros(1_794_601_417_993_000n));
     expect(epochNanosToMillis(INSTANT)).toBe(EpochMillis(1_794_601_417_993));
     expect(nanosToDate(INSTANT).getTime()).toBe(1_794_601_417_993);
     // One nanosecond before the epoch lies in the last microsecond and millisecond before it.
-    expect(epochNanosToMicros(EpochNanos(-1n))).toBe(EpochMicros(-1));
+    expect(epochNanosToMicros(EpochNanos(-1n))).toBe(EpochMicros(-1n));
     expect(epochNanosToMillis(EpochNanos(-1n))).toBe(EpochMillis(-1));
-    expect(epochMicrosToMillis(EpochMicros(-1))).toBe(EpochMillis(-1));
+    expect(epochMicrosToMillis(EpochMicros(-1n))).toBe(EpochMillis(-1));
   });
 
   it('writes every nanosecond digit of an instant', () => {
@@ -76,7 +76,7 @@ describe('unit brands refuse each other', () => {
     // @ts-expect-error a microsecond field takes no nanosecond value
     const asMicros: EpochMicros = nanos;
     // @ts-expect-error a nanosecond field takes no microsecond value
-    const asNanos: EpochNanos = EpochMicros(1);
+    const asNanos: EpochNanos = EpochMicros(1n);
     // @ts-expect-error a nanosecond field takes no bare bigint
     const bare: EpochNanos = 1n;
     expect([asMicros, asNanos, bare].length).toBe(3);

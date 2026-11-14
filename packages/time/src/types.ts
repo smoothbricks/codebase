@@ -1,11 +1,8 @@
 /**
- * Branded time types for compile-time safety between precision domains.
+ * Branded timestamp types for compile-time safety between precision domains.
  *
- * Every instant is a native JS primitive with a phantom brand. A nanosecond instant is a `bigint`: nanoseconds since the
- * epoch are about 1.7e18 today, past what a number holds exactly. A microsecond, millisecond or second instant is a
- * safe-integer `number`: microseconds since the epoch are about 1.7e15 today and stay under 2^53 until the year 2255,
- * and a number adds and compares without the heap value a `bigint` is
- * (specs/lmao/01a_trace_schema_system.md#smoo/lmao!n/schema-time-units).
+ * All timestamps are native JS primitives (bigint or number) with phantom type brands.
+ * No runtime overhead -- branding is purely a TypeScript construct.
  */
 
 // Inline Brand to avoid circular dependencies.
@@ -23,24 +20,12 @@ function brandNumber(value: number): number {
   return value;
 }
 
-/**
- * Microseconds since the epoch as a safe-integer number: a business instant, when something happened or is due in a
- * domain. Some platforms give no nanoseconds; the event and trace clock is `EpochNanos`.
- */
-export type EpochMicros = Brand<number, 'EpochMicros'>;
+/** Bigint microseconds since epoch -- canonical timestamp */
+export type EpochMicros = Brand<bigint, 'EpochMicros'>;
 
-/**
- * Constructor. Throws a RangeError for a value that counts no whole microsecond (a fraction, NaN, an infinity) or lies
- * past the safe-integer range (more than about 285 years from 1970): a caller holding such a value has a defect. A value
- * from outside the program is judged by its own schema first (a `Timestamp(us)` field's `validate`). Negative zero
- * reads as the epoch.
- */
-export function EpochMicros(value: number): EpochMicros {
-  if (!Number.isSafeInteger(value)) {
-    throw new RangeError(`EpochMicros: ${value} is not a safe integer count of microseconds`);
-  }
-  // `+ 0` turns -0 into 0 and leaves every other integer as it is.
-  return brandNumber<'EpochMicros'>(value + 0);
+/** Constructor. Currency-style: `EpochMicros(value)` */
+export function EpochMicros(value: bigint): EpochMicros {
+  return brandBigint<'EpochMicros'>(value);
 }
 
 /** Bigint nanoseconds since epoch -- the unit of an Arrow `Timestamp(ns)` and of a span's clock */
