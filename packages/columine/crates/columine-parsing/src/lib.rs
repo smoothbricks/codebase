@@ -443,14 +443,29 @@ impl ExtractionConfig {
     }
 
     /// The column the lanes write `member` of an event of `event_type` to:
-    /// its discriminated column, else its `value.<member>` column, when a
-    /// member writes that column.
+    /// its discriminated column, else none when its routing row places it in
+    /// the declared record, else its `value.<member>` column, when a member
+    /// writes that column.
     fn placed_column(&self, event_type: &str, member: &str) -> Option<usize> {
         self.variant_map
             .get(event_type, member)
-            .or_else(|| self.payload_map.get(member))
+            .or_else(|| {
+                if self.routes_to_record(event_type, member) {
+                    None
+                } else {
+                    self.payload_map.get(member)
+                }
+            })
             .map(|lookup| lookup.column)
             .filter(|column| self.member_write(*column).is_some())
+    }
+
+    /// Whether a routing row places `member` of `discriminant` in the
+    /// declared record: a plain `value.<member>` column then belongs to
+    /// another type's member, never to this one
+    /// (specs/columine/10-physical-vocabulary.md §7).
+    fn routes_to_record(&self, discriminant: &str, member: &str) -> bool {
+        !self.record_routes.is_empty() && self.record_routes.get(discriminant, member).is_some()
     }
 
     /// Whether a lane reads an event's `type`: its schema routes and judges
@@ -525,18 +540,23 @@ impl ExtractionConfig {
     }
 
     /// Resolve one nested-payload member: its discriminated column for this
-    /// discriminant first, then the plain `value.<member>` column.
+    /// discriminant first, then none when its routing row places it in the
+    /// declared record, then the plain `value.<member>` column.
     pub(crate) fn lookup_payload_member(
         &self,
         discriminant: Option<&str>,
         member: &str,
         column_name: &str,
     ) -> Option<&FieldLookup> {
-        if let Some(discriminant) = discriminant
-            && !self.variant_map.is_empty()
-            && let Some(lookup) = self.variant_map.get(discriminant, member)
-        {
-            return Some(lookup);
+        if let Some(discriminant) = discriminant {
+            if !self.variant_map.is_empty()
+                && let Some(lookup) = self.variant_map.get(discriminant, member)
+            {
+                return Some(lookup);
+            }
+            if self.routes_to_record(discriminant, member) {
+                return None;
+            }
         }
         self.lookup_field(column_name)
     }

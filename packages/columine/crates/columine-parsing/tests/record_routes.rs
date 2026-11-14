@@ -10,9 +10,9 @@ use columine_parsing::json_extractor::{ExtractionDiagnostic, extract_json_events
 use columine_parsing::msgpack_extractor::extract_msgpack_events_with_projections;
 use columine_parsing::validate::{NumberValue, ValueKind, ValueView, parse_schema_envelope};
 use columine_parsing::{
-    ArrowType, CellLayout, CellWriter, ColumnValue, DynamicColumns, FrameProjections,
-    PayloadDiscriminator, SignalSchemaField, build_extraction_config_with_semantic_schemas,
-    read_cell,
+    ArrowType, CellLayout, CellWriter, ColumnValue, DiscriminatedMember, DynamicColumns,
+    FrameProjections, PayloadDiscriminator, SignalSchemaField,
+    build_extraction_config_with_semantic_schemas, read_cell,
 };
 use columine_types::category::NoCategories;
 use columine_types::cells::{
@@ -242,16 +242,23 @@ fn msgpack_orders() -> Vec<u8> {
     out
 }
 
-/// Columns 1 to 3 of every row the lane stores, as text: `-` is the empty cell.
-fn stored(lane: &str, semantic: bool) -> Vec<[String; 3]> {
-    let (fields, config) = record_config(semantic);
-    let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
+/// The cells at `cells` of every row a lane stores from `json` or its
+/// MessagePack twin `msgpack`, as text: `-` is the empty cell.
+fn extract<const N: usize>(
+    lane: &str,
+    fields: &[SignalSchemaField],
+    config: &columine_parsing::ExtractionConfig,
+    json: &[u8],
+    msgpack: &[u8],
+    cells: [usize; N],
+) -> Vec<[String; N]> {
+    let mut columns = DynamicColumns::new(fields, 8).expect("column plane fits");
     let mut embedder = TextCells::default();
     let mut work = [0; 512];
     let rows = match lane {
         "json" => extract_json_events(
-            JSON_ORDERS,
-            &config,
+            json,
+            config,
             &mut columns,
             &mut work,
             &mut ExtractionDiagnostic::default(),
@@ -260,8 +267,8 @@ fn stored(lane: &str, semantic: bool) -> Vec<[String; 3]> {
             &mut Vec::new(),
         ),
         _ => extract_msgpack_events_with_projections(
-            &msgpack_orders(),
-            &config,
+            msgpack,
+            config,
             &mut columns,
             &mut work,
             false,
@@ -274,7 +281,7 @@ fn stored(lane: &str, semantic: bool) -> Vec<[String; 3]> {
     .unwrap_or_else(|error| panic!("{lane}: the batch is accepted: {error:?}"));
     (0..rows)
         .map(|row| {
-            [1, 2, 3].map(|column| match read_cell(&columns, column, row) {
+            cells.map(|column| match read_cell(&columns, column, row) {
                 None => "-".to_owned(),
                 Some(ColumnValue::Utf8(text)) => text.into_owned(),
                 Some(ColumnValue::Binary(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -282,6 +289,140 @@ fn stored(lane: &str, semantic: bool) -> Vec<[String; 3]> {
             })
         })
         .collect()
+}
+
+/// Columns 1 to 3 of every row the lane stores from the `order` events.
+fn stored(lane: &str, semantic: bool) -> Vec<[String; 3]> {
+    let (fields, config) = record_config(semantic);
+    extract(
+        lane,
+        &fields,
+        &config,
+        JSON_ORDERS,
+        &msgpack_orders(),
+        [1, 2, 3],
+    )
+}
+
+const SHADOWED_NAMES: [&str; 5] = [
+    "type",
+    "value.name",
+    "value.$declared",
+    "value.$undeclared",
+    "value.qty",
+];
+
+/// [`record_config`] with a column `value.qty` that type `tally`'s `qty` has,
+/// by its discriminated row: `order`'s `qty` keeps its routing row.
+fn shadowed_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConfig) {
+    let fields = vec![
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+        SignalSchemaField::new(ArrowType::Int64, true),
+    ];
+    let schemas = parse_schema_envelope(
+        br#"{"order":{"kind":"object","fields":{"name":{"kind":"string"},"qty":{"kind":"optional","value":{"kind":"number"}}}},"tally":{"kind":"object","fields":{"qty":{"kind":"number"}}}}"#,
+    )
+    .unwrap();
+    let cell = Some(ENCODING.to_owned());
+    let config = build_extraction_config_with_semantic_schemas(
+        &fields,
+        &SHADOWED_NAMES,
+        &[],
+        semantic.then_some(&schemas),
+        Some(&PayloadDiscriminator {
+            key: "type".into(),
+            members: vec![DiscriminatedMember {
+                discriminant: "tally".into(),
+                member: "qty".into(),
+                column: 4,
+            }],
+        }),
+        CellLayout {
+            cell_metadata: &[None, None, cell.clone(), cell, None],
+            record_members: &[RecordMember {
+                discriminant: "order".into(),
+                member: "qty".into(),
+                path: vec![3],
+                descriptor_position: 7,
+            }],
+            encoding: Some(ENCODING),
+            ..CellLayout::default()
+        },
+    )
+    .unwrap();
+    (fields, config)
+}
+
+/// An `order` and a `tally` in each spelling.
+const JSON_SHADOWED: &[u8] = br#"[
+    {"type":"order","value":{"name":"a","qty":5}},
+    {"type":"order","value.name":"c","value.qty":7},
+    {"type":"tally","value":{"qty":9}},
+    {"type":"tally","value.qty":10}
+]"#;
+
+/// [`JSON_SHADOWED`] as a MessagePack array.
+fn msgpack_shadowed() -> Vec<u8> {
+    use Mp::{Int, Map, Str};
+    let events = [
+        Map(vec![
+            ("type", Str("order")),
+            ("value", Map(vec![("name", Str("a")), ("qty", Int(5))])),
+        ]),
+        Map(vec![
+            ("type", Str("order")),
+            ("value.name", Str("c")),
+            ("value.qty", Int(7)),
+        ]),
+        Map(vec![
+            ("type", Str("tally")),
+            ("value", Map(vec![("qty", Int(9))])),
+        ]),
+        Map(vec![("type", Str("tally")), ("value.qty", Int(10))]),
+    ];
+    let mut out = vec![0x90 | u8::try_from(events.len()).unwrap()];
+    for event in &events {
+        msgpack(&mut out, event);
+    }
+    out
+}
+
+#[test]
+fn a_routed_member_keeps_its_declared_record_beside_another_types_column_of_its_name() {
+    let lanes = [
+        ("json", true),
+        ("json", false),
+        ("msgpack", true),
+        ("msgpack", false),
+    ];
+    let row = |cells: [&str; 3]| cells.map(str::to_owned);
+    let expected = [
+        // `order`'s `qty` is in its record, nested and flat.
+        row(["a", "[3]@7=5", "-"]),
+        row(["c", "[3]@7=7", "-"]),
+        // `tally`'s `qty` is its column, nested and flat.
+        row(["-", "-", "Int(9)"]),
+        row(["-", "-", "Int(10)"]),
+    ];
+    let stored = |lane: &str, semantic: bool| {
+        let (fields, config) = shadowed_config(semantic);
+        extract(
+            lane,
+            &fields,
+            &config,
+            JSON_SHADOWED,
+            &msgpack_shadowed(),
+            [1, 2, 4],
+        )
+    };
+    assert_eq!(
+        lanes.map(|(lane, semantic)| (lane, semantic, stored(lane, semantic))),
+        lanes.map(|(lane, semantic)| (lane, semantic, expected.to_vec())),
+        "(lane, semantic schema, [value.name, value.$declared, value.qty] per row)"
+    );
 }
 
 #[test]

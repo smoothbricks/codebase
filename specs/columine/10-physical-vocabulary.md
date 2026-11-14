@@ -151,7 +151,9 @@ schema. A declared member is never dropped and never falls to the carrier. A sch
 rows has a `value.$declared` column the embedder writes. A routing row places its member whether or not the processor
 holds a semantic schema, in either payload spelling and whichever side of the payload `type` is spelled on: a flat
 `value.<member>` key takes the member's discriminated column and routing row as the nested member does, and a member
-nothing places keeps its key as its carrier path.
+nothing places keeps its key as its carrier path. A routing row places its member before a plain `value.<member>` column
+of the same name: the plain column belongs to a member no row places. A placement is per `(event type, member)` and a
+column is per schema, so one type's member never lands in the column another type's member of the same name has.
 
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
