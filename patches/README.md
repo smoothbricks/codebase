@@ -15,6 +15,16 @@ consumer's `skipLibCheck` to hide a factory declaration mismatch. Apply this pat
 and ordinary `bun install`; rebuild lmao's declarations from the installed product. Retire the patch only when the
 upstream declaration preserves the same contract.
 
+## Flechette delta dictionaries
+
+The same patch adds a `tableToIPC` option, `deltaDictionaries`: a set of dictionary values columns whose every batch,
+the first included, is written as a delta. A writer whose stream continues a dictionary an earlier stream defined (a
+column store whose entries each carry the values they added, columine `10-physical-vocabulary.md` §5: "The message is a
+delta exactly when the mark is above zero") needs it, since upstream writes a dictionary's first batch as its definition
+and keeps the assembly that could flag it private. A call without the option writes the same bytes as before
+(`packages/arrow-builder/src/lib/arrow/__tests__/ipcDeltaDictionaries.test.ts`). Retire it when upstream offers the same
+choice.
+
 Flechette 2.7 builds Date64 metadata from numeric millisecond inputs. The Compact fixture seeds only that schema with a
 number; its physical payload remains `BigInt64Array`, with the same i64 round-trip assertions.
 
