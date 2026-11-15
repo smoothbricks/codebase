@@ -2903,6 +2903,9 @@ to the command, which the keyed modules decide. Each entry, and what the executo
 - `parent-grant.js`: what a run asks its parent's pool for and says of the answer, `peak-charge.js` and `cpu-grant.js`:
   the charge the task's last record names and the grant a record states. A grant reaches the command as a token count
   and nothing else, through `runner-sizing.js`; a record that cannot be read refuses the run.
+- `suite-minimum.js`: the minimum a reserved test leaf names on its reservation, from the walls its last run recorded.
+  It decides how many cores the leaf waits for before it starts; the grant still reaches the command as a token count
+  through `runner-sizing.js`, and a leaf with no recorded wall names none.
 - `memory-retry.js`: whether a command the kernel killed for memory (a SIGKILL this executor did not send, to a command
   no bound of it ended) runs once more, alone in its run's pool, and how the two runs' output joins. The second run is
   the same command; only the pool it is lent from differs, and a pass after it is a pass of that command.

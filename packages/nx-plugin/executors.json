@@ -22,6 +22,7 @@
         "./dist/executors/bounded-exec/ram-detach.js",
         "./dist/executors/bounded-exec/ram-temp-held.js",
         "./dist/executors/bounded-exec/ram-temp.js",
+        "./dist/executors/bounded-exec/suite-minimum.js",
         "./dist/testing.js"
       ]
     },

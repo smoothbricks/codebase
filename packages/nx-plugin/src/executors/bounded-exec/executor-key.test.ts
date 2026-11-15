@@ -115,6 +115,7 @@ const SCHEDULING = [
   'executors/bounded-exec/parent-grant.ts',
   'executors/bounded-exec/peak-charge.ts',
   'executors/bounded-exec/pool-admission.ts',
+  'executors/bounded-exec/suite-minimum.ts',
 ];
 
 describe('the bounded-exec key', () => {
