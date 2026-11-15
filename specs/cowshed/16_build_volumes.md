@@ -582,9 +582,16 @@ lock, which every fork of the target holds while it clones the seed, so a reseed
 
 1. the source's build hold (`<id>.dmg.hold`, outside its mounted filesystem) is taken exclusively without waiting,
    before anything else; an admitted job holding it skips the capture before any image mutation, retaining the old seed,
-   and the skip names each process holding the hold. From here the hold refuses every job admission, as Land's quiet
-   capture refuses replacement admission from before its jobs stop: a shed's daemon keeper (04_sandbox.md) restarts the
-   daemon step 2 stops as a read-write job, and taken after that stop the hold would lose to the restart;
+   and the skip names each process holding the hold when one census of the hold file's descriptors answers within the
+   control bound (5 s). That census runs on a thread of its own and is all the skip waits for: a per-descriptor query
+   waits as long as any kernel call the asked process sits in (02_workspaces.md, "Holders cowshed does not run"), so a
+   census that has not answered at the bound is left to end by itself and the skip says that the holders were not listed
+   within it. The hold decides the skip, so no census of the files open inside the volume is taken for it. Measured
+   2026-11-16 on a host of 970 processes at load 27: the hold census took 0.43 to 0.51 s and the volume census 0.87 to
+   1.13 s, 0.29 s of it on a CPU; one fork whose skip took both waited 45.3 s where its siblings waited 0.6 to 2.7 s.
+   From here the hold refuses every job admission, as Land's quiet capture refuses replacement admission from before its
+   jobs stop: a shed's daemon keeper (04_sandbox.md) restarts the daemon step 2 stops as a read-write job, and taken
+   after that stop the hold would lose to the restart;
 2. the target's Nx task database may have no holder but the target's daemon, which is stopped as at an adoption (Land
    step 5); any other holder, or a daemon that outlives its stop, skips the reseed. The Nx database open locks remain
    held through capture so another client cannot open a known task database between the holder check and the clone;

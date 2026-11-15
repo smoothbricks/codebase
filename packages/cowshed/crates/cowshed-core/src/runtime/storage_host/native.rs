@@ -169,6 +169,14 @@ where
         MacOsApfsExecutionHost::claim_build_volume(self, layout, id)
     }
 
+    fn try_claim_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<Option<ReleaseClaim>, ApfsStorageError> {
+        MacOsApfsExecutionHost::try_claim_build_volume(self, layout, id)
+    }
+
     fn detach_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,

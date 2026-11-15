@@ -3181,16 +3181,26 @@ fn seed_age(
     let Some(record) = layout.read_record_present(&live)? else {
         return Ok(None);
     };
-    let written = host.build_volume_written(layout, &live).map_err(storage)?;
+    let written = {
+        let _span = cowshed_os::timing::span("reseed", "live-written");
+        host.build_volume_written(layout, &live).map_err(storage)?
+    };
     let seed = match select_seed()? {
         Some((id, seed_tree)) => Some(Frozen {
-            written: host.build_volume_written(layout, &id).map_err(storage)?,
-            nearness: nearness(checkout, seed_tree.as_ref(), tree),
+            written: {
+                let _span = cowshed_os::timing::span("reseed", "seed-written");
+                host.build_volume_written(layout, &id).map_err(storage)?
+            },
+            nearness: {
+                let _span = cowshed_os::timing::span("reseed", "seed-nearness");
+                nearness(checkout, seed_tree.as_ref(), tree)
+            },
             tree: seed_tree,
             id,
         }),
         None => None,
     };
+    let _span = cowshed_os::timing::span("reseed", "live-nearness");
     Ok(Some(SeedAge {
         live,
         nearness: nearness(checkout, record.tree.as_ref(), tree),
@@ -3382,22 +3392,72 @@ impl<'a> SeedCapture<'a> {
     }
 }
 
+/// How long a skipped reseed waits for the census that names its hold's holders: the control
+/// bound (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional writers",
+/// step 1).
+const HOLDERS_NAMED_WITHIN: Duration = cowshed_os::deadline::CONTROL.within;
+
+/// Who holds a build hold a reseed could not claim.
+enum HoldHolders {
+    Named(Vec<cowshed_os::process::Holder>),
+    /// The census had not answered within this bound; it was left to end by itself.
+    Unlisted(Duration),
+}
+
+/// `ask`'s answer when it comes within `bound`. `ask` runs on a thread of its own, which ends
+/// with it whenever that is: nothing waits for it past the bound.
+fn answered_within<T: Send + 'static>(
+    bound: Duration,
+    ask: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<Option<T>> {
+    let (answered, answer) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("cowshed-hold-census".into())
+        .spawn(move || {
+            // A caller past its bound has dropped `answer`; the refused send drops the answer.
+            let _ = answered.send(ask());
+        })?;
+    match answer.recv_timeout(bound) {
+        Ok(answer) => Ok(Some(answer)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "the census thread ended without an answer",
+        )),
+    }
+}
+
+/// The reseed's exclusive claim on `source`'s build hold, taken without waiting, or the skip
+/// when a job is admitted on the volume or another operation claims it. The hold alone decides;
+/// the skip then names the hold's holders as one bounded census lists them.
 fn claim_seed_source(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     source: &BuildVolumeId,
 ) -> Result<std::result::Result<ReleaseClaim, CaptureSkip>> {
-    match host.claim_build_volume(layout, source).map_err(storage)? {
-        BuildVolumeClaim::Claimed(claim) => Ok(Ok(claim)),
-        BuildVolumeClaim::Held { open } => {
-            let hold = layout.hold_path(source);
-            let claimants = nx::holders(host.census(), &hold)
-                .map_err(|error| io("list the build hold's holders", &hold, &error))?;
-            Ok(Err(CaptureSkip::VolumeBusy {
-                reason: build_hold_busy_reason(&layout.image(source), &hold, &claimants, &open),
-            }))
-        }
+    let claimed = {
+        let _span = cowshed_os::timing::span("reseed", "claim");
+        host.try_claim_build_volume(layout, source)
+            .map_err(storage)?
+    };
+    if let Some(claim) = claimed {
+        return Ok(Ok(claim));
     }
+    let hold = layout.hold_path(source);
+    let holders = {
+        let _span = cowshed_os::timing::span("reseed", "hold-holders");
+        let (census, asked) = (host.census().clone(), hold.clone());
+        match answered_within(HOLDERS_NAMED_WITHIN, move || nx::holders(&census, &asked))
+            .map_err(|error| io("start the build hold's census", &hold, &error))?
+        {
+            Some(holders) => HoldHolders::Named(
+                holders.map_err(|error| io("list the build hold's holders", &hold, &error))?,
+            ),
+            None => HoldHolders::Unlisted(HOLDERS_NAMED_WITHIN),
+        }
+    };
+    Ok(Err(CaptureSkip::VolumeBusy {
+        reason: build_hold_busy_reason(&layout.image(source), &hold, &holders),
+    }))
 }
 /// Replace only the seed; live cache and declared-state contents stay untouched.
 fn retained_seed<H: RuntimeStorageHost>(
@@ -3669,7 +3729,10 @@ fn capture(
     tree: Option<GitOid>,
 ) -> Result<CaptureAttempt> {
     let started = Instant::now();
-    let (mount, mount_elapsed) = host.mount_build_volume(layout, source).map_err(storage)?;
+    let (mount, mount_elapsed) = {
+        let _span = cowshed_os::timing::span("reseed", "source-mount");
+        host.mount_build_volume(layout, source).map_err(storage)?
+    };
     let state = BuildVolumeState::read(&mount)?;
     if state.mbx.is_some() {
         let source = HeldVolume::for_seed(host, layout, source.clone())?;
@@ -3766,36 +3829,31 @@ pub(crate) fn say_refresh(
     }
 }
 
-/// Why a reseed could not claim its source's build hold, naming every holder of that hold: a
-/// job admitted on the volume (its supervisor's process holds the hold for it) or another
-/// cowshed operation claiming the volume, and anything with a file open inside it.
-fn build_hold_busy_reason(
-    image: &Path,
-    hold: &Path,
-    claimants: &[cowshed_os::process::Holder],
-    open: &[cowshed_os::process::Holder],
-) -> String {
-    let named = |holders: &[cowshed_os::process::Holder]| {
-        holders
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+/// Why a reseed could not claim its source's build hold, naming every holder of that hold the
+/// census listed: a job admitted on the volume (its supervisor's process holds the hold for it)
+/// or another cowshed operation claiming the volume.
+fn build_hold_busy_reason(image: &Path, hold: &Path, holders: &HoldHolders) -> String {
+    let held_by = match holders {
+        HoldHolders::Named(holders) if holders.is_empty() => {
+            "is held by a process this user cannot see".to_owned()
+        }
+        HoldHolders::Named(holders) => format!(
+            "is held by {}",
+            holders
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HoldHolders::Unlisted(bound) => format!(
+            "is held, and the census naming its holders did not answer within {bound:?} (a process it asks sits in a kernel call), so it was left to end by itself"
+        ),
     };
-    let mut reason = format!(
-        "build volume {} has a job admitted on it or another cowshed operation claiming it: its build hold {} is held by {}",
+    format!(
+        "build volume {} has a job admitted on it or another cowshed operation claiming it: its build hold {} {held_by}; nothing was stopped: the next fork retries once that job ends",
         image.display(),
         hold.display(),
-        match claimants {
-            [] => "a process this user cannot see".to_owned(),
-            claimants => named(claimants),
-        }
-    );
-    if !open.is_empty() {
-        reason.push_str(&format!(", and {} has it open", named(open)));
-    }
-    reason.push_str("; nothing was stopped: the next fork retries once that job ends");
-    reason
+    )
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -8145,6 +8203,93 @@ fn main() {
         a_fork_of_an_unmoved_workspace_carries_its_build_volume(Scratch::new("build-unmoved-fork"))
             .await;
     }
+
+    /// A fork of a workspace a job is admitted on, and writing its build volume, clones the seed
+    /// as it is (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional
+    /// writers", step 1): the reseed is skipped at the build hold before the job's volume is
+    /// touched, the seed stays, and the skip names the hold.
+    #[cfg(target_os = "macos")]
+    async fn a_fork_of_a_source_a_job_writes_keeps_the_seed<H: RuntimeStorageHost>(
+        scratch: Scratch<H>,
+    ) {
+        let main = owner("main", '0');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        let tree = commit(&main_checkout, &[("lib.rs", "1")]);
+        scratch
+            .layout
+            .write_record(
+                &main_live,
+                &BuildVolumeRecord::new(Some(tree.clone()), linked("main")),
+            )
+            .unwrap();
+        let seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &seed,
+                &registered(BuildVolumeRecord::new(
+                    Some(tree.clone()),
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                )),
+            )
+            .expect("seed main");
+        let job = scratch.layout.admit(&main_live).expect("a job's hold");
+        let (wrote, written) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn({
+            let mount = main_mount.clone();
+            move || {
+                let block = vec![7_u8; 1 << 20];
+                for index in 0..256_u32 {
+                    fs::write(mount.join(format!("built-{}", index % 16)), &block).unwrap();
+                    let _ = wrote.send(());
+                }
+            }
+        });
+        written.recv().expect("the job's first write");
+        let refreshed = scratch
+            .volumes
+            .refresh_seed(
+                main.clone(),
+                main_checkout.clone(),
+                Aim {
+                    tree,
+                    landed: Vec::new(),
+                },
+                LockHolding::of(LockOperation::Fork, &WorkspaceName::new("topic").unwrap()),
+            )
+            .await;
+        writer.join().expect("the job's writes");
+        drop(job);
+        let seeds = seeds_of(&scratch.layout, &main).unwrap();
+        let hold = scratch.layout.hold_path(&main_live);
+        scratch.release_all();
+        assert_eq!(seeds, [seed], "the skip keeps the seed");
+        let Refresh::Skipped {
+            reason: CaptureSkip::VolumeBusy { reason },
+            ..
+        } = refreshed.expect("refresh main's seed").outcome
+        else {
+            panic!("a job admitted on the source skips its reseed");
+        };
+        assert!(reason.contains(&hold.display().to_string()), "{reason}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_fork_of_a_source_a_job_writes_keeps_the_seed() {
+        a_fork_of_a_source_a_job_writes_keeps_the_seed(Scratch::directory("build-busy-fork")).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_fork_of_a_source_a_job_writes_keeps_the_seed() {
+        a_fork_of_a_source_a_job_writes_keeps_the_seed(Scratch::new("build-busy-fork")).await;
+    }
     /// An external land (16_build_volumes.md, "Which volume a seed holds"): main's branch moves
     /// by plain git to the tree `lander` has checked out, and `lander`'s build volume holds a
     /// marker output nothing in main built. A fork of main at that tree inherits the marker
@@ -8564,6 +8709,21 @@ fn main() {
                 && reason.contains(&format!("pid {}", std::process::id()))
                 && reason.contains("a job admitted on it"),
             "{reason}"
+        );
+    }
+
+    /// The census that names a skipped reseed's holders is waited for only to its bound
+    /// (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional writers",
+    /// step 1): one held off past the bound answers nothing, and one that answers is heard.
+    #[test]
+    fn an_answer_held_past_its_bound_is_not_waited_for() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let unanswered = answered_within(Duration::ZERO, move || held.recv().is_ok());
+        assert_eq!(unanswered.unwrap(), None);
+        drop(release);
+        assert_eq!(
+            answered_within(HOLDERS_NAMED_WITHIN, || 7).unwrap(),
+            Some(7)
         );
     }
 

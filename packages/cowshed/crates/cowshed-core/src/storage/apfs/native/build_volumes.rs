@@ -787,12 +787,7 @@ where
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<Claim, ApfsStorageError> {
-        self.verify_controller_path(&layout.image(id))?;
-        let hold = layout.hold_path(id);
-        match layout
-            .claim_release(id)
-            .map_err(|error| io_error("claim a build volume for release", &hold, error))?
-        {
+        match self.try_claim_build_volume(layout, id)? {
             Some(claim) => Ok(Claim::Claimed(claim)),
             None => {
                 let mount = layout.mount(id);
@@ -803,6 +798,20 @@ where
                 Ok(Claim::Held { open })
             }
         }
+    }
+
+    /// The exclusive claim on build volume `id`'s hold, taken without waiting and without asking
+    /// who holds it: `None` while a job is admitted on it or another operation claims it.
+    pub fn try_claim_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<Option<ReleaseClaim>, ApfsStorageError> {
+        self.verify_controller_path(&layout.image(id))?;
+        let hold = layout.hold_path(id);
+        layout
+            .claim_release(id)
+            .map_err(|error| io_error("claim a build volume for release", &hold, error))
     }
 
     /// Detach build volume `id` of `owner`, kept whole for its next mount, once `owner` is

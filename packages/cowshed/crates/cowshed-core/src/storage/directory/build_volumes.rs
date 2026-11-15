@@ -744,18 +744,26 @@ impl DirectoryExecutionHost {
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<BuildVolumeClaim, ApfsStorageError> {
-        let image = layout.image(id);
-        self.require_store_image(&image)?;
-        let hold = layout.hold_path(id);
-        match layout
-            .claim_release(id)
-            .map_err(|error| io_error("claim a build volume for release", &hold, error))?
-        {
+        match self.try_claim_build_volume(layout, id)? {
             Some(claim) => Ok(BuildVolumeClaim::Claimed(claim)),
             None => Ok(BuildVolumeClaim::Held {
-                open: holders_of(&self.census, &image)?,
+                open: holders_of(&self.census, &layout.image(id))?,
             }),
         }
+    }
+
+    /// The exclusive claim on build volume `id`'s hold, taken without waiting and without asking
+    /// who holds it: `None` while a job is admitted on it or another operation claims it.
+    pub fn try_claim_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<Option<ReleaseClaim>, ApfsStorageError> {
+        self.require_store_image(&layout.image(id))?;
+        let hold = layout.hold_path(id);
+        layout
+            .claim_release(id)
+            .map_err(|error| io_error("claim a build volume for release", &hold, error))
     }
 
     /// Seal the still-linked payload under its caller's exclusive admission claim

@@ -143,6 +143,15 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
     ) -> Result<BuildVolumeClaim, ApfsStorageError>;
+    /// [`Self::claim_build_volume`] without the census of what a held volume has open: the claim,
+    /// or `None` while a job is admitted on the volume or another operation claims it. For a
+    /// caller the hold alone decides (16_build_volumes.md, "A non-mbx reseed excludes the named
+    /// non-transactional writers", step 1).
+    fn try_claim_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+    ) -> Result<Option<ReleaseClaim>, ApfsStorageError>;
     /// Seal the still-linked volume without force, borrowing its exclusive admission claim.
     /// This never deletes storage. A native detach failure can follow an accepted unmount, so
     /// the caller restores canonical before dropping the retained claim on a prepublication
