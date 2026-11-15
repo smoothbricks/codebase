@@ -16,8 +16,8 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
   it('asks for many reservations over one connection, each granted its cores, and releases each once', async () => {
     const endpoint = await standInReservations((heard) => Math.min(heard.cpus, 4));
     try {
-      const wide = reserveCores(endpoint.socket, 6, 'low');
-      const narrow = reserveCores(endpoint.socket, 2, 'normal');
+      const wide = reserveCores(endpoint.socket, 6, 'low', 1);
+      const narrow = reserveCores(endpoint.socket, 2, 'normal', 1);
       expect(await wide.granted).toMatchObject({ ok: true, cpus: 4 });
       expect(await narrow.granted).toMatchObject({ ok: true, cpus: 2 });
       wide.release();
@@ -36,12 +36,35 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
     }
   });
 
+  it('names its minimum on the request, cut to its ask, and names none for a minimum of one', async () => {
+    const endpoint = await standInReservations((heard) => heard.cpus);
+    try {
+      const gathering = reserveCores(endpoint.socket, 6, 'low', 3);
+      const overAsk = reserveCores(endpoint.socket, 2, 'low', 5);
+      const plain = reserveCores(endpoint.socket, 4, 'low', 1);
+      expect(await gathering.granted).toMatchObject({ ok: true, cpus: 6 });
+      expect(await overAsk.granted).toMatchObject({ ok: true, cpus: 2 });
+      expect(await plain.granted).toMatchObject({ ok: true, cpus: 4 });
+      expect(endpoint.reserves.map(({ cpus, min }) => ({ cpus, min }))).toEqual([
+        { cpus: 6, min: 3 },
+        { cpus: 2, min: 2 },
+        { cpus: 4, min: null },
+      ]);
+      gathering.release();
+      overAsk.release();
+      plain.release();
+      await endpoint.released(3);
+    } finally {
+      await endpoint.close();
+    }
+  });
+
   it("answers a refusal as its request's error, and the connection serves on", async () => {
     const endpoint = await standInReservations((heard) =>
       heard.cpus === 3 ? { refused: '--memory needs scheduler.memory to be configured' } : 1,
     );
     try {
-      const refused = reserveCores(endpoint.socket, 3, 'low');
+      const refused = reserveCores(endpoint.socket, 3, 'low', 1);
       expect(await refused.granted).toEqual({
         ok: false,
         refusal: {
@@ -50,7 +73,7 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
           message: '--memory needs scheduler.memory to be configured',
         },
       });
-      const next = reserveCores(endpoint.socket, 1, 'low');
+      const next = reserveCores(endpoint.socket, 1, 'low', 1);
       expect(await next.granted).toMatchObject({ ok: true, cpus: 1 });
       next.release();
       await endpoint.released(1);
@@ -63,16 +86,16 @@ describe("a leaf's reservation on its run's mbx endpoint", () => {
   it('fails what waits and loses what is held when the endpoint goes, and finds none after', async () => {
     // A full pool keeps the second request waiting.
     const endpoint = await standInReservations((heard) => (heard.cpus === 1 ? 1 : null));
-    const held = reserveCores(endpoint.socket, 1, 'low');
+    const held = reserveCores(endpoint.socket, 1, 'low', 1);
     const granted = await held.granted;
     if (!granted.ok) throw new Error(`the stand-in grants one core: ${granted.refusal.message}`);
-    const waiting = reserveCores(endpoint.socket, 2, 'low');
+    const waiting = reserveCores(endpoint.socket, 2, 'low', 1);
 
     await endpoint.close();
 
     expect(await waiting.granted).toMatchObject({ ok: false });
     expect(await granted.lost).toContain(endpoint.socket);
-    const after = await reserveCores(endpoint.socket, 1, 'low').granted;
+    const after = await reserveCores(endpoint.socket, 1, 'low', 1).granted;
     expect(after).toMatchObject({ ok: false });
     if (!after.ok) expect(after.refusal.message).toContain(endpoint.socket);
   });

@@ -10,7 +10,9 @@ import { ownedSocketDirectory } from '../testing.js';
  * A line a client writes to `mbx reservations` (mbx's docs/scheduling.md, "Serve reservations to many commands"):
  * exactly these fields, as the host's installed mbx accepts them.
  */
-type HeardLine = { type: 'reserve'; id: number; cpus: number; priority: MbxPriority } | { type: 'release'; id: number };
+type HeardLine =
+  | { type: 'reserve'; id: number; cpus: number; priority: MbxPriority; min?: number }
+  | { type: 'release'; id: number };
 
 const validLine = typia.createValidateEquals<HeardLine>();
 
@@ -37,6 +39,8 @@ export interface HeardReserve {
   readonly id: number;
   readonly cpus: number;
   readonly priority: MbxPriority;
+  /** The minimum the request named; null for a request that named none. */
+  readonly min: number | null;
   readonly connection: number;
 }
 
@@ -95,7 +99,13 @@ export async function standInReservations(
           for (const wait of waiting.filter((wait) => releases.length >= wait.count)) wait.heard();
           continue;
         }
-        const heard = { id: line.id, cpus: line.cpus, priority: line.priority, connection };
+        const heard = {
+          id: line.id,
+          cpus: line.cpus,
+          priority: line.priority,
+          min: line.min ?? null,
+          connection,
+        };
         reserves.push(heard);
         const said = answer(heard);
         if (said === null) continue;

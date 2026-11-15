@@ -135,6 +135,7 @@
     "src/wait-why-policy.test.ts": 13,
     "src/executors/bounded-exec/progress.test.ts": 12,
     "src/task-graph-policy.test.ts": 12,
+    "src/executors/bounded-exec/suite-minimum.test.ts": 12,
     "src/executors/bounded-exec/disk-lease.test.ts": 11,
     "src/executors/bounded-exec/lock-wait.test.ts": 10,
     "src/executors/bounded-exec/ram-fixture.test.ts": 10,

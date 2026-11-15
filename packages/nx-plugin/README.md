@@ -2156,9 +2156,10 @@ own (specs/cowshed/05_gateway.md, "An Nx run serves its leaves one reservation e
 `preTasksExecution` starts `mbx reservations <socket>` once for a run with mbx's pool and publishes the socket in
 `MBX_RESERVATIONS_SOCKET`; its `postTasksExecution` ends it. The leaf's shell writes the count it asks for on descriptor
 5 and reads back the cores granted. The executor asks the endpoint over its process's one connection, says
-`cowshed: mbx reserve wait start cpus=<asked> priority=<p>` and then
-`cowshed: mbx reserve granted elapsed=<ms> priority=<p>`, and gives the grant back once the leaf's subtree is retired;
-the grant starts the leaf's total and fixture ceilings as a first `g` does. The shell runs the command with
+`cowshed: mbx reserve wait start cpus=<asked> priority=<p>` (with ` min=<m>` after the count when the leaf names a
+minimum: the fewest threads at which the walls its last run recorded keep a test finishing within its `idleTimeoutMs`)
+and then `cowshed: mbx reserve granted elapsed=<ms> priority=<p>`, and gives the grant back once the leaf's subtree is
+retired; the grant starts the leaf's total and fixture ceilings as a first `g` does. The shell runs the command with
 `MBX_RESERVE_CPUS`, `MBX_SCHED_DISABLE=1` and an empty `MBX_SCHED_DIR`. A refusal fails the leaf, naming mbx's error,
 and a run with no endpoint refuses its reserved leaves.
 

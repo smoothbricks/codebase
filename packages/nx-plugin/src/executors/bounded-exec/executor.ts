@@ -66,6 +66,7 @@ import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import { type BoundedExecOptions, boundedCommand } from './schema.js';
+import { readLastWalls, suiteMinimum } from './suite-minimum.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
   type BoundedExecRecord,
@@ -311,10 +312,14 @@ export async function runBoundedExec(
   // pool, read once before a run's clear removes them: a command run again after a kill is charged by the record the
   // killed run replaced, not by the peak it reached before it was killed.
   const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
+  // The walls its last run recorded size the minimum its reservation names (suite-minimum.ts), read before the same
+  // clear removes them.
+  const lastWalls = directory !== null ? await readLastWalls(directory) : [];
   return runUntilNotKilledForMemory(
     (alone) =>
       runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
         lastPeak,
+        lastWalls,
         alone,
       }),
     inherited !== null,
@@ -322,9 +327,13 @@ export async function runBoundedExec(
   );
 }
 
-/** What a run of the command is told that the run before it was not: the task's charge, and whether it runs alone. */
+/**
+ * What a run of the command is told that the run before it was not: the task's charge, the walls its tests last took,
+ * and whether it runs alone.
+ */
 interface Attempt {
   readonly lastPeak: LastPeak | null;
+  readonly lastWalls: readonly number[];
   readonly alone: boolean;
 }
 
@@ -342,7 +351,7 @@ async function runCommand(
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
-  const { lastPeak } = attempt;
+  const { lastPeak, lastWalls } = attempt;
   // A previous run's verdict and report go first, so neither can be read as this run's.
   if (directory !== null) {
     await clearTaskDirectory(directory);
@@ -1359,8 +1368,12 @@ async function runCommand(
           return;
         }
         queue.waiting();
-        tell(`cowshed: mbx reserve wait start cpus=${cpus} priority=${reservedLeaf.priority}\n`);
-        const held = reserveCores(endpoint, cpus, reservedLeaf.priority);
+        // A whole-suite test leaf names the fewest threads at which its recorded walls keep a test finishing within
+        // its own no-progress bound (specs/cowshed/05_gateway.md, "A minimum for a whole suite").
+        const min = idleTimeoutMs === undefined ? 1 : suiteMinimum(lastWalls, cpus, idleTimeoutMs);
+        const named = min > 1 ? ` min=${min}` : '';
+        tell(`cowshed: mbx reserve wait start cpus=${cpus}${named} priority=${reservedLeaf.priority}\n`);
+        const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min);
         reservation = held;
         void held.granted.then((granted) => {
           if (!granted.ok) {

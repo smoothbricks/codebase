@@ -199,9 +199,12 @@ export interface Reservation {
 
 type Uint = number & tags.Type<'uint32'>;
 
-/** The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). */
+/**
+ * The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). `min` is the fewest
+ * of its cores a reservation starts on before it has waited mbx's aging bound; absent, it starts on one.
+ */
 type ReservationRequest =
-  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: MbxPriority }
+  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: MbxPriority; min?: Uint & tags.Minimum<2> }
   | { type: 'release'; id: Uint };
 
 /** The lines the endpoint answers; an added field is mbx's to add. */
@@ -247,7 +250,7 @@ class Connection {
     this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
   }
 
-  reserve(cpus: number, priority: MbxPriority): Reservation {
+  reserve(cpus: number, priority: MbxPriority, min: number): Reservation {
     if (this.#closed !== null) {
       return { granted: Promise.resolve({ ok: false, refusal: this.#closed }), release() {} };
     }
@@ -256,7 +259,11 @@ class Connection {
     const granted = new Promise<Granted>((resolve) => (answer = resolve));
     this.#entries.set(id, { kind: 'waiting', answer });
     this.#socket.ref();
-    this.#socket.write(`${stringifyRequest({ type: 'reserve', id, cpus, priority })}\n`);
+    // A minimum of one is no minimum, and mbx refuses one above the ask.
+    const gathers = Math.min(min, cpus);
+    this.#socket.write(
+      `${stringifyRequest({ type: 'reserve', id, cpus, priority, ...(gathers > 1 ? { min: gathers } : {}) })}\n`,
+    );
     let released = false;
     return {
       granted,
@@ -335,10 +342,11 @@ class Connection {
 const connections = new Map<string, Connection>();
 
 /**
- * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, over this process's one connection to it,
- * opened by its first request and kept while another one may come.
+ * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, starting on no fewer than `min` of them until
+ * mbx's aging bound, over this process's one connection to it, opened by its first request and kept while another one
+ * may come.
  */
-export function reserveCores(socket: string, cpus: number, priority: MbxPriority): Reservation {
+export function reserveCores(socket: string, cpus: number, priority: MbxPriority, min: number): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
     const opened: Connection = new Connection(socket, () => {
@@ -347,5 +355,5 @@ export function reserveCores(socket: string, cpus: number, priority: MbxPriority
     connections.set(socket, opened);
     connection = opened;
   }
-  return connection.reserve(cpus, priority);
+  return connection.reserve(cpus, priority, min);
 }
