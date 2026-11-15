@@ -1,0 +1,47 @@
+[package]
+name = "proto2"
+version = "0.3.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+v1 = { package = "bitmosaic", path = "../../../../../packages/bitmosaic/crates/bitmosaic" }
+# With the feature `small-forms`: an implementation of small forms to measure beside the repository's crate.
+# small = { package = "bitmosaic", path = "/path/to/that/crate" }
+
+[features]
+small-forms = []
+
+[[bin]]
+name = "proto2"
+path = "src/main.rs"
+
+[[bin]]
+name = "crate_len"
+path = "src/crate_len.rs"
+
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.dev.build-override]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+[profile.debugging.package."*"]
+debug = 2
+
+[profile.debugging.build-override]
+debug = 2

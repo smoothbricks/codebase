@@ -1,0 +1,240 @@
+## postings 1-3: 20000 sets, 1.7 members a set
+postings 1-3 (the probe loop alone)                        ins       8.0  cyc      2.0  miss  0.000  br     1.0
+# postings 1-3 List: 4.86 B a set
+postings 1-3 List contains                                 ins     113.3  cyc     56.0  miss  1.375  br    25.0
+postings 1-3 List rank                                     ins     104.0  cyc     47.2  miss  1.240  br    24.5
+postings 1-3 List select                                   ins      81.7  cyc     48.7  miss  1.119  br    22.4
+postings 1-3 List walk (per member)                        ins      61.0  cyc     19.1  miss  0.373  br    16.7
+postings 1-3 List write (per set)                          ins     128.2  cyc     31.9  miss  0.504  br    28.3
+# postings 1-3 Blocks (sets of 2 or more: 9580): 9.89 B a set
+postings 1-3 Blocks (sets of 2 or more: 9580) contains     ins     203.4  cyc    102.8  miss  2.107  br    40.6
+postings 1-3 Blocks (sets of 2 or more: 9580) rank         ins     206.6  cyc    105.5  miss  1.939  br    39.8
+postings 1-3 Blocks (sets of 2 or more: 9580) select       ins     265.1  cyc    120.9  miss  2.129  br    47.9
+postings 1-3 Blocks (sets of 2 or more: 9580) walk (per member) ins     133.3  cyc     34.5  miss  0.469  br    27.9
+postings 1-3 Blocks (sets of 2 or more: 9580) write (per set) ins     298.6  cyc     79.5  miss  1.105  br    51.8
+# postings 1-3 small forms, sealed: 10.18 B a set
+postings 1-3 small forms, sealed contains                          ins     107.3  cyc     81.1  miss  1.060  br    23.3
+postings 1-3 small forms, sealed rank                              ins     125.2  cyc     85.5  miss  1.127  br    27.4
+postings 1-3 small forms, sealed select                            ins     131.4  cyc     57.2  miss  0.526  br    29.2
+postings 1-3 small forms, sealed walk (per member)                 ins      73.6  cyc     16.6  miss  0.192  br    18.3
+# postings 1-3 format 1: 14.25 B a set
+postings 1-3 format 1 contains                              ins     118.0  cyc     87.8  miss  1.008  br    25.4
+postings 1-3 format 1 rank                                  ins     138.9  cyc     89.8  miss  1.082  br    30.3
+postings 1-3 format 1 select                                ins     144.0  cyc     53.5  miss  0.390  br    31.8
+postings 1-3 format 1 walk (per member)                     ins      81.8  cyc     16.0  miss  0.191  br    20.3
+postings 1-3 small forms write_image_into (per set)               ins    2863.6  cyc   1068.7  miss  2.306  br   478.8
+
+## postings 4-8: 11041 sets, 5.4 members a set
+postings 4-8 (the probe loop alone)                        ins       8.0  cyc      2.0  miss  0.000  br     1.0
+# postings 4-8 List: 13.50 B a set
+postings 4-8 List contains                                 ins     113.2  cyc     65.2  miss  1.307  br    21.0
+postings 4-8 List rank                                     ins     101.3  cyc     57.0  miss  1.255  br    19.7
+postings 4-8 List select                                   ins      75.5  cyc     37.2  miss  0.798  br    17.5
+postings 4-8 List walk (per member)                        ins      36.8  cyc      9.9  miss  0.129  br    10.0
+postings 4-8 List write (per set)                          ins     277.7  cyc     78.1  miss  1.327  br    72.4
+# postings 4-8 Blocks (sets of 2 or more: 11041): 16.63 B a set
+postings 4-8 Blocks (sets of 2 or more: 11041) contains    ins     232.8  cyc    128.0  miss  2.568  br    45.1
+postings 4-8 Blocks (sets of 2 or more: 11041) rank        ins     237.5  cyc    127.7  miss  2.649  br    44.5
+postings 4-8 Blocks (sets of 2 or more: 11041) select      ins     272.1  cyc    137.9  miss  2.575  br    46.2
+postings 4-8 Blocks (sets of 2 or more: 11041) walk (per member) ins      89.9  cyc     26.0  miss  0.337  br    19.2
+postings 4-8 Blocks (sets of 2 or more: 11041) write (per set) ins     439.2  cyc    108.2  miss  1.906  br    80.5
+# postings 4-8 small forms, sealed: 22.13 B a set
+postings 4-8 small forms, sealed contains                          ins     126.5  cyc    100.4  miss  1.835  br    26.9
+postings 4-8 small forms, sealed rank                              ins     141.8  cyc     77.9  miss  1.534  br    30.6
+postings 4-8 small forms, sealed select                            ins     136.9  cyc     51.0  miss  0.840  br    29.6
+postings 4-8 small forms, sealed walk (per member)                 ins      35.5  cyc      9.8  miss  0.152  br     8.2
+# postings 4-8 format 1: 25.69 B a set
+postings 4-8 format 1 contains                              ins     130.9  cyc     95.3  miss  1.724  br    27.8
+postings 4-8 format 1 rank                                  ins     148.3  cyc     93.6  miss  1.790  br    32.2
+postings 4-8 format 1 select                                ins     142.5  cyc     49.7  miss  0.755  br    30.8
+postings 4-8 format 1 walk (per member)                     ins      36.7  cyc      6.4  miss  0.050  br     8.5
+postings 4-8 small forms write_image_into (per set)               ins    3628.9  cyc   1270.4  miss  5.017  br   622.8
+
+## postings 9-32: 8413 sets, 16.1 members a set
+postings 9-32 (the probe loop alone)                       ins       8.0  cyc      2.1  miss  0.000  br     1.0
+# postings 9-32 Blocks (sets of 2 or more: 8413): 38.17 B a set
+postings 9-32 Blocks (sets of 2 or more: 8413) contains    ins     246.2  cyc    141.2  miss  2.489  br    44.3
+postings 9-32 Blocks (sets of 2 or more: 8413) rank        ins     252.6  cyc    142.4  miss  2.478  br    44.0
+postings 9-32 Blocks (sets of 2 or more: 8413) select      ins     249.2  cyc    106.2  miss  1.886  br    37.4
+postings 9-32 Blocks (sets of 2 or more: 8413) walk (per member) ins      47.6  cyc     10.6  miss  0.121  br     9.4
+postings 9-32 Blocks (sets of 2 or more: 8413) write (per set) ins     868.2  cyc    179.2  miss  2.709  br   168.0
+# postings 9-32 small forms, sealed: 45.75 B a set
+postings 9-32 small forms, sealed contains                         ins     159.1  cyc    104.3  miss  1.797  br    35.4
+postings 9-32 small forms, sealed rank                             ins     160.4  cyc    124.2  miss  2.058  br    35.6
+postings 9-32 small forms, sealed select                           ins     127.5  cyc     44.0  miss  1.013  br    25.6
+postings 9-32 small forms, sealed walk (per member)                ins      28.4  cyc      6.2  miss  0.054  br     5.4
+# postings 9-32 format 1: 48.98 B a set
+postings 9-32 format 1 contains                             ins     160.5  cyc    132.0  miss  2.016  br    35.8
+postings 9-32 format 1 rank                                 ins     162.6  cyc    106.5  miss  1.977  br    36.2
+postings 9-32 format 1 select                               ins     130.4  cyc     55.5  miss  1.122  br    26.1
+postings 9-32 format 1 walk (per member)                    ins      28.8  cyc      5.3  miss  0.052  br     5.5
+postings 9-32 small forms write_image_into (per set)              ins    3998.4  cyc   1430.9  miss 11.949  br   737.3
+
+## postings 33-128: 3286 sets, 63.7 members a set
+postings 33-128 (the probe loop alone)                     ins       8.0  cyc      2.1  miss  0.000  br     1.0
+# postings 33-128 Blocks (sets of 2 or more: 3286): 124.10 B a set
+postings 33-128 Blocks (sets of 2 or more: 3286) contains  ins     288.9  cyc    153.2  miss  2.886  br    51.7
+postings 33-128 Blocks (sets of 2 or more: 3286) rank      ins     298.1  cyc    149.3  miss  2.792  br    51.5
+postings 33-128 Blocks (sets of 2 or more: 3286) select    ins     252.5  cyc    107.7  miss  1.915  br    36.7
+postings 33-128 Blocks (sets of 2 or more: 3286) walk (per member) ins      30.6  cyc      5.8  miss  0.061  br     5.5
+postings 33-128 Blocks (sets of 2 or more: 3286) write (per set) ins    2597.8  cyc    472.3  miss  5.245  br   508.6
+# postings 33-128 small forms, sealed: 139.06 B a set
+postings 33-128 small forms, sealed contains                       ins     238.4  cyc    157.3  miss  2.147  br    55.7
+postings 33-128 small forms, sealed rank                           ins     231.8  cyc    179.3  miss  2.207  br    53.0
+postings 33-128 small forms, sealed select                         ins     151.6  cyc     86.2  miss  1.535  br    29.7
+postings 33-128 small forms, sealed walk (per member)              ins      28.8  cyc      4.8  miss  0.049  br     5.2
+# postings 33-128 format 1: 142.07 B a set
+postings 33-128 format 1 contains                           ins     238.5  cyc    142.8  miss  1.978  br    55.7
+postings 33-128 format 1 rank                               ins     231.7  cyc    148.7  miss  1.978  br    53.0
+postings 33-128 format 1 select                             ins     151.6  cyc    105.2  miss  1.678  br    29.7
+postings 33-128 format 1 walk (per member)                  ins      28.8  cyc      6.7  miss  0.051  br     5.2
+postings 33-128 small forms write_image_into (per set)            ins    8352.3  cyc   2171.8  miss 18.415  br  1609.2
+
+## frames: 3248 sets, 14.8 members a set
+frames (the probe loop alone)                              ins       8.0  cyc      2.0  miss  0.000  br     1.0
+# frames Bitmap: 4.31 B a set
+frames Bitmap contains                                     ins      29.9  cyc     13.0  miss  0.279  br     6.6
+frames Bitmap rank                                         ins     110.7  cyc     40.1  miss  0.780  br    21.9
+frames Bitmap select                                       ins     138.5  cyc     83.8  miss  1.657  br    25.7
+frames Bitmap walk (per member)                            ins      12.0  cyc      3.3  miss  0.026  br     2.6
+frames Bitmap len                                          ins      86.7  cyc     32.5  miss  0.742  br    21.8
+frames Bitmap and_len (per pair)                           ins     144.2  cyc     49.3  miss  0.719  br    36.4
+frames Bitmap write (per set)                              ins     245.7  cyc     47.3  miss  0.347  br    45.9
+frames Bitmap patch: add one, remove it (per pair)         ins      57.1  cyc     27.1  miss  0.466  br    13.5
+# frames small forms, sealed: 4.31 B a set
+frames small forms, sealed contains                                ins      56.9  cyc     19.2  miss  0.387  br    12.6
+frames small forms, sealed rank                                    ins      89.2  cyc     33.2  miss  0.358  br    21.6
+frames small forms, sealed select                                  ins     157.9  cyc     36.1  miss  0.316  br    22.7
+frames small forms, sealed walk (per member)                       ins      11.5  cyc      3.6  miss  0.033  br     2.3
+# frames format 1: 20.56 B a set
+frames format 1 contains                                    ins     117.3  cyc     71.0  miss  1.183  br    24.8
+frames format 1 rank                                        ins     115.6  cyc     69.1  miss  1.162  br    24.8
+frames format 1 select                                      ins     114.7  cyc     48.1  miss  1.159  br    24.1
+frames format 1 walk (per member)                           ins      16.1  cyc      3.7  miss  0.024  br     3.1
+frames small forms and_len (per pair)                             ins     199.5  cyc     41.8  miss  0.214  br    46.9
+frames small forms patch: add one, remove it (per pair)           ins    3552.3  cyc    703.2  miss  3.966  br   694.0
+frames small forms write_image_into (per set)                     ins     766.8  cyc    136.8  miss  0.656  br   104.2
+
+## runs (present-column sets, best order): 812 sets, 15.8 members and 3.4 runs a set
+runs (present-column sets, best order) (the probe loop alone)     ins       8.0  cyc      2.0  miss  0.000  br     1.0
+# runs (present-column sets, best order) Spans16 with a base: 14.55 B a set; RunEf: 12.09 B a set
+runs (present-column sets, best order) Spans contains+rank (no prefix counts) ins     113.9  cyc     31.1  miss  0.787  br    26.4
+runs (present-column sets, best order) RunEf rank (every boundary read) ins     653.4  cyc    130.2  miss  1.285  br   148.4
+runs (present-column sets, best order) RunEf contains (boundary parity) ins     226.0  cyc    105.2  miss  2.134  br    47.6
+# runs (present-column sets, best order) Bitmap: 56.91 B a set
+runs (present-column sets, best order) Bitmap contains            ins      30.4  cyc      4.7  miss  0.024  br     6.7
+runs (present-column sets, best order) Bitmap rank                ins     146.7  cyc     43.6  miss  1.048  br    25.1
+runs (present-column sets, best order) Bitmap select              ins     160.4  cyc     91.9  miss  1.826  br    27.2
+# runs (present-column sets, best order) Blocks: 16.67 B a set
+runs (present-column sets, best order) Blocks contains            ins     241.8  cyc    109.8  miss  2.177  br    49.0
+runs (present-column sets, best order) Blocks rank                ins     248.4  cyc    108.3  miss  2.215  br    48.4
+runs (present-column sets, best order) Blocks select              ins     241.0  cyc    110.1  miss  2.044  br    39.6
+runs (present-column sets, best order) Blocks walk (per member)   ins      53.3  cyc     10.4  miss  0.038  br    11.9
+# runs (present-column sets, best order) small forms, sealed: 13.95 B a set
+runs (present-column sets, best order) small forms, sealed contains       ins     104.8  cyc     49.6  miss  1.147  br    20.8
+runs (present-column sets, best order) small forms, sealed rank           ins     117.2  cyc     59.0  miss  1.166  br    24.5
+runs (present-column sets, best order) small forms, sealed select         ins     116.3  cyc     53.8  miss  1.034  br    22.8
+
+## runs (actor planes, synthetic): 1992 sets, 149.4 members and 2.4 runs a set
+runs (actor planes, synthetic) (the probe loop alone)      ins       8.0  cyc      2.1  miss  0.000  br     1.0
+# runs (actor planes, synthetic) Spans16 with a base: 10.77 B a set; RunEf: 9.26 B a set
+runs (actor planes, synthetic) Spans contains+rank (no prefix counts) ins      89.5  cyc     35.2  miss  0.714  br    20.4
+runs (actor planes, synthetic) RunEf rank (every boundary read) ins     508.4  cyc    124.3  miss  1.597  br   114.4
+runs (actor planes, synthetic) RunEf contains (boundary parity) ins     213.3  cyc    106.7  miss  2.358  br    45.0
+# runs (actor planes, synthetic) Bitmap: 20.31 B a set
+runs (actor planes, synthetic) Bitmap contains             ins      30.5  cyc      4.7  miss  0.025  br     6.7
+runs (actor planes, synthetic) Bitmap rank                 ins     109.3  cyc     56.6  miss  1.568  br    20.7
+runs (actor planes, synthetic) Bitmap select               ins     132.6  cyc     82.1  miss  1.651  br    21.6
+# runs (actor planes, synthetic) Blocks: 25.88 B a set
+runs (actor planes, synthetic) Blocks contains             ins     143.9  cyc     75.0  miss  1.726  br    25.9
+runs (actor planes, synthetic) Blocks rank                 ins     151.4  cyc     65.0  miss  1.572  br    26.0
+runs (actor planes, synthetic) Blocks select               ins     172.1  cyc     90.1  miss  2.211  br    27.7
+runs (actor planes, synthetic) Blocks walk (per member)    ins       6.4  cyc      2.2  miss  0.020  br     1.0
+# runs (actor planes, synthetic) small forms, sealed: 9.62 B a set
+runs (actor planes, synthetic) small forms, sealed contains        ins      87.6  cyc     35.0  miss  0.799  br    18.1
+runs (actor planes, synthetic) small forms, sealed rank            ins     100.0  cyc     40.4  miss  0.840  br    21.8
+runs (actor planes, synthetic) small forms, sealed select          ins     104.9  cyc     37.4  miss  0.812  br    21.0
+
+## postings >256 (text): 1569 sets, 1594.4 members a set
+postings >256 (text) (the probe loop alone)                ins       8.0  cyc      2.1  miss  0.000  br     1.0
+# postings >256 (text) Blocks: 1871.86 B a set
+postings >256 (text) Blocks contains                       ins     375.5  cyc    291.5  miss  4.309  br    62.9
+postings >256 (text) Blocks rank                           ins     388.2  cyc    289.1  miss  4.249  br    63.6
+postings >256 (text) Blocks select                         ins     277.7  cyc    161.5  miss  2.318  br    41.8
+postings >256 (text) Blocks walk (per member)              ins      25.7  cyc      6.9  miss  0.050  br     4.3
+# postings >256 (text) small forms, sealed: 2145.57 B a set
+postings >256 (text) small forms, sealed contains                  ins     273.9  cyc    232.3  miss  2.628  br    63.1
+postings >256 (text) small forms, sealed rank                      ins     266.2  cyc    231.0  miss  2.517  br    60.0
+postings >256 (text) small forms, sealed select                    ins     170.6  cyc    148.4  miss  1.704  br    33.1
+postings >256 (text) small forms, sealed walk (per member)         ins      28.5  cyc      4.3  miss  0.039  br     5.2
+# postings >256 (text) small forms, directory: 3214.54 B a set
+postings >256 (text) small forms, directory contains               ins     301.3  cyc    267.3  miss  4.330  br    62.8
+postings >256 (text) small forms, directory rank                   ins     307.7  cyc    274.1  miss  4.357  br    67.1
+postings >256 (text) small forms, directory select                 ins     251.9  cyc    109.2  miss  0.865  br    60.9
+postings >256 (text) small forms, directory walk (per member)      ins       9.8  cyc      2.0  miss  0.018  br     2.2
+postings >256 (text) Blocks seek                           ins     467.9  cyc    326.0  miss  4.795  br    76.6
+postings >256 (text) small forms, sealed seek (a fresh cursor)     ins     598.2  cyc    384.7  miss  4.522  br   113.1
+postings >256 (text) small forms, directory seek (a fresh cursor)  ins     773.8  cyc    343.2  miss  4.261  br   167.1
+# postings >256 (text) large x large: 256 pairs, 151911 members in the smaller sides
+postings >256 (text) Blocks and_len large x large (per smaller-side member) ins     292.8  cyc     90.9  miss  0.346  br    51.2
+postings >256 (text) small forms, sealed and_len large x large     ins     233.6  cyc     81.6  miss  1.141  br    48.2
+postings >256 (text) small forms, directory and_len large x large  ins      34.5  cyc     11.1  miss  0.059  br     4.4
+postings >256 (text) List x Blocks and_len (per list member) ins     378.8  cyc    209.1  miss  3.970  br    67.9
+postings >256 (text) small forms small x small forms, sealed and_len (per list member) ins     296.0  cyc    191.5  miss  2.270  br    66.0
+postings >256 (text) small forms small x small forms, directory and_len (per list member) ins     363.5  cyc    215.0  miss  3.015  br    79.8
+
+## postings (parity corpus, 54k): 256 sets, 2101.8 members a set
+postings (parity corpus, 54k) (the probe loop alone)                 ins       8.0  cyc      2.0  miss  0.000  br     1.0
+# postings (parity corpus, 54k) Blocks: 1482.84 B a set
+postings (parity corpus, 54k) Blocks contains                        ins     358.7  cyc    210.6  miss  3.497  br    57.6
+postings (parity corpus, 54k) Blocks rank                            ins     371.0  cyc    207.2  miss  3.591  br    58.2
+postings (parity corpus, 54k) Blocks select                          ins     269.5  cyc    126.3  miss  2.062  br    40.2
+postings (parity corpus, 54k) Blocks walk (per member)               ins      20.6  cyc      4.1  miss  0.042  br     3.4
+# postings (parity corpus, 54k) small forms, sealed: 1577.59 B a set
+postings (parity corpus, 54k) small forms, sealed contains                   ins     204.9  cyc    145.4  miss  2.206  br    44.1
+postings (parity corpus, 54k) small forms, sealed rank                       ins     203.2  cyc    141.5  miss  2.075  br    43.5
+postings (parity corpus, 54k) small forms, sealed select                     ins     163.5  cyc    106.2  miss  1.642  br    31.4
+postings (parity corpus, 54k) small forms, sealed walk (per member)          ins      21.2  cyc      5.8  miss  0.037  br     3.8
+# postings (parity corpus, 54k) small forms, directory: 2605.94 B a set
+postings (parity corpus, 54k) small forms, directory contains                ins     293.4  cyc    212.6  miss  4.944  br    60.0
+postings (parity corpus, 54k) small forms, directory rank                    ins     292.8  cyc    203.7  miss  5.049  br    63.3
+postings (parity corpus, 54k) small forms, directory select                  ins     154.0  cyc     37.4  miss  0.283  br    33.8
+postings (parity corpus, 54k) small forms, directory walk (per member)       ins       8.5  cyc      2.6  miss  0.034  br     1.6
+postings (parity corpus, 54k) Blocks seek                            ins     452.1  cyc    265.1  miss  4.349  br    71.5
+postings (parity corpus, 54k) small forms, sealed seek (a fresh cursor)      ins     717.3  cyc    340.0  miss  3.725  br   120.8
+postings (parity corpus, 54k) small forms, directory seek (a fresh cursor)   ins    1057.8  cyc    333.4  miss  0.899  br   175.3
+# postings (parity corpus, 54k) large x large: 256 pairs, 203373 members in the smaller sides
+postings (parity corpus, 54k) Blocks and_len large x large (per smaller-side member) ins     229.6  cyc     89.0  miss  0.276  br    41.4
+postings (parity corpus, 54k) small forms, sealed and_len large x large      ins     226.8  cyc    108.0  miss  1.977  br    46.8
+postings (parity corpus, 54k) small forms, directory and_len large x large   ins      23.8  cyc      6.4  miss  0.004  br     3.2
+postings (parity corpus, 54k) List x Blocks and_len (per list member) ins     229.8  cyc     97.3  miss  1.931  br    43.2
+postings (parity corpus, 54k) small forms small x small forms, sealed and_len (per list member) ins     160.7  cyc     68.5  miss  0.897  br    35.9
+postings (parity corpus, 54k) small forms small x small forms, directory and_len (per list member) ins     107.4  cyc     44.3  miss  0.920  br    23.4
+
+## sparse 1e6 of 2^32 (synthetic): 10 sets, 207972.3 members a set
+sparse 1e6 of 2^32 (synthetic) (the probe loop alone)      ins       8.0  cyc      2.1  miss  0.000  br     1.0
+# sparse 1e6 of 2^32 (synthetic) Blocks: 385221.70 B a set
+sparse 1e6 of 2^32 (synthetic) Blocks contains             ins     455.9  cyc    289.6  miss  2.604  br    71.7
+sparse 1e6 of 2^32 (synthetic) Blocks rank                 ins     467.3  cyc    306.7  miss  2.655  br    72.2
+sparse 1e6 of 2^32 (synthetic) Blocks select               ins     294.4  cyc    159.8  miss  1.865  br    44.8
+sparse 1e6 of 2^32 (synthetic) Blocks walk (per member)    ins      26.0  cyc      6.3  miss  0.044  br     4.3
+# sparse 1e6 of 2^32 (synthetic) small forms, sealed: 398750.10 B a set
+sparse 1e6 of 2^32 (synthetic) small forms, sealed contains        ins     207.7  cyc    176.2  miss  2.412  br    44.6
+sparse 1e6 of 2^32 (synthetic) small forms, sealed rank            ins     204.7  cyc    146.6  miss  2.097  br    43.6
+sparse 1e6 of 2^32 (synthetic) small forms, sealed select          ins     160.9  cyc    110.1  miss  1.599  br    30.4
+sparse 1e6 of 2^32 (synthetic) small forms, sealed walk (per member) ins      28.4  cyc      6.9  miss  0.034  br     5.1
+# sparse 1e6 of 2^32 (synthetic) small forms, directory: 733663.80 B a set
+sparse 1e6 of 2^32 (synthetic) small forms, directory contains     ins     178.0  cyc    116.1  miss  1.547  br    37.2
+sparse 1e6 of 2^32 (synthetic) small forms, directory rank         ins     250.2  cyc    160.1  miss  1.725  br    50.2
+sparse 1e6 of 2^32 (synthetic) small forms, directory select       ins     402.5  cyc    281.0  miss  7.972  br    99.6
+sparse 1e6 of 2^32 (synthetic) small forms, directory walk (per member) ins      21.2  cyc      4.5  miss  0.082  br     4.8
+sparse 1e6 of 2^32 (synthetic) Blocks seek                 ins     554.2  cyc    330.9  miss  3.102  br    86.4
+sparse 1e6 of 2^32 (synthetic) small forms, sealed seek (a fresh cursor) ins     533.9  cyc    267.4  miss  3.401  br    96.1
+sparse 1e6 of 2^32 (synthetic) small forms, directory seek (a fresh cursor) ins     892.1  cyc    400.2  miss  2.304  br   177.4
+# sparse 1e6 of 2^32 (synthetic) large x large: 256 pairs, 14438299 members in the smaller sides
+sparse 1e6 of 2^32 (synthetic) Blocks and_len large x large (per smaller-side member) ins     420.6  cyc    127.0  miss  0.433  br    72.9
+sparse 1e6 of 2^32 (synthetic) small forms, sealed and_len large x large ins     238.0  cyc     98.2  miss  1.608  br    49.3
+sparse 1e6 of 2^32 (synthetic) small forms, directory and_len large x large ins      73.6  cyc     19.7  miss  0.438  br    15.9
+sparse 1e6 of 2^32 (synthetic) List x Blocks and_len (per list member) ins     379.5  cyc    110.5  miss  1.603  br    65.8
+sparse 1e6 of 2^32 (synthetic) small forms small x small forms, sealed and_len (per list member) ins     206.2  cyc     82.0  miss  1.363  br    46.7
+sparse 1e6 of 2^32 (synthetic) small forms small x small forms, directory and_len (per list member) ins     168.7  cyc     67.4  miss  1.266  br    37.1
