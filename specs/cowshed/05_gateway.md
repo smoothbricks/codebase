@@ -1270,24 +1270,29 @@ the handshake bound.
   command's own report names the failure, and a seal that fails is said there and never changes the outcome. A CLI
   foreground relay that fails SILENT on a workspace supervisor captures that peer's stacks before releasing its job
   hold. On macOS it invokes unprivileged /usr/bin/sample for 2 seconds, within one 10 s ffi bound, without signalling
-  the supervisor. It retains the report as a private 0600 wait-<uuid>.sample.txt beside the wait span, names it in the
-  error, and records its path as wait_stack_sample (or the capture failure as wait_stack_error). A control-class
-  `TIMEOUT` on a workspace supervisor or a controller, a call it answers at once left unanswered past its control bound
-  (a job `hold`'s), is that peer's silence too, and is sampled the same way where it is recorded. A client whose call on
-  a process-external controller connection fails SILENT samples that controller the same way and seals the
-  `cowshed.wait` span itself under the host's telemetry root: the controller's own boundaries never see a wait its peer
-  gave up on. It samples the pid the hello reported only while that pid's process started at the instant it read at the
-  handshake; a pid that ended or was recycled since is not sampled, and why is its wait_stack_error. The sample and the
-  seal run off the client's actor, which keeps serving calls, answers and stream closes meanwhile; the waiting calls are
-  told once the silence is recorded, and their error names the sample (`cowshed controller stacks: …`) and carries the
-  receipt, so an embedder's span names it and a later boundary records nothing again. Other command failures use the
-  same final error boundary. The local receipt is reused there: one capture and one seal attempt per failure, even when
-  either failed. The wait's expiry timestamp, elapsed time, bound and exit code are fixed before sampling; diagnostics
-  neither retry the operation nor renew its silence. An in-process controller socketpair retains each typed wait cause
-  in that pair alone, under its response id, before encoding the unchanged error frame. Its reader takes and reattaches
-  the cause before delivering Err. The client's pending-call cap and the connection's open-stream cap bound retained
-  causes. Process-external connections share no custody and encode no private cause. Host exec and a declined resident
-  path therefore retain the same diagnostic facts as a direct resident call, without extending the public error wire.
+  the supervisor. The sampler writes its report to a private 0600 file of its own under the temporary directory. A
+  sampler that has not ended at the bound is left running, and the capture failure names that file, which holds the
+  stacks once the sampler ends: a sampler takes as long as the kernel calls it makes on the silent peer, 2.2 to 2.4 s
+  for the 2 s sample of a cowshed process at load 25 and more than 10 s beside a host whose process listings took 9 to
+  17 s (both measured 2026-11-16). Within the bound, cowshed reads the report, removes that file and retains the report
+  as a private 0600 wait-<uuid>.sample.txt beside the wait span, names it in the error, and records its path as
+  wait_stack_sample (or the capture failure as wait_stack_error). A control-class `TIMEOUT` on a workspace supervisor or
+  a controller, a call it answers at once left unanswered past its control bound (a job `hold`'s), is that peer's
+  silence too, and is sampled the same way where it is recorded. A client whose call on a process-external controller
+  connection fails SILENT samples that controller the same way and seals the `cowshed.wait` span itself under the host's
+  telemetry root: the controller's own boundaries never see a wait its peer gave up on. It samples the pid the hello
+  reported only while that pid's process started at the instant it read at the handshake; a pid that ended or was
+  recycled since is not sampled, and why is its wait_stack_error. The sample and the seal run off the client's actor,
+  which keeps serving calls, answers and stream closes meanwhile; the waiting calls are told once the silence is
+  recorded, and their error names the sample (`cowshed controller stacks: …`) and carries the receipt, so an embedder's
+  span names it and a later boundary records nothing again. Other command failures use the same final error boundary.
+  The local receipt is reused there: one capture and one seal attempt per failure, even when either failed. The wait's
+  expiry timestamp, elapsed time, bound and exit code are fixed before sampling; diagnostics neither retry the operation
+  nor renew its silence. An in-process controller socketpair retains each typed wait cause in that pair alone, under its
+  response id, before encoding the unchanged error frame. Its reader takes and reattaches the cause before delivering
+  Err. The client's pending-call cap and the connection's open-stream cap bound retained causes. Process-external
+  connections share no custody and encode no private cause. Host exec and a declined resident path therefore retain the
+  same diagnostic facts as a direct resident call, without extending the public error wire.
 - **Enforcement.** TypeScript: the `deadline/no-unbounded-wait` ESLint rule (`tooling/checks/no-unbounded-wait.ts`,
   wired in `eslint.config.ts` over `packages/*/src`) refuses `fetch` without a `signal`, a socket connect (`net`/`tls`
   `connect`, `createConnection`, `Socket#connect`, `Bun.connect`), a Bun child's `exited`, `events.once` on a child,
