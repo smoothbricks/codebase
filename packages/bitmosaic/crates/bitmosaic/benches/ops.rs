@@ -585,7 +585,7 @@ fn bench_large_views(c: &mut Criterion) {
     for (name, va, vb) in shapes {
         let owned_a = bitmosaic::Bitmosaic::from_sorted(va.iter().copied());
         let owned_b = bitmosaic::Bitmosaic::from_sorted(vb.iter().copied());
-        let mut state = 0x9120_be5_u64 ^ va.len() as u64;
+        let mut state = 0x0912_0be5_u64 ^ va.len() as u64;
         let top = u64::from(*va.last().expect("a nonempty shape")) + 2;
         let probes: Vec<u32> = (0..1024)
             .map(|i| {

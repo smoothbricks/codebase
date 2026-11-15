@@ -90,7 +90,7 @@ fn main() {
     };
     let a_view = BitmosaicView::open(&a_bytes).expect("attach left");
     let b_view = BitmosaicView::open(&b_bytes).expect("attach right");
-    let mut state = 0x9120_be5_u64 ^ va.len() as u64;
+    let mut state = 0x0912_0be5_u64 ^ va.len() as u64;
     let top = u64::from(va[va.len() - 1]) + 2;
     let probes: Vec<u32> = (0..1024)
         .map(|i| {
