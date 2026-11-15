@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { CaptureError } from '../capture.js';
 import { composeLibraries, defineLibrary, mountLibrary, type ValueCodec } from '../composition.js';
 import { ManualScheduler } from '../dispatch.js';
-import { recordScenario } from '../recording.js';
+import { captureCheckpoint, recordScenario } from '../recording.js';
 
 const text: ValueCodec<string> = {
   schema: 'notes.text',
@@ -106,6 +106,25 @@ describe('recordScenario size limits', () => {
 
       expect(recorder.snapshot().complete).toBe(false);
       expect(errors.map((cause) => cause instanceof CaptureError && cause.issue.code)).toEqual(['size-limit']);
+    } finally {
+      runtime.dispose();
+    }
+  });
+});
+
+describe('captureCheckpoint keyed entries', () => {
+  it('orders resource IDs canonically without validating the IDs it already holds', () => {
+    const { runtime, events, decodes } = notes();
+    try {
+      for (const note of ['b', 10, 'a', 2]) runtime.publish(events.noted, note);
+      runtime.flush();
+      const before = decodes();
+
+      const checkpoint = captureCheckpoint(runtime);
+
+      const body = checkpoint.states.find((state) => state.key.endsWith('body'));
+      expect(body?.entries.map((entry) => entry.id?.value)).toEqual([2, 10, 'a', 'b']);
+      expect(decodes() - before).toBe(0);
     } finally {
       runtime.dispose();
     }

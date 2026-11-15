@@ -151,6 +151,7 @@ export interface StateDeclaration {
   initialize(runtime: ComposedRuntime): void;
   release(runtime: ComposedRuntime): void;
   capture(runtime: ComposedRuntime): EncodedState;
+  /** Non-default entries in canonical resource-ID order (`compareResourceIds`). */
   captureEntries(runtime: ComposedRuntime): Iterable<EncodedStateEntry>;
   restore(runtime: ComposedRuntime, state: EncodedState): void;
   captureEntry(runtime: ComposedRuntime, id: string | number | undefined): EncodedStateEntry | undefined;
@@ -353,23 +354,28 @@ export class KeyedHandle<T, ID extends string | number> implements StateDeclarat
       value: encode(this.options, decode(this.options.codec, entry.value, this.metadata)),
     };
   }
+  private encodeCell(id: ID, cell: KeyedCell<T> | undefined): EncodedStateEntry | undefined {
+    if (!cell) return undefined;
+    const value = cell.signal.get();
+    // Merely reading a default must not become application state or change replay equivalence.
+    if (Object.is(value, cell.initial)) return undefined;
+    return { id: this.encodeId(id), value: encode(this.options, value) };
+  }
   captureEntry(runtime: ComposedRuntime, address: string | number | undefined): EncodedStateEntry | undefined {
     const id = this.options.idCodec.decode(address);
-    const cell = this.map(runtime).get(id);
-    if (!cell || Object.is(cell.signal.get(), cell.initial)) return undefined;
-    return { id: this.encodeId(id), value: encode(this.options, cell.signal.get()) };
+    return this.encodeCell(id, this.map(runtime).get(id));
   }
   *captureEntries(runtime: ComposedRuntime): Iterable<EncodedStateEntry> {
-    // Incremental cold capture can stop at its size bound before encoding another cell.
-    for (const id of this.map(runtime).keys()) {
-      const entry = this.captureEntry(runtime, id);
+    // The live keys are already valid IDs: order them here, once, so no consumer decodes an encoded ID
+    // again to sort. Incremental cold capture can still stop at its size bound before encoding another cell.
+    const cells = this.map(runtime);
+    for (const id of [...cells.keys()].sort(compareResourceIds)) {
+      const entry = this.encodeCell(id, cells.get(id));
       if (entry) yield entry;
     }
   }
   capture(runtime: ComposedRuntime): EncodedState {
-    const entries = [...this.captureEntries(runtime)];
-    entries.sort((a, b) => compareResourceIds(this.entryId(a), this.entryId(b)));
-    return { key: this.metadata.key, entries };
+    return { key: this.metadata.key, entries: [...this.captureEntries(runtime)] };
   }
   restore(runtime: ComposedRuntime, state: EncodedState): void {
     const map = this.map(runtime);

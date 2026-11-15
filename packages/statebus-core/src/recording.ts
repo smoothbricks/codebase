@@ -1,4 +1,4 @@
-import { CaptureError, captureBytes, captureLimit, captureValue, compareResourceIds } from './capture.js';
+import { CaptureError, captureBytes, captureLimit, captureValue } from './capture.js';
 import { decodeCodec } from './codec.js';
 import type {
   ComposedRuntime,
@@ -73,11 +73,7 @@ export function captureCheckpoint(runtime: ComposedRuntime, options: CheckpointC
       account(captureBytes(value, maxEntryBytes) + (entries.length > 0 ? 1 : 0));
       entries.push(value);
     }
-    entries.sort((a, b) => {
-      const left = declaration.entryId(a);
-      const right = declaration.entryId(b);
-      return left === undefined || right === undefined ? 0 : compareResourceIds(left, right);
-    });
+    // A declaration yields its entries in canonical resource-ID order.
     states.push(Object.freeze({ key, entries: Object.freeze(entries) }));
   }
   return Object.freeze({ formatVersion: 1, schema: runtime.composition.metadata, states: Object.freeze(states) });
