@@ -834,4 +834,7 @@ fn main() {
         u32::MAX,
         &mut rng,
     );
+    if let Some(pmu) = &b.pmu {
+        pmu.disarm();
+    }
 }

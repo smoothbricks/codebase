@@ -293,10 +293,6 @@ pub fn list_select(img: &[u8], j: u32) -> u32 {
     }
 }
 #[inline(always)]
-pub fn list_count(img: &[u8]) -> u32 {
-    ((img[0] as u32 >> 2) & 7) + 1
-}
-#[inline(always)]
 pub fn list_walk(img: &[u8], mut f: impl FnMut(u32)) {
     let (k, wa, wd, first) = list_head(img);
     f(first);
