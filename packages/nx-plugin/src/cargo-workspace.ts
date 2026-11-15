@@ -1,11 +1,10 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { buildClosure } from '@smoothbricks/build-inputs/cargo-closure';
 import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml, type TomlTable } from 'smol-toml';
-
 import {
-  buildClosure,
   type CargoResolve,
   type CargoSourceIndex,
   type CompiledCargoInput,

@@ -838,11 +838,13 @@ pinning fixes the bytes they inspect rather than accepting differences from a mo
 A live link runs what its checkout last built, so it refuses a checkout whose build no longer describes its sources: the
 refusal names each build unit, the input that moved and its cached Nx rebuild, and leaves the alias as it was. The
 TypeScript emit and native producers (the macOS collector and Linux cross executor) write `.build-inputs.json` beside
-their outputs with the SHA-256 of every input. When run under Nx, the writer also records its actual task's project,
-target and optional configuration as `producer`; this provenance is an ownership byproduct, not another output registry.
-Nx restores the record with its outputs on a cache hit, so a branch switch that rewrites inputs with their own bytes
-refuses nothing. Normal published units without records retain the modification-time fallback, which says that a
-same-bytes rewrite also counts.
+their outputs with the SHA-256 of every input file; a Cargo build's record states the `Cargo.lock` entries its
+dependency closure resolves, the closure its Nx key holds, never the lockfile's bytes, so a lockfile change for another
+crate refuses nothing. When run under Nx, the writer also records its actual task's project, target and optional
+configuration as `producer`; this provenance is an ownership byproduct, not another output registry. Nx restores the
+record with its outputs on a cache hit, so a branch switch that rewrites inputs with their own bytes refuses nothing.
+Normal published units without records retain the modification-time fallback, which says that a same-bytes rewrite also
+counts.
 
 At shell entry, the check inventories source-owned package `.cache` receipts and published receipts without following
 cache symlinks or entering `target` or `node_modules`. It selects this package's producer with no configuration, or the

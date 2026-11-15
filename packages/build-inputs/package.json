@@ -12,6 +12,11 @@
       "types": "./dist/ts/build-inputs.d.ts",
       "import": "./dist/ts/build-inputs.js",
       "default": "./dist/ts/build-inputs.js"
+    },
+    "./cargo-closure": {
+      "types": "./dist/ts/cargo-closure.d.ts",
+      "import": "./dist/ts/cargo-closure.js",
+      "default": "./dist/ts/cargo-closure.js"
     }
   },
   "bin": {

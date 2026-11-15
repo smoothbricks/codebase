@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import { outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
 import {
   type BuildInputProducer,
@@ -16,6 +17,7 @@ import {
   pathspecFiles,
   writeBuildInputs,
 } from './build-inputs.js';
+import type { CargoLockResolve } from './cargo-closure.js';
 
 const GIT_IDENTITY = ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test'];
 
@@ -258,35 +260,88 @@ describe('cargoBuildInputs', () => {
     'crates/c/Cargo.toml': '[package]\nname = "c"\n',
     'crates/c/src/lib.rs': 'pub fn c() {}\n',
   };
+  const REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index';
+  // What Cargo resolves for it: `a` builds `b` and tests with proptest, `b` builds serde, `c` builds rand.
+  const resolve = (root: string): CargoLockResolve => ({
+    root,
+    local: ['a', 'b', 'c'].map((name) => ({
+      id: `path:${name}`,
+      name,
+      version: '0.1.0',
+      manifest: join(root, `crates/${name}/Cargo.toml`),
+    })),
+    pinned: new Map(
+      [
+        ['serde', '1.0.219'],
+        ['rand', '0.8.5'],
+        ['proptest', '1.6.0'],
+      ].map(([name, version]) => [`registry:${name}`, { name, version, source: REGISTRY }]),
+    ),
+    edges: new Map([
+      [
+        'path:a',
+        [
+          { pkg: 'path:b', devOnly: false },
+          { pkg: 'registry:proptest', devOnly: true },
+        ],
+      ],
+      ['path:b', [{ pkg: 'registry:serde', devOnly: false }]],
+      ['path:c', [{ pkg: 'registry:rand', devOnly: false }]],
+      ['registry:serde', []],
+      ['registry:rand', []],
+      ['registry:proptest', []],
+    ]),
+  });
 
-  it('records the sources rustc read, the manifest of each crate they belong to, and the workspace manifest and lock', async () => {
+  it('records the sources rustc read, their crates manifests, the workspace manifest and the lockfile closure of those crates', async () => {
     await inGitRepository(workspace, (root) => {
       // Compiled in a sibling clone, as a shed's cloned `target/` records it; crate `c` was never read.
       const depInfo = rustcDepInfo('/elsewhere/clone', ['crates/a/src/lib.rs', 'crates/b/src/lib.rs']);
       const producer = { project: 'cli', target: 'cli-x64-linux', configuration: 'production' };
-      expect(cargoBuildInputs(root, depInfo, root, producer)).toEqual(
+      const record = cargoBuildInputs(root, depInfo, resolve(root), producer);
+      expect(record).toEqual(
         buildInputRecord(
           root,
-          [
-            'Cargo.lock',
-            'Cargo.toml',
-            'crates/a/Cargo.toml',
-            'crates/a/src/lib.rs',
-            'crates/b/Cargo.toml',
-            'crates/b/src/lib.rs',
-          ],
+          ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs', 'crates/b/Cargo.toml', 'crates/b/src/lib.rs'],
           undefined,
           producer,
+          {
+            file: 'Cargo.lock',
+            // Neither `c`'s rand nor the proptest only `a`'s tests build: the artifact holds no byte of either.
+            packages: {
+              'a 0.1.0': ['b 0.1.0'],
+              'b 0.1.0': [`serde 1.0.219 (${REGISTRY})`],
+              [`serde 1.0.219 (${REGISTRY})`]: [],
+            },
+          },
         ),
       );
+      // The lockfile is an input by its closure alone: its bytes hold every other crate's entries too.
+      expect(Object.keys(record?.files ?? {})).not.toContain('Cargo.lock');
     });
   });
 
-  it('leaves out a workspace lock the checkout does not hold', async () => {
+  it('records the manifest of a local crate Cargo built for the artifact though rustc named none of its files', async () => {
+    await inGitRepository(workspace, (root) => {
+      const record = cargoBuildInputs(root, rustcDepInfo(root, ['crates/a/src/lib.rs']), resolve(root));
+      expect(Object.keys(record?.files ?? {})).toEqual([
+        'Cargo.toml',
+        'crates/a/Cargo.toml',
+        'crates/a/src/lib.rs',
+        'crates/b/Cargo.toml',
+      ]);
+      expect(Object.keys(record?.cargoLock?.packages ?? {})).toEqual([
+        'a 0.1.0',
+        'b 0.1.0',
+        `serde 1.0.219 (${REGISTRY})`,
+      ]);
+    });
+  });
+  it('states no lockfile closure for a workspace lock the checkout does not hold', async () => {
     await inGitRepository({ ...workspace, '.gitignore': 'Cargo.lock\n' }, (root) => {
       const depInfo = rustcDepInfo(root, ['crates/a/src/lib.rs']);
-      expect(cargoBuildInputs(root, depInfo, root)).toEqual(
-        buildInputRecord(root, ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs']),
+      expect(cargoBuildInputs(root, depInfo, resolve(root))).toEqual(
+        buildInputRecord(root, ['Cargo.toml', 'crates/a/Cargo.toml', 'crates/a/src/lib.rs', 'crates/b/Cargo.toml']),
       );
     });
   });
@@ -295,7 +350,16 @@ describe('cargoBuildInputs', () => {
     await inGitRepository(workspace, (root) => {
       // A registry file whose tail is no tracked path is no input of this checkout.
       const depInfo = rustcDepInfo('/registry/src/foo-1.0', ['src/lib.rs']);
-      expect(cargoBuildInputs(root, depInfo, root)).toBeNull();
+      expect(cargoBuildInputs(root, depInfo, resolve(root))).toBeNull();
+    });
+  });
+
+  it('refuses a resolve that holds none of the crates the dep-info names', async () => {
+    await inGitRepository(workspace, (root) => {
+      const depInfo = rustcDepInfo(root, ['crates/a/src/lib.rs']);
+      expect(() => cargoBuildInputs(root, depInfo, resolve('/another/workspace'))).toThrow(
+        'the Cargo resolve of /another/workspace holds no package for the crates the dep-info names (crates/a/Cargo.toml)',
+      );
     });
   });
 });
@@ -332,5 +396,72 @@ describe('smoo-nx-build-inputs --input', () => {
       expect(refused.status).toBe(2);
       expect(refused.stderr).toContain('../source/gone.js does not exist');
       expect(await readdir(plugin)).toEqual(['package.json']);
+    }));
+});
+
+describe('smoo-nx-build-inputs --lock-closure', () => {
+  useFixtureCargoHome();
+  const cli = join(import.meta.dir, 'bin/smoo-nx-build-inputs.ts');
+  const crate = (name: string, dependencies: string) =>
+    `[package]\nname = "${name}"\nversion = "0.1.0"\nedition = "2021"\n\n${dependencies}`;
+  const entry = (name: string, dependencies: readonly string[]) =>
+    [
+      '[[package]]',
+      `name = "${name}"`,
+      'version = "0.1.0"',
+      ...(dependencies.length === 0 ? [] : ['dependencies = [', ...dependencies.map((each) => ` "${each}",`), ']']),
+      '',
+    ].join('\n');
+  // Two shipped crates, one building the other and testing with a third, and a crate nothing shipped reaches.
+  const workspace = {
+    'Cargo.toml': '[workspace]\nresolver = "2"\nmembers = ["shipped/*", "tools/*"]\n',
+    'Cargo.lock': `version = 4\n\n${[entry('api', ['core', 'fixtures']), entry('core', []), entry('fixtures', []), entry('unrelated', [])].join('\n')}`,
+    'shipped/api/Cargo.toml': crate(
+      'api',
+      '[dependencies]\ncore = { path = "../core" }\n\n[dev-dependencies]\nfixtures = { path = "../../tools/fixtures" }\n',
+    ),
+    'shipped/api/src/lib.rs': '',
+    'shipped/core/Cargo.toml': crate('core', ''),
+    'shipped/core/src/lib.rs': '',
+    'tools/fixtures/Cargo.toml': crate('fixtures', ''),
+    'tools/fixtures/src/lib.rs': '',
+    'tools/unrelated/Cargo.toml': crate('unrelated', ''),
+    'tools/unrelated/src/lib.rs': '',
+  };
+
+  it('records the lockfile closure Cargo resolves for the crates under the directory, their tests included', () =>
+    inGitRepository(workspace, async (root) => {
+      const written = spawnSync(
+        process.execPath,
+        [
+          cli,
+          ...['--input', 'shipped/api/src/lib.rs'],
+          ...['--manifest-path', 'Cargo.toml', '--lock-closure', 'shipped', '--output', 'out'],
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, NX_TASK_TARGET_PROJECT: '', NX_TASK_TARGET_TARGET: '' } },
+      );
+      expect(written.status, written.stderr).toBe(0);
+      const record: BuildInputRecord = JSON.parse(await readFile(join(root, 'out/.build-inputs.json'), 'utf8'));
+      expect(record).toEqual({
+        version: 1,
+        files: { 'shipped/api/src/lib.rs': sha256('') },
+        cargoLock: {
+          file: 'Cargo.lock',
+          packages: { 'api 0.1.0': ['core 0.1.0', 'fixtures 0.1.0'], 'core 0.1.0': [], 'fixtures 0.1.0': [] },
+        },
+      });
+    }));
+
+  it('refuses a directory holding no crate of the workspace, writing no record', () =>
+    inGitRepository(workspace, async (root) => {
+      await mkdir(join(root, 'empty'));
+      const refused = spawnSync(
+        process.execPath,
+        [cli, '--input', 'Cargo.toml', '--manifest-path', 'Cargo.toml', '--lock-closure', 'empty', '--output', 'out'],
+        { cwd: root, encoding: 'utf8' },
+      );
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain(`no local Cargo package lies under ${join(root, 'empty')}`);
+      expect(await readdir(root)).not.toContain('out');
     }));
 });

@@ -325,6 +325,8 @@
         "executor": "nx:run-commands",
         "cache": true,
         "inputs": [
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
           "{projectRoot}/crates/**/*.js",
@@ -368,6 +370,8 @@
         "executor": "nx:run-commands",
         "cache": true,
         "inputs": [
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
           "{projectRoot}/crates/**/*.js",

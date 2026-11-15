@@ -6,8 +6,10 @@ const packageRoot = resolve(import.meta.dirname, '..');
 const workspaceRoot = resolve(packageRoot, '..', '..');
 const sourceCrates = join(packageRoot, 'crates');
 const outputRoot = join(packageRoot, 'dist', 'rust');
-// Every file this copy reads: the input record (packages/build-inputs) beside the copy names exactly these.
-const inputs = [import.meta.filename, join(workspaceRoot, 'Cargo.toml'), join(workspaceRoot, 'Cargo.lock')];
+// Every file this copy reads: the input record (packages/build-inputs) beside the copy names exactly these. Of the
+// workspace lockfile the copy keeps the entries its crates resolve (cargo metadata below drops the rest), so the
+// record states that closure (--lock-closure), as the task's cargo-lock:packages/lmao key does, never the file.
+const inputs = [import.meta.filename, join(workspaceRoot, 'Cargo.toml')];
 const recordFile = (source) => {
   if (lstatSync(source).isFile()) inputs.push(source);
   return true;
@@ -88,6 +90,10 @@ const recorded = spawnSync(
   [
     join(workspaceRoot, 'packages', 'build-inputs', 'dist', 'ts', 'bin', 'smoo-nx-build-inputs.js'),
     ...inputs.flatMap((file) => ['--input', file]),
+    '--manifest-path',
+    join(workspaceRoot, 'Cargo.toml'),
+    '--lock-closure',
+    sourceCrates,
     '--output',
     outputRoot,
   ],

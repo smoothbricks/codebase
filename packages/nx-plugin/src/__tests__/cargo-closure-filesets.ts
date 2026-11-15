@@ -26,7 +26,7 @@ export function filesetSource(
       root,
       members: new Set(local.map(({ id }) => id)),
       local,
-      locked: new Map(),
+      pinned: new Map(),
       edges: new Map(local.map(({ id }) => [id, []])),
     },
     indexed: new Set(directories.map((directory) => posix.join(directory, 'Cargo.toml'))),

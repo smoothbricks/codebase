@@ -34,6 +34,7 @@ async function workspace(prefix: string): Promise<string> {
 
 const REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index';
 const locked = (name: string, version: string) => `${REGISTRY}#${name}@${version}`;
+const pinned = (name: string, version: string) => ({ name, version, source: REGISTRY });
 
 /** Two crates, `a` reaching serde and `b` reaching rand at `randVersion`, resolved in a checkout at `root`. */
 async function cargoSource(root: string, randVersion: string): Promise<CargoClosureSource> {
@@ -57,9 +58,9 @@ async function cargoSource(root: string, randVersion: string): Promise<CargoClos
     root,
     members: new Set([a.id, b.id]),
     local: [a, b],
-    locked: new Map([
-      [serde, REGISTRY],
-      [rand, REGISTRY],
+    pinned: new Map([
+      [serde, pinned('serde', '1.0.219')],
+      [rand, pinned('rand', randVersion)],
     ]),
     edges: new Map([
       [a.id, [{ pkg: serde, devOnly: false }]],
@@ -124,9 +125,9 @@ it("keys a crate's Cargo lock-scope node on what its dependencies link, never on
       root,
       members: new Set([top.id, mid.id]),
       local: [top, mid],
-      locked: new Map([
-        [serde, REGISTRY],
-        [rand, REGISTRY],
+      pinned: new Map([
+        [serde, pinned('serde', serdeVersion)],
+        [rand, pinned('rand', randVersion)],
       ]),
       edges: new Map([
         [top.id, [{ pkg: mid.id, devOnly: false }]],

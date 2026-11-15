@@ -15,6 +15,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { cargoLockInputs } from '@smoothbricks/build-inputs';
+import { buildClosure, cargoLockResolve, parseCargoMetadata } from '@smoothbricks/build-inputs/cargo-closure';
 import {
   applyDeclaredLinks,
   decodeBuildInputRecord,
@@ -623,5 +625,177 @@ describe('the actual producer of a developer build receipt', () => {
         producer: expected,
       });
     }
+  });
+});
+
+describe('a live developer link to a Cargo build that recorded its lockfile closure', () => {
+  const REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index';
+  const registry = (name: string, version: string) => `${name} ${version} (${REGISTRY})`;
+
+  /** One `[[package]]` of a Cargo.lock: a path package has no source. */
+  const entry = (name: string, version: string, dependencies: readonly string[], source?: string) =>
+    [
+      '[[package]]',
+      `name = "${name}"`,
+      `version = "${version}"`,
+      ...(source === undefined ? [] : [`source = "${source}"`, 'checksum = "0000"']),
+      ...(dependencies.length === 0 ? [] : ['dependencies = [', ...dependencies.map((each) => ` "${each}",`), ']']),
+      '',
+    ].join('\n');
+
+  /**
+   * The provider's lockfile. `api` builds anyhow and serde (which builds serde_derive) and tests with rand; `other`,
+   * a crate no build of `api` reaches, builds rand. `second` adds an older serde for `other`, after which Cargo
+   * spells `api`'s own serde dependency with its version.
+   */
+  const lockfile = (versions: { anyhow?: string; derive?: string; rand?: string; second?: boolean } = {}): string => {
+    const { anyhow = '1.0.98', derive = '1.0.219', rand = '0.8.5', second = false } = versions;
+    return [
+      'version = 4\n',
+      entry('anyhow', anyhow, [], REGISTRY),
+      entry('api', '0.1.0', ['anyhow', 'rand', second ? 'serde 1.0.219' : 'serde']),
+      entry('other', '0.1.0', ['rand', ...(second ? ['serde 0.9.15'] : [])]),
+      entry('rand', rand, [], REGISTRY),
+      ...(second ? [entry('serde', '0.9.15', [], REGISTRY)] : []),
+      entry('serde', '1.0.219', ['serde_derive'], REGISTRY),
+      entry('serde_derive', derive, [], REGISTRY),
+    ].join('\n');
+  };
+
+  /**
+   * A provider whose developer wasm build wrote its record as a Cargo producer does: from the resolve
+   * `cargo metadata` reports for the lockfile above, through build-inputs' own closure and record functions.
+   */
+  function recorded(): Fixture & { readonly provider: string } {
+    const built = fixture();
+    record(built);
+    const provider = join(built.source, '../..');
+    writeFileSync(join(provider, 'Cargo.lock'), lockfile());
+    const local = (name: string) => ({
+      id: `path+file://${provider}/crates/${name}#0.1.0`,
+      name,
+      version: '0.1.0',
+      source: null,
+      manifest_path: join(provider, 'crates', name, 'Cargo.toml'),
+      targets: [],
+    });
+    const pinned = (name: string, version: string) => ({
+      id: `${REGISTRY}#${name}@${version}`,
+      name,
+      version,
+      source: REGISTRY,
+      manifest_path: `/registry/${name}-${version}/Cargo.toml`,
+      targets: [],
+    });
+    const packages = [
+      local('api'),
+      local('other'),
+      pinned('anyhow', '1.0.98'),
+      pinned('rand', '0.8.5'),
+      pinned('serde', '1.0.219'),
+      pinned('serde_derive', '1.0.219'),
+    ];
+    const id = (name: string) => packages.find((pkg) => pkg.name === name)?.id ?? '';
+    const node = (name: string, deps: readonly [string, null | 'dev'][]) => ({
+      id: id(name),
+      deps: deps.map(([dependency, kind]) => ({ pkg: id(dependency), dep_kinds: [{ kind }] })),
+    });
+    const cargo = cargoLockResolve(
+      parseCargoMetadata(
+        JSON.stringify({
+          packages,
+          resolve: {
+            nodes: [
+              node('api', [
+                ['anyhow', null],
+                ['serde', null],
+                ['rand', 'dev'],
+              ]),
+              node('other', [['rand', null]]),
+              node('anyhow', []),
+              node('rand', []),
+              node('serde', [['serde_derive', null]]),
+              node('serde_derive', []),
+            ],
+          },
+          workspace_members: [id('api'), id('other')],
+          workspace_root: provider,
+        }),
+      ),
+    );
+    // What the build of `api` compiled: its own crate, no test of it.
+    const cargoLock = cargoLockInputs(provider, cargo, buildClosure(cargo, [], [id('api')]));
+    expect(cargoLock).toEqual({
+      file: 'Cargo.lock',
+      packages: {
+        [registry('anyhow', '1.0.98')]: [],
+        'api 0.1.0': [registry('anyhow', '1.0.98'), registry('serde', '1.0.219')],
+        [registry('serde', '1.0.219')]: [registry('serde_derive', '1.0.219')],
+        [registry('serde_derive', '1.0.219')]: [],
+      },
+    });
+    write(join(built.source, '.cache/wasm-dev/allocator.wasm'), 'dev wasm', BUILT);
+    writeFileSync(
+      join(built.source, '.cache/wasm-dev/.build-inputs.json'),
+      JSON.stringify({
+        version: 1,
+        producer: { project: 'api', target: 'cargo-wasm' },
+        files: { 'packages/api/crates/api/src/lib.rs': sha256(join(built.source, 'crates/api/src/lib.rs')) },
+        cargoLock,
+      }),
+    );
+    return { ...built, provider };
+  }
+
+  it('links the output a cached build restored with the record its producer wrote', async () => {
+    const restored = recorded();
+    expect(await link(restored)).not.toContain('refusing');
+    expect(realpathSync(restored.alias)).toBe(restored.source);
+  });
+
+  it('links after the lockfile changed for crates outside the closure, however its bytes moved', async () => {
+    const unrelated = recorded();
+    // Another crate's dependency moved, a test-only dependency with it, and a second serde changed how Cargo spells
+    // the closure's own edge: every byte range of the file differs, and no entry the build read does.
+    writeFileSync(join(unrelated.provider, 'Cargo.lock'), lockfile({ rand: '0.9.1', second: true }));
+    expect(await link(unrelated)).not.toContain('refusing');
+    expect(realpathSync(unrelated.alias)).toBe(unrelated.source);
+  });
+
+  it('refuses a dependency of the closure that resolves to another package, naming the entry and the rebuild', async () => {
+    const moved = recorded();
+    writeFileSync(join(moved.provider, 'Cargo.lock'), lockfile({ derive: '1.0.228' }));
+    const refused = await refusal(moved);
+    expect(refused).toContain(
+      `packages/api/.cache/wasm-dev is stale: input Cargo.lock [[package]] ${registry('serde', '1.0.219')} no longer resolves its dependency ${registry('serde_derive', '1.0.219')}, which the build read (its .build-inputs.json)`,
+    );
+    expect(refused).toContain('nx run api:cargo-wasm');
+    expect(readlinkSync(moved.alias)).toBe(STORE);
+  });
+
+  it('refuses an entry of the closure the lockfile no longer holds, and a lockfile that is gone', async () => {
+    const bumped = recorded();
+    writeFileSync(join(bumped.provider, 'Cargo.lock'), lockfile({ anyhow: '1.0.99' }));
+    expect(await refusal(bumped)).toContain(
+      `packages/api/.cache/wasm-dev is stale: input Cargo.lock [[package]] ${registry('anyhow', '1.0.98')} was removed since the build`,
+    );
+    rmSync(join(bumped.provider, 'Cargo.lock'));
+    expect(await refusal(bumped)).toContain(
+      'packages/api/.cache/wasm-dev is stale: input Cargo.lock was removed since the build',
+    );
+  });
+
+  it('refuses a record whose lockfile closure it cannot read rather than trusting it', () => {
+    for (const cargoLock of [
+      null,
+      'Cargo.lock',
+      { file: 'Cargo.lock' },
+      { file: 'Cargo.lock', packages: { api: 'serde' } },
+    ]) {
+      expect(() => decodeBuildInputRecord({ version: 1, files: {}, cargoLock }, 'record')).toThrow(
+        'record is not a version 1 build input record: cargoLock',
+      );
+    }
+    expect(decodeBuildInputRecord({ version: 1, files: {} }, 'record').cargoLock).toBeUndefined();
   });
 });

@@ -981,6 +981,18 @@ function nextestHelperInputs(
 }
 
 /**
+ * The record writer's bytes, for a target that runs it after its build, where this workspace builds it: the writer
+ * decides the `.build-inputs.json` the target's outputs hold, so a change to what a record states re-keys the target
+ * and no cache hit restores a record in the old form. An installed writer is its package's, keyed as the package.
+ */
+function buildInputsToolInputs(
+  nativeTools: NativeTools | null,
+): { dependentTasksOutputFiles: string; transitive: false }[] {
+  return nativeTools !== null && nativeToolDependsOn(nativeTools, 'build-inputs').length > 0
+    ? [{ dependentTasksOutputFiles: `**/dist/bin/${nativeTools.platform}/smoo-nx-build-inputs`, transitive: false }]
+    : [];
+}
+/**
  * One foreign triple's test archive, and the target that EXECUTES it.
  *
  * The one place a test archive exists: binaries built on one platform and run
@@ -2997,6 +3009,7 @@ function createNapiTargets(
   };
   // The task that builds the executable recordInputs runs, when this workspace builds it.
   const buildInputsTool = nativeToolDependsOn(nativeTools, 'build-inputs');
+  const recordedInputs = [...(cargoInputs ?? []), ...buildInputsToolInputs(nativeTools)];
   const hasHostPlatformTarget = config.targets.some((triple) => {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
     return convention !== undefined && sameNapiPlatform(convention, hostPlatform);
@@ -3040,7 +3053,7 @@ function createNapiTargets(
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       dependsOn: ['^build', ...buildInputsTool],
-      inputs: cargoInputs,
+      inputs: recordedInputs,
       outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
       options: {
         cwd: cargoCwd,
@@ -3095,7 +3108,7 @@ function createNapiTargets(
       metadata: CARGO_PRODUCER_METADATA,
       cache: true,
       ...(buildInputsTool.length > 0 ? { dependsOn: buildInputsTool } : {}),
-      inputs: cargoInputs,
+      inputs: recordedInputs,
       outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
       options: {
         cwd: cargoCwd,

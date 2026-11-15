@@ -15,6 +15,10 @@
  *   it only through an edited file that is already listed).
  * - `producer`: the Nx task that wrote the record (`buildInputProducer`), when one did: the target whose cached run
  *   rewrites the outputs beside it. A record a standalone writer made has none.
+ * - `cargoLock`: for a Cargo build, the part of `Cargo.lock` it read (`cargoLockInputs`): each package of the build's
+ *   dependency closure as the lockfile spells it, to the packages its built dependencies resolved to. The closure is
+ *   the one the nx-plugin keys the task on (`buildClosure`, cargo-closure.ts), so an entry of another crate's closure
+ *   moves neither the key nor the record. The lockfile is never among `files`.
  *
  * The consumer re-evaluates `complete` with the same `git ls-files` invocation, so both sides agree by construction.
  *
@@ -27,6 +31,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { dirname as dirnamePosix, join as joinPosix, normalize as normalizePosix } from 'node:path/posix';
+import { buildClosure, type CargoClosure, type CargoLockResolve, lockClosure } from './cargo-closure.js';
 
 /** The record's file name inside each output directory. */
 export const BUILD_INPUTS_FILE = '.build-inputs.json';
@@ -38,11 +43,22 @@ export interface BuildInputProducer {
   readonly configuration?: string;
 }
 
+/**
+ * The part of `Cargo.lock` a Cargo build read: `file` is the lockfile, workspace-relative, and `packages` its closure
+ * as `lockClosure` spells it. Verified against the lockfile's own text: each package still has its entry, and that
+ * entry's dependency list still resolves to each recorded package.
+ */
+export interface CargoLockInputs {
+  readonly file: string;
+  readonly packages: Readonly<Record<string, readonly string[]>>;
+}
+
 export interface BuildInputRecord {
   readonly version: 1;
   readonly files: Readonly<Record<string, string>>;
   readonly complete?: readonly string[];
   readonly producer?: BuildInputProducer;
+  readonly cargoLock?: CargoLockInputs;
 }
 
 /**
@@ -103,13 +119,15 @@ export function depInfoFiles(tracked: ReadonlySet<string>, depInfo: string): str
 /**
  * The record of `files` (and `complete` pathspecs) as their bytes are now. A producer that knows its inputs before it
  * builds takes this first, so a source edited during the build is recorded with the bytes the build could have read
- * before the edit, and the consumer sees the edit. `producer` is the Nx task that writes it (`buildInputProducer`).
+ * before the edit, and the consumer sees the edit. `producer` is the Nx task that writes it (`buildInputProducer`),
+ * and `cargoLock` the lockfile closure of a producer that reads one (`cargoLockInputs`).
  */
 export function buildInputRecord(
   workspaceRoot: string,
   files: readonly string[],
   complete?: readonly string[],
   producer?: BuildInputProducer,
+  cargoLock?: CargoLockInputs,
 ): BuildInputRecord {
   const hashed: Record<string, string> = {};
   for (const file of [...new Set(files)].sort()) {
@@ -122,6 +140,7 @@ export function buildInputRecord(
     files: hashed,
     ...(complete ? { complete: [...complete] } : {}),
     ...(producer ? { producer } : {}),
+    ...(cargoLock ? { cargoLock } : {}),
   };
 }
 
@@ -170,13 +189,29 @@ export function gitWorkspaceRoot(directory: string): string | null {
 }
 
 /**
+ * What `closure` reads of the lockfile of the Cargo workspace `cargo` resolved, for a record of the work tree
+ * `workspaceRoot`. Undefined when that work tree holds no such lockfile (an ignored one is no input a checkout shares).
+ */
+export function cargoLockInputs(
+  workspaceRoot: string,
+  cargo: CargoLockResolve,
+  closure: CargoClosure,
+): CargoLockInputs | undefined {
+  const file = workspacePath(workspaceRoot, join(cargo.root, 'Cargo.lock'));
+  if (pathspecFiles(workspaceRoot, [`:(literal)${file}`]).length === 0) return undefined;
+  return { file, packages: lockClosure(cargo, closure) };
+}
+
+/**
  * The record of a Cargo build, from the text of the dep-info file rustc wrote for its artifact: the workspace files it
- * names (`depInfoFiles`), the `Cargo.toml` of each crate they belong to, and the Cargo workspace's own `Cargo.toml`
- * and `Cargo.lock`, which decide every dependency's bytes. The caller resolves the facts: `workspaceRoot` is the Git
- * work tree the record's paths are relative to (`gitWorkspaceRoot`) and `cargoWorkspaceRoot` the `workspace_root`
- * `cargo metadata` names. Null when the dep-info names no file of `workspaceRoot`. There is no `complete`: a new
- * module reaches the dep-info only through an edited file that is already listed. `producer` is the Nx task that
- * writes the record (`buildInputProducer`).
+ * names (`depInfoFiles`), the `Cargo.toml` of each crate they belong to, the `Cargo.toml` of every other local crate Cargo built for them (a crate rustc opened no file of still decides, by its manifest, what the lockfile entry beside it resolves; the task key holds the same manifests), the Cargo workspace's own `Cargo.toml`, and
+ * the lockfile closure of those crates (`cargoLockInputs`): what Cargo built for them, their own dev-dependencies
+ * left out because no test of them was compiled. The caller resolves the facts: `workspaceRoot` is the Git work tree
+ * the record's paths are relative to (`gitWorkspaceRoot`) and `cargo` the resolve `cargo metadata --locked` reports
+ * for the build's manifest. Null when the dep-info names no file of `workspaceRoot`; a dep-info whose crates the
+ * resolve does not hold is another workspace's, which throws. There is no `complete`: a new module reaches the
+ * dep-info only through an edited file that is already listed. `producer` is the Nx task that writes the record
+ * (`buildInputProducer`).
  *
  * Hashed when called, after the build, the only time rustc's list exists: a source edited during the build is recorded
  * with its new bytes. Nx's own cache key is computed before the build and has the same window.
@@ -184,7 +219,7 @@ export function gitWorkspaceRoot(directory: string): string | null {
 export function cargoBuildInputs(
   workspaceRoot: string,
   depInfo: string,
-  cargoWorkspaceRoot: string,
+  cargo: CargoLockResolve,
   producer?: BuildInputProducer,
 ): BuildInputRecord | null {
   const tracked = new Set(pathspecFiles(workspaceRoot, ['.']));
@@ -200,10 +235,27 @@ export function cargoBuildInputs(
       }
     }
   }
-  const cargoRoot = realpathSync(cargoWorkspaceRoot);
-  for (const name of ['Cargo.toml', 'Cargo.lock']) {
-    const file = workspacePath(workspaceRoot, join(cargoRoot, name));
-    if (tracked.has(file)) manifests.add(file);
+  const crates = cargo.local.filter((pkg) => manifests.has(workspacePath(workspaceRoot, pkg.manifest)));
+  if (crates.length === 0)
+    throw new Error(
+      `the Cargo resolve of ${cargo.root} holds no package for the crates the dep-info names (${[...manifests].sort().join(', ')})`,
+    );
+  const closure = buildClosure(
+    cargo,
+    [],
+    crates.map((pkg) => pkg.id),
+  );
+  for (const pkg of cargo.local) {
+    const manifest = workspacePath(workspaceRoot, pkg.manifest);
+    if (closure.has(pkg.id) && tracked.has(manifest)) manifests.add(manifest);
   }
-  return buildInputRecord(workspaceRoot, [...sources, ...manifests], undefined, producer);
+  const workspaceManifest = workspacePath(workspaceRoot, join(cargo.root, 'Cargo.toml'));
+  if (tracked.has(workspaceManifest)) manifests.add(workspaceManifest);
+  return buildInputRecord(
+    workspaceRoot,
+    [...sources, ...manifests],
+    undefined,
+    producer,
+    cargoLockInputs(workspaceRoot, cargo, closure),
+  );
 }

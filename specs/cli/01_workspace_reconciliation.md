@@ -172,6 +172,22 @@ producer of a linked package's outputs therefore writes a record, including one 
 (`smoo-nx-build-inputs --input`). Producer receipts above stay the proof for pins: they bind a clean HEAD and live
 outside Nx outputs, so neither a dirty working tree nor a cache hit can vouch through them.
 
+A Cargo build's record never lists `Cargo.lock` among its files. Cargo opens the whole lockfile, but an artifact holds
+bytes only of the packages its crates' dependency closure reaches, and the producer's Nx key holds exactly that closure
+(its `cargo-lock:` node), so Nx rightly restores the output after the lockfile changed for another crate. A record of
+the file's bytes would call that restored output stale, and no cached rebuild could clear it. The record therefore
+states the same closure by the same computation (`buildClosure` in `@smoothbricks/build-inputs/cargo-closure`, which the
+nx-plugin's key imports) as `cargoLock`: the lockfile's path, and each package of the closure as the lockfile spells a
+dependency in full (`name version (source)`, a path package `name version`) with the packages its built dependencies
+resolved to. For a compiled artifact the closure starts at the crates rustc read, without their dev-dependencies, which
+no test of them compiled; for a producer that ships crates with the entries they resolve
+(`smoo-nx-build-inputs --input … --lock-closure <directory>`) it starts at every crate under the directory, tests
+included, as the task's `cargo-lock:<directory>` key does. The record is never wider than the key. The link check reads
+the lockfile's text and starts no Cargo process: the unit is stale when a recorded package has lost its entry or that
+entry's dependency list resolves a recorded dependency to another package, and the refusal names the entry. A registry
+checksum is in neither statement: a published version's bytes never change, and every `--locked` build verifies them.
+The workspace `Cargo.toml` and the `Cargo.toml` of every local crate of the closure stay file inputs of both.
+
 The records judged are those beside the outputs the checkout runs. Writers add optional `producer` provenance to the
 existing version 1 record from the actual Nx task environment: its project, target and optional configuration. Shell
 entry inventories source-owned package `.cache` receipts and published receipts, without following cache symlinks or

@@ -347,6 +347,19 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         );
         expect(matchGlobPaths(globs, [helper])[0], `${platform} ${project}:${target}`).toBe(true);
       }
+      // A macOS addon build runs the record writer after its build, so the writer's bytes key it: a change to what a
+      // record states leaves no cache hit restoring an addon beside a record in the old form.
+      const addon = inferred.nodes.cowshed?.data.targets?.[`napi-${arch}-macos`];
+      if (platform === 'darwin' && typeof addon?.options?.command === 'string') {
+        const writer = `packages/build-inputs/dist/bin/${platform}-${arch}/smoo-nx-build-inputs`;
+        expect(addon.options.command, `${platform} ${arch}`).toContain(
+          `${writer.slice('packages/'.length)} --manifest-path`,
+        );
+        const globs = (addon.inputs ?? []).flatMap((input) =>
+          typeof input === 'object' && 'dependentTasksOutputFiles' in input ? [input.dependentTasksOutputFiles] : [],
+        );
+        expect(matchGlobPaths(globs, [writer])[0], `${platform} cowshed:napi-${arch}-macos`).toBe(true);
+      }
     }
     const nx = await readRecord('nx.json', JSON.parse);
     expect(child(child(nx, 'targetDefaults'), 'cargo-test-cowshed-*').dependsOn).toEqual(['...', APFS_TEST_ROOT]);

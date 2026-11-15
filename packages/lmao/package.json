@@ -182,6 +182,8 @@
           }
         ],
         "inputs": [
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
           "{workspaceRoot}/Cargo.toml",
           {
             "externalDependencies": [
@@ -288,6 +290,8 @@
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
           "{workspaceRoot}/Cargo.toml",
           {
             "externalDependencies": [

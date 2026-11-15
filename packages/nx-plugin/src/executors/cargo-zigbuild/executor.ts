@@ -11,9 +11,11 @@ import {
   gitWorkspaceRoot,
   writeBuildInputs,
 } from '@smoothbricks/build-inputs';
-import { cargoWorkspace, describeRetentionError, type Result } from '@smoothbricks/cargo-retain';
+import type { CargoLockResolve } from '@smoothbricks/build-inputs/cargo-closure';
+import type { Result } from '@smoothbricks/cargo-retain';
 import typia from 'typia';
 
+import { CargoMetadataError, readCargoResolve } from '../../cargo-source-hash.js';
 import type { CargoZigbuildOptions } from './schema.js';
 
 interface CargoZigbuildContext {
@@ -172,13 +174,14 @@ export function depInfoPath(built: string): string {
 /**
  * The input record (build-inputs.ts) of the build that wrote `built`, or why none can be made: the record
  * `smoo-nx-build-inputs` writes after a macOS build, from the dep-info beside the artifact, so one link check judges
- * both. `cargoRoot` is the Cargo workspace root, whose manifest and lock the record names as well. `producer` is the
- * Nx task running the build, which the executor reads from its environment.
+ * both. `cargo` is the resolve Cargo reports for the build's manifest, which names the workspace manifest and the
+ * lockfile closure the record states. `producer` is the Nx task running the build, which the executor reads from its
+ * environment.
  */
 export function buildInputsOf(
   built: string,
   manifestPath: string,
-  cargoRoot: string,
+  cargo: CargoLockResolve,
   producer?: BuildInputProducer,
 ): Result<BuildInputRecord, string> {
   const directory = path.dirname(manifestPath);
@@ -190,7 +193,12 @@ export function buildInputsOf(
   if (!existsSync(depInfo)) {
     return { ok: false, error: `${depInfo} does not exist: cargo wrote no dep-info beside ${built}` };
   }
-  const record = cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargoRoot, producer);
+  let record: BuildInputRecord | null;
+  try {
+    record = cargoBuildInputs(workspaceRoot, readFileSync(depInfo, 'utf8'), cargo, producer);
+  } catch (error) {
+    return { ok: false, error: `${depInfo}: ${error instanceof Error ? error.message : String(error)}` };
+  }
   if (record === null) return { ok: false, error: `${depInfo} names no file of ${workspaceRoot}` };
   return { ok: true, value: record };
 }
@@ -272,13 +280,17 @@ export default async function cargoZigbuildExecutor(
   }
 
   // From the dep-info cargo just wrote, before the artifact is copied: a build whose inputs cannot be named leaves the
-  // output as it was, and a source edited while the artifact is copied is not recorded with its new bytes.
-  const cargo = await cargoWorkspace(path.dirname(manifestPath));
-  if (!cargo.ok) {
-    console.error(`${command}: ${describeRetentionError(cargo.error)}`);
+  // output as it was, and a source edited while the artifact is copied is not recorded with its new bytes. The resolve
+  // is the one the task's key was computed from (readCargoResolve), so the record states the key's lockfile closure.
+  let cargo: CargoLockResolve;
+  try {
+    cargo = await readCargoResolve(manifestPath, context.root);
+  } catch (error) {
+    if (!(error instanceof CargoMetadataError)) throw error;
+    console.error(`${command}: ${error.message}`);
     return { success: false };
   }
-  const inputs = buildInputsOf(built, manifestPath, cargo.value.workspaceRoot, producer);
+  const inputs = buildInputsOf(built, manifestPath, cargo, producer);
   if (!inputs.ok) {
     console.error(`${command}: ${inputs.error}`);
     return { success: false };

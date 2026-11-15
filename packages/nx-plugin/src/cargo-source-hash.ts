@@ -16,6 +16,17 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
+import {
+  buildClosure,
+  type CargoClosure,
+  type CargoEdge,
+  type CargoMetadata,
+  cargoEdges,
+  localPackagesUnder,
+  type PinnedCargoPackage,
+  parseCargoMetadata,
+  pinnedPackages,
+} from '@smoothbricks/build-inputs/cargo-closure';
 import { CARGO_ANCESTOR_INPUTS } from '@smoothbricks/cargo-retain/cargo-ancestor-inputs';
 import native, { type FileData } from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
@@ -26,99 +37,6 @@ import { rustTokens } from './rust-tokens.js';
 const { IS_WASM, WorkspaceContext, hashArray } = native;
 
 const cargoResolveEvents = channel('@smoothbricks/nx-plugin:cargo-resolve');
-
-/** The fields of `cargo metadata --format-version 1` this module reads. */
-interface CargoMetadata {
-  packages: {
-    id: string;
-    name: string;
-    version: string;
-    source: string | null;
-    manifest_path: string;
-    targets: { src_path: string }[];
-    /** Added by the cache after Cargo identifies each local package's governing workspace. */
-    governing_manifest_path?: string;
-  }[];
-  resolve: { nodes: { id: string; deps: { pkg: string; dep_kinds: { kind: CargoDependencyKind }[] }[] }[] } | null;
-  workspace_members: string[];
-  workspace_root: string;
-}
-
-/**
- * Narrowed field by field, not by typia: graph inference imports this module,
- * and a workspace that loads the plugin from its sources runs them without
- * typia's compile-time transform.
- */
-function parseCargoMetadata(json: string): CargoMetadata {
-  const member = (value: unknown, key: string): unknown =>
-    typeof value === 'object' && value !== null && key in value ? Reflect.get(value, key) : undefined;
-  const text = (value: unknown, field: string): string => {
-    if (typeof value !== 'string') throw new Error(`cargo metadata reported no valid ${field}`);
-    return value;
-  };
-  const list = (value: unknown, field: string): unknown[] => {
-    if (!Array.isArray(value)) throw new Error(`cargo metadata reported no valid ${field}`);
-    return value;
-  };
-  const document: unknown = JSON.parse(json);
-  const resolveGraph = member(document, 'resolve');
-  return {
-    packages: list(member(document, 'packages'), 'packages').map((pkg) => ({
-      id: text(member(pkg, 'id'), 'package id'),
-      name: text(member(pkg, 'name'), 'package name'),
-      version: text(member(pkg, 'version'), 'package version'),
-      source: member(pkg, 'source') === null ? null : text(member(pkg, 'source'), 'package source'),
-      manifest_path: text(member(pkg, 'manifest_path'), 'package manifest_path'),
-      targets: list(member(pkg, 'targets'), 'package targets').map((target) => ({
-        src_path: text(member(target, 'src_path'), 'target src_path'),
-      })),
-      ...(member(pkg, 'governing_manifest_path') === undefined
-        ? {}
-        : { governing_manifest_path: text(member(pkg, 'governing_manifest_path'), 'governing manifest') }),
-    })),
-    resolve:
-      resolveGraph === null
-        ? null
-        : {
-            nodes: list(member(resolveGraph, 'nodes'), 'resolve').map((node) => ({
-              id: text(member(node, 'id'), 'resolve node id'),
-              deps: list(member(node, 'deps'), 'resolve node deps').map((dependency) => ({
-                pkg: text(member(dependency, 'pkg'), 'resolve edge'),
-                dep_kinds: dependencyKinds(member(dependency, 'dep_kinds')),
-              })),
-            })),
-          },
-    workspace_members: list(member(document, 'workspace_members'), 'workspace_members').map((id) =>
-      text(id, 'workspace member'),
-    ),
-    workspace_root: text(member(document, 'workspace_root'), 'workspace_root'),
-  };
-}
-
-/** How a package declares a dependency: `[dependencies]` (null), `[dev-dependencies]` or `[build-dependencies]`. */
-type CargoDependencyKind = null | 'dev' | 'build';
-
-/** A resolve edge's `dep_kinds`. An edge Cargo reports with no kind is refused: read as dev-only, it would drop a dependency. */
-function dependencyKinds(value: unknown): { kind: CargoDependencyKind }[] {
-  if (!Array.isArray(value) || value.length === 0)
-    throw new Error('cargo metadata reported no valid resolve edge kinds');
-  return value.map((entry: unknown) => {
-    const kind = typeof entry === 'object' && entry !== null ? Reflect.get(entry, 'kind') : undefined;
-    if (kind !== null && kind !== 'dev' && kind !== 'build')
-      throw new Error('cargo metadata reported no valid resolve edge kind');
-    return { kind };
-  });
-}
-
-/** One resolved dependency of a package: the package it resolved to, and whether every declaration of it is a dev one. */
-export interface CargoEdge {
-  readonly pkg: string;
-  /** Cargo builds this dependency for the dependent's tests, examples and benches only. */
-  readonly devOnly: boolean;
-}
-
-/** Every package Cargo builds for a selection, by package id, each with the dependencies Cargo builds for it. */
-export type CargoClosure = ReadonlyMap<string, readonly string[]>;
 
 /** A mutable (path) package in Cargo's locked resolve. Every path is canonical. */
 export interface LocalCargoPackage {
@@ -139,11 +57,8 @@ export interface CargoResolve {
   /** The workspace's own members: `root`'s manifest governs each of them. */
   readonly members: ReadonlySet<string>;
   readonly local: readonly LocalCargoPackage[];
-  /**
-   * Every package Cargo.lock pins (registry, git, alternate registry), by package id: its `source`, which for a git
-   * dependency names the locked commit that the id alone does not.
-   */
-  readonly locked: ReadonlyMap<string, string>;
+  /** Every package Cargo.lock pins (registry, git, alternate registry), by package id. */
+  readonly pinned: ReadonlyMap<string, PinnedCargoPackage>;
   /** Every dependency edge by package id, or null when Cargo reported no resolution. */
   readonly edges: ReadonlyMap<string, readonly CargoEdge[]> | null;
 }
@@ -534,16 +449,8 @@ function cargoFromMetadata(metadata: CargoMetadata): CargoResolve {
           governingManifest: pkg.governing_manifest_path,
         };
       }),
-    locked: new Map(metadata.packages.flatMap((pkg) => (pkg.source === null ? [] : [[pkg.id, pkg.source] as const]))),
-    edges:
-      metadata.resolve === null
-        ? null
-        : new Map(
-            metadata.resolve.nodes.map((node) => [
-              node.id,
-              node.deps.map((dep) => ({ pkg: dep.pkg, devOnly: dep.dep_kinds.every(({ kind }) => kind === 'dev') })),
-            ]),
-          ),
+    pinned: pinnedPackages(metadata),
+    edges: cargoEdges(metadata),
   };
 }
 
@@ -1073,32 +980,9 @@ export async function hashCargoPathInputs(
  */
 export async function dependencyClosure(cargo: CargoResolve, directory: string): Promise<CargoClosure> {
   const base = await realpath(directory);
-  const selected = cargo.local
-    .filter((pkg) => pkg.directory === base || pkg.directory.startsWith(`${base}${sep}`))
-    .map((pkg) => pkg.id);
+  const selected = localPackagesUnder(cargo.local, base).map((pkg) => pkg.id);
   if (selected.length === 0) throw new Error(`no local Cargo package lies under ${directory}`);
   return buildClosure(cargo, selected);
-}
-
-/**
- * The packages Cargo compiles to build, test or run the `selected` ones, each with the dependencies Cargo builds for
- * it. A selected package's targets reach every dependency kind: its library and binaries the normal ones, its build
- * script the build ones, its tests, examples and benches the dev ones. Below the selection Cargo builds a package for
- * its library and build script alone, so a dependency's own dev-dependencies never compile into a selected package's
- * binaries and are not part of what it builds.
- */
-export function buildClosure(cargo: CargoResolve, selected: readonly string[]): CargoClosure {
-  if (cargo.edges === null) throw new Error('cargo metadata reported no dependency resolution');
-  const roots = new Set(selected);
-  const reached = new Map<string, readonly string[]>();
-  const pending = [...selected];
-  for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
-    if (reached.has(id)) continue;
-    const built = (cargo.edges.get(id) ?? []).filter((edge) => roots.has(id) || !edge.devOnly).map((edge) => edge.pkg);
-    reached.set(id, built);
-    pending.push(...built);
-  }
-  return reached;
 }
 
 /**

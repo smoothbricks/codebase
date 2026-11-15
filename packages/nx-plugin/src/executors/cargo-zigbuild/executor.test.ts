@@ -189,13 +189,20 @@ describe('cargo-zigbuild executor', () => {
       const built = join(root, 'target/x86_64-unknown-linux-musl/release/cowshed');
       const depInfo = join(root, 'target/x86_64-unknown-linux-musl/release/cowshed.d');
       await mkdir(dirname(manifest), { recursive: true });
+      // What Cargo resolves for the build's manifest: the one crate, which reaches nothing.
+      const cargo = {
+        root,
+        local: [{ id: 'path:cli', name: 'cli', version: '0.1.0', manifest }],
+        pinned: new Map(),
+        edges: new Map([['path:cli', []]]),
+      };
       // Outside a Git work tree there is nothing to name an input relative to.
-      expect(buildInputsOf(built, manifest, root)).toEqual({
+      expect(buildInputsOf(built, manifest, cargo)).toEqual({
         ok: false,
         error: `${dirname(manifest)} is not in a Git work tree, so no input can be named`,
       });
       execFileSync('git', ['init', '-q', root]);
-      expect(buildInputsOf(built, manifest, root)).toEqual({
+      expect(buildInputsOf(built, manifest, cargo)).toEqual({
         ok: false,
         error: `${depInfo} does not exist: cargo wrote no dep-info beside ${built}`,
       });
@@ -213,16 +220,25 @@ describe('cargo-zigbuild executor', () => {
       await mkdir(dirname(depInfo), { recursive: true });
       // A registry file whose tail is no tracked path is no input of this checkout.
       await writeFile(depInfo, `${built}: /registry/src/foo-1.0/src/lib.rs\n`);
-      expect(buildInputsOf(built, manifest, root)).toEqual({ ok: false, error: `${depInfo} names no file of ${root}` });
+      expect(buildInputsOf(built, manifest, cargo)).toEqual({
+        ok: false,
+        error: `${depInfo} names no file of ${root}`,
+      });
       // Compiled in a sibling clone, as a shed's cloned target directory records it.
       const depInfoText = `${built}: /elsewhere/clone/crates/cli/src/main.rs\n`;
       await writeFile(depInfo, depInfoText);
       const producer = { project: 'cli', target: 'cli-x64-linux' };
-      const expected = cargoBuildInputs(root, depInfoText, root, producer);
+      const expected = cargoBuildInputs(root, depInfoText, cargo, producer);
       if (expected === null) throw new Error('The fixture dep-info must name its tracked source');
-      expect(buildInputsOf(built, manifest, root, producer)).toEqual({
+      expect(buildInputsOf(built, manifest, cargo, producer)).toEqual({
         ok: true,
         value: expected,
+      });
+      expect(expected.cargoLock).toEqual({ file: 'Cargo.lock', packages: { 'cli 0.1.0': [] } });
+      // A resolve of another workspace names none of the crates rustc read.
+      expect(buildInputsOf(built, manifest, { ...cargo, local: [] }, producer)).toEqual({
+        ok: false,
+        error: `${depInfo}: the Cargo resolve of ${root} holds no package for the crates the dep-info names (crates/cli/Cargo.toml)`,
       });
     });
   });

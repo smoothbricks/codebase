@@ -924,6 +924,12 @@ change re-keys the tasks that can load what changed and no other.
   each with what its dependencies resolved to). `cargoClosure` names its project's node; each `cargo-test-*` runner
   names its crates' nodes; workspace-wide cargo targets name the workspace root's.
 
+  A Cargo build's input record (`.build-inputs.json`) states the same closure, from the same resolve by the same
+  `buildClosure` (`@smoothbricks/build-inputs/cargo-closure`, which this plugin imports), spelled as the lockfile's own
+  entries so a link check can verify it without Cargo. A lockfile change therefore moves a Cargo task's key and makes
+  its restored output's record stale together, or does neither; a record of the whole file would refuse every output Nx
+  rightly restored after another crate's dependency changed.
+
 A hand-written target names the same nodes in its `externalDependencies`:
 
 ```json
@@ -1279,14 +1285,15 @@ Concrete targets come from concrete files:
   `outDir`, only when the record changed: the SHA-256 of every file the config's `include` matches less its `exclude`,
   taken before the emit, and those globs as Git pathspecs. Native targets write the same record from rustc's dep-info
   through `@smoothbricks/build-inputs`: macOS uses its `smoo-nx-build-inputs` CLI and Linux's `cargo-zigbuild` executor
-  calls that same collector. A record produced under Nx also carries its producer's project, target and optional
-  configuration, taken from the actual task environment. Shell entry uses that identity to judge the selected
-  development receipts, including inferred targets absent from package manifests, and name their actual cached rebuild.
-  It constructs no Nx graph, shadow output registry or second interpolation policy. The record is inside the target's
-  outputs, so a cache hit restores it with them; a live developer link (`@smoothbricks/cli`, "Declared Links") checks it
-  to tell a current build from a stale one by content. The shell entry that bootstraps the plugin
-  (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not under `outDir`, where the
-  executor would remove it as a file its emit did not write.
+  calls that same collector. Such a record states its lockfile input as `cargoLock`, the closure a `cargo-lock:` node
+  digests (Lockfile scope), and never lists `Cargo.lock` as a file. A record produced under Nx also carries its
+  producer's project, target and optional configuration, taken from the actual task environment. Shell entry uses that
+  identity to judge the selected development receipts, including inferred targets absent from package manifests, and
+  name their actual cached rebuild. It constructs no Nx graph, shadow output registry or second interpolation policy.
+  The record is inside the target's outputs, so a cache hit restores it with them; a live developer link
+  (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content. The shell entry
+  that bootstraps the plugin (`tooling/direnv/enter-shell.ts`) keeps its build marker under `node_modules/.cache`, not
+  under `outDir`, where the executor would remove it as a file its emit did not write.
 - `scriptc-<arch>-<family>` (`scriptc-arm64-macos`, `scriptc-x64-macos`, `scriptc-arm64-linux`, `scriptc-x64-linux`) are
   inferred for a package that lists `scriptc` in `devDependencies` (that pin is the compiler the targets run; the
   workspace root lists `scriptc` in `trustedDependencies` so its install links the platform compiler) together with each

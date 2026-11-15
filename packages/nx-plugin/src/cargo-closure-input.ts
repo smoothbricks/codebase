@@ -306,7 +306,7 @@ export async function cargoLockNode(
       const paths = new Map(cargo.local.map((pkg) => [pkg.id, `path:${pkg.name}`]));
       const label = (id: string) => paths.get(id) ?? id;
       const rows = [...closure]
-        .map(([id, built]) => [label(id), cargo.locked.get(id) ?? '', ...built.map(label).sort()].join('\t'))
+        .map(([id, built]) => [label(id), cargo.pinned.get(id)?.source ?? '', ...built.map(label).sort()].join('\t'))
         .sort();
       hash.update(`${source.manifest}\n${rows.join('\n')}\n\0`);
     }

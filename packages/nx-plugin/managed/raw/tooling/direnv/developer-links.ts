@@ -875,7 +875,8 @@ function unavailableReason(target: string): string | null {
 /**
  * A build unit of a linked package that does not describe its current sources, or cannot be shown to: what an alias
  * to the live checkout would actually run. A unit with an input record is judged by content: one of its inputs has
- * other bytes than the build read, was removed, or was added since. A unit with outputs but no record is
+ * other bytes than the build read, was removed, or was added since, or an entry of the `Cargo.lock` closure the build
+ * read is gone or resolves a dependency to another package. A unit with outputs but no record is
  * `unrecorded`: nothing says which bytes built it, and modification times cannot tell a rewrite with the same bytes (a
  * rebase, a branch switch, a stash) from a change. A published unit with no outputs was never built.
  */
@@ -887,15 +888,28 @@ export type StaleBuild = {
   readonly rebuild: string;
   readonly workspaceRoot: string;
 } & (
-  | { readonly basis: 'recorded'; readonly input: string; readonly change: 'changed' | 'removed' | 'added' }
+  | ({ readonly basis: 'recorded' } & RecordedChange)
   | { readonly basis: 'unrecorded'; readonly output: string }
   | { readonly basis: 'unbuilt' }
 );
 
 /**
+ * What a record no longer describes: a file by its path, or an entry of the recorded `Cargo.lock` closure, named as
+ * `<lockfile> [[package]] <name version (source)>`, that is gone (`removed`) or whose dependency list no longer
+ * resolves to the recorded `dependency` (`relocked`).
+ */
+type RecordedChange =
+  | { readonly input: string; readonly change: 'changed' | 'removed' | 'added' }
+  | { readonly input: string; readonly change: 'relocked'; readonly dependency: string };
+
+/**
  * The input record a producer writes into each output directory and Nx restores with it (`.build-inputs.json`; the
  * producer side is the nx-plugin's build-inputs.ts): `files` maps each workspace-relative input to the SHA-256 of the
- * bytes the build read, and `complete`, when present, holds Git pathspecs whose every match is an input.
+ * bytes the build read, and `complete`, when present, holds Git pathspecs whose every match is an input. A Cargo
+ * build's `cargoLock` names its lockfile and the closure it read of it, by the computation its Nx task key uses
+ * (build-inputs' cargo-closure.ts): each package as the lockfile spells a dependency in full, to the packages its
+ * built dependencies resolved to. The lockfile is never among `files`: an entry of another crate's closure is no
+ * input of this build, and its task key does not move for one either.
  */
 const BUILD_INPUTS_FILE = '.build-inputs.json';
 
@@ -903,6 +917,7 @@ interface BuildInputRecord {
   readonly files: ReadonlyMap<string, string>;
   readonly complete: readonly string[];
   readonly producer: BuildInputProducer | undefined;
+  readonly cargoLock: CargoLockInputs | undefined;
 }
 
 /** The file boundary parses JSON once, then the pure decoder validates its data and provenance together. */
@@ -933,14 +948,91 @@ export function decodeBuildInputRecord(parsed: unknown, record: string): BuildIn
     files: new Map(Object.entries(files).map(([file, hash]) => [file, String(hash)])),
     complete: complete ?? [],
     producer,
+    cargoLock: decodeCargoLock(Reflect.get(parsed, 'cargoLock'), record),
   };
+}
+
+interface CargoLockInputs {
+  readonly file: string;
+  readonly packages: ReadonlyMap<string, readonly string[]>;
+}
+
+function decodeCargoLock(value: unknown, record: string): CargoLockInputs | undefined {
+  if (value === undefined) return undefined;
+  const file: unknown = isObject(value) ? Reflect.get(value, 'file') : undefined;
+  const listed: unknown = isObject(value) ? Reflect.get(value, 'packages') : undefined;
+  const refusal = `${record} is not a version 1 build input record: cargoLock`;
+  if (typeof file !== 'string' || !isObject(listed) || Array.isArray(listed)) throw new Error(refusal);
+  const packages = new Map<string, readonly string[]>();
+  for (const [spelling, dependencies] of Object.entries(listed)) {
+    if (!Array.isArray(dependencies) || !dependencies.every((entry): entry is string => typeof entry === 'string'))
+      throw new Error(refusal);
+    packages.set(spelling, dependencies);
+  }
+  return { file, packages };
+}
+
+/**
+ * The first package of a recorded lockfile closure that the lockfile no longer resolves as the build read it, or null
+ * when every recorded package still has its entry and that entry's dependency list still resolves to each recorded
+ * dependency. Read from the lockfile's own text, with no Cargo process: an entry is `name version (source)`, a path
+ * package's has no source, and a dependency is spelled as short as stays unambiguous (`name`, `name version`, or in
+ * full), so each is resolved to its one entry before it is compared. An entry outside the recorded closure is not
+ * read, whatever it says.
+ */
+function lockClosureChange(workspaceRoot: string, { file, packages }: CargoLockInputs): RecordedChange | null {
+  const at = path.join(workspaceRoot, file);
+  if (!existsSync(at)) return { input: file, change: 'removed' };
+  const parsed: unknown = Bun.TOML.parse(readFileSync(at, 'utf8'));
+  const listed: unknown = isObject(parsed) ? Reflect.get(parsed, 'package') : undefined;
+  const text = (entry: unknown, key: string): string | undefined => {
+    const value: unknown = isObject(entry) ? Reflect.get(entry, key) : undefined;
+    return typeof value === 'string' ? value : undefined;
+  };
+  const bySpelling = new Map<string, readonly string[]>();
+  const byName = new Map<string, { version: string; source: string | undefined; spelling: string }[]>();
+  for (const entry of Array.isArray(listed) ? listed : []) {
+    const name = text(entry, 'name');
+    const version = text(entry, 'version');
+    if (name === undefined || version === undefined)
+      throw new Error(`${at} holds a [[package]] without a name or version`);
+    const source = text(entry, 'source');
+    const spelling = source === undefined ? `${name} ${version}` : `${name} ${version} (${source})`;
+    const dependencies: unknown = Reflect.get(entry, 'dependencies');
+    bySpelling.set(
+      spelling,
+      Array.isArray(dependencies) ? dependencies.filter((each): each is string => typeof each === 'string') : [],
+    );
+    const named = byName.get(name) ?? [];
+    named.push({ version, source, spelling });
+    byName.set(name, named);
+  }
+  const resolved = (reference: string): string | undefined => {
+    const [name, version, source] = reference.split(' ');
+    const candidates = (byName.get(name ?? '') ?? []).filter(
+      (entry) =>
+        (version === undefined || entry.version === version) &&
+        (source === undefined || `(${entry.source})` === source),
+    );
+    return candidates.length === 1 ? candidates[0]?.spelling : undefined;
+  };
+  for (const [spelling, dependencies] of packages) {
+    const entry = bySpelling.get(spelling);
+    const input = `${file} [[package]] ${spelling}`;
+    if (entry === undefined) return { input, change: 'removed' };
+    const current = new Set(entry.map(resolved));
+    for (const dependency of dependencies) {
+      if (!current.has(dependency)) return { input, change: 'relocked', dependency };
+    }
+  }
+  return null;
 }
 
 /** The first input whose bytes differ from what the build recorded, or null when the record describes the sources. */
 function recordedChange(
   workspaceRoot: string,
-  { files: recorded, complete }: BuildInputRecord,
-): { readonly input: string; readonly change: 'changed' | 'removed' | 'added' } | null {
+  { files: recorded, complete, cargoLock }: BuildInputRecord,
+): RecordedChange | null {
   for (const [file, hash] of recorded) {
     const at = path.join(workspaceRoot, file);
     if (!existsSync(at)) return { input: file, change: 'removed' };
@@ -961,7 +1053,7 @@ function recordedChange(
       if (!recorded.has(file) && existsSync(path.join(workspaceRoot, file))) return { input: file, change: 'added' };
     }
   }
-  return null;
+  return cargoLock === undefined ? null : lockClosureChange(workspaceRoot, cargoLock);
 }
 
 /** One build of a linked package: the outputs it writes and the files it reads. */
@@ -1266,11 +1358,13 @@ export function staleBuildsRefusal(stale: readonly StaleBuild[]): string {
   const lines = stale.map((build) => {
     if (build.basis === 'recorded') {
       const how =
-        build.change === 'changed'
-          ? 'has other bytes than the build read'
-          : build.change === 'removed'
-            ? 'was removed since the build'
-            : 'was added since the build';
+        build.change === 'relocked'
+          ? `no longer resolves its dependency ${build.dependency}, which the build read`
+          : build.change === 'changed'
+            ? 'has other bytes than the build read'
+            : build.change === 'removed'
+              ? 'was removed since the build'
+              : 'was added since the build';
       return `  - ${build.packageName}: ${build.unit} is stale: input ${build.input} ${how} (its ${BUILD_INPUTS_FILE})`;
     }
     return build.basis === 'unbuilt'
