@@ -27,6 +27,7 @@
 
 mod admission;
 mod array;
+mod canon;
 mod ef;
 #[cfg(any(test, feature = "bench-internals"))]
 pub mod oracle;

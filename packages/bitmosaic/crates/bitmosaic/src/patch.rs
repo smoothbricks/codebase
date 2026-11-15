@@ -742,7 +742,7 @@ fn prepare<'state, 'work, W: Witness, const CAPTURE: bool>(
 // ── staging one chunk ────────────────────────────────────────────────────
 
 /// Load a frozen container into the plane, which is zero on entry.
-fn stage(plane: &mut [u64; CHUNK_WORDS], container: CView<'_>) {
+pub(crate) fn stage(plane: &mut [u64; CHUNK_WORDS], container: CView<'_>) {
     match container {
         CView::Runs(runs) => {
             for i in 0..runs.count() {
@@ -962,7 +962,7 @@ fn extract(plane: &[u64; CHUNK_WORDS], members: &mut Vec<u16>) {
     }
 }
 
-fn kind_of(arm: Arm) -> u32 {
+pub(crate) fn kind_of(arm: Arm) -> u32 {
     match arm {
         Arm::Runs { .. } => K_RUNS,
         Arm::Words => K_WORDS,
@@ -1772,6 +1772,9 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
         return Err(PatchError::Malformed);
     };
     let small = view.small();
+    if let Some(plan) = prepare_tiny(slot, &view, small, adds, removes, scratch, witness) {
+        return plan;
+    }
     let forest = match small {
         Some(set) => Forest {
             bytes: &slot[..view.serialized_len()],
@@ -1823,6 +1826,86 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
     }))
 }
 
+/// Most members a slot's small image may hold, and most adds a batch may
+/// bring, for [`prepare_tiny`]: its old members fit a stack array.
+const TINY_MAX: usize = 256;
+
+/// The patch of a slot that holds a small image or the empty one, by a
+/// batch whose adds all lie in chunk zero: the common slot. The old members
+/// are read where they lie, merged with the batch in one pass (which is
+/// also where every witness is read off), laddered once and written as the
+/// image the surviving set selects. `None` leaves the batch untouched for
+/// the forest planner: a set too large for the stack, or an add above
+/// chunk zero.
+fn prepare_tiny<W: Witness>(
+    slot: &[u8],
+    view: &BitmosaicView<'_>,
+    small: Option<SmallSet<'_>>,
+    adds: &[u32],
+    removes: &[u32],
+    scratch: &mut PatchScratch,
+    witness: &mut W,
+) -> Option<Result<PreparedPlan, PatchError>> {
+    let old_card = match small {
+        Some(set) => set.cardinality() as usize,
+        None if view.is_empty() => 0,
+        None => return None,
+    };
+    if old_card > TINY_MAX
+        || adds.len() > TINY_MAX
+        || adds.last().is_some_and(|&last| last > 0xFFFF)
+    {
+        return None;
+    }
+    let mut old = [0u16; TINY_MAX];
+    if let Some(set) = small {
+        let mut at = 0;
+        set.for_each(|member| {
+            old[at] = member as u16;
+            at += 1;
+        });
+    }
+    // A remove above chunk zero holds nothing here.
+    let removes = &removes[..removes.partition_point(|&value| value <= 0xFFFF)];
+    let (added, removed) = merge_members(
+        (old_card, |i| old[i]),
+        adds,
+        removes,
+        (0, 0),
+        witness,
+        &mut scratch.members,
+    );
+    let card = scratch.members.len() as u32;
+    let report = |serialized_len| PatchReport {
+        added,
+        removed,
+        len: u64::from(card),
+        serialized_len,
+    };
+    if added == 0 && removed == 0 {
+        return Some(Ok(PreparedPlan::Unchanged(report(view.serialized_len()))));
+    }
+    scratch.rows.clear();
+    scratch.staged.clear();
+    if card != 0 {
+        let fresh = finish_members(scratch, card);
+        push_fresh(
+            &mut scratch.rows,
+            Touched {
+                key: 0,
+                old: None,
+                fresh: Some(fresh),
+            },
+        );
+        encode_first_row(slot, scratch);
+    }
+    let needed = rows_total(&scratch.rows);
+    if needed > slot.len() {
+        return Some(Err(PatchError::Capacity { needed }));
+    }
+    assemble(slot, scratch, needed, u64::from(card));
+    Some(Ok(PreparedPlan::Built(report(needed))))
+}
 /// Derive writes from the retained geometry and edits, without reopening the
 /// image, restaging a chunk, or probing membership. The descending payload walk
 /// follows the writer's transient totals, not merely the final image length.

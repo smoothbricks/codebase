@@ -2523,7 +2523,22 @@ impl<'a> BitmosaicView<'a> {
     /// Linear in the string, allocation-free; for bytes that crossed a
     /// trust boundary, and once per plane rather than per probe.
     pub fn open_verified(bytes: &'a [u8]) -> Result<BitmosaicView<'a>, AdmissionError> {
-        Self::open_with(bytes, true)
+        let view = Self::open_with(bytes, true)?;
+        crate::canon::check(&view, crate::canon::Root::Either, true)?;
+        Ok(view)
+    }
+
+    /// [`Self::open_verified`] for bytes whose identity matters: it admits
+    /// exactly the image [`Bitmosaic::to_bytes`] writes for the set, so two
+    /// admitted byte strings are equal exactly when their sets are. An
+    /// image a patched slot may hold (the forest family where an
+    /// Elias-Fano root is shorter, or an Elias-Fano root a patch kept) is
+    /// refused as [`AdmissionClass::Canonical`]. A consumer that hashes or
+    /// compares images calls this one.
+    pub fn open_canonical(bytes: &'a [u8]) -> Result<BitmosaicView<'a>, AdmissionError> {
+        let view = Self::open_with(bytes, true)?;
+        crate::canon::check(&view, crate::canon::Root::Sealed, true)?;
+        Ok(view)
     }
 
     fn open_with(bytes: &'a [u8], verify: bool) -> Result<BitmosaicView<'a>, AdmissionError> {
@@ -2892,8 +2907,12 @@ impl<'a> BitmosaicView<'a> {
                         c.for_each(|v| f(high | u32::from(v)));
                     }
                 }
-                if forest.chunks == 0 {
-                    crate::small::image_for_each(forest.bytes, f);
+                // Inlined, not a call: a call would take the caller's closure,
+                // whose captures then live in memory for the loop above too.
+                if forest.chunks == 0
+                    && let Some(set) = SmallSet::of(forest.bytes)
+                {
+                    set.for_each(f);
                 }
             }
         }
@@ -3133,7 +3152,15 @@ impl<'a> Bitmosaic64View<'a> {
                 "u64 child offsets are not adjacent within their payload plane",
             )
         })?;
-        BitmosaicView::open_child::<true>(body, verify).map_err(|error| error.shifted(at))
+        // A child is a sealed image: its root is the writer's choice too.
+        BitmosaicView::open_child::<true>(body, verify)
+            .and_then(|child| {
+                if verify {
+                    crate::canon::check(&child, crate::canon::Root::Sealed, false)?;
+                }
+                Ok(child)
+            })
+            .map_err(|error| error.shifted(at))
     }
 
     fn forest(&self, i: usize) -> Option<BitmosaicView<'a>> {

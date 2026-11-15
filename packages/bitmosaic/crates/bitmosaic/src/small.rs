@@ -908,11 +908,3 @@ pub(crate) fn image_rank(image: &[u8], value: u32) -> u64 {
 pub(crate) fn image_select(image: &[u8], k: u64) -> Option<u32> {
     SmallSet::of(image)?.select(u32::try_from(k).ok()?)
 }
-
-#[cold]
-#[inline(never)]
-pub(crate) fn image_for_each(image: &[u8], f: impl FnMut(u32)) {
-    if let Some(set) = SmallSet::of(image) {
-        set.for_each(f);
-    }
-}
