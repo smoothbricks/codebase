@@ -52,6 +52,15 @@ into `Bitmosaic64`. Lazy intersection, union, difference, and symmetric-differen
 intermediate member buffer. Seeking into a long run is arithmetic; counting run intersections works on intervals rather
 than enumerating their members.
 
+A writer that holds its members as an ascending slice needs no set: `image_len(members)` is the sealed image's length
+and `write_image_into(members, out, scratch)` writes it, byte-equal to `from_sorted(members).to_bytes()`. A small image
+(a few ordinals below 65,536) is one pass over the members and a tag byte, with no allocation; so is an Elias–Fano root;
+a directory is laid out through the caller's `PatchScratch`.
+
+A reader that holds only the bytes of a small image takes `SmallView::open(bytes)` (or `view.as_small()`): `contains`,
+`rank`, `select`, `iter`, `and_len` and `and_rank` are computed on the image bytes where they lie and inline into the
+caller. `BitmosaicView` answers the same for every image and reaches a small one by one call.
+
 ## Native v2
 
 This is bitmosaic's native format, not the standard Roaring format. There is no legacy-format reader and no

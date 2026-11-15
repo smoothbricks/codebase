@@ -12,6 +12,16 @@ item = "as_str"
 consumer = "private"
 why = "an embedder reports the bitmap admission rule beside its image-relative offset without reparsing the image"
 
+[[package.metadata.wiring.external]]
+item = "open_canonical"
+consumer = "private"
+why = "a value format that hashes the images it embeds admits exactly the sealed image of a set"
+
+[[package.metadata.wiring.external]]
+item = "as_small"
+consumer = "private"
+why = "a reader that probes a small set in a loop takes its inline reader once"
+
 [dependencies]
 
 [features]

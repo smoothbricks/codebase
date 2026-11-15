@@ -446,13 +446,33 @@ pub(crate) enum SmallSet<'a> {
 }
 
 impl<'a> SmallSet<'a> {
-    /// The set a small image holds, from its tag; `None` for any other
-    /// image. Attachment proved the payload holds what the tag says.
+    /// The set an attached small image holds; `None` for any other image.
+    /// `image` is exactly the image's extent, as every view holds it, so
+    /// the tag's kind alone says where the members lie.
     #[inline(always)]
     pub(crate) fn of(image: &'a [u8]) -> Option<Self> {
-        let (kind, count) = read_small_tag(*image.first()?)?;
-        let payload = image.get(1..small_image_len(image)?)?;
-        Some(Self::from_validated(payload, kind, count))
+        let (&tag, payload) = image.split_first()?;
+        Some(match tag >> 5 {
+            1 => SmallSet::List8(payload),
+            2 => SmallSet::Window {
+                bits: payload,
+                base: 0,
+            },
+            3 => {
+                let (&start, bits) = payload.split_first()?;
+                SmallSet::Window {
+                    bits,
+                    base: 8 * u32::from(start),
+                }
+            }
+            4 => SmallSet::List16(payload),
+            5 => SmallSet::Spans(payload),
+            6 if tag == TAG_WINDOW_WIDE => SmallSet::Window {
+                bits: payload.get(3..)?,
+                base: 8 * u32::from(u16::from_le_bytes([payload[0], payload[1]])),
+            },
+            _ => return None,
+        })
     }
 
     /// Admit a small image: its tag, its exact extent and the structure no
