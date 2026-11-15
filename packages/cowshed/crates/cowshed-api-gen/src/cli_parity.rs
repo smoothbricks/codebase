@@ -308,6 +308,7 @@ pub const PARITY: &[Row] = &[
     row("land", "ungated", field(&[("coordinator.land", "options.mode")], &[argument("Coordinator.land", 1, "mode")])),
     row("land", "preflight", field(&[("coordinator.land", "options.preflight")], &[argument("Coordinator.land", 1, "preflight")])),
     row("land", "no-push", Counterpart::Composed { recipe: "a declared land (02_workspaces.md \"A declared land\"): land({preflight}), rebase, the repository's gate, land({refTurn, retire: false}) and remove, whose detached after-land child pushes; --no-push leaves the push out", facade: &[member("Coordinator.land"), member("Coordinator.rebase"), member("Coordinator.remove")] }),
+    row("land", "gate-only", Counterpart::Composed { recipe: "a declared land's gate alone (02_workspaces.md \"A declared land\", \"The gate alone\"): land({preflight}), then the repository's gate as the command of spawnLandTurn, so it holds the land turn; nothing is rebased, landed or removed", facade: &[member("Coordinator.land"), member("spawnLandTurn")] }),
 
     row("doc-commit", "", input(member("spawnDocCommit"))),
     row("doc-commit", "message", input(argument("spawnDocCommit", 0, "message"))),
