@@ -1789,6 +1789,16 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
     // the forest value carries its extent and cardinality, and the chunk
     // itself is read through `small`.
     let small = forest.lone_small();
+    // The reader holds a lone image as a forest of no chunks; the patch
+    // plans over its one chunk.
+    let forest = if forest.geometry.is_lone() {
+        Forest {
+            chunks: 1,
+            ..forest
+        }
+    } else {
+        forest
+    };
     let mut plan = match plan_forest::<W, CAPTURE>(
         &forest,
         small,

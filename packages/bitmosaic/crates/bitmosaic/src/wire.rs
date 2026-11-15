@@ -2598,6 +2598,9 @@ impl<'a> BitmosaicView<'a> {
         } else if CHECK {
             Self::admit_chunks(&forest, 0, verify)?;
         }
+        // Admitted as its one chunk; held as a forest of none, which is what
+        // every directory loop then sees.
+        forest.chunks = 0;
         Ok(Self {
             root: Root::Forest(forest),
             encoded_len: bytes.len(),
@@ -2755,11 +2758,8 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.contains(value),
             Root::Forest(f) => {
-                if f.geometry.lone {
-                    return lone_contains(f, value);
-                }
                 let Some(at) = f.locate((value >> 16) as u16) else {
-                    return false;
+                    return f.geometry.lone && lone_contains(f, value);
                 };
                 f.container(at)
                     .is_some_and(|c| c.contains((value & 0xFFFF) as u16))
@@ -2773,9 +2773,6 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.rank(value),
             Root::Forest(f) => {
-                if f.geometry.lone {
-                    return lone_rank(f, value);
-                }
                 let key = (value >> 16) as u16;
                 match f.locate(key) {
                     Some(at) => {
@@ -2785,6 +2782,9 @@ impl<'a> BitmosaicView<'a> {
                                 as u64
                     }
                     None => {
+                        if f.geometry.lone {
+                            return lone_rank(f, value);
+                        }
                         let at = f.walk(key);
                         if at == 0 { 0 } else { f.after(at - 1) }
                     }
@@ -2903,14 +2903,14 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.for_each(f),
             Root::Forest(forest) => {
-                if forest.geometry.lone {
-                    return lone_for_each(forest, f);
-                }
                 for i in 0..forest.chunks as usize {
                     let high = u32::from(forest.key(i)) << 16;
                     if let Some(c) = forest.container(i) {
                         c.for_each(|v| f(high | u32::from(v)));
                     }
+                }
+                if forest.geometry.lone {
+                    lone_for_each(forest, f);
                 }
             }
         }
@@ -2966,13 +2966,18 @@ enum LoneChunk<'a> {
 }
 
 impl<'a> Forest<'a> {
-    /// The chunk of a lone forest (`geometry.lone`), from its control byte.
+    /// The chunk of a lone forest (`geometry.lone`), whose kind its control
+    /// byte holds and whose cardinality is the forest's.
     fn lone_chunk(&self) -> Option<LoneChunk<'a>> {
-        if u32::from(self.bytes[0]) & 7 >= K_BYTES {
-            self.lone_small().map(LoneChunk::Small)
-        } else {
-            self.container(0).map(LoneChunk::Arm)
+        let kind = u32::from(self.bytes[0]) & 7;
+        if kind >= K_BYTES {
+            return self.lone_small().map(LoneChunk::Small);
         }
+        Some(LoneChunk::Arm(CView::from_validated(
+            self.bytes.get(self.geometry.payload_at..)?,
+            kind,
+            self.len as u32,
+        )))
     }
 
     /// The small chunk of a lone forest, when its kind is Bytes or Window.
@@ -3901,7 +3906,7 @@ impl<'a> BitmosaicViewRange<'a> {
                 Some(LoneChunk::Arm(container)) => BitmosaicViewRange {
                     remaining: lone.len,
                     root: ViewCursor::Forest {
-                        forest: Forest { chunks: 0, ..lone },
+                        forest: lone,
                         chunk: 0,
                         high: 0,
                         inner: CRange::open(container),
@@ -4334,7 +4339,11 @@ mod refuter {
         let Root::Forest(forest) = view.root else {
             panic!("expected a forest root")
         };
-        let Some(CView::Words { payload, len, .. }) = forest.container(0) else {
+        let lone = Forest {
+            chunks: forest.chunks.max(1),
+            ..forest
+        };
+        let Some(CView::Words { payload, len, .. }) = lone.container(0) else {
             panic!("expected a Words chunk")
         };
         (payload.as_ptr() as usize - bytes.as_ptr() as usize, len)
@@ -4404,6 +4413,10 @@ mod refuter {
         let view = BitmosaicView::open(bytes).expect("open");
         let Root::Forest(forest) = view.root else {
             panic!("expected a forest root")
+        };
+        let forest = Forest {
+            chunks: forest.chunks.max(1),
+            ..forest
         };
         let Some(CView::Words { payload, .. }) = forest.container(index) else {
             panic!("expected a Words chunk at {index}")
@@ -4675,7 +4688,11 @@ mod admission_tests {
             else {
                 panic!("forest fixture")
             };
-            let CView::Cone { eps, residuals, .. } = forest.container(0).expect("one chunk") else {
+            let lone = Forest {
+                chunks: 1,
+                ..forest
+            };
+            let CView::Cone { eps, residuals, .. } = lone.container(0).expect("one chunk") else {
                 panic!("fixture must select Cone")
             };
             assert_ne!(eps, 0, "fixture needs a model window margin");

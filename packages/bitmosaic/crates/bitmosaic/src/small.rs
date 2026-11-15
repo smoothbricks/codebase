@@ -750,7 +750,7 @@ impl<'a> SmallRange<'a> {
         }
     }
 
-    #[inline(never)]
+    #[inline(always)]
     pub(crate) fn pop_front(&mut self) {
         match self {
             Self::Bytes(range) => range.pop_front(),
@@ -759,7 +759,7 @@ impl<'a> SmallRange<'a> {
     }
 
     /// The head is below `target`.
-    #[inline(never)]
+    #[inline(always)]
     pub(crate) fn seek(&mut self, target: u16) {
         match self {
             Self::Bytes(range) => range.seek(target),
