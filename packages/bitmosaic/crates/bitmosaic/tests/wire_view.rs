@@ -209,8 +209,7 @@ fn runs_reject_overlapping_adjacent_reversed_and_inexact_payloads() {
         damaged[5..7].copy_from_slice(&start.to_le_bytes());
         damaged[7..9].copy_from_slice(&end.to_le_bytes());
         let refusal = BitmosaicView::open_verified(&damaged)
-            .err()
-            .expect("a Spans image whose intervals do not ascend apart");
+            .expect_err("a Spans image whose intervals do not ascend apart");
         assert_eq!(
             (refusal.class, refusal.offset),
             (AdmissionClass::MapOrder, refused_at),
@@ -400,9 +399,8 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
                 "control {control:#04x}: one payload byte short"
             );
         } else if !framed {
-            let refusal = BitmosaicView::open_verified(&image)
-                .err()
-                .expect("an unassigned control is refused");
+            let refusal =
+                BitmosaicView::open_verified(&image).expect_err("an unassigned control is refused");
             assert_eq!(
                 (refusal.class, refusal.offset),
                 (AdmissionClass::Kind, 0),
@@ -1529,8 +1527,9 @@ fn small_forms_answer_every_read_where_they_lie() {
     for len in 1..=32u32 {
         for (kk, start) in [(2u8, 0u32), (3, 1), (3, 255), (3, 1 + len * 7 % 255)] {
             let (lo, hi) = (8 * start, 8 * (start + len));
-            let mut members: Vec<u32> =
-                (lo..hi).filter(|_| xorshift(&mut state) % 3 == 0).collect();
+            let mut members: Vec<u32> = (lo..hi)
+                .filter(|_| xorshift(&mut state).is_multiple_of(3))
+                .collect();
             members.push(lo + (xorshift(&mut state) % 8) as u32);
             members.push(hi - 1 - (xorshift(&mut state) % 8) as u32);
             members.sort_unstable();

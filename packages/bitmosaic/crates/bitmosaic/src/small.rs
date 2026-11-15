@@ -114,7 +114,7 @@ pub(crate) fn small_form(
     let card = card as usize;
     let candidates = [
         (end < COUNT_MAX).then_some((K_WINDOW, end + 1)),
-        (start >= 1 && start <= 255 && end - start < COUNT_MAX)
+        ((1..=255).contains(&start) && end - start < COUNT_MAX)
             .then_some((K_WINDOW_AT, 2 + end - start)),
         (runs <= COUNT_MAX).then(|| (K_SPANS, 4 * runs)),
         (last <= 255 && card <= COUNT_MAX).then_some((K_LIST8, card)),
@@ -127,7 +127,7 @@ pub(crate) fn small_form(
         }
     }
     // Every small header is the tag alone.
-    best.filter(|&(_, len)| 1 + len <= directory)
+    best.filter(|&(_, len)| len < directory)
 }
 
 /// Writes a small payload from a set's ascending members. `out` is exactly
@@ -278,7 +278,7 @@ fn count_below(bits: &[u8], below: usize) -> u32 {
     for i in 0..below / 64 {
         count += word_at(bits, i).count_ones();
     }
-    if below % 64 != 0 {
+    if !below.is_multiple_of(64) {
         count += (word_at(bits, below / 64) & ((1u64 << (below % 64)) - 1)).count_ones();
     }
     count
@@ -317,7 +317,7 @@ fn window_and(a: &[u8], a_base: u32, b: &[u8], b_base: u32, below: u32) -> u32 {
     for i in 0..bits / 64 {
         count += (word_at(a, i) & word_at(b, i)).count_ones();
     }
-    if bits % 64 != 0 {
+    if !bits.is_multiple_of(64) {
         let both = word_at(a, bits / 64) & word_at(b, bits / 64);
         count += (both & ((1u64 << (bits % 64)) - 1)).count_ones();
     }
@@ -342,8 +342,10 @@ fn member(list: &[u8], wide: bool, i: usize) -> u32 {
 #[inline(always)]
 fn list_rank(list: &[u8], wide: bool, value: u32) -> usize {
     if wide {
-        list.chunks_exact(2)
-            .map(|pair| usize::from(u32::from(u16::from_le_bytes([pair[0], pair[1]])) < value))
+        list.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| usize::from(u32::from(u16::from_le_bytes(pair)) < value))
             .sum()
     } else {
         list.iter()
@@ -357,8 +359,8 @@ fn list_rank(list: &[u8], wide: bool, value: u32) -> usize {
 #[inline(always)]
 fn list_holds(list: &[u8], wide: bool, value: u32) -> bool {
     if wide {
-        list.chunks_exact(2).fold(false, |held, pair| {
-            held | (u32::from(u16::from_le_bytes([pair[0], pair[1]])) == value)
+        list.as_chunks::<2>().0.iter().fold(false, |held, &pair| {
+            held | (u32::from(u16::from_le_bytes(pair)) == value)
         })
     } else {
         list.iter()
@@ -698,8 +700,8 @@ impl<'a> SmallSet<'a> {
                 }
             }
             (SmallSet::List16(list), probed) | (probed, SmallSet::List16(list)) => {
-                for pair in list.chunks_exact(2) {
-                    let value = u32::from(u16::from_le_bytes([pair[0], pair[1]]));
+                for &pair in list.as_chunks::<2>().0 {
+                    let value = u32::from(u16::from_le_bytes(pair));
                     count += u32::from((value < below) & probed.contains(value));
                 }
             }

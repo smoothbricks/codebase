@@ -481,8 +481,8 @@ fn run_container_histories_split_bridge_extend_and_erase() {
 
     // The format's worked example: 8192 members in two maximal intervals.
     // Two runs cost 12 owned bytes against the Words arm's 8720, so the
-    // chunk is priced as Runs, and the whole image is 12 bytes: the lone
-    // control byte, a two-byte cardinality and the 9-byte runs payload.
+    // chunk is priced as Runs; its members are all below 65,536, so the
+    // image is the small interval form: a tag and two four-byte intervals.
     let two_runs: Vec<u32> = (0..4096).chain(32768..36864).collect();
     slot_step(
         &mut env, &mut hooks, &mut state, &meta, storage, &mut model, &two_runs, true,
@@ -492,7 +492,7 @@ fn run_container_histories_split_bridge_extend_and_erase() {
         (0, 0, 0, 0, 1),
         "two intervals freeze to one Runs container"
     );
-    assert_eq!(storage.serialized_len(&state), Ok(12));
+    assert_eq!(storage.serialized_len(&state), Ok(9));
     let two_run_image = storage
         .serialized_data(&state)
         .expect("image parses")
@@ -1087,8 +1087,7 @@ fn serialized_queries() {
     assert_eq!(cardinality_serialized(&a), 4);
     assert_eq!(cardinality_serialized(&[]), 0);
     assert_eq!(cardinality_validated(&a), Ok(4));
-    let error = cardinality_validated(b"not a native image at all")
-        .expect_err("native refusal is forwarded");
+    let error = cardinality_validated(&[0xFF, 0, 0, 0]).expect_err("native refusal is forwarded");
     assert_eq!(
         (error.class, error.offset),
         (bitmosaic::AdmissionClass::Kind, 0)

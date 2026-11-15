@@ -101,7 +101,7 @@ impl Page {
         for word in &self.words[..bit / 64] {
             count += word.count_ones();
         }
-        if bit % 64 != 0 {
+        if !bit.is_multiple_of(64) {
             count += (self.words[bit / 64] & ((1u64 << (bit % 64)) - 1)).count_ones();
         }
         count
@@ -306,8 +306,11 @@ fn page_and_len(cell: &Cell<'_>) -> u64 {
     }
 }
 
+/// The measuring hook: given the iterations, the operations an iteration
+/// makes and the iteration itself, it runs them and returns their sum.
+pub type Measure<'a> = dyn FnMut(u64, u64, &mut dyn FnMut() -> u64) -> u64 + 'a;
 /// Run the cell the arguments name; `measure` is `format_gate`'s hook.
-pub fn gate(measure: &mut dyn FnMut(u64, u64, &mut dyn FnMut() -> u64) -> u64) {
+pub fn gate(measure: &mut Measure<'_>) {
     let args: Vec<String> = std::env::args().collect();
     let [_, shape_name, reader, op, iterations, ..] = args.as_slice() else {
         panic!("usage: small_gate <shape> <view|small|page> <op> <iterations>");

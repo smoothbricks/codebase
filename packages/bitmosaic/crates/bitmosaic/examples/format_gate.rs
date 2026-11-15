@@ -199,11 +199,14 @@ fn to_forest_bytes(cell: &Cell<'_>) -> u64 {
     black_box(cell.owned_a).to_forest_bytes().len() as u64
 }
 
+/// The measuring hook: given the iterations, the operations an iteration
+/// makes and the iteration itself, it runs them and returns their sum.
+pub type Measure<'a> = dyn FnMut(u64, u64, &mut dyn FnMut() -> u64) -> u64 + 'a;
 /// Run the cell the arguments name. `measure(iterations, operations, body)`
 /// runs `body` (one iteration, of `operations` probes or members) that
 /// many times and returns the sum of its answers: the place a counter
 /// window goes.
-pub fn gate(measure: &mut dyn FnMut(u64, u64, &mut dyn FnMut() -> u64) -> u64) {
+pub fn gate(measure: &mut Measure<'_>) {
     let args: Vec<String> = std::env::args().collect();
     let [_, shape_name, form, op, iterations, ..] = args.as_slice() else {
         panic!("usage: format_gate <shape> <sealed|forest> <op> <iterations>");
