@@ -76,7 +76,7 @@ control:
 | `10`         | `u32` directory                         | control, `body_bytes` varint, body |
 | `12`         | `u32` Elias–Fano                        | control, `body_bytes` varint, body |
 | `11`         | `u64` directory                         | control, `body_bytes` varint, body |
-| `20` to `BF` | `u32` small image: members below 65,536 | control (the tag), payload         |
+| `20` to `C0` | `u32` small image: members below 65,536 | control (the tag), payload         |
 
 Every other control is refused. `body_bytes` counts the body alone, and the whole image must fit the `u32` offset
 domain. `IMAGE_ID_LEN` (one), `EMPTY_U32_IMAGE` and `EMPTY_U64_IMAGE` are public constants.
@@ -84,29 +84,32 @@ domain. `IMAGE_ID_LEN` (one), `EMPTY_U32_IMAGE` and `EMPTY_U64_IMAGE` are public
 ### Small images
 
 A small image holds a set whose members are all below 65,536 (chunk key zero) with no directory. Its tag is `kk lllll`:
-`kk` (bits 5 to 7, values 1 to 5) is the form and `lllll + 1` (1 to 32) the count. The payload follows and its length
-follows from the tag alone:
+`kk` (bits 5 to 7, values 1 to 6) is the form and, for forms 1 to 5, `lllll + 1` (1 to 32) the count. The payload
+follows; its length follows from the tag alone, except a Window wide's, which its third payload byte gives:
 
-| `kk` | Tag          | Form      | Count is     | Payload                                                                                             | Payload bytes |
-| ---- | ------------ | --------- | ------------ | --------------------------------------------------------------------------------------------------- | ------------- |
-| 1    | `20` to `3F` | List8     | members      | the members, each below 256, as ascending bytes                                                     | `count`       |
-| 2    | `40` to `5F` | Window    | bitmap bytes | a bitmap: bit `j` of byte `i` is the member `8i + j`                                                | `count`       |
-| 3    | `60` to `7F` | Window at | bitmap bytes | `start` (one byte, at least 1), then a bitmap: bit `j` of byte `i` is the member `8(start + i) + j` | `1 + count`   |
-| 4    | `80` to `9F` | List16    | members      | the members as ascending `u16`                                                                      | `2 * count`   |
-| 5    | `A0` to `BF` | Spans     | intervals    | `count` pairs `(start: u16, end: u16)`, both inclusive                                              | `4 * count`   |
+| `kk` | Tag          | Form        | Count is                | Payload                                                                                                                           | Payload bytes |
+| ---- | ------------ | ----------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| 1    | `20` to `3F` | List8       | members                 | the members, each below 256, as ascending bytes                                                                                   | `count`       |
+| 2    | `40` to `5F` | Window      | bitmap bytes            | a bitmap: bit `j` of byte `i` is the member `8i + j`                                                                              | `count`       |
+| 3    | `60` to `7F` | Window at   | bitmap bytes            | `start` (one byte, at least 1), then a bitmap: bit `j` of byte `i` is the member `8(start + i) + j`                               | `1 + count`   |
+| 4    | `80` to `9F` | List16      | members                 | the members as ascending `u16`                                                                                                    | `2 * count`   |
+| 5    | `A0` to `BF` | Spans       | intervals               | `count` pairs `(start: u16, end: u16)`, both inclusive                                                                            | `4 * count`   |
+| 6    | `C0`         | Window wide | (none: `lllll` is zero) | `start: u16`, `len - 1` (one byte), then a bitmap of `len` bytes (1 to 256): bit `j` of byte `i` is the member `8(start + i) + j` | `3 + len`     |
 
 **List8, List16.** Strictly ascending.
 
-**Window, Window at.** A bitmap of whole bytes aligned in the value domain: a member `v` is bit `v mod 8` of the byte
-for `v div 8`, whatever the window's start, so two windows AND byte for byte where they overlap. The last bitmap byte is
-not zero. In a Window at, `start` is at least 1 and the first bitmap byte is not zero either; a window that would start
-at byte zero is a Window. The cardinality is the bitmap's popcount.
+**Window, Window at, Window wide.** A bitmap of whole bytes aligned in the value domain: a member `v` is bit `v mod 8`
+of the byte for `v div 8`, whatever the window's start, so two windows AND byte for byte where they overlap. The last
+bitmap byte is not zero. In a Window at, `start` is at least 1 and the first bitmap byte is not zero either; a window
+that would start at byte zero is a Window. In a Window wide the first bitmap byte is not zero and `start + len <= 8192`.
+The cardinality is the bitmap's popcount.
 
 **Spans.** `start <= end`; intervals ascend and neither overlap nor touch (`end_i + 1 < start_{i+1}`). A singleton
 interval has `start = end`. The cardinality is the sum of `end - start + 1`.
 
 Examples: `{7}` is `40 80`; `{7, 200}` is `21 07 C8`; `{0, 1, 2, 10}` is `41 07 04`; `0..=82` is `A0 00 00 52 00`;
-`{1000, 2000}` is `81 E8 03 D0 07`.
+`{1000, 2000}` is `81 E8 03 D0 07`; the even numbers `3000, 3002, ..` up to `3398` with `3001` are `C0 77 01 31` and 50
+bitmap bytes (`start` 375, `len` 50), 54 bytes in all.
 
 Every form is read where it lies: `contains` on a window is one byte load, a shift and a mask; rank and the intersection
 of two windows are popcounts over at most four unaligned 64-bit loads (a partial last word is two overlapping narrower
@@ -207,6 +210,7 @@ small image as it stands, or control `10` or `12` and the body. An empty child i
    3. Spans, when `r <= 32`: `4r`.
    4. List8, when `last <= 255` and `n <= 32`: `n`.
    5. List16, when `n <= 32`: `2n`.
+   6. Window wide, when `last div 8 - first div 8 <= 255`: `4 + last div 8 - first div 8`.
 
    The shortest candidate is the small form; the earlier one wins a tie. The small image (one byte more than its
    payload) is written when it is no longer than the directory image of step 2; otherwise the directory.
@@ -222,30 +226,30 @@ small image as it stands, or control `10` or `12` and the body. An empty child i
 
 Three entries, by what the caller needs:
 
-| Entry            | Proves                                                                                                                                                   | Who calls it                                               |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `open`           | structure: control, framing, directory geometry, kinds, payload extents, counts                                                                          | a hot attach path over bytes it wrote or already admitted  |
-| `open_verified`  | `open`, every member and derived plane, and that every form is the writer's: the image is byte-equal to the sealed or the forest-family image of its set | a consumer that patches slots, or reads bytes from outside |
-| `open_canonical` | `open_verified`, and the sealed root choice: the image is byte-equal to `to_bytes()`                                                                     | a consumer that hashes or compares images                  |
+| Entry            | Proves                                                                                                                                                                                                                       | Who calls it                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `open`           | structure: control, framing, directory geometry, kinds, payload extents, counts                                                                                                                                              | a hot attach path over bytes it wrote or already admitted  |
+| `open_verified`  | `open`, every member and derived plane, and that every form is the writer's: the image is byte-equal to the sealed or the forest-family image of its set, or is an Elias–Fano image of it (a patch keeps an Elias–Fano root) | a consumer that patches slots, or reads bytes from outside |
+| `open_canonical` | `open_verified`, and the sealed root choice: the image is byte-equal to `to_bytes()`                                                                                                                                         | a consumer that hashes or compares images                  |
 
 `open` returns `Option`; the other two return `Result<View, AdmissionError>`. None allocates. `open_verified` runs the
-selection rules above over the members of every chunk: one more pass, with 16 KiB of stack. `image_header(bytes)`
+selection rules above over the members of every chunk: one more pass, with up to 16 KiB of stack. `image_header(bytes)`
 returns `ImageHeader { width, encoded_len, .. }` in bounded constant work, from the control byte and, for a framed
-image, its `body_bytes`.
+image, its `body_bytes`, for a Window wide its length byte.
 
 `AdmissionError` retains the typed `class`, the image-relative byte `offset`, and a static `what`. A child refusal in a
 u64 directory is shifted to the complete image. `AdmissionClass::as_str()` names the rules:
 
-| Class         | Refuses                                                                                                                                                                                                                                                                                                                               |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `extent`      | a missing control byte; a truncated or non-shortest `body_bytes`; a body, plane or payload that is truncated or does not cover its extent exactly; a Window bitmap that ends, or a Window at bitmap that starts, in a zero byte                                                                                                       |
-| `kind`        | an unassigned control; an image of the other key width; a Window at whose `start` is zero; a directory chunk of kind 5 to 7; a u64 child that is not a nonempty `u32` image                                                                                                                                                           |
-| `count`       | a non-shortest varint count; a chunk cardinality outside `1..=65536` or outside its kind's range; prefixes that do not ascend or disagree with their payloads (Runs, Words, u64 children); a Words window that is not whole blocks                                                                                                    |
-| `map-order`   | chunk keys, u64 keys, Array, List8, List16 or Cone members, runs, intervals or Elias–Fano members that do not ascend strictly; intervals that overlap or touch                                                                                                                                                                        |
-| `plane-range` | a value outside its domain: a zero Stride step, a member past 65,535, a Cone model that overflows or whose window misses a member, Words bounds, summary or rank entries that disagree with the words, an Elias–Fano base plus span past `u32`                                                                                        |
-| `bit-pad`     | a nonzero unused bit in the kind plane or an Elias–Fano plane                                                                                                                                                                                                                                                                         |
-| `placement`   | payload or child offsets that are not adjacent within their area; a slot-plane entry or an Elias–Fano sample that names the wrong position                                                                                                                                                                                            |
-| `canonical`   | a well-formed image that is not the writer's for its set: a chunk whose members select another kind (step 1); a directory of one chunk at key zero where a small form is no longer (step 3); a small image that is not the selected form; under `open_canonical`, a root that is not step 5's; a u64 child whose root is not step 5's |
+| Class         | Refuses                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `extent`      | a missing control byte; a truncated or non-shortest `body_bytes`; a body, plane or payload that is truncated or does not cover its extent exactly; a window's bitmap that ends, or a Window wide or Window at bitmap that starts, in a zero byte                                                                                                                                                             |
+| `kind`        | an unassigned control; an image of the other key width; a Window at whose `start` is zero; a directory chunk of kind 5 to 7; a u64 child that is not a nonempty `u32` image                                                                                                                                                                                                                                  |
+| `count`       | a non-shortest varint count; a chunk cardinality outside `1..=65536` or outside its kind's range; prefixes that do not ascend or disagree with their payloads (Runs, Words, u64 children); a Words window that is not whole blocks                                                                                                                                                                           |
+| `map-order`   | chunk keys, u64 keys, Array, List8, List16 or Cone members, runs, intervals or Elias–Fano members that do not ascend strictly; intervals that overlap or touch                                                                                                                                                                                                                                               |
+| `plane-range` | a value outside its domain: a zero Stride step, a member past 65,535, a Window wide whose `start + len` passes 8,192, a Cone model that overflows or whose window misses a member, Words bounds, summary or rank entries that disagree with the words, an Elias–Fano base plus span past `u32`                                                                                                               |
+| `bit-pad`     | a nonzero unused bit in the kind plane or an Elias–Fano plane                                                                                                                                                                                                                                                                                                                                                |
+| `placement`   | payload or child offsets that are not adjacent within their area; a slot-plane entry or an Elias–Fano sample that names the wrong position                                                                                                                                                                                                                                                                   |
+| `canonical`   | a well-formed image that is not the writer's for its set: a chunk whose members select another kind (step 1); a Cone whose `scale` or `eps` is not step 1's or the largest residual; a directory of one chunk at key zero where a small form is no longer (step 3); a small image that is not the selected form; under `open_canonical`, a root that is not step 5's; a u64 child whose root is not step 5's |
 
 ### Reading
 
@@ -273,6 +277,7 @@ in a word is six halvings by popcount, so no port needs a bit-deposit instructio
 | 13 ordinals spread over 129                 |                               14 bytes |
 | any set below 256                           |                             at most 33 |
 | any set within 32 value-aligned bytes       | at most `3 + last div 8 - first div 8` |
+| a dense set spanning up to 2,048 positions  | at most `5 + last div 8 - first div 8` |
 | one interval below 65,536, such as `0..=99` |                                5 bytes |
 | 4 members below 65,536                      |                              at most 9 |
 | u32 `0..=4095` plus `32768..=36863`         |                                9 bytes |
@@ -341,9 +346,10 @@ its span within 256 positions.
 
 <a id="smoo/bitmosaic!n/conformance-vectors"></a>`tests/vectors/native-v2.json` is the conformance document a port is
 checked against: for every case the member list and the canonical image as hex, and for every refusal the image and its
-admission class. It covers every container kind alone and in a directory, both sides of every selection boundary, every
-lone count width, the slot plane, the Elias–Fano root and the u64 tier. `tests/vectors.rs` holds the file to what the
-crate writes, admits and refuses; regenerate it with the `conformance_vectors` example.
+admission class. It covers every small form and every container kind, alone and in a directory, both sides of every
+selection boundary, the slot plane, the Elias–Fano root and the u64 tier, and for every form a well-formed image that is
+not the writer's, with the admission that refuses it. `tests/vectors.rs` holds the file to what the crate writes, admits
+and refuses; regenerate it with the `conformance_vectors` example.
 
 The existing wire, range, skew, and patch oracles compare observable behavior against BTreeSet and development-only
 roaring-rs. They cover hostile framing, unaligned images, the full-u32 cardinality boundary without enumerating the

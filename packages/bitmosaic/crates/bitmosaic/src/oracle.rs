@@ -249,6 +249,25 @@ fn check_reads(step: usize, bytes: &[u8], oracle: &BTreeSet<u32>, input: &mut In
     let mut walked = Vec::with_capacity(n);
     view.for_each(|v| walked.push(v));
     assert!(walked == members, "step {step}: walk");
+    if let Some(small) = view.as_small() {
+        assert_eq!(small.len() as usize, n, "step {step}: small len");
+        assert!(
+            small.iter().eq(members.iter().copied()),
+            "step {step}: small iter"
+        );
+    }
+    // The sealed image is the one canonical admission takes, and the slot
+    // image only where it is the same bytes.
+    let (sealed, slot) = (owned.to_bytes(), owned.to_forest_bytes());
+    assert!(
+        BitmosaicView::open_canonical(&sealed).is_ok(),
+        "step {step}: the sealed image is canonical"
+    );
+    assert_eq!(
+        BitmosaicView::open_canonical(&slot).is_ok(),
+        slot == sealed,
+        "step {step}: the slot image is canonical exactly when it is the sealed one"
+    );
 
     let every = (n / 64).max(1);
     let mut probes: Vec<u32> = members
@@ -269,6 +288,14 @@ fn check_reads(step: usize, bytes: &[u8], oracle: &BTreeSet<u32>, input: &mut In
         );
         assert_eq!(view.rank(v), rank as u64, "step {step}: view rank({v})");
         assert_eq!(owned.rank(v), rank as u64, "step {step}: owned rank({v})");
+        if let Some(small) = view.as_small() {
+            assert_eq!(
+                small.contains(v),
+                member,
+                "step {step}: small contains({v})"
+            );
+            assert_eq!(small.rank(v) as usize, rank, "step {step}: small rank({v})");
+        }
         assert_eq!(
             owned.successor(v),
             members.get(rank).copied(),
@@ -365,6 +392,32 @@ pub(crate) fn check_and(name: &str, a: &BTreeSet<u32>, b: &BTreeSet<u32>) {
         for (form, forward, reversed) in answers {
             assert_eq!(forward, expected, "{name}: {form} on {arm:?}");
             assert_eq!(reversed, expected, "{name}: {form} on {arm:?}, reversed");
+        }
+    }
+    // The intersection rank at the ends, at a member of each side and
+    // between them.
+    let both: Vec<u32> = a.intersection(b).copied().collect();
+    let marks = [0, u32::MAX]
+        .into_iter()
+        .chain(a.iter().step_by(a.len() / 8 + 1).copied())
+        .chain(b.iter().step_by(b.len() / 8 + 1).map(|v| v.wrapping_add(1)));
+    for below in marks {
+        let expected = both.partition_point(|v| *v < below) as u64;
+        for (form, x, y) in [
+            ("sealed", &va, &vb),
+            ("forest", &wa, &wb),
+            ("mixed", &va, &wb),
+        ] {
+            assert_eq!(
+                x.and_rank(y, below),
+                expected,
+                "{name}: {form} and_rank({below})"
+            );
+            assert_eq!(
+                y.and_rank(x, below),
+                expected,
+                "{name}: {form} and_rank({below}), reversed"
+            );
         }
     }
 }

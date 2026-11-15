@@ -19,12 +19,11 @@
 //! `open` and every probe are untouched.
 
 use crate::ef::EfLayout;
-use crate::patch::{kind_of, stage};
-use crate::small::{SmallSet, read_small_tag, small_form, small_payload_len};
+use crate::patch::stage;
+use crate::small::{SmallSet, read_small_tag, small_form};
 use crate::wire::{
-    BitmosaicView, CView, Forest, Geometry, K_WORDS, Root as ViewRoot, ef_header_len,
-    forest_header_len, frame_len, runs_payload_len, slot_bits_for_span, word_window,
-    words_payload_len,
+    BitmosaicView, CView, Forest, Geometry, Root as ViewRoot, ef_header_len, forest_header_len,
+    frame_len, runs_payload_len, slot_bits_for_span, word_window, words_payload_len,
 };
 use crate::{ARRAY_MAX, AdmissionClass, AdmissionError, Arm, CHUNK_WORDS, choose_arm};
 
@@ -90,9 +89,9 @@ impl Staged {
         self.card += 1;
     }
 
-    /// The arm the ladder picks for the staged members, as its kind and
-    /// payload length.
-    fn arm(&self) -> (u32, usize) {
+    /// The arm the ladder picks for the staged members, and its payload
+    /// length.
+    fn arm(&self) -> (Arm, usize) {
         let n = self.card;
         let arm = if n <= ARRAY_MAX {
             choose_arm(&self.values[..n], false)
@@ -109,7 +108,7 @@ impl Staged {
                 words_payload_len(hi - lo)
             }
         };
-        (kind_of(arm), len)
+        (arm, len)
     }
 
     fn first(&self) -> u16 {
@@ -149,7 +148,6 @@ pub(crate) fn check(
     if n == 0 {
         return Ok(());
     }
-    let mut staged = Staged::new();
     let (first, last) = (view.select(0).unwrap_or(0), view.select(n - 1).unwrap_or(0));
     let forest_family = match &view.root {
         ViewRoot::Ef(ef) => {
@@ -157,6 +155,7 @@ pub(crate) fn check(
                 return Ok(());
             }
             // The forest family's length for this set, chunk by chunk.
+            let mut staged = Staged::new();
             let (mut chunks, mut payloads, mut key) = (0u32, 0usize, 0u16);
             let mut only_small = None;
             let mut close = |staged: &mut Staged, key: u16| {
@@ -208,9 +207,9 @@ pub(crate) fn check(
         frame_len(view.serialized_len() - 1)
     };
     if forest_family.chunks == 0 {
-        small(forest_family.bytes, &mut staged)?;
+        small(forest_family.bytes)?;
     } else {
-        directory(forest_family, standalone, &mut staged)?;
+        directory(forest_family, standalone)?;
     }
     if root == Root::Sealed
         && elias_fano_len(n, first, last).is_some_and(|sealed| sealed < standalone)
@@ -223,12 +222,23 @@ pub(crate) fn check(
     Ok(())
 }
 
+/// The payload length of the arm the ladder picks for `values`, at most
+/// [`ARRAY_MAX`] ascending members.
+fn arm_len(values: &[u16]) -> usize {
+    match choose_arm(values, false) {
+        Arm::Runs { count } => runs_payload_len(count),
+        Arm::Stride { .. } => 4,
+        Arm::Cone { .. } => 11 + values.len(),
+        Arm::Array | Arm::Words => 2 * values.len(),
+    }
+}
+
 /// A small image is the small form its set selects.
-fn small(image: &[u8], staged: &mut Staged) -> Result<(), AdmissionError> {
+fn small(image: &[u8]) -> Result<(), AdmissionError> {
     let Some(set) = SmallSet::of(image) else {
         return Ok(());
     };
-    let Some((kind, count)) = image.first().and_then(|&tag| read_small_tag(tag)) else {
+    let Some((kind, _)) = image.first().and_then(|&tag| read_small_tag(tag)) else {
         return Ok(());
     };
     let card = set.cardinality();
@@ -236,25 +246,48 @@ fn small(image: &[u8], staged: &mut Staged) -> Result<(), AdmissionError> {
         set.select(0).unwrap_or(0) as u16,
         set.select(card - 1).unwrap_or(0) as u16,
     );
-    // The directory this set would otherwise be. An interval list of more
-    // than 256 members is shorter than any directory of them: its payload
-    // is four bytes a run, where Runs costs more and every other arm at
-    // least one byte a member.
-    let (runs, directory) = if let SmallSet::Spans(spans) = set
-        && card as usize > 256
-    {
-        (spans.len() / 4, usize::MAX)
-    } else {
-        set.for_each(|value| staged.push(value as u16));
-        let (_, payload) = staged.arm();
-        (
-            staged.runs,
-            directory_len(1, 0, 0, u64::from(card), payload),
-        )
+    // The directory this set would otherwise be, and its runs. An interval
+    // list of more than 256 members is shorter than any directory of them:
+    // its payload is four bytes a run, where Runs costs more and every
+    // other arm at least one byte a member.
+    let (mut runs, mut next) = (0usize, u32::MAX);
+    let mut count_runs = |value: u32| {
+        runs += usize::from(value != next);
+        next = value + 1;
     };
-    if small_form(directory, first, last, card, runs)
-        != Some((kind, small_payload_len(kind, count)))
+    let payload = if let SmallSet::Spans(spans) = set
+        && card > 256
     {
+        runs = spans.len() / 4;
+        usize::MAX / 2
+    } else if card <= 256 {
+        let mut values = [0u16; 256];
+        let mut at = 0;
+        set.for_each(|value| {
+            count_runs(value);
+            values[at] = value as u16;
+            at += 1;
+        });
+        arm_len(&values[..at])
+    } else {
+        // A wide window of up to 2,048 members.
+        let mut values = [0u16; 2048];
+        let mut at = 0;
+        set.for_each(|value| {
+            count_runs(value);
+            if let Some(slot) = values.get_mut(at) {
+                *slot = value as u16;
+                at += 1;
+            }
+        });
+        arm_len(&values[..at])
+    };
+    let directory = if payload == usize::MAX / 2 {
+        usize::MAX
+    } else {
+        directory_len(1, 0, 0, u64::from(card), payload)
+    };
+    if small_form(directory, first, last, card, runs) != Some((kind, image.len() - 1)) {
         return Err(refuse(
             0,
             "the set selects another form than this small one",
@@ -263,55 +296,93 @@ fn small(image: &[u8], staged: &mut Staged) -> Result<(), AdmissionError> {
     Ok(())
 }
 
-/// Every chunk of a directory is in its ladder arm, and a directory of one
-/// chunk at key zero has no small form as short.
-fn directory(
-    forest: &Forest<'_>,
-    standalone: usize,
-    staged: &mut Staged,
-) -> Result<(), AdmissionError> {
+/// Every chunk of a directory is in its ladder arm, with the parameters the
+/// writer derives, and a directory of one chunk at key zero has no small
+/// form as short.
+fn directory(forest: &Forest<'_>, standalone: usize) -> Result<(), AdmissionError> {
+    let mut staged = None;
     for i in 0..forest.chunks as usize {
         let Some(chunk) = forest.container(i) else {
             continue;
         };
         let card = chunk.cardinality() as usize;
         let at = forest.payload_at(i);
-        staged.clear();
-        let kind = if card <= ARRAY_MAX {
-            chunk.for_each(|value| staged.push(value));
-            staged.arm().0
-        } else {
-            // Past the list: the plane, staged by the patch's own decoder.
-            staged.plane.fill(0);
-            stage(&mut staged.plane, chunk);
-            staged.card = card;
-            staged.values[0] = chunk.select(0);
-            staged.arm().0
+        let other_kind = || refuse(at, "the chunk's members select another container kind");
+        // The chunk's runs where its view says them without a walk.
+        let runs = match chunk {
+            // Runs is the ladder's pick from its counts alone when no other
+            // arm can cost as little: Cone costs 16 and a byte a member
+            // whatever its fit, Array two bytes a member, and two or more
+            // runs that are not all singletons are no Stride.
+            CView::Runs(runs) => {
+                let r = runs.count();
+                let canonical = if card <= ARRAY_MAX {
+                    r >= 2 && 6 * r < 2 * card && (6 * r < 16 + card || card > 1024)
+                } else {
+                    r >= 2 && 6 * r < crate::WORDS_HEAP_BYTES
+                };
+                canonical.then_some(r)
+            }
+            // Any two or more members with equal gaps are a Stride.
+            CView::Stride { stride, .. } => {
+                if card < 2 {
+                    return Err(other_kind());
+                }
+                Some(if stride == 1 { 1 } else { card })
+            }
+            // One member is an Array.
+            CView::Array(_) if card == 1 => Some(1),
+            _ => None,
         };
-        let held = match chunk {
-            CView::Words { .. } => K_WORDS,
-            CView::Stride { .. } => crate::wire::K_STRIDE,
-            CView::Cone { .. } => crate::wire::K_CONE,
-            CView::Array(_) => crate::wire::K_ARRAY,
-            CView::Runs(_) => crate::wire::K_RUNS,
+        let (first, last, runs) = match runs {
+            Some(runs) => (chunk.select(0), chunk.select(card as u32 - 1), runs),
+            None => {
+                // The members, through the ladder.
+                let staged = staged.get_or_insert_with(Staged::new);
+                staged.clear();
+                if card <= ARRAY_MAX {
+                    chunk.for_each(|value| staged.push(value));
+                } else {
+                    // Past the list: the plane, by the patch's own decoder.
+                    staged.plane.fill(0);
+                    stage(&mut staged.plane, chunk);
+                    staged.card = card;
+                    staged.values[0] = chunk.select(0);
+                    staged.runs = usize::MAX;
+                    staged.last = u32::from(chunk.select(card as u32 - 1));
+                }
+                let (arm, _) = staged.arm();
+                let same = match (arm, chunk) {
+                    (
+                        Arm::Cone { scale, eps, .. },
+                        CView::Cone {
+                            scale: held_scale,
+                            eps: held_eps,
+                            ..
+                        },
+                    ) => {
+                        if scale != held_scale || eps != held_eps {
+                            return Err(refuse(
+                                at + 2,
+                                "the Cone's scale or eps is not the one its members give",
+                            ));
+                        }
+                        true
+                    }
+                    (Arm::Array, CView::Array(_))
+                    | (Arm::Words, CView::Words { .. })
+                    | (Arm::Runs { .. }, CView::Runs(_)) => true,
+                    _ => false,
+                };
+                if !same {
+                    return Err(other_kind());
+                }
+                (staged.first(), staged.last as u16, staged.runs)
+            }
         };
-        if kind != held {
-            return Err(refuse(
-                at,
-                "the chunk's members select another container kind",
-            ));
-        }
         if forest.chunks == 1
             && forest.key(0) == 0
-            && card <= ARRAY_MAX
-            && small_form(
-                standalone,
-                staged.first(),
-                staged.last as u16,
-                card as u32,
-                staged.runs,
-            )
-            .is_some()
+            && small_form(standalone, first, last, card as u32, runs).is_some()
         {
             return Err(refuse(
                 0,

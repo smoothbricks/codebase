@@ -71,7 +71,7 @@ impl Small {
 }
 
 /// The form of a u32 image.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Form {
     Empty,
     Small(Small),
@@ -1343,8 +1343,14 @@ fn structural_rejects() -> Vec<Reject> {
     };
     let words = directory(&[Chunk::of(1, WORDS, &[5, 77, 300])]);
     let words_at = Planes::of(&words, true).payload_at;
-    let mut cone_eps_zero = Chunk::of(1, CONE, &jittered(16, 500));
-    cone_eps_zero.payload[2] = 0;
+    // A step-one model whose members sit ten past it: with eps zero the
+    // window of member 1 (value 11) is indices 9 to 13.
+    let cone_window_misses = [
+        vec![0, 0, 0],
+        (1u64 << 32).to_le_bytes().to_vec(),
+        vec![0, 10, 10, 10, 10, 10, 10, 10],
+    ]
+    .concat();
     let cone_descends = [
         vec![0, 0, 15],
         (10u64 << 32).to_le_bytes().to_vec(),
@@ -1485,7 +1491,9 @@ fn structural_rejects() -> Vec<Reject> {
         (
             "body-truncated",
             32,
-            altered(&three_image, |bytes| drop(bytes.pop())),
+            altered(&three_image, |bytes| {
+                bytes.pop();
+            }),
             Class::Extent,
             Entry::Open,
         ),
@@ -1601,7 +1609,7 @@ fn structural_rejects() -> Vec<Reject> {
         (
             "cone-window-misses-a-member",
             32,
-            directory(&[cone_eps_zero]),
+            one_chunk(1, CONE, 8, cone_window_misses),
             Class::PlaneRange,
             Entry::Verified,
         ),
@@ -1617,7 +1625,7 @@ fn structural_rejects() -> Vec<Reject> {
             32,
             one_chunk(1, RUNS, 6, [vec![1], u16s(&[0, 2, 3, 5])].concat()),
             Class::MapOrder,
-            Entry::Verified,
+            Entry::Open,
         ),
         (
             "runs-count-differs",
@@ -1669,7 +1677,7 @@ fn structural_rejects() -> Vec<Reject> {
             32,
             altered(&ef.image, |bytes| bytes[ef.high_at + 7] |= 0x80),
             Class::BitPad,
-            Entry::Verified,
+            Entry::Open,
         ),
         (
             "elias-fano-zero-sample-misplaced",
@@ -1755,6 +1763,10 @@ fn canonical_rejects() -> Vec<Reject> {
             kind(CONE, 1, &even_runs(21, 6, 10)),
         ),
         canonical("words-of-three-members", kind(WORDS, 1, &[5, 77, 300])),
+        canonical(
+            "cone-past-1024-members",
+            kind(CONE, 1, &even_runs(1_025, 180, 16)),
+        ),
         // Step 3: a directory of one chunk at key zero where a small form is no longer.
         canonical("directory-of-a-singleton-at-key-zero", kind(ARRAY, 0, &[7])),
         canonical(
@@ -1764,10 +1776,6 @@ fn canonical_rejects() -> Vec<Reject> {
         canonical(
             "cone-directory-where-list16-ties",
             kind(CONE, 0, &jittered(17, 500)),
-        ),
-        canonical(
-            "directory-of-a-full-chunk-at-key-zero",
-            kind(STRIDE, 0, &interval(0, 65_535)),
         ),
         // Step 3: a small image in another form than the selected one.
         canonical("list8-where-window-ties", small_image(List8, &[0, 8])),
@@ -1860,7 +1868,13 @@ fn canonical_rejects() -> Vec<Reject> {
     ]
 }
 
-fn reject(name: &str, width: u32, image: &[u8], class: AdmissionClass, entry: Entry) -> String {
+fn reject(
+    name: &str,
+    width: u32,
+    image: &[u8],
+    class: AdmissionClass,
+    entry: Entry,
+) -> Result<String, String> {
     let (open, verified, canonical) = if width == 32 {
         (
             BitmosaicView::open(image).is_some(),
@@ -1876,34 +1890,32 @@ fn reject(name: &str, width: u32, image: &[u8], class: AdmissionClass, entry: En
     };
     let observed =
         format!("open admits: {open}, open_verified: {verified:?}, open_canonical: {canonical:?}");
-    assert_eq!(open, entry != Entry::Open, "{name}: {observed}");
-    match entry {
-        Entry::Canonical => assert!(verified.is_ok(), "{name}: {observed}"),
-        _ => assert_eq!(
-            verified.err().map(|error| error.class),
-            Some(class),
-            "{name}: {observed}"
-        ),
+    // The first entry that refuses, and every stronger one with its class.
+    let refused = match (open, &verified, &canonical) {
+        (false, Err(error), None | Some(Err(_))) => Some((Entry::Open, error.class)),
+        (true, Err(error), None | Some(Err(_))) => Some((Entry::Verified, error.class)),
+        (true, Ok(()), Some(Err(error))) => Some((Entry::Canonical, error.class)),
+        _ => None,
+    };
+    let stronger_agree = [verified.err(), canonical.and_then(Result::err)]
+        .into_iter()
+        .flatten()
+        .all(|error| error.class == class);
+    if refused != Some((entry, class)) || !stronger_agree {
+        return Err(format!(
+            "{name}: recorded {} {}; {observed}; image {}",
+            entry.name(),
+            class.as_str(),
+            hex(image)
+        ));
     }
-    match canonical {
-        Some(canonical) => assert_eq!(
-            canonical.err().map(|error| error.class),
-            Some(class),
-            "{name}: {observed}"
-        ),
-        None => assert_ne!(
-            entry,
-            Entry::Canonical,
-            "{name}: a u64 image has no open_canonical"
-        ),
-    }
-    format!(
+    Ok(format!(
         "{{\"name\": \"{name}\", \"width\": {width}, \"class\": \"{}\", \"entry\": \"{}\", \"open_accepts\": {open}, \
          \"image\": \"{}\"}}",
         class.as_str(),
         entry.name(),
         hex(image),
-    )
+    ))
 }
 
 // ── the document ────────────────────────────────────────────────────────
@@ -1968,11 +1980,18 @@ pub fn document() -> String {
         .iter()
         .map(|(name, members, children)| u64_case(name, members, children))
         .collect();
-    let reject_lines: Vec<String> = structural_rejects()
+    let (reject_lines, mismatches): (Vec<_>, Vec<_>) = structural_rejects()
         .into_iter()
         .chain(canonical_rejects())
         .map(|(name, width, image, class, entry)| reject(name, width, &image, class, entry))
-        .collect();
+        .partition(Result::is_ok);
+    let mismatches: Vec<String> = mismatches.into_iter().filter_map(Result::err).collect();
+    assert!(
+        mismatches.is_empty(),
+        "rejects the crate treats otherwise:\n{}",
+        mismatches.join("\n")
+    );
+    let reject_lines: Vec<String> = reject_lines.into_iter().filter_map(Result::ok).collect();
     format!(
         "{{\n\"format\": \"bitmosaic native v2\",\n\"u32\": [\n{}\n],\n\"u64\": [\n{}\n],\n\"rejects\": [\n{}\n]\n}}\n",
         u32_lines.join(",\n"),

@@ -44,25 +44,36 @@ pub(crate) const K_WINDOW_AT: u32 = 7;
 pub(crate) const K_LIST16: u32 = 8;
 /// Inclusive intervals. Payload: `(start: u16, end: u16)` pairs.
 pub(crate) const K_SPANS: u32 = 9;
+/// A bitmap of up to 256 bytes from value `8 * start`. Payload: `start`
+/// as a `u16`, the bitmap's length less one, then the bitmap.
+pub(crate) const K_WINDOW_WIDE: u32 = 10;
 
 /// Lowest tag of a small image, `kk lllll` with `kk` from one: the kind as
 /// `kk + 4` and the count as `lllll + 1`. The framed controls lie below.
 pub(crate) const SMALL_MIN: u8 = 0x20;
-/// First tag past the small forms.
-const SMALL_END: u8 = 0xC0;
+/// First tag past the forms whose tag holds their count.
+const COUNTED_END: u8 = 0xC0;
+/// The Window wide's tag: its length is in its payload.
+const TAG_WINDOW_WIDE: u8 = 0xC0;
 /// Most members of a list, bytes of a window's bitmap, intervals of Spans.
 const COUNT_MAX: usize = 32;
-/// Most payload bytes of a small image: 32 intervals.
-pub(crate) const SMALL_PAYLOAD_MAX: usize = 4 * COUNT_MAX;
+/// Most bytes of a Window wide's bitmap.
+const WIDE_MAX: usize = 256;
+/// Most payload bytes of a small image: a Window wide.
+pub(crate) const SMALL_PAYLOAD_MAX: usize = 3 + WIDE_MAX;
 
 pub(crate) fn is_small(kind: u32) -> bool {
     kind >= K_LIST8
 }
 
-/// A small tag's kind and count, or `None` for a byte that is not one.
+/// A small tag's kind and count, or `None` for a byte that is not one. A
+/// Window wide's count is one: its length is in its payload.
 #[inline(always)]
 pub(crate) fn read_small_tag(tag: u8) -> Option<(u32, u32)> {
-    (SMALL_MIN..SMALL_END)
+    if tag == TAG_WINDOW_WIDE {
+        return Some((K_WINDOW_WIDE, 1));
+    }
+    (SMALL_MIN..COUNTED_END)
         .contains(&tag)
         .then(|| (u32::from(tag >> 5) + 4, u32::from(tag & 31) + 1))
 }
@@ -71,25 +82,29 @@ pub(crate) fn small_tag(kind: u32, count: u32) -> u8 {
     ((kind - 4) as u8) << 5 | (count - 1) as u8
 }
 
-/// Payload bytes of a small image whose tag holds `count`.
+/// Bytes of the small image that starts `image`, from its tag and, for a
+/// Window wide, its length byte. `None` for a byte that is no small tag or
+/// a Window wide cut before its length.
 #[inline(always)]
-pub(crate) fn small_payload_len(kind: u32, count: u32) -> usize {
+pub(crate) fn small_image_len(image: &[u8]) -> Option<usize> {
+    let (kind, count) = read_small_tag(*image.first()?)?;
     let count = count as usize;
-    match kind {
-        K_WINDOW_AT => 1 + count,
-        K_LIST16 => 2 * count,
-        K_SPANS => 4 * count,
-        _ => count,
-    }
+    Some(match kind {
+        K_WINDOW_AT => 2 + count,
+        K_LIST16 => 1 + 2 * count,
+        K_SPANS => 1 + 4 * count,
+        K_WINDOW_WIDE => 5 + usize::from(*image.get(3)?),
+        _ => 1 + count,
+    })
 }
 
-/// The count a small tag holds, from its payload length: the inverse of
-/// [`small_payload_len`].
+/// The count a small tag holds, from its payload length.
 pub(crate) fn small_count(kind: u32, payload: usize) -> u32 {
     (match kind {
         K_WINDOW_AT => payload - 1,
         K_LIST16 => payload / 2,
         K_SPANS => payload / 4,
+        K_WINDOW_WIDE => 1,
         _ => payload,
     }) as u32
 }
@@ -101,8 +116,8 @@ pub(crate) fn small_count(kind: u32, payload: usize) -> u32 {
 ///
 /// One rule, so one image per set: the shortest image wins. On a tie a
 /// small form beats the directory, and among small forms the order is
-/// Window from zero, Window, Spans, List8, List16: roughly the order of
-/// their point lookups.
+/// Window from zero, Window at, Spans, List8, List16, Window wide: roughly
+/// the order of their point lookups.
 pub(crate) fn small_form(
     directory: usize,
     first: u16,
@@ -119,6 +134,7 @@ pub(crate) fn small_form(
         (runs <= COUNT_MAX).then(|| (K_SPANS, 4 * runs)),
         (last <= 255 && card <= COUNT_MAX).then_some((K_LIST8, card)),
         (card <= COUNT_MAX).then_some((K_LIST16, 2 * card)),
+        (end - start < WIDE_MAX).then_some((K_WINDOW_WIDE, 4 + end - start)),
     ];
     let mut best: Option<(u32, usize)> = None;
     for candidate in candidates.into_iter().flatten() {
@@ -147,11 +163,17 @@ pub(crate) struct SmallSink<'a> {
 impl<'a> SmallSink<'a> {
     pub(crate) fn new(out: &'a mut [u8], kind: u32, first: u16) -> Self {
         out.fill(0);
-        let (base, at) = if kind == K_WINDOW_AT {
-            out[0] = (first / 8) as u8;
-            (first & !7, 1)
-        } else {
-            (0, 0)
+        let (base, at) = match kind {
+            K_WINDOW_AT => {
+                out[0] = (first / 8) as u8;
+                (first & !7, 1)
+            }
+            K_WINDOW_WIDE => {
+                out[..2].copy_from_slice(&(first / 8).to_le_bytes());
+                out[2] = (out.len() - 4) as u8;
+                (first & !7, 3)
+            }
+            _ => (0, 0),
         };
         Self {
             out,
@@ -429,7 +451,8 @@ impl<'a> SmallSet<'a> {
     #[inline(always)]
     pub(crate) fn of(image: &'a [u8]) -> Option<Self> {
         let (kind, count) = read_small_tag(*image.first()?)?;
-        Some(Self::from_validated(image.get(1..)?, kind, count))
+        let payload = image.get(1..small_image_len(image)?)?;
+        Some(Self::from_validated(payload, kind, count))
     }
 
     /// Admit a small image: its tag, its exact extent and the structure no
@@ -442,7 +465,7 @@ impl<'a> SmallSet<'a> {
                 "unassigned small tag",
             ));
         };
-        let need = 1 + small_payload_len(kind, count);
+        let need = small_image_len(image).unwrap_or(usize::MAX);
         if image.len() != need {
             return Err(AdmissionError::new(
                 AdmissionClass::Extent,
@@ -451,6 +474,24 @@ impl<'a> SmallSet<'a> {
             ));
         }
         let set = Self::from_validated(&image[1..], kind, count);
+        if kind == K_WINDOW_WIDE
+            && let SmallSet::Window { bits, base } = set
+        {
+            if base as usize / 8 + bits.len() > 8192 {
+                return Err(AdmissionError::new(
+                    AdmissionClass::PlaneRange,
+                    1,
+                    "Window wide reaches past 65,535",
+                ));
+            }
+            if bits[0] == 0 {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Extent,
+                    4,
+                    "Window bitmap starts with a zero byte",
+                ));
+            }
+        }
         if let SmallSet::Window { bits, base } = set {
             if kind == K_WINDOW_AT && base == 0 {
                 return Err(AdmissionError::new(
@@ -478,10 +519,7 @@ impl<'a> SmallSet<'a> {
     }
 
     #[inline(always)]
-    pub(crate) fn from_validated(payload: &'a [u8], kind: u32, count: u32) -> Self {
-        let payload = payload
-            .get(..small_payload_len(kind, count))
-            .unwrap_or(payload);
+    pub(crate) fn from_validated(payload: &'a [u8], kind: u32, _count: u32) -> Self {
         match kind {
             K_LIST8 => SmallSet::List8(payload),
             K_WINDOW => SmallSet::Window {
@@ -493,6 +531,13 @@ impl<'a> SmallSet<'a> {
                 base: 8 * u32::from(payload.first().copied().unwrap_or(0)),
             },
             K_LIST16 => SmallSet::List16(payload),
+            K_WINDOW_WIDE => SmallSet::Window {
+                bits: payload.get(3..).unwrap_or(&[]),
+                base: 8 * u32::from(u16::from_le_bytes([
+                    payload.first().copied().unwrap_or(0),
+                    payload.get(1).copied().unwrap_or(0),
+                ])),
+            },
             _ => SmallSet::Spans(payload),
         }
     }
@@ -531,25 +576,6 @@ impl<'a> SmallSet<'a> {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn kind(self) -> u32 {
-        match self {
-            SmallSet::List8(_) => K_LIST8,
-            SmallSet::Window { base: 0, .. } => K_WINDOW,
-            SmallSet::Window { .. } => K_WINDOW_AT,
-            SmallSet::List16(_) => K_LIST16,
-            SmallSet::Spans(_) => K_SPANS,
-        }
-    }
-
-    pub(crate) fn payload_len(self) -> usize {
-        match self {
-            SmallSet::List8(bytes) | SmallSet::List16(bytes) | SmallSet::Spans(bytes) => {
-                bytes.len()
-            }
-            SmallSet::Window { bits, base } => bits.len() + usize::from(base != 0),
-        }
     }
 
     #[inline(always)]
@@ -952,8 +978,7 @@ impl<'a> SmallView<'a> {
     /// empty one included. Member order and canonical form are
     /// [`crate::BitmosaicView::open_verified`]'s to prove.
     pub fn open(image: &'a [u8]) -> Option<Self> {
-        let (kind, count) = read_small_tag(*image.first()?)?;
-        SmallSet::open(image.get(..1 + small_payload_len(kind, count))?)
+        SmallSet::open(image.get(..small_image_len(image)?)?)
             .ok()
             .map(Self)
     }

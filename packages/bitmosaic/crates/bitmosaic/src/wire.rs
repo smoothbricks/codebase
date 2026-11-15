@@ -30,7 +30,7 @@ use crate::ef::{self, EfLayout, EfRange, EfView};
 use crate::patch::PatchError;
 use crate::small::{
     SMALL_MIN, SmallRange, SmallSet, SmallSink, read_small_tag, small_count, small_form,
-    small_payload_len, small_tag,
+    small_image_len, small_tag,
 };
 use crate::{AdmissionClass, AdmissionError};
 use crate::{
@@ -86,21 +86,20 @@ fn parse_header(bytes: &[u8]) -> Result<ImageHeader, AdmissionError> {
         ));
     };
     if control >= SMALL_MIN {
-        let Some((kind, count)) = read_small_tag(control) else {
+        if read_small_tag(control).is_none() {
             return Err(AdmissionError::new(
                 AdmissionClass::Kind,
                 0,
                 "unsupported image format",
             ));
-        };
-        let encoded_len = 1 + small_payload_len(kind, count);
-        if encoded_len > bytes.len() {
+        }
+        let Some(encoded_len) = small_image_len(bytes).filter(|len| *len <= bytes.len()) else {
             return Err(AdmissionError::new(
                 AdmissionClass::Extent,
                 bytes.len(),
                 "small payload exceeds its available extent",
             ));
-        }
+        };
         return Ok(ImageHeader {
             width: KeyWidth::U32,
             encoded_len,

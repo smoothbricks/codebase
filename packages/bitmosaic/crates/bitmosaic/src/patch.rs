@@ -39,7 +39,8 @@ use core::fmt;
 
 use crate::ef::{self, EfLayout, EfView, SAMPLE_STRIDE};
 use crate::small::{
-    SMALL_PAYLOAD_MAX, SmallSet, SmallSink, is_small, small_count, small_form, small_tag,
+    SMALL_PAYLOAD_MAX, SmallSet, SmallSink, is_small, read_small_tag, small_count, small_form,
+    small_tag,
 };
 use crate::wire::{
     BOUNDS_AT, BitmosaicView, CView, ChunkRow, EMPTY_U32_IMAGE, Forest, Geometry, IMAGE_ID_LEN,
@@ -2101,7 +2102,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         if let (Some(small), 0) = (small, key) {
             let old = Old {
                 index: 0,
-                len: small.payload_len() as u32,
+                len: forest.bytes.len() as u32 - 1,
                 card: small.cardinality(),
                 at: forest.geometry.payload_at as u32,
             };
@@ -2329,7 +2330,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         && chunk_key(forest, 0) == 0
         && scratch.touched[0].fresh.is_some_and(|fresh| {
             fresh.kind != K_WORDS
-                && (fresh.card <= 256 || fresh.kind == K_RUNS || fresh.kind == K_STRIDE)
+                && (fresh.card <= 2048 || fresh.kind == K_RUNS || fresh.kind == K_STRIDE)
         });
     // Layout of the patched forest. In place needs the chunk set unchanged;
     // otherwise the geometry moves and the string is rebuilt from rows. A
@@ -2573,8 +2574,8 @@ fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallSet<'_>
         rows.push(Row {
             key: 0,
             card: small.cardinality(),
-            kind: small.kind(),
-            len: small.payload_len() as u32,
+            kind: read_small_tag(forest.bytes[0]).map_or(0, |(kind, _)| kind),
+            len: forest.bytes.len() as u32 - 1,
             staged: false,
             src: forest.geometry.payload_at as u32,
         });
