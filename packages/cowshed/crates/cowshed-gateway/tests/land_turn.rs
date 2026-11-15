@@ -699,7 +699,19 @@ async fn control_line(answers: &mut Lines<BufReader<UnixStream>>) -> serde_json:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
     let (_gateway, _root, socket) = gateway().await;
-    let first = take_free(&socket, "first").await;
+    // Every ask of this test comes from one process, and an ask by a turn's own asker is made
+    // inside that turn, never parked: so the first land's turn is held by its command alone.
+    let mut first = take_free(&socket, "first").await;
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped());
+    first.bind_at_exec(&mut command);
+    let mut command = command.spawn().expect("spawn the first land's command");
+    awaiting("the command's bind", first.bound(command.id()))
+        .await
+        .expect("bind the first land's command");
+    first.end("its command runs on".to_owned());
     let mut install = waiting_fence(&socket).await;
     let waiting = control_line(&mut install).await;
     assert_eq!(
@@ -725,7 +737,10 @@ async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
         ["first"],
         "an ask while an install waits is parked, never numbered"
     );
-    first.end("exited 0".to_owned());
+    drop(command.stdin.take());
+    command
+        .wait_bounded()
+        .expect("the first land's command ends");
     let fenced = control_line(&mut install).await;
     assert_eq!(
         (&fenced["ok"], &fenced["fenced"]),
@@ -756,6 +771,50 @@ async fn a_land_that_asks_after_a_waiting_install_runs_after_it() {
     );
 }
 
+/// A land takes its ref turn inside its land turn though an install waits for that land turn
+/// (05_gateway.md "The read fences the turns"): the install waits for the land's ticket, which ends
+/// only after the fast-forward under the ref turn, so the ask made inside the held turn is numbered,
+/// never parked behind the install. The land then ends both turns, and that step fences the
+/// install. Recorded 2026-11-16: the ref ask was parked behind the install of the land before, and
+/// the land and that install each waited for the other for 24 minutes, until the land was ended by
+/// hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_land_takes_its_ref_turn_inside_its_turn_though_an_install_waits_for_that_turn() {
+    let (_gateway, _root, socket) = gateway().await;
+    let land = take_free(&socket, "second").await;
+    let mut install = waiting_fence(&socket).await;
+    let waiting = control_line(&mut install).await;
+    assert_eq!(
+        (
+            &waiting["fenced"],
+            &waiting["landTurns"][0]["tickets"][0]["workspace"]
+        ),
+        (&serde_json::json!(false), &serde_json::json!("second")),
+        "the install waits for the land's turn: {waiting}"
+    );
+    // The land's gate has passed: it asks its ref turn, and is told at once that it holds it.
+    let fence = take_asked(
+        &socket,
+        &TurnAsk {
+            repo: LandTurnName::new("acme.ref").unwrap(),
+            workspace: "second".to_owned(),
+            command: "cowshed land second (ref fence)".to_owned(),
+        },
+    )
+    .await;
+    fence.end("delivered".to_owned());
+    land.end("exited 0".to_owned());
+    let fenced = control_line(&mut install).await;
+    assert_eq!(
+        (&fenced["ok"], &fenced["fenced"], &fenced["landTurns"]),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(true),
+            &serde_json::json!([])
+        ),
+        "the install is fenced once the land has ended both turns: {fenced}"
+    );
+}
 /// A gateway stand-in at `socket`: each connection it accepts is said on the returned channel by
 /// its order, from 1, after the ask it carries has been read and the answers `script` gives for
 /// that order have been written. `script` answers `None` once the stand-in has nothing more to

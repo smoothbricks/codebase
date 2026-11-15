@@ -1297,7 +1297,8 @@ unchanged.
    no fence made, with main holding the gated head and that head not the one it rebased onto, came after the
    fast-forward, from the retire: main has moved, so the land goes on to step 6 and answers that refusal last. Any other
    refusal stops the land. Lock order is always the land turn, then the ref turn; nothing holds a ref turn and then asks
-   for a land turn, so the two never deadlock.
+   for a land turn, so the two never deadlock; and an install that waits for the land turn never parks the ref turn
+   asked inside it (05_gateway.md "The read fences the turns").
 6. **After the turn.** The turn ends once the fast-forward's retire has. Then, outside it: the landed head is recorded
    in `lands.log` in the turn's records directory (`{atUnixMs, event, head, before?, detail?}`, `event` one of `landed`,
    `unpushed`, `pushed`, `push-failed`, `after-exited`, `installed`; appended, never rewritten), and the land submits

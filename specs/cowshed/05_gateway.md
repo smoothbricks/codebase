@@ -290,24 +290,33 @@ refuses. An install may wait for the turns instead: `cowshed gateway await-turns
 the actor fences at once and answers as it answers the read; otherwise it answers every queue with `"fenced":false`,
 records the install as waiting and heartbeats while it waits ("Deadlines"), and in the step that ends the last ticket it
 fences every waiting install and answers each every queue with `"fenced":true`. While any install waits or any fence
-holds, an ask is parked: it is answered `{"turn":"fenced"}`, never numbered, and its connection is kept open. So the
-queues only shrink while an install waits, and it is fenced once the tickets queued when it asked have ended, however
-many lands ask meanwhile (`waiting_install_numbers_no_ask`, `install_fenced_when_queue_empties`, "Land-turn laws"). Its
-command runs under that fence and holds it until it exits: the after-land install runs `setup` that way, and setup's own
-read under the slot finds no ticket, since a parked ask is none, and fences again. A waiting install whose connection
-closes leaves the wait. A gateway that refuses the waiting form, a build from before it, is said, and the command runs
-unfenced, its `setup` reading the turns as before. Recorded 2026-11-10: land 124380eca9's after-land install, which
-deferred whenever it found a turn held or queued, deferred at 12:16, 12:48 and 13:17Z, each rerun losing the gap to the
-next land's ask (`laws/land_turn_open.bend`). Once no install waits and no fence holds, the parked asks are numbered in
-the order they arrived, and each asker is told its turn on the connection it asked on (`parked_asks_enter_in_order`). A
-parked asker — `land-turn`, a declared land, a ref-turn writer — says it waits behind an install and keeps reading; one
-whose connection the gateway closes, as the install's restart drains it, waits for the install slot, as a land step
-does, and asks again of the gateway the install leaves, and a fence it meets again is waited for the same way, since
-only an install's open connection holds one. An ask whose connection is refused while an install holds the slot waits
-the same way. The install holds the read's connection until the restart's drain closes it, which lifts the fence with
-the gateway that held it. An install that restarts nothing after its read lifts the fence before it lets the slot go: it
-ends the read and waits for the gateway's end of file, which the gateway writes once the fence is lifted, so no ask made
-after the slot is free meets it. `cowshed gateway status` reads the turns without the fence. The model is
+holds, an ask is parked: it is answered `{"turn":"fenced"}`, never numbered, and its connection is kept open. One ask is
+not parked: an ask made inside a held turn, by that turn's asker before it ends its hold or by a command bound to it, as
+a land asks its ref turn inside its land turn ("A ref turn"). The install waits for that turn to end, and the turn ends
+only after the ask made inside it is served, so the gateway numbers that ask at once, whatever install waits
+(`held_turn_ask_numbered`); parked, the land and the install would each wait for the other with no end. Recorded
+2026-11-16: a land that asked its turn during the gate of the land before it held that turn when the earlier land's
+install began to wait, its ask for the ref turn was parked behind that install, and neither moved for 24 minutes, until
+the land was ended by hand; the install then ran in 40 s. No fence meets such an ask, since a fence is set only when no
+queue holds a ticket. A process a bound command starts holds no turn ("Land turns"), so its ask comes from outside and
+is parked. So no ask from outside lengthens an install's wait: it is fenced once the tickets queued when it asked, and
+the turns their holders took inside them, have ended, however many lands ask meanwhile
+(`waiting_install_numbers_no_ask`, `install_fenced_when_queue_empties`, "Land-turn laws"). Its command runs under that
+fence and holds it until it exits: the after-land install runs `setup` that way, and setup's own read under the slot
+finds no ticket, since a parked ask is none, and fences again. A waiting install whose connection closes leaves the
+wait. A gateway that refuses the waiting form, a build from before it, is said, and the command runs unfenced, its
+`setup` reading the turns as before. Recorded 2026-11-10: land 124380eca9's after-land install, which deferred whenever
+it found a turn held or queued, deferred at 12:16, 12:48 and 13:17Z, each rerun losing the gap to the next land's ask
+(`laws/land_turn_open.bend`). Once no install waits and no fence holds, the parked asks are numbered in the order they
+arrived, and each asker is told its turn on the connection it asked on (`parked_asks_enter_in_order`). A parked asker —
+`land-turn`, a declared land, a ref-turn writer — says it waits behind an install and keeps reading; one whose
+connection the gateway closes, as the install's restart drains it, waits for the install slot, as a land step does, and
+asks again of the gateway the install leaves, and a fence it meets again is waited for the same way, since only an
+install's open connection holds one. An ask whose connection is refused while an install holds the slot waits the same
+way. The install holds the read's connection until the restart's drain closes it, which lifts the fence with the gateway
+that held it. An install that restarts nothing after its read lifts the fence before it lets the slot go: it ends the
+read and waits for the gateway's end of file, which the gateway writes once the fence is lifted, so no ask made after
+the slot is free meets it. `cowshed gateway status` reads the turns without the fence. The model is
 `laws/install_restart.bend` with `fenced` set, where no restart cuts a turn (`fenced_restart_never_cuts_a_turn`), kills
 an admitted gate (`fenced_restart_never_kills_an_admitted_gate`) or refuses an ask
 (`fenced_restart_never_refuses_an_ask`) in any interleaving, and its unfenced counterexamples
@@ -471,29 +480,30 @@ So a land asks the gateway over a connection of its own to the control socket,
 kernel's identity of the connection's peer, and numbers each ticket itself as the ask reaches it, so a ticket's number
 is its place and no ask that arrived later takes the turn ahead of one that arrived first. The first ticket of a
 repository holds its turn. A waiting land is answered `{"turn":"queued","ticket","holder","ahead"}` when it asks and
-whenever its queue changes, and `{"turn":"held","ticket"}` once the turn is its own; an ask while an install waits for
-the turns or fences them is answered `{"turn":"fenced"}` and parked, then told its turn on that same connection once the
-gateway numbers it ("The read fences the turns"). A turn is held by processes, never by descriptors: by its asker until
-the asker ends its hold (`{"step":"end","outcome"}`), closes the connection or exits, and by each command bound to it
-(`{"step":"bind","pid"}`, answered `{"turn":"bound","pid"}`) until that command exits. A command binds itself: its asker
-arms it so that, between its fork and its exec, the child writes the bind step naming its own pid on the asker's
-connection, which it shares until its exec closes it, and the asker reads the answer once the spawn has returned. The
-gateway reads that step before the asker's end, which follows it on the connection, and after the asker's exit it reads
-the connection on to its end of file, which comes once every copy is closed: so a land killed at any moment after the
-fork leaves its command holding the turn, and one killed before it started none (measured 2026-10-26 in review: a land
-killed between spawning its gate and binding it left the gate running outside the turn). The gateway watches every one
-of those exits (`ExitWatch`: `NOTE_EXIT`, a pidfd), never polls, and follows a bound command across its execs by the
-kernel's identity of the process (Darwin's unique id, which an exec keeps while it renews the pid version). A watch that
-fails is armed again once, on that same life, never on its bare pid, so a later process given the pid holds nothing; one
-that fails again leaves the command holding the turn until the gateway restarts, said on stderr, since a command that
-may still run is never taken for exited. The turn passes on once the last holder has ended: the next ticket is told at
-once that it holds the turn, each other how many are ahead and who holds it. Nothing a bound command starts holds the
-turn, whatever descriptors it inherits. A waiter that leaves, closed or killed, leaves the queue, and nobody behind it
-waits for it. A turn is asked only over the Unix control socket, whose peer the kernel names; the gateway refuses one
-asked over TCP. A waiting land says on stderr how many lands are ahead and who holds the turn — its workspace, its pid,
-the pids of the commands bound to it and when it asked — when it starts waiting, whenever the land ahead changes, and
-every 90 s between (the land watchdog's cadence), from the gateway's answers alone, and how long it waited once the turn
-is its own. `--gateway-socket <path>` names another gateway's queue than the host's, as for `disk-command`.
+whenever its queue changes, and `{"turn":"held","ticket"}` once the turn is its own; an ask from outside every held turn
+that meets an install waiting for the turns or fencing them is answered `{"turn":"fenced"}` and parked, then told its
+turn on that same connection once the gateway numbers it ("The read fences the turns"). A turn is held by processes,
+never by descriptors: by its asker until the asker ends its hold (`{"step":"end","outcome"}`), closes the connection or
+exits, and by each command bound to it (`{"step":"bind","pid"}`, answered `{"turn":"bound","pid"}`) until that command
+exits. A command binds itself: its asker arms it so that, between its fork and its exec, the child writes the bind step
+naming its own pid on the asker's connection, which it shares until its exec closes it, and the asker reads the answer
+once the spawn has returned. The gateway reads that step before the asker's end, which follows it on the connection, and
+after the asker's exit it reads the connection on to its end of file, which comes once every copy is closed: so a land
+killed at any moment after the fork leaves its command holding the turn, and one killed before it started none (measured
+2026-10-26 in review: a land killed between spawning its gate and binding it left the gate running outside the turn).
+The gateway watches every one of those exits (`ExitWatch`: `NOTE_EXIT`, a pidfd), never polls, and follows a bound
+command across its execs by the kernel's identity of the process (Darwin's unique id, which an exec keeps while it
+renews the pid version). A watch that fails is armed again once, on that same life, never on its bare pid, so a later
+process given the pid holds nothing; one that fails again leaves the command holding the turn until the gateway
+restarts, said on stderr, since a command that may still run is never taken for exited. The turn passes on once the last
+holder has ended: the next ticket is told at once that it holds the turn, each other how many are ahead and who holds
+it. Nothing a bound command starts holds the turn, whatever descriptors it inherits. A waiter that leaves, closed or
+killed, leaves the queue, and nobody behind it waits for it. A turn is asked only over the Unix control socket, whose
+peer the kernel names; the gateway refuses one asked over TCP. A waiting land says on stderr how many lands are ahead
+and who holds the turn — its workspace, its pid, the pids of the commands bound to it and when it asked — when it starts
+waiting, whenever the land ahead changes, and every 90 s between (the land watchdog's cadence), from the gateway's
+answers alone, and how long it waited once the turn is its own. `--gateway-socket <path>` names another gateway's queue
+than the host's, as for `disk-command`.
 
 The queues live as long as the gateway: an install refuses while a turn is held (below), so only a crash loses them. A
 land whose gateway connection closes while it holds the turn has lost it, since not knowing whether another land runs is
@@ -542,14 +552,19 @@ waits (`--verdict`):
   queued; nothing asked after it lengthens that wait.
 - **A waiting ticket binds nothing** (`waiting_bind_refused`): a bind of a ticket that does not hold its turn is refused
   and changes no queue.
-- **A fenced ask is parked** (`fenced_ask_parked`): an ask while a fence holds changes no queue, numbers nothing and
-  keeps the fence.
-- **A waiting install numbers no ask** (`waiting_install_numbers_no_ask`): an ask while an install waits is parked and
-  changes no queue, so the queues only shrink until the install is fenced.
+- **A fenced ask is parked** (`fenced_ask_parked`): an ask from outside every held turn that meets a fence changes no
+  queue, numbers nothing and keeps the fence.
+- **A waiting install numbers no ask from outside** (`waiting_install_numbers_no_ask`): an ask from outside every held
+  turn that meets a waiting install is parked and changes no queue, so no such ask lengthens the install's wait.
+- **An ask inside a held turn is numbered** (`held_turn_ask_numbered`): an ask whose asker is inside a held turn enters
+  its queue last, numbered one past the last number given, whatever installs wait, and changes neither the waiting
+  installs nor the parked asks. The asker of a ticket that holds its turn is inside it until it ends its hold
+  (`the_holder_asks_inside_its_turn`), and so is a command bound to a turn (`a_bound_command_asks_inside_its_turn`); the
+  asker of a ticket that waits, and every other process, asks from outside.
 - **An install is fenced when the queue empties** (`install_fenced_when_queue_empties`,
   `install_fenced_when_the_last_command_exits`): the step that ends the last ticket, a departure or a bound command's
-  exit, fences every waiting install. With the law before it, an install waits for the tickets queued when it asked and
-  no others, however many lands ask meanwhile.
+  exit, fences every waiting install. With the two laws before it, an install waits for the tickets queued when it asked
+  and the turns their holders take inside them, and no others, however many lands ask meanwhile.
 - **Parked asks enter in order** (`parked_asks_enter_in_order`): on the lift of the last fence, with no install waiting,
   the parked asks are numbered in the order they arrived, each one past the last, behind every ticket already queued.
 - **A fence only on a free queue** (`fence_only_when_free`): a fenced read that finds a ticket sets no fence and changes
@@ -561,12 +576,15 @@ The open twin is `laws/land_turn_open.bend`: `install_read_holds_back_later_asks
 its own read refutes, since the ask after a read that found a ticket is numbered ahead of the install's next read.
 `a_reading_install_is_overtaken_by_every_later_ask` computes the recorded schedule of 2026-11-10, three reads none of
 which fenced, and `a_waiting_install_is_fenced_after_the_ticket_before_it` the same lands meeting a waiting install.
+`a_land_takes_its_ref_turn_under_a_waiting_install` computes the schedule recorded 2026-11-16 as the queue meets it now:
+the land's ask inside its turn is numbered, the land ends both turns, and that step fences the install.
 
 The gateway's `land_turn::laws` runs the model, emitted to Rust, and `Turns` on the same inputs: the model's enumerated
 corpus, its seeded draws and the six repositories' queues recorded from 2026-10-21 to 2026-10-27. After every input it
-compares the two queues ticket by ticket, every bind's answer, whether each ask is numbered or parked, the last number
-given, the fences, the waiting installs and the parked asks, and checks `one_holder` and `fifo` on `Turns`' own queue. A
-change to `Turns` that breaks a law fails there; changing a law is changing this paragraph.
+compares the two queues ticket by ticket, each ticket's asker included, every bind's answer, whether each ask is
+numbered or parked, the last number given, the fences, the waiting installs and the parked asks, and checks `one_holder`
+and `fifo` on `Turns`' own queue. A change to `Turns` that breaks a law fails there; changing a law is changing this
+paragraph.
 
 **A ref turn.** A repository whose main also moves outside its lands (an operator's Markdown commit straight into main)
 keeps a second queue beside its land turn, by convention `<repo>.ref`: every writer that moves main's ref outside
@@ -575,9 +593,10 @@ it to `cowshed land --ref-turn <repo>.ref`, which takes it only from re-reading 
 (02_workspaces.md "`cowshed land`" step 3). It is a land-turn queue like any other: first asked, first served, the
 holder named, held by the land and by the fast-forward's git, which it binds to the turn. A Markdown commit therefore
 waits for one fast-forward, never for a land's gate, and never barges. A land takes its land turn first and the ref turn
-inside it; a writer that holds the ref turn never asks for the land turn, so the two never deadlock. A flock(2) ref lock
-(`--ref-lock`) orders no waiters: the kernel wakes them all and the first to retry wins, and it names no holder in
-order.
+inside it; a writer that holds the ref turn never asks for the land turn, so the two never deadlock. Nor does an install
+that waits for the turns come between them: the land asks its ref turn inside its land turn, so that ask is numbered,
+never parked behind the install ("The read fences the turns"). A flock(2) ref lock (`--ref-lock`) orders no waiters: the
+kernel wakes them all and the first to retry wins, and it names no holder in order.
 
 **A publish holds the land turn.** A release workflow that versions, tags and pushes a release commit onto main from a
 CI runner (smoothbricks' `publish.yml`, about 45 minutes) writes the push remote's main once, at the end of its run, and

@@ -116,6 +116,17 @@ impl Land {
 
     /// [`Land::gated`] in `repo`'s queue, its head taking `outside` too when given.
     fn gated_in(home: &Home, repo: &str, workspace: &str, outside: Option<&Path>) -> Self {
+        Self::gated_then(home, repo, workspace, outside, "")
+    }
+
+    /// [`Land::gated_in`] whose command, once released, goes on with the shell text `then`.
+    fn gated_then(
+        home: &Home,
+        repo: &str,
+        workspace: &str,
+        outside: Option<&Path>,
+        then: &str,
+    ) -> Self {
         let fifo = home.path.join(format!("{workspace}.fifo"));
         let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("a fifo path has no NUL");
         // SAFETY: mkfifo(3) on a path inside this test's own HOME.
@@ -128,7 +139,7 @@ impl Land {
             io::Error::last_os_error()
         );
         let script = format!(
-            "echo {workspace} >> {}; echo command-started >&2; read x < {}",
+            "echo {workspace} >> {}; echo command-started >&2; read x < {}{then}",
             home.order().display(),
             fifo.display()
         );
@@ -701,3 +712,40 @@ fn a_process_the_command_leaves_running_holds_no_turn() {
         "a finished land left a ticket in the queue"
     );
 }
+
+//#region smoo/cowshed!n/read-fences-turns
+/// A land takes its ref turn inside its land turn though an install waits for that land turn, and
+/// both end with no hand (05_gateway.md "The read fences the turns"). The land's command is bound
+/// to its turn and, released, becomes the ask for the ref turn, as `cowshed land --ref-turn` under
+/// `land-turn` is; the install is `cowshed gateway await-turns`. Recorded 2026-11-16: the ref ask
+/// was parked behind the install, the install waited for the land's turn, and neither moved for 24
+/// minutes, until the land was ended by hand.
+#[test]
+fn a_land_takes_its_ref_turn_under_a_waiting_install_and_both_end() {
+    let home = Home::new();
+    let ref_turn = format!(
+        "; exec {} land-turn {REPO}.ref --workspace second --gateway-socket {} -- true",
+        cowshed().display(),
+        home.gateway.socket.display()
+    );
+    let mut land = Land::gated_then(&home, REPO, "second", None, &ref_turn);
+    wait_for_order(&home, &mut land, &["second"]);
+    let mut install = Land::start(
+        "install",
+        Command::new(cowshed())
+            .env("HOME", &home.path)
+            .args(["gateway", "await-turns", "--gateway-socket"])
+            .arg(&home.gateway.socket)
+            .args(["--", "true"]),
+    );
+    // The install's place is taken once it says whom it waits for.
+    install.stderr_line("cowshed: await-turns: the install waits for 1 land turn(s)");
+    land.release();
+    land.wait_success();
+    install.wait_success();
+    assert!(
+        queues(&home, u64::MAX).is_empty(),
+        "the land and its ref fence left a ticket in a queue"
+    );
+}
+//#endregion smoo/cowshed!n/read-fences-turns

@@ -7,7 +7,7 @@
 # its twin for the waiting install (waiting_install_numbers_no_ask) and computes
 # the recorded schedule (a_reading_install_is_overtaken_by_every_later_ask).
 #   install_read_holds_back_later_asks
-#     e = E{0n, False{}, [], False{}}, t = [], c = 0n
+#     e = E{0n, 0n, False{}, [], False{}}, t = [], c = 0n, x = 0n
 # The read finds a ticket and sets no fence, and the next ask is numbered 1n and
 # queued behind that ticket, ahead of the install. Recorded 2026-11-10: land
 # 124380eca9's after-land install deferred at 12:16, 12:48 and 13:17Z, each time
@@ -24,4 +24,5 @@ law install_read_holds_back_later_asks:
   for +e: L.E
   for +t: +List<L.E>
   for +c: Nat
-  {L.queue(L.step(L.TAsk{}, L.step(L.TFence{}, L.St{e <> t, c, 0n, 0n, 0n}))) == e <> t : +List<L.E>}
+  for +x: Nat
+  {L.queue(L.step(L.TAsk{x}, L.step(L.TFence{}, L.St{e <> t, c, 0n, 0n, []}))) == e <> t : +List<L.E>}

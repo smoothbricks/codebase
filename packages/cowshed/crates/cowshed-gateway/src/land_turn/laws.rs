@@ -2,10 +2,10 @@
 //! turns", its laws under "Land-turn laws"). The model's laws are proven for every input
 //! sequence; this driver shows the code is the model: it runs the emitted model and `Turns` on the
 //! same inputs, the model's enumerated corpus, its seeded draws and the recorded queues of
-//! 2026-10-21 to 2026-10-27, and after every input compares the two queues ticket by ticket,
-//! the answer to every bind, whether every ask is numbered or parked, the last number given, the
-//! fences, the waiting installs and the parked asks, and evaluates the laws' checks on the code's
-//! own queue.
+//! 2026-10-21 to 2026-10-27, and after every input compares the two queues ticket by ticket, its
+//! asker included, the answer to every bind, whether every ask is numbered or parked, the last
+//! number given, the fences, the waiting installs and the parked asks' askers in order, and
+//! evaluates the laws' checks on the code's own queue.
 
 use std::rc::Rc;
 
@@ -83,6 +83,7 @@ impl Pair {
                         .map(|entry| {
                             E::E(
                                 entry.ticket.number,
+                                u64::from(entry.ticket.pid),
                                 entry.asker,
                                 list(
                                     entry
@@ -113,7 +114,7 @@ impl Pair {
         self.inputs.push(model::show_Op(op));
         let pid = |p: u64| u32::try_from(p).expect("a model pid fits a pid");
         let answers = match op {
-            Op::TAsk => {
+            Op::TAsk(asker) => {
                 let workspace = format!("ws{}", self.inputs.len());
                 let asked = self.turns.ask(
                     u64::try_from(self.inputs.len()).expect("an input count fits a key"),
@@ -122,12 +123,14 @@ impl Pair {
                         command: format!("land {workspace}"),
                         workspace,
                     },
-                    4242,
+                    pid(*asker),
                     self.now_unix_ms,
                 );
                 let (code, model) = (
                     matches!(asked, Err(Parked)),
-                    model::fences(self.model.clone()) > 0 || model::waiting(self.model.clone()) > 0,
+                    !model::inside(*asker, self.model_queue())
+                        && (model::fences(self.model.clone()) > 0
+                            || model::waiting(self.model.clone()) > 0),
                 );
                 if code != model {
                     let said = |parked: bool| if parked { "parked" } else { "numbered" };
@@ -206,13 +209,17 @@ impl Pair {
             model::counter(self.model.clone()),
             model::fences(self.model.clone()),
             model::waiting(self.model.clone()),
-            model::parked(self.model.clone()),
+            items(&model::parked(self.model.clone())),
         );
         let code_numbering = (
             self.turns.numbered,
             self.turns.fences,
             u64::try_from(self.turns.waiting.len()).expect("a count fits u64"),
-            u64::try_from(self.turns.parked.len()).expect("a count fits u64"),
+            self.turns
+                .parked
+                .iter()
+                .map(|parked| u64::from(parked.pid))
+                .collect::<Vec<_>>(),
         );
         if model_numbering != code_numbering {
             return Err(self.refused(&format!(
@@ -284,11 +291,11 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
     let mut pair = Pair::new("acme");
     for op in [
         Op::TFence,
-        Op::TAsk,
+        Op::TAsk(41),
         Op::TUnfence,
         Op::TBind(1, 7),
         Op::TFence,
-        Op::TAsk,
+        Op::TAsk(42),
         Op::TExit(1, 7),
     ] {
         pair.input(&op, None).unwrap();
@@ -301,7 +308,7 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
          nothing"
     );
     assert_eq!(shown(&pair.code_queue()), shown(&pair.model_queue()));
-    let E::E(holder, _, _, held) = items(&pair.code_queue())[0].clone();
+    let E::E(holder, _, _, _, held) = items(&pair.code_queue())[0].clone();
     assert_eq!((holder, held), (2, true), "the next land holds the turn");
 }
 
@@ -312,11 +319,11 @@ fn the_recorded_fenced_schedule_replays_through_the_model_and_turns() {
 #[test]
 fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
     let mut pair = Pair::new("smoothbricks");
-    for op in [Op::TAsk, Op::TWait, Op::TAsk] {
+    for op in [Op::TAsk(41), Op::TWait, Op::TAsk(42)] {
         pair.input(&op, None).unwrap();
     }
     pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
-    pair.input(&Op::TAsk, None).unwrap();
+    pair.input(&Op::TAsk(43), None).unwrap();
     assert_eq!(
         (
             pair.turns.fences,
@@ -334,12 +341,56 @@ fn the_recorded_deferred_install_waits_in_order_through_the_model_and_turns() {
     assert_eq!(
         items(&pair.code_queue())
             .into_iter()
-            .map(|E::E(number, _, _, held)| (number, held))
+            .map(|E::E(number, _, _, _, held)| (number, held))
             .collect::<Vec<_>>(),
         [(2, true), (3, false)],
         "the parked lands are numbered in arrival order once the install's fence lifts"
     );
 }
+
+//#region smoo/cowshed!n/read-fences-turns
+/// Recorded 2026-11-16 (05_gateway.md "The read fences the turns"): a land holds its turn, the
+/// install of the land before it waits for that turn, and the land asks its ref turn inside its
+/// turn. That ask is numbered, though a land that asked from outside a moment earlier is parked;
+/// the land ends both turns, which fences the install, and the install's lift numbers the parked
+/// land. As recorded, the ref ask was parked too, and the land and the install each waited for
+/// the other for 24 minutes.
+#[test]
+fn the_recorded_ref_turn_under_a_waiting_install_replays_through_the_model_and_turns() {
+    let mut pair = Pair::new("smoothbricks");
+    for op in [Op::TAsk(41), Op::TWait, Op::TAsk(42), Op::TAsk(41)] {
+        pair.input(&op, None).unwrap();
+    }
+    assert_eq!(
+        (
+            items(&pair.code_queue())
+                .into_iter()
+                .map(|E::E(number, asker, _, _, held)| (number, asker, held))
+                .collect::<Vec<_>>(),
+            pair.turns.waiting.len(),
+            pair.turns.parked.len()
+        ),
+        (vec![(1, 41, true), (2, 41, false)], 1, 1),
+        "the land's ask inside its turn is numbered, and the ask from outside is parked"
+    );
+    pair.input(&Op::TLeave(2), Some("delivered")).unwrap();
+    pair.input(&Op::TLeave(1), Some("exited 0")).unwrap();
+    assert_eq!(
+        (pair.turns.fences, pair.turns.waiting.len()),
+        (1, 0),
+        "the install is fenced the step the land ends its turn"
+    );
+    pair.input(&Op::TUnfence, None).unwrap();
+    assert_eq!(
+        items(&pair.code_queue())
+            .into_iter()
+            .map(|E::E(number, asker, _, _, held)| (number, asker, held))
+            .collect::<Vec<_>>(),
+        [(3, 42, true)],
+        "the land parked behind the install holds the turn once its fence lifts"
+    );
+}
+//#endregion smoo/cowshed!n/read-fences-turns
 /// The recorded queues, 2026-10-21 to 2026-10-27 (the land-turn records of six repositories'
 /// `turns.log`, before the queues moved into the gateway): every `taken` is the ticket the model
 /// and `Turns` both hand the turn to.
@@ -360,7 +411,8 @@ fn recorded_turns_replay_through_the_model_and_turns() {
             .or_insert_with(|| (Pair::new(&q), std::collections::HashMap::new()));
         match e.as_str() {
             "queued" => {
-                pair.input(&Op::TAsk, None).unwrap();
+                // Each recorded land is a process of its own: no ask comes from inside a turn.
+                pair.input(&Op::TAsk(n), None).unwrap();
                 numbers.insert(n, pair.turns.numbered);
             }
             "taken" => {
@@ -368,7 +420,7 @@ fn recorded_turns_replay_through_the_model_and_turns() {
                 let held = |queue: Rc<List<E>>| {
                     items(&queue)
                         .first()
-                        .is_some_and(|E::E(first, _, _, held)| *first == number && *held)
+                        .is_some_and(|E::E(first, _, _, _, held)| *first == number && *held)
                 };
                 assert!(
                     held(pair.model_queue()) && held(pair.code_queue()),

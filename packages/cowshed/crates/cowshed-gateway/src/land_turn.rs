@@ -11,9 +11,15 @@
 //! An install's read of the turns, asked with the fence, fences every queue when it finds no
 //! holder, the read and the fence one step. An install that finds tickets may wait for them
 //! instead: it takes its place after every ticket queued when it asked, and is fenced in the step
-//! that ends the last of them. An ask while any install waits or any fence holds is answered
+//! that ends the last of them. An ask that meets a waiting install or a fence is answered
 //! `fenced` and parked, never numbered, on the connection it asked on; once no install waits and
 //! no fence holds, the parked asks are numbered in the order they arrived (05_gateway.md "The read
+//! fences the turns"). One ask is never parked: an ask made inside a held turn, by its asker
+//! or by a command bound to it, as a land asks its ref turn inside its land turn. The install
+//! waits for that turn, which ends only once the ask made inside it is served. Recorded
+//! 2026-11-16: such an ask was parked behind the install of the land before, and the two waited
+//! for each other for 24 minutes, until the land was ended by hand. Recorded 2026-10-28
+//! 13:52:39Z: an install read no holder, a land asked its
 //! fences the turns"). Recorded 2026-10-28 13:52:39Z: an install read no holder, a land asked its
 //! turn and bound its gate, and the install's restart closed the turn's connection, so the land
 //! sent its gate SIGTERM. Recorded 2026-11-10: an install that deferred whenever it found a turn
@@ -110,8 +116,8 @@ impl std::fmt::Display for BindRefusal {
     }
 }
 
-/// An ask while an install waits for the turns or fences them: parked, never numbered, until no
-/// install waits and no fence holds.
+/// An ask from outside every held turn that met an install waiting for the turns or fencing them:
+/// parked, never numbered, until no install waits and no fence holds.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Parked;
 
@@ -132,10 +138,10 @@ pub(crate) struct Turns {
     abandoned: VecDeque<(LandTurnName, Abandonment)>,
     /// The last ticket number given; the next ask is given the one after it.
     numbered: u64,
-    /// How many installs fence every queue now: while any does, an ask is parked.
+    /// How many installs fence every queue now: an ask that meets one is parked.
     fences: u64,
-    /// The installs waiting for every queue to empty, by the key the actor gave each: while any
-    /// waits, an ask is parked, so the queues only shrink until it is fenced.
+    /// The installs waiting for every queue to empty, by the key the actor gave each: an ask from
+    /// outside every held turn that meets one is parked, so no such ask lengthens its wait.
     waiting: Vec<u64>,
     /// The waiting installs that were fenced and hold that fence until they leave, by key.
     fenced_installs: Vec<u64>,
@@ -147,8 +153,9 @@ impl Turns {
     /// `ask`, whose connection the actor keys `key`, takes its place at the end of its queue, asked
     /// by `pid` at `asked_unix_ms`, and is numbered here, as it arrives: first asked, first served,
     /// and no ask that arrived later ever takes a place ahead of it. Answers its number, or
-    /// [`Parked`] while an install waits for the queues or fences them: then no queue changes, and
-    /// the ask is numbered once no install waits and no fence holds ([`Settled::numbered`]).
+    /// [`Parked`] when an install waits for the queues or fences them and `pid` asks from outside
+    /// every held turn ([`Self::inside`]): then no queue changes, and the ask is numbered once no
+    /// install waits and no fence holds ([`Settled::numbered`]).
     pub(crate) fn ask(
         &mut self,
         key: u64,
@@ -156,7 +163,7 @@ impl Turns {
         pid: u32,
         asked_unix_ms: u64,
     ) -> Result<(u64, Settled), Parked> {
-        if self.fences > 0 || !self.waiting.is_empty() {
+        if (self.fences > 0 || !self.waiting.is_empty()) && !self.inside(pid) {
             self.parked.push_back(ParkedAsk {
                 key,
                 ask,
@@ -175,6 +182,20 @@ impl Turns {
         ))
     }
 
+    /// `pid` asks from inside a held turn: it is a command bound to a turn, or the asker of a
+    /// ticket that holds its turn and has not ended its hold. A waiting install waits for that
+    /// turn, and the turn ends only once what its holder asks inside it is served (a land takes
+    /// its ref turn inside its land turn), so such an ask is never parked behind the install. A
+    /// process a bound command starts holds no turn and asks from outside. The asker's exit and
+    /// each bound command's are watched, so a pid named here is that process's own; only a bound
+    /// command whose watch failed twice may lend its pid to a later process, whose ask is then
+    /// numbered ahead of the install instead of behind it.
+    fn inside(&self, pid: u32) -> bool {
+        self.queues.values().flatten().any(|entry| {
+            entry.ticket.bound.contains(&pid)
+                || (entry.held && entry.asker && entry.ticket.pid == pid)
+        })
+    }
     /// Number `ask` one past the last number given and put it at the end of its queue: its number
     /// and what its queue is told.
     fn number(&mut self, ask: TurnAsk, pid: u32, asked_unix_ms: u64) -> (u64, Vec<Notice>) {
@@ -702,10 +723,17 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
             } => {
                 let repo = ask.repo.clone();
                 let asked = format!("{} (pid {pid}) for `{}`", ask.workspace, ask.command);
+                let ahead_of_install = !turns.waiting.is_empty();
                 match turns.ask(connection, ask, pid, now_unix_ms()) {
                     Ok((given, settled)) => {
                         cowshed_os::eprintln!(
-                            "cowshed: land turn {repo}: ticket {given} asked by {asked}"
+                            "cowshed: land turn {repo}: ticket {given} asked by {asked}{}",
+                            if ahead_of_install {
+                                ", inside a turn it holds: numbered ahead of the install that \
+                                 waits for that turn"
+                            } else {
+                                ""
+                            }
                         );
                         // A connection that has gone hears nothing; its departure is on its way.
                         let _ = number.send(given);
@@ -790,8 +818,9 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Message>) {
                     let _ = fenced.send(turns.queues(abandoned_since_unix_ms));
                 } else {
                     cowshed_os::eprintln!(
-                        "cowshed: land turns: an install waits for the {} ticket(s) queued now, \
-                         and every ask is parked until it is fenced and lifts its fence",
+                        "cowshed: land turns: an install waits for the {} ticket(s) queued now; \
+                         every ask from outside their turns is parked until it is fenced and \
+                         lifts its fence",
                         queues
                             .iter()
                             .map(|queue| queue.tickets.len())
