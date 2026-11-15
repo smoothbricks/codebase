@@ -1429,6 +1429,17 @@ pub(crate) fn text_cell(
         hash_column,
         Some(ColumnValue::FixedBytes(Cow::Borrowed(&hash))),
     )?;
+    inline_text(columns, place, inline, text)
+}
+
+/// Store a text's bytes in its inline column when the embedder keeps them
+/// inline. A text answered inline with no inline column is refused.
+fn inline_text(
+    columns: &mut DynamicColumns,
+    place: TextPlace,
+    inline: Option<usize>,
+    text: &str,
+) -> Result<(), json_extractor::ExtractionError> {
     match (place, inline) {
         (TextPlace::Inline, Some(inline)) => {
             json_extractor::append(
@@ -1446,17 +1457,46 @@ pub(crate) fn text_cell(
     }
 }
 
+/// A text that arrived as bytes that are no content hash
+/// (specs/columine/10-physical-vocabulary.md §7): the embedder decides
+/// whether they are a frame of the text that it admits, and answers the hash
+/// the hash column stores and, kept inline, the text's bytes. Inline bytes
+/// that are not UTF-8 are no text.
+pub(crate) fn text_frame_cell(
+    columns: &mut DynamicColumns,
+    hash_column: usize,
+    inline: Option<usize>,
+    bytes: &[u8],
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), json_extractor::ExtractionError> {
+    let mut hash = [0; TEXT_HASH_BYTES];
+    scratch.clear();
+    let place = cells
+        .embedder()?
+        .text_frame(seam_column(hash_column), bytes, &mut hash, scratch)
+        .map_err(json_extractor::ExtractionError::Cell)?;
+    json_extractor::append(
+        columns,
+        hash_column,
+        Some(ColumnValue::FixedBytes(Cow::Borrowed(&hash))),
+    )?;
+    let text = match place {
+        TextPlace::Inline => std::str::from_utf8(scratch)
+            .map_err(|_| json_extractor::ExtractionError::InvalidFieldType)?,
+        TextPlace::HashOnly => "",
+    };
+    inline_text(columns, place, inline, text)
+}
+
 /// A text that arrived as its content hash: the embedder answers whether it
 /// holds the content, and the hash column stores the hash.
 pub(crate) fn text_hash_cell(
     columns: &mut DynamicColumns,
     hash_column: usize,
-    hash: &[u8],
+    hash: &[u8; TEXT_HASH_BYTES],
     cells: &mut CellWriter<'_>,
 ) -> Result<(), json_extractor::ExtractionError> {
-    let hash: &[u8; TEXT_HASH_BYTES] = hash
-        .try_into()
-        .map_err(|_| json_extractor::ExtractionError::InvalidFieldType)?;
     cells
         .embedder()?
         .text_by_hash(seam_column(hash_column), hash)

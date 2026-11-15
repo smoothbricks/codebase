@@ -135,6 +135,19 @@ pub trait ValueCells {
         hash_column: u32,
         hash: &[u8; TEXT_HASH_BYTES],
     ) -> Result<(), CellRefusal>;
+
+    /// A text member that arrived as bytes that are no content hash: the
+    /// embedder decides whether they are a frame of the text that it admits.
+    /// Admitted, write the text's content hash to `hash` and say where its
+    /// bytes live, appending them to `inline` when they live inline; any
+    /// other bytes are refused by name.
+    fn text_frame(
+        &mut self,
+        hash_column: u32,
+        bytes: &[u8],
+        hash: &mut [u8; TEXT_HASH_BYTES],
+        inline: &mut Vec<u8>,
+    ) -> Result<TextPlace, CellRefusal>;
 }
 
 /// The writer of a processor whose embedder injects none: it writes no cell.
@@ -198,6 +211,16 @@ impl ValueCells for NoValueCells {
         _hash_column: u32,
         _hash: &[u8; TEXT_HASH_BYTES],
     ) -> Result<(), CellRefusal> {
+        Err(CellRefusal::Unsupported)
+    }
+
+    fn text_frame(
+        &mut self,
+        _hash_column: u32,
+        _bytes: &[u8],
+        _hash: &mut [u8; TEXT_HASH_BYTES],
+        _inline: &mut Vec<u8>,
+    ) -> Result<TextPlace, CellRefusal> {
         Err(CellRefusal::Unsupported)
     }
 }

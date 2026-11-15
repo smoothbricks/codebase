@@ -13,6 +13,7 @@ use crate::{
     PlaneKind, SeamCell, SignalSchemaField, json_extractor::ExtractionError, placed_beneath,
 };
 use columine_types::category::CategoryImage;
+use columine_types::cells::TEXT_HASH_BYTES;
 
 /// Extracts either a concatenated MessagePack map stream or an array of maps.
 pub fn extract_msgpack_events(
@@ -1103,8 +1104,9 @@ fn certified_bin<'s, 'i: 's, 'p: 's>(
 /// One member whose column the value-cell seam rules
 /// (specs/columine/10-physical-vocabulary.md §7, §8): the embedder writes a
 /// structured member's cell; a text stores the hash the embedder computes,
-/// from its text or from a 32-byte `bin` hash; and a raw Binary column takes
-/// a `bin` payload or a projected frame's certified bytes, nothing structured.
+/// from its text or from a `bin` that is no hash, or a 32-byte `bin` hash
+/// the embedder holds; and a raw Binary column takes a `bin` payload or a
+/// projected frame's certified bytes, nothing structured.
 #[allow(
     clippy::too_many_arguments,
     reason = "one seam cell: its column and kind, its open-path capture and null rule, the frame projections, the writer and its scratch"
@@ -1153,8 +1155,13 @@ fn seam_member(
                 reader.skip_value();
                 Ok(())
             } else if matches!(first, 0xc4..=0xc6) {
-                let hash = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
-                crate::text_hash_cell(columns, column, hash, cells)
+                let bytes = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+                match <&[u8; TEXT_HASH_BYTES]>::try_from(bytes) {
+                    Ok(hash) => crate::text_hash_cell(columns, column, hash, cells),
+                    Err(_) => {
+                        crate::text_frame_cell(columns, column, inline, bytes, cells, scratch)
+                    }
+                }
             } else if Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader

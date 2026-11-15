@@ -94,6 +94,16 @@ impl ValueCells for TextCells {
     ) -> Result<TextPlace, CellRefusal> {
         Err(CellRefusal::Unsupported)
     }
+    fn text_frame(
+        &mut self,
+        _hash_column: u32,
+        _bytes: &[u8],
+        _hash: &mut [u8; TEXT_HASH_BYTES],
+        _inline: &mut Vec<u8>,
+    ) -> Result<TextPlace, CellRefusal> {
+        Err(CellRefusal::Unsupported)
+    }
+
     fn text_by_hash(
         &mut self,
         _hash_column: u32,

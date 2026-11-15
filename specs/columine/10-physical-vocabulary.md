@@ -117,8 +117,11 @@ schema has judged that value, and stores the bytes it writes:
 - `begin_undeclared`, `put_undeclared(path, value)`, `finish_undeclared(out)` write the row's carrier;
 - `text(hash_column, text, hash)` computes a text's 32-byte content hash and answers whether its bytes are also stored
   inline, in the text's Utf8 column; `text_by_hash(hash_column, hash)` answers for a text that arrived as its hash
-  alone. Which columns are a text's is a creation fact, rows of `(hash column, inline column?)`; nothing reads it from a
-  column's name.
+  alone; `text_frame(hash_column, bytes, hash, inline)` answers for a text that arrived, on a wire with bytes, as bytes
+  that are no 32-byte hash: the embedder alone decides whether they are a frame of the text that it admits, writes the
+  text's hash and, when it answers inline, the text's bytes, and refuses any other bytes by name. A text stays a text
+  and 32 bytes stay a hash. Which columns are a text's is a creation fact, rows of `(hash column, inline column?)`;
+  nothing reads it from a column's name.
 
 <a id="smoo/columine!n/vocab-value-view"></a> A `ValueView` names a value's kind and answers the value through the
 accessor of that kind: `as_str`, `as_number`, `as_canonical_i64`, `as_bytes`, `as_bool`, and the object and array
@@ -199,20 +202,20 @@ its own and refuses the row.
 
 One table for both lanes; a value of another kind is refused naming the column.
 
-| column                   | takes                                                                                          |
-| ------------------------ | ---------------------------------------------------------------------------------------------- |
-| integer plane            | an integral number in range; at eight bytes also a decimal string                              |
-| float plane              | a number                                                                                       |
-| Bool                     | a boolean                                                                                      |
-| Timestamp                | an integer of the field's unit, or the text of an RFC 3339 UTC instant no finer than the unit  |
-| Duration                 | an integer of the field's unit                                                                 |
-| schema dictionary        | the text of one of its values                                                                  |
-| stream dictionary        | a text, stored as the ordinal the image answers                                                |
-| Utf8                     | a text                                                                                         |
-| fixed-size planes        | bytes of exactly the width; on the JSON wire their hex                                         |
-| Binary without `sb.cell` | raw bytes, or a certified frame for a value object; with no embedder, any value as MessagePack |
-| Binary with `sb.cell`    | any value, as the bytes that encoding's writer produces                                        |
-| text hash column         | a text, stored as the hash the embedder computes; on a wire with bytes also a 32-byte hash     |
+| column                   | takes                                                                                                                                              |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| integer plane            | an integral number in range; at eight bytes also a decimal string                                                                                  |
+| float plane              | a number                                                                                                                                           |
+| Bool                     | a boolean                                                                                                                                          |
+| Timestamp                | an integer of the field's unit, or the text of an RFC 3339 UTC instant no finer than the unit                                                      |
+| Duration                 | an integer of the field's unit                                                                                                                     |
+| schema dictionary        | the text of one of its values                                                                                                                      |
+| stream dictionary        | a text, stored as the ordinal the image answers                                                                                                    |
+| Utf8                     | a text                                                                                                                                             |
+| fixed-size planes        | bytes of exactly the width; on the JSON wire their hex                                                                                             |
+| Binary without `sb.cell` | raw bytes, or a certified frame for a value object; with no embedder, any value as MessagePack                                                     |
+| Binary with `sb.cell`    | any value, as the bytes that encoding's writer produces                                                                                            |
+| text hash column         | a text, stored as the hash the embedder computes; on a wire with bytes also a 32-byte hash, or other bytes the embedder admits as the text's frame |
 
 **A bounded string.** <a id="smoo/columine!n/vocab-bounded-string"></a> A semantic `string` node may bound a text's
 UTF-8 length: `{"kind":"string","maxBytes":N}`, `N` a `u32`, absent = unbounded. A bounded string holds from its minimum
