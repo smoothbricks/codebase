@@ -9385,6 +9385,106 @@ async fn directory_a_declared_land_whose_gate_fails_keeps_main_and_the_workspace
         .expect("stop the real directory project");
 }
 
+/// `--gate-only` runs the declared gate on the workspace as it stands, under the land turn, and
+/// stops: main is where the gate's own racing doc commit left it, the workspace and its branch
+/// are untouched, nothing is recorded as landed, and the turn is ended. A failing gate answers
+/// the land's own refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_with_gate_only_gates_under_the_turn_and_moves_nothing_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-gate-only-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 0);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let (result, _, stderr) = run(&mut service, ["land", "topic", "--gate-only"]).await;
+    result.unwrap_or_else(|refused| {
+        panic!(
+            "a passing gate answers the gate-only land: {refused}\n{}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    assert_eq!(
+        fs::read_to_string(&declared.gates).expect("read the gate's log"),
+        "topic\n",
+        "the declared gate ran once, for the workspace"
+    );
+    assert_eq!(
+        git_stdout(&topic, &["rev-parse", "HEAD"]),
+        head,
+        "the workspace was not rebased"
+    );
+    assert_eq!(
+        git_stdout(&declared.main, &["log", "-1", "--format=%s"]),
+        "docs: race the gate",
+        "main moved only by the gate's own doc commit"
+    );
+    assert!(topic.exists(), "the workspace is kept");
+    assert!(
+        declared.lands().is_empty(),
+        "nothing landed, so nothing is recorded"
+    );
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the gate-only land ended its turn"
+    );
+
+    // With the fences a preflight runs, it is not a preflight: the two are refused together.
+    let (result, _, _) = run(
+        &mut service,
+        ["land", "topic", "--gate-only", "--preflight"],
+    )
+    .await;
+    assert_eq!(
+        result
+            .expect_err("--gate-only with --preflight is refused")
+            .code,
+        ErrorCode::Usage
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// A gate that fails under `--gate-only` answers the land's refusal and moves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_declared_land_with_gate_only_whose_gate_fails_names_the_gate_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory().with_background_program();
+    let turn = format!("fixture-gate-only-refused-{}", std::process::id());
+    let declared = DeclaredLand::declare(&fixture, &turn, 3);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").expect("write the workspace file");
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let (result, _, stderr) = run(&mut service, ["land", "topic", "--gate-only"]).await;
+    let refusal = result.expect_err("a failed gate refuses the gate-only land");
+    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
+    assert!(
+        refusal.message.contains("gate.sh topic` exited 3"),
+        "the refusal names the gate and its status: {refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(topic.exists(), "the workspace stays for its fix");
+    assert!(declared.lands().is_empty(), "nothing landed");
+    assert_eq!(
+        settled_land_turn(&fixture.storage.control_socket(), &turn).await,
+        [],
+        "the refused gate-only land ended its turn"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 /// The declared land fixture's push remote, given main's head and then one commit main lacks, as
 /// a release workflow pushes its version commits: answers that commit.
 fn release_on_the_remote(fixture: &Fixture, declared: &DeclaredLand) -> String {

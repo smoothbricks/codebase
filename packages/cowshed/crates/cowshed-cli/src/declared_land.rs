@@ -29,6 +29,8 @@ pub(crate) struct DeclaredLand<'a> {
     pub workspace: &'a str,
     pub retire: bool,
     pub push: bool,
+    /// Run the fences and the declared gate under the land turn and stop: nothing moves.
+    pub gate_only: bool,
 }
 
 /// Refuse what a declared land pins or runs itself (02_workspaces.md "A declared land"): the
@@ -65,7 +67,10 @@ pub(crate) fn refuse_primitive_options(args: &crate::args::LandArgs) -> Result<(
             "this repository declares its land route in main's .cowshed.toml [land], which pins its own heads, gate and ref turn; {} cannot be given to it",
             refused.join(", ")
         ),
-        format!("cowshed land {} [--no-push] [--no-retire]", args.workspace),
+        format!(
+            "cowshed land {} [--no-push] [--no-retire] [--gate-only]",
+            args.workspace
+        ),
     ))
 }
 
@@ -122,6 +127,40 @@ where
     if let Err(refused) = service.require_daemon_of_this_build().await {
         turn.end(format!("refused: {}", refused.message));
         return Err(refused);
+    }
+    if land.gate_only {
+        // The gate alone (02_workspaces.md "A declared land", "The gate alone"): the fences and
+        // the turn are the land's, so it never runs beside a land's gate, and what it answers is
+        // what a land of this head would be told.
+        let gated = gate_alone(
+            main,
+            declaration,
+            &land,
+            &preflight,
+            &environment,
+            &mut turn,
+            output,
+        )
+        .await;
+        return match gated {
+            Ok(()) => {
+                turn.end(format!("gated {}", preflight.source_head.as_str()));
+                say(
+                    output,
+                    &format!(
+                        "the gate passed for {} of {}; nothing was rebased, landed or retired, and the land turn {} is free",
+                        preflight.source_head.as_str(),
+                        land.workspace,
+                        declaration.turn().as_str()
+                    ),
+                )?;
+                Ok(LandReport::Preflighted(preflight))
+            }
+            Err(error) => {
+                turn.end(format!("refused: {}", error.message));
+                Err(error)
+            }
+        };
     }
     let routed = route(
         service,
@@ -259,6 +298,35 @@ struct Routed {
     branch: String,
     before: GitOid,
     retire: Result<LandedReport>,
+}
+
+/// The declared gate on `land`'s workspace as it stands, under the land turn: no sync with the
+/// push remote, no rebase, no fast-forward and no retire.
+async fn gate_alone<W, E>(
+    main: &Path,
+    declaration: &LandDeclaration,
+    land: &DeclaredLand<'_>,
+    preflight: &cowshed_core::api::dto::LandPreflight,
+    environment: &[(OsString, OsString)],
+    turn: &mut Turn,
+    output: &mut Output<W, E>,
+) -> Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    say(
+        output,
+        &format!(
+            "gating {} as it stands with {}; nothing is rebased or landed",
+            preflight.source_head.as_str(),
+            declaration.gate().program()
+        ),
+    )?;
+    if let Some(lost) = lost_now(turn).await {
+        return Err(turn_lost(declaration.turn(), "before the gate", &lost));
+    }
+    gate(main, declaration, land.workspace, environment, turn).await
 }
 
 /// Submit the after-land work for `request` to main's workspace supervisor as a background job at

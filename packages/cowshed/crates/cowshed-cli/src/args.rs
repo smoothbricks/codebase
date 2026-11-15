@@ -675,6 +675,8 @@ pub struct LandArgs {
     pub preflight: bool,
     /// `false` for `--no-push`: a declared land records `unpushed` instead of pushing.
     pub push: bool,
+    /// `--gate-only`: a declared land runs its fences and its gate under the land turn and stops.
+    pub gate_only: bool,
 }
 
 /// `doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>) [--gateway-socket <path>]`.
@@ -1071,6 +1073,7 @@ pub fn cli_command() -> ClapCommand {
             flag("ungated"),
             flag("preflight"),
             flag("no-push"),
+            flag("gate-only"),
         ]))
         .subcommand(leaf("doc-commit").args([
             value("message").short('m'),
@@ -3973,6 +3976,10 @@ const LAND: CommandSpec = CommandSpec {
             spelling: "--no-push",
             meaning: "a declared land records `unpushed` and pushes nothing; its after-land commands still run",
         },
+        Opt {
+            spelling: "--gate-only",
+            meaning: "a declared land runs its preflight fences and its declared gate under the land turn, on the workspace as it stands, and stops: nothing is rebased, fast-forwarded, retired or pushed; exit 0 when the gate passes, 4 with the gate's refusal otherwise",
+        },
     ],
 };
 
@@ -4085,6 +4092,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         mode: land_mode(matches),
         preflight: flagged(matches, "preflight"),
         push: !flagged(matches, "no-push"),
+        gate_only: flagged(matches, "gate-only"),
     }))
 }
 

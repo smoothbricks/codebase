@@ -1252,7 +1252,7 @@ workspace's incarnation once, at its start, and never reads the workspace back a
 retire finds the workspace already gone (removed by a cowshed that predates the lease, or by hand) reports `landed` and
 says on stderr that there was nothing left to retire. Who removed it is the deletion log's `retiredBy`.
 
-### A declared land: `cowshed land <ws> [--no-push] [--no-retire]`
+### A declared land: `cowshed land <ws> [--no-push] [--no-retire] [--gate-only]`
 
 A repository whose main checkout's `.cowshed.toml` declares `[land]` (06_cli.md "Configuration") lands into main by one
 verb: `cowshed land <ws>` is the whole route from a committed workspace to a pushed main, and no host script
@@ -1346,6 +1346,15 @@ With `[land]` declared, a land into main refuses the primitive's caller-side opt
 `--expected-target-head` (the route pins its own heads), `--ref-lock` and `--ref-turn` (the route takes the declared ref
 turn), `--push-only` and `--ungated`. `--preflight` runs the fences alone, as for any land. `--no-push` is refused where
 `[land]` is not declared, since only the route pushes.
+
+**The gate alone.** `cowshed land <ws> --gate-only` answers what a land of `<ws>` would be told by its gate, and moves
+nothing. It runs step 1's fences, takes the land turn as step 2 does, and runs the declared gate (step 4) on `<ws>` as
+it stands, in main's pure environment, bound to the turn; it skips the sync with the push remote, the rebase, the
+fast-forward, the retire, the push and the after-land commands, and writes no line to `lands.log`. A gate that passes
+exits 0 with the preflight's report; one that fails exits 4 with the land's own refusal naming the gate and its status.
+The turn ends with `gated <head>` or the refusal. Because it holds the land turn, it never runs beside a land's gate,
+and a lane base is checked by exactly the command its land will run before it is landed. It is refused with exit 2
+together with `--preflight`, and where `[land]` is not declared, since only the route names a gate.
 
 ### `cowshed doc-commit (-m <msg> | -F <file>) (--patch <file> | --icm <program>)`
 

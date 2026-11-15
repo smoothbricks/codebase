@@ -2171,6 +2171,16 @@ where
             } else {
                 None
             };
+            if args.gate_only && (args.preflight || declared.is_none()) {
+                return Err(CowshedError::usage(
+                    if args.preflight {
+                        "--gate-only runs the fences --preflight runs and then the declared gate; the two cannot be given together"
+                    } else {
+                        "--gate-only needs a declared land: only the route [land] declares in main's .cowshed.toml names a gate"
+                    },
+                    format!("cowshed land {}", args.workspace),
+                ));
+            }
             if let Some((main, declaration)) = declared.as_ref().filter(|_| !args.preflight) {
                 crate::declared_land::refuse_primitive_options(&args)?;
                 let report = crate::declared_land::land(
@@ -2181,6 +2191,7 @@ where
                         workspace: &args.workspace,
                         retire: args.retire,
                         push: args.push,
+                        gate_only: args.gate_only,
                     },
                     output,
                 )
