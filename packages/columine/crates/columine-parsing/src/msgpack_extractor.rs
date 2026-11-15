@@ -203,7 +203,7 @@ fn extract_msgpack_fields(
     // The discriminant, once its key has been read: discriminated columns and
     // enum ordinals resolve against it. Canonical encoders sort keys, so a
     // discriminator key that sorts before `value` is always seen first; a
-    // producer that spells `value` earlier resolves undiscriminated, unless
+    // producer that spells `value` earlier finds no row, unless
     // the discriminator is `type`, which is looked ahead for.
     let mut discriminant: Option<&str> = None;
     // The signal type, which selects the schema nested payload members are
@@ -489,7 +489,7 @@ fn extract_msgpack_member(
     let place = if placed {
         lookup_name.and_then(|name| {
             config
-                .lookup_payload_member(discriminant, member.unwrap_or(name), name)
+                .lookup_member(discriminant, member.unwrap_or(name), name, payload)
                 .map(|place| (place, member.unwrap_or(name)))
         })
     } else {
@@ -1709,6 +1709,12 @@ mod tests {
         let discriminator = crate::PayloadDiscriminator {
             key: "type".into(),
             members: vec![
+                crate::DiscriminatedMember {
+                    discriminant: "close".into(),
+                    member: "outcome".into(),
+                    path: Vec::new(),
+                    column: 2,
+                },
                 crate::DiscriminatedMember {
                     discriminant: "close".into(),
                     member: "authorRole".into(),

@@ -60,6 +60,8 @@ fn range_rows() -> Vec<DiscriminatedMember> {
     ]
 }
 
+/// The whole-member rows of `order_id` and `qty`, each unless `members` names
+/// that member, then `members`.
 fn create(
     envelope: Option<&[u8]>,
     members: Vec<DiscriminatedMember>,
@@ -72,7 +74,15 @@ fn create(
         schemas.as_ref(),
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members,
+            members: ["order_id", "qty"]
+                .into_iter()
+                .zip(1..)
+                .filter(|(member, _)| members.iter().all(|row| row.member != *member))
+                .map(|(member, column)| row(member, &[], column))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .chain(members)
+                .collect(),
         }),
         CellLayout::default(),
     )

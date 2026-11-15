@@ -504,7 +504,7 @@ fn semantic_batches_refuse_exhausted_memory() {
         semantic_schema: Some(envelope.to_vec()),
         payload_discriminator: Some(PayloadDiscriminator {
             key: "type".into(),
-            members: vec![DiscriminatedMember {
+members: vec![DiscriminatedMember { discriminant: "close".into(), member: "outcome".into(), path: Vec::new(), column: 3 },DiscriminatedMember { discriminant: "close".into(), member: "items".into(), path: Vec::new(), column: 4 },DiscriminatedMember { discriminant: "close".into(), member: "meta".into(), path: Vec::new(), column: 5 },DiscriminatedMember { discriminant: "close".into(), member: "tally".into(), path: Vec::new(), column: 8 },DiscriminatedMember { discriminant: "close".into(), member: "pick".into(), path: Vec::new(), column: 9 },DiscriminatedMember {
                 discriminant: "close".into(),
                 member: "authorRole".into(),
                 path: Vec::new(),

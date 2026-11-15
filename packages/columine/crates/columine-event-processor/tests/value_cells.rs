@@ -229,7 +229,22 @@ fn schema(columns: &[Column], envelope: &str) -> DynamicSchemaConfig {
         semantic_schema: Some(envelope.as_bytes().to_vec()),
         payload_discriminator: Some(PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+            // Every member column is `order`'s member of that name, by a row.
+            members: columns
+                .iter()
+                .enumerate()
+                .filter_map(|(column, named)| {
+                    let member = named.name.strip_prefix("value.")?;
+                    (!member.starts_with('$')).then(|| {
+                        columine_arrow::schema::DiscriminatedMember {
+                            discriminant: "order".into(),
+                            member: member.into(),
+                            path: Vec::new(),
+                            column,
+                        }
+                    })
+                })
+                .collect(),
         }),
         ..DynamicSchemaConfig::with_field_names(&message, &fields, &names).unwrap()
     }

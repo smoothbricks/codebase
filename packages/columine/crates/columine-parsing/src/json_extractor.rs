@@ -528,7 +528,7 @@ fn extract_json_event_open(
     // The discriminant, once its key has been read: discriminated columns and
     // enum ordinals resolve against it. Canonical encoders sort keys, so a
     // discriminator key that sorts before `value` is always seen first; a
-    // producer that spells `value` earlier resolves undiscriminated, unless
+    // producer that spells `value` earlier finds no row, unless
     // the discriminator is `type`, which is looked ahead for.
     let mut discriminant: Option<String> = None;
     // The signal type, which selects the schema nested payload members are
@@ -839,7 +839,7 @@ fn extract_named_member(
         MemberSchema::Unjudged | MemberSchema::Declared(_) => true,
     };
     let place = if placed {
-        config.lookup_payload_member(discriminant, member, column_name)
+        config.lookup_member(discriminant, member, column_name, payload)
     } else {
         None
     };
@@ -2055,6 +2055,12 @@ mod tests {
         crate::PayloadDiscriminator {
             key: "type".into(),
             members: vec![
+                crate::DiscriminatedMember {
+                    discriminant: "close".into(),
+                    member: "outcome".into(),
+                    path: Vec::new(),
+                    column: 2,
+                },
                 crate::DiscriminatedMember {
                     discriminant: "close".into(),
                     member: "authorRole".into(),

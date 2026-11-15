@@ -106,8 +106,8 @@ fn stored(
 const VARIANT: &str = "value.$variant.order.data";
 
 /// A member the owner names dynamic as `(event type, member)` marks the
-/// discriminated column that places it, so the column's own name spelled
-/// flat reaches the same dynamic cell as the nested member.
+/// discriminated column that places it, so the member spelled flat reaches
+/// the same dynamic cell as the nested member.
 #[test]
 fn a_named_dynamic_members_null_is_data_in_its_discriminated_column_in_both_spellings() {
     let fields = [utf8(), binary()];
@@ -136,16 +136,16 @@ fn a_named_dynamic_members_null_is_data_in_its_discriminated_column_in_both_spel
     .unwrap();
     let json = br#"[
         {"type":"order","value":{"data":null}},
-        {"type":"order","value.$variant.order.data":null},
-        {"value.$variant.order.data":null,"type":"order"},
+        {"type":"order","value.data":null},
+        {"value.data":null,"type":"order"},
         {"type":"order","value":{}},
         {"type":"order"}
     ]"#;
     let order = || ("type", Mp::Str("order"));
     let events = [
         Mp::Map(vec![order(), ("value", Mp::Map(vec![("data", Mp::Nil)]))]),
-        Mp::Map(vec![order(), (VARIANT, Mp::Nil)]),
-        Mp::Map(vec![(VARIANT, Mp::Nil), order()]),
+        Mp::Map(vec![order(), ("value.data", Mp::Nil)]),
+        Mp::Map(vec![("value.data", Mp::Nil), order()]),
         Mp::Map(vec![order(), ("value", Mp::Map(Vec::new()))]),
         Mp::Map(vec![order()]),
     ];

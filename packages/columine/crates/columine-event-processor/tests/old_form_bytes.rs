@@ -160,7 +160,7 @@ fn old_form() -> DynamicSchemaConfig {
         ),
         payload_discriminator: Some(PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+members: vec![columine_arrow::schema::DiscriminatedMember { discriminant: "order".into(), member: "name".into(), path: Vec::new(), column: 1 },],
         }),
         record_members: vec![plain("qty", 3, 7), plain("note", 4, 8)],
         ..DynamicSchemaConfig::with_field_names(&message, &fields, &joined).unwrap()

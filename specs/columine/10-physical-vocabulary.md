@@ -146,25 +146,37 @@ event's semantic schema declares dynamic or that the owner names as `(event type
 (`DynamicSchemaConfig::dynamic_members`). An explicit null in a dynamic column is present whichever member or spelling
 reached it. A member a column places is dynamic by its column alone; a member the declared record holds is dynamic by
 its `(event type, member)` alone. Naming either lets a processor created without a semantic schema keep the rule, and
-naming the column reaches a column no `(event type, member)` reaches, such as a subtype's column spelled only as a flat
-key. **Placement is total.** Where a schema gives payload members columns of their own (a `value.<member>` column
-exists), every top-level member a semantic schema declares has a column or a routing row, or creation refuses the
-schema. A declared member is never dropped and never falls to the carrier. A schema that stores the whole payload in one
-`value` column places every member there. A routing row's discriminant is the event's `type`, and a schema with routing
-rows has a `value.$declared` column the embedder writes. <a id="smoo/columine!n/vocab-subtype-routes"></a> A routing row
-may also name a subtype: the payload member whose text names a row's subtype (its key) and that text. Such a row places
-its member only on rows whose key member holds that text, read from the row itself, wherever the row spells it (nested
-or flat, before or after the member); a row of no subtype places the member on every row of its type that no subtype row
-places it on. Every subtype row of one `(event type, member)` reads the same key, or creation refuses the schema. A
-routing row places its member whether or not the processor holds a semantic schema, in either payload spelling and
-whichever side of the payload `type` is spelled on: a flat `value.<member>` key takes the member's discriminated column
-and routing row as the nested member does, and a member nothing places keeps its key as its carrier path. Where payload
-members have columns of their own and the schema has no carrier, a payload member no column and no routing row places is
-refused by name (`UNPLACED_MEMBER`, with the member's path), never dropped: the rule asks for no column of any
-particular name. A routing row places its member before a plain `value.<member>` column of the same name: the plain
-column belongs to a member no row places. A placement is per `(event type, subtype, member)` and a column is per schema,
-so one type's member never lands in the column another type's member of the same name has, and one subtype's member
-never lands in another subtype's record.
+naming the column reaches a column no `(event type, member)` names, such as one a path row places a value in or, in a
+schema with no discriminator, one spelled only as a flat key. **Placement is total.** Where a schema gives payload
+members columns of their own (a `value.<member>` column exists), every top-level member a semantic schema declares has a
+column or a routing row, or creation refuses the schema. A declared member is never dropped and never falls to the
+carrier. A schema that stores the whole payload in one `value` column places every member there. A routing row's
+discriminant is the event's `type`, and a schema with routing rows has a `value.$declared` column the embedder writes.
+<a id="smoo/columine!n/vocab-subtype-routes"></a> A routing row may also name a subtype: the payload member whose text
+names a row's subtype (its key) and that text. Such a row places its member only on rows whose key member holds that
+text, read from the row itself, wherever the row spells it (nested or flat, before or after the member); a row of no
+subtype places the member on every row of its type that no subtype row places it on. Every subtype row of one
+`(event type, member)` reads the same key, or creation refuses the schema. A routing row places its member whether or
+not the processor holds a semantic schema, in either payload spelling and whichever side of the payload `type` is
+spelled on: a flat `value.<member>` key takes the member's discriminated column and routing row as the nested member
+does, and a member nothing places keeps its key as its carrier path. Where payload members have columns of their own and
+the schema has no carrier, a payload member no column and no routing row places is refused by name (`UNPLACED_MEMBER`,
+with the member's path), never dropped: the rule asks for no column of any particular name. A placement is per
+`(event type, subtype, member)` and a column is per schema, so one type's member never lands in the column another
+type's member of the same name has, and one subtype's member never lands in another subtype's record.
+
+**Rows alone place a member.** <a id="smoo/columine!n/vocab-member-rows"></a> A schema created with a discriminator
+places its payload members by its rows and by nothing else: a placement row `(event type, member, path, column)` or a
+routing row `(event type, subtype, member)`. There a column's name places nothing. A `value.<member>` column receives a
+member only through a row that names that column, on both lanes and in both payload spellings, and a top-level key that
+is no `value.<member>` spelling reaches the column of exactly its own name, never a `value.<member>` column. A member
+that no row of its event's type names has no column, whatever columns the schema has: it is carried in the carrier under
+its path when the schema has a carrier, and is otherwise refused by name (`UNPLACED_MEMBER`, with the member's path).
+Every member of an event whose type no row names, or that spells no discriminant, is such a member. Creation agrees: a
+member a semantic schema declares that no row of its type names is refused (`UnplacedMember`) whatever columns exist,
+and an enum member's dictionary is checked on its row's column alone. A schema created with no discriminator has no
+rows. There, and only there, a member's column is by definition the column named `value.<member>`, and a member with no
+such column is carried or refused in the same way.
 
 **A placement row may name a path.** <a id="smoo/columine!n/vocab-member-paths"></a> An object member that no column
 holds whole is placed value by value. A placement row is `(event type, member, path, column)`: `path` lists the member

@@ -169,7 +169,12 @@ fn record_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing::E
         semantic.then_some(&schemas),
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+            members: vec![DiscriminatedMember {
+                discriminant: "order".into(),
+                member: "name".into(),
+                path: Vec::new(),
+                column: 1,
+            }],
         }),
         CellLayout {
             cell_metadata: &[None, None, cell.clone(), cell],
@@ -378,12 +383,20 @@ fn shadowed_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing:
         semantic.then_some(&schemas),
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members: vec![DiscriminatedMember {
-                discriminant: "tally".into(),
-                member: "qty".into(),
-                path: Vec::new(),
-                column: 4,
-            }],
+            members: vec![
+                DiscriminatedMember {
+                    discriminant: "order".into(),
+                    member: "name".into(),
+                    path: Vec::new(),
+                    column: 1,
+                },
+                DiscriminatedMember {
+                    discriminant: "tally".into(),
+                    member: "qty".into(),
+                    path: Vec::new(),
+                    column: 4,
+                },
+            ],
         }),
         CellLayout {
             cell_metadata: &[None, None, cell.clone(), cell, None],
@@ -531,7 +544,12 @@ fn subtype_config() -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConf
         Some(&schemas),
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+            members: vec![DiscriminatedMember {
+                discriminant: "step".into(),
+                member: "kind".into(),
+                path: Vec::new(),
+                column: 1,
+            }],
         }),
         CellLayout {
             cell_metadata: &[None, None, Some(ENCODING.to_owned())],
@@ -720,7 +738,12 @@ fn card_config() -> (Vec<SignalSchemaField>, columine_parsing::ExtractionConfig)
         Some(&schemas),
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+            members: vec![DiscriminatedMember {
+                discriminant: "card".into(),
+                member: "box".into(),
+                path: Vec::new(),
+                column: 1,
+            }],
         }),
         CellLayout {
             cell_metadata: &[None, cell.clone(), cell.clone(), cell],

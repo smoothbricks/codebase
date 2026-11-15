@@ -175,7 +175,26 @@ fn config(opaque_ext: Option<i8>) -> ([SignalSchemaField; 6], ExtractionConfig) 
         None,
         Some(&PayloadDiscriminator {
             key: "type".into(),
-            members: Vec::new(),
+            members: vec![
+                columine_parsing::DiscriminatedMember {
+                    discriminant: "order".into(),
+                    member: "data".into(),
+                    path: Vec::new(),
+                    column: 1,
+                },
+                columine_parsing::DiscriminatedMember {
+                    discriminant: "order".into(),
+                    member: "name".into(),
+                    path: Vec::new(),
+                    column: 2,
+                },
+                columine_parsing::DiscriminatedMember {
+                    discriminant: "order".into(),
+                    member: "meta".into(),
+                    path: Vec::new(),
+                    column: 3,
+                },
+            ],
         }),
         CellLayout {
             cell_metadata: &[None, cell.clone(), None, cell.clone(), cell.clone(), cell],

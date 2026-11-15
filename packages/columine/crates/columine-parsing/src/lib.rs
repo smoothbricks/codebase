@@ -225,8 +225,10 @@ pub struct ExtractionConfig {
     /// Whether any column names a `value.<field>` payload path — the arming
     /// condition for the nested-envelope descent in the extractors.
     pub(crate) has_value_fields: bool,
-    /// The envelope key whose string value discriminates payload members;
-    /// `None` leaves every nested member resolving by its plain name.
+    /// The envelope key whose string value discriminates payload members.
+    /// A schema that has one places its payload members by its rows alone;
+    /// `None` is the schema with no rows, whose members resolve by their
+    /// `value.<member>` column's name.
     pub(crate) discriminator_key: Option<String>,
     /// `(discriminant, payload member)` → where the caller's placement rows
     /// ([`PayloadDiscriminator`]) put it: its discriminated column, or a
@@ -698,30 +700,19 @@ impl ExtractionConfig {
         }
     }
 
-    /// The column the lanes write `member` of an event of `event_type` to:
-    /// its discriminated column, else none when its routing row places it in
-    /// the declared record, else its `value.<member>` column, when a member
-    /// writes that column.
+    /// The column the lanes write `member` of an event of `event_type` to,
+    /// when a member writes that column: the column its placement row names
+    /// or, in a schema with no discriminator, its `value.<member>` column.
     fn placed_column(&self, event_type: &str, member: &str) -> Option<usize> {
         let lookup = match self.variant_map.get(event_type, member) {
             Some(Placed::Column(lookup)) => Some(lookup),
             Some(Placed::Members(_)) => None,
-            None if self.routes_to_record(event_type, member) => None,
+            None if self.discriminator_key.is_some() => None,
             None => self.payload_map.get(member),
         };
         lookup
             .map(|lookup| lookup.column)
             .filter(|column| self.member_write(*column).is_some())
-    }
-
-    /// Whether a routing row places `member` of `discriminant` in the
-    /// declared record: a plain `value.<member>` column then belongs to
-    /// another type's member, never to this one
-    /// (specs/columine/10-physical-vocabulary.md §7).
-    fn routes_to_record(&self, discriminant: &str, member: &str) -> bool {
-        !self.record_routes.is_empty() && self.record_routes.get(discriminant, member).is_some()
-            || !self.subtype_routes.is_empty()
-                && self.subtype_routes.get(discriminant, member).is_some()
     }
 
     /// The payload member whose text names the subtype that places `member`
@@ -828,37 +819,40 @@ impl ExtractionConfig {
         }
     }
 
-    pub(crate) fn lookup_field(&self, name: &str) -> Option<&FieldLookup> {
-        self.field_map
-            .get(name)
-            .or_else(|| self.payload_map.get(name))
-    }
-
     /// Whether `name` is the envelope member carrying the discriminant.
     pub(crate) fn is_discriminator_key(&self, name: &[u8]) -> bool {
         self.discriminator_key.as_deref().map(str::as_bytes) == Some(name)
     }
 
-    /// Resolve one nested-payload member: its discriminated column for this
-    /// discriminant first, then none when its routing row places it in the
-    /// declared record, then the plain `value.<member>` column.
-    pub(crate) fn lookup_payload_member(
+    /// The place of one member of an event
+    /// (specs/columine/10-physical-vocabulary.md §7 "Rows alone place a
+    /// member"). In a schema with a discriminator a payload member has the
+    /// place its row for `discriminant` names and no other, so none when no
+    /// row names it or when its routing row places it in the declared
+    /// record, and a system member (`payload` false) has the column of
+    /// exactly its own name. Only a schema with no discriminator, which has
+    /// no rows, resolves a payload member by `name`, its `value.<member>`
+    /// spelling.
+    pub(crate) fn lookup_member(
         &self,
         discriminant: Option<&str>,
         member: &str,
-        column_name: &str,
+        name: &str,
+        payload: bool,
     ) -> Option<Place<'_>> {
-        if let Some(discriminant) = discriminant {
-            if !self.variant_map.is_empty()
-                && let Some(placed) = self.variant_map.get(discriminant, member)
-            {
-                return Some(placed.place());
-            }
-            if self.routes_to_record(discriminant, member) {
-                return None;
-            }
+        let named = self.field_map.get(name);
+        if self.discriminator_key.is_none() {
+            return named
+                .or_else(|| self.payload_map.get(name))
+                .copied()
+                .map(Place::Column);
         }
-        self.lookup_field(column_name).copied().map(Place::Column)
+        if !payload {
+            return named.copied().map(Place::Column);
+        }
+        self.variant_map
+            .get(discriminant?, member)
+            .map(Placed::place)
     }
 
     /// The values of the schema dictionary `column` is encoded against;
@@ -1915,6 +1909,9 @@ pub fn build_extraction_config_with_semantic_schemas(
                     // An enum is no object: the placement check refuses the
                     // paths of these rows.
                     Some(Placed::Members(_)) => return Ok(()),
+                    // In a schema with a discriminator a member no row
+                    // names has no column.
+                    None if discriminator.is_some() => return Ok(()),
                     None => match payload_map.get(member) {
                         Some(lookup) => lookup,
                         None => return Ok(()),
