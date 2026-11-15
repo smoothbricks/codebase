@@ -507,6 +507,7 @@ fn semantic_batches_refuse_exhausted_memory() {
             members: vec![DiscriminatedMember {
                 discriminant: "close".into(),
                 member: "authorRole".into(),
+                path: Vec::new(),
                 column: 6,
             }],
         }),

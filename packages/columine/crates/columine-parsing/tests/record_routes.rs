@@ -371,6 +371,7 @@ fn shadowed_config(semantic: bool) -> (Vec<SignalSchemaField>, columine_parsing:
             members: vec![DiscriminatedMember {
                 discriminant: "tally".into(),
                 member: "qty".into(),
+                path: Vec::new(),
                 column: 4,
             }],
         }),

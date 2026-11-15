@@ -759,11 +759,17 @@ pub struct PayloadDiscriminator {
     pub members: Vec<DiscriminatedMember>,
 }
 
-/// One `(discriminant, payload member)` → column binding.
+/// One placement row: the column that holds, for events of `discriminant`,
+/// the payload member `member`, or the one value beneath it that `path`
+/// leads to (specs/columine/10-physical-vocabulary.md §7 "A placement row
+/// may name a path"). `path` lists member names from the member down, to any
+/// depth; empty, the column holds the whole member. A member with path rows
+/// is an object no column holds: each of its values has a row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscriminatedMember {
     pub discriminant: String,
     pub member: String,
+    pub path: Vec<String>,
     pub column: usize,
 }
 

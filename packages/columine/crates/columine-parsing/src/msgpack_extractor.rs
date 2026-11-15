@@ -8,9 +8,9 @@ use crate::validate::{
     encoded_segment_len, parse_msgpack_value, push_path_segment,
 };
 use crate::{
-    Carrier, CellWriter, ColumnValue, DynamicColumns, EmptyCell, ExtractionConfig,
-    FrameProjections, MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell,
-    SignalSchemaField, json_extractor::ExtractionError,
+    Carrier, CellWriter, ColumnValue, DynamicColumns, EmptyCell, ExtractionConfig, FieldLookup,
+    FrameProjections, MemberPath, MemberSchema, MemberWrite, NullCell, ParseError, Place, Placed,
+    PlaneKind, SeamCell, SignalSchemaField, json_extractor::ExtractionError, placed_beneath,
 };
 use columine_types::category::CategoryImage;
 
@@ -485,66 +485,52 @@ fn extract_msgpack_member(
         MemberSchema::UndeclaredOpen => false,
         MemberSchema::Unjudged | MemberSchema::Declared(_) => true,
     };
-    let lookup = if placed {
+    let place = if placed {
         lookup_name.and_then(|name| {
-            config.lookup_payload_member(discriminant, member.unwrap_or(name), name)
+            config
+                .lookup_payload_member(discriminant, member.unwrap_or(name), name)
+                .map(|place| (place, member.unwrap_or(name)))
         })
     } else {
         None
-    }
-    .and_then(|lookup| {
-        config
+    };
+    let lookup = match place {
+        Some((Place::Members(rows), member)) => {
+            return extract_placed_object(
+                reader,
+                config,
+                columns,
+                frames,
+                rows,
+                member_schema,
+                &MemberPath::top(member),
+                image,
+                cells,
+                scratch,
+            );
+        }
+        Some((Place::Column(lookup), _)) => config
             .member_write(lookup.column)
-            .map(|write| (lookup, write))
-    });
+            .map(|write| (lookup, write)),
+        None => None,
+    };
     if let Some((lookup, write)) = lookup {
-        let takes = matches!(write, MemberWrite::Seam(SeamCell::Embedder))
-            && config.takes_opaque(lookup.column);
-        if opaque_here && !takes {
-            return Err(opaque_refusal(cell_path));
-        }
-        // A column's cell is one form for every row: the column decides its
-        // null, whichever member or spelling reached it.
-        let null = config.column_null(lookup.column);
-        match write {
-            MemberWrite::Lane => {
-                let dictionary = config.schema_dictionary(lookup.column);
-                extract_typed_value(
-                    reader,
-                    lookup.field,
-                    columns,
-                    lookup.column,
-                    dictionary,
-                    null,
-                    frames,
-                    image,
-                )?;
-            }
-            MemberWrite::Seam(cell) => {
-                let capture = match member_schema {
-                    MemberSchema::Declared(schema) => path
-                        .filter(|name| config.is_open_payload_path(name))
-                        .map(|name| (schema, name)),
-                    MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
-                };
-                seam_member(
-                    reader,
-                    config,
-                    columns,
-                    lookup.column,
-                    cell,
-                    capture,
-                    empty,
-                    null,
-                    opaque(takes),
-                    frames,
-                    cells,
-                    scratch,
-                )?;
-            }
-        }
-        columns.columns_seen[lookup.column] = true;
-        return Ok(());
+        return write_member_column(
+            reader,
+            config,
+            columns,
+            frames,
+            lookup,
+            write,
+            member_schema,
+            empty,
+            path.map(MemberPath::top),
+            cell_path,
+            opaque_here,
+            image,
+            cells,
+            scratch,
+        );
     }
     // A payload member without a column that the layout routes lives in the
     // row's declared record, under its routing row, whether or not a semantic
@@ -640,6 +626,189 @@ fn extract_msgpack_member(
     Ok(())
 }
 
+/// Write one member's value into the column that places it: the lane's own
+/// coercion, or the value-cell seam's cell. `member_path` keys the capture of
+/// what an open object beneath the member does not declare, and `cell_path`
+/// is the path a refusal of the reserved opaque extension names.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column write, reached from a member and from a value a path row places"
+)]
+fn write_member_column(
+    reader: &mut Reader<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    frames: &mut FrameWrites<'_>,
+    lookup: FieldLookup,
+    write: MemberWrite,
+    member_schema: MemberSchema<'_>,
+    empty: EmptyCell<'_>,
+    member_path: Option<MemberPath<'_>>,
+    cell_path: &str,
+    opaque_here: bool,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    let takes = matches!(write, MemberWrite::Seam(SeamCell::Embedder))
+        && config.takes_opaque(lookup.column);
+    if opaque_here && !takes {
+        return Err(opaque_refusal(cell_path));
+    }
+    // A column's cell is one form for every row: the column decides its
+    // null, whichever member or spelling reached it.
+    let null = config.column_null(lookup.column);
+    match write {
+        MemberWrite::Lane => {
+            let dictionary = config.schema_dictionary(lookup.column);
+            extract_typed_value(
+                reader,
+                lookup.field,
+                columns,
+                lookup.column,
+                dictionary,
+                null,
+                frames,
+                image,
+            )?;
+        }
+        MemberWrite::Seam(cell) => {
+            let capture = match (member_schema, member_path) {
+                (MemberSchema::Declared(schema), Some(path))
+                    if config.is_open_member_path(&path)? =>
+                {
+                    Some((schema, path))
+                }
+                (
+                    MemberSchema::Declared(_)
+                    | MemberSchema::Unjudged
+                    | MemberSchema::UndeclaredOpen,
+                    _,
+                ) => None,
+            };
+            seam_member(
+                reader,
+                config,
+                columns,
+                lookup.column,
+                cell,
+                capture,
+                empty,
+                null,
+                OpaqueCell {
+                    read: config.opaque_read(takes),
+                    path: cell_path,
+                },
+                frames,
+                cells,
+                scratch,
+            )?;
+        }
+    }
+    columns.columns_seen[lookup.column] = true;
+    Ok(())
+}
+
+/// Store an object member no column holds whole, value by value, the
+/// MessagePack twin of the JSON extractor's `extract_placed_object`
+/// (specs/columine/10-physical-vocabulary.md §7 "A placement row may name a
+/// path"): each member `rows` names goes to its column or, an object itself,
+/// to the rows beneath it. A nil object writes nothing, so every cell of its
+/// rows stays null; a member no row names is refused by name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the member seam's state, the rows and schema of one object and its path"
+)]
+fn extract_placed_object(
+    reader: &mut Reader<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    frames: &mut FrameWrites<'_>,
+    rows: &[(String, Placed)],
+    schema: MemberSchema<'_>,
+    path: &MemberPath<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    match reader.input().get(reader.position()) {
+        Some(0xc0) => {
+            reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+            return Ok(());
+        }
+        Some(0x80..=0x8f | 0xde | 0xdf) => {}
+        Some(_) => return Err(ExtractionError::InvalidFieldType),
+        None => return Err(ExtractionError::InvalidJson),
+    }
+    let members = reader
+        .read_map_header()
+        .ok_or(ExtractionError::InvalidJson)?;
+    for _ in 0..members {
+        let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
+        // A key that is not UTF-8 is one no row names.
+        let name = std::str::from_utf8(key).ok();
+        let member_path = MemberPath::beneath(path, name.unwrap_or(NON_UTF8_KEY));
+        let member_schema = name.map_or(MemberSchema::Unjudged, |name| schema.beneath(name));
+        let placed = name
+            .and_then(|name| placed_beneath(rows, name))
+            .map(Placed::place);
+        let lookup = match placed {
+            Some(Place::Members(beneath)) => {
+                extract_placed_object(
+                    reader,
+                    config,
+                    columns,
+                    frames,
+                    beneath,
+                    member_schema,
+                    &member_path,
+                    image,
+                    cells,
+                    scratch,
+                )?;
+                continue;
+            }
+            Some(Place::Column(lookup)) => config
+                .member_write(lookup.column)
+                .map(|write| (lookup, write)),
+            None => None,
+        };
+        let Some((lookup, write)) = lookup else {
+            return Err(ExtractionError::UnplacedMember {
+                path: member_path.refusal_path()?,
+            });
+        };
+        let empty = EmptyCell::of_placed(member_schema);
+        if empty.empty_text && holds_empty_str(reader) {
+            reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+            continue;
+        }
+        // Only a reserved opaque extension's refusal names the cell.
+        let opaque_here = config.opaque_ext.is_some_and(|ext| holds_ext(reader, ext));
+        let cell_path = if config.opaque_ext.is_some() {
+            member_path.refusal_path()?
+        } else {
+            String::new()
+        };
+        write_member_column(
+            reader,
+            config,
+            columns,
+            frames,
+            lookup,
+            write,
+            member_schema,
+            empty,
+            Some(member_path),
+            &cell_path,
+            opaque_here,
+            image,
+            cells,
+            scratch,
+        )?;
+    }
+    Ok(())
+}
 /// Coerce one MessagePack value into one column.
 ///
 /// The Arrow-plane coercion table is one contract, shared in spirit with
@@ -946,7 +1115,7 @@ fn seam_member(
     columns: &mut DynamicColumns,
     column: usize,
     cell: SeamCell,
-    capture: Option<(&SemanticSchema, &str)>,
+    capture: Option<(&SemanticSchema, MemberPath<'_>)>,
     empty: EmptyCell<'_>,
     null: NullCell,
     opaque: OpaqueCell<'_>,
@@ -1536,11 +1705,13 @@ mod tests {
                 crate::DiscriminatedMember {
                     discriminant: "close".into(),
                     member: "authorRole".into(),
+                    path: Vec::new(),
                     column: 3,
                 },
                 crate::DiscriminatedMember {
                     discriminant: "open".into(),
                     member: "authorRole".into(),
+                    path: Vec::new(),
                     column: 4,
                 },
             ],

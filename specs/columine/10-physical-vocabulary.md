@@ -163,6 +163,23 @@ column belongs to a member no row places. A placement is per `(event type, subty
 so one type's member never lands in the column another type's member of the same name has, and one subtype's member
 never lands in another subtype's record.
 
+**A placement row may name a path.** <a id="smoo/columine!n/vocab-member-paths"></a> An object member that no column
+holds whole is placed value by value. A placement row is `(event type, member, path, column)`: `path` lists the member
+names that lead, beneath the member and to any depth, to the one value the column holds, and a row with an empty path
+places the whole member in its column. A member with path rows is placed, on both lanes and in both payload spellings.
+The lane descends the member's object and writes each value a row names into that row's column, with the coercion every
+member's column has: a value of the wrong type is a type violation there as in any member's column, and so is a value
+that is not an object where the rows name members beneath it. A member the object does not spell leaves its column's
+cell null, and a null or missing object leaves the cell of every one of its rows null. A value a row places follows its
+own schema as a top-level member does: a dynamic value makes its column dynamic, an enum's column is its dictionary, and
+an optional bounded string's empty text is its empty cell. The rows state every value of the object they place: a member
+beneath it that no row names has no place, carrier or not, and the event that spells it is refused by name
+(`UNPLACED_MEMBER`, with its path from `value`). Two rows of the same path are one placement, the later row's. Creation
+refuses rows of one `(event type, member)` that give a column both to a member and to a member beneath it. Where a
+semantic schema declares the event, creation also refuses a row whose path the schema does not have (a name the object
+at that depth does not declare, or a step beneath a value that is not an object), and, placement being total, a member
+the placed object declares that no row names.
+
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
 at the top of a cell that takes it reaches the seam unread, as its payload bytes: its view's kind is `unknown` and

@@ -121,6 +121,7 @@ fn a_named_dynamic_members_null_is_data_in_its_discriminated_column_in_both_spel
             members: vec![DiscriminatedMember {
                 discriminant: "order".into(),
                 member: "data".into(),
+                path: Vec::new(),
                 column: 1,
             }],
         }),

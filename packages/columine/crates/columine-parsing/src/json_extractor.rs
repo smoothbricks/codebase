@@ -2,8 +2,10 @@
 
 use crate::{
     ArrowType, Carrier, CellWriter, ColumnValue, DynamicColumns, EmptyCell, ExtractionConfig,
-    MemberSchema, MemberWrite, NullCell, ParseError, PlaneKind, SeamCell, SignalSchemaField,
+    FieldLookup, MemberPath, MemberSchema, MemberWrite, NullCell, ParseError, Place, Placed,
+    PlaneKind, SeamCell, SignalSchemaField,
     json_parser::{JsonParser, JsonStr, ParserError, Token},
+    placed_beneath,
     validate::{
         JsonValue, SemanticSchema, ValueKind, ValueParseError, ValueView, encode_segment_into,
         encoded_segment_len, push_path_segment,
@@ -836,86 +838,50 @@ fn extract_named_member(
         MemberSchema::UndeclaredOpen => false,
         MemberSchema::Unjudged | MemberSchema::Declared(_) => true,
     };
-    let lookup = if placed {
+    let place = if placed {
         config.lookup_payload_member(discriminant, member, column_name)
     } else {
         None
-    }
-    .and_then(|lookup| {
-        config
-            .member_write(lookup.column)
-            .map(|write| (lookup, write))
-    });
-    if let Some((lookup, write)) = lookup {
-        // A column's cell is one form for every row: the column decides its
-        // null, whichever member or spelling reached it.
-        let null = config.column_null(lookup.column);
-        let capture_schema = match member_schema {
-            MemberSchema::Declared(schema) => Some(schema),
-            MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
-        }
-        .filter(|_| config.is_open_payload_path(payload_name));
-        let extraction_result = match write {
-            MemberWrite::Seam(cell) => seam_member(
+    };
+    let lookup = match place {
+        Some(Place::Members(rows)) => {
+            return extract_placed_object(
                 parser,
                 config,
                 columns,
-                lookup.column,
-                cell,
-                capture_schema.map(|schema| (schema, payload_name)),
-                empty,
-                null,
+                diagnostic,
+                extra,
+                extra_count,
+                rows,
+                member_schema,
+                &MemberPath::top(member),
+                image,
                 cells,
                 scratch,
-            ),
-            MemberWrite::Lane => {
-                let dictionary = config.schema_dictionary(lookup.column);
-                match (capture_schema, extra.as_mut()) {
-                    (Some(schema), Some(extra_writer)) => {
-                        let mut path = String::new();
-                        push_path_segment(&mut path, payload_name)
-                            .map_err(|_| ExtractionError::MemoryExhausted)?;
-                        extract_typed_value_with_capture(
-                            parser,
-                            lookup.field,
-                            columns,
-                            lookup.column,
-                            diagnostic,
-                            Some((extra_writer, extra_count, &mut path, schema)),
-                            dictionary,
-                            null,
-                            image,
-                        )
-                    }
-                    _ => extract_typed_value_with_capture(
-                        parser,
-                        lookup.field,
-                        columns,
-                        lookup.column,
-                        diagnostic,
-                        None,
-                        dictionary,
-                        null,
-                        image,
-                    ),
-                }
-            }
-        };
-        if let Err(err) = extraction_result {
-            // Fill in diagnostic context that the typed-value failure did
-            // not set at its source.
-            if diagnostic.field_index == NO_FIELD {
-                diagnostic.field_index = lookup.column as u16;
-            }
-            if diagnostic.expected_type == 0 {
-                diagnostic.expected_type = lookup.field.arrow_type as u8;
-            }
-            diagnostic.row_index = columns.count.min(u16::MAX as u32) as u16;
-            diagnostic.complete(&err);
-            return Err(err);
+            );
         }
-        columns.columns_seen[lookup.column] = true;
-        return Ok(());
+        Some(Place::Column(lookup)) => config
+            .member_write(lookup.column)
+            .map(|write| (lookup, write)),
+        None => None,
+    };
+    if let Some((lookup, write)) = lookup {
+        return write_member_column(
+            parser,
+            config,
+            columns,
+            diagnostic,
+            extra,
+            extra_count,
+            lookup,
+            write,
+            member_schema,
+            empty,
+            MemberPath::top(payload_name),
+            image,
+            cells,
+            scratch,
+        );
     }
     // A payload member without a column that the layout routes lives in the
     // row's declared record, under its routing row, whether or not a semantic
@@ -1013,6 +979,205 @@ fn extract_named_member(
     parser.skip_value().map_err(lex_error)
 }
 
+/// Write one member's value into the column that places it: the lane's own
+/// coercion, or the value-cell seam's cell. `member_path` keys the capture of
+/// what an open object beneath the member does not declare.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column write, reached from a member and from a value a path row places"
+)]
+fn write_member_column(
+    parser: &mut JsonParser<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    diagnostic: &mut ExtractionDiagnostic,
+    extra: &mut Option<MsgpackValueWriter<'_>>,
+    extra_count: &mut u32,
+    lookup: FieldLookup,
+    write: MemberWrite,
+    member_schema: MemberSchema<'_>,
+    empty: EmptyCell<'_>,
+    member_path: MemberPath<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    // A column's cell is one form for every row: the column decides its
+    // null, whichever member or spelling reached it.
+    let null = config.column_null(lookup.column);
+    let capture_schema = match member_schema {
+        MemberSchema::Declared(schema) if config.is_open_member_path(&member_path)? => Some(schema),
+        MemberSchema::Declared(_) | MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => None,
+    };
+    let extraction_result = match write {
+        MemberWrite::Seam(cell) => seam_member(
+            parser,
+            config,
+            columns,
+            lookup.column,
+            cell,
+            capture_schema.map(|schema| (schema, member_path)),
+            empty,
+            null,
+            cells,
+            scratch,
+        ),
+        MemberWrite::Lane => {
+            let dictionary = config.schema_dictionary(lookup.column);
+            match (capture_schema, extra.as_mut()) {
+                (Some(schema), Some(extra_writer)) => {
+                    let mut path = String::new();
+                    member_path
+                        .spell_carrier(&mut path)
+                        .map_err(|_| ExtractionError::MemoryExhausted)?;
+                    extract_typed_value_with_capture(
+                        parser,
+                        lookup.field,
+                        columns,
+                        lookup.column,
+                        diagnostic,
+                        Some((extra_writer, extra_count, &mut path, schema)),
+                        dictionary,
+                        null,
+                        image,
+                    )
+                }
+                _ => extract_typed_value_with_capture(
+                    parser,
+                    lookup.field,
+                    columns,
+                    lookup.column,
+                    diagnostic,
+                    None,
+                    dictionary,
+                    null,
+                    image,
+                ),
+            }
+        }
+    };
+    if let Err(err) = extraction_result {
+        // Fill in diagnostic context that the typed-value failure did
+        // not set at its source.
+        if diagnostic.field_index == NO_FIELD {
+            diagnostic.field_index = lookup.column as u16;
+        }
+        if diagnostic.expected_type == 0 {
+            diagnostic.expected_type = lookup.field.arrow_type as u8;
+        }
+        diagnostic.row_index = columns.count.min(u16::MAX as u32) as u16;
+        diagnostic.complete(&err);
+        return Err(err);
+    }
+    columns.columns_seen[lookup.column] = true;
+    Ok(())
+}
+
+/// Store an object member no column holds whole, value by value
+/// (specs/columine/10-physical-vocabulary.md §7 "A placement row may name a
+/// path"): each member `rows` names goes to its column or, an object itself,
+/// to the rows beneath it. A null object writes nothing, so every cell of its
+/// rows stays null; a member no row names is refused by name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the member seam's state, the rows and schema of one object and its path"
+)]
+fn extract_placed_object(
+    parser: &mut JsonParser<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    diagnostic: &mut ExtractionDiagnostic,
+    extra: &mut Option<MsgpackValueWriter<'_>>,
+    extra_count: &mut u32,
+    rows: &[(String, Placed)],
+    schema: MemberSchema<'_>,
+    path: &MemberPath<'_>,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    match parser.next_token().map_err(lex_error)? {
+        Token::Null => return Ok(()),
+        Token::ObjectBegin => {}
+        other => {
+            diagnostic.set(
+                diagnostic_stage::VALUE,
+                diagnostic_detail::TYPE_MISMATCH,
+                NO_FIELD,
+                0,
+                json_value_type_of(&other),
+                columns.count,
+            );
+            return Err(ExtractionError::InvalidFieldType);
+        }
+    }
+    while !parser.is_object_end() {
+        let name = owned(parser.expect_field_name().map_err(lex_error)?)?;
+        let member_path = MemberPath::beneath(path, &name);
+        let member_schema = schema.beneath(&name);
+        let placed = placed_beneath(rows, &name).map(Placed::place);
+        let lookup = match placed {
+            Some(Place::Members(beneath)) => {
+                extract_placed_object(
+                    parser,
+                    config,
+                    columns,
+                    diagnostic,
+                    extra,
+                    extra_count,
+                    beneath,
+                    member_schema,
+                    &member_path,
+                    image,
+                    cells,
+                    scratch,
+                )?;
+                continue;
+            }
+            Some(Place::Column(lookup)) => config
+                .member_write(lookup.column)
+                .map(|write| (lookup, write)),
+            None => None,
+        };
+        let Some((lookup, write)) = lookup else {
+            diagnostic.set(
+                diagnostic_stage::VALUE,
+                diagnostic_detail::UNPLACED_MEMBER,
+                NO_FIELD,
+                0,
+                json_value_type::UNKNOWN,
+                columns.count,
+            );
+            return Err(ExtractionError::UnplacedMember {
+                path: member_path.refusal_path()?,
+            });
+        };
+        let empty = EmptyCell::of_placed(member_schema);
+        if empty.empty_text && matches!(parser.peek_token(), Ok(Token::String(text)) if text == "")
+        {
+            parser.next_token().map_err(lex_error)?;
+            continue;
+        }
+        write_member_column(
+            parser,
+            config,
+            columns,
+            diagnostic,
+            extra,
+            extra_count,
+            lookup,
+            write,
+            member_schema,
+            empty,
+            member_path,
+            image,
+            cells,
+            scratch,
+        )?;
+    }
+    parser.next_token().map_err(lex_error)?;
+    Ok(())
+}
 /// Coerce one JSON value into one column.
 ///
 /// The table is per plane KIND, not per plane: twenty-three planes reduce to
@@ -1774,7 +1939,7 @@ fn seam_member(
     columns: &mut DynamicColumns,
     column: usize,
     cell: SeamCell,
-    capture: Option<(&SemanticSchema, &str)>,
+    capture: Option<(&SemanticSchema, MemberPath<'_>)>,
     empty: EmptyCell<'_>,
     null: NullCell,
     cells: &mut CellWriter<'_>,
@@ -1893,11 +2058,13 @@ mod tests {
                 crate::DiscriminatedMember {
                     discriminant: "close".into(),
                     member: "authorRole".into(),
+                    path: Vec::new(),
                     column: 3,
                 },
                 crate::DiscriminatedMember {
                     discriminant: "open".into(),
                     member: "authorRole".into(),
+                    path: Vec::new(),
                     column: 4,
                 },
             ],

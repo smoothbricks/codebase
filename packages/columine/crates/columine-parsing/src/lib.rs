@@ -228,12 +228,13 @@ pub struct ExtractionConfig {
     /// The envelope key whose string value discriminates payload members;
     /// `None` leaves every nested member resolving by its plain name.
     pub(crate) discriminator_key: Option<String>,
-    /// `(discriminant, payload member)` → its discriminated column, from the
-    /// caller's [`PayloadDiscriminator`]. A member whose physical type differs
+    /// `(discriminant, payload member)` → where the caller's placement rows
+    /// ([`PayloadDiscriminator`]) put it: its discriminated column, or a
+    /// column for each value beneath it. A member whose physical type differs
     /// between discriminants lives in a column of its own on the flat lane,
     /// and an admitted nested payload must land in that same column or the
     /// member is silently lost to the carrier.
-    pub(crate) variant_map: MemberTable<FieldLookup>,
+    pub(crate) variant_map: MemberTable<Placed>,
     /// The values of every dictionary of the creation call's table, in table
     /// order; a stream dictionary's values are empty, they are its owner's.
     pub(crate) dictionaries: Vec<Vec<Option<String>>>,
@@ -354,6 +355,157 @@ impl<T> MemberTable<T> {
     }
 }
 
+/// Where the placement rows put one payload member, or one member beneath an
+/// object they place (specs/columine/10-physical-vocabulary.md §7 "A
+/// placement row may name a path").
+#[derive(Clone, Debug)]
+pub(crate) enum Placed {
+    /// One column holds the value whole.
+    Column(FieldLookup),
+    /// No column holds the object: each member beneath it has its own place,
+    /// held sorted by name.
+    Members(Vec<(String, Placed)>),
+}
+
+impl Placed {
+    /// The place a first row of `path` opens.
+    fn opened(path: &[String], lookup: FieldLookup) -> Self {
+        if path.is_empty() {
+            Self::Column(lookup)
+        } else {
+            Self::Members(Vec::new())
+        }
+    }
+
+    /// Put the value `path` leads to in `lookup`'s column. A later row of
+    /// the same path replaces the earlier one; a column for a member and for
+    /// a member beneath it is refused.
+    fn bind(&mut self, path: &[String], lookup: FieldLookup) -> Result<(), ConfigError> {
+        match (self, path.split_first()) {
+            (Self::Column(held), None) => {
+                *held = lookup;
+                Ok(())
+            }
+            (Self::Members(members), Some((name, rest))) => {
+                let index = match members.binary_search_by(|(held, _)| held.as_str().cmp(name)) {
+                    Ok(index) => index,
+                    Err(index) => {
+                        members
+                            .try_reserve(1)
+                            .map_err(|_| ConfigError::OutOfMemory)?;
+                        members.insert(index, (owned(name)?, Self::opened(rest, lookup)));
+                        index
+                    }
+                };
+                members[index].1.bind(rest, lookup)
+            }
+            (Self::Column(_), Some(_)) | (Self::Members(_), None) => {
+                Err(ConfigError::MemberRowsDisagree)
+            }
+        }
+    }
+
+    pub(crate) fn place(&self) -> Place<'_> {
+        match self {
+            Self::Column(lookup) => Place::Column(*lookup),
+            Self::Members(members) => Place::Members(members),
+        }
+    }
+}
+
+/// The place of `name` among the `members` the rows place beneath an object.
+pub(crate) fn placed_beneath<'a>(
+    members: &'a [(String, Placed)],
+    name: &str,
+) -> Option<&'a Placed> {
+    members
+        .binary_search_by(|(held, _)| held.as_str().cmp(name))
+        .ok()
+        .map(|index| &members[index].1)
+}
+
+/// How a lane stores one payload member: whole in a column, or value by
+/// value through the rows beneath it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Place<'a> {
+    Column(FieldLookup),
+    Members(&'a [(String, Placed)]),
+}
+
+/// A payload member's names from the payload down, the innermost last. A
+/// lane holds one link per object it has entered and spells the path only
+/// where one is asked for: a capture's carrier key, a refusal's path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemberPath<'a> {
+    parent: Option<&'a MemberPath<'a>>,
+    name: &'a str,
+}
+
+impl<'a> MemberPath<'a> {
+    /// A top-level payload member.
+    pub(crate) fn top(name: &'a str) -> Self {
+        Self { parent: None, name }
+    }
+
+    /// The member `name` of the object at `parent`.
+    pub(crate) fn beneath(parent: &'a MemberPath<'a>, name: &'a str) -> Self {
+        Self {
+            parent: Some(parent),
+            name,
+        }
+    }
+
+    /// Append the names as written, joined by `.`.
+    fn spell(&self, out: &mut String) -> Result<(), std::collections::TryReserveError> {
+        if let Some(parent) = self.parent {
+            parent.spell(out)?;
+            out.try_reserve(1)?;
+            out.push('.');
+        }
+        out.try_reserve(self.name.len())?;
+        out.push_str(self.name);
+        Ok(())
+    }
+
+    /// Append the carrier's spelling: each name escaped, joined by `.`.
+    pub(crate) fn spell_carrier(
+        &self,
+        out: &mut String,
+    ) -> Result<(), std::collections::TryReserveError> {
+        if let Some(parent) = self.parent {
+            parent.spell_carrier(out)?;
+        }
+        crate::validate::push_path_segment(out, self.name).map(|_| ())
+    }
+
+    /// The path a refusal names the member by: `value.` and its names.
+    pub(crate) fn refusal_path(&self) -> Result<String, json_extractor::ExtractionError> {
+        let mut path = String::new();
+        path.try_reserve("value.".len())
+            .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+        path.push_str("value.");
+        self.spell(&mut path)
+            .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+        Ok(path)
+    }
+}
+
+impl<'a> MemberSchema<'a> {
+    /// How the member's object schema declares the member `name` beneath it.
+    /// A name it does not declare is unjudged: no row places it, so the lane
+    /// refuses it whatever its schema.
+    pub(crate) fn beneath(self, name: &str) -> Self {
+        match self {
+            Self::Declared(schema) => schema
+                .object_fields()
+                .iter()
+                .find(|(field, _)| field == name)
+                .map_or(Self::Unjudged, |(_, field)| Self::Declared(field)),
+            Self::Unjudged | Self::UndeclaredOpen => Self::Unjudged,
+        }
+    }
+}
+
 /// A nested payload member as its event's own schema declares it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MemberSchema<'a> {
@@ -403,6 +555,20 @@ impl EmptyCell<'_> {
         empty_text: false,
         below: None,
     };
+
+    /// The empty states of a value a path row places, from its own schema:
+    /// its null is its column's, and its empty text is judged as a top-level
+    /// member's is.
+    pub(crate) fn of_placed<'a>(schema: MemberSchema<'a>) -> EmptyCell<'a> {
+        match schema {
+            MemberSchema::Declared(schema) => EmptyCell {
+                null: NullCell::Empty,
+                empty_text: schema.empty_text_is_empty(),
+                below: schema.states_empty_text_below().then_some(schema),
+            },
+            MemberSchema::Unjudged | MemberSchema::UndeclaredOpen => EmptyCell::NULL,
+        }
+    }
 
     /// Leave a structured value of the member without the empty texts that
     /// are empty states beneath it, as the embedder is to write it.
@@ -537,15 +703,13 @@ impl ExtractionConfig {
     /// the declared record, else its `value.<member>` column, when a member
     /// writes that column.
     fn placed_column(&self, event_type: &str, member: &str) -> Option<usize> {
-        self.variant_map
-            .get(event_type, member)
-            .or_else(|| {
-                if self.routes_to_record(event_type, member) {
-                    None
-                } else {
-                    self.payload_map.get(member)
-                }
-            })
+        let lookup = match self.variant_map.get(event_type, member) {
+            Some(Placed::Column(lookup)) => Some(lookup),
+            Some(Placed::Members(_)) => None,
+            None if self.routes_to_record(event_type, member) => None,
+            None => self.payload_map.get(member),
+        };
+        lookup
             .map(|lookup| lookup.column)
             .filter(|column| self.member_write(*column).is_some())
     }
@@ -622,6 +786,24 @@ impl ExtractionConfig {
         self.open_paths.iter().any(|open| open == path)
     }
 
+    /// Whether the object at `path` is open, as [`Self::is_open_payload_path`]
+    /// answers for a top-level member.
+    pub(crate) fn is_open_member_path(
+        &self,
+        path: &MemberPath<'_>,
+    ) -> Result<bool, json_extractor::ExtractionError> {
+        if path.parent.is_none() {
+            return Ok(self.is_open_payload_path(path.name));
+        }
+        if self.open_paths.is_empty() {
+            return Ok(false);
+        }
+        let mut spelled = String::new();
+        path.spell(&mut spelled)
+            .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
+        Ok(self.is_open_payload_path(&spelled))
+    }
+
     /// How one nested payload member of an event of `event_type` is judged by
     /// that event's OWN schema. Columns are shared across signal types, so a
     /// member resolves against the schema of the type that carries it, never
@@ -665,18 +847,18 @@ impl ExtractionConfig {
         discriminant: Option<&str>,
         member: &str,
         column_name: &str,
-    ) -> Option<&FieldLookup> {
+    ) -> Option<Place<'_>> {
         if let Some(discriminant) = discriminant {
             if !self.variant_map.is_empty()
-                && let Some(lookup) = self.variant_map.get(discriminant, member)
+                && let Some(placed) = self.variant_map.get(discriminant, member)
             {
-                return Some(lookup);
+                return Some(placed.place());
             }
             if self.routes_to_record(discriminant, member) {
                 return None;
             }
         }
-        self.lookup_field(column_name)
+        self.lookup_field(column_name).copied().map(Place::Column)
     }
 
     /// The values of the schema dictionary `column` is encoded against;
@@ -797,10 +979,12 @@ impl ExtractionConfig {
     /// Placement is total (specs/columine/10-physical-vocabulary.md §7):
     /// where the lanes descend the payload, every top-level member an event's
     /// object schema declares resolves, as the lanes resolve it, to a column
-    /// a member writes or to a record routing row. A whole-payload `value`
-    /// column places every member, so a schema without `value.<member>`
-    /// columns has nothing to place.
-    fn check_placement(&self) -> Result<(), ConfigError> {
+    /// a member writes, to a record routing row, or to path rows that place
+    /// every value beneath it. A whole-payload `value` column places every
+    /// member, so a schema without `value.<member>` columns has nothing to
+    /// place. A dynamic value a path row places marks its column in
+    /// `dynamic_columns`.
+    fn check_placement(&self, dynamic_columns: &mut [bool]) -> Result<(), ConfigError> {
         let Some(schemas) = self
             .semantic_schemas
             .as_ref()
@@ -812,12 +996,68 @@ impl ExtractionConfig {
             let crate::validate::SemanticSchema::Object { fields, .. } = schema else {
                 continue;
             };
-            for (member, _) in fields {
+            for (member, declared) in fields {
+                if let Some(Placed::Members(rows)) = self.variant_map.get(event_type, member) {
+                    self.check_path_rows(declared, rows, dynamic_columns)?;
+                    continue;
+                }
                 let placed = self.placed_column(event_type, member).is_some()
                     || self.record_routes.get(event_type, member).is_some()
                     || self.subtype_routes.get(event_type, member).is_some();
                 if !placed {
                     return Err(ConfigError::UnplacedMember);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The path rows beneath one member against the schema that declares it
+    /// (specs/columine/10-physical-vocabulary.md §7 "A placement row may name
+    /// a path"): the member is an object, every row names a member it
+    /// declares, and every member it declares has a row. A value a row
+    /// places follows its own schema: a dynamic one makes its column dynamic
+    /// and an enum's column is its dictionary.
+    fn check_path_rows(
+        &self,
+        schema: &crate::validate::SemanticSchema,
+        rows: &[(String, Placed)],
+        dynamic_columns: &mut [bool],
+    ) -> Result<(), ConfigError> {
+        let mut object = schema;
+        while let crate::validate::SemanticSchema::Optional(inner) = object {
+            object = inner;
+        }
+        let crate::validate::SemanticSchema::Object { fields, .. } = object else {
+            return Err(ConfigError::UnknownMemberPath);
+        };
+        if rows
+            .iter()
+            .any(|(name, _)| !fields.iter().any(|(field, _)| field == name))
+        {
+            return Err(ConfigError::UnknownMemberPath);
+        }
+        for (name, declared) in fields {
+            match placed_beneath(rows, name) {
+                None => return Err(ConfigError::UnplacedMember),
+                Some(Placed::Members(beneath)) => {
+                    self.check_path_rows(declared, beneath, dynamic_columns)?;
+                }
+                Some(Placed::Column(lookup)) => {
+                    if self.member_write(lookup.column).is_none() {
+                        return Err(ConfigError::UnplacedMember);
+                    }
+                    if declared.is_dynamic() {
+                        dynamic_columns[lookup.column] = true;
+                    }
+                    if let Some(variants) = declared.enum_variants() {
+                        check_enum_dictionary(
+                            &self.column_dictionaries,
+                            &self.dictionaries,
+                            lookup.column,
+                            variants,
+                        )?;
+                    }
                 }
             }
         }
@@ -1033,7 +1273,7 @@ pub(crate) fn member_cell(
     column: usize,
     value: &dyn ValueView,
     null: NullCell,
-    capture: Option<(&crate::validate::SemanticSchema, &str)>,
+    capture: Option<(&crate::validate::SemanticSchema, MemberPath<'_>)>,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> Result<(), json_extractor::ExtractionError> {
@@ -1052,7 +1292,7 @@ pub(crate) fn member_cell(
     )?;
     if let Some((schema, name)) = capture {
         let mut path = String::new();
-        crate::validate::push_path_segment(&mut path, name)
+        name.spell_carrier(&mut path)
             .map_err(|_| json_extractor::ExtractionError::MemoryExhausted)?;
         undeclared_below(config, schema, value, &mut path, cells)?;
     }
@@ -1288,6 +1528,13 @@ pub enum ConfigError {
     /// A member an event's object schema declares resolves to no column and
     /// no record routing row.
     UnplacedMember,
+    /// A placement row's path names, under an event's semantic schema, a
+    /// member the object at that depth does not declare, or a step beneath a
+    /// value that is not an object.
+    UnknownMemberPath,
+    /// Placement rows of one `(discriminant, member)` give a column both to a
+    /// member and to a member beneath it.
+    MemberRowsDisagree,
     /// Record routing rows without a discriminator key, or without a
     /// [`DECLARED_RECORD_COLUMN_NAME`] Binary column the processor writes.
     RecordColumnMissing,
@@ -1424,6 +1671,25 @@ fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
     String::from_utf8(decoded)
         .map(Some)
         .map_err(|_| ConfigError::InvalidPresenceField)
+}
+
+/// An enum's column is a schema-dictionary column whose values are the
+/// enum's variants in order.
+fn check_enum_dictionary(
+    column_dictionaries: &[Option<usize>],
+    dictionaries: &[Vec<Option<String>>],
+    column: usize,
+    variants: &[String],
+) -> Result<(), ConfigError> {
+    let values = column_dictionaries
+        .get(column)
+        .copied()
+        .flatten()
+        .and_then(|position| dictionaries.get(position));
+    match values {
+        Some(values) if values.iter().flatten().eq(variants) => Ok(()),
+        Some(_) | None => Err(ConfigError::EnumDictionaryMismatch),
+    }
 }
 
 pub fn build_extraction_config(
@@ -1586,14 +1852,15 @@ pub fn build_extraction_config_with_semantic_schemas(
             let field = fields
                 .get(member.column)
                 .ok_or(ConfigError::InvalidDiscriminatedColumn)?;
-            variant_map.bind(
-                &member.discriminant,
-                &member.member,
-                FieldLookup {
-                    column: member.column,
-                    field: *field,
-                },
-            )?;
+            let lookup = FieldLookup {
+                column: member.column,
+                field: *field,
+            };
+            variant_map
+                .entry(&member.discriminant, &member.member, || {
+                    Ok(Placed::opened(&member.path, lookup))
+                })?
+                .bind(&member.path, lookup)?;
         }
     }
     // An enum member's column is a schema-dictionary column whose values are
@@ -1603,21 +1870,22 @@ pub fn build_extraction_config_with_semantic_schemas(
     if let Some(semantic_schemas) = semantic_schemas {
         for (event_type, schema) in semantic_schemas {
             crate::validate::collect_enum_members(schema, |member, variants| {
-                let Some(lookup) = variant_map
-                    .get(event_type, member)
-                    .or_else(|| payload_map.get(member))
-                else {
-                    return Ok(());
+                let lookup = match variant_map.get(event_type, member) {
+                    Some(Placed::Column(lookup)) => lookup,
+                    // An enum is no object: the placement check refuses the
+                    // paths of these rows.
+                    Some(Placed::Members(_)) => return Ok(()),
+                    None => match payload_map.get(member) {
+                        Some(lookup) => lookup,
+                        None => return Ok(()),
+                    },
                 };
-                let values = column_dictionaries
-                    .get(lookup.column)
-                    .copied()
-                    .flatten()
-                    .and_then(|position| schema_dictionaries.get(position));
-                match values {
-                    Some(values) if values.iter().flatten().eq(variants) => Ok(()),
-                    Some(_) | None => Err(ConfigError::EnumDictionaryMismatch),
-                }
+                check_enum_dictionary(
+                    &column_dictionaries,
+                    &schema_dictionaries,
+                    lookup.column,
+                    variants,
+                )
             })?;
         }
     }
@@ -1706,7 +1974,6 @@ pub fn build_extraction_config_with_semantic_schemas(
         },
     );
     config.dynamic_members = dynamic_members;
-    config.dynamic_columns = dynamic_columns;
     // The reserved opaque extension is the embedder's alone: it never shadows
     // the bigint extension, a processor with no embedder has no seam to hand
     // its values to, and a carrier columine writes itself would capture one
@@ -1718,7 +1985,8 @@ pub fn build_extraction_config_with_semantic_schemas(
     {
         return Err(ConfigError::InvalidOpaqueExt);
     }
-    config.check_placement()?;
+    config.check_placement(&mut dynamic_columns)?;
+    config.dynamic_columns = dynamic_columns;
     Ok(config)
 }
 

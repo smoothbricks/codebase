@@ -894,11 +894,21 @@ impl SemanticSchema {
 
     /// The fields of an object, beneath any `optional`; none for any other
     /// kind.
-    fn object_fields(&self) -> &[(String, Self)] {
+    pub(crate) fn object_fields(&self) -> &[(String, Self)] {
         match self {
             Self::Optional(inner) => inner.object_fields(),
             Self::Object { fields, .. } => fields,
             _ => &[],
+        }
+    }
+
+    /// The variants of an enum, beneath any `optional`; none for any other
+    /// kind.
+    pub(crate) fn enum_variants(&self) -> Option<&[String]> {
+        match self {
+            Self::Optional(inner) => inner.enum_variants(),
+            Self::Enum(variants) => Some(variants),
+            _ => None,
         }
     }
     pub fn is_open_object(&self) -> bool {
@@ -1001,11 +1011,7 @@ pub(crate) fn collect_enum_members<E>(
         return Ok(());
     };
     for (name, field) in fields {
-        let mut inner = field;
-        while let SemanticSchema::Optional(next) = inner {
-            inner = next;
-        }
-        if let SemanticSchema::Enum(variants) = inner {
+        if let Some(variants) = field.enum_variants() {
             visit(name, variants)?;
         }
     }
