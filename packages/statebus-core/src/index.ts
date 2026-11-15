@@ -121,6 +121,7 @@ export {
   recordScenario,
   replayScenario,
   type ScenarioRecorder,
+  type ScenarioRecorderOptions,
   type StateCheckpoint,
 } from './recording.js';
 export {

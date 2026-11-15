@@ -83,9 +83,16 @@ export function captureCheckpoint(runtime: ComposedRuntime, options: CheckpointC
   return Object.freeze({ formatVersion: 1, schema: runtime.composition.metadata, states: Object.freeze(states) });
 }
 
+export interface ScenarioRecorderOptions {
+  readonly maxEvents?: number;
+  /** Canonical bytes of each explicit checkpoint. Omitted, `captureCheckpoint`'s own default applies. */
+  readonly maxCheckpointBytes?: number;
+  /** Canonical bytes of one checkpoint entry or one event payload. Omitted, the capture defaults apply. */
+  readonly maxEntryBytes?: number;
+}
 export function recordScenario(
   runtime: ComposedRuntime,
-  { maxEvents = 1024 }: { readonly maxEvents?: number } = {},
+  { maxEvents = 1024, maxCheckpointBytes, maxEntryBytes }: ScenarioRecorderOptions = {},
 ): ScenarioRecorder {
   if (!Number.isSafeInteger(maxEvents) || maxEvents < 1)
     throw new RangeError('maxEvents must be a positive safe integer.');
@@ -93,7 +100,9 @@ export function recordScenario(
   for (const entry of runtime.composition.metadata)
     if (!entry.schema || entry.version === undefined)
       throw new Error(`Replay codec missing: ${entry.owner}/${entry.name}`);
-  let checkpoint = captureCheckpoint(runtime);
+  // The first checkpoint also validates both byte limits before any wave is observed.
+  const capture = () => captureCheckpoint(runtime, { maxBytes: maxCheckpointBytes, maxEntryBytes });
+  let checkpoint = capture();
   const waves: RecordedWave[] = [];
   let count = 0;
   let complete = true;
@@ -104,7 +113,7 @@ export function recordScenario(
       try {
         for (let index = 0; index < length; index++) {
           const event = queue[index];
-          if (event?.kind === 'event') events.push(ownEvent(event.capture()));
+          if (event?.kind === 'event') events.push(ownEvent(event.capture(), maxEntryBytes));
         }
       } catch (cause) {
         complete = false;
@@ -135,7 +144,7 @@ export function recordScenario(
     snapshot: () => Object.freeze({ formatVersion: 1, checkpoint, waves: Object.freeze([...waves]), complete }),
     reset() {
       if (closed) throw new Error('Recorder is disposed.');
-      checkpoint = captureCheckpoint(runtime);
+      checkpoint = capture();
       waves.length = 0;
       count = 0;
       complete = true;
