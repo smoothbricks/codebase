@@ -179,7 +179,8 @@ fn waiting_line(queues: &[LandTurnQueue]) -> String {
         .join("; ");
     format!(
         "await-turns: the install waits for {ahead} land turn(s) queued before it: {holders}; \
-         lands that ask meanwhile wait behind it"
+         it is fenced the moment the last of them ends, with no hand: a land among them takes its \
+         ref turn inside its turn, and lands that ask meanwhile wait behind the install"
     )
 }
 
