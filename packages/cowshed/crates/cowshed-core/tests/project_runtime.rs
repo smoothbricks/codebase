@@ -2310,6 +2310,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     assert_eq!(ended.state, JobState::Exited);
 }
 
+//#region smoo/cowshed!n/job-calls-beside-router
 /// A fork holds the router for as long as it runs, and a job's status is none of what it holds
 /// (07_api.md, "A job's calls are its supervisor's to answer"): with a create held open inside
 /// its clone step, a status read of a job the controller admitted earlier is answered by the
@@ -2398,6 +2399,7 @@ async fn a_job_s_status_is_answered_while_a_fork_holds_the_router() {
     gate.notify_one();
     fork.await.expect("the fork ends once released");
 }
+//#endregion smoo/cowshed!n/job-calls-beside-router
 
 /// A job process the test speaks for: the supervisor hands each spawned job's event sender to
 /// the test, which admits the job's output and ends it through that sender, in the order it

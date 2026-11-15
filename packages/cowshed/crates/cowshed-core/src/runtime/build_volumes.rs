@@ -8204,6 +8204,7 @@ fn main() {
             .await;
     }
 
+    //#region smoo/cowshed!n/reseed-skip-by-hold
     /// A fork of a workspace a job is admitted on, and writing its build volume, clones the seed
     /// as it is (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional
     /// writers", step 1): the reseed is skipped at the build hold before the job's volume is
@@ -8290,6 +8291,7 @@ fn main() {
     async fn real_apfs_a_fork_of_a_source_a_job_writes_keeps_the_seed() {
         a_fork_of_a_source_a_job_writes_keeps_the_seed(Scratch::new("build-busy-fork")).await;
     }
+    //#endregion smoo/cowshed!n/reseed-skip-by-hold
     /// An external land (16_build_volumes.md, "Which volume a seed holds"): main's branch moves
     /// by plain git to the tree `lander` has checked out, and `lander`'s build volume holds a
     /// marker output nothing in main built. A fork of main at that tree inherits the marker
@@ -8712,6 +8714,7 @@ fn main() {
         );
     }
 
+    //#region smoo/cowshed!n/reseed-skip-by-hold
     /// The census that names a skipped reseed's holders is waited for only to its bound
     /// (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional writers",
     /// step 1): one held off past the bound answers nothing, and one that answers is heard.
@@ -8726,6 +8729,7 @@ fn main() {
             Some(7)
         );
     }
+    //#endregion smoo/cowshed!n/reseed-skip-by-hold
 
     /// Build volume `id`, mounted, its image recording `gib` GiB: a clone of the run's blank
     /// image put in place, once `registration` is registered, and mounted the way a fork's

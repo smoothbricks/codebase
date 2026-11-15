@@ -2016,22 +2016,22 @@ One boundary answer, no ambiguity:
   Stream-lane requests, demands and closes continue while the non-stream queue is full; the client neither opens extra
   connections nor retries or suppresses a controller conflict. A fatal connection error fails queued calls as well as
   calls already sent.
-- **A job's calls are its supervisor's to answer.** The project router is serial because its operations share the
-  controller's one host state: a fork, a land, a rename, a destroy, a grant, an admission and every other call that
-  reads or changes workspaces, mounts, records or the set of supervisors the controller reaches run one at a time, in
-  arrival order. A fork excludes exactly those. A call that names a job (`job.status`, `worker.job`, `job.wait`,
-  `job.kill`, `job.detach`, `job.logs`) needs none of that state once the controller holds a lane to the job's
-  supervisor: the lane an admission of that workspace left, either the resident lane (06_cli.md, "Resident workspaces")
-  or the handle of the supervisor the controller started or found serving. The router answers such a call beside the
-  operation it serves, on a task of its own: one `hello` on the lane proves that the supervisor still serves the
-  incarnation the call names, a grant advance followed, and the supervisor, the one writer of its jobs, answers. The
-  call's repository and, on a worker connection, its workspace and incarnation are checked against the connection's
-  authority first, from the request alone. A call with no lane, with a lane whose supervisor retired or serves another
-  incarnation, or with a request its connection's authority does not cover takes the serial route, which starts a
-  supervisor, answers from the sealed records or refuses, as for every job call not listed here. A status read is
-  therefore answered in one supervisor round trip however long a fork runs, and a heartbeat's `busy` names an operation
-  only the serial calls queue behind. Any other process may send a supervisor the same calls at any time, so the
-  router's order never fenced them.
+- <a id="smoo/cowshed!n/job-calls-beside-router"></a>**A job's calls are its supervisor's to answer.** The project
+  router is serial because its operations share the controller's one host state: a fork, a land, a rename, a destroy, a
+  grant, an admission and every other call that reads or changes workspaces, mounts, records or the set of supervisors
+  the controller reaches run one at a time, in arrival order. A fork excludes exactly those. A call that names a job
+  (`job.status`, `worker.job`, `job.wait`, `job.kill`, `job.detach`, `job.logs`) needs none of that state once the
+  controller holds a lane to the job's supervisor: the lane an admission of that workspace left, either the resident
+  lane (06_cli.md, "Resident workspaces") or the handle of the supervisor the controller started or found serving. The
+  router answers such a call beside the operation it serves, on a task of its own: one `hello` on the lane proves that
+  the supervisor still serves the incarnation the call names, a grant advance followed, and the supervisor, the one
+  writer of its jobs, answers. The call's repository and, on a worker connection, its workspace and incarnation are
+  checked against the connection's authority first, from the request alone. A call with no lane, with a lane whose
+  supervisor retired or serves another incarnation, or with a request its connection's authority does not cover takes
+  the serial route, which starts a supervisor, answers from the sealed records or refuses, as for every job call not
+  listed here. A status read is therefore answered in one supervisor round trip however long a fork runs, and a
+  heartbeat's `busy` names an operation only the serial calls queue behind. Any other process may send a supervisor the
+  same calls at any time, so the router's order never fenced them.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step

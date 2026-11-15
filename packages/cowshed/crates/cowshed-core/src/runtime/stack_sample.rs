@@ -124,6 +124,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
     }
 
+    //#region smoo/cowshed!n/late-sampler-report
     /// A sampler that has not ended at its bound is left running, and the failure names the
     /// report it writes (05_gateway.md, "Deadlines"): the stand-in sampler is held at a FIFO
     /// past a zero bound, and once released its stacks are in the file the failure named.
@@ -177,6 +178,7 @@ mod tests {
         assert_eq!(stacks, b"stacks");
         assert!(!report.exists(), "the read report is removed");
     }
+    //#endregion smoo/cowshed!n/late-sampler-report
 }
 
 #[cfg(not(target_os = "macos"))]
