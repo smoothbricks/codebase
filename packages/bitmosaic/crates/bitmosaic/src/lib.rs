@@ -27,6 +27,7 @@
 
 mod admission;
 mod array;
+mod bitmap;
 mod ef;
 #[cfg(any(test, feature = "bench-internals"))]
 pub mod oracle;
@@ -35,6 +36,7 @@ mod range;
 mod wire;
 
 pub use admission::{AdmissionClass, AdmissionError};
+pub use bitmap::{BitmapIter, BitmapView, Image, bitmap_len, bitmap_seal, bitmap_set};
 pub use ef::EfView;
 pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,

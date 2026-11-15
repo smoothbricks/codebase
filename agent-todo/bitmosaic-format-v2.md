@@ -6,7 +6,22 @@
 [specs/bitmosaic/prototypes/format-2/README.md](../specs/bitmosaic/prototypes/format-2/README.md). Where this brief and
 the spec differ, the spec is right. It supersedes `agent-todo/bitmosaic-tiny-sets.md`, whose measured defect it closes.
 
-The rules that decide the design, quoted from the spec:
+## Delivered: the Bitmap root
+
+The crate reads and writes format 2's Bitmap root (spec §4) and nothing else of format 2: `src/bitmap.rs` (`BitmapView`
+with `open`, `open_admitted`, `extent`, `bytes`, `len`, `is_empty`, `word`, `contains`, `rank`, `iter`; the writer
+`bitmap_len`, `bitmap_set`, `bitmap_seal`; `Image::open`, which tells the format by the first byte, admits format 1 as
+before and refuses every other format-2 root by name). `tests/bitmap_root.rs` holds it to the corpus's Bitmap rows and
+refusals and to the laws `one_image.bend` (a trimmed bitmap is the written one) and `bitmap_probe.bend` (rank by whole
+words and one masked word; AND word by word; the `k`-th member has `k` below it). Its first caller is a storing format
+whose field is always a Bitmap (§7.3).
+
+So of the order of work below, step 1 exists for the Bitmap alone and step 2's Bitmap half is done. What remains: Single
+and List; the lean Elias-Fano root; the sealed and forest rules (§7) and the writers that apply them; `select` and a
+two-image `and_len` on the Bitmap (nothing calls them yet, and the wiring lint refuses an export with no caller); the
+`u64` directory; patching; the law tests of the other forms; the ports. The uses waiting on those: a datom store's
+set-typed values, n-gram and posting tails (List), a deduplication set's runs (Single). The rules that decide the
+design, quoted from the spec:
 
 - §1: "Format 2 is an additive version. An image of format 1 … begins with the bytes `42 4D 53`; no image of format 2
   begins with `42`. A reader of format 2 reads format 1 as well, and nothing written in format 1 is rewritten."

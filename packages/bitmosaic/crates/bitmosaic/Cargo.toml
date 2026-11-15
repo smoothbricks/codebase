@@ -12,6 +12,56 @@ item = "as_str"
 consumer = "private"
 why = "an embedder reports the bitmap admission rule beside its image-relative offset without reparsing the image"
 
+[[package.metadata.wiring.external]]
+item = "BitmapView"
+consumer = "private"
+why = "a storing format whose field is always the Bitmap root reads it with no dispatch on the control byte"
+
+[[package.metadata.wiring.external]]
+item = "open_admitted"
+consumer = "private"
+why = "a kernel reopens a Bitmap its certifying pass admitted, with the extent checked and the last-byte rule not repeated"
+
+[[package.metadata.wiring.external]]
+item = "extent"
+consumer = "private"
+why = "a Bitmap is embedded with no outer length, so its reader finds the next field by the image's own extent"
+
+[[package.metadata.wiring.external]]
+item = "bytes"
+consumer = "private"
+why = "a certifying pass compares a frame's bitmap bytes with what its descriptor allows"
+
+[[package.metadata.wiring.external]]
+item = "word"
+consumer = "private"
+why = "a column's place in a frame is the population count of the frame's words under the descriptor's own masks"
+
+[[package.metadata.wiring.external]]
+item = "BitmapIter"
+consumer = "private"
+why = "a certifying pass walks a frame's positions and returns its refusal from inside the walk"
+
+[[package.metadata.wiring.external]]
+item = "bitmap_len"
+consumer = "private"
+why = "a writer that holds no slice of positions reserves a frame's bytes from its greatest position"
+
+[[package.metadata.wiring.external]]
+item = "bitmap_set"
+consumer = "private"
+why = "a writer names a frame's columns one at a time while it lays their buffers into the same output"
+
+[[package.metadata.wiring.external]]
+item = "bitmap_seal"
+consumer = "private"
+why = "a writer closes a frame once its last column is named"
+
+[[package.metadata.wiring.external]]
+item = "Image"
+consumer = "private"
+why = "a consumer that holds a set-typed value tells its format by the first byte and refuses by name what this version does not read"
+
 [dependencies]
 
 [features]
@@ -35,6 +85,7 @@ wasm-scalar-portable = []
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
 roaring = "0.10"
+serde_json = { workspace = true }
 
 [[bench]]
 name = "ops"

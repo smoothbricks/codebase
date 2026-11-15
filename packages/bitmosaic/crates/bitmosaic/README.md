@@ -47,6 +47,29 @@ into `Bitmosaic64`. Lazy intersection, union, difference, and symmetric-differen
 intermediate member buffer. Seeking into a long run is arithmetic; counting run intersections works on intervals rather
 than enumerating their members.
 
+## Format 2: the Bitmap root
+
+[Format 2](../../../../specs/bitmosaic/01-format.md) is specified whole; this version of the crate reads and writes one
+of its roots, the Bitmap (§4): one control byte `0x80 | n` and `n` bitmap bytes, bit `j` of byte `i` the member
+`8 i + j`, the last byte not zero, members `0..=1015`. The empty set is the single byte `80`. It is a bare little-endian
+bitset behind one byte, so `{0, 1, 2, 9}` is `82 07 02`.
+
+- `BitmapView::open(image)` is the form's direct entry: no dispatch on the control. `image` may run past the image (its
+  extent comes from the control, `extent()`); the view keeps the longer slice, so `word(i)` is one load masked to the
+  bitmap. It refuses a control that is no Bitmap's (`kind` at byte 0), a bitmap cut short (`extent` at byte 0) and a
+  last byte of zero (`extent` at that byte). `open_admitted` skips the last-byte rule for bytes a pass admitted. Reads:
+  `contains`, `rank`, `len`, `is_empty`, `word`, `bytes`, `iter`.
+- Writing needs no slice of members and never holds the buffer between calls: `bitmap_len(last)` bytes zeroed,
+  `bitmap_set(image, v)` per member, `bitmap_seal(image, last)` writes the control and answers the extent.
+- `Image::open(bytes)` is the entry for a caller that does not know the form: a first byte with the high bit set is a
+  Bitmap, `42 4D 53` is a format-1 image admitted as `open_verified` admits it, and every other root of format 2
+  (Single, List, Elias-Fano, the directories) is refused by name as `kind`: this version does not read them.
+
+Which form a set takes (the sealed-image rule of §7.1) is not in this version: a caller of the direct entry writes a
+Bitmap by its own rule (§7.3). Measured on 3,248 frames of 4.3 bytes (random probes, the 8 instructions of the probe
+loop included, host load 17): open and `contains` 31 instructions and 7 cycles, open and `rank` 68 and 13, the members
+two frames share by two word ANDs 73 and 11, writing a frame of 15 members 236 and 49.
+
 ## Native v1
 
 This is bitmosaic's native format, not the standard Roaring format. There is no legacy-format reader.

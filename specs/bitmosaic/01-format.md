@@ -35,8 +35,8 @@ A set is written `{a, b, ..}`; `first` and `last` are its least and greatest mem
 
 ## 3. The control byte
 
-The first byte of an image is its control. It names the form and, for the three small forms, everything needed to find
-the image's end.
+<a id="smoo/bitmosaic!n/control-byte"></a> The first byte of an image is its control. It names the form and, for the
+three small forms, everything needed to find the image's end.
 
 | Control                             | Form            | Image                                                                           |
 | ----------------------------------- | --------------- | ------------------------------------------------------------------------------- |
@@ -62,8 +62,8 @@ The empty set is the Bitmap of no bytes: the single byte `80`, for `u32` and `u6
 [1..1+n)   the bitmap                bit j of byte i is the member 8 i + j
 ```
 
-- The image is `1 + n` bytes: a bare little-endian bitset of `8 n` positions behind one byte. Loaded as 64-bit words,
-  bit `v mod 64` of word `v div 64` is the member `v`.
+- <a id="smoo/bitmosaic!n/bitmap-root"></a> The image is `1 + n` bytes: a bare little-endian bitset of `8 n` positions
+  behind one byte. Loaded as 64-bit words, bit `v mod 64` of word `v div 64` is the member `v`.
 - The last bitmap byte is not zero (trailing zero bytes are trimmed), so `n = last div 8 + 1` and the form holds members
   `0..=1015`.
 - The cardinality is the population count of the `n` bytes.
@@ -297,8 +297,9 @@ Three entries, by what the caller needs. None allocates.
 | `open_verified`  | `open`, every member and every derived plane (Array, Cone and Elias-Fano order; Words bounds, summary and rank entries; samples), and that the image is the sealed or the forest image of its set                                                      | bytes from outside; a region that is patched                                             |
 | `open_canonical` | `open_verified`, and that the image is the sealed image                                                                                                                                                                                                | bytes that are hashed or compared                                                        |
 
-Each form also has a direct entry that admits that form alone at `open`'s level and returns a reader with no dispatch
-(for a Bitmap: the control's high bit, `1 + n` bytes present, the last byte not zero).
+<a id="smoo/bitmosaic!n/bitmap-direct-entry"></a> Each form also has a direct entry that admits that form alone at
+`open`'s level and returns a reader with no dispatch (for a Bitmap: the control's high bit, `1 + n` bytes present, the
+last byte not zero).
 
 `image_header(bytes)` returns the image's format, form, key width and extent in bounded constant work: from the control
 alone for a Bitmap, a Single and a List; from three varints for Elias-Fano; from `body_bytes` for a `u32` directory;
