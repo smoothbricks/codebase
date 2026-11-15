@@ -39,8 +39,7 @@ use core::fmt;
 
 use crate::ef::{self, EfLayout, EfView, SAMPLE_STRIDE};
 use crate::small::{
-    K_BYTES, SmallSink, SmallView, lone_count, lone_header_len, small_form, window_count,
-    write_lone_header,
+    SMALL_PAYLOAD_MAX, SmallSet, SmallSink, is_small, small_count, small_form, small_tag,
 };
 use crate::wire::{
     BOUNDS_AT, BitmosaicView, CView, ChunkRow, EMPTY_U32_IMAGE, Forest, Geometry, IMAGE_ID_LEN,
@@ -246,26 +245,15 @@ impl<'state, W: Witness> PreparedPatch<'state, '_, W> {
                 plan.added += added;
                 plan.removed += removed;
                 plan.len = plan.len + u64::from(plan.added) - u64::from(plan.removed);
-                if plan.geometry.is_lone() {
-                    let fresh = scratch.touched[0]
-                        .fresh
-                        .expect("in place: chunk set unchanged");
-                    write_lone_header(
-                        image,
-                        fresh.kind,
-                        lone_count(fresh.kind, plan.len as u32, fresh.lone_window),
-                    );
-                } else {
-                    let body_bytes = plan.forest_total
-                        - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
-                    write_forest_header(
-                        image,
-                        plan.geometry.slot_bits,
-                        plan.len,
-                        plan.chunks as u32,
-                        body_bytes,
-                    );
-                }
+                let body_bytes = plan.forest_total
+                    - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
+                write_forest_header(
+                    image,
+                    plan.geometry.slot_bits,
+                    plan.len,
+                    plan.chunks as u32,
+                    body_bytes,
+                );
                 PatchReport {
                     added: plan.added,
                     removed: plan.removed,
@@ -409,8 +397,6 @@ struct Row {
     /// staged region when true.
     staged: bool,
     src: u32,
-    /// A Window payload's lone count ([`window_count`]); zero otherwise.
-    window: u32,
 }
 
 /// The patched form of one touched chunk: re-laddered and emitted into the
@@ -431,8 +417,6 @@ struct Fresh {
     window: (u16, u16),
     /// Bounds retained by the Words trial, so journaling does not probe it again.
     word_writes: Option<WordWrites>,
-    /// A Window payload's lone count ([`window_count`]); zero otherwise.
-    lone_window: u32,
 }
 
 /// A chunk of the old string: directory index, payload length,
@@ -1222,7 +1206,6 @@ fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
         edits: (0, 0, 0, 0),
         window: (0, 0),
         word_writes: None,
-        lone_window: 0,
     }
 }
 
@@ -1782,22 +1765,21 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
     witness: &mut W,
 ) -> Result<PreparedPlan, PatchError> {
     let view = BitmosaicView::open(slot).ok_or(PatchError::Malformed)?;
+    // The patch plans a small image as a forest of one chunk at key zero
+    // that the forest reader has no view of: the forest value carries its
+    // extent, and the chunk itself is read through `small`.
     let Root::Forest(forest) = view.root else {
         return Err(PatchError::Malformed);
     };
-    // A lone image's small chunk is one the forest reader has no view of:
-    // the forest value carries its extent and cardinality, and the chunk
-    // itself is read through `small`.
-    let small = forest.lone_small();
-    // The reader holds a lone image as a forest of no chunks; the patch
-    // plans over its one chunk.
-    let forest = if forest.geometry.is_lone() {
-        Forest {
+    let small = view.small();
+    let forest = match small {
+        Some(set) => Forest {
+            bytes: &slot[..view.serialized_len()],
+            len: u64::from(set.cardinality()),
             chunks: 1,
-            ..forest
-        }
-    } else {
-        forest
+            geometry: Geometry::lone(1),
+        },
+        None => forest,
     };
     let mut plan = match plan_forest::<W, CAPTURE>(
         &forest,
@@ -2013,7 +1995,7 @@ fn refresh_rows(scratch: &mut PatchScratch) {
 /// against the same bound.
 fn plan_forest<W: Witness, const CAPTURE: bool>(
     forest: &Forest<'_>,
-    small: Option<SmallView<'_>>,
+    small: Option<SmallSet<'_>>,
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
@@ -2044,7 +2026,9 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
             let sparse = old.card as usize + chunk_adds.len() <= ARRAY_MAX;
             let (a, r) = if sparse {
                 merge_members(
-                    (old.card as usize, |i| small.select(i as u32)),
+                    (old.card as usize, |i| {
+                        small.select(i as u32).unwrap_or(0) as u16
+                    }),
                     chunk_adds,
                     chunk_removes,
                     offsets,
@@ -2053,7 +2037,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
                 )
             } else {
                 scratch.plane.fill(0);
-                small.for_each(|v| set_bit(&mut scratch.plane, v));
+                small.for_each(|v| set_bit(&mut scratch.plane, v as u16));
                 apply(
                     &mut scratch.plane,
                     chunk_adds,
@@ -2148,7 +2132,6 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
                         ),
                         window,
                         word_writes: Some(word_writes),
-                        lone_window: 0,
                     }),
                 });
                 continue;
@@ -2253,87 +2236,64 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         len + u64::from(touched.fresh.map_or(0, |fresh| fresh.card))
             - u64::from(touched.old.map_or(0, |old| old.card))
     });
-    // A lone image has no cardinality varint; its header is priced below.
-    let lone = forest.geometry.is_lone();
-    // A lone image that stays lone holds its one chunk in the small form
-    // where that is shorter; decided here so the in-place verdict below
-    // prices the payload the image will hold.
-    if lone
-        && small.is_none()
-        && !chunk_set_changed
-        && let Some(fresh) = scratch.touched[0].fresh
-        && fresh.staged
-        && let Some((kind, staged_at, len, lone_window)) = small_payload(
-            forest.bytes,
-            scratch,
-            (true, fresh.staged_at, fresh.len),
-            fresh.kind,
-            fresh.card,
-        )
-    {
-        scratch.touched[0].fresh = Some(Fresh {
-            kind,
-            staged_at,
-            len,
-            lone_window,
-            ..fresh
-        });
-    }
     let count_width_changed = final_len == 0
         || forest.len == 0
-        || (!lone && uleb_len((final_len - 1) as u32) != uleb_len((forest.len - 1) as u32));
+        || uleb_len((final_len - 1) as u32) != uleb_len((forest.len - 1) as u32);
+    // One chunk at key zero may be a small image after the patch: more than
+    // 256 members in an Array or a Cone cannot be, and Words cannot.
+    let may_be_small = chunks == 1
+        && !chunk_set_changed
+        && chunk_key(forest, 0) == 0
+        && scratch.touched[0].fresh.is_some_and(|fresh| {
+            fresh.kind != K_WORDS
+                && (fresh.card <= 256 || fresh.kind == K_RUNS || fresh.kind == K_STRIDE)
+        });
     // Layout of the patched forest. In place needs the chunk set unchanged;
-    // otherwise the geometry moves and the string is rebuilt from rows.
-    let (forest_total, in_place) = if small.is_some() || chunk_set_changed || count_width_changed {
-        (layout_rows(forest, small, scratch), false)
-    } else {
-        let mut total = old_total;
-        let mut moved = 0usize;
-        // The in-place walk is descending, so when it reaches a chunk the
-        // string already holds every later chunk's change: its tail move
-        // needs `old_total` plus the sum of the deltas behind it, and the
-        // largest of those partial sums is the walk's transient peak. The
-        // final length bounds nothing here — a lower chunk that shrinks
-        // gives its bytes back only after a higher one has taken its own.
-        let (mut running, mut peak) = (0isize, 0isize);
-        for t in scratch.touched.iter().rev() {
-            let old = t.old.expect("chunk set unchanged");
-            let fresh = t.fresh.expect("chunk set unchanged");
-            let (was, now) = (old.len as usize, fresh.len as usize);
-            running += now as isize - was as isize;
-            peak = peak.max(running);
-            if was != now {
-                moved += old_total - old.at as usize;
-            }
-        }
-        total = (total as isize + running) as usize;
-        // Each changed footprint moves the tail once; past two copies of
-        // the string, rebuilding it is the cheaper traffic. A transient
-        // peak past the slot takes the same route rather than a refusal:
-        // the rebuild needs only the final length, so `Capacity` keeps
-        // naming the length the patched string needs and never a length
-        // the slot would hold for one copy — and the rebuild's two copies
-        // of the string are exactly the traffic bound the in-place walk
-        // is already allowed to reach.
-        let header_holds = if lone {
-            let fresh = scratch.touched[0].fresh.expect("chunk set unchanged");
-            lone_header_len(
-                fresh.kind,
-                lone_count(fresh.kind, fresh.card, fresh.lone_window),
-            ) == forest.geometry.payload_at
-        } else {
-            let old_prefix = forest.geometry.keys_at - forest_header_len(forest.len, forest.chunks);
-            frame_len(total - old_prefix) == total
-        };
-        let in_place = header_holds
-            && moved <= 2 * old_total
-            && old_total as isize + peak <= capacity as isize;
-        if !in_place {
+    // otherwise the geometry moves and the string is rebuilt from rows. A
+    // small image is always rebuilt, a few bytes.
+    let (forest_total, in_place) =
+        if small.is_some() || may_be_small || chunk_set_changed || count_width_changed {
             (layout_rows(forest, small, scratch), false)
         } else {
-            (total, true)
-        }
-    };
+            let mut total = old_total;
+            let mut moved = 0usize;
+            // The in-place walk is descending, so when it reaches a chunk the
+            // string already holds every later chunk's change: its tail move
+            // needs `old_total` plus the sum of the deltas behind it, and the
+            // largest of those partial sums is the walk's transient peak. The
+            // final length bounds nothing here — a lower chunk that shrinks
+            // gives its bytes back only after a higher one has taken its own.
+            let (mut running, mut peak) = (0isize, 0isize);
+            for t in scratch.touched.iter().rev() {
+                let old = t.old.expect("chunk set unchanged");
+                let fresh = t.fresh.expect("chunk set unchanged");
+                let (was, now) = (old.len as usize, fresh.len as usize);
+                running += now as isize - was as isize;
+                peak = peak.max(running);
+                if was != now {
+                    moved += old_total - old.at as usize;
+                }
+            }
+            total = (total as isize + running) as usize;
+            // Each changed footprint moves the tail once; past two copies of
+            // the string, rebuilding it is the cheaper traffic. A transient
+            // peak past the slot takes the same route rather than a refusal:
+            // the rebuild needs only the final length, so `Capacity` keeps
+            // naming the length the patched string needs and never a length
+            // the slot would hold for one copy — and the rebuild's two copies
+            // of the string are exactly the traffic bound the in-place walk
+            // is already allowed to reach.
+            let old_prefix = forest.geometry.keys_at - forest_header_len(forest.len, forest.chunks);
+            let header_holds = frame_len(total - old_prefix) == total;
+            let in_place = header_holds
+                && moved <= 2 * old_total
+                && old_total as isize + peak <= capacity as isize;
+            if !in_place {
+                (layout_rows(forest, small, scratch), false)
+            } else {
+                (total, true)
+            }
+        };
     ForestPass::Planned(ForestPlan {
         chunks,
         geometry: forest.geometry,
@@ -2351,7 +2311,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
 /// length.
 fn layout_rows(
     forest: &Forest<'_>,
-    small: Option<SmallView<'_>>,
+    small: Option<SmallSet<'_>>,
     scratch: &mut PatchScratch,
 ) -> usize {
     scratch.rows.clear();
@@ -2403,46 +2363,67 @@ fn chunk_of(forest: &Forest<'_>, key: u16) -> Option<usize> {
         forest.locate(key)
     }
 }
-/// The classic payload at \`(staged, src, len)\` re-emitted into the staged
-/// region in the small form, when [\`small_form\`] finds one shorter: its
-/// kind, staged offset, length and Window count.
+/// The arm payload at `(staged, src, len)` of the one chunk of a directory
+/// `directory` bytes long, re-emitted into the staged region in the small
+/// form [`small_form`] gives its set, if any: the form's kind, staged
+/// offset and length.
 fn small_payload(
     slot: &[u8],
     scratch: &mut PatchScratch,
     (staged, src, len): (bool, u32, u32),
-    kind: u32,
-    card: u32,
-) -> Option<(u32, u32, u32, u32)> {
-    // Words holds more members than a small span has positions.
-    if kind == K_WORDS || kind >= K_BYTES {
+    (kind, card): (u32, u32),
+    directory: usize,
+) -> Option<(u32, u32, u32)> {
+    // Words holds more members than any small form does.
+    if kind == K_WORDS || is_small(kind) {
         return None;
     }
-    let PatchScratch {
-        staged: region,
-        members,
-        ..
-    } = scratch;
+    let region = &mut scratch.staged;
+    // The payload behind its kind is a forest of one chunk, which is how
+    // the reader decodes a container.
     let range = src as usize..(src + len) as usize;
-    let container = CView::from_validated(
-        if staged { &region[range] } else { &slot[range] },
-        kind,
-        card,
-    );
+    let lone_at = region.len();
+    region.push(kind as u8);
+    if staged {
+        region.extend_from_within(range);
+    } else {
+        region.extend_from_slice(&slot[range]);
+    }
+    let lone = Forest {
+        bytes: &region[lone_at..],
+        len: u64::from(card),
+        chunks: 1,
+        geometry: Geometry::lone(1),
+    };
+    let container = lone.container(0)?;
     let first = container.select(0);
-    let (small_kind, small_len) =
-        small_form(len as usize, first, container.select(card - 1), card)?;
-    members.clear();
-    container.for_each(|v| members.push(v));
+    let runs = match container {
+        CView::Runs(runs) => runs.count(),
+        CView::Stride { stride: 1, .. } => 1,
+        _ if card > 256 => usize::MAX,
+        _ => {
+            let (mut runs, mut next) = (0, u32::MAX);
+            container.for_each(|v| {
+                runs += usize::from(u32::from(v) != next);
+                next = u32::from(v) + 1;
+            });
+            runs
+        }
+    };
+    let form = small_form(directory, first, container.select(card - 1), card, runs);
+    // At most 32 listed members or intervals, or 256 bitmap positions: the
+    // sink takes them from the view into a stack buffer, and the staged
+    // copy the view reads gives its bytes back.
+    let mut out = [0u8; SMALL_PAYLOAD_MAX];
+    if let Some((small_kind, small_len)) = form {
+        let mut sink = SmallSink::new(&mut out[..small_len], small_kind, first);
+        container.for_each(|v| sink.push(v));
+    }
+    region.truncate(lone_at);
+    let (small_kind, small_len) = form?;
     let at = region.len();
-    region.resize(at + small_len, 0);
-    let mut sink = SmallSink::new(&mut region[at..], small_kind, first);
-    members.iter().for_each(|&v| sink.push(v));
-    Some((
-        small_kind,
-        at as u32,
-        small_len as u32,
-        window_count(small_kind, small_len - uleb_len(u32::from(first))),
-    ))
+    region.extend_from_slice(&out[..small_len]);
+    Some((small_kind, at as u32, small_len as u32))
 }
 
 /// Give the first row the encoding its image calls for. The one chunk of a
@@ -2454,48 +2435,57 @@ fn encode_first_row(slot: &[u8], scratch: &mut PatchScratch) {
         return;
     };
     if scratch.rows.len() == 1 && row.key == 0 {
-        if let Some((kind, src, len, window)) = small_payload(
+        let directory = rows_total(&scratch.rows);
+        if let Some((kind, src, len)) = small_payload(
             slot,
             scratch,
             (row.staged, row.src, row.len),
-            row.kind,
-            row.card,
+            (row.kind, row.card),
+            directory,
         ) {
             scratch.rows[0] = Row {
                 kind,
                 src,
                 len,
-                window,
                 staged: true,
                 ..row
             };
         }
-    } else if row.kind >= K_BYTES {
+    } else if is_small(row.kind) {
         let range = row.src as usize..(row.src + row.len) as usize;
-        let small = SmallView::from_validated(
+        let small = SmallSet::from_validated(
             if row.staged {
                 &scratch.staged[range]
             } else {
                 &slot[range]
             },
             row.kind,
-            lone_count(row.kind, row.card, row.window),
+            small_count(row.kind, row.len as usize),
         );
-        scratch.members.clear();
-        small.for_each(|v| scratch.members.push(v));
-        let fresh = finish_members(scratch, row.card);
+        let fresh = if row.card as usize <= ARRAY_MAX {
+            scratch.members.clear();
+            small.for_each(|v| scratch.members.push(v as u16));
+            finish_members(scratch, row.card)
+        } else {
+            small_into_plane(small, &mut scratch.plane);
+            finish(scratch, row.card)
+        };
         scratch.rows[0] = Row {
             kind: fresh.kind,
             len: fresh.len,
             staged: true,
             src: fresh.staged_at,
-            window: 0,
             ..row
         };
     }
 }
 
-fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallView<'_>>, i: usize) {
+/// Stage a small set's members as the dense plane of chunk zero.
+fn small_into_plane(small: SmallSet<'_>, plane: &mut [u64; CHUNK_WORDS]) {
+    plane.fill(0);
+    small.for_each(|v| set_bit(plane, v as u16));
+}
+fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallSet<'_>>, i: usize) {
     if let Some(small) = small {
         rows.push(Row {
             key: 0,
@@ -2504,7 +2494,6 @@ fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallView<'_
             len: small.payload_len() as u32,
             staged: false,
             src: forest.geometry.payload_at as u32,
-            window: small.lone_count(),
         });
         return;
     }
@@ -2516,7 +2505,6 @@ fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallView<'_
         len: view_len(c),
         staged: false,
         src: payload_at(forest.bytes, forest.geometry, i) as u32,
-        window: 0,
     });
 }
 
@@ -2533,7 +2521,6 @@ fn push_fresh(rows: &mut Vec<Row>, t: Touched) {
             } else {
                 t.old.expect("an in-place chunk is an old chunk").at
             },
-            window: f.lone_window,
         });
     }
 }
@@ -2555,13 +2542,11 @@ fn geometry_of(rows: &[Row]) -> Geometry {
     if rows.is_empty() {
         return Geometry::new(0, 0, IMAGE_ID_LEN);
     }
+    // One row in a small form is the whole image behind its tag.
     if let [only] = rows
-        && only.key == 0
+        && is_small(only.kind)
     {
-        return Geometry::lone(lone_header_len(
-            only.kind,
-            lone_count(only.kind, only.card, only.window),
-        ));
+        return Geometry::lone(1);
     }
     let len = rows.iter().map(|row| u64::from(row.card)).sum();
     let body_header = forest_header_len(len, chunks);
@@ -2588,7 +2573,8 @@ fn assemble(slot: &[u8], scratch: &mut PatchScratch, total: usize, len: u64) {
     }
     if geometry.is_lone() {
         let row = scratch.rows[0];
-        let at = write_lone_header(build, row.kind, lone_count(row.kind, row.card, row.window));
+        build[0] = small_tag(row.kind, small_count(row.kind, row.len as usize));
+        let at = 1;
         let src = row.src as usize..row.src as usize + row.len as usize;
         build[at..total].copy_from_slice(if row.staged {
             &scratch.staged[src]

@@ -1,898 +1,918 @@
-//! Small sets: the containers for a chunk whose members lie within 256
-//! positions of its first, and the header of an image that is one chunk at
-//! key zero.
+//! Small sets: the image forms that need no directory, and the readers that
+//! answer from their bytes where they lie.
 //!
 //! A set of a few dozen ordinals is the common slot, and on it every byte of
-//! framing is a tenth of the image. Three things make it small, each decided
-//! by the byte count and nothing else:
+//! framing is a tenth of the image. A small image is one tag byte and the
+//! members, all below 65,536, in the shortest of four forms, each chosen
+//! for the read as much as for the size:
 //!
-//! - **Bytes.** The first member as a varint, then one byte per further
-//!   member: its distance from the first. A member costs one byte, not two.
-//! - **Window.** The first member, then a bitmap of the positions after it,
-//!   as long as the last member needs. A dense handful costs a bit a
-//!   position. Its two kinds differ only in the bitmap's length, so that the
-//!   length always fits the lone control byte.
-//! - **The lone image.** One chunk at key zero needs no chunk count, key or
-//!   length: its control byte carries the container kind and the one count
-//!   the payload does not say, and the payload follows.
+//! - **List8.** Up to 32 members below 256 as ascending bytes. `select` is
+//!   one load; `contains` and `rank` bisect.
+//! - **Window.** A bitmap of up to 32 whole bytes: bit `j` of byte `i` is
+//!   the member `8 * (start + i) + j`. `contains` is one byte load, a shift
+//!   and a mask; `rank` and the intersection of two windows are popcounts
+//!   over at most four unaligned word loads. The window is byte-aligned in
+//!   the value domain, not anchored at its first member, so two windows of
+//!   any two images share bit positions and intersect with no shift.
+//! - **List16.** Up to 32 members as ascending `u16`.
+//! - **Spans.** Up to 32 inclusive intervals as `(start, end)` pairs of
+//!   `u16`. One interval answers in closed form.
 //!
-//! The ladder still picks the in-memory arm ([`crate::choose_arm`]); a small
-//! form replaces that arm's payload on the wire when it costs fewer bytes
-//! ([`small_form`]), so the owned containers and their kernels are unchanged.
+//! Opening a small image reads its tag: the view is a pointer and a length,
+//! plus the window's start. Nothing is derived from the members, and no
+//! accessor copies them.
+//!
+//! Nothing here is shared with the directory reader ([`crate::wire`]): not
+//! a container view, not a kernel. The directory code reaches a small image
+//! only where it finds a forest of no chunks, through the `image_*`
+//! functions below, which are never inlined there. So the code compiled for
+//! a directory or an Elias-Fano root is the code compiled without this
+//! module (the compiler specializes an internal function to the set of its
+//! call sites, so one more caller of a directory function changes what
+//! every directory probe runs).
 
-use crate::wire::{read_u16_at, read_uleb_checked, runs_payload_len, uleb_len, write_uleb};
+use crate::wire::{read_u16_at, read_u32_at, read_u64_at};
 use crate::{AdmissionClass, AdmissionError};
 
-pub(crate) const K_BYTES: u32 = 5;
-/// A Window whose bitmap is 1..=16 bytes.
+/// Members below 256 as ascending bytes. Payload: the members.
+pub(crate) const K_LIST8: u32 = 5;
+/// A bitmap from value zero. Payload: the bitmap.
 pub(crate) const K_WINDOW: u32 = 6;
-/// A Window whose bitmap is 17..=32 bytes.
-pub(crate) const K_WINDOW_WIDE: u32 = 7;
+/// A bitmap from value `8 * start`. Payload: `start`, then the bitmap.
+pub(crate) const K_WINDOW_AT: u32 = 7;
+/// Members as ascending `u16`. Payload: the members.
+pub(crate) const K_LIST16: u32 = 8;
+/// Inclusive intervals. Payload: `(start: u16, end: u16)` pairs.
+pub(crate) const K_SPANS: u32 = 9;
 
-/// Largest distance from a small container's first member to its last.
-const SPAN_MAX: usize = 255;
-/// Bitmap bytes the narrow Window kind reaches; the wide kind holds the
-/// same number past them.
-const WINDOW_NARROW_MAX: usize = 16;
+/// Lowest tag of a small image, `kk lllll` with `kk` from one: the kind as
+/// `kk + 4` and the count as `lllll + 1`. The framed controls lie below.
+pub(crate) const SMALL_MIN: u8 = 0x20;
+/// First tag past the small forms.
+const SMALL_END: u8 = 0xC0;
+/// Most members of a list, bytes of a window's bitmap, intervals of Spans.
+const COUNT_MAX: usize = 32;
+/// Most payload bytes of a small image: 32 intervals.
+pub(crate) const SMALL_PAYLOAD_MAX: usize = 4 * COUNT_MAX;
 
-pub(crate) fn is_window(kind: u32) -> bool {
-    kind == K_WINDOW || kind == K_WINDOW_WIDE
+pub(crate) fn is_small(kind: u32) -> bool {
+    kind >= K_LIST8
 }
 
-/// The small form for a chunk of `card` members from `first` to `last` whose
-/// ladder arm costs `arm_len` payload bytes, or `None` when the arm stays.
-///
-/// One rule, so one image per set: the shortest payload wins; the arm wins a
-/// tie with a small form, and Bytes wins a tie with Window.
-pub(crate) fn small_form(arm_len: usize, first: u16, last: u16, card: u32) -> Option<(u32, usize)> {
-    let span = usize::from(last - first);
-    if span > SPAN_MAX {
-        return None;
-    }
-    let head = uleb_len(u32::from(first));
-    let bitmap = span.div_ceil(8);
-    let (bytes, window) = (head + card as usize - 1, head + bitmap);
-    let (kind, len) = if window >= bytes {
-        (K_BYTES, bytes)
-    } else if bitmap <= WINDOW_NARROW_MAX {
-        (K_WINDOW, window)
-    } else {
-        (K_WINDOW_WIDE, window)
-    };
-    (len < arm_len).then_some((kind, len))
-}
-
-/// A small payload's first member and the bytes it took. Attachment proved
-/// the varint; a damaged one decodes to what its first three bytes hold.
+/// A small tag's kind and count, or `None` for a byte that is not one.
 #[inline(always)]
-fn first_of(payload: &[u8]) -> (u16, usize) {
-    let mut value = 0u32;
-    for (i, &byte) in payload.iter().take(3).enumerate() {
-        value |= u32::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            return (value as u16, i + 1);
+pub(crate) fn read_small_tag(tag: u8) -> Option<(u32, u32)> {
+    (SMALL_MIN..SMALL_END)
+        .contains(&tag)
+        .then(|| (u32::from(tag >> 5) + 4, u32::from(tag & 31) + 1))
+}
+
+pub(crate) fn small_tag(kind: u32, count: u32) -> u8 {
+    ((kind - 4) as u8) << 5 | (count - 1) as u8
+}
+
+/// Payload bytes of a small image whose tag holds `count`.
+#[inline(always)]
+pub(crate) fn small_payload_len(kind: u32, count: u32) -> usize {
+    let count = count as usize;
+    match kind {
+        K_WINDOW_AT => 1 + count,
+        K_LIST16 => 2 * count,
+        K_SPANS => 4 * count,
+        _ => count,
+    }
+}
+
+/// The count a small tag holds, from its payload length: the inverse of
+/// [`small_payload_len`].
+pub(crate) fn small_count(kind: u32, payload: usize) -> u32 {
+    (match kind {
+        K_WINDOW_AT => payload - 1,
+        K_LIST16 => payload / 2,
+        K_SPANS => payload / 4,
+        _ => payload,
+    }) as u32
+}
+
+/// The small form of a set that is one chunk at key zero: `card` members
+/// from `first` to `last` in `runs` maximal runs, whose directory image
+/// would be `directory` bytes. Its kind and payload length, or `None` when
+/// the directory stays.
+///
+/// One rule, so one image per set: the shortest image wins. On a tie a
+/// small form beats the directory, and among small forms the order is
+/// Window from zero, Window, Spans, List8, List16: roughly the order of
+/// their point lookups.
+pub(crate) fn small_form(
+    directory: usize,
+    first: u16,
+    last: u16,
+    card: u32,
+    runs: usize,
+) -> Option<(u32, usize)> {
+    let (start, end) = (usize::from(first) / 8, usize::from(last) / 8);
+    let card = card as usize;
+    let candidates = [
+        (end < COUNT_MAX).then_some((K_WINDOW, end + 1)),
+        (start >= 1 && start <= 255 && end - start < COUNT_MAX)
+            .then_some((K_WINDOW_AT, 2 + end - start)),
+        (runs <= COUNT_MAX).then(|| (K_SPANS, 4 * runs)),
+        (last <= 255 && card <= COUNT_MAX).then_some((K_LIST8, card)),
+        (card <= COUNT_MAX).then_some((K_LIST16, 2 * card)),
+    ];
+    let mut best: Option<(u32, usize)> = None;
+    for candidate in candidates.into_iter().flatten() {
+        if best.is_none_or(|(_, len)| candidate.1 < len) {
+            best = Some(candidate);
         }
     }
-    (value as u16, payload.len().min(3))
+    // Every small header is the tag alone.
+    best.filter(|&(_, len)| 1 + len <= directory)
 }
 
-/// The first member of a payload under admission: a shortest-form varint
-/// within the chunk.
-fn read_first(rest: &[u8]) -> Result<(u16, usize), AdmissionError> {
-    let mut at = 0;
-    let first = read_uleb_checked(
-        rest,
-        &mut at,
-        u32::from(u16::MAX),
-        AdmissionClass::PlaneRange,
-    )?;
-    Ok((first as u16, at))
-}
-
-/// Writes a small payload from a chunk's ascending members, the first
-/// included. `out` is exactly the length [`small_form`] priced.
+/// Writes a small payload from a set's ascending members. `out` is exactly
+/// the length [`small_form`] priced.
 pub(crate) struct SmallSink<'a> {
     out: &'a mut [u8],
     kind: u32,
-    first: u16,
-    head: usize,
+    /// The value of the bitmap's bit zero.
+    base: u16,
+    /// Next list byte or pair, where the bitmap starts, or the open
+    /// interval's pair.
     at: usize,
+    /// Members written.
+    pushed: usize,
 }
 
 impl<'a> SmallSink<'a> {
     pub(crate) fn new(out: &'a mut [u8], kind: u32, first: u16) -> Self {
-        let mut head = 0;
-        write_uleb(out, &mut head, u32::from(first));
-        out[head..].fill(0);
+        out.fill(0);
+        let (base, at) = if kind == K_WINDOW_AT {
+            out[0] = (first / 8) as u8;
+            (first & !7, 1)
+        } else {
+            (0, 0)
+        };
         Self {
             out,
             kind,
-            first,
-            head,
-            at: head,
+            base,
+            at,
+            pushed: 0,
         }
     }
 
     #[inline]
     pub(crate) fn push(&mut self, member: u16) {
-        let delta = usize::from(member - self.first);
-        if delta == 0 {
-            return;
+        match self.kind {
+            K_LIST8 => {
+                self.out[self.at] = member as u8;
+                self.at += 1;
+            }
+            K_LIST16 => {
+                self.out[self.at..self.at + 2].copy_from_slice(&member.to_le_bytes());
+                self.at += 2;
+            }
+            K_SPANS => {
+                let end = self.at + 2..self.at + 4;
+                let open = self.pushed != 0
+                    && u32::from(read_u16_at(self.out, self.at + 2)) + 1 == u32::from(member);
+                if !open {
+                    if self.pushed != 0 {
+                        self.at += 4;
+                    }
+                    self.out[self.at..self.at + 2].copy_from_slice(&member.to_le_bytes());
+                }
+                let end = if open { end } else { self.at + 2..self.at + 4 };
+                self.out[end].copy_from_slice(&member.to_le_bytes());
+            }
+            _ => {
+                let bit = usize::from(member - self.base);
+                self.out[self.at + bit / 8] |= 1 << (bit % 8);
+            }
         }
-        if self.kind == K_BYTES {
-            self.out[self.at] = delta as u8;
-            self.at += 1;
-        } else {
-            self.out[self.head + (delta - 1) / 8] |= 1 << ((delta - 1) % 8);
-        }
+        self.pushed += 1;
     }
 }
 
-// ── Bytes ────────────────────────────────────────────────────────────────
+// ── reading a bitmap where it lies ───────────────────────────────────────
 
-/// `first`, then each further member's distance from it, ascending.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BytesView<'a> {
-    first: u16,
-    offsets: &'a [u8],
+/// Bits `64 * i .. 64 * i + 64` of a bitmap, zero past its end. A whole word
+/// is one unaligned load; the last, partial word is two overlapping loads of
+/// the widest power of two it holds, so no read leaves the image.
+#[inline(always)]
+fn word_at(bits: &[u8], i: usize) -> u64 {
+    let at = 8 * i;
+    if at + 8 <= bits.len() {
+        return read_u64_at(bits, at);
+    }
+    let rest = bits.get(at..).unwrap_or(&[]);
+    let n = rest.len();
+    if n >= 4 {
+        u64::from(read_u32_at(rest, 0)) | u64::from(read_u32_at(rest, n - 4)) << (8 * (n - 4))
+    } else if n >= 2 {
+        u64::from(read_u16_at(rest, 0)) | u64::from(read_u16_at(rest, n - 2)) << (8 * (n - 2))
+    } else if n == 1 {
+        u64::from(rest[0])
+    } else {
+        0
+    }
 }
 
-impl<'a> BytesView<'a> {
-    pub(crate) fn open(rest: &'a [u8], card: u32) -> Result<Self, AdmissionError> {
-        if !(1..=SPAN_MAX as u32 + 1).contains(&card) {
+/// The set bits of a word, ascending.
+struct Bits(u64);
+
+impl Iterator for Bits {
+    type Item = u32;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros();
+        self.0 &= self.0 - 1;
+        Some(bit)
+    }
+}
+
+/// Position of the `k`-th set bit of `word`, `k` below its popcount: six
+/// halvings by popcount, no branch and no bit-deposit instruction, the same
+/// in every port.
+#[inline(always)]
+fn select_in_word(mut word: u64, mut k: u32) -> u32 {
+    let mut position = 0;
+    for width in [32u32, 16, 8, 4, 2, 1] {
+        let low = (word & ((1u64 << width) - 1)).count_ones();
+        let upper = u32::from(k >= low);
+        k -= low * upper;
+        position += width * upper;
+        word >>= width * upper;
+    }
+    position
+}
+
+/// Set bits of `bits` below bit `below`.
+#[inline(always)]
+fn count_below(bits: &[u8], below: usize) -> u32 {
+    let below = below.min(8 * bits.len());
+    let mut count = 0;
+    for i in 0..below / 64 {
+        count += word_at(bits, i).count_ones();
+    }
+    if below % 64 != 0 {
+        count += (word_at(bits, below / 64) & ((1u64 << (below % 64)) - 1)).count_ones();
+    }
+    count
+}
+
+/// Members two windows share below the value `below`: the bytes both cover,
+/// ANDed a word at a time.
+fn window_and(a: &[u8], a_base: u32, b: &[u8], b_base: u32, below: u32) -> u32 {
+    let (a_start, b_start) = ((a_base / 8) as usize, (b_base / 8) as usize);
+    let start = a_start.max(b_start);
+    let end = (a_start + a.len()).min(b_start + b.len());
+    if end <= start {
+        return 0;
+    }
+    let (a, b) = (
+        &a[start - a_start..end - a_start],
+        &b[start - b_start..end - b_start],
+    );
+    let bits = (below as usize).saturating_sub(8 * start).min(8 * a.len());
+    let mut count = 0;
+    for i in 0..bits / 64 {
+        count += (word_at(a, i) & word_at(b, i)).count_ones();
+    }
+    if bits % 64 != 0 {
+        let both = word_at(a, bits / 64) & word_at(b, bits / 64);
+        count += (both & ((1u64 << (bits % 64)) - 1)).count_ones();
+    }
+    count
+}
+
+// ── reading lists and intervals where they lie ───────────────────────────
+
+/// A list's `i`-th member: a byte, or a `u16` when `wide`.
+#[inline(always)]
+fn member(list: &[u8], wide: bool, i: usize) -> u32 {
+    if wide {
+        u32::from(read_u16_at(list, 2 * i))
+    } else {
+        u32::from(list[i])
+    }
+}
+
+/// Members of an ascending list strictly below `value`: a bisection that
+/// moves by a conditional add, never a branch on a member.
+#[inline(always)]
+fn list_rank(list: &[u8], wide: bool, value: u32) -> usize {
+    let n = list.len() >> u32::from(wide);
+    if n == 0 {
+        return 0;
+    }
+    if value > member(list, wide, n - 1) {
+        return n;
+    }
+    let (mut low, mut len) = (0, n);
+    for _ in 0..n.ilog2() + 1 {
+        let half = len / 2;
+        let probe = member(list, wide, low + half.saturating_sub(1));
+        low += if half != 0 && probe < value { half } else { 0 };
+        len -= half;
+    }
+    low + usize::from(member(list, wide, low) < value)
+}
+
+/// Interval `i` of a Spans payload, as `(start, end)` inclusive.
+#[inline(always)]
+fn span(spans: &[u8], i: usize) -> (u32, u32) {
+    (
+        u32::from(read_u16_at(spans, 4 * i)),
+        u32::from(read_u16_at(spans, 4 * i + 2)),
+    )
+}
+
+/// Members of the intervals strictly below `value`, and whether `value` is
+/// one.
+#[inline(always)]
+fn spans_rank(spans: &[u8], value: u32) -> (u32, bool) {
+    let mut below = 0;
+    for i in 0..spans.len() / 4 {
+        let (start, end) = span(spans, i);
+        if value <= end {
+            return (below + value.saturating_sub(start), value >= start);
+        }
+        below += end - start + 1;
+    }
+    (below, false)
+}
+
+// ── the small set ────────────────────────────────────────────────────────
+
+/// A small image's members, read where they lie.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SmallSet<'a> {
+    /// The members, ascending.
+    List8(&'a [u8]),
+    /// Bit `j` of byte `i` is the member `base + 8 * i + j`.
+    Window { bits: &'a [u8], base: u32 },
+    /// The members as ascending `u16`.
+    List16(&'a [u8]),
+    /// Inclusive `(start: u16, end: u16)` intervals, ascending and apart.
+    Spans(&'a [u8]),
+}
+
+impl<'a> SmallSet<'a> {
+    /// The set a small image holds, from its tag; `None` for any other
+    /// image. Attachment proved the payload holds what the tag says.
+    #[inline(always)]
+    pub(crate) fn of(image: &'a [u8]) -> Option<Self> {
+        let (kind, count) = read_small_tag(*image.first()?)?;
+        Some(Self::from_validated(image.get(1..)?, kind, count))
+    }
+
+    /// Admit a small image: its tag, its exact extent and the structure no
+    /// reader survives without. Member order is [`Self::verify`]'s.
+    pub(crate) fn open(image: &'a [u8]) -> Result<Self, AdmissionError> {
+        let Some((kind, count)) = image.first().and_then(|&tag| read_small_tag(tag)) else {
             return Err(AdmissionError::new(
-                AdmissionClass::Count,
+                AdmissionClass::Kind,
                 0,
-                "Bytes holds 1..=256 members",
+                "unassigned small tag",
+            ));
+        };
+        let need = 1 + small_payload_len(kind, count);
+        if image.len() != need {
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                image.len().min(need),
+                "small payload does not cover its extent exactly",
             ));
         }
-        let (first, head) = read_first(rest)?;
-        let offsets = rest.get(head..head + card as usize - 1).ok_or_else(|| {
-            AdmissionError::new(AdmissionClass::Extent, 0, "Bytes offset plane is truncated")
-        })?;
-        Ok(Self { first, offsets })
+        let set = Self::from_validated(&image[1..], kind, count);
+        if let SmallSet::Window { bits, base } = set {
+            if kind == K_WINDOW_AT && base == 0 {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Kind,
+                    1,
+                    "a Window from value zero is written without its start",
+                ));
+            }
+            if bits.last() == Some(&0) {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Extent,
+                    image.len() - 1,
+                    "Window bitmap ends in a zero byte",
+                ));
+            }
+            if kind == K_WINDOW_AT && bits[0] == 0 {
+                return Err(AdmissionError::new(
+                    AdmissionClass::Extent,
+                    2,
+                    "Window bitmap starts with a zero byte",
+                ));
+            }
+        }
+        Ok(set)
     }
 
-    pub(crate) fn from_validated(payload: &'a [u8]) -> Self {
-        let (first, head) = first_of(payload);
-        Self {
-            first,
-            offsets: &payload[head..],
+    #[inline(always)]
+    pub(crate) fn from_validated(payload: &'a [u8], kind: u32, count: u32) -> Self {
+        let payload = payload
+            .get(..small_payload_len(kind, count))
+            .unwrap_or(payload);
+        match kind {
+            K_LIST8 => SmallSet::List8(payload),
+            K_WINDOW => SmallSet::Window {
+                bits: payload,
+                base: 0,
+            },
+            K_WINDOW_AT => SmallSet::Window {
+                bits: payload.get(1..).unwrap_or(&[]),
+                base: 8 * u32::from(payload.first().copied().unwrap_or(0)),
+            },
+            K_LIST16 => SmallSet::List16(payload),
+            _ => SmallSet::Spans(payload),
         }
     }
 
+    /// What structural admission leaves to the verifying one: members in
+    /// strictly ascending order, intervals ascending and apart. Offsets are
+    /// image-relative.
     pub(crate) fn verify(self) -> Result<(), AdmissionError> {
-        let head = uleb_len(u32::from(self.first));
-        let mut prev = 0u8;
-        for (i, &offset) in self.offsets.iter().enumerate() {
-            if offset <= prev {
-                return Err(AdmissionError::new(
-                    AdmissionClass::MapOrder,
-                    head + i,
-                    "Bytes offsets are not strictly ascending from the first member",
-                ));
+        let disorder = |at: usize, what: &'static str| {
+            Err(AdmissionError::new(AdmissionClass::MapOrder, 1 + at, what))
+        };
+        match self {
+            SmallSet::Window { .. } => {}
+            SmallSet::List8(list) => {
+                if let Some(i) = list.windows(2).position(|pair| pair[0] >= pair[1]) {
+                    return disorder(i + 1, "List8 members are not strictly ascending");
+                }
             }
-            if u32::from(self.first) + u32::from(offset) > u32::from(u16::MAX) {
-                return Err(AdmissionError::new(
-                    AdmissionClass::PlaneRange,
-                    head + i,
-                    "Bytes member exceeds its u16 chunk",
-                ));
+            SmallSet::List16(list) => {
+                for i in 1..list.len() / 2 {
+                    if member(list, true, i - 1) >= member(list, true, i) {
+                        return disorder(2 * i, "List16 members are not strictly ascending");
+                    }
+                }
             }
-            prev = offset;
+            SmallSet::Spans(spans) => {
+                for i in 0..spans.len() / 4 {
+                    let (start, end) = span(spans, i);
+                    if end < start {
+                        return disorder(4 * i + 2, "an interval ends before it starts");
+                    }
+                    if i != 0 && start <= span(spans, i - 1).1 + 1 {
+                        return disorder(4 * i, "intervals overlap or touch");
+                    }
+                }
+            }
         }
         Ok(())
     }
 
+    pub(crate) fn kind(self) -> u32 {
+        match self {
+            SmallSet::List8(_) => K_LIST8,
+            SmallSet::Window { base: 0, .. } => K_WINDOW,
+            SmallSet::Window { .. } => K_WINDOW_AT,
+            SmallSet::List16(_) => K_LIST16,
+            SmallSet::Spans(_) => K_SPANS,
+        }
+    }
+
+    pub(crate) fn payload_len(self) -> usize {
+        match self {
+            SmallSet::List8(bytes) | SmallSet::List16(bytes) | SmallSet::Spans(bytes) => {
+                bytes.len()
+            }
+            SmallSet::Window { bits, base } => bits.len() + usize::from(base != 0),
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn cardinality(self) -> u32 {
-        self.offsets.len() as u32 + 1
+        match self {
+            SmallSet::List8(list) => list.len() as u32,
+            SmallSet::List16(list) => (list.len() / 2) as u32,
+            SmallSet::Window { bits, .. } => count_below(bits, usize::MAX),
+            SmallSet::Spans(spans) => spans_rank(spans, u32::MAX).0,
+        }
     }
 
     #[inline(always)]
-    pub(crate) fn payload_len(self) -> usize {
-        uleb_len(u32::from(self.first)) + self.offsets.len()
+    pub(crate) fn contains(self, value: u32) -> bool {
+        match self {
+            SmallSet::Window { bits, base } => {
+                let bit = value.wrapping_sub(base);
+                bits.get((bit >> 3) as usize)
+                    .is_some_and(|byte| byte >> (bit & 7) & 1 != 0)
+            }
+            SmallSet::List8(list) => {
+                let at = list_rank(list, false, value);
+                at < list.len() && member(list, false, at) == value
+            }
+            SmallSet::List16(list) => {
+                let at = list_rank(list, true, value);
+                at < list.len() / 2 && member(list, true, at) == value
+            }
+            SmallSet::Spans(spans) => spans_rank(spans, value).1,
+        }
     }
 
+    /// Members strictly below `value`.
     #[inline(always)]
-    pub(crate) fn contains(self, v: u16) -> bool {
-        match v.checked_sub(self.first) {
-            None => false,
-            Some(0) => true,
-            Some(delta) => {
-                u8::try_from(delta).is_ok_and(|delta| self.offsets.binary_search(&delta).is_ok())
+    pub(crate) fn rank_below(self, value: u32) -> u32 {
+        match self {
+            SmallSet::Window { bits, base } => {
+                count_below(bits, value.saturating_sub(base) as usize)
+            }
+            SmallSet::List8(list) => list_rank(list, false, value) as u32,
+            SmallSet::List16(list) => list_rank(list, true, value) as u32,
+            SmallSet::Spans(spans) => spans_rank(spans, value).0,
+        }
+    }
+
+    /// The `k`-th member ascending, or `None` at or past the cardinality.
+    #[inline(always)]
+    pub(crate) fn select(self, k: u32) -> Option<u32> {
+        let at = k as usize;
+        match self {
+            SmallSet::List8(list) => (at < list.len()).then(|| member(list, false, at)),
+            SmallSet::List16(list) => (at < list.len() / 2).then(|| member(list, true, at)),
+            SmallSet::Window { bits, base } => {
+                let mut k = k;
+                for i in 0..bits.len().div_ceil(8) {
+                    let word = word_at(bits, i);
+                    let count = word.count_ones();
+                    if k < count {
+                        return Some(base + 64 * i as u32 + select_in_word(word, k));
+                    }
+                    k -= count;
+                }
+                None
+            }
+            SmallSet::Spans(spans) => {
+                let mut k = k;
+                for i in 0..spans.len() / 4 {
+                    let (start, end) = span(spans, i);
+                    if k <= end - start {
+                        return Some(start + k);
+                    }
+                    k -= end - start + 1;
+                }
+                None
             }
         }
     }
 
     #[inline(always)]
-    pub(crate) fn rank_below(self, v: u16) -> u32 {
-        match v.checked_sub(self.first) {
-            None | Some(0) => 0,
-            Some(delta) => {
-                1 + u8::try_from(delta).map_or(self.offsets.len(), |delta| {
-                    self.offsets.partition_point(|offset| *offset < delta)
-                }) as u32
+    pub(crate) fn for_each(self, mut f: impl FnMut(u32)) {
+        match self {
+            SmallSet::List8(list) => {
+                for &member in list {
+                    f(u32::from(member));
+                }
+            }
+            SmallSet::List16(list) => {
+                for i in 0..list.len() / 2 {
+                    f(member(list, true, i));
+                }
+            }
+            SmallSet::Window { bits, base } => {
+                for i in 0..bits.len().div_ceil(8) {
+                    let low = base + 64 * i as u32;
+                    for bit in Bits(word_at(bits, i)) {
+                        f(low + bit);
+                    }
+                }
+            }
+            SmallSet::Spans(spans) => {
+                for i in 0..spans.len() / 4 {
+                    let (start, end) = span(spans, i);
+                    for value in start..=end {
+                        f(value);
+                    }
+                }
             }
         }
     }
 
-    /// `k` is below the cardinality.
-    #[inline(always)]
-    pub(crate) fn select(self, k: u32) -> u16 {
-        match k.checked_sub(1) {
-            None => self.first,
-            Some(i) => self.first.wrapping_add(u16::from(self.offsets[i as usize])),
+    /// `(first, step, members)` when two or more members are one arithmetic
+    /// progression.
+    pub(crate) fn progression(self) -> Option<(u32, u32, u32)> {
+        if let SmallSet::Spans(spans) = self
+            && spans.len() == 4
+        {
+            let (start, end) = span(spans, 0);
+            return (end > start).then_some((start, 1, end - start + 1));
         }
+        let (mut first, mut previous, mut step, mut members, mut even) = (0, 0, 0, 0u32, true);
+        self.for_each(|value| {
+            match members {
+                0 => first = value,
+                1 => step = value - previous,
+                _ => even &= value - previous == step,
+            }
+            previous = value;
+            members += 1;
+        });
+        (members >= 2 && even).then_some((first, step, members))
     }
 
-    #[inline]
-    pub(crate) fn for_each(self, mut f: impl FnMut(u16)) {
-        f(self.first);
-        for &offset in self.offsets {
-            f(self.first.wrapping_add(u16::from(offset)));
+    /// Members both sets hold below `below`. Two windows meet word by word;
+    /// otherwise the side that is not an interval list is walked against
+    /// the other's probe.
+    pub(crate) fn and_below(self, other: SmallSet<'_>, below: u32) -> u32 {
+        if let (
+            SmallSet::Window {
+                bits: a,
+                base: a_base,
+            },
+            SmallSet::Window {
+                bits: b,
+                base: b_base,
+            },
+        ) = (self, other)
+        {
+            return window_and(a, a_base, b, b_base, below);
         }
-    }
-
-    /// `(stride, members)` when the members are one arithmetic progression.
-    pub(crate) fn progression(self) -> Option<(u16, u32)> {
-        let stride = usize::from(*self.offsets.first()?);
-        self.offsets
-            .iter()
-            .enumerate()
-            .all(|(i, &offset)| usize::from(offset) == (i + 1) * stride)
-            .then_some((stride as u16, self.cardinality()))
-    }
-}
-
-/// Ascending cursor over a [`BytesView`]: `at` is the rank of the head.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BytesRange<'a> {
-    view: BytesView<'a>,
-    at: usize,
-}
-
-impl<'a> BytesRange<'a> {
-    pub(crate) fn at_rank(view: BytesView<'a>, k: u32) -> Self {
-        Self {
-            view,
-            at: k as usize,
+        let mut count = 0;
+        match (self, other) {
+            (SmallSet::Spans(a), SmallSet::Spans(b)) => {
+                let (mut i, mut j) = (0, 0);
+                for _ in 0..(a.len() + b.len()) / 4 {
+                    if i >= a.len() / 4 || j >= b.len() / 4 {
+                        break;
+                    }
+                    let ((a_start, a_end), (b_start, b_end)) = (span(a, i), span(b, j));
+                    let (low, high) = (a_start.max(b_start), a_end.min(b_end).min(below - 1));
+                    if below != 0 && low <= high {
+                        count += high - low + 1;
+                    }
+                    i += usize::from(a_end <= b_end);
+                    j += usize::from(b_end <= a_end);
+                }
+            }
+            (SmallSet::Spans(_), walked) => {
+                walked.for_each(|v| count += u32::from(v < below && self.contains(v)));
+            }
+            (walked, probed) => {
+                walked.for_each(|v| count += u32::from(v < below && probed.contains(v)));
+            }
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn remaining(&self) -> u32 {
-        (self.view.offsets.len() + 1).saturating_sub(self.at) as u32
-    }
-
-    #[inline(always)]
-    pub(crate) fn front(&self) -> u16 {
-        self.view.select(self.at as u32)
-    }
-
-    #[inline(always)]
-    pub(crate) fn pop_front(&mut self) {
-        self.at += 1;
-    }
-
-    /// The head is below `target`.
-    #[inline]
-    pub(crate) fn seek(&mut self, target: u16) {
-        let offsets = self.view.offsets;
-        let from = self.at.saturating_sub(1).min(offsets.len());
-        self.at = 1 + match u8::try_from(target.wrapping_sub(self.view.first)) {
-            Ok(delta) => from + offsets[from..].partition_point(|offset| *offset < delta),
-            Err(_) => offsets.len(),
-        };
-    }
-}
-
-// ── Window ───────────────────────────────────────────────────────────────
-
-/// `first`, then a bitmap of the positions after it: bit `p` is the member
-/// `first + 1 + p`. The last byte holds the last member, so it is never
-/// zero, and the cardinality is one more than the popcount.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowView<'a> {
-    first: u16,
-    bits: &'a [u8],
-    len: u32,
-}
-
-/// The bitmap bytes of a Window payload.
-fn window_bits(payload: &[u8]) -> &[u8] {
-    payload.get(first_of(payload).1..).unwrap_or(&[])
-}
-
-/// Members a lone image holds: its count, or for a Window, whose count is
-/// its bitmap's length, one more than the bitmap's popcount.
-pub(crate) fn lone_cardinality(kind: u32, count: u32, payload: &[u8]) -> u32 {
-    if is_window(kind) {
-        1 + window_bits(payload)
-            .iter()
-            .map(|byte| byte.count_ones())
-            .sum::<u32>()
-    } else {
         count
     }
 }
 
-#[inline(always)]
-fn nth_set_bit(mut word: u64, n: u32) -> u32 {
-    for _ in 0..n {
-        word &= word.wrapping_sub(1);
-    }
-    word.trailing_zeros()
-}
+// ── the ascending cursor ─────────────────────────────────────────────────
 
-impl<'a> WindowView<'a> {
-    pub(crate) fn open(rest: &'a [u8], kind: u32, card: u32) -> Result<Self, AdmissionError> {
-        let (first, head) = read_first(rest)?;
-        let bits = &rest[head..];
-        let lengths = if kind == K_WINDOW {
-            1..=WINDOW_NARROW_MAX
-        } else {
-            WINDOW_NARROW_MAX + 1..=2 * WINDOW_NARROW_MAX
-        };
-        if !lengths.contains(&bits.len()) {
-            return Err(AdmissionError::new(
-                AdmissionClass::Extent,
-                head,
-                "Window bitmap length is outside its kind's range",
-            ));
-        }
-        let last = bits[bits.len() - 1];
-        if last == 0 {
-            return Err(AdmissionError::new(
-                AdmissionClass::Extent,
-                head + bits.len() - 1,
-                "Window ends past its last member",
-            ));
-        }
-        if lone_cardinality(kind, 0, rest) != card {
-            return Err(AdmissionError::new(
-                AdmissionClass::Count,
-                head,
-                "Window cardinality differs from its parent prefix",
-            ));
-        }
-        let span = 8 * bits.len() - last.leading_zeros() as usize;
-        if usize::from(first) + span > usize::from(u16::MAX) {
-            return Err(AdmissionError::new(
-                AdmissionClass::PlaneRange,
-                0,
-                "Window final member exceeds u16",
-            ));
-        }
-        Ok(Self {
-            first,
-            bits,
-            len: card,
-        })
-    }
-
-    pub(crate) fn from_validated(payload: &'a [u8], card: u32) -> Self {
-        let (first, head) = first_of(payload);
-        Self {
-            first,
-            bits: &payload[head..],
-            len: card,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn cardinality(self) -> u32 {
-        self.len
-    }
-
-    #[inline(always)]
-    pub(crate) fn payload_len(self) -> usize {
-        uleb_len(u32::from(self.first)) + self.bits.len()
-    }
-
-    pub(crate) fn bitmap_len(self) -> usize {
-        self.bits.len()
-    }
-
-    /// The kind this bitmap's length belongs to.
-    pub(crate) fn kind(self) -> u32 {
-        if self.bits.len() <= WINDOW_NARROW_MAX {
-            K_WINDOW
-        } else {
-            K_WINDOW_WIDE
-        }
-    }
-
-    /// The bitmap as four little-endian words, zero past its bytes.
-    #[inline(always)]
-    fn words(self) -> [u64; 4] {
-        let mut padded = [0u8; 32];
-        let n = self.bits.len().min(32);
-        padded[..n].copy_from_slice(&self.bits[..n]);
-        let mut words = [0u64; 4];
-        for (word, bytes) in words.iter_mut().zip(padded.as_chunks::<8>().0) {
-            *word = u64::from_le_bytes(*bytes);
-        }
-        words
-    }
-
-    #[inline(always)]
-    pub(crate) fn contains(self, v: u16) -> bool {
-        match v.checked_sub(self.first) {
-            None => false,
-            Some(0) => true,
-            Some(delta) => {
-                let position = usize::from(delta - 1);
-                self.bits
-                    .get(position / 8)
-                    .is_some_and(|byte| byte >> (position % 8) & 1 == 1)
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn rank_below(self, v: u16) -> u32 {
-        let Some(delta) = v.checked_sub(self.first).filter(|delta| *delta != 0) else {
-            return 0;
-        };
-        let below = usize::from(delta - 1).min(256);
-        let words = self.words();
-        let mut rank = 1;
-        for word in &words[..below / 64] {
-            rank += word.count_ones();
-        }
-        if below % 64 != 0 {
-            rank += (words[below / 64] & ((1u64 << (below % 64)) - 1)).count_ones();
-        }
-        rank
-    }
-
-    /// `k` is below the cardinality.
-    #[inline(always)]
-    pub(crate) fn select(self, k: u32) -> u16 {
-        let Some(mut rank) = k.checked_sub(1) else {
-            return self.first;
-        };
-        for (w, word) in self.words().into_iter().enumerate() {
-            let ones = word.count_ones();
-            if rank < ones {
-                return self
-                    .first
-                    .wrapping_add((1 + w as u32 * 64 + nth_set_bit(word, rank)) as u16);
-            }
-            rank -= ones;
-        }
-        self.first
-    }
-
-    #[inline]
-    pub(crate) fn for_each(self, mut f: impl FnMut(u16)) {
-        f(self.first);
-        for (w, mut word) in self.words().into_iter().enumerate() {
-            while word != 0 {
-                f(self
-                    .first
-                    .wrapping_add((1 + w as u32 * 64 + word.trailing_zeros()) as u16));
-                word &= word - 1;
-            }
-        }
-    }
-
-    /// `(stride, members)` when the members are one arithmetic progression.
-    pub(crate) fn progression(self) -> Option<(u16, u32)> {
-        let stride = u32::from(self.select(1).wrapping_sub(self.first));
-        let mut next = u32::from(self.first);
-        let mut regular = true;
-        self.for_each(|member| {
-            regular &= u32::from(member) == next;
-            next += stride;
-        });
-        regular.then_some((stride as u16, self.len))
-    }
-}
-
-/// Ascending cursor over a [`WindowView`]: the head is held decoded and
-/// `words` keeps the members after it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct WindowRange {
-    words: [u64; 4],
-    /// The member bit zero stands for.
-    base: u32,
-    front: u16,
-    remaining: u32,
-}
-
-impl WindowRange {
-    pub(crate) fn at_rank(view: WindowView<'_>, k: u32) -> Self {
-        let mut range = Self {
-            words: view.words(),
-            base: u32::from(view.first) + 1,
-            front: view.first,
-            remaining: view.len.saturating_sub(k),
-        };
-        if let Some(skipped) = k.checked_sub(1) {
-            range.drop_lowest(skipped);
-            range.take();
-        }
-        range
-    }
-
-    fn drop_lowest(&mut self, mut n: u32) {
-        for word in &mut self.words {
-            let ones = word.count_ones();
-            if n < ones {
-                for _ in 0..n {
-                    *word &= *word - 1;
-                }
-                return;
-            }
-            *word = 0;
-            n -= ones;
-        }
-    }
-
-    /// Move the lowest remaining member into the head.
-    #[inline(always)]
-    fn take(&mut self) {
-        for (w, word) in self.words.iter_mut().enumerate() {
-            if *word != 0 {
-                self.front = (self.base + w as u32 * 64 + word.trailing_zeros()) as u16;
-                *word &= *word - 1;
-                return;
-            }
-        }
-        self.remaining = 0;
-    }
-
-    #[inline(always)]
-    pub(crate) fn remaining(&self) -> u32 {
-        self.remaining
-    }
-
-    #[inline(always)]
-    pub(crate) fn front(&self) -> u16 {
-        self.front
-    }
-
-    #[inline(always)]
-    pub(crate) fn pop_front(&mut self) {
-        self.remaining -= 1;
-        if self.remaining != 0 {
-            self.take();
-        }
-    }
-
-    /// The head is below `target`.
-    #[inline]
-    pub(crate) fn seek(&mut self, target: u16) {
-        let below = (u32::from(target).saturating_sub(self.base) as usize).min(256);
-        let mut skipped = 1;
-        for (w, word) in self.words.iter_mut().enumerate() {
-            let mask = match below.saturating_sub(w * 64) {
-                0 => break,
-                bits if bits >= 64 => u64::MAX,
-                bits => (1u64 << bits) - 1,
-            };
-            skipped += (*word & mask).count_ones();
-            *word &= !mask;
-        }
-        self.remaining = self.remaining.saturating_sub(skipped);
-        if self.remaining != 0 {
-            self.take();
-        }
-    }
-}
-
-// ── the small lone chunk ─────────────────────────────────────────────────
-
-/// The chunk of a lone image whose kind is Bytes or Window. The directory
-/// reader's chunk view has no arm for these: a small container exists only
-/// as the whole of a lone image, and is read through this type.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SmallView<'a> {
-    Bytes(BytesView<'a>),
-    Window(WindowView<'a>),
-}
-
-impl<'a> SmallView<'a> {
-    /// Admit `payload`, the whole extent after a lone header of this `kind`
-    /// and `count`.
-    pub(crate) fn open(payload: &'a [u8], kind: u32, count: u32) -> Result<Self, AdmissionError> {
-        let view = if kind == K_BYTES {
-            Self::Bytes(BytesView::open(payload, count)?)
-        } else {
-            Self::Window(WindowView::open(
-                payload,
-                kind,
-                lone_cardinality(kind, count, payload),
-            )?)
-        };
-        if view.payload_len() != payload.len() {
-            return Err(AdmissionError::new(
-                AdmissionClass::Extent,
-                0,
-                "container does not exactly cover its payload extent",
-            ));
-        }
-        Ok(view)
-    }
-
-    pub(crate) fn from_validated(payload: &'a [u8], kind: u32, count: u32) -> Self {
-        if kind == K_BYTES {
-            Self::Bytes(BytesView::from_validated(payload))
-        } else {
-            Self::Window(WindowView::from_validated(
-                payload,
-                lone_cardinality(kind, count, payload),
-            ))
-        }
-    }
-
-    /// The view of an admitted payload whose cardinality is known.
-    #[inline(always)]
-    pub(crate) fn with_cardinality(payload: &'a [u8], kind: u32, card: u32) -> Self {
-        if kind == K_BYTES {
-            Self::Bytes(BytesView::from_validated(payload))
-        } else {
-            Self::Window(WindowView::from_validated(payload, card))
-        }
-    }
-    pub(crate) fn verify(self) -> Result<(), AdmissionError> {
-        match self {
-            Self::Bytes(bytes) => bytes.verify(),
-            // A Window's structure is its whole content: admission proved it.
-            Self::Window(_) => Ok(()),
-        }
-    }
-
-    pub(crate) fn kind(self) -> u32 {
-        match self {
-            Self::Bytes(_) => K_BYTES,
-            Self::Window(window) => window.kind(),
-        }
-    }
-
-    /// The count this chunk's lone header folds.
-    pub(crate) fn lone_count(self) -> u32 {
-        match self {
-            Self::Bytes(bytes) => bytes.cardinality(),
-            Self::Window(window) => window_count(window.kind(), window.bitmap_len()),
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn cardinality(self) -> u32 {
-        match self {
-            Self::Bytes(bytes) => bytes.cardinality(),
-            Self::Window(window) => window.cardinality(),
-        }
-    }
-
-    pub(crate) fn payload_len(self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.payload_len(),
-            Self::Window(window) => window.payload_len(),
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn contains(self, v: u16) -> bool {
-        match self {
-            Self::Bytes(bytes) => bytes.contains(v),
-            Self::Window(window) => window.contains(v),
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn rank_below(self, v: u16) -> u32 {
-        match self {
-            Self::Bytes(bytes) => bytes.rank_below(v),
-            Self::Window(window) => window.rank_below(v),
-        }
-    }
-
-    /// `k` is below the cardinality.
-    #[inline(always)]
-    pub(crate) fn select(self, k: u32) -> u16 {
-        match self {
-            Self::Bytes(bytes) => bytes.select(k),
-            Self::Window(window) => window.select(k),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn for_each(self, f: impl FnMut(u16)) {
-        match self {
-            Self::Bytes(bytes) => bytes.for_each(f),
-            Self::Window(window) => window.for_each(f),
-        }
-    }
-
-    /// `(first, stride, members)` when the members are one arithmetic
-    /// progression of at least two.
-    pub(crate) fn progression(self) -> Option<(u16, u16, u32)> {
-        let (stride, members) = match self {
-            Self::Bytes(bytes) => bytes.progression()?,
-            Self::Window(window) => window.progression()?,
-        };
-        Some((self.select(0), stride, members))
-    }
-}
-
-/// Ascending cursor over a [`SmallView`].
+/// Ascending cursor over a small set: a list index, a Window's next word
+/// and the unconsumed bits of the word before it, or an interval and the
+/// next value in it. No member is decoded twice.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SmallRange<'a> {
-    Bytes(BytesRange<'a>),
-    Window(WindowRange),
+    List {
+        list: &'a [u8],
+        wide: bool,
+        at: usize,
+    },
+    Window {
+        bits: &'a [u8],
+        /// The value of bit zero of the word `word` holds.
+        low: u32,
+        /// Index of the next word to load.
+        next: u32,
+        /// Unconsumed bits of word `next - 1`: nonzero while members remain.
+        word: u64,
+        remaining: u32,
+    },
+    Spans {
+        spans: &'a [u8],
+        /// The interval `value` lies in.
+        at: usize,
+        value: u32,
+        remaining: u32,
+    },
 }
 
 impl<'a> SmallRange<'a> {
-    pub(crate) fn open(view: SmallView<'a>) -> Self {
-        match view {
-            SmallView::Bytes(bytes) => Self::Bytes(BytesRange::at_rank(bytes, 0)),
-            SmallView::Window(window) => Self::Window(WindowRange::at_rank(window, 0)),
+    pub(crate) fn open(set: SmallSet<'a>) -> Self {
+        match set {
+            SmallSet::List8(list) => SmallRange::List {
+                list,
+                wide: false,
+                at: 0,
+            },
+            SmallSet::List16(list) => SmallRange::List {
+                list,
+                wide: true,
+                at: 0,
+            },
+            SmallSet::Window { bits, base } => {
+                let mut range = SmallRange::Window {
+                    bits,
+                    low: base.wrapping_sub(64),
+                    next: 0,
+                    word: 0,
+                    remaining: set.cardinality(),
+                };
+                range.load();
+                range
+            }
+            SmallSet::Spans(spans) => SmallRange::Spans {
+                spans,
+                at: 0,
+                value: if spans.len() >= 4 {
+                    span(spans, 0).0
+                } else {
+                    0
+                },
+                remaining: set.cardinality(),
+            },
+        }
+    }
+
+    /// Establish "`word` is nonzero unless the bitmap is spent".
+    #[inline(always)]
+    fn load(&mut self) {
+        let SmallRange::Window {
+            bits,
+            low,
+            next,
+            word,
+            ..
+        } = self
+        else {
+            return;
+        };
+        for i in *next as usize..bits.len().div_ceil(8) {
+            if *word != 0 {
+                return;
+            }
+            *word = word_at(bits, i);
+            *low = low.wrapping_add(64);
+            *next = i as u32 + 1;
         }
     }
 
     #[inline(always)]
     pub(crate) fn remaining(&self) -> u32 {
         match self {
-            Self::Bytes(range) => range.remaining(),
-            Self::Window(range) => range.remaining(),
+            SmallRange::List { list, wide, at } => {
+                ((list.len() >> u32::from(*wide)).saturating_sub(*at)) as u32
+            }
+            SmallRange::Window { remaining, .. } | SmallRange::Spans { remaining, .. } => {
+                *remaining
+            }
         }
     }
 
+    /// The head; meaningful while members remain.
     #[inline(always)]
-    pub(crate) fn front(&self) -> u16 {
+    pub(crate) fn front(&self) -> u32 {
         match self {
-            Self::Bytes(range) => range.front(),
-            Self::Window(range) => range.front(),
+            SmallRange::List { list, wide, at } => {
+                if *at < list.len() >> u32::from(*wide) {
+                    member(list, *wide, *at)
+                } else {
+                    0
+                }
+            }
+            SmallRange::Window { low, word, .. } => low.wrapping_add(word.trailing_zeros()),
+            SmallRange::Spans { value, .. } => *value,
         }
     }
 
     #[inline(always)]
     pub(crate) fn pop_front(&mut self) {
         match self {
-            Self::Bytes(range) => range.pop_front(),
-            Self::Window(range) => range.pop_front(),
+            SmallRange::List { at, .. } => *at += 1,
+            SmallRange::Window {
+                word, remaining, ..
+            } => {
+                *word &= word.wrapping_sub(1);
+                *remaining = remaining.saturating_sub(1);
+                self.load();
+            }
+            SmallRange::Spans {
+                spans,
+                at,
+                value,
+                remaining,
+            } => {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    return;
+                }
+                if *value < span(spans, *at).1 {
+                    *value += 1;
+                } else {
+                    *at += 1;
+                    *value = span(spans, *at).0;
+                }
+            }
         }
     }
 
-    /// The head is below `target`.
-    #[inline(always)]
-    pub(crate) fn seek(&mut self, target: u16) {
+    /// Advance to the first member at or after `target`; never moves back.
+    pub(crate) fn seek(&mut self, target: u32) {
         match self {
-            Self::Bytes(range) => range.seek(target),
-            Self::Window(range) => range.seek(target),
-        }
-    }
-}
-// ── the lone image ───────────────────────────────────────────────────────
-
-/// Control bit of an image that is one chunk at key zero:
-/// `control = 0x80 | folded << 3 | kind`.
-pub(crate) const CONTROL_LONE: u8 = 0x80;
-/// Counts through this fold into the control byte as `count - 1`.
-const FOLDED_MAX: u32 = 14;
-/// `folded` value saying one byte follows: `count - 15`.
-const FOLDED_BYTE: u32 = 14;
-/// `folded` value saying a little-endian `u16` follows: `count - 1`.
-const FOLDED_WORD: u32 = 15;
-/// Largest count the one-byte extension reaches.
-const BYTE_MAX: u32 = FOLDED_MAX + 1 + 255;
-
-/// A Window's lone count, `1..=16`: its bitmap bytes within its kind's
-/// range. Zero for any other kind, whose count is its cardinality.
-pub(crate) fn window_count(kind: u32, bitmap: usize) -> u32 {
-    match kind {
-        K_WINDOW => bitmap as u32,
-        K_WINDOW_WIDE => (bitmap - WINDOW_NARROW_MAX) as u32,
-        _ => 0,
-    }
-}
-
-/// The one count a lone payload does not say for itself: a Window's
-/// [`window_count`] (its cardinality is its popcount), any other kind's
-/// cardinality.
-pub(crate) fn lone_count(kind: u32, card: u32, window: u32) -> u32 {
-    if is_window(kind) { window } else { card }
-}
-
-/// A Window's count always folds whole; any other count past 14 continues
-/// in one byte, past 270 in two.
-pub(crate) fn lone_header_len(kind: u32, count: u32) -> usize {
-    if is_window(kind) || count <= FOLDED_MAX {
-        1
-    } else if count <= BYTE_MAX {
-        2
-    } else {
-        3
-    }
-}
-
-pub(crate) fn write_lone_header(out: &mut [u8], kind: u32, count: u32) -> usize {
-    let (folded, at) = if is_window(kind) || count <= FOLDED_MAX {
-        (count - 1, 1)
-    } else if count <= BYTE_MAX {
-        out[1] = (count - FOLDED_MAX - 1) as u8;
-        (FOLDED_BYTE, 2)
-    } else {
-        out[1..3].copy_from_slice(&((count - 1) as u16).to_le_bytes());
-        (FOLDED_WORD, 3)
-    };
-    out[0] = CONTROL_LONE | (folded as u8) << 3 | kind as u8;
-    at
-}
-
-/// A lone image's kind, count and payload offset, from its first bytes.
-pub(crate) fn read_lone_header(bytes: &[u8]) -> Result<(u32, u32, usize), AdmissionError> {
-    let control = u32::from(bytes[0]);
-    let (kind, folded) = (control & 7, control >> 3 & 15);
-    let truncated = || AdmissionError::new(AdmissionClass::Extent, 1, "lone count is truncated");
-    Ok(match folded {
-        _ if is_window(kind) => (kind, folded + 1, 1),
-        FOLDED_BYTE => (
-            kind,
-            FOLDED_MAX + 1 + u32::from(*bytes.get(1).ok_or_else(truncated)?),
-            2,
-        ),
-        FOLDED_WORD => {
-            let count = 1 + u32::from(read_u16_at(bytes.get(1..3).ok_or_else(truncated)?, 0));
-            if count <= BYTE_MAX {
-                return Err(AdmissionError::new(
-                    AdmissionClass::Count,
-                    1,
-                    "lone count is not in its shortest form",
-                ));
+            SmallRange::List { list, wide, at } => {
+                *at = (*at).max(list_rank(list, *wide, target));
             }
-            (kind, count, 3)
-        }
-        _ => (kind, folded + 1, 1),
-    })
-}
-
-/// Payload bytes of a lone image, from the header's count and at most the
-/// payload's first 20 bytes. Offsets in a refusal are relative to `rest`.
-pub(crate) fn lone_payload_len(
-    kind: u32,
-    count: u32,
-    rest: &[u8],
-) -> Result<usize, AdmissionError> {
-    let count = count as usize;
-    Ok(match kind {
-        crate::wire::K_STRIDE => 4,
-        crate::wire::K_CONE => 11 + count,
-        crate::wire::K_ARRAY => 2 * count,
-        K_BYTES => first_of(rest).1 + count - 1,
-        K_WINDOW => first_of(rest).1 + count,
-        K_WINDOW_WIDE => first_of(rest).1 + WINDOW_NARROW_MAX + count,
-        crate::wire::K_RUNS => {
-            let mut at = 0;
-            runs_payload_len(
-                read_uleb_checked(rest, &mut at, 32_767, AdmissionClass::Count)? as usize + 1,
-            )
-        }
-        _ => {
-            let window = rest.get(18..20).map(|_| usize::from(read_u16_at(rest, 18)));
-            match window {
-                Some(words) if words != 0 && words.is_multiple_of(crate::BLOCK_WORDS) => {
-                    crate::wire::words_payload_len(words)
+            SmallRange::Window {
+                bits,
+                low,
+                next,
+                word,
+                remaining,
+            } => {
+                let first = low.wrapping_sub(64 * next.wrapping_sub(1));
+                let bit = target.saturating_sub(first) as usize;
+                let i = bit / 64;
+                if (i as u32) < next.wrapping_sub(1) {
+                    return;
                 }
-                Some(_) => {
-                    return Err(AdmissionError::new(
-                        AdmissionClass::Count,
-                        16,
-                        "Words window is not whole blocks within its u16 chunk",
-                    ));
+                if i as u32 >= *next {
+                    *word = word_at(bits, i);
+                    *low = first + 64 * i as u32;
+                    *next = i as u32 + 1;
                 }
-                None => {
-                    return Err(AdmissionError::new(
-                        AdmissionClass::Extent,
-                        0,
-                        "Words metadata is truncated",
-                    ));
+                *word &= !((1u64 << (bit % 64)) - 1);
+                let mut left = word.count_ones();
+                for later in *next as usize..bits.len().div_ceil(8) {
+                    left += word_at(bits, later).count_ones();
+                }
+                *remaining = left;
+                self.load();
+            }
+            SmallRange::Spans {
+                spans,
+                at,
+                value,
+                remaining,
+            } => {
+                if *remaining == 0 || target <= *value {
+                    return;
+                }
+                let set = SmallSet::Spans(spans);
+                let left = set.cardinality() - set.rank_below(target);
+                *remaining = left;
+                if left == 0 {
+                    return;
+                }
+                for i in *at..spans.len() / 4 {
+                    let (start, end) = span(spans, i);
+                    if target <= end {
+                        *at = i;
+                        *value = target.max(start);
+                        return;
+                    }
                 }
             }
         }
-    })
+    }
+}
+
+// ── a small image's answers to the directory reader ──────────────────────
+//
+// A view holds a small image as a forest of no chunks over its bytes. Where
+// the directory code finds no chunks it asks here, by a call that is never
+// inlined: beside that branch the directory and Elias-Fano code is then the
+// code it is without this module. The empty image is no small image and
+// answers as the empty set.
+
+#[cold]
+#[inline(never)]
+pub(crate) fn image_len(image: &[u8]) -> u64 {
+    SmallSet::of(image).map_or(0, |set| u64::from(set.cardinality()))
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn image_contains(image: &[u8], value: u32) -> bool {
+    SmallSet::of(image).is_some_and(|set| set.contains(value))
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn image_rank(image: &[u8], value: u32) -> u64 {
+    SmallSet::of(image).map_or(0, |set| u64::from(set.rank_below(value)))
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn image_select(image: &[u8], k: u64) -> Option<u32> {
+    SmallSet::of(image)?.select(u32::try_from(k).ok()?)
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn image_for_each(image: &[u8], f: impl FnMut(u32)) {
+    if let Some(set) = SmallSet::of(image) {
+        set.for_each(f);
+    }
 }
