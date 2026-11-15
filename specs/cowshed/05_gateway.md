@@ -1240,23 +1240,24 @@ the handshake bound.
   (an open stream counts), the controller writes `{"progress":n,"busy":{method,subject?,forMs}|null}` on it every 5 s.
   `busy` is the op the project's router actor serves now: its method, the workspace it names, and how long it has run.
   The actor publishes it as each route starts and clears it as the route ends; a heartbeat reads it without a lock, and
-  it is `null` while the actor serves nothing. The router is serial, so a call waits behind whatever op it is busy with,
-  and a call has no total bound, which would fail a call that is only queued. The client reads past the heartbeats under
-  the 15 s silence bound, measured from when the controller last owed it nothing. A controller silent that long fails
-  every waiting call `SILENT`, naming it as the socketpair peer with the pid its hello reported (the socketpair's
-  credentials name the process that made the pair, not the controller) and the busy op of its last heartbeat. SILENT
-  ends those waits, never by itself the connection: a `cowshed controller` exits once its peer closes its end
-  (06_cli.md), and every other op of the coordinator shares that connection. The client keeps it, closes each stream
-  whose demand failed, and sends the next call on the same connection. A failed call stays owed: an answer or step the
-  controller sends for it late — a real one included — is read and dropped, and the call holds its in-flight slot until
-  then. Silence is measured on while any such call is owed, and its clock restarts each time it expires, so a call
-  queued behind slots the abandoned calls hold fails `SILENT` too, never waits without a bound. A controller silent for
-  a second window in a row with every slot held by abandoned calls is lost: the client fails every waiting call with
-  that loss, naming the controller's pid and the sample of its last recorded silence, and closes the connection, which
-  ends a `cowshed controller` serving it. A heartbeat proves that the controller process and its connection serve, and
-  names the op the actor is busy with. It does not prove the actor is not deadlocked: an actor stuck inside one op keeps
-  the heartbeats coming, and their `forMs` keeps rising. A version 1 connection, an older client's, hears none
-  (07_api.md, "Controller handshake").
+  it is `null` while the actor serves nothing. The router is serial for every call but a job's own (07_api.md, "A job's
+  calls are its supervisor's to answer"), so any other call waits behind whatever op it is busy with, and a call has no
+  total bound, which would fail a call that is only queued. The client reads past the heartbeats under the 15 s silence
+  bound, measured from when the controller last owed it nothing. A controller silent that long fails every waiting call
+  `SILENT`, naming it as the socketpair peer with the pid its hello reported (the socketpair's credentials name the
+  process that made the pair, not the controller) and the busy op of its last heartbeat. SILENT ends those waits, never
+  by itself the connection: a `cowshed controller` exits once its peer closes its end (06_cli.md), and every other op of
+  the coordinator shares that connection. The client keeps it, closes each stream whose demand failed, and sends the
+  next call on the same connection. A failed call stays owed: an answer or step the controller sends for it late — a
+  real one included — is read and dropped, and the call holds its in-flight slot until then. Silence is measured on
+  while any such call is owed, and its clock restarts each time it expires, so a call queued behind slots the abandoned
+  calls hold fails `SILENT` too, never waits without a bound. A controller silent for a second window in a row with
+  every slot held by abandoned calls is lost: the client fails every waiting call with that loss, naming the
+  controller's pid and the sample of its last recorded silence, and closes the connection, which ends a
+  `cowshed controller` serving it. A heartbeat proves that the controller process and its connection serve, and names
+  the op the actor is busy with. It does not prove the actor is not deadlocked: an actor stuck inside one op keeps the
+  heartbeats coming, and their `forMs` keeps rising. A version 1 connection, an older client's, hears none (07_api.md,
+  "Controller handshake").
 - **Spans.** A failure reaches the boundary that owns the wait as a value. A `TIMEOUT`, `SILENT` or `PEER_LOST` failure
   carries its facts (`WaitFailure`: code, op, peer and its pid, class, bound, time waited, last progress) on the
   caller's error, inside the process only. An owner that has a span ends it `span-err` with the failure's message. The

@@ -40,7 +40,8 @@ use crate::api::dto::GitOid;
 use crate::api::{JobId, JobInfo};
 use crate::gateway_sessions::GatewayControl;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, PublicationState, WorkspaceMarker, WorkspaceName, sidecar_path,
+    DetachedWorkspaceMetadata, PublicationState, WorkspaceIncarnation, WorkspaceMarker,
+    WorkspaceName, sidecar_path,
 };
 use crate::repository::RepoId;
 use crate::runtime::supervisor::LogChunk;
@@ -364,6 +365,11 @@ impl JobLink {
         }
     }
 
+    /// The lane to the supervisor serving `socket`, reached through `handle`.
+    pub fn over(socket: PathBuf, handle: WorkspaceSupervisorHandle) -> Self {
+        Self { socket, handle }
+    }
+
     pub fn socket(&self) -> &Path {
         &self.socket
     }
@@ -464,6 +470,78 @@ impl JobLink {
             }
             done => done,
         }
+    }
+}
+
+/// The lanes a controller holds to its workspaces' supervisors, shared between the host that
+/// makes them and the router that answers a job's calls on them beside the operation it serves
+/// (07_api.md, "A job's calls are its supervisor's to answer"). A workspace has a resident lane
+/// once an exec of the controller was admitted through the resident client, and a supervisor
+/// lane once the controller started its supervisor or found one serving. The host is their one
+/// writer. A lane proves itself on every use ([`JobLink::current`]), so one whose supervisor
+/// retired answers nothing and needs no removal.
+#[derive(Clone, Default)]
+pub struct JobLanes(std::sync::Arc<std::sync::Mutex<Lanes>>);
+
+#[derive(Default)]
+struct Lanes {
+    residents: std::collections::BTreeMap<WorkspaceName, JobLink>,
+    supervisors: std::collections::BTreeMap<WorkspaceName, JobLink>,
+}
+
+/// The lanes held to one workspace at one incarnation, none of them proven yet: the resident
+/// lane first, as the host's own job calls take it.
+pub struct HeldLanes([Option<JobLink>; 2]);
+
+impl JobLanes {
+    fn lanes(&self) -> std::sync::MutexGuard<'_, Lanes> {
+        self.0.lock().expect("job lanes mutex poisoned")
+    }
+
+    pub fn resident(&self, workspace: &WorkspaceName) -> Option<JobLink> {
+        self.lanes().residents.get(workspace).cloned()
+    }
+
+    pub fn set_resident(&self, workspace: WorkspaceName, link: JobLink) {
+        self.lanes().residents.insert(workspace, link);
+    }
+
+    pub fn drop_resident(&self, workspace: &WorkspaceName) {
+        self.lanes().residents.remove(workspace);
+    }
+
+    pub fn set_supervisor(&self, workspace: WorkspaceName, link: JobLink) {
+        self.lanes().supervisors.insert(workspace, link);
+    }
+
+    /// The lanes held to `workspace` whose supervisor served `incarnation` when they were made,
+    /// read without I/O; `None` when there is none.
+    pub fn held(
+        &self,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Option<HeldLanes> {
+        let lanes = self.lanes();
+        let held = [&lanes.residents, &lanes.supervisors].map(|lanes| {
+            lanes
+                .get(workspace)
+                .filter(|link| link.handle().snapshot().workspace_incarnation == *incarnation)
+                .cloned()
+        });
+        held.iter().any(Option::is_some).then_some(HeldLanes(held))
+    }
+}
+
+impl HeldLanes {
+    /// The first of the lanes whose supervisor still serves its incarnation, a grant advance
+    /// followed: one `hello` each ([`JobLink::current`]).
+    pub async fn serving(self, probe: &impl LiveProbe) -> Option<JobLink> {
+        for mut link in self.0.into_iter().flatten() {
+            if link.current(probe).await.is_ok() {
+                return Some(link);
+            }
+        }
+        None
     }
 }
 

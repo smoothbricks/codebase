@@ -162,6 +162,12 @@ pub enum GcReach {
 #[async_trait]
 pub trait ProjectRuntimeHost: Send + 'static {
     fn descriptor(&self) -> &ProjectDescriptor;
+    /// The lanes this host holds to its workspaces' supervisors, which the router answers a
+    /// job's calls on beside the operation it serves (07_api.md, "A job's calls are its
+    /// supervisor's to answer"). A host that publishes none has every call routed in turn.
+    fn job_lanes(&self) -> crate::resident::JobLanes {
+        crate::resident::JobLanes::default()
+    }
 
     async fn recover(&mut self) -> Result<()>;
     /// The verb (or startup recovery) that claimed this host's lifecycle-intent leases returned:
@@ -1228,7 +1234,7 @@ impl ProjectRuntime {
             .ok_or_else(|| CowshedError::internal("project router capacity is zero"))?;
         let (router, receiver) = RouterHandle::channel(capacity);
         let busy = router.busy().clone();
-        let actor = tokio::spawn(ProjectActor::new(Box::new(host), receiver, busy).run());
+        let actor = tokio::spawn(ProjectActor::new(Box::new(host), busy).run(receiver));
         Ok(Self {
             descriptor,
             router,
@@ -1342,51 +1348,253 @@ enum Routed {
     Later(JobAnswer<RouterResponse>),
 }
 
+/// One call that names a job and that the job's supervisor answers by itself (07_api.md, "A
+/// job's calls are its supervisor's to answer").
+struct JobCall {
+    workspace: WorkspaceName,
+    incarnation: WorkspaceIncarnation,
+    job: JobId,
+    ask: JobAsk,
+}
+
+enum JobAsk {
+    Status,
+    WorkerJob,
+    Wait,
+    Kill,
+    Detach,
+    Logs {
+        stream: JobStream,
+        offset: u64,
+        follow: bool,
+    },
+}
+
+impl JobCall {
+    /// `request` as a job call its connection's authority covers, decided from the request
+    /// alone: the project's repository, and on a worker connection the workspace and incarnation
+    /// the connection is fenced to. Anything else is the serial route's to answer or refuse.
+    fn of(request: &RouterRequest, repo: &RepoId) -> Option<Self> {
+        use OperationRequest as Op;
+        let (fence, job, ask) = match request.operation() {
+            Op::JobStatus(params) => (fence_of(params), params.job_id, JobAsk::Status),
+            Op::WorkerJob(params) => (fence_of(params), params.job_id, JobAsk::WorkerJob),
+            Op::JobWait(params) => (fence_of(params), params.job_id, JobAsk::Wait),
+            Op::JobKill(params) => (fence_of(params), params.job_id, JobAsk::Kill),
+            Op::JobDetach(params) => (fence_of(params), params.job_id, JobAsk::Detach),
+            Op::JobLogs(params) => (
+                (
+                    &params.repo_id,
+                    &params.workspace,
+                    &params.workspace_incarnation,
+                ),
+                params.job_id,
+                JobAsk::Logs {
+                    stream: params.stream,
+                    offset: params.offset,
+                    follow: params.follow,
+                },
+            ),
+            _ => return None,
+        };
+        let (named, workspace, incarnation) = fence;
+        if named != repo || request.authority().repo_id() != Some(repo) {
+            return None;
+        }
+        if let ConnectionAuthority::Worker {
+            workspace: fenced,
+            workspace_incarnation: fenced_incarnation,
+            ..
+        } = request.authority()
+            && (fenced != workspace || fenced_incarnation != incarnation)
+        {
+            return None;
+        }
+        Some(Self {
+            workspace: workspace.clone(),
+            incarnation: incarnation.clone(),
+            job,
+            ask,
+        })
+    }
+
+    /// The supervisor's answer on `link`, as the serial route encodes the same call's.
+    async fn answer(self, mut link: crate::resident::JobLink) -> Result<RouterResponse> {
+        let job = self.job;
+        match self.ask {
+            JobAsk::Status => respond::<operations::JobStatus>(&link.info(job).await?),
+            JobAsk::WorkerJob => respond::<operations::WorkerJob>(&link.info(job).await?),
+            JobAsk::Wait => respond::<operations::JobWait>(&link.wait(job).await?),
+            JobAsk::Kill => {
+                link.kill(job).await?;
+                respond::<operations::JobKill>(&EmptyResult {})
+            }
+            JobAsk::Detach => {
+                link.detach(job).await?;
+                respond::<operations::JobDetach>(&EmptyResult {})
+            }
+            JobAsk::Logs {
+                stream,
+                offset,
+                follow,
+            } => {
+                let chunk = link
+                    .log_read(
+                        job,
+                        crate::storage::job_artifact::StreamKind::from(stream),
+                        offset,
+                        follow,
+                    )
+                    .await?;
+                logs_response(RuntimeLogChunk {
+                    bytes: chunk.bytes,
+                    next_offset: chunk.next_offset,
+                    eof: chunk.eof,
+                })
+            }
+        }
+    }
+}
+
+/// The repository, workspace and incarnation a job request names.
+fn fence_of(params: &JobRequest) -> (&RepoId, &WorkspaceName, &WorkspaceIncarnation) {
+    (
+        &params.repo_id,
+        &params.workspace,
+        &params.workspace_incarnation,
+    )
+}
+
+/// The job calls the router answers beside the operation it serves.
+struct Beside {
+    lanes: crate::resident::JobLanes,
+    repo: RepoId,
+    /// Where a call whose lane no longer reaches a serving supervisor goes back to the router.
+    unreached: mpsc::UnboundedSender<RouterCommand>,
+}
+
+impl Beside {
+    /// Answer `command` on a task of its own when it is a job call with a lane held to its
+    /// workspace's supervisor; otherwise hand it back for the serial route. A lane whose
+    /// supervisor no longer serves the call's incarnation sends the call back to the router,
+    /// behind what arrived meanwhile: calls of one connection are concurrent, and none is
+    /// ordered against another it did not wait for.
+    fn take(&self, command: RouterCommand) -> Option<RouterCommand> {
+        let Some(call) = JobCall::of(command.request(), &self.repo) else {
+            return Some(command);
+        };
+        let Some(held) = self.lanes.held(&call.workspace, &call.incarnation) else {
+            return Some(command);
+        };
+        let unreached = self.unreached.clone();
+        tokio::spawn(async move {
+            match held.serving(&crate::resident::HostProbe).await {
+                Some(link) => {
+                    let method = command.request().method();
+                    let _span =
+                        cowshed_os::timing::span_named("route-beside", || method.to_owned());
+                    let (_, reply) = command.into_parts();
+                    let _ = reply.send(call.answer(link).await);
+                }
+                None => {
+                    // The router stopped: dropping the command fails its call as stopped.
+                    let _ = unreached.send(command);
+                }
+            }
+        });
+        None
+    }
+}
+
 struct ProjectActor {
     host: Box<dyn ProjectRuntimeHost>,
-    receiver: mpsc::Receiver<RouterCommand>,
     /// Where the op this actor serves is published for the connections' heartbeats.
     busy: BusySlot,
 }
 
 impl ProjectActor {
-    fn new(
-        host: Box<dyn ProjectRuntimeHost>,
-        receiver: mpsc::Receiver<RouterCommand>,
-        busy: BusySlot,
-    ) -> Self {
-        Self {
-            host,
-            receiver,
-            busy,
-        }
+    fn new(host: Box<dyn ProjectRuntimeHost>, busy: BusySlot) -> Self {
+        Self { host, busy }
     }
 
-    async fn run(mut self) {
-        while let Some(command) = self.receiver.recv().await {
-            let (request, reply) = command.into_parts();
-            self.busy.publish(Some(RouteBusy::of(&request)));
-            let routed = match request.steps().cloned() {
-                Some(steps) => cowshed_os::timing::reporting(steps, self.route(request)).await,
-                None => self.route(request).await,
+    /// Serve the commands in arrival order, one at a time, but for a job's calls: each of those
+    /// with a lane to its supervisor is answered beside the operation in flight ([`Beside`]).
+    /// The commands that arrive during an operation wait here in arrival order; their number is
+    /// bounded by the open calls of the connections that sent them.
+    async fn run(mut self, mut receiver: mpsc::Receiver<RouterCommand>) {
+        let (unreached, mut returned) = mpsc::unbounded_channel();
+        let beside = Beside {
+            lanes: self.host.job_lanes(),
+            repo: self.host.descriptor().repo_id.clone(),
+            unreached,
+        };
+        let mut waiting = std::collections::VecDeque::new();
+        let mut open = true;
+        loop {
+            let command = match waiting.pop_front() {
+                Some(command) => command,
+                None if open => tokio::select! {
+                    returned = returned.recv() => match returned {
+                        Some(command) => command,
+                        None => break,
+                    },
+                    received = receiver.recv() => match received.map(|command| beside.take(command)) {
+                        Some(Some(serial)) => serial,
+                        Some(None) => continue,
+                        None => {
+                            open = false;
+                            continue;
+                        }
+                    },
+                },
+                None => break,
             };
-            self.busy.publish(None);
-            self.host.release_intent_leases();
-            match routed {
-                Ok(Routed::Now(response)) => {
-                    let _ = reply.send(Ok(response));
-                }
-                Ok(Routed::Later(answer)) => {
-                    tokio::spawn(async move {
-                        let _ = reply.send(answer.await);
-                    });
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
+            let serving = self.serve(command);
+            tokio::pin!(serving);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut serving => break,
+                    Some(command) = returned.recv() => waiting.push_back(command),
+                    received = receiver.recv(), if open => match received {
+                        Some(command) => waiting.extend(beside.take(command)),
+                        None => open = false,
+                    },
                 }
             }
         }
+        // Every handle is gone. A call a task still holds comes back once its lane fails; the
+        // tasks hold the only senders left.
+        drop(beside);
+        while let Some(command) = returned.recv().await {
+            self.serve(command).await;
+        }
         self.host.shutdown().await;
+    }
+
+    /// Route one command and answer it: the one operation the router is busy with meanwhile.
+    async fn serve(&mut self, command: RouterCommand) {
+        let (request, reply) = command.into_parts();
+        self.busy.publish(Some(RouteBusy::of(&request)));
+        let routed = match request.steps().cloned() {
+            Some(steps) => cowshed_os::timing::reporting(steps, self.route(request)).await,
+            None => self.route(request).await,
+        };
+        self.busy.publish(None);
+        self.host.release_intent_leases();
+        match routed {
+            Ok(Routed::Now(response)) => {
+                let _ = reply.send(Ok(response));
+            }
+            Ok(Routed::Later(answer)) => {
+                tokio::spawn(async move {
+                    let _ = reply.send(answer.await);
+                });
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
     }
 
     async fn route(&mut self, request: RouterRequest) -> Result<Routed> {
@@ -2209,21 +2417,7 @@ impl ProjectActor {
                 params.follow,
             )
             .await?;
-        Ok(Box::pin(async move {
-            let chunk = chunk.await?;
-            if chunk.bytes.len() > MAX_LOG_CHUNK_BYTES {
-                return Err(CowshedError::internal(
-                    "supervisor returned a log chunk larger than the transport frame",
-                ));
-            }
-            RouterResponse::binary(
-                encode_result::<operations::JobLogs>(&LogsChunk {
-                    eof: chunk.eof,
-                    next_offset: chunk.next_offset,
-                })?,
-                chunk.bytes,
-            )
-        }))
+        Ok(Box::pin(async move { logs_response(chunk.await?) }))
     }
 
     async fn job_tail(
@@ -2716,6 +2910,21 @@ fn workspace_view(snapshot: WorkspaceSnapshot) -> WorkspaceView {
 }
 
 /// Answers a call with its operation's declared result.
+/// A `job.logs` answer: the chunk's position as JSON and its bytes as the call's binary frame.
+fn logs_response(chunk: RuntimeLogChunk) -> Result<RouterResponse> {
+    if chunk.bytes.len() > MAX_LOG_CHUNK_BYTES {
+        return Err(CowshedError::internal(
+            "supervisor returned a log chunk larger than the transport frame",
+        ));
+    }
+    RouterResponse::binary(
+        encode_result::<operations::JobLogs>(&LogsChunk {
+            eof: chunk.eof,
+            next_offset: chunk.next_offset,
+        })?,
+        chunk.bytes,
+    )
+}
 fn respond<O: Operation>(result: &O::Result) -> Result<RouterResponse> {
     encode_result::<O>(result).map(RouterResponse::json)
 }
@@ -2885,10 +3094,12 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
         std::collections::BTreeMap<WorkspaceName, super::supervisor::WorkspaceSupervisorHandle>,
     /// The supervisors this process serves: only in a `cowshed __workspace-supervisor` process.
     served: std::collections::BTreeMap<WorkspaceName, ServedSupervisor>,
-    /// The lane of each workspace whose exec this controller admitted through the resident exec
-    /// client (06_cli.md, "Resident workspaces"); that workspace's job calls take it while it
-    /// names the incarnation they ask about.
-    residents: std::collections::BTreeMap<WorkspaceName, crate::resident::JobLink>,
+    /// The lane to each workspace's supervisor a job's calls take (07_api.md, "A job's calls are
+    /// its supervisor's to answer"), shared with the router: the resident lane of a workspace
+    /// whose exec this controller admitted through the resident exec client (06_cli.md,
+    /// "Resident workspaces"), which this host's own job calls take while it names the
+    /// incarnation they ask about, and the lane beside each handle in `supervisors`.
+    lanes: crate::resident::JobLanes,
     /// Who runs the workspace supervisors this host's commands reach.
     supervisors_run_in: SupervisorHome,
     /// Set by a land step (`exec --class gate`, `rebase`, `land`) when it starts: until this
@@ -4417,7 +4628,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
-            residents: std::collections::BTreeMap::new(),
+            lanes: crate::resident::JobLanes::default(),
             supervisors_run_in,
             other_build_wait_until: None,
             forwarders: if forwards_commitments {
@@ -9983,8 +10194,8 @@ self.finish_retire_intent(&workspace).await?;
             .admissible(self.gateway_control.as_ref())
             .await
             .ok()?;
-        self.residents
-            .insert(workspace.clone(), crate::resident::JobLink::new(&resident));
+        self.lanes
+            .set_resident(workspace.clone(), crate::resident::JobLink::new(&resident));
         Some(resident)
     }
 
@@ -9997,19 +10208,35 @@ self.finish_retire_intent(&workspace).await?;
         workspace: &WorkspaceName,
         incarnation: &WorkspaceIncarnation,
     ) -> Option<crate::resident::JobLink> {
-        let mut link = self.residents.get(workspace)?.clone();
+        let mut link = self.lanes.resident(workspace)?;
         // A call for another incarnation's job leaves this incarnation's lane in place.
         if link.handle().snapshot().workspace_incarnation != *incarnation {
             return None;
         }
         if link.current(&crate::resident::HostProbe).await.is_err() {
-            self.residents.remove(workspace);
+            self.lanes.drop_resident(workspace);
             return None;
         }
-        self.residents.insert(workspace.clone(), link.clone());
+        self.lanes.set_resident(workspace.clone(), link.clone());
         Some(link)
     }
 
+    /// The handle to `name`'s supervisor serving `authority` on `socket`: kept for this host's
+    /// commands, and published as the lane `name`'s job calls take beside the router.
+    fn reached(
+        &mut self,
+        name: &WorkspaceName,
+        socket: PathBuf,
+        authority: super::supervisor::WorkspaceAuthoritySnapshot,
+    ) -> super::supervisor::WorkspaceSupervisorHandle {
+        let handle = super::supervisor_socket::connect(socket.clone(), authority);
+        self.lanes.set_supervisor(
+            name.clone(),
+            crate::resident::JobLink::over(socket, handle.clone()),
+        );
+        self.supervisors.insert(name.clone(), handle.clone());
+        handle
+    }
     async fn ensure_supervisor(
         &mut self,
         name: &WorkspaceName,
@@ -10185,8 +10412,7 @@ self.finish_retire_intent(&workspace).await?;
             )
             .await?;
             self.forward_commitments(&ensured.socket);
-            let handle = super::supervisor_socket::connect(ensured.socket, ensured.authority);
-            self.supervisors.insert(name.clone(), handle.clone());
+            let handle = self.reached(name, ensured.socket, ensured.authority);
             return Ok(handle);
         }
         // One builder, so a grant advance cannot hand the supervisor a different policy than
@@ -10329,8 +10555,7 @@ self.finish_retire_intent(&workspace).await?;
             Ok(Some(hello)) => {
                 match super::supervisor_manager::standing(&hello.authority, &config.authority) {
                     super::supervisor_manager::Standing::Serves => {
-                        let handle = super::supervisor_socket::connect(socket, hello.authority);
-                        self.supervisors.insert(name.clone(), handle.clone());
+                        let handle = self.reached(name, socket, hello.authority);
                         return Ok(handle);
                     }
                     super::supervisor_manager::Standing::Behind
@@ -10384,7 +10609,7 @@ self.finish_retire_intent(&workspace).await?;
             Some(advances),
             Some(feed),
         ));
-        let handle = super::supervisor_socket::connect(socket.clone(), authority);
+        let handle = self.reached(name, socket.clone(), authority);
         self.served.insert(
             name.clone(),
             ServedSupervisor {
@@ -10394,7 +10619,6 @@ self.finish_retire_intent(&workspace).await?;
                 advance_requests,
             },
         );
-        self.supervisors.insert(name.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -14015,6 +14239,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         &self.descriptor
     }
 
+    fn job_lanes(&self) -> crate::resident::JobLanes {
+        self.lanes.clone()
+    }
+
     fn release_intent_leases(&mut self) {
         let _ = self.intent_leases.release_all();
     }
@@ -16358,12 +16586,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .actor
                     .advance_authority(effective_revision, topology_revision, config)
                     .await?;
-                let handle = super::supervisor_socket::connect(
-                    served.socket.clone(),
-                    advanced.snapshot().clone(),
-                );
+                let (socket, authority) = (served.socket.clone(), advanced.snapshot().clone());
                 served.actor = advanced;
-                self.supervisors.insert(workspace, handle);
+                self.reached(&workspace, socket, authority);
             }
         }
         Ok(published)

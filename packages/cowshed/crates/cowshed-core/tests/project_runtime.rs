@@ -276,6 +276,9 @@ struct FakeHost {
     /// The supervisor serving each workspace whose jobs are real; a workspace without one runs
     /// none.
     supervisors: std::collections::BTreeMap<WorkspaceName, WorkspaceSupervisorHandle>,
+    /// The lanes to those supervisors this host publishes for the router; none unless a test
+    /// serves one on a socket.
+    lanes: cowshed_core::resident::JobLanes,
     /// When set, a stdin write is taken only once this is notified, as a job that has not yet
     /// read its input holds the write that would overfill it.
     stdin_gate: Option<Arc<Notify>>,
@@ -331,6 +334,7 @@ impl FakeHost {
             recovery_behavior: RecoveryBehavior::None,
             held_job: None,
             supervisors: std::collections::BTreeMap::new(),
+            lanes: cowshed_core::resident::JobLanes::default(),
             stdin_gate: None,
             create_gate: None,
             gc_gate: None,
@@ -503,6 +507,10 @@ fn stale_lifecycle_conflict() -> CowshedError {
 impl ProjectRuntimeHost for FakeHost {
     fn descriptor(&self) -> &ProjectDescriptor {
         &self.descriptor
+    }
+
+    fn job_lanes(&self) -> cowshed_core::resident::JobLanes {
+        self.lanes.clone()
     }
 
     async fn recover(&mut self) -> Result<()> {
@@ -2300,6 +2308,95 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     held.end();
     let ended = wait.await.expect("wait");
     assert_eq!(ended.state, JobState::Exited);
+}
+
+/// A fork holds the router for as long as it runs, and a job's status is none of what it holds
+/// (07_api.md, "A job's calls are its supervisor's to answer"): with a create held open inside
+/// its clone step, a status read of a job the controller admitted earlier is answered by the
+/// job's supervisor, on the lane the controller holds to it, and the create is still held.
+#[tokio::test]
+async fn a_job_s_status_is_answered_while_a_fork_holds_the_router() {
+    use cowshed_core::resident::JobLink;
+    use cowshed_core::runtime::supervisor_socket;
+    let root = test_root();
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let supervisor = scripted_supervisor(&root, spawn_tx);
+    let socket = root.join("s");
+    let listener = supervisor_socket::bind(&socket)
+        .await
+        .expect("bind main's supervisor");
+    let _serving = tokio::spawn(supervisor_socket::serve(
+        listener,
+        supervisor.clone(),
+        None,
+        None,
+    ));
+    let (events, _events) = mpsc::unbounded_channel();
+    let gate = Arc::new(Notify::new());
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
+    host.create_gate = Some(Arc::clone(&gate));
+    host.supervisors
+        .insert(WorkspaceName::main(), supervisor.clone());
+    host.lanes.set_supervisor(
+        WorkspaceName::main(),
+        JobLink::over(
+            socket.clone(),
+            supervisor_socket::connect(socket, supervisor.snapshot().clone()),
+        ),
+    );
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    let adopted = adopt(&router, &repo).await;
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    let job = route(
+        &router,
+        coordinator(repo.clone()),
+        "worker.exec",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "workspaceIncarnation": incarnation,
+            "argv": serde_json::to_value(vec![CommandArg::from("build")]).unwrap(),
+            "mode": "readWrite",
+            "env": {},
+            "stdin": {"kind":"empty"},
+            "stdoutCopy": null,
+            "stderrCopy": null
+        }),
+    )
+    .await
+    .expect("admit the job");
+    let _process = spawned.recv().await.expect("the admitted job spawned");
+
+    // The fork is sent first, so the status read arrives behind it.
+    let fork = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.fork",
+        json!({ "repoId": repo, "workspace": "task", "options": ForkOptions::default() }),
+    );
+    tokio::pin!(fork);
+    let status = route(
+        &router,
+        coordinator(repo.clone()),
+        "job.status",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "workspaceIncarnation": incarnation,
+            "jobId": job
+        }),
+    );
+    let status = tokio::select! {
+        biased;
+        forked = &mut fork => panic!("the held fork answered: {forked:?}"),
+        status = status => status.expect("the job's status"),
+    };
+    assert_eq!(status["state"], json!("running"), "{status}");
+
+    gate.notify_one();
+    fork.await.expect("the fork ends once released");
 }
 
 /// A job process the test speaks for: the supervisor hands each spawned job's event sender to
