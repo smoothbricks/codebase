@@ -29,8 +29,8 @@
 use crate::ef::{self, EfLayout, EfRange, EfView};
 use crate::patch::PatchError;
 use crate::small::{
-    SMALL_MIN, SmallRange, SmallSet, SmallSink, read_small_tag, small_count, small_form,
-    small_image_len, small_tag,
+    SMALL_MIN, SmallRange, SmallSet, SmallSink, read_small_tag, small_count, small_image_len,
+    small_tag,
 };
 use crate::{AdmissionClass, AdmissionError};
 use crate::{
@@ -962,22 +962,23 @@ impl Bitmosaic {
     /// The forest family's form: a small form for one chunk at key zero
     /// whose image is no longer than the directory's, else the directory.
     fn forest_plan(&self) -> Plan {
-        let directory = Plan::Forest {
-            body_bytes: self.forest_body_bytes(),
-        };
         if let ([0], [container]) = (self.keys(), self.containers()) {
             let card = container.cardinality();
-            if let Some((kind, payload)) = small_form(
-                directory.len(true),
+            let stride = card >= 2 && matches!(container, Container::Stride { .. });
+            if let Some((kind, payload)) = crate::canon::small_choice(
                 container.select(0),
                 container.select(card - 1),
                 card,
                 chunk_runs(container),
+                stride,
+                || payload_len(container),
             ) {
                 return Plan::Small { kind, payload };
             }
         }
-        directory
+        Plan::Forest {
+            body_bytes: self.forest_body_bytes(),
+        }
     }
 
     /// EF wins only on strictly smaller complete standalone size.

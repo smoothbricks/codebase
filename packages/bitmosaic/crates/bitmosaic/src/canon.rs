@@ -153,7 +153,8 @@ fn directory_floor(card: u32, runs: usize, stride: bool) -> usize {
     } else if stride {
         4
     } else {
-        (11 + n).min(2 * n).min(runs_payload_len(runs))
+        // Runs costs at least four bytes a run.
+        (11 + n).min(2 * n).min(runs.saturating_mul(4))
     }
 }
 
