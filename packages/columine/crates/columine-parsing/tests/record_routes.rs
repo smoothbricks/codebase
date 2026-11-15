@@ -631,6 +631,62 @@ fn a_payload_member_nothing_places_is_refused_by_name_where_the_schema_has_a_rec
         }
     }
 }
+
+/// The rule asks for no column of a reserved name: a schema whose payload
+/// members have columns of their own, with no declared record and no carrier,
+/// refuses a member nothing places as a schema with a record does. With a
+/// carrier the same member is the carrier's.
+#[test]
+fn a_payload_member_nothing_places_is_refused_by_name_whatever_the_columns_are_named() {
+    use Mp::{Int, Map, Str};
+    let fields = vec![
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Utf8, true),
+        SignalSchemaField::new(ArrowType::Binary, true),
+    ];
+    let config = |names: &[&str; 3]| {
+        build_extraction_config_with_semantic_schemas(
+            &fields,
+            names,
+            &[],
+            None,
+            None,
+            CellLayout {
+                cell_metadata: &[None, None, Some(ENCODING.to_owned())],
+                encoding: Some(ENCODING),
+                ..CellLayout::default()
+            },
+        )
+        .unwrap()
+    };
+    let json: &[u8] = br#"[{"type":"order","value":{"name":"a","stray":2}}]"#;
+    let mut packed = vec![0x91];
+    msgpack(
+        &mut packed,
+        &Map(vec![
+            ("type", Str("order")),
+            ("value", Map(vec![("name", Str("a")), ("stray", Int(2))])),
+        ]),
+    );
+    let plain = config(&["type", "value.name", "value.detail"]);
+    let carried = config(&["type", "value.name", "value.$undeclared"]);
+    for lane in ["json", "msgpack"] {
+        let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
+        assert_eq!(
+            run(lane, &plain, &mut columns, json, &packed),
+            Err(ExtractionError::UnplacedMember {
+                path: "value.stray".to_owned()
+            }),
+            "{lane}: no column, routing row or carrier places value.stray"
+        );
+        let mut columns = DynamicColumns::new(&fields, 8).expect("column plane fits");
+        assert_eq!(
+            run(lane, &carried, &mut columns, json, &packed),
+            Ok(1),
+            "{lane}: a carrier holds what nothing else places"
+        );
+    }
+}
 //#region smoo/columine!n/vocab-bounded-string
 /// `box` has a structured column the embedder writes and `meta` is routed to
 /// the declared record; each holds optional bounded strings at depth.

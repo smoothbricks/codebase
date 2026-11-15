@@ -22,10 +22,14 @@ use crate::columns::{MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES};
 /// This is the processor's column capacity, not a row, event or decision
 /// bound. Nothing is sized by it: retained metadata and the compact
 /// validator's range table take their counts from the schema's own layout
-/// ([`compute_buffer_count`]). The TypeScript side reads it from the
-/// generated ABI table. A schema this wide is still refused when its Schema
-/// message passes [`MAX_SCHEMA_MESSAGE_BYTES`].
-pub const MAX_SCHEMA_FIELDS: usize = 512;
+/// ([`compute_buffer_count`]), and every per-field pass at creation and per
+/// row is linear in the field count. What it protects is the width of what
+/// names a field elsewhere: a diagnostic's `u16` field index, whose
+/// `0xFFFF` means no field, and a descriptor's `u16` dictionary slot
+/// ([`DictionarySlot`]); 2,048 leaves both five bits of room. The TypeScript
+/// side reads it from the generated ABI table. A schema this wide is still
+/// refused when its Schema message passes [`MAX_SCHEMA_MESSAGE_BYTES`].
+pub const MAX_SCHEMA_FIELDS: usize = 2048;
 
 /// Largest declared byte width of a `FixedSizeBinary` field.
 ///
@@ -1263,9 +1267,10 @@ fn preamble(
 
 /// The largest Schema message a handle accepts, framing included.
 ///
-/// A complete event schema whose fields each carry selector metadata outgrows
-/// 64 KiB well under [`MAX_SCHEMA_FIELDS`] fields (177 such fields take
-/// 103,232 bytes); this cap admits it with room to grow.
+/// A complete event schema whose fields each carry selector metadata takes
+/// about 583 bytes a field (177 such fields take 103,232 bytes), so
+/// [`MAX_SCHEMA_FIELDS`] of them take about 1.2 MiB; the cap is 1,024 bytes
+/// a field, which admits that with room for longer names.
 ///
 /// Decoding goes through the arrow-ipc reader, whose allocations are
 /// infallible, so this cap bounds them before the call. For the max-field,
@@ -1273,7 +1278,7 @@ fn preamble(
 /// decode's additional peak requested allocation stays within four times this
 /// cap. That fixture bound is not a worst-case memory guarantee for every
 /// schema, nor a measure of the memory a host commits.
-pub const MAX_SCHEMA_MESSAGE_BYTES: usize = 256 * 1024;
+pub const MAX_SCHEMA_MESSAGE_BYTES: usize = MAX_SCHEMA_FIELDS * 1024;
 
 /// Decode a Schema message into its Arrow schema and each field's Arrow
 /// dictionary id (`None` for a field that is not dictionary-encoded).

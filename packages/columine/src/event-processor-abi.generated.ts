@@ -119,7 +119,7 @@ export const FIELD_IDENTITY_KEY = 'sb.fields';
 export const CELL_ENCODING_KEY = 'sb.cell';
 
 /** Physical Arrow fields in one flattened schema. */
-export const MAX_SCHEMA_FIELDS = 512;
+export const MAX_SCHEMA_FIELDS = 2048;
 
 /** Ceiling for a batch's row count: a validation limit, nothing is allocated for it. */
 export const MAX_EVENTS_PER_BATCH = 65536;
@@ -128,7 +128,7 @@ export const MAX_EVENTS_PER_BATCH = 65536;
 export const MAX_VALUE_BYTES = 16777216;
 
 /** Longest Arrow IPC Schema message a handle accepts. */
-export const MAX_SCHEMA_MESSAGE_BYTES = 262144;
+export const MAX_SCHEMA_MESSAGE_BYTES = 2097152;
 
 /** Widest FixedSizeBinary field, in bytes per row. */
 export const MAX_FIXED_SIZE_BINARY_WIDTH = 256;

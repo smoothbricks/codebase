@@ -579,11 +579,11 @@ impl ExtractionConfig {
     }
 
     /// Whether a payload member nothing places is refused by name rather than
-    /// dropped: the schema has a declared record, so placement is total, and
-    /// no carrier holds a member nothing else places
+    /// dropped: placement is total where payload members have columns of
+    /// their own, and no carrier holds a member nothing else places
     /// (specs/columine/10-physical-vocabulary.md §7).
     pub(crate) fn refuses_unplaced(&self) -> bool {
-        self.record_column.is_some() && matches!(self.carrier(), Carrier::Absent)
+        self.has_value_fields && matches!(self.carrier(), Carrier::Absent)
     }
 
     /// Whether a lane reads an event's `type`: its schema routes and judges

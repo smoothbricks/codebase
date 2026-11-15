@@ -155,12 +155,13 @@ or flat, before or after the member); a row of no subtype places the member on e
 places it on. Every subtype row of one `(event type, member)` reads the same key, or creation refuses the schema. A
 routing row places its member whether or not the processor holds a semantic schema, in either payload spelling and
 whichever side of the payload `type` is spelled on: a flat `value.<member>` key takes the member's discriminated column
-and routing row as the nested member does, and a member nothing places keeps its key as its carrier path. Where the
-schema has a declared record and no carrier, a payload member no column and no routing row places is refused by name
-(`UNPLACED_MEMBER`, with the member's path), never dropped. A routing row places its member before a plain
-`value.<member>` column of the same name: the plain column belongs to a member no row places. A placement is per
-`(event type, subtype, member)` and a column is per schema, so one type's member never lands in the column another
-type's member of the same name has, and one subtype's member never lands in another subtype's record.
+and routing row as the nested member does, and a member nothing places keeps its key as its carrier path. Where payload
+members have columns of their own and the schema has no carrier, a payload member no column and no routing row places is
+refused by name (`UNPLACED_MEMBER`, with the member's path), never dropped: the rule asks for no column of any
+particular name. A routing row places its member before a plain `value.<member>` column of the same name: the plain
+column belongs to a member no row places. A placement is per `(event type, subtype, member)` and a column is per schema,
+so one type's member never lands in the column another type's member of the same name has, and one subtype's member
+never lands in another subtype's record.
 
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
@@ -228,6 +229,11 @@ plane's carriers, the descriptor layout, limits, status and creation-failure cod
 unit codes, the metadata keys) by `columine-event-processor/tests/host_abi.rs` under `UPDATE_GENERATED=1`, and that test
 fails when the committed file differs. No host number is typed by hand.
 
+A schema holds at most `MAX_SCHEMA_FIELDS` (2,048) physical fields and its Schema message at most
+`MAX_SCHEMA_MESSAGE_BYTES` (1,024 bytes a field: 2 MiB); creation refuses one field or one byte more by name
+(`SCHEMA_TOO_MANY_FIELDS`, `SCHEMA_TOO_LARGE`). Nothing is sized by the field bound: every structure takes its count
+from the schema, and creation and each row cost time linear in the field count.
+
 ## 10. Behavioral acceptance
 
 `columine-arrow/tests/vocabulary.rs`, `columine-event-processor/tests/vocabulary.rs`,
@@ -244,8 +250,8 @@ tests fenced with the id of its line:
   dictionary, the second carries only what it added as a delta, the third carries no dictionary message, and a reader
   given the image reads each batch's texts;
 - <a id="smoo/columine!n/vocab-image-limit"></a> a value past the image's limit refusing the batch;
-- <a id="smoo/columine!n/vocab-buffer-budget"></a> a schema of 512 encoded columns over one dictionary created and
-  encoded;
+- <a id="smoo/columine!n/vocab-buffer-budget"></a> a schema of `MAX_SCHEMA_FIELDS` (2,048) encoded columns over one
+  dictionary created and encoded;
 - <a id="smoo/columine!n/vocab-compact-index"></a> a caller-built batch whose index is past its dictionary refused;
 - <a id="smoo/columine!n/vocab-field-identity"></a> a column with two type digests, and one identity named twice, in one
   column or on two, refused at creation;

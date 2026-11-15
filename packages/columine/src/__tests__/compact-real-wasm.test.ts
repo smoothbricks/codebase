@@ -25,8 +25,7 @@ import type { CompactBatch, CompactColumn, EncodedArrowSchema } from '../pipelin
 const ROW_COUNT = 300;
 const FIELD_NAMES = ['all_null', 'i32_value', 'f64_value', 'i64_value', 'bool_value', 'binary_value', 'utf8_value'];
 const NULL_ROWS: readonly number[] = [0, 7, 8, 9, 257];
-// The shipped artifact's physical field capacity. The fleet's widest
-// coordinator schema needs 313 physical fields.
+// The shipped artifact's physical field capacity.
 const WIDEST_FIELD_COUNT = MAX_SCHEMA_FIELDS;
 
 function schemaMessage(): EncodedArrowSchema {
@@ -351,7 +350,7 @@ describe('Compact real event_processor.wasm', () => {
       expect(table.getChildAt(index).at(0)).toBe(`v${index}`);
       expect(table.getChildAt(index).at(1)).toBeNull();
     }
-    expect(table.getChild('f511').at(0)).toBe('v511');
+    expect(table.getChild(`f${WIDEST_FIELD_COUNT - 1}`).at(0)).toBe(`v${WIDEST_FIELD_COUNT - 1}`);
 
     const overColumns = [...columns, getAt(columns, 0, 'column')];
     expect(() =>
