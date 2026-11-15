@@ -317,10 +317,12 @@ export function migrateCaptureEnvelope(
   for (const [key, descriptor] of codecs) {
     const old = oldEffects.get(key);
     if (!old || old.owner !== descriptor.metadata.owner) refuse(undefined, 'changed effect ownership');
+    // Both effect codecs are optional. A kind the capture never declared retained nothing to convert.
+    const readable = (kind: 'instruction' | 'outcome', schema: string | undefined, version: number | undefined) =>
+      (schema === undefined && version === undefined) || descriptor.acceptsCodec(kind, schema, version);
     if (
-      !descriptor.acceptsCodec('outcome', old.schema, old.version) ||
-      ((old.instructionSchema !== undefined || old.instructionVersion !== undefined) &&
-        !descriptor.acceptsCodec('instruction', old.instructionSchema, old.instructionVersion))
+      !readable('outcome', old.schema, old.version) ||
+      !readable('instruction', old.instructionSchema, old.instructionVersion)
     )
       throw new CaptureError({
         code: 'schema',
