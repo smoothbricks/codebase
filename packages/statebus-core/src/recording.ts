@@ -37,17 +37,56 @@ export interface ScenarioRecorder {
   reset(): void;
   dispose(): void;
 }
-export function ownEncoded(value: EncodedValue, maxBytes?: number): EncodedValue {
-  return Object.freeze({ ...value, value: captureValue(value.value, maxBytes).value });
+/** A detached record together with the canonical JSON bytes of that whole record. */
+export interface Sized<T> {
+  readonly value: T;
+  readonly bytes: number;
+}
+// Canonical JSON size is additive per member. A record's size is therefore its frame measured around
+// `null`, plus the payload that takes the place of that `null`. The payload is walked once, by the
+// copy that detaches it; only the few scalar members of the frame are measured separately.
+const NULL_BYTES = captureBytes(null);
+const ENTRY_BYTES = captureBytes({ value: null }) - NULL_BYTES;
+const KEYED_ENTRY_BYTES = captureBytes({ id: null, value: null }) - 2 * NULL_BYTES;
+function withinRecord(bytes: number, maxRecordBytes: number | undefined): number {
+  if (maxRecordBytes !== undefined && bytes > maxRecordBytes)
+    throw new CaptureError({ code: 'size-limit', boundary: 'portable value', limit: maxRecordBytes });
+  return bytes;
+}
+function sizedEncoded(value: EncodedValue, maxBytes?: number): Sized<EncodedValue> {
+  const payload = captureValue(value.value, maxBytes);
+  return {
+    value: Object.freeze({ ...value, value: payload.value }),
+    bytes: captureBytes({ ...value, value: null }) - NULL_BYTES + payload.bytes,
+  };
+}
+/** `maxBytes` bounds each encoded payload, `maxRecordBytes` the whole detached entry. */
+export function sizedEntry(
+  entry: EncodedStateEntry,
+  maxBytes?: number,
+  maxRecordBytes?: number,
+): Sized<EncodedStateEntry> {
+  const id = entry.id ? sizedEncoded(entry.id, maxBytes) : undefined;
+  const value = sizedEncoded(entry.value, maxBytes);
+  const bytes = id ? KEYED_ENTRY_BYTES + id.bytes + value.bytes : ENTRY_BYTES + value.bytes;
+  return {
+    value: Object.freeze({ ...(id ? { id: id.value } : {}), value: value.value }),
+    bytes: withinRecord(bytes, maxRecordBytes),
+  };
+}
+/** `maxBytes` bounds the encoded payload, `maxRecordBytes` the whole detached event. */
+export function sizedEvent(event: EncodedEvent, maxBytes?: number, maxRecordBytes?: number): Sized<EncodedEvent> {
+  const payload = sizedEncoded(event.payload, maxBytes);
+  return {
+    value: Object.freeze({ ...event, payload: payload.value }),
+    bytes: withinRecord(captureBytes({ ...event, payload: null }) - NULL_BYTES + payload.bytes, maxRecordBytes),
+  };
 }
 export function ownEntry(entry: EncodedStateEntry, maxBytes?: number): EncodedStateEntry {
-  return Object.freeze({
-    ...(entry.id ? { id: ownEncoded(entry.id, maxBytes) } : {}),
-    value: ownEncoded(entry.value, maxBytes),
-  });
+  return sizedEntry(entry, maxBytes).value;
 }
 export function ownEvent(event: EncodedEvent, maxBytes?: number): EncodedEvent {
-  return Object.freeze({ ...event, payload: ownEncoded(event.payload, maxBytes) });
+  return sizedEvent(event, maxBytes).value;
 }
 export interface CheckpointCaptureOptions {
   readonly maxBytes?: number;
@@ -69,9 +108,9 @@ export function captureCheckpoint(runtime: ComposedRuntime, options: CheckpointC
     const entries: EncodedStateEntry[] = [];
     for (const entry of declaration.captureEntries(runtime)) {
       if (bytes >= maxBytes) throw new CaptureError({ code: 'size-limit', boundary: 'checkpoint', limit: maxBytes });
-      const value = ownEntry(entry, Math.min(maxEntryBytes, maxBytes - bytes));
-      account(captureBytes(value, maxEntryBytes) + (entries.length > 0 ? 1 : 0));
-      entries.push(value);
+      const sized = sizedEntry(entry, Math.min(maxEntryBytes, maxBytes - bytes), maxEntryBytes);
+      account(sized.bytes + (entries.length > 0 ? 1 : 0));
+      entries.push(sized.value);
     }
     // A declaration yields its entries in canonical resource-ID order.
     states.push(Object.freeze({ key, entries: Object.freeze(entries) }));
@@ -83,7 +122,7 @@ export interface ScenarioRecorderOptions {
   readonly maxEvents?: number;
   /** Canonical bytes of each explicit checkpoint. Omitted, `captureCheckpoint`'s own default applies. */
   readonly maxCheckpointBytes?: number;
-  /** Canonical bytes of one checkpoint entry or one event payload. Omitted, the capture defaults apply. */
+  /** Canonical bytes of one encoded checkpoint entry or event. Omitted, the capture defaults apply. */
   readonly maxEntryBytes?: number;
 }
 export function recordScenario(
@@ -109,7 +148,7 @@ export function recordScenario(
       try {
         for (let index = 0; index < length; index++) {
           const event = queue[index];
-          if (event?.kind === 'event') events.push(ownEvent(event.capture(), maxEntryBytes));
+          if (event?.kind === 'event') events.push(sizedEvent(event.capture(), maxEntryBytes, maxEntryBytes).value);
         }
       } catch (cause) {
         complete = false;

@@ -5,13 +5,14 @@ import {
   captureCheckpoint,
   captureEffectInstruction,
   captureEffectOutcome,
-  ownEntry,
-  ownEvent,
   type RecordedEffectCapture,
   type RecordedScenario,
   type RecordedWave,
   replayScenario,
+  type Sized,
   type StateCheckpoint,
+  sizedEntry,
+  sizedEvent,
 } from './recording.js';
 
 export interface RollingCaptureLimits {
@@ -131,10 +132,6 @@ class Journal<T extends object> {
     this.start = 0;
   }
 }
-interface Sized<T> {
-  readonly value: T;
-  readonly bytes: number;
-}
 interface CellIndex {
   readonly declaration: StateDeclaration;
   readonly entries: Map<string | number | undefined, Sized<EncodedStateEntry>>;
@@ -184,10 +181,6 @@ export function recordRollingScenario(
 
   function bound(bytes: number, limit: number, boundary: string): void {
     if (bytes > limit) throw new CaptureError({ code: 'size-limit', boundary, limit });
-  }
-  function sizedEntry(entry: EncodedStateEntry): Sized<EncodedStateEntry> {
-    const value = ownEntry(entry, limits.maxEntryBytes);
-    return { value, bytes: captureBytes(value, limits.maxEntryBytes) };
   }
   function checkpoint(): StateCheckpoint {
     materializations++;
@@ -289,7 +282,7 @@ export function recordRollingScenario(
       for (const id of ids) {
         const before = index.entries.get(id);
         const next = declaration.captureEntry(mirror, id);
-        const after = next && sizedEntry(next);
+        const after = next && sizedEntry(next, limits.maxEntryBytes, limits.maxEntryBytes);
         if (after) {
           bound(after.bytes, limits.maxCheckpointBytes, 'rolling checkpoint entry');
           checkpointBytes += after.bytes - (before?.bytes ?? 0) + (!before && index.entries.size > 0 ? 1 : 0);
@@ -336,10 +329,14 @@ export function recordRollingScenario(
             bound(events.length + 1, limits.maxEvents, 'whole wave event count');
             if (bytes >= limits.maxEventBytes)
               throw new CaptureError({ code: 'size-limit', boundary: 'whole wave bytes', limit: limits.maxEventBytes });
-            const owned = ownEvent(event.capture(), Math.min(limits.maxEntryBytes, limits.maxEventBytes - bytes));
-            bytes += captureBytes(owned, limits.maxEntryBytes) + (events.length > 0 ? 1 : 0);
+            const owned = sizedEvent(
+              event.capture(),
+              Math.min(limits.maxEntryBytes, limits.maxEventBytes - bytes),
+              limits.maxEntryBytes,
+            );
+            bytes += owned.bytes + (events.length > 0 ? 1 : 0);
             bound(bytes, limits.maxEventBytes, 'whole wave bytes');
-            events.push(owned);
+            events.push(owned.value);
           }
         }
         if (events.length === 0) return;

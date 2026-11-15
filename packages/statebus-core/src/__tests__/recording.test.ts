@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'bun:test';
-import { CaptureError } from '../capture.js';
-import { composeLibraries, defineLibrary, mountLibrary, type ValueCodec } from '../composition.js';
+import { CaptureError, captureBytes } from '../capture.js';
+import {
+  composeLibraries,
+  defineLibrary,
+  type EncodedEvent,
+  type EncodedStateEntry,
+  type EncodedValue,
+  mountLibrary,
+  type ValueCodec,
+} from '../composition.js';
 import { ManualScheduler } from '../dispatch.js';
-import { captureCheckpoint, recordScenario } from '../recording.js';
+import { captureCheckpoint, recordScenario, sizedEntry, sizedEvent } from '../recording.js';
 
 const text: ValueCodec<string> = {
   schema: 'notes.text',
@@ -128,5 +136,54 @@ describe('captureCheckpoint keyed entries', () => {
     } finally {
       runtime.dispose();
     }
+  });
+});
+
+describe('sized capture records', () => {
+  const encoded = (payload: unknown): EncodedValue => ({
+    schema: 'notes.any',
+    version: 1,
+    value: payload,
+    classification: 'unclassified',
+  });
+  const payloads: readonly unknown[] = [
+    '',
+    'ü "quoted"\n𝄞',
+    0,
+    -1.5e21,
+    null,
+    true,
+    [1, [2, { a: 'b' }]],
+    { z: 1, a: { nested: [null] } },
+  ];
+
+  it('reports exactly the canonical bytes of the detached record', () => {
+    for (const payload of payloads) {
+      const entries: readonly EncodedStateEntry[] = [
+        { value: encoded(payload) },
+        { id: { ...encoded('note-1'), primitive: 'string' }, value: encoded(payload) },
+      ];
+      for (const entry of entries) {
+        const sized = sizedEntry(entry);
+        expect(sized.bytes).toBe(captureBytes(sized.value));
+      }
+      const events: readonly EncodedEvent[] = [
+        { key: 'notes/titled', payload: encoded(payload) },
+        { key: 'notes/titled', payload: encoded(payload), admitted: false, reactionDepth: 2 },
+      ];
+      for (const event of events) {
+        const sized = sizedEvent(event);
+        expect(sized.bytes).toBe(captureBytes(sized.value));
+      }
+    }
+  });
+
+  it('refuses a record whose payload fits but whose framed size does not', () => {
+    const event: EncodedEvent = { key: 'notes/titled', payload: encoded('short') };
+    const framed = sizedEvent(event).bytes;
+
+    expect(refusedForSize(() => sizedEvent(event, framed, framed))).toBe(false);
+    expect(refusedForSize(() => sizedEvent(event, framed, framed - 1))).toBe(true);
+    expect(refusedForSize(() => sizedEntry({ value: event.payload }, framed, 8))).toBe(true);
   });
 });
