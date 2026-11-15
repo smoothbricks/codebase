@@ -2715,6 +2715,13 @@ impl<'a> BitmosaicView<'a> {
             _ => None,
         }
     }
+
+    /// The reader of a small image, when this is one: its answers inline
+    /// into the caller, where this view's go through one call.
+    pub fn as_small(&self) -> Option<crate::SmallView<'a>> {
+        self.small().map(crate::SmallView::new)
+    }
+
     /// Encoded extent, distinct from the set's cardinality.
     pub fn serialized_len(&self) -> usize {
         self.encoded_len
@@ -2862,6 +2869,28 @@ impl<'a> BitmosaicView<'a> {
         }
     }
 
+    /// Members both sets hold strictly below `below`: the rank of `below`
+    /// in the intersection, with neither side materialized. Two small
+    /// images answer from their bytes in a few word operations; any other
+    /// pair walks the smaller side up to `below` against the other's probe.
+    pub fn and_rank(&self, other: &BitmosaicView<'_>, below: u32) -> u64 {
+        if let (Some(a), Some(b)) = (self.small(), other.small()) {
+            return u64::from(a.and_below(b, below));
+        }
+        let (walked, probed) = if self.len() <= other.len() {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let mut count = 0;
+        for value in walked.range() {
+            if value >= below {
+                break;
+            }
+            count += u64::from(probed.contains(value));
+        }
+        count
+    }
     /// Write the intersection into a caller-owned buffer, ascending, and
     /// return how many values were written.
     ///

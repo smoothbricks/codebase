@@ -198,24 +198,28 @@ impl<'a> SmallSink<'a> {
 // ── reading a bitmap where it lies ───────────────────────────────────────
 
 /// Bits `64 * i .. 64 * i + 64` of a bitmap, zero past its end. A whole word
-/// is one unaligned load; the last, partial word is two overlapping loads of
-/// the widest power of two it holds, so no read leaves the image.
+/// is one unaligned load. A partial last word of a bitmap of eight bytes or
+/// more is the load that ends at the bitmap's last byte, shifted down; of a
+/// shorter one, two overlapping loads of the widest power of two it holds.
+/// No read leaves the image, and every branch is on the bitmap's length.
 #[inline(always)]
 fn word_at(bits: &[u8], i: usize) -> u64 {
-    let at = 8 * i;
-    if at + 8 <= bits.len() {
+    let (at, len) = (8 * i, bits.len());
+    if at + 8 <= len {
         return read_u64_at(bits, at);
     }
-    let rest = bits.get(at..).unwrap_or(&[]);
-    let n = rest.len();
-    if n >= 4 {
-        u64::from(read_u32_at(rest, 0)) | u64::from(read_u32_at(rest, n - 4)) << (8 * (n - 4))
+    if at >= len {
+        return 0;
+    }
+    let n = len - at;
+    if len >= 8 {
+        read_u64_at(bits, len - 8) >> (8 * (8 - n))
+    } else if n >= 4 {
+        u64::from(read_u32_at(bits, 0)) | u64::from(read_u32_at(bits, n - 4)) << (8 * (n - 4))
     } else if n >= 2 {
-        u64::from(read_u16_at(rest, 0)) | u64::from(read_u16_at(rest, n - 2)) << (8 * (n - 2))
-    } else if n == 1 {
-        u64::from(rest[0])
+        u64::from(read_u16_at(bits, 0)) | u64::from(read_u16_at(bits, n - 2)) << (8 * (n - 2))
     } else {
-        0
+        u64::from(bits[0])
     }
 }
 
@@ -236,23 +240,37 @@ impl Iterator for Bits {
     }
 }
 
-/// Position of the `k`-th set bit of `word`, `k` below its popcount: six
-/// halvings by popcount, no branch and no bit-deposit instruction, the same
-/// in every port.
+/// Position of the `k`-th set bit of `word`, `k` below its popcount. The
+/// byte is found from byte-wise prefix counts (three masked adds and one
+/// multiply), the bit by counting through the byte's eight positions. No
+/// branch, no population-count or bit-deposit instruction: the same
+/// arithmetic in every port.
 #[inline(always)]
-fn select_in_word(mut word: u64, mut k: u32) -> u32 {
-    let mut position = 0;
-    for width in [32u32, 16, 8, 4, 2, 1] {
-        let low = (word & ((1u64 << width) - 1)).count_ones();
-        let upper = u32::from(k >= low);
-        k -= low * upper;
-        position += width * upper;
-        word >>= width * upper;
+fn select_in_word(word: u64, k: u32) -> u32 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut counts = word - ((word >> 1) & 0x5555_5555_5555_5555);
+    counts = (counts & 0x3333_3333_3333_3333) + ((counts >> 2) & 0x3333_3333_3333_3333);
+    counts = (counts + (counts >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    // Byte `j` of `through`: set bits in bytes `0..=j`.
+    let through = counts.wrapping_mul(ONES);
+    // Bytes whose running count `k` has passed: the index of the byte.
+    let passed = (((u64::from(k) * ONES) | HIGH) - through) & HIGH;
+    let byte = (((passed >> 7).wrapping_mul(ONES) >> 56) as u32).min(7);
+    let before = ((through << 8) >> (8 * byte)) as u32 & 0xff;
+    let (bits, rest) = ((word >> (8 * byte)) as u32 & 0xff, k.wrapping_sub(before));
+    let (mut seen, mut position) = (0, 0);
+    for j in 0..8 {
+        seen += bits >> j & 1;
+        position += u32::from(seen <= rest);
     }
-    position
+    8 * byte + position.min(7)
 }
 
-/// Set bits of `bits` below bit `below`.
+/// Set bits of `bits` below bit `below`: the whole words below it, then
+/// one masked word. Masking every word of the bitmap instead (no branch on
+/// the probe) was measured: no mispredict, but twice the instructions and
+/// more cycles on random probes (8.5 against 7.5), so the loop stays.
 #[inline(always)]
 fn count_below(bits: &[u8], below: usize) -> u32 {
     let below = below.min(8 * bits.len());
@@ -264,6 +282,21 @@ fn count_below(bits: &[u8], below: usize) -> u32 {
         count += (word_at(bits, below / 64) & ((1u64 << (below % 64)) - 1)).count_ones();
     }
     count
+}
+
+/// The bit of the `k`-th set bit of `bits`, or `None` when there are no
+/// more than `k`.
+#[inline(always)]
+fn select_bit(bits: &[u8], mut k: u32) -> Option<u32> {
+    for i in 0..bits.len().div_ceil(8) {
+        let word = word_at(bits, i);
+        let count = word.count_ones();
+        if k < count {
+            return Some(64 * i as u32 + select_in_word(word, k));
+        }
+        k -= count;
+    }
+    None
 }
 
 /// Members two windows share below the value `below`: the bytes both cover,
@@ -303,49 +336,74 @@ fn member(list: &[u8], wide: bool, i: usize) -> u32 {
     }
 }
 
-/// Members of an ascending list strictly below `value`: a bisection that
-/// moves by a conditional add, never a branch on a member.
+/// Members of an ascending list strictly below `value`. The whole list is
+/// compared, with no search and no early exit: at most 32 compares the
+/// compiler turns into a few vector ones, and no branch on a member.
 #[inline(always)]
 fn list_rank(list: &[u8], wide: bool, value: u32) -> usize {
-    let n = list.len() >> u32::from(wide);
-    if n == 0 {
-        return 0;
+    if wide {
+        list.chunks_exact(2)
+            .map(|pair| usize::from(u32::from(u16::from_le_bytes([pair[0], pair[1]])) < value))
+            .sum()
+    } else {
+        list.iter()
+            .map(|&member| usize::from(u32::from(member) < value))
+            .sum()
     }
-    if value > member(list, wide, n - 1) {
-        return n;
+}
+
+/// Whether an ascending list holds `value`: every member compared, the
+/// answers ORed.
+#[inline(always)]
+fn list_holds(list: &[u8], wide: bool, value: u32) -> bool {
+    if wide {
+        list.chunks_exact(2).fold(false, |held, pair| {
+            held | (u32::from(u16::from_le_bytes([pair[0], pair[1]])) == value)
+        })
+    } else {
+        list.iter()
+            .fold(false, |held, &member| held | (u32::from(member) == value))
     }
-    let (mut low, mut len) = (0, n);
-    for _ in 0..n.ilog2() + 1 {
-        let half = len / 2;
-        let probe = member(list, wide, low + half.saturating_sub(1));
-        low += if half != 0 && probe < value { half } else { 0 };
-        len -= half;
-    }
-    low + usize::from(member(list, wide, low) < value)
 }
 
 /// Interval `i` of a Spans payload, as `(start, end)` inclusive.
+/// An unverified image may hold an end below its start: it reads as the
+/// singleton at the start, so no length underflows.
 #[inline(always)]
 fn span(spans: &[u8], i: usize) -> (u32, u32) {
     (
         u32::from(read_u16_at(spans, 4 * i)),
-        u32::from(read_u16_at(spans, 4 * i + 2)),
+        u32::from(read_u16_at(spans, 4 * i + 2)).max(u32::from(read_u16_at(spans, 4 * i))),
     )
 }
 
 /// Members of the intervals strictly below `value`, and whether `value` is
-/// one.
+/// one. Every interval adds its members below `value`, a distance clamped
+/// to its length, so no branch depends on where `value` falls.
 #[inline(always)]
 fn spans_rank(spans: &[u8], value: u32) -> (u32, bool) {
-    let mut below = 0;
+    let (mut below, mut held) = (0, false);
     for i in 0..spans.len() / 4 {
         let (start, end) = span(spans, i);
-        if value <= end {
-            return (below + value.saturating_sub(start), value >= start);
-        }
-        below += end - start + 1;
+        below += value.saturating_sub(start).min(end - start + 1);
+        held |= start <= value && value <= end;
     }
-    (below, false)
+    (below, held)
+}
+
+/// The `k`-th member of the intervals. This one leaves at its interval:
+/// counting every interval instead was measured at twice the instructions
+/// and a third more cycles, with no mispredict to save.
+#[inline(always)]
+fn spans_select(spans: &[u8], mut k: u32) -> Option<u32> {
+    for i in 0..spans.len() / 4 {
+        let (start, end) = span(spans, i);
+        if k <= end - start {
+            return Some(start + k);
+        }
+        k -= end - start + 1;
+    }
+    None
 }
 
 // ── the small set ────────────────────────────────────────────────────────
@@ -460,8 +518,8 @@ impl<'a> SmallSet<'a> {
             }
             SmallSet::Spans(spans) => {
                 for i in 0..spans.len() / 4 {
-                    let (start, end) = span(spans, i);
-                    if end < start {
+                    let (start, _) = span(spans, i);
+                    if u32::from(read_u16_at(spans, 4 * i + 2)) < start {
                         return disorder(4 * i + 2, "an interval ends before it starts");
                     }
                     if i != 0 && start <= span(spans, i - 1).1 + 1 {
@@ -510,14 +568,8 @@ impl<'a> SmallSet<'a> {
                 bits.get((bit >> 3) as usize)
                     .is_some_and(|byte| byte >> (bit & 7) & 1 != 0)
             }
-            SmallSet::List8(list) => {
-                let at = list_rank(list, false, value);
-                at < list.len() && member(list, false, at) == value
-            }
-            SmallSet::List16(list) => {
-                let at = list_rank(list, true, value);
-                at < list.len() / 2 && member(list, true, at) == value
-            }
+            SmallSet::List8(list) => list_holds(list, false, value),
+            SmallSet::List16(list) => list_holds(list, true, value),
             SmallSet::Spans(spans) => spans_rank(spans, value).1,
         }
     }
@@ -542,29 +594,8 @@ impl<'a> SmallSet<'a> {
         match self {
             SmallSet::List8(list) => (at < list.len()).then(|| member(list, false, at)),
             SmallSet::List16(list) => (at < list.len() / 2).then(|| member(list, true, at)),
-            SmallSet::Window { bits, base } => {
-                let mut k = k;
-                for i in 0..bits.len().div_ceil(8) {
-                    let word = word_at(bits, i);
-                    let count = word.count_ones();
-                    if k < count {
-                        return Some(base + 64 * i as u32 + select_in_word(word, k));
-                    }
-                    k -= count;
-                }
-                None
-            }
-            SmallSet::Spans(spans) => {
-                let mut k = k;
-                for i in 0..spans.len() / 4 {
-                    let (start, end) = span(spans, i);
-                    if k <= end - start {
-                        return Some(start + k);
-                    }
-                    k -= end - start + 1;
-                }
-                None
-            }
+            SmallSet::Window { bits, base } => select_bit(bits, k).map(|bit| base + bit),
+            SmallSet::Spans(spans) => spans_select(spans, k),
         }
     }
 
@@ -622,9 +653,10 @@ impl<'a> SmallSet<'a> {
         (members >= 2 && even).then_some((first, step, members))
     }
 
-    /// Members both sets hold below `below`. Two windows meet word by word;
-    /// otherwise the side that is not an interval list is walked against
-    /// the other's probe.
+    /// Members both sets hold below `below`. Two windows meet word by word
+    /// and two interval lists by a merge; otherwise a list is walked against
+    /// the other side's probe, every member adding its answer without a
+    /// branch, and a window only against an interval list.
     pub(crate) fn and_below(self, other: SmallSet<'_>, below: u32) -> u32 {
         if let (
             SmallSet::Window {
@@ -648,7 +680,10 @@ impl<'a> SmallSet<'a> {
                         break;
                     }
                     let ((a_start, a_end), (b_start, b_end)) = (span(a, i), span(b, j));
-                    let (low, high) = (a_start.max(b_start), a_end.min(b_end).min(below - 1));
+                    let (low, high) = (
+                        a_start.max(b_start),
+                        a_end.min(b_end).min(below.saturating_sub(1)),
+                    );
                     if below != 0 && low <= high {
                         count += high - low + 1;
                     }
@@ -656,11 +691,25 @@ impl<'a> SmallSet<'a> {
                     j += usize::from(b_end <= a_end);
                 }
             }
-            (SmallSet::Spans(_), walked) => {
-                walked.for_each(|v| count += u32::from(v < below && self.contains(v)));
+            (SmallSet::List8(list), probed) | (probed, SmallSet::List8(list)) => {
+                for &member in list {
+                    let value = u32::from(member);
+                    count += u32::from((value < below) & probed.contains(value));
+                }
             }
-            (walked, probed) => {
-                walked.for_each(|v| count += u32::from(v < below && probed.contains(v)));
+            (SmallSet::List16(list), probed) | (probed, SmallSet::List16(list)) => {
+                for pair in list.chunks_exact(2) {
+                    let value = u32::from(u16::from_le_bytes([pair[0], pair[1]]));
+                    count += u32::from((value < below) & probed.contains(value));
+                }
+            }
+            (a, b) => {
+                let (walked, probed) = if matches!(a, SmallSet::Window { .. }) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                walked.for_each(|v| count += u32::from((v < below) & probed.contains(v)));
             }
         }
         count
@@ -859,7 +908,7 @@ impl<'a> SmallRange<'a> {
                     return;
                 }
                 let set = SmallSet::Spans(spans);
-                let left = set.cardinality() - set.rank_below(target);
+                let left = set.cardinality().saturating_sub(set.rank_below(target));
                 *remaining = left;
                 if left == 0 {
                     return;
@@ -874,6 +923,114 @@ impl<'a> SmallRange<'a> {
                 }
             }
         }
+    }
+}
+
+// ── the small reader ─────────────────────────────────────────────────────
+
+/// The reader of a small image: a set of a few members below 65,536, the
+/// common slot. Every answer is computed on the image bytes where they lie
+/// and inlines into its caller; the view is two words and copies nothing.
+///
+/// [`crate::BitmosaicView`] answers the same questions for every image and
+/// reaches a small one by one call; a caller that holds many small sets
+/// and probes them in a loop takes this view once
+/// ([`crate::BitmosaicView::as_small`], or [`Self::open`] on bytes it
+/// already admitted) and pays neither the call nor the root dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct SmallView<'a>(SmallSet<'a>);
+
+impl<'a> SmallView<'a> {
+    pub(crate) fn new(set: SmallSet<'a>) -> Self {
+        Self(set)
+    }
+
+    /// Attach a small image whose structure this proves: its tag, its
+    /// exact extent and its bitmap's ends. `None` for any other image, the
+    /// empty one included. Member order and canonical form are
+    /// [`crate::BitmosaicView::open_verified`]'s to prove.
+    pub fn open(image: &'a [u8]) -> Option<Self> {
+        let (kind, count) = read_small_tag(*image.first()?)?;
+        SmallSet::open(image.get(..1 + small_payload_len(kind, count))?)
+            .ok()
+            .map(Self)
+    }
+
+    /// Members; a small image holds at least one.
+    #[inline]
+    pub fn len(&self) -> u32 {
+        self.0.cardinality()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn contains(&self, value: u32) -> bool {
+        self.0.contains(value)
+    }
+
+    /// Members strictly below `value`.
+    #[inline]
+    pub fn rank(&self, value: u32) -> u32 {
+        self.0.rank_below(value)
+    }
+
+    /// The `k`-th member ascending, from zero.
+    #[inline]
+    pub fn select(&self, k: u32) -> Option<u32> {
+        self.0.select(k)
+    }
+
+    /// Ascending walk.
+    #[inline]
+    pub fn for_each(&self, f: impl FnMut(u32)) {
+        self.0.for_each(f);
+    }
+
+    /// Ascending iterator: no member is decoded twice.
+    #[inline]
+    pub fn iter(&self) -> SmallIter<'a> {
+        SmallIter(SmallRange::open(self.0))
+    }
+
+    /// Members both sets hold.
+    #[inline]
+    pub fn and_len(&self, other: &SmallView<'_>) -> u32 {
+        self.0.and_below(other.0, u32::MAX)
+    }
+
+    /// Members both sets hold strictly below `below`: the rank of `below`
+    /// in the intersection, with neither side materialized.
+    #[inline]
+    pub fn and_rank(&self, other: &SmallView<'_>, below: u32) -> u32 {
+        self.0.and_below(other.0, below)
+    }
+}
+
+/// Ascending iterator over a [`SmallView`].
+#[derive(Clone, Debug)]
+pub struct SmallIter<'a>(SmallRange<'a>);
+
+impl Iterator for SmallIter<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        if self.0.remaining() == 0 {
+            return None;
+        }
+        let value = self.0.front();
+        self.0.pop_front();
+        Some(value)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.0.remaining() as usize;
+        (left, Some(left))
     }
 }
 

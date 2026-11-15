@@ -83,12 +83,29 @@ struct Cell<'a> {
     a_view: BitmosaicView<'a>,
     b_view: BitmosaicView<'a>,
     owned_a: &'a Bitmosaic,
+    /// [`PROBE_TURNS`] slices of [`PROBES`] probes, half of them members;
+    /// `turn` names the slice the next iteration reads.
     probes: &'a [u32],
+    turn: std::cell::Cell<usize>,
     ranks: &'a [u64],
     ascending: &'a [u32],
     batch: &'a [u32],
 }
 
+/// Probes an iteration makes.
+const PROBES: usize = 1024;
+/// Iterations before a probe sequence repeats: a predictor that learned
+/// 65,536 outcomes would be the machine's, not the code's.
+const PROBE_TURNS: usize = 64;
+
+impl Cell<'_> {
+    /// This iteration's probes, in random order.
+    fn probes(&self) -> &[u32] {
+        let turn = self.turn.get();
+        self.turn.set((turn + 1) % PROBE_TURNS);
+        &self.probes[turn * PROBES..(turn + 1) * PROBES]
+    }
+}
 #[inline(never)]
 fn attach(cell: &Cell<'_>) -> u64 {
     BitmosaicView::open(black_box(cell.a_bytes)).map_or(0, |view| view.len())
@@ -102,7 +119,7 @@ fn verify(cell: &Cell<'_>) -> u64 {
 #[inline(never)]
 fn contains(cell: &Cell<'_>) -> u64 {
     let view = black_box(&cell.a_view);
-    cell.probes
+    cell.probes()
         .iter()
         .map(|&p| u64::from(view.contains(black_box(p))))
         .sum()
@@ -111,7 +128,27 @@ fn contains(cell: &Cell<'_>) -> u64 {
 #[inline(never)]
 fn rank(cell: &Cell<'_>) -> u64 {
     let view = black_box(&cell.a_view);
-    cell.probes.iter().map(|&p| view.rank(black_box(p))).sum()
+    cell.probes().iter().map(|&p| view.rank(black_box(p))).sum()
+}
+
+/// [`contains`] over the same probes in ascending order, which a predictor
+/// learns: the difference to the random cell is what mispredicts cost.
+#[inline(never)]
+fn contains_sorted(cell: &Cell<'_>) -> u64 {
+    let view = black_box(&cell.a_view);
+    cell.ascending
+        .iter()
+        .map(|&p| u64::from(view.contains(black_box(p))))
+        .sum()
+}
+
+#[inline(never)]
+fn rank_sorted(cell: &Cell<'_>) -> u64 {
+    let view = black_box(&cell.a_view);
+    cell.ascending
+        .iter()
+        .map(|&p| view.rank(black_box(p)))
+        .sum()
 }
 
 #[inline(never)]
@@ -162,9 +199,13 @@ fn to_forest_bytes(cell: &Cell<'_>) -> u64 {
     black_box(cell.owned_a).to_forest_bytes().len() as u64
 }
 
-fn main() {
+/// Run the cell the arguments name. `measure(iterations, operations, body)`
+/// runs `body` (one iteration, of `operations` probes or members) that
+/// many times and returns the sum of its answers: the place a counter
+/// window goes.
+pub fn gate(measure: &mut dyn FnMut(u64, u64, &mut dyn FnMut() -> u64) -> u64) {
     let args: Vec<String> = std::env::args().collect();
-    let [_, shape_name, form, op, iterations] = args.as_slice() else {
+    let [_, shape_name, form, op, iterations, ..] = args.as_slice() else {
         panic!("usage: format_gate <shape> <sealed|forest> <op> <iterations>");
     };
     let iterations: u64 = iterations.parse().expect("an iteration count");
@@ -180,7 +221,7 @@ fn main() {
     };
     let mut state = 0x0912_0be5_u64 ^ va.len() as u64;
     let top = u64::from(va[va.len() - 1]) + 2;
-    let probes: Vec<u32> = (0..1024)
+    let probes: Vec<u32> = (0..PROBES * PROBE_TURNS)
         .map(|i| {
             let r = xorshift(&mut state);
             if i % 2 == 0 {
@@ -193,7 +234,7 @@ fn main() {
     let ranks: Vec<u64> = (0..1024)
         .map(|_| xorshift(&mut state) % va.len() as u64)
         .collect();
-    let mut ascending = probes.clone();
+    let mut ascending = probes[..PROBES].to_vec();
     ascending.sort_unstable();
     // Sixteen values absent from the set, spread over its chunks: one batch
     // adds them and the next removes them, so every iteration starts from
@@ -212,6 +253,7 @@ fn main() {
         b_view: BitmosaicView::open(&b_bytes).expect("attach right"),
         owned_a: &owned_a,
         probes: &probes,
+        turn: std::cell::Cell::new(0),
         ranks: &ranks,
         ascending: &ascending,
         batch: &batch,
@@ -220,7 +262,9 @@ fn main() {
         "attach" => attach,
         "verify" => verify,
         "contains" => contains,
+        "contains_sorted" => contains_sorted,
         "rank" => rank,
+        "rank_sorted" => rank_sorted,
         "select" => select,
         "walk" => walk,
         "cursor" => cursor,
@@ -231,15 +275,30 @@ fn main() {
         "patch" => |_| 0,
         other => panic!("unknown op {other}"),
     };
-    let mut sum = 0u64;
-    for _ in 0..iterations {
-        sum = sum.wrapping_add(if op == "patch" {
+    let operations = match op.as_str() {
+        "contains" | "contains_sorted" | "rank" | "rank_sorted" | "select" | "seek" => PROBES,
+        "walk" | "cursor" => va.len(),
+        _ => 1,
+    } as u64;
+    let sum = measure(iterations, operations, &mut || {
+        if op == "patch" {
             let added = patch(&mut slot, cell.batch, &[], &mut scratch).expect("room to add");
             let removed = patch(&mut slot, &[], cell.batch, &mut scratch).expect("room to remove");
             added.len + removed.len
         } else {
             run(black_box(&cell))
-        });
-    }
+        }
+    });
     println!("{shape_name} {form} {op} x{iterations}: {sum}");
+}
+
+#[allow(dead_code)]
+fn main() {
+    gate(&mut |iterations, _, body| {
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            sum = sum.wrapping_add(body());
+        }
+        sum
+    });
 }

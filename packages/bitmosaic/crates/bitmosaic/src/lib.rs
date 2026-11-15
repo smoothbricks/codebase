@@ -76,6 +76,7 @@ pub(crate) use range::ContainerRange;
 pub use range::{
     AndNotRange, AndRange, Forest64Range, ForestRange, OrRange, Range, RangeIter, XorRange,
 };
+pub use small::{SmallIter, SmallView};
 pub use wire::{
     Bitmosaic64View, Bitmosaic64ViewRange, BitmosaicView, BitmosaicViewRange, EMPTY_U32_IMAGE,
     EMPTY_U64_IMAGE, IMAGE_ID_LEN, ImageHeader, KeyWidth, image_header, patched_len_bound,

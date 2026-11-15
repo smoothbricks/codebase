@@ -17,33 +17,32 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use bitmosaic::{
-    AndNotRange, AndRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView, OrRange, Range,
-    XorRange,
+    AdmissionClass, AndNotRange, AndRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView,
+    OrRange, Range, XorRange,
 };
 
 #[test]
 fn attached_runs_queries_cover_all_count_varint_widths() {
-    for count in [1usize, 2, 3, 128, 129, 16_384, 16_385, 32_768] {
-        // A lone Runs image of single-member runs: the count is the cardinality.
-        let mut bytes = match count {
-            1..=14 => vec![0x80 | ((count - 1) as u8) << 3 | 4],
-            15..=270 => vec![0x80 | 14 << 3 | 4, (count - 15) as u8],
-            _ => {
-                let mut head = vec![0x80 | 15 << 3 | 4];
-                head.extend_from_slice(&((count - 1) as u16).to_le_bytes());
-                head
-            }
-        };
-        let mut body = Vec::new();
-        let mut runs = count - 1;
+    fn push_uleb(out: &mut Vec<u8>, mut value: usize) {
         loop {
-            let low = (runs & 127) as u8;
-            runs >>= 7;
-            body.push(low | if runs == 0 { 0 } else { 128 });
-            if runs == 0 {
+            let low = (value & 127) as u8;
+            value >>= 7;
+            out.push(low | if value == 0 { 0 } else { 128 });
+            if value == 0 {
                 break;
             }
         }
+    }
+    for count in [1usize, 2, 3, 128, 129, 16_384, 16_385, 32_768] {
+        // A directory of one Runs chunk at key zero, every run a single
+        // member: the run count is the cardinality. Single members at one
+        // gap are a Stride (or a small form) to the writer, so the image is
+        // well formed but not the writer's: `open` reads it, and verified
+        // admission passes every plane and refuses it as `canonical` alone.
+        let mut body = Vec::new();
+        push_uleb(&mut body, count - 1);
+        body.extend_from_slice(&[0, 0, 0, 4]); // one chunk, key zero, Runs
+        push_uleb(&mut body, count - 1);
         for i in 0..count {
             let value = (2 * i) as u16;
             body.extend_from_slice(&value.to_le_bytes());
@@ -52,8 +51,15 @@ fn attached_runs_queries_cover_all_count_varint_widths() {
         for i in 1..count.saturating_sub(1) {
             body.extend_from_slice(&(i as u16).to_le_bytes());
         }
+        let mut bytes = vec![0x10];
+        push_uleb(&mut bytes, body.len());
         bytes.extend_from_slice(&body);
-        let view = BitmosaicView::open_verified(&bytes).expect("bounded Runs count fixture");
+        assert_eq!(
+            BitmosaicView::open_verified(&bytes).err().map(|e| e.class),
+            Some(AdmissionClass::Canonical),
+            "count {count}"
+        );
+        let view = BitmosaicView::open(&bytes).expect("bounded Runs count fixture");
         assert_eq!(view.len(), count as u64);
         for rank in [0, count / 2, count - 1] {
             let value = (2 * rank) as u32;
@@ -70,7 +76,11 @@ fn attached_runs_queries_cover_all_count_varint_widths() {
 
 #[test]
 fn ordinary_attach_rejects_zero_stride_and_nonzero_ef_tail_bits() {
-    let mut stride = Bitmosaic::from_sorted(0..100).to_forest_bytes();
+    // A Stride chunk at key one (at key zero the set is a Spans image): the
+    // step is the image's last two bytes.
+    let mut stride = Bitmosaic::from_sorted((0..100).map(|v| (1 << 16) | v)).to_forest_bytes();
+    assert_eq!(stride.len(), 11);
+    assert!(BitmosaicView::open_verified(&stride).is_ok());
     let end = stride.len();
     stride[end - 2..].fill(0);
     assert!(BitmosaicView::open(&stride).is_none());
@@ -86,18 +96,27 @@ fn ordinary_attach_rejects_zero_stride_and_nonzero_ef_tail_bits() {
 
 #[test]
 fn runs_validate_stored_and_implicit_cardinality_prefixes() {
-    let bytes =
-        Bitmosaic::from_sorted((0..4).chain(1000..1004).chain(2000..2004)).to_forest_bytes();
-    assert_eq!(bytes.len(), 16);
+    // Three runs in a directory chunk at key one (at key zero they are a
+    // Spans image, which stores no prefix).
+    let bytes = Bitmosaic::from_sorted(
+        (0..4)
+            .chain(1000..1004)
+            .chain(2000..2004)
+            .map(|v| (1 << 16) | v),
+    )
+    .to_forest_bytes();
+    assert_eq!(bytes.len(), 22);
     assert!(BitmosaicView::open_verified(&bytes).is_ok());
-    // A lone image: the control byte, then the payload at 1. Three bounds
-    // consume 12 bytes after the run count; the one prefix is at 14.
+    // Control, body length, cardinality, chunk count, key and kind: the
+    // payload at 7. The run count and three bounds take 13 bytes; the one
+    // stored prefix is at 20.
     let mut bad_prefix = bytes.clone();
-    bad_prefix[14..16].copy_from_slice(&5u16.to_le_bytes());
+    bad_prefix[20..22].copy_from_slice(&5u16.to_le_bytes());
     assert!(BitmosaicView::open(&bad_prefix).is_none());
-    // One more member in the folded cardinality than the runs hold.
+    // One more member in the header cardinality than the runs hold: the
+    // last run's implicit prefix disagrees.
     let mut bad_total = bytes;
-    bad_total[0] += 1 << 3;
+    bad_total[2] += 1;
     assert!(BitmosaicView::open(&bad_total).is_none());
 }
 
@@ -164,41 +183,83 @@ fn full_u32_cardinality_uses_widened_final_prefix() {
 
 #[test]
 fn runs_reject_overlapping_adjacent_reversed_and_inexact_payloads() {
-    let bytes = Bitmosaic::from_sorted((0..4096).chain(32768..36864)).to_forest_bytes();
-    assert_eq!(bytes.len(), 12);
-    // A lone Runs image: control and a two-byte count, the run count at 3,
-    // the first run at 4 and the second at 8.
-    for (start, end) in [(4095u16, 8190u16), (4096, 8191), (40000, 36863)] {
+    // A Runs chunk at key one: framing and counts to 8, the run count at 8,
+    // the first run at 9 and the second at 13.
+    let bytes = Bitmosaic::from_sorted((0..4096).chain(32768..36864).map(|v| (1 << 16) | v))
+        .to_forest_bytes();
+    assert_eq!(bytes.len(), 17);
+    assert!(BitmosaicView::open_verified(&bytes).is_ok());
+    // The same intervals at key zero are a Spans image: the second at 5.
+    // `open` reads no small payload, so the order of its intervals is
+    // verified admission's to refuse, at the interval that breaks it.
+    let spans = Bitmosaic::from_sorted((0..4096).chain(32768..36864)).to_forest_bytes();
+    assert_eq!(
+        spans,
+        [0xA1, 0x00, 0x00, 0xFF, 0x0F, 0x00, 0x80, 0xFF, 0x8F]
+    );
+    for (start, end, refused_at) in [(4095u16, 8190u16, 5), (4096, 8191, 5), (40000, 36863, 7)] {
         let mut damaged = bytes.clone();
-        damaged[8..10].copy_from_slice(&start.to_le_bytes());
-        damaged[10..12].copy_from_slice(&end.to_le_bytes());
-        assert!(BitmosaicView::open(&damaged).is_none());
-    }
-    for kind in [0u8, 1, 2, 3, 5, 6, 7] {
-        let mut damaged = bytes.clone();
-        damaged[0] = (damaged[0] & !7) | kind;
+        damaged[13..15].copy_from_slice(&start.to_le_bytes());
+        damaged[15..17].copy_from_slice(&end.to_le_bytes());
         assert!(
-            BitmosaicView::open_verified(&damaged).is_err(),
-            "kind {kind}"
+            BitmosaicView::open(&damaged).is_none(),
+            "Runs ({start}, {end})"
+        );
+        let mut damaged = spans.clone();
+        damaged[5..7].copy_from_slice(&start.to_le_bytes());
+        damaged[7..9].copy_from_slice(&end.to_le_bytes());
+        let refusal = BitmosaicView::open_verified(&damaged)
+            .err()
+            .expect("a Spans image whose intervals do not ascend apart");
+        assert_eq!(
+            (refusal.class, refusal.offset),
+            (AdmissionClass::MapOrder, refused_at),
+            "Spans ({start}, {end})"
         );
     }
+    for kind in [5u8, 6, 7, 0x84] {
+        let mut damaged = bytes.clone();
+        damaged[7] = kind;
+        assert!(BitmosaicView::open(&damaged).is_none(), "kind {kind:#04x}");
+    }
+    let mut gap = bytes.clone();
+    gap[1] += 1;
+    gap.push(0);
+    assert!(BitmosaicView::open(&gap).is_none());
     let mut noncanonical_count = bytes.clone();
-    noncanonical_count[3] |= 128;
-    noncanonical_count.insert(4, 0);
+    noncanonical_count[1] += 1;
+    noncanonical_count[8] |= 128;
+    noncanonical_count.insert(9, 0);
     assert!(BitmosaicView::open(&noncanonical_count).is_none());
+    // A Spans tag naming one interval more than its payload holds.
+    let mut short = spans.clone();
+    short[0] += 1;
+    assert!(BitmosaicView::open(&short).is_none());
 }
 
 #[test]
 fn native_v1_compact_images_round_trip_without_padding() {
-    for (values, expected_bytes) in [
-        (Vec::new(), 1),
-        (vec![7], 2),
-        ((0..100).collect(), 6),
-        ((0..4096).chain(32768..36864).collect(), 12),
+    for (values, expected) in [
+        (Vec::new(), vec![0x14]),
+        (vec![7], vec![0x40, 0x80]),
+        (vec![7, 200], vec![0x21, 0x07, 0xC8]),
+        (vec![0, 1, 2, 10], vec![0x41, 0x07, 0x04]),
+        ((0..=82).collect(), vec![0xA0, 0x00, 0x00, 0x52, 0x00]),
+        ((0..100).collect(), vec![0xA0, 0x00, 0x00, 0x63, 0x00]),
+        (vec![1000, 2000], vec![0x81, 0xE8, 0x03, 0xD0, 0x07]),
+        (
+            (0..4096).chain(32768..36864).collect(),
+            vec![0xA1, 0x00, 0x00, 0xFF, 0x0F, 0x00, 0x80, 0xFF, 0x8F],
+        ),
+        // Above 65,535: a directory of one Array chunk at key one.
+        (
+            vec![70_000],
+            vec![0x10, 0x07, 0x00, 0x00, 0x01, 0x00, 0x03, 0x70, 0x11],
+        ),
     ] {
         let owned = Bitmosaic::from_sorted(values.iter().copied());
         let bytes = owned.to_bytes();
-        assert_eq!(bytes.len(), expected_bytes);
+        assert_eq!(bytes, expected, "{values:?}");
         for offset in 0..64 {
             let mut slot = vec![0xa5; offset];
             slot.extend_from_slice(&bytes);
@@ -309,17 +370,45 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
         assert_eq!(header.encoded_len, 1);
     }
     for control in 0..=u8::MAX {
+        // The payload bytes a small tag `kk lllll` names.
+        let count = usize::from(control & 31) + 1;
+        let small = match control >> 5 {
+            1 | 2 => Some(count),
+            3 => Some(1 + count),
+            4 => Some(2 * count),
+            5 => Some(4 * count),
+            _ => None,
+        };
+        let framed = matches!(control, 0x10 | 0x11 | 0x12 | 0x14 | 0x15);
         let mut image = vec![control, 1];
         image.resize(512, 0);
-        let valid = if control < 0x80 {
-            matches!(control, 0x10 | 0x11 | 0x12 | 0x14 | 0x15)
-        } else {
-            // A lone image over zero bytes: every kind but Words (an empty
-            // window) has an extent; a two-byte count of zero is not the
-            // shortest form of one, and a Window's count never extends.
-            matches!(control & 7, 1..=7) && (control & 7 >= 6 || control >> 3 & 15 != 15)
-        };
-        assert_eq!(image_header(&image).is_some(), valid, "control {control}");
+        let header = image_header(&image);
+        assert_eq!(
+            header.is_some(),
+            framed || small.is_some(),
+            "control {control:#04x}"
+        );
+        if let Some(payload) = small {
+            let header = header.unwrap();
+            assert_eq!(
+                (header.width, header.encoded_len),
+                (KeyWidth::U32, 1 + payload),
+                "control {control:#04x}"
+            );
+            assert!(
+                image_header(&image[..payload]).is_none(),
+                "control {control:#04x}: one payload byte short"
+            );
+        } else if !framed {
+            let refusal = BitmosaicView::open_verified(&image)
+                .err()
+                .expect("an unassigned control is refused");
+            assert_eq!(
+                (refusal.class, refusal.offset),
+                (AdmissionClass::Kind, 0),
+                "control {control:#04x}"
+            );
+        }
         assert!(image_header(&[]).is_none());
     }
     for length in [
@@ -333,9 +422,6 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
         let mut bytes = vec![0x10];
         bytes.extend_from_slice(length);
         assert!(image_header(&bytes).is_none(), "{length:?}");
-    }
-    for old in [b"AXR1", b"AXR8", b"BMS\x08"] {
-        assert!(image_header(old).is_none());
     }
     for body_len in [0usize, 1, 127, 128, 16_383, 16_384] {
         let mut bytes = vec![0x10];
@@ -849,7 +935,7 @@ fn truncated_and_corrupt_planes_are_refused_not_trusted() {
             );
         }
         let mut wrong_control = bytes.clone();
-        wrong_control[0] = 0x42;
+        wrong_control[0] = 0xC0;
         assert!(
             BitmosaicView::open(&wrong_control).is_none(),
             "{name}: control"
@@ -921,7 +1007,7 @@ fn forged_headers_are_refused_and_damaged_planes_never_lie() {
 
     for (name, values) in shapes() {
         let bytes = Bitmosaic::from_sorted(values.iter().copied()).to_bytes();
-        for control in [0, 3, 0x08, 0x0c, 0x13, 0x16, 0x17, 0x18, 0x42, 0x7f] {
+        for control in [0, 3, 0x08, 0x0c, 0x13, 0x16, 0x17, 0x18, 0x1f, 0xc0, 0xff] {
             let mut forged = bytes.clone();
             forged[0] = control;
             assert!(
@@ -1320,3 +1406,218 @@ fn write_into_slice_lands_the_canonical_bytes_and_refuses_a_short_slot() {
         }
     }
 }
+
+//#region smoo/bitmosaic!n/small-forms-read-in-place
+/// Every small form is read where it lies (README, Native v2, Small images).
+/// Each image is built here from its form's table row, not by the writer,
+/// and answers every read a `BTreeSet` answers: counts 1 and 32 of every
+/// form, every bitmap length 1 to 32 (so a last word of 1 to 8 bytes), a
+/// Window at from start 1 to 255, and Spans from singleton intervals to the
+/// whole chunk. Spare bytes of 0xFF follow every image, so a read past its
+/// extent would show as a member. Verified admission takes an image exactly
+/// when it is the writer's image of its set, and refuses any other as
+/// `canonical`.
+#[test]
+fn small_forms_answer_every_read_where_they_lie() {
+    /// The small image of `members` in form `kk`, by the README's table.
+    fn image(kk: u8, members: &[u32]) -> Vec<u8> {
+        let first = members[0] as usize / 8;
+        let last = *members.last().unwrap() as usize / 8;
+        let bitmap = |start: usize| {
+            let mut bits = vec![0u8; last + 1 - start];
+            for &m in members {
+                bits[m as usize / 8 - start] |= 1 << (m % 8);
+            }
+            bits
+        };
+        let (count, payload): (usize, Vec<u8>) = match kk {
+            1 => (
+                members.len(),
+                members.iter().map(|&m| u8::try_from(m).unwrap()).collect(),
+            ),
+            2 => (last + 1, bitmap(0)),
+            3 => (
+                last + 1 - first,
+                std::iter::once(u8::try_from(first).unwrap())
+                    .chain(bitmap(first))
+                    .collect(),
+            ),
+            4 => (
+                members.len(),
+                members
+                    .iter()
+                    .flat_map(|&m| u16::try_from(m).unwrap().to_le_bytes())
+                    .collect(),
+            ),
+            5 => {
+                let mut spans: Vec<(u32, u32)> = Vec::new();
+                for &m in members {
+                    match spans.last_mut() {
+                        Some((_, end)) if *end + 1 == m => *end = m,
+                        _ => spans.push((m, m)),
+                    }
+                }
+                (
+                    spans.len(),
+                    spans
+                        .iter()
+                        .flat_map(|&(start, end)| [start, end])
+                        .flat_map(|v| u16::try_from(v).unwrap().to_le_bytes())
+                        .collect(),
+                )
+            }
+            _ => unreachable!("form {kk}"),
+        };
+        assert!((1..=32).contains(&count), "form {kk}: count {count}");
+        let mut bytes = vec![kk << 5 | (count - 1) as u8];
+        bytes.extend(payload);
+        bytes
+    }
+
+    let mut cases: Vec<(String, u8, Vec<u32>)> = vec![
+        ("List8 of 1".into(), 1, vec![200]),
+        ("List8 of the byte ends".into(), 1, vec![0, 255]),
+        (
+            "List8 of 32".into(),
+            1,
+            (0..32).map(|i| i * 8 + i % 8).collect(),
+        ),
+        ("Window of one bit in 32 bytes".into(), 2, vec![255]),
+        ("Window of 256 bits".into(), 2, (0..256).collect()),
+        (
+            "Window at 255 of 256 bits".into(),
+            3,
+            (2040..2296).collect(),
+        ),
+        ("List16 of 1".into(), 4, vec![65_535]),
+        (
+            "List16 of 32".into(),
+            4,
+            (0..31).map(|i| i * 2_113).chain([65_535]).collect(),
+        ),
+        ("Spans of a singleton".into(), 5, vec![5]),
+        (
+            "Spans of 32 singletons".into(),
+            5,
+            (0..32).map(|i| i * 2_047 + 1).collect(),
+        ),
+        ("Spans of the whole chunk".into(), 5, (0..=65_535).collect()),
+        (
+            "Spans of mixed intervals".into(),
+            5,
+            [0, 2, 3, 4, 5].into_iter().chain(100..=65_535).collect(),
+        ),
+        (
+            "Spans of 32 intervals to the end".into(),
+            5,
+            (0..32u32)
+                .flat_map(|i| {
+                    let end = if i == 31 {
+                        65_535
+                    } else {
+                        2_048 * i + 1_000 + i
+                    };
+                    2_048 * i + i % 7..=end
+                })
+                .collect(),
+        ),
+    ];
+    // Every bitmap length 1 to 32, so the last 64-bit word holds 1 to 8
+    // bytes: a Window from zero, and a Window at from start 1, 255 and one
+    // between. The first and last bitmap bytes are not zero.
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    for len in 1..=32u32 {
+        for (kk, start) in [(2u8, 0u32), (3, 1), (3, 255), (3, 1 + len * 7 % 255)] {
+            let (lo, hi) = (8 * start, 8 * (start + len));
+            let mut members: Vec<u32> =
+                (lo..hi).filter(|_| xorshift(&mut state) % 3 == 0).collect();
+            members.push(lo + (xorshift(&mut state) % 8) as u32);
+            members.push(hi - 1 - (xorshift(&mut state) % 8) as u32);
+            members.sort_unstable();
+            members.dedup();
+            cases.push((
+                format!("form {kk} at byte {start}, {len} bytes"),
+                kk,
+                members,
+            ));
+        }
+    }
+
+    let mut writer_images = [0usize; 6];
+    let mut images = Vec::with_capacity(cases.len());
+    for (name, kk, members) in &cases {
+        let image = image(*kk, members);
+        let mut slot = image.clone();
+        slot.extend_from_slice(&[0xFF; 8]);
+        let view = BitmosaicView::open(&slot).unwrap_or_else(|| panic!("{name}: open"));
+        assert_eq!(view.serialized_len(), image.len(), "{name}: extent");
+        let owned = Bitmosaic::from_sorted(members.iter().copied());
+        let writer = image == owned.to_forest_bytes() || image == owned.to_bytes();
+        match BitmosaicView::open_verified(&slot) {
+            Ok(_) => {
+                assert!(writer, "{name}: verified a form the writer does not select");
+                writer_images[usize::from(*kk)] += 1;
+            }
+            Err(refusal) => assert!(
+                !writer && refusal.class == AdmissionClass::Canonical,
+                "{name}: {refusal}"
+            ),
+        }
+        let len = members.len() as u64;
+        assert_eq!(view.len(), len, "{name}: len");
+        let mut walked = Vec::new();
+        view.for_each(|v| walked.push(v));
+        assert_eq!(&walked, members, "{name}: for_each");
+        assert_eq!(&view.range().collect::<Vec<_>>(), members, "{name}: range");
+        for (k, &m) in members.iter().enumerate() {
+            assert_eq!(view.select(k as u64), Some(m), "{name}: select({k})");
+        }
+        assert_eq!(view.select(len), None, "{name}: select past the end");
+        let oracle: BTreeSet<u32> = members.iter().copied().collect();
+        let probes: BTreeSet<u32> = members
+            .iter()
+            .flat_map(|&m| [m.saturating_sub(1), m, m + 1])
+            .chain([0, 65_535, 65_536, u32::MAX])
+            .collect();
+        for p in probes {
+            let rank = members.partition_point(|&m| m < p);
+            assert_eq!(
+                view.contains(p),
+                oracle.contains(&p),
+                "{name}: contains({p})"
+            );
+            assert_eq!(view.rank(p), rank as u64, "{name}: rank({p})");
+            let mut cursor = view.range();
+            cursor.seek(p);
+            assert_eq!(
+                cursor.next(),
+                members.get(rank).copied(),
+                "{name}: seek({p})"
+            );
+            assert_eq!(
+                cursor.next(),
+                members.get(rank + 1).copied(),
+                "{name}: next after seek({p})"
+            );
+        }
+        images.push((name, slot, oracle));
+    }
+    assert!(
+        writer_images[1..].iter().all(|&n| n > 0),
+        "every form has a writer's image among the cases: {writer_images:?}"
+    );
+    for (a_name, a, a_set) in &images {
+        let a_view = BitmosaicView::open(a).unwrap();
+        for (b_name, b, b_set) in &images {
+            let b_view = BitmosaicView::open(b).unwrap();
+            let (fewer, more) = if a_set.len() <= b_set.len() {
+                (a_set, b_set)
+            } else {
+                (b_set, a_set)
+            };
+            let shared = fewer.iter().filter(|v| more.contains(v)).count() as u64;
+            assert_eq!(a_view.and_len(&b_view), shared, "{a_name} and {b_name}");
+        }
+    }
+}
+//#endregion smoo/bitmosaic!n/small-forms-read-in-place

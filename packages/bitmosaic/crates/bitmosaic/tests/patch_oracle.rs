@@ -1495,56 +1495,122 @@ fn a_slot_patched_across_every_small_form_stays_a_fresh_encoding() {
         .copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
     let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut oracle = BTreeSet::new();
-    // Each batch and the length of the image it leaves: the control byte,
-    // the rest of its count where one follows, and the payload named.
-    /// A batch: its name, adds, removes and, where stated, the image length it leaves.
-    type Step = (&'static str, Vec<u32>, Vec<u32>, Option<usize>);
+    // Each batch, the control byte of the image it leaves (README, Native
+    // v2: small tag `kk lllll`, 0x10 a directory, 0x14 empty) and, where
+    // stated, that image's length.
+    /// A batch: its name, adds, removes, the control it leaves and, where stated, the length.
+    type Step = (&'static str, Vec<u32>, Vec<u32>, u8, Option<usize>);
     let steps: Vec<Step> = vec![
-        ("a singleton: Bytes", vec![7], vec![], Some(1 + 1)),
-        ("two near members: Bytes", vec![40], vec![], Some(1 + 2)),
-        ("four of 83: Bytes", vec![17, 82], vec![], Some(1 + 4)),
+        ("a singleton: Window", vec![7], vec![], 0x40, Some(2)),
         (
-            "thirteen within 82 positions: Window",
-            vec![1, 3, 9, 20, 25, 33, 47, 55, 60],
+            "a member past the window: List8",
+            vec![200],
             vec![],
-            Some(1 + 1 + 11),
+            0x21,
+            Some(3),
         ),
         (
-            "every ordinal: Stride",
-            (0..83).collect(),
-            vec![],
-            Some(2 + 4),
+            "two bytes away from zero: Window at",
+            vec![1000, 1001, 1010],
+            vec![7, 200],
+            0x61,
+            Some(4),
         ),
-        ("one hole: Runs", vec![], vec![40], Some(2 + 9)),
-        ("a second chunk: a directory", vec![70_000], vec![], None),
         (
-            "the second chunk gone: lone again",
+            "spread past any window: List16",
+            vec![2000],
+            vec![1001, 1010],
+            0x81,
+            Some(5),
+        ),
+        (
+            "an interval joins: Spans",
+            (2001..=2100).collect(),
+            vec![],
+            0xA1,
+            Some(9),
+        ),
+        (
+            "back to the first bytes: Window",
+            vec![0, 1, 2, 10],
+            std::iter::once(1000).chain(2000..=2100).collect(),
+            0x41,
+            Some(3),
+        ),
+        (
+            "no small form holds it: a Stride directory",
+            (0..100).map(|i| i * 3).collect(),
+            vec![1, 2, 10],
+            0x10,
+            Some(11),
+        ),
+        (
+            "List16 longer than the directory: a Stride directory",
+            (1..20).map(|i| i * 3000).collect(),
+            (1..100).map(|i| i * 3).collect(),
+            0x10,
+            Some(11),
+        ),
+        (
+            "a second chunk: a directory of two",
+            vec![70_000],
+            vec![],
+            0x10,
+            Some(23),
+        ),
+        (
+            "the second chunk gone: the Stride directory again",
             vec![],
             vec![70_000],
-            Some(2 + 9),
+            0x10,
+            Some(11),
         ),
         (
-            "back to three: Bytes",
+            "four members: List16",
             vec![],
-            (0..83).filter(|v| ![7, 17, 40, 82].contains(v)).collect(),
-            Some(1 + 3),
+            (4..20).map(|i| i * 3000).collect(),
+            0x83,
+            Some(9),
         ),
-        ("a far member: Array", vec![9_000], vec![], Some(1 + 8)),
+        (
+            "43 irregular members: an Array directory",
+            (1..40).map(|i| i * i).collect(),
+            vec![],
+            0x10,
+            Some(93),
+        ),
+        (
+            "44 runs: a Runs directory",
+            (0..40)
+                .flat_map(|r| (0..10).map(move |i| 10_000 + r * 20 + i))
+                .collect(),
+            (1..40).map(|i| i * i).collect(),
+            0x10,
+            Some(270),
+        ),
         (
             "a dense chunk: Words",
             (0..60_000).filter(|v| v % 3 != 0).collect(),
             vec![],
+            0x10,
             None,
         ),
         (
             "one more member, where the Words lie",
             vec![3],
             vec![],
+            0x10,
             None,
         ),
-        ("its count gone", vec![], (0..60_000).collect(), Some(1)),
+        (
+            "its count gone: empty",
+            vec![],
+            (0..60_000).collect(),
+            0x14,
+            Some(1),
+        ),
     ];
-    for (i, (name, adds, removes, expected)) in steps.iter().enumerate() {
+    for (i, (name, adds, removes, control, expected)) in steps.iter().enumerate() {
         let report = captured_prepared_patch(
             &mut state,
             SLOT,
@@ -1554,12 +1620,66 @@ fn a_slot_patched_across_every_small_form_stays_a_fresh_encoding() {
             &mut oracle,
             i % 2 == 0,
         );
+        let image = &state[SLOT.start..SLOT.start + report.serialized_len];
+        assert_eq!(image[0], *control, "{name}");
+        assert_eq!(
+            image,
+            Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes(),
+            "{name}"
+        );
+        assert!(BitmosaicView::open_verified(image).is_ok(), "{name}");
         if let Some(expected) = expected {
             assert_eq!(report.serialized_len, *expected, "{name}");
         }
     }
 
-    // A dense lone chunk takes one member without the image being rebuilt.
+    // The tiny path through `patch_witnessed`: a small slot stays small,
+    // and the witnesses answer against the old set.
+    let mut slot = vec![0xa5u8; 16];
+    slot[..3].copy_from_slice(&[0x21, 7, 200]); // {7, 200}: List8
+    let (mut add_bits, mut remove_bits) = ([0u64; 1], [0u64; 1]);
+    let report = patch_witnessed(
+        &mut slot,
+        &[7, 9],
+        &[200, 201],
+        &mut scratch,
+        &mut BatchOutcome::new(&mut add_bits, &mut remove_bits),
+    )
+    .expect("the slot has room");
+    assert_eq!(
+        (
+            report.added,
+            report.removed,
+            report.len,
+            report.serialized_len
+        ),
+        (1, 1, 2, 3)
+    );
+    assert_eq!((add_bits[0], remove_bits[0]), (0b10, 0b01));
+    assert_eq!(&slot[..3], [0x41, 0x80, 0x02], "{{7, 9}}: Window");
+    assert_eq!(&slot[..3], Bitmosaic::from_sorted([7, 9]).to_forest_bytes());
+    assert!(BitmosaicView::open_verified(&slot).is_ok());
+
+    // A capacity refusal on the tiny path leaves every byte as it was.
+    let mut tight = vec![0x21, 7, 200];
+    let needed = Bitmosaic::from_sorted([7, 200, 300])
+        .to_forest_bytes()
+        .len();
+    assert_eq!(needed, 1 + 2 * 3, "{{7, 200, 300}}: List16");
+    let (mut add_bits, mut remove_bits) = ([0u64; 1], [0u64; 1]);
+    assert_eq!(
+        patch_witnessed(
+            &mut tight,
+            &[300],
+            &[],
+            &mut scratch,
+            &mut BatchOutcome::new(&mut add_bits, &mut remove_bits),
+        ),
+        Err(PatchError::Capacity { needed })
+    );
+    assert_eq!(tight, [0x21, 7, 200]);
+
+    // A dense chunk at key zero takes one member without the image being rebuilt.
     let members: Vec<u32> = (0..60_000).filter(|v| v % 3 != 0).collect();
     let mut slot = vec![0u8; 32 * 1024];
     let len = Bitmosaic::from_sorted(members.iter().copied())
