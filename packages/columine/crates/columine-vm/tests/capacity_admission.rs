@@ -1165,7 +1165,7 @@ fn bitmap_slot(capacity: u32) -> (Vec<u8>, SlotMetaView) {
     state[(base + SlotMetaOffset::CAPACITY) as usize..][..4]
         .copy_from_slice(&capacity.to_le_bytes());
     state[(base + SlotMetaOffset::TYPE_FLAGS) as usize] = SlotType::Bitmap as u8;
-    state[data as usize..][..4].copy_from_slice(&EMPTY_U32_IMAGE);
+    state[data as usize..][..EMPTY_U32_IMAGE.len()].copy_from_slice(&EMPTY_U32_IMAGE);
     let meta = SlotMetaView::read(&state, 0);
     (state, meta)
 }

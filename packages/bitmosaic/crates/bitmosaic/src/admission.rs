@@ -3,11 +3,10 @@
 /// The violated native-image discipline, shared by every language binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionClass {
-    /// The three-byte BMS identification does not match.
-    Magic,
     /// A referenced or derived byte extent is unavailable or overflows.
     Extent,
-    /// An encoding version, root mode, width or container tag is unsupported.
+    /// A control byte, root mode or key width is unsupported, or a form is
+    /// used where another is the set's image.
     Kind,
     /// Cardinalities or their prefix planes disagree.
     Count,
@@ -25,7 +24,6 @@ impl AdmissionClass {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Magic => "magic",
             Self::Extent => "extent",
             Self::Kind => "kind",
             Self::Count => "count",

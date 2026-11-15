@@ -454,5 +454,229 @@ fn bench_u64(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ops, bench_u64, bench_array_search);
+/// Small sets: the borrowed reads a consumer runs on a slot of a few dozen
+/// ordinals. Each cell is one image attached once; `attach` is the open
+/// itself. Probes alternate members and non-members of the universe.
+fn bench_small_sets(c: &mut Criterion) {
+    let mut state = 0x5EED_5E75_0000_0002u64;
+    let mut draw = |k: usize, n: u32| {
+        let mut pool: Vec<u32> = (0..n).collect();
+        for i in 0..k {
+            let j = i + (xorshift(&mut state) % (u64::from(n) - i as u64)) as usize;
+            pool.swap(i, j);
+        }
+        pool.truncate(k);
+        pool.sort_unstable();
+        pool
+    };
+    let mut cells: Vec<(String, Vec<u32>, Vec<u32>)> = [
+        (1usize, 83u32),
+        (4, 83),
+        (13, 70),
+        (40, 83),
+        (83, 83),
+        (16, 4_096),
+        (64, 65_536),
+    ]
+    .into_iter()
+    .map(|(k, n)| (format!("small-{k}-of-{n}"), draw(k, n), draw(k, n)))
+    .collect();
+    cells.push((
+        "small-run-200".to_owned(),
+        (1_000..1_200).collect(),
+        (1_100..1_300).collect(),
+    ));
+    for (name, va, vb) in cells {
+        let a_bytes = bitmosaic::Bitmosaic::from_sorted(va.iter().copied()).to_forest_bytes();
+        let b_bytes = bitmosaic::Bitmosaic::from_sorted(vb.iter().copied()).to_forest_bytes();
+        let a_view = bitmosaic::BitmosaicView::open(&a_bytes).expect("attach left");
+        let b_view = bitmosaic::BitmosaicView::open(&b_bytes).expect("attach right");
+        let universe = va.last().copied().unwrap_or(0) + 2;
+        let probes: Vec<u32> = (0..64)
+            .map(|i| {
+                let r = xorshift(&mut state);
+                if i % 2 == 0 {
+                    va[(r % va.len() as u64) as usize]
+                } else {
+                    (r % u64::from(universe)) as u32
+                }
+            })
+            .collect();
+        eprintln!("BYTES {name}: slot form {} B", a_bytes.len());
+        let mut group = c.benchmark_group(name);
+        group.bench_function("attach", |bch| {
+            bch.iter(|| black_box(bitmosaic::BitmosaicView::open(black_box(&a_bytes)).unwrap()))
+        });
+        group.bench_function("contains-64", |bch| {
+            bch.iter(|| black_box(throughput(&probes, |p| u64::from(a_view.contains(p)))))
+        });
+        group.bench_function("walk", |bch| {
+            bch.iter(|| {
+                let mut sum = 0u64;
+                black_box(&a_view).for_each(|v| sum += u64::from(v));
+                black_box(sum)
+            })
+        });
+        group.bench_function("cursor", |bch| {
+            bch.iter(|| black_box(black_box(&a_view).range().map(u64::from).sum::<u64>()))
+        });
+        group.bench_function("and_len", |bch| {
+            bch.iter(|| black_box(a_view.and_len(black_box(&b_view))))
+        });
+        group.finish();
+    }
+}
+
+/// Large sets through the borrowed view: attach, verify, probes, walks,
+/// seeks, the intersection count and the seal, at 10^4 and 10^6 members in
+/// dense, sparse and run-heavy shapes. The sealed image is what a reader
+/// holds; the forest image is what a slot holds.
+fn bench_large_views(c: &mut Criterion) {
+    let uniform = |n: usize, below: u64, seed: u64| {
+        let mut state = seed;
+        let mut values: Vec<u32> = (0..n * 5 / 4)
+            .map(|_| (xorshift(&mut state) % below) as u32)
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        values.truncate(n);
+        values
+    };
+    let runs = |count: u32, len: u32, gap: u32, offset: u32| -> Vec<u32> {
+        (0..count)
+            .flat_map(|i| {
+                let start = offset + i * (len + gap);
+                start..start + len
+            })
+            .collect()
+    };
+    let shapes: Vec<(&str, Vec<u32>, Vec<u32>)> = vec![
+        (
+            "view-dense-1e4",
+            uniform(10_000, 20_000, 0x1e4_0001),
+            uniform(10_000, 20_000, 0x1e4_0002),
+        ),
+        (
+            "view-sparse-1e4",
+            uniform(10_000, 1 << 32, 0x1e4_0003),
+            uniform(10_000, 1 << 32, 0x1e4_0004),
+        ),
+        (
+            "view-runs-1e4",
+            runs(10, 1_000, 9_000, 0),
+            runs(10, 1_000, 9_000, 500),
+        ),
+        (
+            "view-dense-1e6",
+            uniform(1_000_000, 1 << 21, 0x1e6_0001),
+            uniform(1_000_000, 1 << 21, 0x1e6_0002),
+        ),
+        (
+            "view-sparse-1e6",
+            uniform(1_000_000, 1 << 28, 0x1e6_0003),
+            uniform(1_000_000, 1 << 28, 0x1e6_0004),
+        ),
+        (
+            "view-runs-1e6",
+            runs(1_000, 1_000, 3_000, 0),
+            runs(1_000, 1_000, 3_000, 500),
+        ),
+    ];
+    for (name, va, vb) in shapes {
+        let owned_a = bitmosaic::Bitmosaic::from_sorted(va.iter().copied());
+        let owned_b = bitmosaic::Bitmosaic::from_sorted(vb.iter().copied());
+        let mut state = 0x9120_be5_u64 ^ va.len() as u64;
+        let top = u64::from(*va.last().expect("a nonempty shape")) + 2;
+        let probes: Vec<u32> = (0..1024)
+            .map(|i| {
+                let r = xorshift(&mut state);
+                if i % 2 == 0 {
+                    va[(r % va.len() as u64) as usize]
+                } else {
+                    (r % top) as u32
+                }
+            })
+            .collect();
+        let ranks: Vec<u64> = (0..1024)
+            .map(|_| xorshift(&mut state) % va.len() as u64)
+            .collect();
+        for (form, a_bytes, b_bytes) in [
+            ("sealed", owned_a.to_bytes(), owned_b.to_bytes()),
+            (
+                "forest",
+                owned_a.to_forest_bytes(),
+                owned_b.to_forest_bytes(),
+            ),
+        ] {
+            let a_view = bitmosaic::BitmosaicView::open(&a_bytes).expect("attach left");
+            let b_view = bitmosaic::BitmosaicView::open(&b_bytes).expect("attach right");
+            eprintln!("BYTES {name}/{form}: {} B", a_bytes.len());
+            let mut group = c.benchmark_group(format!("{name}/{form}"));
+            group.bench_function("attach", |bch| {
+                bch.iter(|| black_box(bitmosaic::BitmosaicView::open(black_box(&a_bytes))))
+            });
+            group.bench_function("verify", |bch| {
+                bch.iter(|| {
+                    black_box(bitmosaic::BitmosaicView::open_verified(black_box(&a_bytes)).is_ok())
+                })
+            });
+            group.bench_function("contains-1024", |bch| {
+                bch.iter(|| black_box(throughput(&probes, |p| u64::from(a_view.contains(p)))))
+            });
+            group.bench_function("rank-1024", |bch| {
+                bch.iter(|| black_box(throughput(&probes, |p| a_view.rank(p))))
+            });
+            group.bench_function("select-1024", |bch| {
+                bch.iter(|| {
+                    black_box(ranks.iter().fold(0u64, |acc, &k| {
+                        acc.wrapping_add(u64::from(a_view.select(black_box(k)).unwrap_or(0)))
+                    }))
+                })
+            });
+            group.bench_function("walk", |bch| {
+                bch.iter(|| {
+                    let mut sum = 0u64;
+                    black_box(&a_view).for_each(|v| sum += u64::from(v));
+                    black_box(sum)
+                })
+            });
+            group.bench_function("cursor", |bch| {
+                bch.iter(|| black_box(black_box(&a_view).range().map(u64::from).sum::<u64>()))
+            });
+            let mut ascending = probes.clone();
+            ascending.sort_unstable();
+            group.bench_function("seek-1024", |bch| {
+                bch.iter(|| {
+                    let mut cursor = black_box(&a_view).range();
+                    let mut sum = 0u64;
+                    for &p in &ascending {
+                        cursor.seek(p);
+                        sum = sum.wrapping_add(cursor.remaining());
+                    }
+                    black_box(sum)
+                })
+            });
+            group.bench_function("and_len", |bch| {
+                bch.iter(|| black_box(a_view.and_len(black_box(&b_view))))
+            });
+            group.finish();
+        }
+        let mut group = c.benchmark_group(format!("{name}/seal"));
+        group.bench_function("to_bytes", |bch| {
+            bch.iter(|| black_box(black_box(&owned_a).to_bytes()))
+        });
+        group.bench_function("to_forest_bytes", |bch| {
+            bch.iter(|| black_box(black_box(&owned_a).to_forest_bytes()))
+        });
+        group.finish();
+    }
+}
+criterion_group!(
+    benches,
+    bench_ops,
+    bench_u64,
+    bench_array_search,
+    bench_small_sets,
+    bench_large_views
+);
 criterion_main!(benches);

@@ -23,21 +23,27 @@ use bitmosaic::{
 
 #[test]
 fn attached_runs_queries_cover_all_count_varint_widths() {
-    fn push_uleb(out: &mut Vec<u8>, mut value: usize) {
+    for count in [1usize, 2, 3, 128, 129, 16_384, 16_385, 32_768] {
+        // A lone Runs image of single-member runs: the count is the cardinality.
+        let mut bytes = match count {
+            1..=14 => vec![0x80 | ((count - 1) as u8) << 3 | 4],
+            15..=270 => vec![0x80 | 14 << 3 | 4, (count - 15) as u8],
+            _ => {
+                let mut head = vec![0x80 | 15 << 3 | 4];
+                head.extend_from_slice(&((count - 1) as u16).to_le_bytes());
+                head
+            }
+        };
+        let mut body = Vec::new();
+        let mut runs = count - 1;
         loop {
-            let low = (value & 127) as u8;
-            value >>= 7;
-            out.push(low | if value == 0 { 0 } else { 128 });
-            if value == 0 {
+            let low = (runs & 127) as u8;
+            runs >>= 7;
+            body.push(low | if runs == 0 { 0 } else { 128 });
+            if runs == 0 {
                 break;
             }
         }
-    }
-    for count in [1usize, 2, 3, 128, 129, 16_384, 16_385, 32_768] {
-        let mut body = Vec::new();
-        push_uleb(&mut body, count - 1);
-        body.extend_from_slice(&[0, 0, 0, 4]); // one chunk, key zero, Runs
-        push_uleb(&mut body, count - 1);
         for i in 0..count {
             let value = (2 * i) as u16;
             body.extend_from_slice(&value.to_le_bytes());
@@ -46,8 +52,6 @@ fn attached_runs_queries_cover_all_count_varint_widths() {
         for i in 1..count.saturating_sub(1) {
             body.extend_from_slice(&(i as u16).to_le_bytes());
         }
-        let mut bytes = b"BMS\x08".to_vec();
-        push_uleb(&mut bytes, body.len());
         bytes.extend_from_slice(&body);
         let view = BitmosaicView::open_verified(&bytes).expect("bounded Runs count fixture");
         assert_eq!(view.len(), count as u64);
@@ -82,27 +86,29 @@ fn ordinary_attach_rejects_zero_stride_and_nonzero_ef_tail_bits() {
 
 #[test]
 fn runs_validate_stored_and_implicit_cardinality_prefixes() {
-    let bytes = Bitmosaic::from_sorted((0..4).chain(10..14).chain(20..24)).to_forest_bytes();
-    assert_eq!(bytes.len(), 25);
+    let bytes =
+        Bitmosaic::from_sorted((0..4).chain(1000..1004).chain(2000..2004)).to_forest_bytes();
+    assert_eq!(bytes.len(), 16);
     assert!(BitmosaicView::open_verified(&bytes).is_ok());
-    // One-byte framing/counts, then one key/kind: payload at 10.
-    // Three bounds consume 12 bytes after the count; the one prefix is at 23.
+    // A lone image: the control byte, then the payload at 1. Three bounds
+    // consume 12 bytes after the run count; the one prefix is at 14.
     let mut bad_prefix = bytes.clone();
-    bad_prefix[23..25].copy_from_slice(&5u16.to_le_bytes());
+    bad_prefix[14..16].copy_from_slice(&5u16.to_le_bytes());
     assert!(BitmosaicView::open(&bad_prefix).is_none());
+    // One more member in the folded cardinality than the runs hold.
     let mut bad_total = bytes;
-    bad_total[5] += 1;
+    bad_total[0] += 1 << 3;
     assert!(BitmosaicView::open(&bad_total).is_none());
 }
 
 #[test]
 fn u64_directory_rejects_inconsistent_prefixes_offsets_and_child_bodies() {
     let bytes = Bitmosaic64::from_sorted([1, (1u64 << 32) | 3, (2u64 << 32) | 5]).to_bytes();
-    assert_eq!(bytes.len(), 56);
+    assert_eq!(bytes.len(), 37);
     assert!(Bitmosaic64View::open_verified(&bytes).is_ok());
-    // Three children: keys at 6, interior prefix at 18, offsets at 26,
-    // root bits at 34, tightly packed seven-byte singleton bodies at 35.
-    for (at, value) in [(6, 2u8), (18, 2), (26, 8), (34, 0x80), (35, 1)] {
+    // Three children: keys at 3, interior prefix at 15, offsets at 23,
+    // tightly packed two-byte lone singletons at 31.
+    for (at, value) in [(3, 2u8), (15, 2), (23, 3), (31, 1)] {
         let mut damaged = bytes.clone();
         damaged[at] = value;
         assert!(
@@ -145,7 +151,7 @@ fn full_u32_cardinality_uses_widened_final_prefix() {
     for _ in 0..chunks {
         body.extend_from_slice(&[0, 0, 1, 0]);
     }
-    let mut bytes = b"BMS\x08".to_vec();
+    let mut bytes = vec![0x10];
     varint(&mut bytes, body.len() as u32);
     bytes.extend_from_slice(&body);
     let view = BitmosaicView::open_verified(&bytes).expect("full-domain arithmetic fixture");
@@ -159,41 +165,40 @@ fn full_u32_cardinality_uses_widened_final_prefix() {
 #[test]
 fn runs_reject_overlapping_adjacent_reversed_and_inexact_payloads() {
     let bytes = Bitmosaic::from_sorted((0..4096).chain(32768..36864)).to_forest_bytes();
-    assert_eq!(bytes.len(), 20);
+    assert_eq!(bytes.len(), 12);
+    // A lone Runs image: control and a two-byte count, the run count at 3,
+    // the first run at 4 and the second at 8.
     for (start, end) in [(4095u16, 8190u16), (4096, 8191), (40000, 36863)] {
         let mut damaged = bytes.clone();
-        damaged[16..18].copy_from_slice(&start.to_le_bytes());
-        damaged[18..20].copy_from_slice(&end.to_le_bytes());
+        damaged[8..10].copy_from_slice(&start.to_le_bytes());
+        damaged[10..12].copy_from_slice(&end.to_le_bytes());
         assert!(BitmosaicView::open(&damaged).is_none());
     }
-    for kind in [5u8, 6, 7, 0x84] {
+    for kind in [0u8, 1, 2, 3, 5, 6, 7] {
         let mut damaged = bytes.clone();
-        damaged[10] = kind;
-        assert!(BitmosaicView::open(&damaged).is_none());
+        damaged[0] = (damaged[0] & !7) | kind;
+        assert!(
+            BitmosaicView::open_verified(&damaged).is_err(),
+            "kind {kind}"
+        );
     }
-    let mut gap = bytes.clone();
-    gap[4] += 1;
-    gap.push(0);
-    assert!(BitmosaicView::open(&gap).is_none());
     let mut noncanonical_count = bytes.clone();
-    noncanonical_count[4] += 1;
-    noncanonical_count[11] |= 128;
-    noncanonical_count.insert(12, 0);
+    noncanonical_count[3] |= 128;
+    noncanonical_count.insert(4, 0);
     assert!(BitmosaicView::open(&noncanonical_count).is_none());
 }
 
 #[test]
 fn native_v1_compact_images_round_trip_without_padding() {
     for (values, expected_bytes) in [
-        (Vec::new(), 4),
-        (vec![7], 12),
-        ((0..100).collect(), 14),
-        ((0..4096).chain(32768..36864).collect(), 20),
+        (Vec::new(), 1),
+        (vec![7], 2),
+        ((0..100).collect(), 6),
+        ((0..4096).chain(32768..36864).collect(), 12),
     ] {
         let owned = Bitmosaic::from_sorted(values.iter().copied());
         let bytes = owned.to_bytes();
         assert_eq!(bytes.len(), expected_bytes);
-        assert_eq!(&bytes[..3], b"BMS");
         for offset in 0..64 {
             let mut slot = vec![0xa5; offset];
             slot.extend_from_slice(&bytes);
@@ -206,7 +211,7 @@ fn native_v1_compact_images_round_trip_without_padding() {
             }
         }
     }
-    for (values, expected_bytes) in [(vec![], 4), (vec![u64::MAX], 18)] {
+    for (values, expected_bytes) in [(vec![], 1), (vec![7], 9), (vec![u64::MAX], 15)] {
         let bytes = Bitmosaic64::from_sorted(values.iter().copied()).to_bytes();
         assert_eq!(bytes.len(), expected_bytes);
         assert_eq!(
@@ -301,14 +306,21 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
         slot.extend_from_slice(&[0xa5; 32]);
         let header = image_header(&slot).unwrap();
         assert_eq!(header.width, width);
-        assert_eq!(header.encoded_len, 4);
+        assert_eq!(header.encoded_len, 1);
     }
     for control in 0..=u8::MAX {
-        let mut image = vec![b'B', b'M', b'S', control, 1, 0];
-        let valid = matches!(control, 8 | 9 | 10 | 12 | 13);
+        let mut image = vec![control, 1];
+        image.resize(512, 0);
+        let valid = if control < 0x80 {
+            matches!(control, 0x10 | 0x11 | 0x12 | 0x14 | 0x15)
+        } else {
+            // A lone image over zero bytes: every kind but Words (an empty
+            // window) has an extent; a two-byte count of zero is not the
+            // shortest form of one, and a Window's count never extends.
+            matches!(control & 7, 1..=7) && (control & 7 >= 6 || control >> 3 & 15 != 15)
+        };
         assert_eq!(image_header(&image).is_some(), valid, "control {control}");
-        image.truncate(3);
-        assert!(image_header(&image).is_none());
+        assert!(image_header(&[]).is_none());
     }
     for length in [
         &[0x80][..],
@@ -318,15 +330,15 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
         &[0x80, 0x80, 0x80, 0x80, 0x80, 0][..],
         &[127][..],
     ] {
-        let mut bytes = b"BMS\x08".to_vec();
+        let mut bytes = vec![0x10];
         bytes.extend_from_slice(length);
         assert!(image_header(&bytes).is_none(), "{length:?}");
     }
-    for old in [b"AXR1", b"AXR8"] {
+    for old in [b"AXR1", b"AXR8", b"BMS\x08"] {
         assert!(image_header(old).is_none());
     }
     for body_len in [0usize, 1, 127, 128, 16_383, 16_384] {
-        let mut bytes = b"BMS\x08".to_vec();
+        let mut bytes = vec![0x10];
         let mut remaining = body_len;
         loop {
             let byte = (remaining & 127) as u8;
@@ -836,11 +848,14 @@ fn truncated_and_corrupt_planes_are_refused_not_trusted() {
                 "{name}: one byte short"
             );
         }
-        let mut wrong_magic = bytes.clone();
-        wrong_magic[0] ^= 0xFF;
-        assert!(BitmosaicView::open(&wrong_magic).is_none(), "{name}: magic");
+        let mut wrong_control = bytes.clone();
+        wrong_control[0] = 0x42;
+        assert!(
+            BitmosaicView::open(&wrong_control).is_none(),
+            "{name}: control"
+        );
         let mut wrong_version = bytes.clone();
-        wrong_version[3] = (wrong_version[3] & 7) | (2 << 3);
+        wrong_version[0] = (wrong_version[0] & 7) | (3 << 3);
         assert!(
             BitmosaicView::open(&wrong_version).is_none(),
             "{name}: version"
@@ -906,9 +921,9 @@ fn forged_headers_are_refused_and_damaged_planes_never_lie() {
 
     for (name, values) in shapes() {
         let bytes = Bitmosaic::from_sorted(values.iter().copied()).to_bytes();
-        for control in [0, 3, 11, 14, 15, 16, 255] {
+        for control in [0, 3, 0x08, 0x0c, 0x13, 0x16, 0x17, 0x18, 0x42, 0x7f] {
             let mut forged = bytes.clone();
-            forged[3] = control;
+            forged[0] = control;
             assert!(
                 BitmosaicView::open(&forged).is_none(),
                 "{name}: control {control}"

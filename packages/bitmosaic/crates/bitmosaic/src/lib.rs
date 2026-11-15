@@ -32,6 +32,7 @@ mod ef;
 pub mod oracle;
 mod patch;
 mod range;
+mod small;
 mod wire;
 
 pub use admission::{AdmissionClass, AdmissionError};

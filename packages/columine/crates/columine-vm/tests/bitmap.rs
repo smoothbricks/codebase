@@ -307,8 +307,8 @@ fn capacity_zero_slot_holds_exactly_the_empty_image() {
 /// (`columine_types::types::next_power_of_2`, shared by every slot type and
 /// unchanged here), so any requested capacity up to 8 lands on 16 elements —
 /// and the slot's whole data region is then the image region alone,
-/// `16 * 4 + IMAGE_ID_LEN = 68` bytes, where the old layout spent
-/// `8 + (16 * 4 + 256) = 328`. A 12-byte region is the capacity-2 boundary of
+/// `16 * 4 + IMAGE_ID_LEN = 65` bytes, where the old layout spent
+/// `8 + (16 * 4 + 256) = 328`. A 9-byte region is the capacity-2 boundary of
 /// a directly driven slot, which no declaration reaches; the two pairs are
 /// different baselines.
 #[test]
@@ -328,7 +328,7 @@ fn the_smallest_declarable_bitmap_slot_is_the_image_region_alone() {
         let storage = get_bitmap_storage(&meta);
         assert_eq!(storage.data_offset, meta.offset);
         assert_eq!(storage.payload_offset(), meta.offset);
-        assert_eq!(storage.payload_capacity, 68);
+        assert_eq!(storage.payload_capacity, 65);
         assert_eq!(storage.serialized_len(&state), Ok(IMAGE_ID_LEN as u32));
         assert!(storage.view(&state).expect("fresh slot parses").is_none());
         assert_slot_is_canonical(&state, storage, &BTreeSet::new());
@@ -481,9 +481,8 @@ fn run_container_histories_split_bridge_extend_and_erase() {
 
     // The format's worked example: 8192 members in two maximal intervals.
     // Two runs cost 12 owned bytes against the Words arm's 8720, so the
-    // chunk is priced as Runs, and the whole image is 20 bytes — 4
-    // identifier, 1 body length, and a 15-byte body (2 cardinality, 1 chunk
-    // count, 2 key, 1 kind plane, 9 runs payload).
+    // chunk is priced as Runs, and the whole image is 12 bytes: the lone
+    // control byte, a two-byte cardinality and the 9-byte runs payload.
     let two_runs: Vec<u32> = (0..4096).chain(32768..36864).collect();
     slot_step(
         &mut env, &mut hooks, &mut state, &meta, storage, &mut model, &two_runs, true,
@@ -493,7 +492,7 @@ fn run_container_histories_split_bridge_extend_and_erase() {
         (0, 0, 0, 0, 1),
         "two intervals freeze to one Runs container"
     );
-    assert_eq!(storage.serialized_len(&state), Ok(20));
+    assert_eq!(storage.serialized_len(&state), Ok(12));
     let two_run_image = storage
         .serialized_data(&state)
         .expect("image parses")
@@ -819,7 +818,7 @@ fn batch_bitmap_add_capacity_exceeded_flushes_partial_batch() {
 
 /// The storage layer's tightest boundary: an element cap smaller than the
 /// framing cost cannot store a full set of admitted members. Capacity 2 prices
-/// 12 payload bytes while the two-member image needs 14. No program can
+/// 9 payload bytes while two members in two chunks need a 21-byte directory. No program can
 /// declare a capacity this small (normalization floors at 16), so this drives
 /// the slot directly — the point is the arithmetic every capacity obeys, and
 /// the refusal it produces: the element cap admits the batch, the payload
@@ -833,10 +832,10 @@ fn element_cap_below_the_framing_cost_refuses_the_whole_batch() {
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 2);
     let storage = get_bitmap_storage(&meta);
-    assert_eq!(storage.payload_capacity, 12);
+    assert_eq!(storage.payload_capacity, 9);
     assert_eq!(
-        Bitmosaic::from_sorted([1u32, 3]).forest_len(),
-        14,
+        Bitmosaic::from_sorted([1u32, 70_000]).forest_len(),
+        21,
         "two members frame to more than the slot prices"
     );
     let before = state.clone();
@@ -847,7 +846,7 @@ fn element_cap_below_the_framing_cost_refuses_the_whole_batch() {
         false,
         &mut state,
         &meta,
-        &[3u32, 1],
+        &[70_000u32, 1],
         None,
     );
     assert_eq!(result, ErrorCode::CapacityExceeded);
@@ -856,7 +855,7 @@ fn element_cap_below_the_framing_cost_refuses_the_whole_batch() {
     assert_eq!(state, before);
     assert_slot_is_canonical(&state, storage, &BTreeSet::new());
 
-    // One member does fit: 4 + 1 + 1 + 1 + 2 + 1 + 2 = 12 bytes exactly.
+    // One member does fit: the lone control byte and the member.
     assert_eq!(
         batch_bitmap_add(
             &mut env,
@@ -1092,7 +1091,7 @@ fn serialized_queries() {
         .expect_err("native refusal is forwarded");
     assert_eq!(
         (error.class, error.offset),
-        (bitmosaic::AdmissionClass::Magic, 0)
+        (bitmosaic::AdmissionClass::Kind, 0)
     );
     assert!(intersects_serialized(&a, &b));
     assert!(!intersects_serialized(&a, &c));

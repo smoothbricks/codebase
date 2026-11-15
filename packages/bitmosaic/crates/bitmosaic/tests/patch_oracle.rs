@@ -178,7 +178,10 @@ fn run_patch_split_bridge_spill_and_empty_preserve_witnesses() {
             assert_eq!((remove_bits[i / 64] >> (i % 64)) & 1 != 0, expected);
         }
     }
-    assert_eq!(&slot[..4], &bitmosaic::EMPTY_U32_IMAGE);
+    assert_eq!(
+        &slot[..bitmosaic::IMAGE_ID_LEN],
+        &bitmosaic::EMPTY_U32_IMAGE
+    );
 }
 
 #[test]
@@ -1458,7 +1461,7 @@ fn prepared_patch_has_no_extra_allocations_with_presized_scratch() {
 #[test]
 fn embedded_preparation_refuses_invalid_ranges_before_owner_writes() {
     let mut state = [0xa5; 128];
-    state[17..21].copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
+    state[17..17 + bitmosaic::IMAGE_ID_LEN].copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
     let before = state;
     let mut scratch = PatchScratch::try_new().expect("scratch");
     let mut witness = ();
@@ -1482,3 +1485,101 @@ fn embedded_preparation_refuses_invalid_ranges_before_owner_writes() {
     ));
     assert_eq!(state, before);
 }
+
+//#region smoo/bitmosaic!n/patch-small-forms
+#[test]
+fn a_slot_patched_across_every_small_form_stays_a_fresh_encoding() {
+    const SLOT: core::ops::Range<usize> = 9..9 + 32 * 1024;
+    let mut state = vec![0xa5u8; SLOT.end + 7];
+    state[SLOT.start..SLOT.start + bitmosaic::IMAGE_ID_LEN]
+        .copy_from_slice(&bitmosaic::EMPTY_U32_IMAGE);
+    let mut scratch = PatchScratch::try_new().expect("scratch");
+    let mut oracle = BTreeSet::new();
+    // Each batch and the length of the image it leaves: the control byte,
+    // the rest of its count where one follows, and the payload named.
+    /// A batch: its name, adds, removes and, where stated, the image length it leaves.
+    type Step = (&'static str, Vec<u32>, Vec<u32>, Option<usize>);
+    let steps: Vec<Step> = vec![
+        ("a singleton: Bytes", vec![7], vec![], Some(1 + 1)),
+        ("two near members: Bytes", vec![40], vec![], Some(1 + 2)),
+        ("four of 83: Bytes", vec![17, 82], vec![], Some(1 + 4)),
+        (
+            "thirteen within 82 positions: Window",
+            vec![1, 3, 9, 20, 25, 33, 47, 55, 60],
+            vec![],
+            Some(1 + 1 + 11),
+        ),
+        (
+            "every ordinal: Stride",
+            (0..83).collect(),
+            vec![],
+            Some(2 + 4),
+        ),
+        ("one hole: Runs", vec![], vec![40], Some(2 + 9)),
+        ("a second chunk: a directory", vec![70_000], vec![], None),
+        (
+            "the second chunk gone: lone again",
+            vec![],
+            vec![70_000],
+            Some(2 + 9),
+        ),
+        (
+            "back to three: Bytes",
+            vec![],
+            (0..83).filter(|v| ![7, 17, 40, 82].contains(v)).collect(),
+            Some(1 + 3),
+        ),
+        ("a far member: Array", vec![9_000], vec![], Some(1 + 8)),
+        (
+            "a dense chunk: Words",
+            (0..60_000).filter(|v| v % 3 != 0).collect(),
+            vec![],
+            None,
+        ),
+        (
+            "one more member, where the Words lie",
+            vec![3],
+            vec![],
+            None,
+        ),
+        ("its count gone", vec![], (0..60_000).collect(), Some(1)),
+    ];
+    for (i, (name, adds, removes, expected)) in steps.iter().enumerate() {
+        let report = captured_prepared_patch(
+            &mut state,
+            SLOT,
+            adds,
+            removes,
+            &mut scratch,
+            &mut oracle,
+            i % 2 == 0,
+        );
+        if let Some(expected) = expected {
+            assert_eq!(report.serialized_len, *expected, "{name}");
+        }
+    }
+
+    // A dense lone chunk takes one member without the image being rebuilt.
+    let members: Vec<u32> = (0..60_000).filter(|v| v % 3 != 0).collect();
+    let mut slot = vec![0u8; 32 * 1024];
+    let len = Bitmosaic::from_sorted(members.iter().copied())
+        .write_forest_into_slice(&mut slot)
+        .expect("the image fits");
+    let mut witness = ();
+    let prepared = prepare_patch_witnessed(&mut slot, &[3], &[], &mut scratch, &mut witness)
+        .expect("the slot has room");
+    let written: usize = prepared.mutation_ranges().iter().map(|&(_, len)| len).sum();
+    assert!(
+        written < len / 8,
+        "one member rewrote {written} of {len} bytes"
+    );
+    let (report, slot) = prepared.apply();
+    let mut with = members;
+    with.push(3);
+    with.sort_unstable();
+    assert_eq!(
+        &slot[..report.serialized_len],
+        Bitmosaic::from_sorted(with).to_forest_bytes()
+    );
+}
+//#endregion smoo/bitmosaic!n/patch-small-forms

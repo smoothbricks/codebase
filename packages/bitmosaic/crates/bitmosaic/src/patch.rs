@@ -38,6 +38,10 @@
 use core::fmt;
 
 use crate::ef::{self, EfLayout, EfView, SAMPLE_STRIDE};
+use crate::small::{
+    K_BYTES, SmallSink, SmallView, lone_count, lone_header_len, small_form, window_count,
+    write_lone_header,
+};
 use crate::wire::{
     BOUNDS_AT, BitmosaicView, CView, ChunkRow, EMPTY_U32_IMAGE, Forest, Geometry, IMAGE_ID_LEN,
     K_ARRAY, K_CONE, K_RUNS, K_STRIDE, K_WORDS, KeyWidth, Root, WORDS_AT, cone_value,
@@ -242,15 +246,26 @@ impl<'state, W: Witness> PreparedPatch<'state, '_, W> {
                 plan.added += added;
                 plan.removed += removed;
                 plan.len = plan.len + u64::from(plan.added) - u64::from(plan.removed);
-                let body_bytes = plan.forest_total
-                    - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
-                write_forest_header(
-                    image,
-                    plan.geometry.slot_bits,
-                    plan.len,
-                    plan.chunks as u32,
-                    body_bytes,
-                );
+                if plan.geometry.is_lone() {
+                    let fresh = scratch.touched[0]
+                        .fresh
+                        .expect("in place: chunk set unchanged");
+                    write_lone_header(
+                        image,
+                        fresh.kind,
+                        lone_count(fresh.kind, plan.len as u32, fresh.lone_window),
+                    );
+                } else {
+                    let body_bytes = plan.forest_total
+                        - (plan.geometry.keys_at - forest_header_len(plan.len, plan.chunks as u32));
+                    write_forest_header(
+                        image,
+                        plan.geometry.slot_bits,
+                        plan.len,
+                        plan.chunks as u32,
+                        body_bytes,
+                    );
+                }
                 PatchReport {
                     added: plan.added,
                     removed: plan.removed,
@@ -394,6 +409,8 @@ struct Row {
     /// staged region when true.
     staged: bool,
     src: u32,
+    /// A Window payload's lone count ([`window_count`]); zero otherwise.
+    window: u32,
 }
 
 /// The patched form of one touched chunk: re-laddered and emitted into the
@@ -414,6 +431,8 @@ struct Fresh {
     window: (u16, u16),
     /// Bounds retained by the Words trial, so journaling does not probe it again.
     word_writes: Option<WordWrites>,
+    /// A Window payload's lone count ([`window_count`]); zero otherwise.
+    lone_window: u32,
 }
 
 /// A chunk of the old string: directory index, payload length,
@@ -714,7 +733,7 @@ fn prepare<'state, 'work, W: Witness, const CAPTURE: bool>(
         return Err(PatchError::Malformed);
     }
     scratch.mutation_ranges.clear();
-    let plan = if image[3] & 2 != 0 {
+    let plan = if header.is_ef() {
         PreparedPlan::Built(prepare_ef(image, adds, removes, scratch, witness)?)
     } else {
         prepare_forest::<W, CAPTURE>(image, adds, removes, scratch, witness)?
@@ -1152,10 +1171,20 @@ fn merge_interval_events<W: Witness>(
 }
 
 /// Emit `arm` for the chunk staged in `scratch` — the plane for `Words`,
-/// retained members/runs for the sparse arms — into the staged region.
+/// retained members/runs for the sparse arms — into the staged region, as
+/// the small form where that is shorter ([`small_form`]): the same verdict
+/// the seal-time writer reaches from the owned container.
 fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
     let n = card as usize;
-    let plane = &*scratch.plane;
+    let PatchScratch {
+        plane,
+        members,
+        runs,
+        residuals,
+        staged,
+        ..
+    } = scratch;
+    let plane = &**plane;
     let len = match arm {
         Arm::Runs { count } => runs_payload_len(count),
         Arm::Stride { .. } => 4,
@@ -1166,27 +1195,22 @@ fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
             words_payload_len(hi - lo)
         }
     };
-    let at = scratch.staged.len();
-    scratch.staged.resize(at + len, 0);
-    let out = &mut scratch.staged[at..at + len];
+    let at = staged.len();
+    staged.resize(at + len, 0);
+    let out = &mut staged[at..at + len];
     match arm {
         Arm::Runs { count } => {
-            debug_assert_eq!(scratch.runs.len(), count);
-            emit_runs(out, &scratch.runs);
+            debug_assert_eq!(runs.len(), count);
+            emit_runs(out, runs);
         }
         Arm::Stride { first, stride } => emit_stride(out, first, stride),
         Arm::Cone { first, scale, eps } => {
-            for (i, (slot, &v)) in scratch
-                .residuals
-                .iter_mut()
-                .zip(&scratch.members)
-                .enumerate()
-            {
+            for (i, (slot, &v)) in residuals.iter_mut().zip(members.iter()).enumerate() {
                 *slot = cone_residual(first, scale, i, v);
             }
-            emit_cone(out, first, scale, eps, &scratch.residuals[..n]);
+            emit_cone(out, first, scale, eps, &residuals[..n]);
         }
-        Arm::Array => emit_array(out, &scratch.members),
+        Arm::Array => emit_array(out, members),
         Arm::Words => emit_words(out, plane),
     }
     Fresh {
@@ -1198,6 +1222,7 @@ fn emit_arm(scratch: &mut PatchScratch, arm: Arm, card: u32) -> Fresh {
         edits: (0, 0, 0, 0),
         window: (0, 0),
         word_writes: None,
+        lone_window: 0,
     }
 }
 
@@ -1760,18 +1785,29 @@ fn prepare_forest<W: Witness, const CAPTURE: bool>(
     let Root::Forest(forest) = view.root else {
         return Err(PatchError::Malformed);
     };
-    let mut plan =
-        match plan_forest::<W, CAPTURE>(&forest, adds, removes, scratch, slot.len(), witness) {
-            ForestPass::Planned(plan) => plan,
-            ForestPass::Unchanged { taken_back } => {
-                return Ok(PreparedPlan::Unchanged(PatchReport {
-                    added: taken_back,
-                    removed: taken_back,
-                    len: view.len(),
-                    serialized_len: view.serialized_len(),
-                }));
-            }
-        };
+    // A lone image's small chunk is one the forest reader has no view of:
+    // the forest value carries its extent and cardinality, and the chunk
+    // itself is read through `small`.
+    let small = forest.lone_small();
+    let mut plan = match plan_forest::<W, CAPTURE>(
+        &forest,
+        small,
+        adds,
+        removes,
+        scratch,
+        slot.len(),
+        witness,
+    ) {
+        ForestPass::Planned(plan) => plan,
+        ForestPass::Unchanged { taken_back } => {
+            return Ok(PreparedPlan::Unchanged(PatchReport {
+                added: taken_back,
+                removed: taken_back,
+                len: view.len(),
+                serialized_len: view.serialized_len(),
+            }));
+        }
+    };
     let needed = plan.forest_total;
     if needed > slot.len() {
         return Err(PatchError::Capacity { needed });
@@ -1967,6 +2003,7 @@ fn refresh_rows(scratch: &mut PatchScratch) {
 /// against the same bound.
 fn plan_forest<W: Witness, const CAPTURE: bool>(
     forest: &Forest<'_>,
+    small: Option<SmallView<'_>>,
     adds: &[u32],
     removes: &[u32],
     scratch: &mut PatchScratch,
@@ -1983,7 +2020,57 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
     for (key, add_range, remove_range) in ByChunk::new(adds, removes) {
         let (chunk_adds, chunk_removes) =
             (&adds[add_range.clone()], &removes[remove_range.clone()]);
-        let located = forest.locate(key).map(|i| {
+        // The small lone chunk: at most 256 ordered members, merged with the
+        // batch like any ordered payload and re-laddered. Its image is
+        // always rebuilt, a few bytes.
+        if let (Some(small), 0) = (small, key) {
+            let old = Old {
+                index: 0,
+                len: small.payload_len() as u32,
+                card: small.cardinality(),
+                at: forest.geometry.payload_at as u32,
+            };
+            let offsets = (add_range.start, remove_range.start);
+            let sparse = old.card as usize + chunk_adds.len() <= ARRAY_MAX;
+            let (a, r) = if sparse {
+                merge_members(
+                    (old.card as usize, |i| small.select(i as u32)),
+                    chunk_adds,
+                    chunk_removes,
+                    offsets,
+                    witness,
+                    &mut scratch.members,
+                )
+            } else {
+                scratch.plane.fill(0);
+                small.for_each(|v| set_bit(&mut scratch.plane, v));
+                apply(
+                    &mut scratch.plane,
+                    chunk_adds,
+                    chunk_removes,
+                    offsets,
+                    witness,
+                )
+            };
+            added += a;
+            removed += r;
+            let card = old.card + a - r;
+            let fresh = (card > 0).then(|| {
+                if sparse {
+                    finish_members(scratch, card)
+                } else {
+                    finish(scratch, card)
+                }
+            });
+            chunk_set_changed |= fresh.is_none();
+            scratch.touched.push(Touched {
+                key,
+                old: Some(old),
+                fresh,
+            });
+            continue;
+        }
+        let located = chunk_of(forest, key).map(|i| {
             let container = forest.container(i).expect("open validated every chunk");
             (
                 Old {
@@ -2051,6 +2138,7 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
                         ),
                         window,
                         word_writes: Some(word_writes),
+                        lone_window: 0,
                     }),
                 });
                 continue;
@@ -2155,13 +2243,39 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         len + u64::from(touched.fresh.map_or(0, |fresh| fresh.card))
             - u64::from(touched.old.map_or(0, |old| old.card))
     });
+    // A lone image has no cardinality varint; its header is priced below.
+    let lone = forest.geometry.is_lone();
+    // A lone image that stays lone holds its one chunk in the small form
+    // where that is shorter; decided here so the in-place verdict below
+    // prices the payload the image will hold.
+    if lone
+        && small.is_none()
+        && !chunk_set_changed
+        && let Some(fresh) = scratch.touched[0].fresh
+        && fresh.staged
+        && let Some((kind, staged_at, len, lone_window)) = small_payload(
+            forest.bytes,
+            scratch,
+            (true, fresh.staged_at, fresh.len),
+            fresh.kind,
+            fresh.card,
+        )
+    {
+        scratch.touched[0].fresh = Some(Fresh {
+            kind,
+            staged_at,
+            len,
+            lone_window,
+            ..fresh
+        });
+    }
     let count_width_changed = final_len == 0
         || forest.len == 0
-        || uleb_len((final_len - 1) as u32) != uleb_len((forest.len - 1) as u32);
+        || (!lone && uleb_len((final_len - 1) as u32) != uleb_len((forest.len - 1) as u32));
     // Layout of the patched forest. In place needs the chunk set unchanged;
     // otherwise the geometry moves and the string is rebuilt from rows.
-    let (forest_total, in_place) = if chunk_set_changed || count_width_changed {
-        (layout_rows(forest, scratch), false)
+    let (forest_total, in_place) = if small.is_some() || chunk_set_changed || count_width_changed {
+        (layout_rows(forest, small, scratch), false)
     } else {
         let mut total = old_total;
         let mut moved = 0usize;
@@ -2191,14 +2305,21 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
         // the slot would hold for one copy — and the rebuild's two copies
         // of the string are exactly the traffic bound the in-place walk
         // is already allowed to reach.
-        let old_prefix = forest.geometry.keys_at - forest_header_len(forest.len, forest.chunks);
-        let body_bytes = total - old_prefix;
-        let framed_total = frame_len(body_bytes);
-        let in_place = framed_total == total
+        let header_holds = if lone {
+            let fresh = scratch.touched[0].fresh.expect("chunk set unchanged");
+            lone_header_len(
+                fresh.kind,
+                lone_count(fresh.kind, fresh.card, fresh.lone_window),
+            ) == forest.geometry.payload_at
+        } else {
+            let old_prefix = forest.geometry.keys_at - forest_header_len(forest.len, forest.chunks);
+            frame_len(total - old_prefix) == total
+        };
+        let in_place = header_holds
             && moved <= 2 * old_total
             && old_total as isize + peak <= capacity as isize;
         if !in_place {
-            (layout_rows(forest, scratch), false)
+            (layout_rows(forest, small, scratch), false)
         } else {
             (total, true)
         }
@@ -2218,14 +2339,18 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
 /// Rows of the patched forest — old chunks with touched ones replaced,
 /// dropped ones gone, new ones merged in. Returns the forest's total
 /// length.
-fn layout_rows(forest: &Forest<'_>, scratch: &mut PatchScratch) -> usize {
+fn layout_rows(
+    forest: &Forest<'_>,
+    small: Option<SmallView<'_>>,
+    scratch: &mut PatchScratch,
+) -> usize {
     scratch.rows.clear();
     let chunks = forest.chunks as usize;
     let mut t = 0usize;
     let mut i = 0usize;
     loop {
         let touched = scratch.touched.get(t).copied();
-        let old_key = (i < chunks).then(|| forest.key(i));
+        let old_key = (i < chunks).then(|| chunk_key(forest, i));
         match (old_key, touched) {
             (None, None) => break,
             (Some(key), Some(tc)) if tc.key == key => {
@@ -2234,11 +2359,11 @@ fn layout_rows(forest: &Forest<'_>, scratch: &mut PatchScratch) -> usize {
                 i += 1;
             }
             (Some(key), Some(tc)) if tc.key > key => {
-                push_old(&mut scratch.rows, forest, i);
+                push_old(&mut scratch.rows, forest, small, i);
                 i += 1;
             }
             (Some(_), None) => {
-                push_old(&mut scratch.rows, forest, i);
+                push_old(&mut scratch.rows, forest, small, i);
                 i += 1;
             }
             (_, Some(tc)) => {
@@ -2247,18 +2372,141 @@ fn layout_rows(forest: &Forest<'_>, scratch: &mut PatchScratch) -> usize {
             }
         }
     }
+    encode_first_row(forest.bytes, scratch);
     rows_total(&scratch.rows)
 }
 
-fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, i: usize) {
+/// Chunk `i`'s key. The lone chunk has no key plane: its key is zero.
+fn chunk_key(forest: &Forest<'_>, i: usize) -> u16 {
+    if forest.geometry.is_lone() {
+        0
+    } else {
+        forest.key(i)
+    }
+}
+
+/// The chunk holding `key`, if any.
+fn chunk_of(forest: &Forest<'_>, key: u16) -> Option<usize> {
+    if forest.geometry.is_lone() {
+        (key == 0).then_some(0)
+    } else {
+        forest.locate(key)
+    }
+}
+/// The classic payload at \`(staged, src, len)\` re-emitted into the staged
+/// region in the small form, when [\`small_form\`] finds one shorter: its
+/// kind, staged offset, length and Window count.
+fn small_payload(
+    slot: &[u8],
+    scratch: &mut PatchScratch,
+    (staged, src, len): (bool, u32, u32),
+    kind: u32,
+    card: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    // Words holds more members than a small span has positions.
+    if kind == K_WORDS || kind >= K_BYTES {
+        return None;
+    }
+    let PatchScratch {
+        staged: region,
+        members,
+        ..
+    } = scratch;
+    let range = src as usize..(src + len) as usize;
+    let container = CView::from_validated(
+        if staged { &region[range] } else { &slot[range] },
+        kind,
+        card,
+    );
+    let first = container.select(0);
+    let (small_kind, small_len) =
+        small_form(len as usize, first, container.select(card - 1), card)?;
+    members.clear();
+    container.for_each(|v| members.push(v));
+    let at = region.len();
+    region.resize(at + small_len, 0);
+    let mut sink = SmallSink::new(&mut region[at..], small_kind, first);
+    members.iter().for_each(|&v| sink.push(v));
+    Some((
+        small_kind,
+        at as u32,
+        small_len as u32,
+        window_count(small_kind, small_len - uleb_len(u32::from(first))),
+    ))
+}
+
+/// Give the first row the encoding its image calls for. The one chunk of a
+/// lone result takes the small form where that is shorter; a small chunk
+/// that an untouched lone image carried into a directory is re-laddered,
+/// since a directory holds no small container.
+fn encode_first_row(slot: &[u8], scratch: &mut PatchScratch) {
+    let Some(&row) = scratch.rows.first() else {
+        return;
+    };
+    if scratch.rows.len() == 1 && row.key == 0 {
+        if let Some((kind, src, len, window)) = small_payload(
+            slot,
+            scratch,
+            (row.staged, row.src, row.len),
+            row.kind,
+            row.card,
+        ) {
+            scratch.rows[0] = Row {
+                kind,
+                src,
+                len,
+                window,
+                staged: true,
+                ..row
+            };
+        }
+    } else if row.kind >= K_BYTES {
+        let range = row.src as usize..(row.src + row.len) as usize;
+        let small = SmallView::from_validated(
+            if row.staged {
+                &scratch.staged[range]
+            } else {
+                &slot[range]
+            },
+            row.kind,
+            lone_count(row.kind, row.card, row.window),
+        );
+        scratch.members.clear();
+        small.for_each(|v| scratch.members.push(v));
+        let fresh = finish_members(scratch, row.card);
+        scratch.rows[0] = Row {
+            kind: fresh.kind,
+            len: fresh.len,
+            staged: true,
+            src: fresh.staged_at,
+            window: 0,
+            ..row
+        };
+    }
+}
+
+fn push_old(rows: &mut Vec<Row>, forest: &Forest<'_>, small: Option<SmallView<'_>>, i: usize) {
+    if let Some(small) = small {
+        rows.push(Row {
+            key: 0,
+            card: small.cardinality(),
+            kind: small.kind(),
+            len: small.payload_len() as u32,
+            staged: false,
+            src: forest.geometry.payload_at as u32,
+            window: small.lone_count(),
+        });
+        return;
+    }
     let c = forest.container(i).expect("open validated every chunk");
     rows.push(Row {
-        key: forest.key(i),
+        key: chunk_key(forest, i),
         card: c.cardinality(),
         kind: view_kind(c),
         len: view_len(c),
         staged: false,
         src: payload_at(forest.bytes, forest.geometry, i) as u32,
+        window: 0,
     });
 }
 
@@ -2275,6 +2523,7 @@ fn push_fresh(rows: &mut Vec<Row>, t: Touched) {
             } else {
                 t.old.expect("an in-place chunk is an old chunk").at
             },
+            window: f.lone_window,
         });
     }
 }
@@ -2295,6 +2544,14 @@ fn geometry_of(rows: &[Row]) -> Geometry {
     };
     if rows.is_empty() {
         return Geometry::new(0, 0, IMAGE_ID_LEN);
+    }
+    if let [only] = rows
+        && only.key == 0
+    {
+        return Geometry::lone(lone_header_len(
+            only.kind,
+            lone_count(only.kind, only.card, only.window),
+        ));
     }
     let len = rows.iter().map(|row| u64::from(row.card)).sum();
     let body_header = forest_header_len(len, chunks);
@@ -2317,6 +2574,17 @@ fn assemble(slot: &[u8], scratch: &mut PatchScratch, total: usize, len: u64) {
     grow(build, total);
     if len == 0 {
         build[..IMAGE_ID_LEN].copy_from_slice(&EMPTY_U32_IMAGE);
+        return;
+    }
+    if geometry.is_lone() {
+        let row = scratch.rows[0];
+        let at = write_lone_header(build, row.kind, lone_count(row.kind, row.card, row.window));
+        let src = row.src as usize..row.src as usize + row.len as usize;
+        build[at..total].copy_from_slice(if row.staged {
+            &scratch.staged[src]
+        } else {
+            &slot[src]
+        });
         return;
     }
     // The directory's holes are its empty slots; the payload region is

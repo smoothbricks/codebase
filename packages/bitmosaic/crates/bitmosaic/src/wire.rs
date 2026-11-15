@@ -28,6 +28,12 @@
 
 use crate::ef::{self, EfLayout, EfRange, EfView};
 use crate::patch::PatchError;
+pub(crate) use crate::small::K_BYTES;
+use crate::small::{
+    CONTROL_LONE, SmallRange, SmallSink, SmallView, is_window, lone_cardinality, lone_count,
+    lone_header_len, lone_payload_len, read_lone_header, small_form, window_count,
+    write_lone_header,
+};
 use crate::{AdmissionClass, AdmissionError};
 use crate::{
     BLOCK_WORDS, Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container, DIR_STRIDE, DRIVE_RATIO_KEYS,
@@ -35,11 +41,16 @@ use crate::{
     drive_from_small, gallop_drive, merge_and_array_bytes, select_group, stride_and_closed,
 };
 
-/// Bytes identifying a native bitmap image.
-pub const IMAGE_ID_LEN: usize = 4;
-pub const EMPTY_U32_IMAGE: [u8; IMAGE_ID_LEN] = *b"BMS\x0c";
-pub const EMPTY_U64_IMAGE: [u8; IMAGE_ID_LEN] = *b"BMS\x0d";
-const FORMAT_VERSION: u8 = 1;
+/// Bytes identifying a native bitmap image: its control byte.
+pub const IMAGE_ID_LEN: usize = 1;
+pub const EMPTY_U32_IMAGE: [u8; IMAGE_ID_LEN] = [CONTROL_FRAMED | MODE_EMPTY];
+pub const EMPTY_U64_IMAGE: [u8; IMAGE_ID_LEN] = [CONTROL_FRAMED | MODE_EMPTY | MODE_U64];
+/// Control of every image but the lone one: the format in the high bits,
+/// the root mode in the low three.
+const CONTROL_FRAMED: u8 = 2 << 3;
+const MODE_U64: u8 = 1;
+const MODE_EF: u8 = 2;
+const MODE_EMPTY: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyWidth {
@@ -56,48 +67,66 @@ pub struct ImageHeader {
     body_offset: usize,
 }
 
+impl ImageHeader {
+    pub(crate) fn is_ef(&self) -> bool {
+        self.root == ROOT_EF
+    }
+}
+
 /// Check identification and canonical length framing without scanning the body.
 pub fn image_header(bytes: &[u8]) -> Option<ImageHeader> {
     parse_header(bytes).ok()
 }
 
 fn parse_header(bytes: &[u8]) -> Result<ImageHeader, AdmissionError> {
-    let id = bytes.get(..IMAGE_ID_LEN).ok_or_else(|| {
-        AdmissionError::new(
+    let Some(&control) = bytes.first() else {
+        return Err(AdmissionError::new(
             AdmissionClass::Extent,
             0,
-            "image identification is truncated",
-        )
-    })?;
-    if &id[..3] != b"BMS" {
-        return Err(AdmissionError::new(
-            AdmissionClass::Magic,
-            0,
-            "image identification is not BMS",
+            "image control byte is missing",
         ));
+    };
+    if control & CONTROL_LONE != 0 {
+        let (kind, count, payload_at) = read_lone_header(bytes)?;
+        let payload = lone_payload_len(kind, count, &bytes[payload_at..])
+            .map_err(|error| error.shifted(payload_at))?;
+        let encoded_len = payload_at + payload;
+        if encoded_len > bytes.len() {
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                payload_at,
+                "lone payload exceeds its available extent",
+            ));
+        }
+        return Ok(ImageHeader {
+            width: KeyWidth::U32,
+            encoded_len,
+            root: ROOT_LONE,
+            body_offset: payload_at,
+        });
     }
-    if id[3] >> 3 != FORMAT_VERSION {
+    if control & !7 != CONTROL_FRAMED {
         return Err(AdmissionError::new(
             AdmissionClass::Kind,
-            3,
-            "unsupported image version",
+            0,
+            "unsupported image format",
         ));
     }
-    let mode = id[3] & 7;
+    let mode = control & 7;
     if matches!(mode, 3 | 6 | 7) {
         return Err(AdmissionError::new(
             AdmissionClass::Kind,
-            3,
+            0,
             "unsupported image root mode",
         ));
     }
-    let width = if mode & 1 == 0 {
+    let width = if mode & MODE_U64 == 0 {
         KeyWidth::U32
     } else {
         KeyWidth::U64
     };
     let mut body_offset = IMAGE_ID_LEN;
-    let encoded_len = if mode & 4 != 0 {
+    let encoded_len = if mode & MODE_EMPTY != 0 {
         IMAGE_ID_LEN
     } else {
         let body_bytes =
@@ -121,7 +150,11 @@ fn parse_header(bytes: &[u8]) -> Result<ImageHeader, AdmissionError> {
     Ok(ImageHeader {
         width,
         encoded_len,
-        root: if mode & 2 == 0 { ROOT_FOREST } else { ROOT_EF },
+        root: if mode & MODE_EF == 0 {
+            ROOT_FOREST
+        } else {
+            ROOT_EF
+        },
         body_offset,
     })
 }
@@ -208,10 +241,13 @@ pub(crate) fn frame_len(body_bytes: usize) -> usize {
     total
 }
 
+fn framed_control(width: KeyWidth, root: u8) -> u8 {
+    CONTROL_FRAMED
+        | if root == ROOT_EF { MODE_EF } else { 0 }
+        | if width == KeyWidth::U64 { MODE_U64 } else { 0 }
+}
 pub(crate) fn write_frame(out: &mut [u8], width: KeyWidth, root: u8, body_bytes: usize) -> usize {
-    out[..3].copy_from_slice(b"BMS");
-    out[3] =
-        (FORMAT_VERSION << 3) | ((root == ROOT_EF) as u8) << 1 | (width == KeyWidth::U64) as u8;
+    out[0] = framed_control(width, root);
     let mut at = IMAGE_ID_LEN;
     write_uleb(
         out,
@@ -245,6 +281,8 @@ fn read_kind(bytes: &[u8], start: usize, index: usize) -> u32 {
 
 pub(crate) const ROOT_FOREST: u8 = 0;
 pub(crate) const ROOT_EF: u8 = 1;
+/// One chunk at key zero, with no directory: [`crate::small`].
+pub(crate) const ROOT_LONE: u8 = 2;
 
 pub(crate) const K_RUNS: u32 = 4;
 pub(crate) const K_WORDS: u32 = 0;
@@ -299,6 +337,11 @@ pub(crate) struct Geometry {
     pub(crate) slot_at: usize,
     pub(crate) slot_bits: u8,
     pub(crate) payload_at: usize,
+    /// ANDed onto every key read: all ones over a key plane, zero for the
+    /// lone chunk, whose key is zero and stored nowhere.
+    /// One chunk at key zero with no directory planes at all: only its
+    /// payload offset and the kind in the control byte are read.
+    pub(crate) lone: bool,
 }
 
 impl Geometry {
@@ -321,7 +364,29 @@ impl Geometry {
             slot_at,
             slot_bits,
             payload_at: slot_at + slot_bytes,
+            lone: false,
         }
+    }
+
+    /// One chunk at key zero whose payload starts at `payload_at`. The
+    /// control byte at offset zero holds the kind in its low three bits,
+    /// where the kind plane of a directory would hold its first entry, and
+    /// the key read lands on payload bytes the mask discards.
+    pub(crate) fn lone(payload_at: usize) -> Geometry {
+        Geometry {
+            keys_at: payload_at,
+            before_at: payload_at,
+            desc_at: payload_at,
+            kinds_at: 0,
+            slot_at: payload_at,
+            slot_bits: 0,
+            payload_at,
+            lone: true,
+        }
+    }
+
+    pub(crate) fn is_lone(&self) -> bool {
+        self.lone
     }
 }
 
@@ -380,7 +445,8 @@ pub(crate) fn slot_bits_for_span(chunks: u32, first: u16, last: u16) -> u8 {
 /// most one span-tight Words payload above it. Each added member may open a
 /// chunk and its directory record, the slot plane may appear at its full
 /// width for the grown chunk count, and the frame and header varints grow by
-/// at most 15 bytes. An Elias-Fano root, which a patch keeps, re-encodes the
+/// at most 15 bytes, and a lone image that gains a directory pays three
+/// more for chunk zero's key and kind. An Elias-Fano root, which a patch keeps, re-encodes the
 /// set at under five bytes a member plus its header.
 ///
 /// Each term covers one cost on its own. Two are deliberate margin that no
@@ -394,8 +460,12 @@ pub fn patched_len_bound(image: &[u8], adds: u64, touches: u64) -> Option<u64> {
         return None;
     }
     let encoded = u64::try_from(header.encoded_len).ok()?;
-    let (members, chunks, ef) = if header.encoded_len == IMAGE_ID_LEN {
+    let (members, chunks, ef) = if header.root != ROOT_LONE && header.encoded_len == IMAGE_ID_LEN {
         (0, 0, false)
+    } else if header.root == ROOT_LONE {
+        let (kind, count, at) = read_lone_header(image).ok()?;
+        let members = lone_cardinality(kind, count, &image[at..header.encoded_len]);
+        (u64::from(members), 1, false)
     } else {
         let mut at = header.body_offset;
         let members = u64::from(read_uleb(image, &mut at, u32::MAX)?) + 1;
@@ -442,7 +512,7 @@ pub fn patched_len_bound(image: &[u8], adds: u64, touches: u64) -> Option<u64> {
             .saturating_add(payload)
             .saturating_add(directory)
             .saturating_add(slot_plane)
-            .saturating_add(15),
+            .saturating_add(18),
     )
 }
 
@@ -512,6 +582,18 @@ fn payload_len(container: &Container) -> usize {
             words_payload_len(hi - lo)
         }
     }
+}
+
+/// The kind and payload length of the one chunk of a lone image: its arm,
+/// unless a small form costs fewer bytes ([`small_form`]).
+fn lone_form(container: &Container) -> (u32, usize) {
+    let (kind, len) = (kind_of(container), payload_len(container));
+    // Words holds more members than a small span has positions.
+    if kind == K_WORDS {
+        return (kind, len);
+    }
+    let card = container.cardinality();
+    small_form(len, container.select(0), container.select(card - 1), card).unwrap_or((kind, len))
 }
 
 // ── payload emitters ─────────────────────────────────────────────────────
@@ -605,6 +687,16 @@ pub(crate) fn emit_words(out: &mut [u8], words: &[u64; CHUNK_WORDS]) {
     {
         *slot = (running as u16).to_le_bytes();
         running += group.iter().map(|x| x.count_ones()).sum::<u32>();
+    }
+}
+
+/// The one chunk of a lone image, in the kind [`lone_form`] chose.
+fn write_lone_payload(container: &Container, kind: u32, out: &mut [u8]) {
+    if kind >= K_BYTES {
+        let mut sink = SmallSink::new(out, kind, container.select(0));
+        container.for_each(|member| sink.push(member));
+    } else {
+        write_payload(container, out);
     }
 }
 
@@ -729,6 +821,13 @@ pub(crate) fn write_ef_header(
 /// every writer.
 #[derive(Clone, Copy, Debug)]
 enum Plan {
+    /// One chunk at key zero: the control byte, the rest of its count, the
+    /// payload.
+    Lone {
+        kind: u32,
+        count: u32,
+        payload: usize,
+    },
     Forest {
         body_bytes: usize,
     },
@@ -741,24 +840,24 @@ enum Plan {
 }
 
 impl Plan {
-    fn body_bytes(self) -> usize {
+    /// Image bytes. A standalone image (`framed`) states the length of a
+    /// forest or Elias-Fano body; a u64 child does not, its directory does.
+    /// A lone image needs neither.
+    fn len(self, framed: bool) -> usize {
         match self {
-            Self::Forest { body_bytes } | Self::Ef { body_bytes, .. } => body_bytes,
-        }
-    }
-
-    fn root(self) -> u8 {
-        match self {
-            Self::Forest { .. } => ROOT_FOREST,
-            Self::Ef { .. } => ROOT_EF,
-        }
-    }
-
-    fn total(self) -> usize {
-        if self.body_bytes() == 0 {
-            IMAGE_ID_LEN
-        } else {
-            frame_len(self.body_bytes())
+            Self::Lone {
+                kind,
+                count,
+                payload,
+            } => lone_header_len(kind, count) + payload,
+            Self::Forest { body_bytes: 0 } => IMAGE_ID_LEN,
+            Self::Forest { body_bytes } | Self::Ef { body_bytes, .. } => {
+                if framed {
+                    frame_len(body_bytes)
+                } else {
+                    IMAGE_ID_LEN + body_bytes
+                }
+            }
         }
     }
 }
@@ -770,8 +869,8 @@ impl Bitmosaic {
     /// produces allocates again when read.
     pub fn to_bytes(&self) -> Vec<u8> {
         let plan = self.plan();
-        let mut out = vec![0u8; plan.total()];
-        self.write_plan(plan, &mut out);
+        let mut out = vec![0u8; plan.len(true)];
+        self.write_plan(plan, true, &mut out);
         out
     }
 
@@ -780,8 +879,8 @@ impl Bitmosaic {
     pub fn write_into(&self, out: &mut Vec<u8>) {
         let plan = self.plan();
         let start = out.len();
-        out.resize(start + plan.total(), 0);
-        self.write_plan(plan, &mut out[start..]);
+        out.resize(start + plan.len(true), 0);
+        self.write_plan(plan, true, &mut out[start..]);
     }
 
     /// Write the canonical bytes at `out[0..]`, returning how many were
@@ -791,17 +890,17 @@ impl Bitmosaic {
     /// than the string; the caller grows the slot and retries.
     pub fn write_into_slice(&self, out: &mut [u8]) -> Result<usize, PatchError> {
         let plan = self.plan();
-        let needed = plan.total();
+        let needed = plan.len(true);
         let Some(out) = out.get_mut(..needed) else {
             return Err(PatchError::Capacity { needed });
         };
-        self.write_plan(plan, out);
+        self.write_plan(plan, true, out);
         Ok(needed)
     }
 
     /// Exact length of [`Bitmosaic::to_bytes`] without producing it.
     pub fn serialized_len(&self) -> usize {
-        self.plan().total()
+        self.plan().len(true)
     }
 
     /// The mutable form: the forest root whatever the Elias-Fano arm would
@@ -814,7 +913,7 @@ impl Bitmosaic {
         let Some(out) = out.get_mut(..needed) else {
             return Err(PatchError::Capacity { needed });
         };
-        self.write_forest(out);
+        self.write_plan(self.forest_plan(), true, out);
         Ok(needed)
     }
 
@@ -826,17 +925,31 @@ impl Bitmosaic {
     /// The forest form as bytes — the oracle side of the mutable contract.
     pub fn to_forest_bytes(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.forest_bytes()];
-        self.write_forest(&mut out);
+        self.write_plan(self.forest_plan(), true, &mut out);
         out
     }
 
-    /// The standalone frame and u64 children share this exact body writer.
-    fn write_plan(&self, plan: Plan, out: &mut [u8]) {
+    /// The standalone image and, with `framed` false, a u64 child.
+    fn write_plan(&self, plan: Plan, framed: bool, out: &mut [u8]) {
         if self.is_empty() {
             out[..IMAGE_ID_LEN].copy_from_slice(&EMPTY_U32_IMAGE);
             return;
         }
-        let at = write_frame(out, KeyWidth::U32, plan.root(), plan.body_bytes());
+        let (root, body_bytes) = match plan {
+            Plan::Lone { kind, count, .. } => {
+                let at = write_lone_header(out, kind, count);
+                write_lone_payload(&self.containers()[0], kind, &mut out[at..]);
+                return;
+            }
+            Plan::Forest { body_bytes } => (ROOT_FOREST, body_bytes),
+            Plan::Ef { body_bytes, .. } => (ROOT_EF, body_bytes),
+        };
+        let at = if framed {
+            write_frame(out, KeyWidth::U32, root, body_bytes)
+        } else {
+            out[0] = framed_control(KeyWidth::U32, root);
+            IMAGE_ID_LEN
+        };
         self.write_body(plan, &mut out[at..]);
     }
 
@@ -855,17 +968,36 @@ impl Bitmosaic {
     }
 
     fn forest_bytes(&self) -> usize {
+        self.forest_plan().len(true)
+    }
+
+    /// The forest family's form: lone for one chunk at key zero, else the
+    /// directory.
+    fn forest_plan(&self) -> Plan {
+        if let ([0], [container]) = (self.keys(), self.containers()) {
+            let (kind, payload) = lone_form(container);
+            return Plan::Lone {
+                kind,
+                count: lone_count(
+                    kind,
+                    container.cardinality(),
+                    if is_window(kind) {
+                        window_count(kind, payload - uleb_len(u32::from(container.select(0))))
+                    } else {
+                        0
+                    },
+                ),
+                payload,
+            };
+        }
         Plan::Forest {
             body_bytes: self.forest_body_bytes(),
         }
-        .total()
     }
 
-    /// EF wins only on strictly smaller complete framed size.
+    /// EF wins only on strictly smaller complete standalone size.
     fn plan(&self) -> Plan {
-        let forest = Plan::Forest {
-            body_bytes: self.forest_body_bytes(),
-        };
+        let forest = self.forest_plan();
         let n = self.len();
         if n >= 2
             && let (Some(base), Some(last)) = (self.select(0), self.select(n - 1))
@@ -878,26 +1010,19 @@ impl Bitmosaic {
                 span,
                 body_bytes: ef_header_len(n, base, span) + layout.payload_bytes(),
             };
-            if candidate.total() < forest.total() {
+            if candidate.len(true) < forest.len(true) {
                 return candidate;
             }
         }
         forest
     }
 
-    fn write_forest(&self, out: &mut [u8]) {
-        self.write_plan(
-            Plan::Forest {
-                body_bytes: self.forest_body_bytes(),
-            },
-            out,
-        );
-    }
-
+    /// A forest or Elias-Fano body, after its control byte and length.
     fn write_body(&self, plan: Plan, out: &mut [u8]) {
         let mut at = 0;
         write_uleb(out, &mut at, (self.len() - 1) as u32);
         match plan {
+            Plan::Lone { .. } => unreachable!("a lone image has no body header"),
             Plan::Ef {
                 layout, base, span, ..
             } => {
@@ -939,7 +1064,8 @@ impl Bitmosaic {
 }
 
 impl Bitmosaic64 {
-    /// Canonical directory over tightly adjacent, unframed u32 bodies.
+    /// Canonical directory over tightly adjacent u32 images, each without
+    /// its length: the directory's offsets say where a child ends.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.forests().len();
         if n == 0 {
@@ -951,9 +1077,7 @@ impl Bitmosaic64 {
             .expect("native u64 directory exceeds offset domain");
         let body_bytes = plans
             .iter()
-            .try_fold(local.payload_at, |at, plan| {
-                at.checked_add(plan.body_bytes())
-            })
+            .try_fold(local.payload_at, |at, plan| at.checked_add(plan.len(false)))
             .expect("native u64 image exceeds offset domain");
         let mut out = vec![0; frame_len(body_bytes)];
         let mut at = write_frame(&mut out, KeyWidth::U64, ROOT_FOREST, body_bytes);
@@ -976,9 +1100,9 @@ impl Bitmosaic64 {
                 out[geometry.offsets_at + 4 * (i - 1)..][..4]
                     .copy_from_slice(&((at - geometry.payload_at) as u32).to_le_bytes());
             }
-            out[geometry.roots_at + i / 8] |= plan.root() << (i % 8);
-            forest.write_body(plan, &mut out[at..at + plan.body_bytes()]);
-            at += plan.body_bytes();
+            let len = plan.len(false);
+            forest.write_plan(plan, false, &mut out[at..at + len]);
+            at += len;
             before = before
                 .checked_add(forest.len())
                 .expect("native u64 cardinality overflow");
@@ -992,7 +1116,6 @@ struct Geometry64 {
     keys_at: usize,
     before_at: usize,
     offsets_at: usize,
-    roots_at: usize,
     payload_at: usize,
 }
 
@@ -1000,13 +1123,11 @@ impl Geometry64 {
     fn new(n: usize, keys_at: usize) -> Option<Self> {
         let before_at = keys_at.checked_add(n.checked_mul(4)?)?;
         let offsets_at = before_at.checked_add(n.saturating_sub(2).checked_mul(8)?)?;
-        let roots_at = offsets_at.checked_add(n.saturating_sub(1).checked_mul(4)?)?;
-        let payload_at = roots_at.checked_add(n.div_ceil(8))?;
+        let payload_at = offsets_at.checked_add(n.saturating_sub(1).checked_mul(4)?)?;
         Some(Self {
             keys_at,
             before_at,
             offsets_at,
-            roots_at,
             payload_at,
         })
     }
@@ -1282,6 +1403,7 @@ fn and_runs_view(runs: RunsView<'_>, other: &CView<'_>) -> u32 {
 impl<'a> CView<'a> {
     /// `card` comes from the directory's prefix plane, which is why no
     /// container stores its own length.
+    #[inline(always)]
     pub(crate) fn open(
         rest: &'a [u8],
         kind: u32,
@@ -1401,7 +1523,7 @@ impl<'a> CView<'a> {
 
     /// Query construction reads only the selected payload's query fields.
     /// Attachment has already proved its tag, extent and structural invariants.
-    fn from_validated(payload: &'a [u8], kind: u32, card: u32) -> Self {
+    pub(crate) fn from_validated(payload: &'a [u8], kind: u32, card: u32) -> Self {
         match kind {
             K_WORDS => Self::Words {
                 payload,
@@ -1803,7 +1925,7 @@ impl<'a> CView<'a> {
         }
     }
 
-    fn for_each(&self, mut f: impl FnMut(u16)) {
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u16)) {
         match self {
             CView::Runs(runs) => {
                 for i in 0..runs.count() {
@@ -2108,6 +2230,7 @@ impl<'a> Forest<'a> {
         ))
     }
 
+    #[inline(always)]
     fn container_with(&self, i: usize, count_at: usize) -> Result<CView<'a>, AdmissionError> {
         let offset_at = if i == 0 {
             self.geometry.desc_at
@@ -2352,6 +2475,9 @@ pub struct BitmosaicView<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Root<'a> {
+    /// A directory of chunks, the empty set, or a lone image: one chunk at
+    /// key zero, whose forest value says so (`geometry.lone`) and has no
+    /// directory planes to read.
     Forest(Forest<'a>),
     Ef(EfView<'a>),
 }
@@ -2392,12 +2518,12 @@ impl<'a> BitmosaicView<'a> {
         if header.width != KeyWidth::U32 {
             return Err(AdmissionError::new(
                 AdmissionClass::Kind,
-                3,
+                0,
                 "image key width is not u32",
             ));
         }
         let bytes = &bytes[..header.encoded_len];
-        if header.encoded_len == IMAGE_ID_LEN {
+        if header.root != ROOT_LONE && header.encoded_len == IMAGE_ID_LEN {
             return Ok(Self {
                 root: Root::Forest(Forest {
                     bytes,
@@ -2408,7 +2534,74 @@ impl<'a> BitmosaicView<'a> {
                 encoded_len: IMAGE_ID_LEN,
             });
         }
+        if header.root == ROOT_LONE {
+            return Self::open_lone::<true>(bytes, header.body_offset, verify);
+        }
         Self::open_body::<true>(bytes, header.body_offset, header.root, verify)
+    }
+
+    /// Attach a u64 directory's child: a nonempty u32 image without its
+    /// length, whose extent is `bytes`.
+    fn open_child<const CHECK: bool>(
+        bytes: &'a [u8],
+        verify: bool,
+    ) -> Result<Self, AdmissionError> {
+        let control = bytes.first().copied().unwrap_or(0);
+        if control & CONTROL_LONE != 0 {
+            let (_, _, at) = read_lone_header(bytes)?;
+            return Self::open_lone::<CHECK>(bytes, at, verify);
+        }
+        let root = if control == framed_control(KeyWidth::U32, ROOT_FOREST) {
+            ROOT_FOREST
+        } else if control == framed_control(KeyWidth::U32, ROOT_EF) {
+            ROOT_EF
+        } else {
+            return Err(AdmissionError::new(
+                AdmissionClass::Kind,
+                0,
+                "u64 child is not a nonempty u32 image",
+            ));
+        };
+        Self::open_body::<CHECK>(bytes, IMAGE_ID_LEN, root, verify)
+    }
+
+    /// Attach a lone image whose payload starts at `at`: its own entry, so
+    /// the directory and Elias-Fano attach below is the code it was. An arm
+    /// chunk is admitted by the directory's own chunk admission; a small
+    /// chunk by its own view, which also counts its members.
+    #[inline(never)]
+    fn open_lone<const CHECK: bool>(
+        bytes: &'a [u8],
+        at: usize,
+        verify: bool,
+    ) -> Result<Self, AdmissionError> {
+        let (kind, count, _) = read_lone_header(bytes)?;
+        let mut forest = Forest {
+            bytes,
+            len: u64::from(count),
+            chunks: 1,
+            geometry: Geometry::lone(at),
+        };
+        if kind >= K_BYTES {
+            let payload = &bytes[at..];
+            let small = if CHECK {
+                let small =
+                    SmallView::open(payload, kind, count).map_err(|error| error.shifted(at))?;
+                if verify {
+                    small.verify().map_err(|error| error.shifted(at))?;
+                }
+                small
+            } else {
+                SmallView::from_validated(payload, kind, count)
+            };
+            forest.len = u64::from(small.cardinality());
+        } else if CHECK {
+            Self::admit_chunks(&forest, 0, verify)?;
+        }
+        Ok(Self {
+            root: Root::Forest(forest),
+            encoded_len: bytes.len(),
+        })
     }
 
     /// Attach one bounded body; trusted child probes skip already-admitted directory checks.
@@ -2451,6 +2644,13 @@ impl<'a> BitmosaicView<'a> {
                         "chunk-key endpoints are not ascending",
                     ));
                 }
+                if CHECK && c == 1 && first == 0 {
+                    return Err(AdmissionError::new(
+                        AdmissionClass::Kind,
+                        0,
+                        "one chunk at key zero is a lone image, not a directory",
+                    ));
+                }
                 let geometry = Geometry::new(chunks, slot_bits_for_span(chunks, first, last), at);
                 if bytes.get(..geometry.payload_at).is_none() {
                     return Err(AdmissionError::new(
@@ -2474,20 +2674,7 @@ impl<'a> BitmosaicView<'a> {
                     geometry,
                 };
                 if CHECK {
-                    for i in 0..c {
-                        if i != 0 && forest.key(i) <= forest.key(i - 1) {
-                            return Err(AdmissionError::new(
-                                AdmissionClass::MapOrder,
-                                geometry.keys_at + 2 * i,
-                                "chunk keys are not strictly ascending",
-                            ));
-                        }
-                        let container = forest.container_with(i, count_at)?;
-                        if verify {
-                            container.verify(container.cardinality(), forest.payload_at(i))?;
-                        }
-                    }
-                    forest.verify_slot_plane()?;
+                    Self::admit_chunks(&forest, count_at, verify)?;
                 }
                 Root::Forest(forest)
             }
@@ -2503,6 +2690,31 @@ impl<'a> BitmosaicView<'a> {
             root,
             encoded_len: bytes.len(),
         })
+    }
+
+    /// Admit every chunk of a forest whose directory geometry is proven:
+    /// keys ascending, each container attached and, under `verify`, its
+    /// payload checked, then the slot plane.
+    #[inline(always)]
+    fn admit_chunks(
+        forest: &Forest<'a>,
+        count_at: usize,
+        verify: bool,
+    ) -> Result<(), AdmissionError> {
+        for i in 0..forest.chunks as usize {
+            if i != 0 && forest.key(i) <= forest.key(i - 1) {
+                return Err(AdmissionError::new(
+                    AdmissionClass::MapOrder,
+                    forest.geometry.keys_at + 2 * i,
+                    "chunk keys are not strictly ascending",
+                ));
+            }
+            let container = forest.container_with(i, count_at)?;
+            if verify {
+                container.verify(container.cardinality(), forest.payload_at(i))?;
+            }
+        }
+        forest.verify_slot_plane()
     }
 
     /// Encoded extent, distinct from the set's cardinality.
@@ -2543,6 +2755,9 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.contains(value),
             Root::Forest(f) => {
+                if f.geometry.lone {
+                    return lone_contains(f, value);
+                }
                 let Some(at) = f.locate((value >> 16) as u16) else {
                     return false;
                 };
@@ -2558,6 +2773,9 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.rank(value),
             Root::Forest(f) => {
+                if f.geometry.lone {
+                    return lone_rank(f, value);
+                }
                 let key = (value >> 16) as u16;
                 match f.locate(key) {
                     Some(at) => {
@@ -2581,6 +2799,9 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.select(k),
             Root::Forest(f) => {
+                if f.geometry.lone {
+                    return lone_select(f, k);
+                }
                 if k >= f.len {
                     return None;
                 }
@@ -2596,6 +2817,9 @@ impl<'a> BitmosaicView<'a> {
     pub fn and_len(&self, other: &BitmosaicView<'_>) -> u64 {
         match (&self.root, &other.root) {
             (Root::Forest(a), Root::Forest(b)) => {
+                if a.geometry.lone || b.geometry.lone {
+                    return lone_and_len(a, b);
+                }
                 let (na, nb) = (a.chunks as usize, b.chunks as usize);
                 // Same chooser as the owned forest: a sorted u16 key plane
                 // whose merge is scalar, so it crosses over an order of
@@ -2679,6 +2903,9 @@ impl<'a> BitmosaicView<'a> {
         match &self.root {
             Root::Ef(e) => e.for_each(f),
             Root::Forest(forest) => {
+                if forest.geometry.lone {
+                    return lone_for_each(forest, f);
+                }
                 for i in 0..forest.chunks as usize {
                     let high = u32::from(forest.key(i)) << 16;
                     if let Some(c) = forest.container(i) {
@@ -2698,8 +2925,10 @@ impl<'a> BitmosaicView<'a> {
     /// dense-ordinal domain, which is a literal stride-1 progression, that
     /// makes `rank`/`select` pure arithmetic over two loads total.
     pub fn as_arithmetic(&self) -> Option<(u32, u32, u64)> {
-        let Root::Forest(f) = &self.root else {
-            return None;
+        let f = match &self.root {
+            Root::Forest(f) if f.geometry.lone => return lone_as_arithmetic(f),
+            Root::Forest(f) => f,
+            Root::Ef(_) => return None,
         };
         for i in 0..f.chunks as usize {
             if read_kind(f.bytes, f.geometry.kinds_at, i) != K_STRIDE {
@@ -2711,12 +2940,9 @@ impl<'a> BitmosaicView<'a> {
             let CView::Stride { first, stride, len } = f.container(i)? else {
                 return None;
             };
+            let (stride, members) = (u32::from(stride.max(1)), u64::from(len) + 1);
             let base = u32::from(f.key(i)) << 16;
-            let (cf, cs, cn) = (
-                base + u32::from(first),
-                u32::from(stride.max(1)),
-                u64::from(len) + 1,
-            );
+            let (cf, cs, cn) = (base + u32::from(first), stride, members);
             match &mut expect {
                 None => expect = Some((cf, cs, cn, cf + (cn as u32 - 1) * cs)),
                 Some((_, s, n, last)) => {
@@ -2730,7 +2956,134 @@ impl<'a> BitmosaicView<'a> {
         }
         expect.map(|(first, stride, n, _)| (first, stride, n))
     }
+}
 
+/// The one chunk of a lone image: an arm container the directory reader
+/// also reads, or a small one.
+enum LoneChunk<'a> {
+    Arm(CView<'a>),
+    Small(SmallView<'a>),
+}
+
+impl<'a> Forest<'a> {
+    /// The chunk of a lone forest (`geometry.lone`), from its control byte.
+    fn lone_chunk(&self) -> Option<LoneChunk<'a>> {
+        if u32::from(self.bytes[0]) & 7 >= K_BYTES {
+            self.lone_small().map(LoneChunk::Small)
+        } else {
+            self.container(0).map(LoneChunk::Arm)
+        }
+    }
+
+    /// The small chunk of a lone forest, when its kind is Bytes or Window.
+    pub(crate) fn lone_small(&self) -> Option<SmallView<'a>> {
+        let kind = u32::from(self.bytes[0]) & 7;
+        if !self.geometry.lone || kind < K_BYTES {
+            return None;
+        }
+        Some(SmallView::with_cardinality(
+            self.bytes.get(self.geometry.payload_at..)?,
+            kind,
+            self.len as u32,
+        ))
+    }
+}
+
+// The lone image's answers. Each is its own function, never inlined into
+// the method that dispatches to it: a lone image is decided by one branch
+// per call, and the directory and Elias-Fano code beside that branch is the
+// code it was before the lone image existed.
+
+#[inline(never)]
+fn lone_contains(lone: &Forest<'_>, value: u32) -> bool {
+    value <= 0xFFFF
+        && match lone.lone_chunk() {
+            Some(LoneChunk::Arm(c)) => c.contains(value as u16),
+            Some(LoneChunk::Small(small)) => small.contains(value as u16),
+            None => false,
+        }
+}
+
+#[inline(never)]
+fn lone_rank(lone: &Forest<'_>, value: u32) -> u64 {
+    if value > 0xFFFF {
+        return lone.len;
+    }
+    match lone.lone_chunk() {
+        Some(LoneChunk::Arm(c)) => u64::from(c.rank_below(value as u16)),
+        Some(LoneChunk::Small(small)) => u64::from(small.rank_below(value as u16)),
+        None => 0,
+    }
+}
+
+#[inline(never)]
+fn lone_select(lone: &Forest<'_>, k: u64) -> Option<u32> {
+    if k >= lone.len {
+        return None;
+    }
+    Some(u32::from(match lone.lone_chunk()? {
+        LoneChunk::Arm(c) => c.select(k as u32),
+        LoneChunk::Small(small) => small.select(k as u32),
+    }))
+}
+
+#[inline(never)]
+fn lone_for_each(lone: &Forest<'_>, mut f: impl FnMut(u32)) {
+    match lone.lone_chunk() {
+        Some(LoneChunk::Arm(c)) => c.for_each(|v| f(u32::from(v))),
+        Some(LoneChunk::Small(small)) => small.for_each(|v| f(u32::from(v))),
+        None => {}
+    }
+}
+
+/// Two forests of which at least one is lone: only chunk zero can meet. Arm
+/// against arm runs the container kernels; a small chunk, at most 256
+/// members, is enumerated against the other side's chunk.
+#[inline(never)]
+fn lone_and_len(a: &Forest<'_>, b: &Forest<'_>) -> u64 {
+    fn chunk_zero<'b>(forest: &Forest<'b>) -> Option<LoneChunk<'b>> {
+        if forest.geometry.lone {
+            forest.lone_chunk()
+        } else {
+            forest
+                .locate(0)
+                .and_then(|at| forest.container(at))
+                .map(LoneChunk::Arm)
+        }
+    }
+    let (Some(a), Some(b)) = (chunk_zero(a), chunk_zero(b)) else {
+        return 0;
+    };
+    let mut count = 0u64;
+    match (a, b) {
+        (LoneChunk::Arm(ca), LoneChunk::Arm(cb)) => return u64::from(and_count(&ca, &cb)),
+        (LoneChunk::Small(small), LoneChunk::Arm(arm))
+        | (LoneChunk::Arm(arm), LoneChunk::Small(small)) => {
+            small.for_each(|v| count += u64::from(arm.contains(v)));
+        }
+        (LoneChunk::Small(sa), LoneChunk::Small(sb)) => {
+            sa.for_each(|v| count += u64::from(sb.contains(v)));
+        }
+    }
+    count
+}
+
+fn lone_as_arithmetic(lone: &Forest<'_>) -> Option<(u32, u32, u64)> {
+    match lone.lone_chunk()? {
+        LoneChunk::Arm(CView::Stride { first, stride, len }) => Some((
+            u32::from(first),
+            u32::from(stride.max(1)),
+            u64::from(len) + 1,
+        )),
+        LoneChunk::Arm(_) => None,
+        LoneChunk::Small(small) => {
+            let (first, stride, members) = small.progression()?;
+            Some((u32::from(first), u32::from(stride), u64::from(members)))
+        }
+    }
+}
+
+impl<'a> BitmosaicView<'a> {
     /// An ascending cursor over every member, positioned at the first.
     ///
     /// [`Self::for_each`] pushes; this pulls. A merge needs to advance ONE
@@ -2768,7 +3121,7 @@ impl<'a> Bitmosaic64View<'a> {
         if header.width != KeyWidth::U64 {
             return Err(AdmissionError::new(
                 AdmissionClass::Kind,
-                3,
+                0,
                 "image key width is not u64",
             ));
         }
@@ -2801,13 +3154,6 @@ impl<'a> Bitmosaic64View<'a> {
                 AdmissionClass::Extent,
                 at,
                 "u64 directory planes are truncated",
-            ));
-        }
-        if !n.is_multiple_of(8) && bytes[geometry.roots_at + n / 8] >> (n % 8) != 0 {
-            return Err(AdmissionError::new(
-                AdmissionClass::BitPad,
-                geometry.roots_at + n / 8,
-                "u64 child-root plane tail bits are not zero",
             ));
         }
         let mut view = Self {
@@ -2922,8 +3268,7 @@ impl<'a> Bitmosaic64View<'a> {
                 "u64 child offsets are not adjacent within their payload plane",
             )
         })?;
-        let root = (self.bytes[self.geometry.roots_at + i / 8] >> (i % 8)) & 1;
-        BitmosaicView::open_body::<true>(body, 0, root, verify).map_err(|error| error.shifted(at))
+        BitmosaicView::open_child::<true>(body, verify).map_err(|error| error.shifted(at))
     }
 
     fn forest(&self, i: usize) -> Option<BitmosaicView<'a>> {
@@ -2936,8 +3281,7 @@ impl<'a> Bitmosaic64View<'a> {
         } else {
             self.child_at(i + 1)
         };
-        let root = (self.bytes[self.geometry.roots_at + i / 8] >> (i % 8)) & 1;
-        BitmosaicView::open_body::<false>(self.bytes.get(at..end)?, 0, root, false).ok()
+        BitmosaicView::open_child::<false>(self.bytes.get(at..end)?, false).ok()
     }
 
     #[inline(always)]
@@ -3519,6 +3863,8 @@ enum ViewCursor<'a> {
     /// No source at all — an empty plane, or the placeholder a reposition
     /// installs before opening a chunk.
     Done,
+    /// The one chunk of a lone image in a small form.
+    Small(SmallRange<'a>),
 }
 
 impl<'a> BitmosaicViewRange<'a> {
@@ -3543,6 +3889,26 @@ impl<'a> BitmosaicViewRange<'a> {
                     root: ViewCursor::Ef(range),
                 }
             }
+            // A lone image's one chunk is opened here. For an arm chunk the
+            // cursor's forest holds no chunk to open next or to seek among,
+            // so a walk past it and a seek above it both end the range
+            // without a key read.
+            Root::Forest(lone) if lone.geometry.lone => match lone.lone_chunk() {
+                Some(LoneChunk::Small(small)) => BitmosaicViewRange {
+                    remaining: lone.len,
+                    root: ViewCursor::Small(SmallRange::open(small)),
+                },
+                Some(LoneChunk::Arm(container)) => BitmosaicViewRange {
+                    remaining: lone.len,
+                    root: ViewCursor::Forest {
+                        forest: Forest { chunks: 0, ..lone },
+                        chunk: 0,
+                        high: 0,
+                        inner: CRange::open(container),
+                    },
+                },
+                None => BitmosaicViewRange::done(),
+            },
             Root::Forest(forest) => BitmosaicViewRange {
                 remaining: forest.len,
                 root: ViewCursor::Forest {
@@ -3624,6 +3990,14 @@ impl<'a> BitmosaicViewRange<'a> {
         }
         self.remaining = match &mut self.root {
             ViewCursor::Done => 0,
+            ViewCursor::Small(small) => {
+                if value > 0xFFFF {
+                    0
+                } else {
+                    small.seek(value as u16);
+                    u64::from(small.remaining())
+                }
+            }
             ViewCursor::Ef(ef) => {
                 ef.seek(value);
                 ef.remaining()
@@ -3700,6 +4074,7 @@ impl Range for BitmosaicViewRange<'_> {
             ViewCursor::Forest { high, inner, .. } => *high | u32::from(Range::front(inner)),
             ViewCursor::Ef(ef) => ef.front(),
             ViewCursor::Done => 0,
+            ViewCursor::Small(small) => u32::from(small.front()),
         }
     }
 
@@ -3718,6 +4093,7 @@ impl Range for BitmosaicViewRange<'_> {
                 }
             }
             ViewCursor::Done => return,
+            ViewCursor::Small(small) => small.pop_front(),
         }
         self.remaining -= 1;
         self.open_next();
@@ -4198,35 +4574,27 @@ mod admission_tests {
 
     #[test]
     fn verified_admission_keeps_each_rule_and_its_field_byte() {
-        let array = Bitmosaic::from_sorted([1, 9, 22]).to_forest_bytes();
-        let (array_at, kinds_at) = {
+        // Three members too far apart for a small form: a lone Array.
+        let array = Bitmosaic::from_sorted([1, 900, 2200]).to_forest_bytes();
+        let array_at = {
             let Root::Forest(f) = BitmosaicView::open(&array).expect("native forest").root else {
                 panic!("forest fixture")
             };
-            (f.payload_at(0), f.geometry.kinds_at)
+            assert!(f.geometry.is_lone());
+            f.payload_at(0)
         };
         let mut bad = array.clone();
-        bad[0] ^= 1;
-        refusal32(&bad, AdmissionClass::Magic, 0);
+        bad[0] = 0x42;
+        refusal32(&bad, AdmissionClass::Kind, 0);
         let mut bad = array.clone();
-        bad[3] = (FORMAT_VERSION << 3) | 3;
-        refusal32(&bad, AdmissionClass::Kind, 3);
-        refusal32(
-            &array[..array.len() - 1],
-            AdmissionClass::Extent,
-            IMAGE_ID_LEN,
-        );
-        let mut bad = array.clone();
-        bad[kinds_at] = K_RUNS as u8 + 1;
-        refusal32(&bad, AdmissionClass::Kind, kinds_at);
-        let mut bad = array.clone();
-        bad[kinds_at] |= 0x80;
-        refusal32(&bad, AdmissionClass::BitPad, kinds_at);
+        bad[0] = CONTROL_FRAMED | 3;
+        refusal32(&bad, AdmissionClass::Kind, 0);
+        refusal32(&array[..array.len() - 1], AdmissionClass::Extent, array_at);
         let mut bad = array.clone();
         bad[array_at + 2..array_at + 4].copy_from_slice(&1u16.to_le_bytes());
         refusal32(&bad, AdmissionClass::MapOrder, array_at + 2);
 
-        let stride = Bitmosaic::from_sorted([2, 4, 6]).to_forest_bytes();
+        let stride = Bitmosaic::from_sorted([2, 400, 798]).to_forest_bytes();
         let payload = {
             let Root::Forest(f) = BitmosaicView::open(&stride).expect("native stride").root else {
                 panic!("stride fixture")
@@ -4238,7 +4606,6 @@ mod admission_tests {
         refusal32(&bad, AdmissionClass::PlaneRange, payload + 2);
 
         let words = Bitmosaic::from_sorted((0..9000u32).filter(|v| v % 3 != 0)).to_forest_bytes();
-        let header = image_header(&words).expect("native header");
         let payload = {
             let Root::Forest(f) = BitmosaicView::open(&words).expect("native words").root else {
                 panic!("words fixture")
@@ -4246,19 +4613,35 @@ mod admission_tests {
             f.payload_at(0)
         };
         let mut bad = words;
-        bad[header.body_offset] ^= 1;
+        // The low byte of the lone count: the cardinality, off by one.
+        bad[1] ^= 1;
         refusal32(&bad, AdmissionClass::Count, payload);
 
         let chunks = Bitmosaic::from_sorted([1, 65_545, 131_094]).to_forest_bytes();
-        let descriptor_at = {
+        let (descriptor_at, kinds_at) = {
             let Root::Forest(f) = BitmosaicView::open(&chunks).expect("native chunks").root else {
                 panic!("chunk fixture")
             };
-            f.geometry.desc_at
+            (f.geometry.desc_at, f.geometry.kinds_at)
         };
+        refusal32(
+            &chunks[..chunks.len() - 1],
+            AdmissionClass::Extent,
+            IMAGE_ID_LEN,
+        );
+        let mut bad = chunks.clone();
+        bad[kinds_at] |= 7;
+        refusal32(&bad, AdmissionClass::Kind, kinds_at);
+        let mut bad = chunks.clone();
+        bad[kinds_at + 1] |= 0x80;
+        refusal32(&bad, AdmissionClass::BitPad, kinds_at + 1);
         let mut bad = chunks;
         bad[descriptor_at..descriptor_at + 4].copy_from_slice(&9999u32.to_le_bytes());
         refusal32(&bad, AdmissionClass::Placement, descriptor_at);
+
+        // One chunk at key zero written as a directory: the lone form's set.
+        let directory = [CONTROL_FRAMED, 7, 0, 0, 0, 0, K_ARRAY as u8, 7, 0];
+        refusal32(&directory, AdmissionClass::Kind, 0);
     }
 
     #[test]

@@ -302,8 +302,8 @@ pub const DERIVED_FACT_TOMBSTONE_IDENTITY: u64 = u64::MAX - 1;
 /// container records; a set scattered one member per chunk exceeds this and
 /// takes the slot-growth retry, which is the contract for every shape the
 /// closed form does not cover. This is the per-element price only:
-/// `bitmap_ops::bitmap_payload_capacity` adds the four-byte image identifier
-/// on top (`capacity * 4 + 4`), so even a zero-capacity slot holds the empty
+/// `bitmap_ops::bitmap_payload_capacity` adds the one-byte image identifier
+/// on top (`capacity * 4 + 1`), so even a zero-capacity slot holds the empty
 /// image. Declared capacities normalize to `next_power_of_2(requested * 2)`,
 /// which floors at 16, so the smallest declarable bitmap slot holds 16
 /// elements and its whole data region is 68 bytes. The slot holds the image

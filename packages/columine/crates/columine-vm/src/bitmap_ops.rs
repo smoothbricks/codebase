@@ -5,7 +5,7 @@
 //!
 //! `[image: bitmap_payload_capacity bytes]` — the self-delimited native u32
 //! image directly, with no length word and no fixed headroom. The empty set
-//! is the four-byte empty image; a non-empty set occupies the first
+//! is the one-byte empty image; a non-empty set occupies the first
 //! `serialized_len` bytes as the forest root of the set, and every payload
 //! byte past the image is zero. Together those make the slot image a pure
 //! function of the set: byte-equal, whatever the history, to a fresh
@@ -53,7 +53,7 @@ use columine_types::{
 /// Canonical payload-capacity formula used by allocation, grow-copy, and
 /// readers. Keeping one formula prevents those paths from disagreeing: four
 /// bytes per element of slot capacity plus the image identifier, so even a
-/// zero-capacity slot fits the four-byte empty image.
+/// zero-capacity slot fits the one-byte empty image.
 pub const fn bitmap_payload_capacity(slot_capacity: u32) -> u32 {
     slot_capacity * BITMAP_BYTES_PER_CAPACITY + IMAGE_ID_LEN as u32
 }
@@ -90,7 +90,7 @@ impl BitmapStorage {
 
     /// The native image bytes, or `Err` when no width-checked image of a
     /// fitting extent starts at the slot offset. The empty set is the
-    /// four-byte empty image, not an absent slice.
+    /// one-byte empty image, not an absent slice.
     pub fn serialized_data<'a>(&self, state: &'a [u8]) -> Result<&'a [u8], ErrorCode> {
         let len = self.serialized_len(state)? as usize;
         let start = self.data_offset as usize;

@@ -20,7 +20,9 @@
 //! chunks, so operations meet chunks already present; low halves as runs,
 //! strides, jittered strides, scatters and single values, the shapes that
 //! select each container arm, at sizes that cross `ARRAY_MAX` and
-//! `CONE_MAX_LEN`.
+//! `CONE_MAX_LEN`. A narrow batch folds the same shapes into 256 positions,
+//! where the Bytes and Window forms win; a batch whose key is zero builds
+//! and leaves the lone image.
 
 use std::collections::BTreeSet;
 
@@ -78,14 +80,20 @@ fn keys(input: &mut Input<'_>) -> [u16; 4] {
     ]
 }
 
-/// One batch from the recipe, strictly ascending, into `out`.
-fn values(input: &mut Input<'_>, keys: &[u16; 4], out: &mut Vec<u32>) {
+/// One batch from the recipe, strictly ascending, into `out`. `narrow`
+/// folds its members into the 256 positions of the first one's page.
+fn values(input: &mut Input<'_>, keys: &[u16; 4], narrow: bool, out: &mut Vec<u32>) {
     out.clear();
     let key = u32::from(keys[usize::from(input.u8() & 3)]) << 16;
     let shape = input.u8() % 5;
     let first = u32::from(input.u16());
     let mut seed = u64::from(input.u32()) | 1;
     let mut push = |low: u32| {
+        let low = if narrow {
+            (first & 0xFF00) | (low & 0xFF)
+        } else {
+            low
+        };
         if low <= 0xFFFF {
             out.push(key | low);
         }
@@ -120,10 +128,11 @@ fn values(input: &mut Input<'_>, keys: &[u16; 4], out: &mut Vec<u32>) {
 pub fn patch_step(data: &[u8]) {
     let mut input = Input(data);
     let keys = keys(&mut input);
-    let sealed = input.u8() & 1 == 1;
+    let flags = input.u8();
+    let (sealed, narrow) = (flags & 1 == 1, flags & 2 != 0);
     let mut adds = Vec::new();
     let mut removes = Vec::new();
-    values(&mut input, &keys, &mut adds);
+    values(&mut input, &keys, narrow, &mut adds);
     let mut oracle: BTreeSet<u32> = adds.iter().copied().collect();
     let mut slot = vec![0u8; SLOT_BYTES];
     let initial = Bitmosaic::from_sorted(adds.iter().copied());
@@ -147,10 +156,10 @@ pub fn patch_step(data: &[u8]) {
         adds.clear();
         removes.clear();
         if op & 1 != 0 {
-            values(&mut input, &keys, &mut adds);
+            values(&mut input, &keys, narrow, &mut adds);
         }
         if op & 2 != 0 {
-            values(&mut input, &keys, &mut removes);
+            values(&mut input, &keys, narrow, &mut removes);
         }
         // Empty one chunk of the pool, whatever it holds.
         if op & 4 != 0 {
@@ -302,7 +311,7 @@ pub fn and_step(data: &[u8]) {
             break;
         }
         let op = input.u8();
-        values(&mut input, &keys, &mut batch);
+        values(&mut input, &keys, op & 8 != 0, &mut batch);
         for (side, set) in [(1, &mut a), (2, &mut b)] {
             if op & 3 & side == 0 {
                 continue;
@@ -433,6 +442,11 @@ mod tests {
             ("jittered-8", cone(53, 11, 8, 0x11)),
             ("array-8", scatter(8, 0x22)),
             ("array-64", scatter(64, 0x23)),
+            ("bytes-4", BTreeSet::from([5, 17, 40, 82])),
+            (
+                "window-13",
+                (0..13).map(|i| 9_000 + i * 5 + i % 3).collect(),
+            ),
         ];
         let wide: Vec<(&str, BTreeSet<u32>)> = vec![
             ("stride-4000", stride(3, 13, 4_000)),
