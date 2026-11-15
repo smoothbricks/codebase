@@ -44,19 +44,34 @@ enum Small {
     WindowAt = 3,
     List16 = 4,
     Spans = 5,
+    WindowWide = 6,
 }
 
 impl Small {
-    const ALL: [Small; 5] = [
+    const ALL: [Small; 6] = [
         Small::List8,
         Small::Window,
         Small::WindowAt,
         Small::List16,
         Small::Spans,
+        Small::WindowWide,
     ];
 
+    /// The form of a small tag; a Window wide's tag is `C0` alone.
     fn of_tag(tag: u8) -> Option<Small> {
-        Small::ALL.into_iter().find(|form| *form as u8 == tag >> 5)
+        Small::ALL
+            .into_iter()
+            .find(|form| *form as u8 == tag >> 5)
+            .filter(|form| *form != Small::WindowWide || tag == 0xc0)
+    }
+
+    /// Members of a list, bitmap bytes of a window, intervals of Spans: the
+    /// tag's count, or a Window wide's `len` from its third payload byte.
+    fn count(image: &[u8]) -> usize {
+        match Small::of_tag(image[0]) {
+            Some(Small::WindowWide) => usize::from(image[3]) + 1,
+            _ => usize::from(image[0] & 31) + 1,
+        }
     }
 
     fn name(self) -> &'static str {
@@ -66,6 +81,7 @@ impl Small {
             Small::WindowAt => "window-at",
             Small::List16 => "list16",
             Small::Spans => "spans",
+            Small::WindowWide => "window-wide",
         }
     }
 }
@@ -363,7 +379,7 @@ fn directory(chunks: &[Chunk]) -> Vec<u8> {
 
 /// Step 3's candidates for one chunk at key zero, in their order, with
 /// their payload lengths.
-fn small_candidates(lows: &[u32]) -> [Option<(Small, usize)>; 5] {
+fn small_candidates(lows: &[u32]) -> [Option<(Small, usize)>; 6] {
     let (first, last) = (lows[0], lows[lows.len() - 1]);
     let (start, end) = (first / 8, last / 8);
     let (n, r) = (lows.len(), intervals(lows).len());
@@ -374,6 +390,7 @@ fn small_candidates(lows: &[u32]) -> [Option<(Small, usize)>; 5] {
         (r <= 32).then_some((Small::Spans, 4 * r)),
         (last <= 255 && n <= 32).then_some((Small::List8, n)),
         (n <= 32).then_some((Small::List16, 2 * n)),
+        (end - start <= 255).then_some((Small::WindowWide, 4 + (end - start) as usize)),
     ]
 }
 
@@ -426,6 +443,16 @@ fn small_image(form: Small, lows: &[u32]) -> Vec<u8> {
             }
             (spans.len(), out)
         }
+        Small::WindowWide => {
+            let start = first / 8;
+            let bits = bitmap(start);
+            let len = u8::try_from(bits.len() - 1).expect("a Window wide of at most 256 bytes");
+            let mut out = vec![0xc0];
+            put_u16(&mut out, start);
+            out.push(len);
+            out.extend(bits);
+            return out;
+        }
     };
     assert!((1..=32).contains(&count), "a small count is 1 to 32");
     [vec![(form as u8) << 5 | (count - 1) as u8], payload].concat()
@@ -458,7 +485,7 @@ fn forest(members: &[u32]) -> Vec<u8> {
     );
     match chunks.as_slice() {
         [(0, lows)] => match small_choice(lows) {
-            Some((form, len)) if 1 + len <= directory.len() => small_image(form, lows),
+            Some((form, len)) if len < directory.len() => small_image(form, lows),
             _ => directory,
         },
         _ => directory,
@@ -676,7 +703,7 @@ fn form_of(image: &[u8], framed: bool) -> Form {
 /// The members of a small image, decoded from its payload.
 fn small_members(image: &[u8]) -> Vec<u32> {
     let form = Small::of_tag(image[0]).expect("a small tag");
-    let count = usize::from(image[0] & 31) + 1;
+    let count = Small::count(image);
     let payload = &image[1..];
     let bits = |start: u32, bytes: &[u8]| -> Vec<u32> {
         (0..8 * bytes.len())
@@ -692,6 +719,7 @@ fn small_members(image: &[u8]) -> Vec<u32> {
         Small::Spans => (0..count)
             .flat_map(|i| u16_at(payload, 4 * i)..=u16_at(payload, 4 * i + 2))
             .collect(),
+        Small::WindowWide => bits(u16_at(payload, 0), &payload[3..3 + count]),
     }
 }
 
@@ -803,6 +831,16 @@ fn residual(residual: i32) -> Vec<u32> {
         .collect()
 }
 
+/// `first` and `last` and `n - 2` values scattered between them.
+fn pinned(first: u32, last: u32, n: usize, seed: u64) -> Vec<u32> {
+    let inside = scatter(n - 2, last - first - 1, seed);
+    [
+        vec![first],
+        inside.iter().map(|value| first + 1 + value).collect(),
+        vec![last],
+    ]
+    .concat()
+}
 fn in_chunk(key: u32, lows: impl IntoIterator<Item = u32>) -> Vec<u32> {
     lows.into_iter().map(|low| key << 16 | low).collect()
 }
@@ -816,7 +854,7 @@ fn words_4097() -> Vec<u32> {
 
 /// The u32 cases: a name, the members, and the form of the slot image.
 fn u32_cases() -> Vec<(&'static str, Vec<u32>, Form)> {
-    use Small::{List8, List16, Spans, Window, WindowAt};
+    use Small::{List8, List16, Spans, Window, WindowAt, WindowWide};
     let small = Form::Small;
     let dir = |kinds: &[u8]| Form::Directory(kinds.to_vec());
     let singletons = |keys: Vec<u32>| {
@@ -839,6 +877,8 @@ fn u32_cases() -> Vec<(&'static str, Vec<u32>, Form)> {
         .map(|(_, lows)| arm(lows))
         .collect();
     let list8_31: Vec<u32> = (0..30).map(|i| i * 8 + i % 3).chain([255]).collect();
+    // README: the even numbers from 3,000 to 3,398 with 3,001.
+    let readme_wide: Vec<u32> = [vec![3000, 3001], (3002..=3398).step_by(2).collect()].concat();
     vec![
         ("empty", vec![], Form::Empty),
         // List8: count 1 to 31; at 32 members below 256 a Window is never longer.
@@ -881,9 +921,9 @@ fn u32_cases() -> Vec<(&'static str, Vec<u32>, Form)> {
         ("window-of-13-bytes", thinned(0, 100), small(Window)),
         ("window-count-32", thinned(0, 255), small(Window)),
         (
-            "window-past-32-bytes-is-a-cone-directory",
+            "window-wide-start-0-len-33",
             thinned(0, 263),
-            dir(&[CONE]),
+            small(WindowWide),
         ),
         ("window-ties-window-at", thinned(8, 63), small(Window)),
         (
@@ -912,8 +952,70 @@ fn u32_cases() -> Vec<(&'static str, Vec<u32>, Form)> {
             small(WindowAt),
         ),
         (
-            "window-at-past-32-bytes-is-a-cone-directory",
+            "window-wide-start-1-len-33",
             thinned(8, 271),
+            small(WindowWide),
+        ),
+        // Window wide.
+        ("readme-window-wide", readme_wide, small(WindowWide)),
+        (
+            "window-wide-len-1",
+            vec![2048, 2050, 2052],
+            small(WindowWide),
+        ),
+        (
+            "list16-ties-window-wide",
+            vec![2048, 2050, 2064],
+            small(List16),
+        ),
+        (
+            "window-wide-shorter-than-list16",
+            vec![2048, 2050, 2056],
+            small(WindowWide),
+        ),
+        (
+            "spans-ties-window-wide",
+            [interval(2048, 2050), interval(2080, 2082)].concat(),
+            small(Spans),
+        ),
+        (
+            "window-wide-shorter-than-spans",
+            [interval(2048, 2050), interval(2072, 2074)].concat(),
+            small(WindowWide),
+        ),
+        (
+            "window-wide-ties-stride-directory",
+            progression(2048, 2, 28),
+            small(WindowWide),
+        ),
+        (
+            "stride-directory-one-shorter-than-window-wide",
+            progression(2048, 2, 29),
+            dir(&[STRIDE]),
+        ),
+        (
+            "window-wide-len-64",
+            pinned(800, 800 + 64 * 8 - 1, 60, 0x5eed_0040),
+            small(WindowWide),
+        ),
+        (
+            "window-wide-len-65",
+            pinned(800, 800 + 65 * 8 - 1, 60, 0x5eed_0041),
+            small(WindowWide),
+        ),
+        (
+            "window-wide-len-256",
+            pinned(0, 2047, 250, 0x5eed_0100),
+            small(WindowWide),
+        ),
+        (
+            "window-wide-start-7936-len-256",
+            pinned(63_488, 65_535, 250, 0x5eed_1f00),
+            small(WindowWide),
+        ),
+        (
+            "past-256-bitmap-bytes-is-a-cone-directory",
+            pinned(800, 800 + 257 * 8 - 1, 250, 0x5eed_0101),
             dir(&[CONE]),
         ),
         ("window-at-ties-spans", interval(16, 39), small(WindowAt)),
@@ -1376,7 +1478,7 @@ fn structural_rejects() -> Vec<Reject> {
         (
             "unassigned-control",
             32,
-            vec![0xc0],
+            vec![0xff],
             Class::Kind,
             Entry::Open,
         ),
@@ -1427,6 +1529,41 @@ fn structural_rejects() -> Vec<Reject> {
             32,
             vec![0x61, 0x02, 0x00, 0x01],
             Class::Extent,
+            Entry::Open,
+        ),
+        (
+            "window-wide-cut-before-its-length-byte",
+            32,
+            vec![0xc0, 0x00, 0x01],
+            Class::Extent,
+            Entry::Open,
+        ),
+        (
+            "window-wide-ends-in-a-zero-byte",
+            32,
+            vec![0xc0, 0x00, 0x01, 0x01, 0x01, 0x00],
+            Class::Extent,
+            Entry::Open,
+        ),
+        (
+            "window-wide-starts-in-a-zero-byte",
+            32,
+            vec![0xc0, 0x00, 0x01, 0x01, 0x00, 0x01],
+            Class::Extent,
+            Entry::Open,
+        ),
+        (
+            "window-wide-past-8192",
+            32,
+            vec![0xc0, 0xff, 0x1f, 0x01, 0x01, 0x01],
+            Class::PlaneRange,
+            Entry::Open,
+        ),
+        (
+            "unassigned-tag-c1",
+            32,
+            vec![0xc1, 0x00, 0x01, 0x00, 0x01],
+            Class::Kind,
             Entry::Open,
         ),
         (
@@ -1727,7 +1864,7 @@ fn structural_rejects() -> Vec<Reject> {
 /// Well-formed images that are not the writer's for their set: `open`
 /// admits each, and the class is `canonical`.
 fn canonical_rejects() -> Vec<Reject> {
-    use Small::{List8, List16, Spans, Window, WindowAt};
+    use Small::{List8, List16, Spans, Window, WindowAt, WindowWide};
     let kind = |kind: u8, key: u32, lows: &[u32]| directory(&[Chunk::of(key, kind, lows)]);
     let (one, two) = ([1, 65_545], [7, 40]);
     assert!(
@@ -1738,6 +1875,11 @@ fn canonical_rejects() -> Vec<Reject> {
     assert_eq!(form_of(&sealed(&ef_shorter), true), Form::EliasFano);
     let wide_child = |child: Vec<u8>, card: u64| wide_directory(&[(9, card, child)]);
     let list8_of_32: Vec<u32> = (0..32).map(|i| i * 8 + i % 3).collect();
+    let cone_eps = |eps: u8| {
+        let mut chunk = Chunk::of(1, CONE, &jittered(16, 500));
+        chunk.payload[2] = eps;
+        directory(&[chunk])
+    };
     let canonical = |name, image| (name, 32, image, AdmissionClass::Canonical, Entry::Verified);
     vec![
         // Step 1: each container kind where the members select another.
@@ -1767,6 +1909,8 @@ fn canonical_rejects() -> Vec<Reject> {
             "cone-past-1024-members",
             kind(CONE, 1, &even_runs(1_025, 180, 16)),
         ),
+        canonical("cone-with-a-larger-eps", cone_eps(100)),
+        canonical("cone-with-eps-zero", cone_eps(0)),
         // Step 3: a directory of one chunk at key zero where a small form is no longer.
         canonical("directory-of-a-singleton-at-key-zero", kind(ARRAY, 0, &[7])),
         canonical(
@@ -1776,6 +1920,22 @@ fn canonical_rejects() -> Vec<Reject> {
         canonical(
             "cone-directory-where-list16-ties",
             kind(CONE, 0, &jittered(17, 500)),
+        ),
+        canonical(
+            "stride-directory-of-a-full-chunk-where-spans-is-shorter",
+            kind(STRIDE, 0, &interval(0, 65_535)),
+        ),
+        canonical(
+            "runs-directory-where-spans-is-shorter",
+            kind(
+                RUNS,
+                0,
+                &[interval(0, 4_999), interval(6_000, 9_999)].concat(),
+            ),
+        ),
+        canonical(
+            "stride-directory-where-window-wide-ties",
+            kind(STRIDE, 0, &progression(2048, 2, 28)),
         ),
         // Step 3: a small image in another form than the selected one.
         canonical("list8-where-window-ties", small_image(List8, &[0, 8])),
@@ -1808,6 +1968,29 @@ fn canonical_rejects() -> Vec<Reject> {
             "window-at-where-list16-is-shorter",
             small_image(WindowAt, &[300, 324]),
         ),
+        canonical(
+            "window-wide-where-window-fits",
+            small_image(WindowWide, &[0, 8]),
+        ),
+        canonical(
+            "window-wide-where-window-at-fits",
+            small_image(WindowWide, &[16, 17, 24]),
+        ),
+        canonical(
+            "window-wide-where-spans-ties",
+            small_image(
+                WindowWide,
+                &[interval(2048, 2050), interval(2080, 2082)].concat(),
+            ),
+        ),
+        canonical(
+            "window-wide-where-list16-ties",
+            small_image(WindowWide, &[2048, 2050, 2064]),
+        ),
+        canonical(
+            "list16-where-window-wide-is-shorter",
+            small_image(List16, &[2048, 2050, 2056]),
+        ),
         // Step 3: a small image where the directory is strictly shorter.
         canonical(
             "list8-where-stride-directory-is-shorter",
@@ -1820,6 +2003,10 @@ fn canonical_rejects() -> Vec<Reject> {
         canonical(
             "list16-where-cone-directory-is-shorter",
             small_image(List16, &jittered(18, 500)),
+        ),
+        canonical(
+            "window-wide-where-stride-directory-is-shorter",
+            small_image(WindowWide, &progression(2048, 2, 29)),
         ),
         // Step 5: an Elias-Fano root where the forest family is not longer.
         (
@@ -1929,13 +2116,18 @@ fn assert_coverage(cases: &[(&'static str, Vec<u32>, Form)]) {
         .map(|(_, members, _)| forest(members))
         .collect();
     for form in Small::ALL {
-        let counts: Vec<u8> = slots
+        let counts: Vec<usize> = slots
             .iter()
             .filter(|slot| Small::of_tag(slot[0]) == Some(form))
-            .map(|slot| (slot[0] & 31) + 1)
+            .map(|slot| Small::count(slot))
             .collect();
-        // 32 List8 members below 256 always fit a Window of at most 32 bytes.
-        let most = if form == Small::List8 { 31 } else { 32 };
+        // 32 List8 members below 256 always fit a Window of at most 32
+        // bytes; a Window wide holds up to 256.
+        let most = match form {
+            Small::List8 => 31,
+            Small::WindowWide => 256,
+            _ => 32,
+        };
         assert!(
             counts.contains(&1) && counts.contains(&most),
             "{}: counts {counts:?}",

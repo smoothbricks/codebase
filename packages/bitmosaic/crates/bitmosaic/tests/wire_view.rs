@@ -369,18 +369,22 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
         assert_eq!(header.encoded_len, 1);
     }
     for control in 0..=u8::MAX {
-        // The payload bytes a small tag `kk lllll` names.
+        // The payload bytes a small tag `kk lllll` names. A Window wide is
+        // `C0` alone and names its bitmap length, less one, in its fourth
+        // byte: 200 bytes here.
         let count = usize::from(control & 31) + 1;
         let small = match control >> 5 {
             1 | 2 => Some(count),
             3 => Some(1 + count),
             4 => Some(2 * count),
             5 => Some(4 * count),
+            6 if control == 0xC0 => Some(3 + 200),
             _ => None,
         };
         let framed = matches!(control, 0x10 | 0x11 | 0x12 | 0x14 | 0x15);
         let mut image = vec![control, 1];
         image.resize(512, 0);
+        image[3] = 199;
         let header = image_header(&image);
         assert_eq!(
             header.is_some(),
@@ -407,7 +411,57 @@ fn native_header_refuses_noncanonical_framing_and_bounds_extent() {
                 "control {control:#04x}"
             );
         }
+        if control == 0xC0 {
+            for cut in [1, 2, 3] {
+                assert!(
+                    image_header(&image[..cut]).is_none(),
+                    "Window wide cut to {cut}: before its length byte"
+                );
+            }
+        }
         assert!(image_header(&[]).is_none());
+    }
+    // A Window wide ends inside chunk zero: `start + len <= 8192`, and past
+    // that it is refused as `plane-range` at its `start`.
+    for (start, len, fits) in [
+        (8000u16, 192usize, true),
+        (8001, 192, false),
+        (7936, 256, true),
+        (7937, 256, false),
+        (8191, 1, true),
+        (8192, 1, false),
+    ] {
+        let mut image = vec![0xC0];
+        image.extend_from_slice(&start.to_le_bytes());
+        image.push((len - 1) as u8);
+        image.resize(4 + len, 0);
+        image[4] |= 1;
+        image[3 + len] |= 0x80;
+        assert_eq!(
+            image_header(&image).map(|header| header.encoded_len),
+            Some(4 + len),
+            "start {start}, len {len}"
+        );
+        if fits {
+            let view = BitmosaicView::open(&image).expect("a Window wide inside the chunk");
+            assert_eq!(
+                view.select(view.len() - 1),
+                Some(8 * (u32::from(start) + len as u32) - 1)
+            );
+        } else {
+            assert!(
+                BitmosaicView::open(&image).is_none(),
+                "start {start}, len {len}"
+            );
+            let refusal = BitmosaicView::open_verified(&image)
+                .map(|_| ())
+                .expect_err("a Window wide past the chunk");
+            assert_eq!(
+                (refusal.class, refusal.offset),
+                (AdmissionClass::PlaneRange, 1),
+                "start {start}, len {len}"
+            );
+        }
     }
     for length in [
         &[0x80][..],
@@ -933,7 +987,7 @@ fn truncated_and_corrupt_planes_are_refused_not_trusted() {
             );
         }
         let mut wrong_control = bytes.clone();
-        wrong_control[0] = 0xC0;
+        wrong_control[0] = 0xC1;
         assert!(
             BitmosaicView::open(&wrong_control).is_none(),
             "{name}: control"
@@ -1005,7 +1059,7 @@ fn forged_headers_are_refused_and_damaged_planes_never_lie() {
 
     for (name, values) in shapes() {
         let bytes = Bitmosaic::from_sorted(values.iter().copied()).to_bytes();
-        for control in [0, 3, 0x08, 0x0c, 0x13, 0x16, 0x17, 0x18, 0x1f, 0xc0, 0xff] {
+        for control in [0, 3, 0x08, 0x0c, 0x13, 0x16, 0x17, 0x18, 0x1f, 0xc1, 0xff] {
             let mut forged = bytes.clone();
             forged[0] = control;
             assert!(
@@ -1410,11 +1464,13 @@ fn write_into_slice_lands_the_canonical_bytes_and_refuses_a_short_slot() {
 /// Each image is built here from its form's table row, not by the writer,
 /// and answers every read a `BTreeSet` answers: counts 1 and 32 of every
 /// form, every bitmap length 1 to 32 (so a last word of 1 to 8 bytes), a
-/// Window at from start 1 to 255, and Spans from singleton intervals to the
-/// whole chunk. Spare bytes of 0xFF follow every image, so a read past its
-/// extent would show as a member. Verified admission takes an image exactly
-/// when it is the writer's image of its set, and refuses any other as
-/// `canonical`.
+/// Window at from start 1 to 255, Spans from singleton intervals to the
+/// whole chunk, and Window wide from 1 to 256 bytes at starts from 0 to
+/// the last the chunk allows, sparse and dense. `as_small()` answers the
+/// same as the view. Spare bytes of 0xFF follow every image, so a read past
+/// its extent would show as a member. Verified admission takes an image
+/// exactly when it is the writer's image of its set, and refuses any other
+/// as `canonical`.
 #[test]
 fn small_forms_answer_every_read_where_they_lie() {
     /// The small image of `members` in form `kk`, by the README's table.
@@ -1463,6 +1519,14 @@ fn small_forms_answer_every_read_where_they_lie() {
                         .flat_map(|v| u16::try_from(v).unwrap().to_le_bytes())
                         .collect(),
                 )
+            }
+            6 => {
+                let bits = bitmap(first);
+                let mut bytes = vec![0xC0];
+                bytes.extend(u16::try_from(first).unwrap().to_le_bytes());
+                bytes.push(u8::try_from(bits.len() - 1).unwrap());
+                bytes.extend(bits);
+                return bytes;
             }
             _ => unreachable!("form {kk}"),
         };
@@ -1541,8 +1605,56 @@ fn small_forms_answer_every_read_where_they_lie() {
             ));
         }
     }
+    // Window wide: bitmap lengths 1, 33, 64, 65, 255 and 256, each at two
+    // of the starts 0, 1, 255 and 256 (so every length meets a start that
+    // is word-aligned in the value domain and one that is not), sparse and
+    // dense, and the last starts the chunk allows: 8191 for one byte, 7936
+    // for 256.
+    let wide: Vec<(u32, u32)> = [
+        (0, 1),
+        (255, 1),
+        (1, 33),
+        (256, 33),
+        (0, 64),
+        (255, 64),
+        (1, 65),
+        (256, 65),
+        (0, 255),
+        (255, 255),
+        (1, 256),
+        (256, 256),
+        (8191, 1),
+        (7936, 256),
+    ]
+    .into_iter()
+    .collect();
+    for (start, len) in wide {
+        for dense in [false, true] {
+            let (lo, hi) = (8 * start, 8 * (start + len));
+            let mut members: Vec<u32> = (lo..hi)
+                .filter(|_| {
+                    let draw = xorshift(&mut state);
+                    if dense {
+                        !draw.is_multiple_of(32)
+                    } else {
+                        draw.is_multiple_of(16)
+                    }
+                })
+                .collect();
+            members.push(lo + (xorshift(&mut state) % 8) as u32);
+            members.push(hi - 1 - (xorshift(&mut state) % 8) as u32);
+            members.sort_unstable();
+            members.dedup();
+            let density = if dense { "dense" } else { "sparse" };
+            cases.push((
+                format!("Window wide at byte {start}, {len} bytes, {density}"),
+                6,
+                members,
+            ));
+        }
+    }
 
-    let mut writer_images = [0usize; 6];
+    let mut writer_images = [0usize; 7];
     let mut images = Vec::with_capacity(cases.len());
     for (name, kk, members) in &cases {
         let image = image(*kk, members);
@@ -1564,14 +1676,36 @@ fn small_forms_answer_every_read_where_they_lie() {
         }
         let len = members.len() as u64;
         assert_eq!(view.len(), len, "{name}: len");
+        let small = view
+            .as_small()
+            .unwrap_or_else(|| panic!("{name}: as_small"));
+        assert_eq!(u64::from(small.len()), len, "{name}: SmallView len");
         let mut walked = Vec::new();
         view.for_each(|v| walked.push(v));
         assert_eq!(&walked, members, "{name}: for_each");
+        let mut walked = Vec::new();
+        small.for_each(|v| walked.push(v));
+        assert_eq!(&walked, members, "{name}: SmallView for_each");
         assert_eq!(&view.range().collect::<Vec<_>>(), members, "{name}: range");
+        assert_eq!(
+            &small.iter().collect::<Vec<_>>(),
+            members,
+            "{name}: SmallView iter"
+        );
         for (k, &m) in members.iter().enumerate() {
             assert_eq!(view.select(k as u64), Some(m), "{name}: select({k})");
+            assert_eq!(
+                small.select(k as u32),
+                Some(m),
+                "{name}: SmallView select({k})"
+            );
         }
         assert_eq!(view.select(len), None, "{name}: select past the end");
+        assert_eq!(
+            small.select(len as u32),
+            None,
+            "{name}: SmallView select past the end"
+        );
         let oracle: BTreeSet<u32> = members.iter().copied().collect();
         let probes: BTreeSet<u32> = members
             .iter()
@@ -1585,7 +1719,13 @@ fn small_forms_answer_every_read_where_they_lie() {
                 oracle.contains(&p),
                 "{name}: contains({p})"
             );
+            assert_eq!(
+                small.contains(p),
+                oracle.contains(&p),
+                "{name}: SmallView contains({p})"
+            );
             assert_eq!(view.rank(p), rank as u64, "{name}: rank({p})");
+            assert_eq!(small.rank(p) as usize, rank, "{name}: SmallView rank({p})");
             let mut cursor = view.range();
             cursor.seek(p);
             assert_eq!(
@@ -1607,15 +1747,56 @@ fn small_forms_answer_every_read_where_they_lie() {
     );
     for (a_name, a, a_set) in &images {
         let a_view = BitmosaicView::open(a).unwrap();
+        let a_small = a_view.as_small().unwrap();
         for (b_name, b, b_set) in &images {
             let b_view = BitmosaicView::open(b).unwrap();
+            let b_small = b_view.as_small().unwrap();
             let (fewer, more) = if a_set.len() <= b_set.len() {
                 (a_set, b_set)
             } else {
                 (b_set, a_set)
             };
-            let shared = fewer.iter().filter(|v| more.contains(v)).count() as u64;
-            assert_eq!(a_view.and_len(&b_view), shared, "{a_name} and {b_name}");
+            let shared: Vec<u32> = fewer.iter().copied().filter(|v| more.contains(v)).collect();
+            assert_eq!(
+                a_view.and_len(&b_view),
+                shared.len() as u64,
+                "{a_name} and {b_name}"
+            );
+            assert_eq!(
+                a_small.and_len(&b_small) as usize,
+                shared.len(),
+                "{a_name} and {b_name}: SmallView"
+            );
+            // `and_rank` is a rank in the intersection. Inside one of its
+            // runs, and inside one of its gaps, the rank moves by one per
+            // value or not at all, so every member next to a gap, every gap
+            // boundary and the ends of either side decide every answer.
+            let mut probes: BTreeSet<u32> = [0, 65_535, 65_536, u32::MAX].into();
+            for (i, &m) in shared.iter().enumerate() {
+                let opens = i == 0 || shared[i - 1] + 1 != m;
+                let closes = shared.get(i + 1) != Some(&(m + 1));
+                if opens || closes {
+                    probes.extend([m.saturating_sub(1), m, m + 1]);
+                }
+            }
+            for set in [a_set, b_set] {
+                for &m in set.first().into_iter().chain(set.last()) {
+                    probes.extend([m.saturating_sub(1), m, m + 1]);
+                }
+            }
+            for p in probes {
+                let rank = shared.partition_point(|&m| m < p);
+                assert_eq!(
+                    a_view.and_rank(&b_view, p),
+                    rank as u64,
+                    "{a_name} and {b_name}: and_rank({p})"
+                );
+                assert_eq!(
+                    a_small.and_rank(&b_small, p) as usize,
+                    rank,
+                    "{a_name} and {b_name}: SmallView and_rank({p})"
+                );
+            }
         }
     }
 }

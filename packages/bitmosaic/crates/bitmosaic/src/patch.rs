@@ -1886,6 +1886,28 @@ fn prepare_tiny<W: Witness>(
     if added == 0 && removed == 0 {
         return Some(Ok(PreparedPlan::Unchanged(report(view.serialized_len()))));
     }
+    if card != 0 {
+        let members = &scratch.members[..];
+        let (first, last) = (members[0], members[members.len() - 1]);
+        let (runs, stride) =
+            crate::canon::runs_and_stride(members.iter().map(|&member| u32::from(member)));
+        let form = crate::canon::small_choice(first, last, card, runs, stride, || {
+            crate::canon::arm_len(members)
+        });
+        if let Some((kind, len)) = form {
+            let needed = 1 + len;
+            if needed > slot.len() {
+                return Some(Err(PatchError::Capacity { needed }));
+            }
+            grow(&mut scratch.build, needed);
+            scratch.build[0] = small_tag(kind, small_count(kind, len));
+            let mut sink = SmallSink::new(&mut scratch.build[1..needed], kind, first);
+            for &member in members {
+                sink.push(member);
+            }
+            return Some(Ok(PreparedPlan::Built(report(needed))));
+        }
+    }
     scratch.rows.clear();
     scratch.staged.clear();
     if card != 0 {

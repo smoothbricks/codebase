@@ -1609,6 +1609,51 @@ fn a_slot_patched_across_every_small_form_stays_a_fresh_encoding() {
             0x14,
             Some(1),
         ),
+        (
+            "200 of 400 positions: Window wide",
+            [3000, 3001]
+                .into_iter()
+                .chain((3002..=3398).step_by(2))
+                .collect(),
+            vec![],
+            0xC0,
+            Some(54),
+        ),
+        (
+            "a member 300 positions further: a wider Window wide",
+            vec![3698],
+            vec![],
+            0xC0,
+            Some(5 + 87),
+        ),
+        (
+            "three members left: List16",
+            vec![],
+            (3002..=3398).step_by(2).collect(),
+            0x82,
+            Some(7),
+        ),
+        (
+            "past 2,048 positions: a directory",
+            (3002..=3398).step_by(2).chain([5100]).collect(),
+            vec![],
+            0x10,
+            None,
+        ),
+        (
+            "back inside 256 bytes: Window wide",
+            vec![],
+            vec![5100],
+            0xC0,
+            Some(5 + 87),
+        ),
+        (
+            "emptied from Window wide",
+            vec![],
+            (3000..=3698).collect(),
+            0x14,
+            Some(1),
+        ),
     ];
     for (i, (name, adds, removes, control, expected)) in steps.iter().enumerate() {
         let report = captured_prepared_patch(

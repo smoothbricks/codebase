@@ -184,7 +184,7 @@ impl<'a> SmallSink<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn push(&mut self, member: u16) {
         match self.kind {
             K_LIST8 => {
@@ -731,14 +731,21 @@ impl<'a> SmallSet<'a> {
                     count += u32::from((value < below) & probed.contains(value));
                 }
             }
-            (a, b) => {
-                let (walked, probed) = if matches!(a, SmallSet::Window { .. }) {
-                    (a, b)
-                } else {
-                    (b, a)
-                };
-                walked.for_each(|v| count += u32::from((v < below) & probed.contains(v)));
+            (SmallSet::Window { bits, base }, SmallSet::Spans(spans))
+            | (SmallSet::Spans(spans), SmallSet::Window { bits, base }) => {
+                // An interval holds the window's members below its end less
+                // those below its start.
+                for i in 0..spans.len() / 4 {
+                    let (start, end) = span(spans, i);
+                    let (low, high) = (start, (end + 1).min(below));
+                    if low < high {
+                        count += count_below(bits, high.saturating_sub(base) as usize)
+                            - count_below(bits, low.saturating_sub(base) as usize);
+                    }
+                }
             }
+            // Every other pair is matched above.
+            _ => {}
         }
         count
     }

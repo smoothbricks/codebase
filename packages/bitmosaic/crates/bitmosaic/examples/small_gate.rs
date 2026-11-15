@@ -18,7 +18,7 @@
 
 use std::hint::black_box;
 
-use bitmosaic::{Bitmosaic, BitmosaicView, SmallView};
+use bitmosaic::{Bitmosaic, BitmosaicView, PatchScratch, SmallView, image_len, write_image_into};
 
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -57,6 +57,20 @@ fn shape(name: &str) -> (Vec<u32>, Vec<u32>) {
             (100..400).chain(1_000..1_200).chain(9_000..9_050).collect(),
             (300..1_100).chain(9_010..9_020).collect(),
         ),
+        // Window wide: two hundred of four hundred positions from 3,000.
+        "wide" => (
+            (0..400)
+                .filter(|v| v % 2 == 0 || v % 7 == 0)
+                .map(|v| 3_000 + v)
+                .collect(),
+            (0..400)
+                .filter(|v| v % 3 == 0 || v % 5 == 0)
+                .map(|v| 3_000 + v)
+                .collect(),
+        ),
+        // A directory of many chunks, and an Elias-Fano root: write cells only.
+        "large-dense" => ((0..200_000).filter(|v| v % 3 != 0).collect(), vec![1]),
+        "large-sparse" => ((0..10_000).map(|i| i * 429_497 + i % 7).collect(), vec![1]),
         other => panic!("unknown shape {other}"),
     }
 }
@@ -317,6 +331,25 @@ pub fn gate(measure: &mut Measure<'_>) {
     };
     let iterations: u64 = iterations.parse().expect("an iteration count");
     let (va, vb) = shape(shape_name);
+    if reader == "write" {
+        // The slice writer against the builder: `write` is the image of
+        // the members written into a caller's bytes, `build` the same
+        // bytes through `from_sorted` and `to_bytes`.
+        let mut out = vec![0u8; 16 + 5 * va.len()];
+        let mut scratch = PatchScratch::try_new().expect("scratch");
+        let sum = measure(iterations, 1, &mut || match op.as_str() {
+            "write" => {
+                write_image_into(black_box(&va), &mut out, &mut scratch).expect("room") as u64
+            }
+            "image_len" => image_len(black_box(&va)) as u64,
+            "build" => Bitmosaic::from_sorted(black_box(&va).iter().copied())
+                .to_bytes()
+                .len() as u64,
+            other => panic!("unknown write cell {other}"),
+        });
+        println!("{shape_name} {reader} {op} x{iterations}: {sum}");
+        return;
+    }
     let image = Bitmosaic::from_sorted(va.iter().copied()).to_forest_bytes();
     let other = Bitmosaic::from_sorted(vb.iter().copied()).to_forest_bytes();
     let small = SmallView::open(&image).expect("the shape is a small image");

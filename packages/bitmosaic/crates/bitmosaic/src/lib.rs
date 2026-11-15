@@ -37,6 +37,7 @@ mod small;
 mod wire;
 
 pub use admission::{AdmissionClass, AdmissionError};
+pub use canon::{image_len, write_image_into};
 pub use ef::EfView;
 pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,
