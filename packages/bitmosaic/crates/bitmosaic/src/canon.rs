@@ -211,8 +211,23 @@ fn elias_fano_len(n: u64, first: u32, last: u32) -> Option<usize> {
     ))
 }
 
+/// The payload length of the arm the ladder picks for at most 2,048
+/// ascending members below 65,536. Its own cold function: the members are
+/// staged on 4 KiB of stack, which the paths that never ask do not zero.
+#[cold]
+#[inline(never)]
+fn ladder_len(members: impl Iterator<Item = u32>) -> usize {
+    let mut values = [0u16; 2048];
+    let mut at = 0;
+    for (slot, member) in values.iter_mut().zip(members) {
+        *slot = member as u16;
+        at += 1;
+    }
+    arm_len(&values[..at])
+}
 /// The forest family's length for the `n` ascending members `walk` hands
 /// over, from `first` to `last`: chunk by chunk through the ladder.
+#[inline(never)]
 fn forest_family_len(
     n: u64,
     first: u32,
@@ -284,13 +299,7 @@ fn small_of(members: &[u32]) -> Option<(u32, usize)> {
         members.len() as u32,
         runs,
         stride,
-        || {
-            let mut values = [0u16; 2048];
-            for (slot, &member) in values.iter_mut().zip(members) {
-                *slot = member as u16;
-            }
-            arm_len(&values[..members.len()])
-        },
+        || ladder_len(members.iter().copied()),
     )
 }
 
@@ -463,15 +472,7 @@ fn small(image: &[u8]) -> Result<(), AdmissionError> {
     // be as short as the small form ([`small_choice`]).
     let (runs, stride) = runs_and_stride(crate::SmallView::new(set).iter());
     let chosen = small_choice(first, last, card, runs, stride, || {
-        let mut values = [0u16; 2048];
-        let mut at = 0;
-        set.for_each(|value| {
-            if let Some(slot) = values.get_mut(at) {
-                *slot = value as u16;
-                at += 1;
-            }
-        });
-        arm_len(&values[..at])
+        ladder_len(crate::SmallView::new(set).iter())
     });
     if chosen != Some((kind, image.len() - 1)) {
         return Err(refuse(

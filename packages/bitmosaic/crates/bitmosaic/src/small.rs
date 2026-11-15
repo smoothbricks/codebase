@@ -127,23 +127,33 @@ pub(crate) fn small_form(
 ) -> Option<(u32, usize)> {
     let (start, end) = (usize::from(first) / 8, usize::from(last) / 8);
     let card = card as usize;
-    let candidates = [
-        (end < COUNT_MAX).then_some((K_WINDOW, end + 1)),
-        ((1..=255).contains(&start) && end - start < COUNT_MAX)
-            .then_some((K_WINDOW_AT, 2 + end - start)),
-        (runs <= COUNT_MAX).then(|| (K_SPANS, 4 * runs)),
-        (last <= 255 && card <= COUNT_MAX).then_some((K_LIST8, card)),
-        (card <= COUNT_MAX).then_some((K_LIST16, 2 * card)),
-        (end - start < WIDE_MAX).then_some((K_WINDOW_WIDE, 4 + end - start)),
-    ];
-    let mut best: Option<(u32, usize)> = None;
-    for candidate in candidates.into_iter().flatten() {
-        if best.is_none_or(|(_, len)| candidate.1 < len) {
-            best = Some(candidate);
+    // The candidates in tie order: a later one must be strictly shorter.
+    let mut best = (0u32, usize::MAX);
+    let mut offer = |kind: u32, len: usize| {
+        if len < best.1 {
+            best = (kind, len);
         }
+    };
+    if end < COUNT_MAX {
+        offer(K_WINDOW, end + 1);
+    }
+    if (1..=255).contains(&start) && end - start < COUNT_MAX {
+        offer(K_WINDOW_AT, 2 + end - start);
+    }
+    if runs <= COUNT_MAX {
+        offer(K_SPANS, 4 * runs);
+    }
+    if last <= 255 && card <= COUNT_MAX {
+        offer(K_LIST8, card);
+    }
+    if card <= COUNT_MAX {
+        offer(K_LIST16, 2 * card);
+    }
+    if end - start < WIDE_MAX {
+        offer(K_WINDOW_WIDE, 4 + end - start);
     }
     // Every small header is the tag alone.
-    best.filter(|&(_, len)| len < directory)
+    (best.1 < directory).then_some(best)
 }
 
 /// Writes a small payload from a set's ascending members. `out` is exactly
