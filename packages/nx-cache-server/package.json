@@ -37,7 +37,7 @@
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*",
-    "typia": "15.2.1"
+    "typia": "15.4.1"
   },
   "publishConfig": {
     "access": "public"

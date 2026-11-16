@@ -150,7 +150,7 @@
     "@smoothbricks/validation": "workspace:*",
     "@uwdata/flechette": "^2.7.0",
     "tslib": "^2.8.1",
-    "typia": "15.2.1"
+    "typia": "15.4.1"
   },
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",

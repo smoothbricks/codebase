@@ -1,5 +1,5 @@
 diff --git a/native/core/programmers/internal/FeatureProgrammer.go b/native/core/programmers/internal/FeatureProgrammer.go
-index 13b41a1..30533f7 100644
+index 13b41a12d0e2ea076d99af4d45c495744cf56e07..30533f724f1d09aa86da5bfbc7b20f307d5ab360 100644
 --- a/native/core/programmers/internal/FeatureProgrammer.go
 +++ b/native/core/programmers/internal/FeatureProgrammer.go
 @@ -762,7 +762,13 @@ func (featureProgrammerNamespace) Compose(props FeatureProgrammer_ComposeProps)

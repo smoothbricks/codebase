@@ -166,7 +166,7 @@
     "@smoothbricks/failure-summary": "workspace:*",
     "@smoothbricks/nx-plugin": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
-    "typia": "15.2.1"
+    "typia": "15.4.1"
   },
   "devDependencies": {
     "@typescript-eslint/parser": "^8.70.0",

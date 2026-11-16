@@ -20,7 +20,7 @@ inputs:
   devenv:
     url: github:cachix/devenv/v2.4.0?dir=src/modules
   # Go for devenv.smoo.nix, pinned to the patch release ttsc vendors inside its
-  # native package (0.36.3 -> go1.27.3); `smoo monorepo check` fails when the two
+  # native package (0.37.1 -> go1.27.4); `smoo monorepo check` fails when the two
   # disagree. Our curated channel above cannot supply it — rolling has no Go 1.27 —
   # so this is one leaf package from a nixpkgs that has it.
   #
@@ -28,8 +28,10 @@ inputs:
   # whole point of this input is to name ONE Go version, so a `devenv update` must
   # not be able to slide it out from under the vendored SDK it is matched to. It
   # moves when someone bumps ttsc and the check says it has to.
+  # The revision is on release-26.05, whose Hydra jobsets build go 1.27.4 for
+  # every system the fleet uses, so no shell compiles Go.
   nixpkgs-go:
-    url: github:NixOS/nixpkgs/674a2028661e550a97400c1cc992b9cca9a668a1
+    url: github:NixOS/nixpkgs/c7b1abae52b3d63540e318af1162d9bbd22e4870
     flake: true
   # Its own nixpkgs is the single largest duplication in the shell closure. This
   # is a Python script, and on Darwin nixpkgs' python3 retains the whole SDK

@@ -34,10 +34,10 @@
     "nx": "24.0.3",
     "prettier": "^3.9.8",
     "tslib": "^2.8.1",
-    "ttsc": "0.36.3",
+    "ttsc": "0.37.1",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.70.0",
-    "typia": "15.2.1",
+    "typia": "15.4.1",
     "verdaccio": "6.8.0"
   },
   "scripts": {
@@ -352,14 +352,13 @@
     "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
     "nx@24.0.3": "patches/nx@24.0.3.patch",
     "@nx/js@24.0.3": "patches/@nx%2Fjs@24.0.3.patch",
-    "ttsc@0.36.3": "patches/ttsc@0.36.3.patch",
-    "typia@15.2.1": "patches/typia@15.2.1.patch",
-    "@typia/interface@15.2.1": "patches/@typia%2Finterface@15.2.1.patch",
-    "scriptc@0.4.4": "patches/scriptc@0.4.4.patch",
-    "@ttsc/unplugin@0.36.3": "patches/@ttsc%2Funplugin@0.36.3.patch"
+    "ttsc@0.37.1": "patches/ttsc@0.37.1.patch",
+    "typia@15.4.1": "patches/typia@15.4.1.patch",
+    "@typia/interface@15.4.1": "patches/@typia%2Finterface@15.4.1.patch",
+    "scriptc@0.4.4": "patches/scriptc@0.4.4.patch"
   },
   "overrides": {
-    "typia": "15.2.1",
+    "typia": "15.4.1",
     "@nx/js": "24.0.3",
     "nx": "24.0.3"
   },

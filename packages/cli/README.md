@@ -401,7 +401,7 @@ hoist onto that API package so Nx does not load `@typescript/native` (TS7) via t
 ([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Both dependencies and the environment binding are
 required: TypeScript 7 under the unscoped name breaks Nx API calls such as `readConfigFile`.
 
-For `ttsc@0.36.3`, smoo temporarily distributes `patches/ttsc@0.36.3.patch` and registers it in the root
+For `ttsc@0.37.1`, smoo temporarily distributes `patches/ttsc@0.37.1.patch` and registers it in the root
 `patchedDependencies` before `smoo monorepo update` runs Bun installation; it removes every other `ttsc@` registration.
 The patch repairs import-extension handling during the compiler's internal forced-emission diagnostic pass; user
 `--noEmit` still writes no output. It also makes a source-plugin build lock waiter inspect the holder before it reports
@@ -417,31 +417,28 @@ and keeps the rest: a host shell exporting `GOFLAGS=-mod=mod` failed its entry r
 for plugin `typia` failed". A plugin source's link at or below a name the go tool passes over (`.`/`_`-prefixed, or
 `testdata`) is skipped like one in a pruned directory instead of refusing the module: go neither compiles nor embeds it,
 and cowshed's `.cache/lmao` build-state link inside a package that is also a Go plugin module cost that module its
-recorded source identity, so every load copied it and ran `go` 21 more times. One load walks the Go SDK once: its
-package selections and build environments share that observation and its witness entries while the load runs
-synchronously, and a watch delivery ends the batch. Each `TtscCompiler.prepare()` walked the bundled SDK three times
-before, about 25k path lookups a call. An emit whose caller sets `TTSC_WRITE_IF_CHANGED=1` writes an output only when
-its bytes differ (`driver/rewrite.go` `DefaultWriteFile`), as a watch child's (`TTSC_WATCH_WRITE_IF_CHANGED`) already
-does: an emit after one source edit rewrote every `.js`, `.d.ts` and map in place, file churn every copy-on-write clone
-of the checkout pays for. It is an opt-in because a caller that finds stale outputs by which files the emit did not
-touch (the `typescript-emit` executor through nx-plugin 0.7.9, and any checkout whose plugin dist predates the patch,
-which `bun install` applies first) would remove every unchanged output. The executor sets it and prunes `outDir` by
-ttsc's `--verbose` emitted-file list instead. The bootstrap emits that build the plugin before Nx can run (the shell
-entry and `tooling/ttsc-emit.ts`) set it too: they prune nothing, and one that rewrote the plugin's dist moved every
-stamp Nx recorded for it, so the plugin's `tsc-js` restored its dist from the cache, removing the directory while other
-tasks resolved their executors from it. ttsc's utility-plugin host, which links a plugin's Go library (lmao-ttsc's, a
-consumer's lint plugins), printed only `// ttsc utility: plugins=N emit=true` and a count under `--verbose`, so the
-executor refused its emits; the patch makes it print the build lane's header (`tsconfig=… cwd=… emit=…`) and one
-`  + <path>` line per emitted file (`utility/host.go` `RunBuildWithIO`), and it writes through the same
-`DefaultWriteFile`. A linked plugin that writes a file beside the compiler's outputs (a census in outDir) reports it
-with `PluginContext.ReportHostOutput(file string)`; each emit then hands the file's bytes to the host's writer after the
-compiler's own outputs (`driver/plugins.go`, `driver/rewrite.go`, `driver/emit_plugin.go`), so ttsc's build lane, its
-utility host and a plugin's own host such as typia's list it, and the executor keeps it. An unreported one is pruned as
-a file this emit did not produce. A linked plugin reads an environment variable with `PluginContext.Env(name)`, which
-returns `os.LookupEnv(name)` and records the name and value as an input of the compile, as a macro's tracked read does
-(Rust's `proc_macro::tracked_env::var`): the envelopes carry it as `environmentInputs`, and `--verbose` names the
-variables read (`// ttsc utility: environment inputs=[…]`). lmao-ttsc reads `NODE_ENV` this way. It is the Go half of
-[samchon/ttsc#1842](https://github.com/samchon/ttsc/pull/1842), and the managed patch drops it when that release lands.
+recorded source identity, so every load copied it and ran `go` 21 more times. An emit whose caller sets
+`TTSC_WRITE_IF_CHANGED=1` writes an output only when its bytes differ (`driver/rewrite.go` `DefaultWriteFile`), as a
+watch child's (`TTSC_WATCH_WRITE_IF_CHANGED`) already does: an emit after one source edit rewrote every `.js`, `.d.ts`
+and map in place, file churn every copy-on-write clone of the checkout pays for. It is an opt-in because a caller that
+finds stale outputs by which files the emit did not touch (the `typescript-emit` executor through nx-plugin 0.7.9, and
+any checkout whose plugin dist predates the patch, which `bun install` applies first) would remove every unchanged
+output. The executor sets it and prunes `outDir` by ttsc's `--verbose` emitted-file list instead. The bootstrap emits
+that build the plugin before Nx can run (the shell entry and `tooling/ttsc-emit.ts`) set it too: they prune nothing, and
+one that rewrote the plugin's dist moved every stamp Nx recorded for it, so the plugin's `tsc-js` restored its dist from
+the cache, removing the directory while other tasks resolved their executors from it. ttsc's utility-plugin host, which
+links a plugin's Go library (lmao-ttsc's, a consumer's lint plugins), printed only
+`// ttsc utility: plugins=N emit=true` and a count under `--verbose`, so the executor refused its emits; the patch makes
+it print the build lane's header (`tsconfig=… cwd=… emit=…`) and one `  + <path>` line per emitted file
+(`utility/host.go` `RunBuildWithIO`), and it writes through the same `DefaultWriteFile`. A linked plugin that writes a
+file beside the compiler's outputs (a census in outDir) reports it with `PluginContext.ReportHostOutput(file string)`;
+each emit then hands the file's bytes to the host's writer after the compiler's own outputs (`driver/plugins.go`,
+`driver/rewrite.go`, `driver/emit_plugin.go`), so ttsc's build lane, its utility host and a plugin's own host such as
+typia's list it, and the executor keeps it. An unreported one is pruned as a file this emit did not produce. When a
+transform host fails after printing an error diagnostic of its own, ttsc skips its plain `tsgo --noEmit` recheck
+(`PluginFailureDiagnostics.transformHostReported`): that host has reported its program, and the recheck loads no plugin
+and reads each referenced project from its declaration outputs, so it could only add false errors. A host that printed
+none keeps the recheck, which leaves out the refusals a `DiagnosticPlugin` withdrew (`TTSC_WITHDRAWN_DIAGNOSTICS_PATH`).
 The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
 edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
 continues to own its compiler pin.

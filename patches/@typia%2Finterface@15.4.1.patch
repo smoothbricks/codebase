@@ -1,6 +1,6 @@
 diff --git a/lib/index.mjs b/lib/index.mjs
 new file mode 100644
-index 0000000..73975ac
+index 0000000000000000000000000000000000000000..73975acbe19dc6c227557019276413d434c775b3
 --- /dev/null
 +++ b/lib/index.mjs
 @@ -0,0 +1,16 @@
@@ -21,7 +21,7 @@ index 0000000..73975ac
 +  exports_tags as tags
 +};
 diff --git a/package.json b/package.json
-index 99d65a0..4cd9bd0 100644
+index 3deda7bae34b0343a6662305aeec94074344f4de..9861a473b12ef0bfea7788a6d44c24785e00c03a 100644
 --- a/package.json
 +++ b/package.json
 @@ -7,6 +7,7 @@

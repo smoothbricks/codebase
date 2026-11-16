@@ -44,32 +44,20 @@ the upstream installer publishes depth-independent payload paths.
 ## typia output scriptc compiles
 
 scriptc compiles a package's ttsc-emitted JavaScript to a native executable (`scriptc-<arch>-<family>`,
-`packages/nx-plugin/README.md`), and two facts of typia 15.2.1 stop it. Both patches change no validator's behaviour.
+`packages/nx-plugin/README.md`), and two facts of typia 15.4.1 stop it. Both patches change no validator's behaviour.
 
-- `typia@15.2.1.patch`: `FeatureProgrammer.WriteDecomposed` (`native/core/programmers/internal/FeatureProgrammer.go`)
+- `typia@15.4.1.patch`: `FeatureProgrammer.WriteDecomposed` (`native/core/programmers/internal/FeatureProgrammer.go`)
   appended the uninitialized `let errors; let _report;` (validate) and `let _errorFactory;` (assert) after the functor
   helpers and checker closures that read them. That is valid JavaScript, but scriptc 0.4.4 refuses a closure over a
   binding declared after it ("a binding form with no lowering"), so the program built and died on its first invalid
   input. The patch declares those slots first. ttsc builds typia's transformer from `node_modules/typia/native`, so the
   next ttsc run rebuilds it from the patched source.
-- `@typia/interface@15.2.1.patch`: ttsc keeps `import typia from 'typia'` after transforming every call away, and
+- `@typia/interface@15.4.1.patch`: ttsc keeps `import typia from 'typia'` after transforming every call away, and
   `typia/lib/index.mjs` re-exports `tags` from `@typia/interface`, which ships only its tsc CommonJS output (top-level
   `this`, `exports` as a value), which scriptc refuses. The patch adds `lib/index.mjs` (the package's whole runtime
   surface: the `ProtobufWire` enum and an empty `tags` namespace) and an `import` export condition naming it.
 
 Retire each when typia or scriptc removes its cause; bump both with typia.
-
-## Tracked environment reads (samchon/ttsc#1842)
-
-A ttsc plugin is a macro, and its output can depend on an environment variable. The managed `ttsc@0.36.3.patch` carries
-`PluginContext.Env(name)`: it returns `os.LookupEnv(name)` and records the name and value as an input of the compile, as
-Rust's `proc_macro::tracked_env::var` records an expansion's reads. The envelopes carry the record as
-`environmentInputs`, and ttsc's runtime build lane proves it before reusing a stored result.
-`@ttsc%2Funplugin@0.36.3.patch` proves the same record before every reuse: a cached delivery, shared-store adoption and
-project records. A recorded variable whose value changed recompiles. No tool names a variable. A plugin that reads none
-keeps today's keys and proofs. Both patches are the built output of
-[samchon/ttsc#1842](https://github.com/samchon/ttsc/pull/1842) on v0.36.3 (its `lib` diffs from a byte-identical base
-build) and retire when a release includes it. `@smoothbricks/lmao-ttsc` reads `NODE_ENV` this way.
 
 ## Activating a patch change
 
