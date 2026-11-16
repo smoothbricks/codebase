@@ -274,8 +274,8 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 ```
 
 `setup` installs **cowshed's pinned mbx** (specs/cowshed/14_nix.md, "mbx") on every run once storage is up and the
-invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.29.1 and upstream's
-later fixes, plus compact predictions, scheduler admission, grant descriptors, short session roots, Cargo shim-chain
+invoking build is the installed cowshed. It builds the flake the package ships at `nix/mbx` (mbx v1.30.0 as upstream has
+it at 6caed39, plus compact predictions, scheduler admission, grant descriptors, short session roots, Cargo shim-chain
 selection, selected default sysroots, Clippy member keys that stay the same under every installation of a toolchain,
 precompiled-header dependencies listed under every Clang release, generated-source directories shared as `OUT_DIR` is
 when `MBX_SHARE_ENV` names their variable, with a build script's declared dependency on such a variable keyed as the
