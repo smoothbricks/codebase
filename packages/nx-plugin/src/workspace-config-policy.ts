@@ -428,10 +428,12 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
     const catchAll = build.entries.filter((entry) => !('filter' in entry)).at(-1);
     if (catchAll !== undefined) {
       changed = setBooleanProperty(catchAll, 'cache', true);
-    } else {
+    } else if (build.form === 'list') {
       // A list with no entry for every build gets one that caches; the entries it holds stay as written.
       build.list.push({ cache: true });
       changed = true;
+    } else {
+      changed = setBooleanProperty(build.record, 'cache', true);
     }
   }
   for (const entry of build.entries) {
@@ -632,7 +634,11 @@ function recordProperty(record: Record<string, unknown>, key: string): Record<st
  */
 type TargetDefault =
   | { readonly form: 'absent' }
-  | { readonly form: 'record'; readonly entries: readonly Record<string, unknown>[] }
+  | {
+      readonly form: 'record';
+      readonly entries: readonly Record<string, unknown>[];
+      readonly record: Record<string, unknown>;
+    }
   | {
       readonly form: 'list';
       readonly entries: readonly Record<string, unknown>[];
@@ -646,7 +652,7 @@ function targetDefault(nxJson: Record<string, unknown>, targetName: string): Tar
     return { form: 'absent' };
   }
   if (isRecord(value)) {
-    return { form: 'record', entries: [value] };
+    return { form: 'record', entries: [value], record: value };
   }
   if (Array.isArray(value) && value.every(isRecord)) {
     return { form: 'list', entries: [...value], list: value };
