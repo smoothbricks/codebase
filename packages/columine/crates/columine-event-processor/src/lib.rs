@@ -223,7 +223,7 @@ impl From<EpInitError> for CreateFailure {
             | EpInitError::FieldIdentity(IdentityError::OutOfMemory) => Self::MemoryExhausted,
             EpInitError::Config(
                 columine_parsing::ConfigError::MissingDictionary
-                | columine_parsing::ConfigError::EnumDictionaryMismatch,
+                | columine_parsing::ConfigError::EnumDictionaryMismatch { .. },
             ) => Self::SchemaDictionary,
             EpInitError::FieldIdentity(
                 IdentityError::Malformed { .. }

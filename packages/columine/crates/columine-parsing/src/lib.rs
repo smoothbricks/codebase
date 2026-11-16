@@ -1108,29 +1108,29 @@ impl ExtractionConfig {
                     if beneath.iter().any(|schema| schema.is_dynamic()) {
                         dynamic_columns[lookup.column] = true;
                     }
-                    // The arms' enums share the column: its dictionary holds
-                    // the variants of each, each once, as first declared.
-                    let mut variants: Vec<&String> = Vec::new();
-                    let mut enums = 0;
-                    for declared in beneath.iter().filter_map(|schema| schema.enum_variants()) {
-                        enums += 1;
-                        for variant in declared {
-                            if !variants.contains(&variant) {
-                                room(&mut variants, 1)?;
-                                variants.push(variant);
-                            }
+                    // Each enum the arms declare narrows the column's one
+                    // dictionary; a declaration that is no enum has none.
+                    let enums = beneath.iter().filter_map(|schema| schema.enum_variants());
+                    let declared = enums.clone().count();
+                    if declared != 0 {
+                        let checked = if declared == beneath.len() {
+                            enum_in_dictionary(
+                                &self.column_dictionaries,
+                                &self.dictionaries,
+                                lookup.column,
+                                enums.flatten(),
+                            )
+                        } else {
+                            Err(None)
+                        };
+                        if let Err(lacking) = checked {
+                            return Err(enum_mismatch(
+                                event_type,
+                                path_beneath(path, name)?,
+                                lookup.column,
+                                lacking,
+                            )?);
                         }
-                    }
-                    if enums != 0 {
-                        if enums != beneath.len() {
-                            return Err(ConfigError::EnumDictionaryMismatch);
-                        }
-                        check_enum_dictionary(
-                            &self.column_dictionaries,
-                            &self.dictionaries,
-                            lookup.column,
-                            variants,
-                        )?;
                     }
                 }
             }
@@ -1633,9 +1633,18 @@ pub enum ConfigError {
     /// A column is encoded against a schema dictionary the creation call's
     /// table does not hold.
     MissingDictionary,
-    /// An enum member's column is not a schema-dictionary column whose
-    /// non-null values are the enum's variants in order.
-    EnumDictionaryMismatch,
+    /// A member's enum is no subset of its column's dictionary
+    /// (specs/columine/10-physical-vocabulary.md §7): `path` names the
+    /// member from `value`, `column` its column, and `value` the variant the
+    /// dictionary lacks. `value` is `None` when the column is no
+    /// schema-dictionary column, or arms declare the member as an enum and as
+    /// something that is none.
+    EnumDictionaryMismatch {
+        event_type: String,
+        path: String,
+        column: usize,
+        value: Option<String>,
+    },
     /// A Binary field's `sb.cell` names an encoding this processor does not
     /// write.
     CellEncodingMismatch,
@@ -1816,23 +1825,45 @@ fn path_beneath(path: &str, name: &str) -> Result<String, ConfigError> {
     Ok(out)
 }
 
-/// An enum's column is a schema-dictionary column whose values are
-/// `variants` in order.
-fn check_enum_dictionary<'a>(
+/// A member's enum is a subset of its column's dictionary
+/// (specs/columine/10-physical-vocabulary.md §7): `column` is a
+/// schema-dictionary column that holds each of `variants`. The error is the
+/// first variant it lacks, or `None` for a column with no schema dictionary.
+fn enum_in_dictionary<'a>(
     column_dictionaries: &[Option<usize>],
     dictionaries: &[Vec<Option<String>>],
     column: usize,
     variants: impl IntoIterator<Item = &'a String>,
-) -> Result<(), ConfigError> {
+) -> Result<(), Option<&'a String>> {
     let values = column_dictionaries
         .get(column)
         .copied()
         .flatten()
-        .and_then(|position| dictionaries.get(position));
-    match values {
-        Some(values) if values.iter().flatten().eq(variants) => Ok(()),
-        Some(_) | None => Err(ConfigError::EnumDictionaryMismatch),
+        .and_then(|position| dictionaries.get(position))
+        .ok_or(None)?;
+    match variants
+        .into_iter()
+        .find(|variant| !values.iter().flatten().any(|value| value == *variant))
+    {
+        Some(lacking) => Err(Some(lacking)),
+        None => Ok(()),
     }
+}
+
+/// The refusal of a member's enum that is no subset of its column's
+/// dictionary.
+fn enum_mismatch(
+    event_type: &str,
+    path: String,
+    column: usize,
+    lacking: Option<&String>,
+) -> Result<ConfigError, ConfigError> {
+    Ok(ConfigError::EnumDictionaryMismatch {
+        event_type: owned(event_type)?,
+        path,
+        column,
+        value: lacking.map(|value| owned(value)).transpose()?,
+    })
 }
 
 pub fn build_extraction_config(
@@ -2020,10 +2051,10 @@ pub fn build_extraction_config_with_semantic_schemas(
             }
         }
     }
-    // An enum member's column is a schema-dictionary column whose values are
-    // the enum's variants: the wire spells a variant as its text and the
-    // column stores the text's index. The column is resolved as the lanes
-    // resolve it, its discriminated column first.
+    // An enum member's column is a schema-dictionary column that holds the
+    // enum's variants: the wire spells a variant as its text and the column
+    // stores the text's index in the dictionary. The column is resolved as
+    // the lanes resolve it, its discriminated column first.
     if let Some(semantic_schemas) = semantic_schemas {
         for (event_type, schema) in semantic_schemas {
             crate::validate::collect_enum_members(schema, |member, variants| {
@@ -2040,12 +2071,20 @@ pub fn build_extraction_config_with_semantic_schemas(
                         None => return Ok(()),
                     },
                 };
-                check_enum_dictionary(
+                enum_in_dictionary(
                     &column_dictionaries,
                     &schema_dictionaries,
                     lookup.column,
                     variants,
                 )
+                .or_else(|lacking| {
+                    Err(enum_mismatch(
+                        event_type,
+                        path_beneath("value", member)?,
+                        lookup.column,
+                        lacking,
+                    )?)
+                })
             })?;
         }
     }

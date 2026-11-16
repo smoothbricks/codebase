@@ -367,18 +367,19 @@ fn creation_refuses_path_rows_beneath_a_union_with_a_variant_that_is_no_object()
 
 #[test]
 fn enums_the_variants_declare_under_one_path_share_the_columns_dictionary() {
-    // Each once, in the order first declared.
-    assert_eq!(
-        create(&[INNER, OUTER], ["outer", "inner"], sender_rows()).err(),
-        Some(ConfigError::EnumDictionaryMismatch),
-    );
-    create(&[OUTER, INNER], ["outer", "inner"], sender_rows())
-        .expect("the dictionary in the variants' order");
+    // Each arm narrows the one dictionary, whatever its order.
+    create(&[INNER, OUTER], ["outer", "inner"], sender_rows())
+        .expect("the dictionary holds each arm's variant");
     // An enum beside a declaration that is no enum has no dictionary.
     let text_kind = r#"{"kind":"object","fields":{"kind":{"kind":"string"},"from":{"kind":"string"},"agent":{"kind":"string"}}}"#;
     assert_eq!(
         create(&[INNER, text_kind], KINDS, sender_rows()).err(),
-        Some(ConfigError::EnumDictionaryMismatch),
+        Some(ConfigError::EnumDictionaryMismatch {
+            event_type: "held".into(),
+            path: "value.sender.kind".into(),
+            column: KIND,
+            value: None,
+        }),
     );
 }
 //#endregion smoo/columine!n/vocab-member-arms

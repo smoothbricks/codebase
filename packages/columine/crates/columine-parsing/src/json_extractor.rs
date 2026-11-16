@@ -2255,9 +2255,9 @@ mod tests {
     fn an_enum_whose_column_is_not_its_dictionary_is_refused_at_config() {
         let envelope = crate::validate::parse_schema_envelope(ENUM_SCHEMAS).unwrap();
         let (mut fields, dictionaries) = enum_columns();
-        // A column holding the variants in another order.
-        let reordered = [
-            schema_dictionary(0, &["stuck", "achieved"]),
+        // A column whose dictionary lacks one of the enum's variants.
+        let lacking = [
+            schema_dictionary(0, &["stuck", "other"]),
             schema_dictionary(1, &["human"]),
         ];
         let build = |fields: &[SignalSchemaField], dictionaries: &[SchemaDictionary]| {
@@ -2272,8 +2272,13 @@ mod tests {
             .map(|_| ())
         };
         assert_eq!(
-            build(&fields, &reordered),
-            Err(crate::ConfigError::EnumDictionaryMismatch)
+            build(&fields, &lacking),
+            Err(crate::ConfigError::EnumDictionaryMismatch {
+                event_type: "close".into(),
+                path: "value.outcome".into(),
+                column: 2,
+                value: Some("achieved".into()),
+            })
         );
         // A column naming a dictionary the table lacks.
         assert_eq!(
@@ -2284,7 +2289,12 @@ mod tests {
         fields[2] = field(ArrowType::Int32);
         assert_eq!(
             build(&fields, &dictionaries),
-            Err(crate::ConfigError::EnumDictionaryMismatch)
+            Err(crate::ConfigError::EnumDictionaryMismatch {
+                event_type: "close".into(),
+                path: "value.outcome".into(),
+                column: 2,
+                value: None,
+            })
         );
     }
     //#endregion smoo/columine!n/vocab-enum-dictionary

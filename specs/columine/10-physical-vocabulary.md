@@ -186,14 +186,14 @@ The lane descends the member's object and writes each value a row names into tha
 member's column has: a value of the wrong type is a type violation there as in any member's column, and so is a value
 that is not an object where the rows name members beneath it. A member the object does not spell leaves its column's
 cell null, and a null or missing object leaves the cell of every one of its rows null. A value a row places follows its
-own schema as a top-level member does: a dynamic value makes its column dynamic, an enum's column is its dictionary, and
-an optional bounded string's empty text is its empty cell. The rows state every value of the object they place: a member
-beneath it that no row names has no place, carrier or not, and the event that spells it is refused by name
-(`UNPLACED_MEMBER`, with its path from `value`). Two rows of the same path are one placement, the later row's. Creation
-refuses rows of one `(event type, member)` that give a column both to a member and to a member beneath it. Where a
-semantic schema declares the event, creation also refuses a row whose path the schema does not have (a name the object
-at that depth does not declare, or a step beneath a value that is not an object), and, placement being total, a member
-the placed object declares that no row names.
+own schema as a top-level member does: a dynamic value makes its column dynamic, an enum's column is a dictionary that
+holds its variants, and an optional bounded string's empty text is its empty cell. The rows state every value of the
+object they place: a member beneath it that no row names has no place, carrier or not, and the event that spells it is
+refused by name (`UNPLACED_MEMBER`, with its path from `value`). Two rows of the same path are one placement, the later
+row's. Creation refuses rows of one `(event type, member)` that give a column both to a member and to a member beneath
+it. Where a semantic schema declares the event, creation also refuses a row whose path the schema does not have (a name
+the object at that depth does not declare, or a step beneath a value that is not an object), and, placement being total,
+a member the placed object declares that no row names.
 
 **Path rows place a set of arms.** <a id="smoo/columine!n/vocab-member-arms"></a> A member whose value is one of several
 objects (a semantic `union` whose every variant is an object, beneath any `optional`) is a set of arms, and path rows
@@ -202,13 +202,23 @@ has a row. The lane does not ask which variant a value is of: it descends the ob
 that object holds into its row's column, so a member of a variant the value is not of keeps its null cell. The member
 that tells the variants apart is a member like any other, placed by its row with its column's coercion. A value that
 several variants declare under one path has one column. Where they declare it alike it follows that schema. Where they
-differ, a variant that declares it dynamic makes the column dynamic, its empty text is stored as given, and enums make
-the column's dictionary hold the variants of each, each once and in the order first declared; an enum beside a
-declaration that is no enum is refused (`EnumDictionaryMismatch`). Where a semantic schema declares the event, creation
-refuses a row whose path no variant has (`UnknownMemberPath`) and a member of a variant that no row names
-(`UnplacedMember`). A union with a variant that is no object is no set of arms and has no members to place: a path row
-beneath it is refused (`UnknownMemberPath`). Each refusal of a row at creation names what it refuses, the event's type
-and the path from `value`: `UnplacedMember`, `UnknownMemberPath` and `MemberRowsDisagree`.
+differ, a variant that declares it dynamic makes the column dynamic, its empty text is stored as given, and each enum's
+variants are in the column's dictionary; an enum beside a declaration that is no enum is refused
+(`EnumDictionaryMismatch`). Where a semantic schema declares the event, creation refuses a row whose path no variant has
+(`UnknownMemberPath`) and a member of a variant that no row names (`UnplacedMember`). A union with a variant that is no
+object is no set of arms and has no members to place: a path row beneath it is refused (`UnknownMemberPath`). Each
+refusal of a row at creation names what it refuses, the event's type and the path from `value`: `UnplacedMember`,
+`UnknownMemberPath` and `MemberRowsDisagree`.
+
+**A member's enum is a subset of its column's dictionary.** <a id="smoo/columine!n/vocab-enum-subset"></a> An enum
+member's column is a schema-dictionary column, and every variant the member's enum declares is one of that dictionary's
+values, in any order. The dictionary is the column's: several members, or the arms of one, may each narrow it to the
+variants they admit. A value outside the member's own enum is refused at the member, as its schema says, whether or not
+the dictionary holds it; a value the member admits is stored as its index in the dictionary. Creation refuses a member's
+enum whose column is no schema-dictionary column, or whose dictionary lacks one of its variants
+(`EnumDictionaryMismatch`), and names the event's type, the member's path from `value`, the column's ordinal and the
+variant the dictionary lacks. The rule is one for a member a row places whole, a value a path row places, and, in a
+schema with no discriminator, a member in the column named for it.
 
 **A row may hold a cell by its column's ordinal.** <a id="smoo/columine!n/vocab-ordinal-cells"></a> On the MessagePack
 lane a top-level key of a row's map that is an unsigned integer is a column's ordinal: the field index a placement row's
