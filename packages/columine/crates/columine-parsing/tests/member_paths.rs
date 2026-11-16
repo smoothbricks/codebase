@@ -400,23 +400,29 @@ fn a_member_beneath_a_placed_object_that_no_row_names_is_refused_by_name() {
 #[test]
 fn creation_refuses_a_declared_member_no_column_and_no_row_places() {
     let refused = |members| create(Some(ENVELOPE), members).err();
+    let unplaced = |path: &str| {
+        Some(ConfigError::UnplacedMember {
+            event_type: "order".into(),
+            path: path.into(),
+        })
+    };
     assert_eq!(
         refused(Vec::new()),
-        Some(ConfigError::UnplacedMember),
+        unplaced("value.range"),
         "`range` has neither a column nor rows"
     );
     let mut rows = range_rows();
     rows.remove(1);
     assert_eq!(
         refused(rows),
-        Some(ConfigError::UnplacedMember),
+        unplaced("value.range.hi"),
         "`range.hi` is declared and no row names it"
     );
     let mut rows = range_rows();
     rows.truncate(2);
     assert_eq!(
         refused(rows),
-        Some(ConfigError::UnplacedMember),
+        unplaced("value.range.unit"),
         "`range.unit` is declared and no row names a value of it"
     );
 }
@@ -430,44 +436,39 @@ fn creation_refuses_a_row_whose_path_the_schema_does_not_have() {
     };
     let mut beneath_a_number = range_rows();
     beneath_a_number[0] = row("range", &["lo", "digits"], LO);
-    for (rows, why) in [
-        (
-            with(row("range", &["mid"], HI)),
-            "`range` declares no `mid`",
-        ),
-        (beneath_a_number, "`range.lo` is not an object"),
+    for (rows, path) in [
+        (with(row("range", &["mid"], HI)), "value.range.mid"),
+        (beneath_a_number, "value.range.lo.digits"),
         (
             with(row("order_id", &["first"], HI)),
-            "`order_id` is not an object",
+            "value.order_id.first",
         ),
     ] {
         assert_eq!(
             create(Some(ENVELOPE), rows).err(),
-            Some(ConfigError::UnknownMemberPath),
-            "{why}"
+            Some(ConfigError::UnknownMemberPath {
+                event_type: "order".into(),
+                path: path.into(),
+            }),
         );
     }
 }
 
 #[test]
 fn creation_refuses_rows_that_place_a_member_and_a_member_beneath_it() {
-    for (extra, why) in [
-        (row("range", &[], LO), "the whole member after its values"),
-        (
-            row("range", &["unit"], UNIT_NAME),
-            "an object after its values",
-        ),
-        (
-            row("range", &["lo", "digits"], HI),
-            "a value beneath a placed value",
-        ),
+    for (extra, path) in [
+        (row("range", &[], LO), "value.range"),
+        (row("range", &["unit"], UNIT_NAME), "value.range.unit"),
+        (row("range", &["lo", "digits"], HI), "value.range.lo.digits"),
     ] {
         let mut rows = range_rows();
         rows.push(extra);
         assert_eq!(
             create(None, rows).err(),
-            Some(ConfigError::MemberRowsDisagree),
-            "{why}"
+            Some(ConfigError::MemberRowsDisagree {
+                event_type: "order".into(),
+                path: path.into(),
+            }),
         );
     }
     // The same path twice is one placement, the later row's.

@@ -902,6 +902,53 @@ impl SemanticSchema {
         }
     }
 
+    /// The objects a value of this schema may be, beneath any `optional`,
+    /// each as its fields appended to `out`: an object, or every variant of
+    /// a union of objects, its arms. False when a value may be no object.
+    pub(crate) fn arms<'a>(
+        &'a self,
+        out: &mut Vec<&'a [(String, Self)]>,
+    ) -> Result<bool, std::collections::TryReserveError> {
+        match self {
+            Self::Optional(inner) => inner.arms(out),
+            Self::Object { fields, .. } => {
+                out.try_reserve(1)?;
+                out.push(fields);
+                Ok(true)
+            }
+            Self::Union(variants) => {
+                let mut objects = true;
+                for variant in variants {
+                    objects &= variant.arms(out)?;
+                }
+                Ok(objects)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// How a value of this schema declares the member `name` beneath it,
+    /// beneath any `optional`. Extraction does not know which arm of a union
+    /// a value conformed to, so beneath a union it is the declaration only
+    /// when every variant that declares the member declares it alike.
+    pub(crate) fn member_beneath(&self, name: &str) -> Option<&Self> {
+        match self {
+            Self::Optional(inner) => inner.member_beneath(name),
+            Self::Object { fields, .. } => fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, schema)| schema),
+            Self::Union(variants) => {
+                let mut declared = variants
+                    .iter()
+                    .filter_map(|variant| variant.member_beneath(name));
+                let first = declared.next()?;
+                declared.all(|other| other == first).then_some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// The variants of an enum, beneath any `optional`; none for any other
     /// kind.
     pub(crate) fn enum_variants(&self) -> Option<&[String]> {

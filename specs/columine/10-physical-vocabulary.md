@@ -195,6 +195,21 @@ semantic schema declares the event, creation also refuses a row whose path the s
 at that depth does not declare, or a step beneath a value that is not an object), and, placement being total, a member
 the placed object declares that no row names.
 
+**Path rows place a set of arms.** <a id="smoo/columine!n/vocab-member-arms"></a> A member whose value is one of several
+objects (a semantic `union` whose every variant is an object, beneath any `optional`) is a set of arms, and path rows
+place it as they place an object. A path row names a member of at least one variant, and every member of every variant
+has a row. The lane does not ask which variant a value is of: it descends the object it is given and writes each value
+that object holds into its row's column, so a member of a variant the value is not of keeps its null cell. The member
+that tells the variants apart is a member like any other, placed by its row with its column's coercion. A value that
+several variants declare under one path has one column. Where they declare it alike it follows that schema. Where they
+differ, a variant that declares it dynamic makes the column dynamic, its empty text is stored as given, and enums make
+the column's dictionary hold the variants of each, each once and in the order first declared; an enum beside a
+declaration that is no enum is refused (`EnumDictionaryMismatch`). Where a semantic schema declares the event, creation
+refuses a row whose path no variant has (`UnknownMemberPath`) and a member of a variant that no row names
+(`UnplacedMember`). A union with a variant that is no object is no set of arms and has no members to place: a path row
+beneath it is refused (`UnknownMemberPath`). Each refusal of a row at creation names what it refuses, the event's type
+and the path from `value`: `UnplacedMember`, `UnknownMemberPath` and `MemberRowsDisagree`.
+
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
 at the top of a cell that takes it reaches the seam unread, as its payload bytes: its view's kind is `unknown` and

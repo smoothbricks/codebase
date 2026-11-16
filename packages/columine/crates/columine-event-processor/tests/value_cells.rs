@@ -441,7 +441,11 @@ fn creation_without_an_embedder_refuses_a_record_row_and_a_text_column() {
 #[test]
 fn a_declared_member_with_neither_a_column_nor_a_routing_row_refuses_creation() {
     let envelope = r#"{"order":{"kind":"object","fields":{"name":{"kind":"string"},"qty":{"kind":"number"},"lost":{"kind":"string"}}}}"#;
-    let unplaced = Some(EpInitError::Config(ConfigError::UnplacedMember));
+
+    let unplaced = Some(EpInitError::Config(ConfigError::UnplacedMember {
+        event_type: "order".into(),
+        path: "value.lost".into(),
+    }));
     assert_eq!(
         embedded(record_schema(Some(ENCODING), envelope)).err(),
         unplaced

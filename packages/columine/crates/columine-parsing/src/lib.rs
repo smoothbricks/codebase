@@ -382,7 +382,7 @@ impl Placed {
     /// Put the value `path` leads to in `lookup`'s column. A later row of
     /// the same path replaces the earlier one; a column for a member and for
     /// a member beneath it is refused.
-    fn bind(&mut self, path: &[String], lookup: FieldLookup) -> Result<(), ConfigError> {
+    fn bind(&mut self, path: &[String], lookup: FieldLookup) -> Result<(), RowRefusal> {
         match (self, path.split_first()) {
             (Self::Column(held), None) => {
                 *held = lookup;
@@ -394,16 +394,15 @@ impl Placed {
                     Err(index) => {
                         members
                             .try_reserve(1)
-                            .map_err(|_| ConfigError::OutOfMemory)?;
-                        members.insert(index, (owned(name)?, Self::opened(rest, lookup)));
+                            .map_err(|_| RowRefusal::OutOfMemory)?;
+                        let name = owned(name).map_err(|_| RowRefusal::OutOfMemory)?;
+                        members.insert(index, (name, Self::opened(rest, lookup)));
                         index
                     }
                 };
                 members[index].1.bind(rest, lookup)
             }
-            (Self::Column(_), Some(_)) | (Self::Members(_), None) => {
-                Err(ConfigError::MemberRowsDisagree)
-            }
+            (Self::Column(_), Some(_)) | (Self::Members(_), None) => Err(RowRefusal::Disagree),
         }
     }
 
@@ -493,16 +492,14 @@ impl<'a> MemberPath<'a> {
 }
 
 impl<'a> MemberSchema<'a> {
-    /// How the member's object schema declares the member `name` beneath it.
-    /// A name it does not declare is unjudged: no row places it, so the lane
-    /// refuses it whatever its schema.
+    /// How the member's schema declares the member `name` beneath it
+    /// ([`crate::validate::SemanticSchema::member_beneath`]). A name it does
+    /// not declare, or that its arms declare differently, is unjudged.
     pub(crate) fn beneath(self, name: &str) -> Self {
         match self {
             Self::Declared(schema) => schema
-                .object_fields()
-                .iter()
-                .find(|(field, _)| field == name)
-                .map_or(Self::Unjudged, |(_, field)| Self::Declared(field)),
+                .member_beneath(name)
+                .map_or(Self::Unjudged, Self::Declared),
             Self::Unjudged | Self::UndeclaredOpen => Self::Unjudged,
         }
     }
@@ -992,59 +989,122 @@ impl ExtractionConfig {
             };
             for (member, declared) in fields {
                 if let Some(Placed::Members(rows)) = self.variant_map.get(event_type, member) {
-                    self.check_path_rows(declared, rows, dynamic_columns)?;
+                    self.check_path_rows(
+                        event_type,
+                        &path_beneath("value", member)?,
+                        &[declared],
+                        rows,
+                        dynamic_columns,
+                    )?;
                     continue;
                 }
                 let placed = self.placed_column(event_type, member).is_some()
                     || self.record_routes.get(event_type, member).is_some()
                     || self.subtype_routes.get(event_type, member).is_some();
                 if !placed {
-                    return Err(ConfigError::UnplacedMember);
+                    return Err(ConfigError::UnplacedMember {
+                        event_type: owned(event_type)?,
+                        path: path_beneath("value", member)?,
+                    });
                 }
             }
         }
         Ok(())
     }
 
-    /// The path rows beneath one member against the schema that declares it
+    /// The path rows beneath the value at `path` against the schemas that
+    /// declare it, one per arm that does
     /// (specs/columine/10-physical-vocabulary.md §7 "A placement row may name
-    /// a path"): the member is an object, every row names a member it
-    /// declares, and every member it declares has a row. A value a row
-    /// places follows its own schema: a dynamic one makes its column dynamic
-    /// and an enum's column is its dictionary.
+    /// a path", "Path rows place a set of arms"): every value it may be is an
+    /// object, every row names a member one of those objects declares, and
+    /// every member any of them declares has a row. A value a row places
+    /// follows its own schema: a dynamic one makes its column dynamic and an
+    /// enum's column is its dictionary.
     fn check_path_rows(
         &self,
-        schema: &crate::validate::SemanticSchema,
+        event_type: &str,
+        path: &str,
+        declared: &[&crate::validate::SemanticSchema],
         rows: &[(String, Placed)],
         dynamic_columns: &mut [bool],
     ) -> Result<(), ConfigError> {
-        let mut object = schema;
-        while let crate::validate::SemanticSchema::Optional(inner) = object {
-            object = inner;
-        }
-        let crate::validate::SemanticSchema::Object { fields, .. } = object else {
-            return Err(ConfigError::UnknownMemberPath);
+        let unknown = |name: &str| {
+            Ok::<_, ConfigError>(ConfigError::UnknownMemberPath {
+                event_type: owned(event_type)?,
+                path: path_beneath(path, name)?,
+            })
         };
-        if rows
-            .iter()
-            .any(|(name, _)| !fields.iter().any(|(field, _)| field == name))
-        {
-            return Err(ConfigError::UnknownMemberPath);
+        let unplaced = |name: &str| {
+            Ok::<_, ConfigError>(ConfigError::UnplacedMember {
+                event_type: owned(event_type)?,
+                path: path_beneath(path, name)?,
+            })
+        };
+        let mut arms = Vec::new();
+        let mut objects = true;
+        for schema in declared {
+            objects &= schema
+                .arms(&mut arms)
+                .map_err(|_| ConfigError::OutOfMemory)?;
         }
-        for (name, declared) in fields {
-            match placed_beneath(rows, name) {
-                None => return Err(ConfigError::UnplacedMember),
-                Some(Placed::Members(beneath)) => {
-                    self.check_path_rows(declared, beneath, dynamic_columns)?;
+        let declares = |fields: &[(String, crate::validate::SemanticSchema)], name: &str| {
+            fields.iter().any(|(field, _)| field == name)
+        };
+        for (name, _) in rows {
+            if !objects || !arms.iter().any(|fields| declares(fields, name)) {
+                return Err(unknown(name)?);
+            }
+        }
+        for (name, _) in arms.iter().copied().flatten() {
+            if placed_beneath(rows, name).is_none() {
+                return Err(unplaced(name)?);
+            }
+        }
+        for (name, placed) in rows {
+            let mut beneath = Vec::new();
+            for (_, schema) in arms
+                .iter()
+                .copied()
+                .flatten()
+                .filter(|(field, _)| field == name)
+            {
+                room(&mut beneath, 1)?;
+                beneath.push(schema);
+            }
+            match placed {
+                Placed::Members(rows) => {
+                    self.check_path_rows(
+                        event_type,
+                        &path_beneath(path, name)?,
+                        &beneath,
+                        rows,
+                        dynamic_columns,
+                    )?;
                 }
-                Some(Placed::Column(lookup)) => {
+                Placed::Column(lookup) => {
                     if self.member_write(lookup.column).is_none() {
-                        return Err(ConfigError::UnplacedMember);
+                        return Err(unplaced(name)?);
                     }
-                    if declared.is_dynamic() {
+                    if beneath.iter().any(|schema| schema.is_dynamic()) {
                         dynamic_columns[lookup.column] = true;
                     }
-                    if let Some(variants) = declared.enum_variants() {
+                    // The arms' enums share the column: its dictionary holds
+                    // the variants of each, each once, as first declared.
+                    let mut variants: Vec<&String> = Vec::new();
+                    let mut enums = 0;
+                    for declared in beneath.iter().filter_map(|schema| schema.enum_variants()) {
+                        enums += 1;
+                        for variant in declared {
+                            if !variants.contains(&variant) {
+                                room(&mut variants, 1)?;
+                                variants.push(variant);
+                            }
+                        }
+                    }
+                    if enums != 0 {
+                        if enums != beneath.len() {
+                            return Err(ConfigError::EnumDictionaryMismatch);
+                        }
                         check_enum_dictionary(
                             &self.column_dictionaries,
                             &self.dictionaries,
@@ -1541,7 +1601,7 @@ pub(crate) fn signed_text(field: SignalSchemaField, text: &str) -> Option<i64> {
     }
     instant::parse_instant(text, columine_arrow::time_unit(field.type_param)?).ok()
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConfigError {
     FieldNameCountMismatch,
     DuplicateFieldName,
@@ -1559,16 +1619,27 @@ pub enum ConfigError {
     /// A Binary field's `sb.cell` names an encoding this processor does not
     /// write.
     CellEncodingMismatch,
-    /// A member an event's object schema declares resolves to no column and
-    /// no record routing row.
-    UnplacedMember,
-    /// A placement row's path names, under an event's semantic schema, a
-    /// member the object at that depth does not declare, or a step beneath a
-    /// value that is not an object.
-    UnknownMemberPath,
+    /// A member an event's schema declares resolves to no column, no record
+    /// routing row and no path row: `path` names it from `value`.
+    UnplacedMember {
+        event_type: String,
+        path: String,
+    },
+    /// A placement row's path is one the event's semantic schema does not
+    /// have. `path` is the row's path from `value` as far as its first such
+    /// step: a member no object there declares, or a member beneath a value
+    /// that may be no object.
+    UnknownMemberPath {
+        event_type: String,
+        path: String,
+    },
     /// Placement rows of one `(discriminant, member)` give a column both to a
-    /// member and to a member beneath it.
-    MemberRowsDisagree,
+    /// member and to a member beneath it. `path` is the path, from `value`,
+    /// of the row that disagrees with those before it.
+    MemberRowsDisagree {
+        event_type: String,
+        path: String,
+    },
     /// Record routing rows without a discriminator key, or without a
     /// [`DECLARED_RECORD_COLUMN_NAME`] Binary column the processor writes.
     RecordColumnMissing,
@@ -1707,13 +1778,31 @@ fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
         .map_err(|_| ConfigError::InvalidPresenceField)
 }
 
-/// An enum's column is a schema-dictionary column whose values are the
-/// enum's variants in order.
-fn check_enum_dictionary(
+/// Why a placement row does not bind.
+enum RowRefusal {
+    OutOfMemory,
+    /// A column for a member and for a member beneath it.
+    Disagree,
+}
+
+/// The member `name` beneath `path`, as a refusal names it.
+fn path_beneath(path: &str, name: &str) -> Result<String, ConfigError> {
+    let mut out = String::new();
+    out.try_reserve_exact(path.len() + 1 + name.len())
+        .map_err(|_| ConfigError::OutOfMemory)?;
+    out.push_str(path);
+    out.push('.');
+    out.push_str(name);
+    Ok(out)
+}
+
+/// An enum's column is a schema-dictionary column whose values are
+/// `variants` in order.
+fn check_enum_dictionary<'a>(
     column_dictionaries: &[Option<usize>],
     dictionaries: &[Vec<Option<String>>],
     column: usize,
-    variants: &[String],
+    variants: impl IntoIterator<Item = &'a String>,
 ) -> Result<(), ConfigError> {
     let values = column_dictionaries
         .get(column)
@@ -1890,11 +1979,25 @@ pub fn build_extraction_config_with_semantic_schemas(
                 column: member.column,
                 field: *field,
             };
-            variant_map
+            let bound = variant_map
                 .entry(&member.discriminant, &member.member, || {
                     Ok(Placed::opened(&member.path, lookup))
                 })?
-                .bind(&member.path, lookup)?;
+                .bind(&member.path, lookup);
+            match bound {
+                Ok(()) => {}
+                Err(RowRefusal::OutOfMemory) => return Err(ConfigError::OutOfMemory),
+                Err(RowRefusal::Disagree) => {
+                    let mut path = path_beneath("value", &member.member)?;
+                    for name in &member.path {
+                        path = path_beneath(&path, name)?;
+                    }
+                    return Err(ConfigError::MemberRowsDisagree {
+                        event_type: owned(&member.discriminant)?,
+                        path,
+                    });
+                }
+            }
         }
     }
     // An enum member's column is a schema-dictionary column whose values are

@@ -330,7 +330,10 @@ fn creation_refuses_a_declared_member_no_row_names_whatever_columns_exist() {
                 Some(vec![row("order", "order_id", ORDER_ID)])
             )
             .err(),
-            Some(ConfigError::UnplacedMember),
+            Some(ConfigError::UnplacedMember {
+                event_type: "order".into(),
+                path: "value.note".into(),
+            }),
             "carrier {carrier}: `note` has a column named for it and no row"
         );
         assert!(
