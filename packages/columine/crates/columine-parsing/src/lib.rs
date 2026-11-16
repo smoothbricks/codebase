@@ -879,6 +879,26 @@ impl ExtractionConfig {
         }
     }
 
+    /// The column an ordinal key names and how its cell is written
+    /// (specs/columine/10-physical-vocabulary.md §7 "A row may hold a cell by
+    /// its column's ordinal"), or `None` for an ordinal no member's cell has:
+    /// one past the fields, a column only the lane writes, a presence column.
+    pub(crate) fn ordinal_place(&self, column: usize) -> Option<(FieldLookup, MemberWrite)> {
+        let (_, field) = self.field_entries.get(column)?;
+        if self
+            .presence_entries
+            .iter()
+            .any(|(presence, _)| *presence == column)
+        {
+            return None;
+        }
+        let lookup = FieldLookup {
+            column,
+            field: *field,
+        };
+        Some((lookup, self.member_write(column)?))
+    }
+
     /// Who writes the carrier of undeclared members.
     pub(crate) fn carrier(&self) -> Carrier {
         let Some(column) = self.fallback_column else {

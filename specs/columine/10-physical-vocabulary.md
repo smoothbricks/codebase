@@ -210,6 +210,20 @@ refuses a row whose path no variant has (`UnknownMemberPath`) and a member of a 
 beneath it is refused (`UnknownMemberPath`). Each refusal of a row at creation names what it refuses, the event's type
 and the path from `value`: `UnplacedMember`, `UnknownMemberPath` and `MemberRowsDisagree`.
 
+**A row may hold a cell by its column's ordinal.** <a id="smoo/columine!n/vocab-ordinal-cells"></a> On the MessagePack
+lane a top-level key of a row's map that is an unsigned integer is a column's ordinal: the field index a placement row's
+`column` holds. Its value is that column's cell, written as the value of a member whose row names the column is written:
+the column's coercion (§8) or its seam (the embedder's member cell, a raw cell's bytes, a text's hash with the lane
+filling its inline column), its dictionary, and the column's own null. No row, no name and no semantic schema is read,
+so the cell lands in a schema with or without a discriminator, whatever the row's type and whether or not a placement
+row names the column. A string key keeps its meaning, and one row may hold both kinds. Integer keys are the flat
+spelling: a row that holds one and a nested `value` object is refused as a row of two spellings is. An ordinal that
+names no column a member can be written to is refused by its number (`UnknownColumn`): one past the schema's fields, the
+carrier, the declared record, a text's inline column, a presence column. From a row's first ordinal key on, a column is
+written once: a second write of it in that row, by an ordinal or by a member a row places there, is refused by the
+column's ordinal (`ColumnWrittenTwice`). A key inside `value` or any other nested map is never an ordinal, and a key
+that is a negative integer, a float or bytes is refused as before. The JSON lane has no integer keys.
+
 **An opaque value is the embedder's.** An embedder may reserve one MessagePack extension type at creation
 (`DynamicSchemaConfig::opaque_ext`) for values it encodes itself, which a `ValueView` cannot carry. A value of that type
 at the top of a cell that takes it reaches the seam unread, as its payload bytes: its view's kind is `unknown` and

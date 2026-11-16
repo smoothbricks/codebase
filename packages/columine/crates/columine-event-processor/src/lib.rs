@@ -1312,7 +1312,11 @@ impl Plane {
                 | json_extractor::ExtractionError::Category(_)
                 | json_extractor::ExtractionError::Cell(_)
                 | json_extractor::ExtractionError::OpaqueValue { .. }
-                | json_extractor::ExtractionError::UnplacedMember { .. } => ResultCode::ParseError,
+                | json_extractor::ExtractionError::UnplacedMember { .. }
+                | json_extractor::ExtractionError::UnknownColumn { .. }
+                | json_extractor::ExtractionError::ColumnWrittenTwice { .. } => {
+                    ResultCode::ParseError
+                }
             };
             // JSON carries a per-field diagnostic; MessagePack derives
             // stage/detail from its error at this level.
@@ -1352,6 +1356,14 @@ impl Plane {
                     }
                     json_extractor::ExtractionError::UnplacedMember { .. } => {
                         (diagnostic_detail::UNPLACED_MEMBER, 0)
+                    }
+                    // An ordinal no member's cell has is a cell nothing
+                    // places; a column written twice is a malformed row.
+                    json_extractor::ExtractionError::UnknownColumn { .. } => {
+                        (diagnostic_detail::UNPLACED_MEMBER, 0)
+                    }
+                    json_extractor::ExtractionError::ColumnWrittenTwice { .. } => {
+                        (diagnostic_detail::INVALID_JSON, 0)
                     }
                     json_extractor::ExtractionError::Cell(_) => {
                         (diagnostic_detail::CELL_REFUSED, 0)

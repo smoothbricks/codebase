@@ -194,6 +194,9 @@ fn extract_msgpack_fields(
     };
     let mut saw_nested_value = false;
     let mut saw_flat_value_key = false;
+    // Whether the row has held an ordinal key: from then on a column is
+    // written once.
+    let mut ordinals = false;
     let mut column_name = String::new();
     let row = RowStart {
         input: reader.input(),
@@ -211,6 +214,25 @@ fn extract_msgpack_fields(
     // for it, so routing never depends on key order.
     let mut event_type: Option<&str> = None;
     for field_index in 0..fields {
+        // A key that is an unsigned integer is a column's ordinal
+        // (specs/columine/10-physical-vocabulary.md §7 "A row may hold a cell
+        // by its column's ordinal"), a cell of the flat spelling.
+        if matches!(
+            reader.input().get(reader.position()),
+            Some(0x00..=0x7f | 0xcc..=0xcf)
+        ) {
+            let ordinal = reader
+                .read_unsigned_integer()
+                .ok_or(ExtractionError::InvalidJson)?;
+            if saw_nested_value {
+                return Err(ExtractionError::InvalidJson);
+            }
+            ordinals = true;
+            extract_ordinal_cell(
+                reader, config, columns, frames, ordinal, image, cells, scratch,
+            )?;
+            continue;
+        }
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
         let key_end = reader.position();
@@ -227,7 +249,7 @@ fn extract_msgpack_fields(
                 .and_then(|bytes| std::str::from_utf8(bytes).ok());
         }
         if saw_nested_value && key.starts_with(b"value.")
-            || saw_flat_value_key && key == b"value" && config.has_value_fields
+            || (saw_flat_value_key || ordinals) && key == b"value" && config.has_value_fields
         {
             // One spelling per event: the validator judges the nested form,
             // and a second spelling in the same event would let the judged
@@ -295,6 +317,7 @@ fn extract_msgpack_fields(
                     member_start,
                     member_end,
                     true,
+                    ordinals,
                     row,
                     image,
                     cells,
@@ -327,6 +350,7 @@ fn extract_msgpack_fields(
             key_start,
             key_end,
             flat_member.is_some(),
+            ordinals,
             row,
             image,
             cells,
@@ -456,6 +480,7 @@ fn extract_msgpack_member(
     key_start: usize,
     key_end: usize,
     payload: bool,
+    ordinals: bool,
     row: RowStart<'_>,
     image: &mut dyn CategoryImage,
     cells: &mut CellWriter<'_>,
@@ -505,6 +530,7 @@ fn extract_msgpack_member(
                 rows,
                 member_schema,
                 &MemberPath::top(member),
+                ordinals,
                 image,
                 cells,
                 scratch,
@@ -516,6 +542,7 @@ fn extract_msgpack_member(
         None => None,
     };
     if let Some((lookup, write)) = lookup {
+        written_once(columns, lookup.column, ordinals)?;
         return write_member_column(
             reader,
             config,
@@ -627,6 +654,80 @@ fn extract_msgpack_member(
     Ok(())
 }
 
+/// From a row's first ordinal key on a column is written once
+/// (specs/columine/10-physical-vocabulary.md §7 "A row may hold a cell by its
+/// column's ordinal"): refuse a write of a `column` the row has written.
+fn written_once(
+    columns: &DynamicColumns,
+    column: usize,
+    ordinals: bool,
+) -> Result<(), ExtractionError> {
+    if ordinals && columns.columns_seen[column] {
+        return Err(ExtractionError::ColumnWrittenTwice { ordinal: column });
+    }
+    Ok(())
+}
+
+/// `number` in decimal, in the tail of `digits`.
+fn decimal(mut number: u64, digits: &mut [u8; 20]) -> &str {
+    let mut start = digits.len();
+    for digit in digits.iter_mut().rev() {
+        *digit = b'0' + u8::try_from(number % 10).unwrap_or_default();
+        number /= 10;
+        start -= 1;
+        if number == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&digits[start..]).unwrap_or_default()
+}
+
+/// Write the cell a row holds by its column's ordinal
+/// (specs/columine/10-physical-vocabulary.md §7 "A row may hold a cell by its
+/// column's ordinal"): the write a member whose row names the column gets,
+/// with no row, name or schema read. An ordinal that names no column a member
+/// is written to is refused by its number.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one column write: the lane's state and the ordinal"
+)]
+fn extract_ordinal_cell(
+    reader: &mut Reader<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    frames: &mut FrameWrites<'_>,
+    ordinal: u64,
+    image: &mut dyn CategoryImage,
+    cells: &mut CellWriter<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), ExtractionError> {
+    let place = usize::try_from(ordinal)
+        .ok()
+        .and_then(|column| config.ordinal_place(column));
+    let Some((lookup, write)) = place else {
+        return Err(ExtractionError::UnknownColumn { ordinal });
+    };
+    written_once(columns, lookup.column, true)?;
+    // A refusal of the reserved opaque extension names the cell by its
+    // ordinal.
+    let mut digits = [0; 20];
+    write_member_column(
+        reader,
+        config,
+        columns,
+        frames,
+        lookup,
+        write,
+        MemberSchema::Unjudged,
+        EmptyCell::NULL,
+        None,
+        decimal(ordinal, &mut digits),
+        config.opaque_ext.is_some_and(|ext| holds_ext(reader, ext)),
+        image,
+        cells,
+        scratch,
+    )
+}
 /// Write one member's value into the column that places it: the lane's own
 /// coercion, or the value-cell seam's cell. `member_path` keys the capture of
 /// what an open object beneath the member does not declare, and `cell_path`
@@ -728,6 +829,7 @@ fn extract_placed_object(
     rows: &[(String, Placed)],
     schema: MemberSchema<'_>,
     path: &MemberPath<'_>,
+    ordinals: bool,
     image: &mut dyn CategoryImage,
     cells: &mut CellWriter<'_>,
     scratch: &mut Vec<u8>,
@@ -763,6 +865,7 @@ fn extract_placed_object(
                     beneath,
                     member_schema,
                     &member_path,
+                    ordinals,
                     image,
                     cells,
                     scratch,
@@ -784,6 +887,7 @@ fn extract_placed_object(
             reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
             continue;
         }
+        written_once(columns, lookup.column, ordinals)?;
         // Only a reserved opaque extension's refusal names the cell.
         let opaque_here = config.opaque_ext.is_some_and(|ext| holds_ext(reader, ext));
         let cell_path = if config.opaque_ext.is_some() {

@@ -48,6 +48,16 @@ pub enum ExtractionError {
     UnplacedMember {
         path: String,
     },
+    /// An ordinal key of a row that names no column a member can be written
+    /// to (specs/columine/10-physical-vocabulary.md §7 "A row may hold a cell
+    /// by its column's ordinal").
+    UnknownColumn {
+        ordinal: u64,
+    },
+    /// A second write of one column in a row that holds an ordinal key.
+    ColumnWrittenTwice {
+        ordinal: usize,
+    },
 }
 
 /// A lexer refusal at the extraction boundary: memory the lexer could not
@@ -255,9 +265,10 @@ impl ExtractionDiagnostic {
             ExtractionError::WorkBufferTooSmall => diagnostic_stage::MSGPACK,
             ExtractionError::UnwrittenProjection => diagnostic_stage::VALIDATION,
             ExtractionError::Cell(_) => diagnostic_stage::VALUE,
-            ExtractionError::OpaqueValue { .. } | ExtractionError::UnplacedMember { .. } => {
-                diagnostic_stage::VALUE
-            }
+            ExtractionError::OpaqueValue { .. }
+            | ExtractionError::UnplacedMember { .. }
+            | ExtractionError::UnknownColumn { .. }
+            | ExtractionError::ColumnWrittenTwice { .. } => diagnostic_stage::VALUE,
         };
         self.detail = match failure {
             ExtractionError::InvalidJson => diagnostic_detail::INVALID_JSON,
@@ -272,6 +283,8 @@ impl ExtractionDiagnostic {
             ExtractionError::Cell(_) => diagnostic_detail::CELL_REFUSED,
             ExtractionError::OpaqueValue { .. } => diagnostic_detail::OPAQUE_VALUE,
             ExtractionError::UnplacedMember { .. } => diagnostic_detail::UNPLACED_MEMBER,
+            ExtractionError::UnknownColumn { .. } => diagnostic_detail::UNPLACED_MEMBER,
+            ExtractionError::ColumnWrittenTwice { .. } => diagnostic_detail::INVALID_JSON,
         };
     }
 }
