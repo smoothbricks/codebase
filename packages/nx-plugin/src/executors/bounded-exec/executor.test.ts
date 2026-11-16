@@ -2137,7 +2137,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
    * A prebuilt nextest leaf whose run's stand-in endpoint records what it was asked for, and whether the fixture had
    * run by then, and grants all it was asked for.
    */
-  const reservedNextest = async (fixtureCommand: string, unitsCommand: string, fixtureTimeoutMs: number) => {
+  const reservedNextest = async (fixtureCommand: string, unitsCommand: string | null, fixtureTimeoutMs: number) => {
     const workspace = await createWorkspace();
     const bin = join(workspace.root, 'stand-in-cargo');
     await mkdir(bin);
@@ -2165,7 +2165,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           command: 'cargo nextest run --binaries-metadata m.json --test-threads=6',
           fixtureCommand,
           fixtureTimeoutMs,
-          unitsCommand,
+          ...(unitsCommand === null ? {} : { unitsCommand }),
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           killAfterMs: 0,
         },
@@ -2183,6 +2183,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   };
 
+  //#region smoo/cowshed!n/build-precedes-reservation
   it('builds a reserved leaf’s fixture before it reserves, then asks for no more cores than it has units', async () => {
     // A prebuilt nextest piece knows its tests only once its fixture has written the test build's metadata; reserved
     // for every core it can use, a piece of two slow tests held the idle rest of its grant for its whole run.
@@ -2214,6 +2215,27 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('fixtureTimeoutMs=150');
     expect(reservation).toBeNull();
   });
+
+  it('builds the fixture of a reserved leaf that counts no units before it reserves', async () => {
+    const { result, reservation } = await reservedNextest(
+      'printf built > fixture-ran',
+      null,
+      BOUNDED_TEST_IDLE_TIMEOUT_MS,
+    );
+
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(reservation).toMatchObject({ fixtureRan: true });
+  });
+
+  it('holds no grant while a reserved leaf’s fixture waits', async () => {
+    // A fixture waiting on Cargo's build-directory lock under a grant held the cores the lock's holder waited for.
+    const { result, reservation } = await reservedNextest('node -e "process.stdin.resume()"', null, 150);
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Fixture command timed out after');
+    expect(reservation).toBeNull();
+  });
+  //#endregion smoo/cowshed!n/build-precedes-reservation
 
   it('fails a reserved leaf whose units cannot be counted, reserving nothing', async () => {
     const { result, reservation } = await reservedNextest(

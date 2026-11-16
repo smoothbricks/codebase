@@ -12,6 +12,7 @@ import {
   runsPrebuiltNextest,
   withCountedReservation,
   withMbxLeaf,
+  withReservationAfterFixture,
 } from './mbx-pool.js';
 import { runnerDemand } from './runner-sizing.js';
 
@@ -93,6 +94,7 @@ describe("mbx's one pool at the leaf", () => {
     expect(leafOf('cargo nextest run -p x', 8)).toEqual({ kind: 'cargo' });
   });
 
+  //#region smoo/cowshed!n/build-precedes-reservation
   it('builds a reserved leaf’s fixture first, then asks its executor for at most its units, at least one', async () => {
     // A gate on 2026-10-30: every cargo-test leaf reserved `--cpus 18` of an 18-core pool, so they ran one at a time
     // and the host sat 70% idle. mbx now grants a reservation the cores that are free, and a piece of two slow tests
@@ -104,22 +106,24 @@ describe("mbx's one pool at the leaf", () => {
     expect(runsPrebuiltNextest('cargo nextest run -p x')).toBe(false);
     const leaf = mbxLeaf(pool, runnerDemand(nextest, 6, 18, {}), nextest);
     if (leaf?.kind !== 'reserve') throw new Error('a prebuilt nextest leaf is reserved for');
-    const fixture = 'echo built >&2';
+    // The fixture says whether mbx's scheduler is off for it, as it is under a reservation.
+    const fixture = 'echo "built [$MBX_SCHED_DISABLE]" >&2';
     // What the command sees: its grant, mbx work inside it held under that grant, and no descriptor of its executor's.
     const command =
       'echo "ran $BOUNDED_EXEC_CPU_TOKENS $MBX_RESERVE_CPUS $MBX_SCHED_DISABLE [$MBX_SCHED_DIR]"; ' +
       '{ true >&5; } 2>/dev/null && echo fd5-open || echo fd5-closed';
     // The executor's side of the leaf's descriptor: it records what the shell asks for and grants one core.
-    const run = async (units: string | null) => {
+    const run = async (units: string | null, built = fixture) => {
       const child = spawn(
         '/bin/sh',
         [
           '-c',
           units === null
-            ? withMbxLeaf(`${fixture} && { ${command}; }`, leaf)
-            : withCountedReservation(`{ ${fixture}; } && ${units}`, command, leaf),
+            ? withReservationAfterFixture(built, command, leaf)
+            : withCountedReservation(`{ ${built}; } && ${units}`, command, leaf),
         ],
-        { stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe'] },
+        // This test may itself run under a reservation; the leaf's shell starts outside one.
+        { stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'ignore', 'pipe'], env: { PATH: process.env.PATH ?? '' } },
       );
       const channel = child.stdio.at(MBX_GRANT_FD);
       if (!(channel instanceof Duplex)) throw new Error('a reserved leaf has its mbx descriptor');
@@ -141,11 +145,11 @@ describe("mbx's one pool at the leaf", () => {
       return { asked, stdout, stderr, status };
     };
     const ran = 'ran 1 1 1 []\nfd5-closed\n';
-    // Uncounted, the fixture runs inside the reservation, as it always did.
+    // The fixture runs first, with the scheduler on, as pooled work; the leaf asks only once it has ended.
     expect(await run(null)).toMatchObject({
       asked: '6\n',
       stdout: ran,
-      stderr: 'cowshed: mbx reserve running cpus=1 asked=6\nbuilt\n',
+      stderr: 'built []\ncowshed: mbx reserve running cpus=1 asked=6\n',
       status: 0,
     });
     // Counted, it runs first, and the leaf asks for its units, at most its runner's count and at least one.
@@ -153,7 +157,7 @@ describe("mbx's one pool at the leaf", () => {
       expect(await run(units)).toMatchObject({
         asked: `${asked}\n`,
         stdout: ran,
-        stderr: `built\ncowshed: mbx reserve running cpus=1 asked=${asked}\n`,
+        stderr: `built []\ncowshed: mbx reserve running cpus=1 asked=${asked}\n`,
         status: 0,
       });
     await counted("printf 'a\\nb\\n'", 2);
@@ -161,9 +165,14 @@ describe("mbx's one pool at the leaf", () => {
     await counted('true', 1);
     // A count that fails fails the leaf before anything is asked for.
     const failed = await run('false');
-    expect(failed).toMatchObject({ asked: '', stdout: '', stderr: 'built\n' });
+    expect(failed).toMatchObject({ asked: '', stdout: '', stderr: 'built []\n' });
     expect(failed.status).not.toBe(0);
+    // So does a fixture that fails.
+    const unbuilt = await run(null, 'false');
+    expect(unbuilt).toMatchObject({ asked: '', stdout: '', stderr: '' });
+    expect(unbuilt.status).not.toBe(0);
   });
+  //#endregion smoo/cowshed!n/build-precedes-reservation
 
   it("reads the cores a reserved leaf's shell asks for: a whole count from one to its runner's most", () => {
     expect(askedCores('1', 6)).toBe(1);

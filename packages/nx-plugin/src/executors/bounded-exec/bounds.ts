@@ -39,7 +39,7 @@ export type BoundEvent =
   /**
    * The command started; `testing` is the lifecycle's answer then, `fixture` whether a supervised fixture leads it,
    * `queued` whether mbx schedules this leaf, as known before spawn, and `fixtureFirst` whether that fixture runs
-   * before the leaf's reservation (it counts the leaf's units), so its ceiling starts now, not at the grant.
+   * before the leaf's reservation (every reserved leaf's does), so its ceiling starts now, not at the grant.
    */
   | {
       readonly kind: 'spawn';

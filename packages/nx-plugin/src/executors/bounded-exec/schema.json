@@ -42,7 +42,7 @@
     },
     "fixtureCommand": {
       "type": "string",
-      "description": "A compiler-fixture producer for command: a shell command run first, in the same cwd and environment, as a lifecycle build interval the progress bound does not run during. Under mbx it runs inside its leaf's CPU reservation, or before it when unitsCommand counts the leaf's units. Its failure fails the run and command starts only after it exits 0. For warmth outside Nx outputs (a compiler plugin cache, a Cargo target directory): inside the consumer's task a cache hit restores the verdict and warms nothing, an execution warms first. Requires fixtureTimeoutMs."
+      "description": "A compiler-fixture producer for command: a shell command run first, in the same cwd and environment, as a lifecycle build interval the progress bound does not run during. Under mbx's pool it runs before its leaf's CPU reservation, as pooled work: a reservation is never held across a build. Its failure fails the run and command starts only after it exits 0. For warmth outside Nx outputs (a compiler plugin cache, a Cargo target directory): inside the consumer's task a cache hit restores the verdict and warms nothing, an execution warms first. Requires fixtureTimeoutMs."
     },
     "fixtureTimeoutMs": {
       "type": "number",

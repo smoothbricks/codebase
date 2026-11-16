@@ -29,8 +29,8 @@ export interface BoundedExecCommand {
 
   /**
    * A compiler-fixture producer for `command`: a shell command run first, in the same cwd and environment, inside
-   * the run's CPU grant; under mbx inside its leaf's reservation, or before it when `unitsCommand` counts the leaf's
-   * units, since then the fixture is a build whose compilers mbx admits one by one.
+   * the run's CPU grant; under mbx's pool before its leaf's reservation, as pooled work whose compilers mbx admits one
+   * by one, since a reservation is never held across a build.
    * Its whole life is a lifecycle build interval — the progress bound does not run during it, as it does not run
    * during a `cargo test` build. Its failure fails the run; `command` starts only after it exits 0.
    *

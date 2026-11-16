@@ -188,7 +188,8 @@ export const MBX_GRANT_FD = 5;
 
 /**
  * `command` as the shell runs it under its leaf's admission, or as it is for a leaf in no pool (`null`): a reserved
- * leaf asks for its runner's count (`reservation`).
+ * leaf asks for its runner's count (`reservation`). A reserved leaf's fixture is never part of `command`
+ * (`withReservationAfterFixture`).
  */
 export function withMbxLeaf(command: string, leaf: MbxLeaf | null): string {
   if (leaf === null || leaf.kind === 'cargo') {
@@ -198,10 +199,21 @@ export function withMbxLeaf(command: string, leaf: MbxLeaf | null): string {
 }
 
 /**
+ * A reserved leaf with a `fixture`: the fixture runs first, outside the reservation, as pooled work like any other
+ * build, and the leaf asks for its runner's count only once it has exited 0 (specs/cowshed/05_gateway.md, "A leaf's
+ * build precedes its reservation"). A reservation holds cores only while its command can use them: a fixture inside
+ * one waits on Cargo's build-directory lock holding its grant, and when reserved leaves hold every core the lock's
+ * holder, a pooled build whose compiler waits for one, never gets it. A fixture that fails fails the run before
+ * anything is reserved.
+ */
+export function withReservationAfterFixture(fixture: string, command: string, leaf: ReservedLeaf): string {
+  return `${fixture} && ${withMbxLeaf(command, leaf)}`;
+}
+/**
  * A reserved leaf whose `fixture` segment ends by printing one line per unit its `command` runs (`unitsCommand`): the
- * segment runs first, outside the reservation, since a build's compilers are admitted by mbx one by one, and the leaf
- * asks for its units, at most its runner's count and at least one. A segment that fails fails the run before anything
- * is reserved.
+ * segment runs first, outside the reservation as every fixture does (`withReservationAfterFixture`), and the leaf asks
+ * for its units, at most its runner's count and at least one. A segment that fails fails the run before anything is
+ * reserved.
  */
 export function withCountedReservation(fixture: string, command: string, leaf: ReservedLeaf): string {
   const most = leaf.demand.want;

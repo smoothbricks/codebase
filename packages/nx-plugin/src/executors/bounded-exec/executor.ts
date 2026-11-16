@@ -32,6 +32,7 @@ import {
   mbxPool,
   withCountedReservation,
   withMbxLeaf,
+  withReservationAfterFixture,
 } from './mbx-pool.js';
 import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
 import { killedFromOutside, type RunOutcome, runUntilNotKilledForMemory } from './memory-retry.js';
@@ -798,9 +799,9 @@ async function runCommand(
     ...(progressChannel === null ? {} : { [PROGRESS_SOCKET_ENV]: progressChannel.socket }),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
-  // of the command: the progress bound runs during it and its own ceiling does not. Under mbx a leaf that names its
-  // units counts them at the end of that segment, under the fixture's ceiling, its fixture's own output on stderr, and
-  // reserves after it (`withCountedReservation`).
+  // of the command: the progress bound runs during it and its own ceiling does not. Under mbx a reserved leaf's
+  // fixture runs before its reservation, its ceiling from spawn (`withReservationAfterFixture`); a leaf that names its
+  // units counts them at the end of that segment, its fixture's own output on stderr (`withCountedReservation`).
   const counted =
     process.platform !== 'win32' && leaf?.kind === 'reserve' && fixture !== null && options.unitsCommand !== undefined;
   const segment =
@@ -826,8 +827,12 @@ async function runCommand(
   // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
   const unadmitted = hooked?.command ?? (segment === null ? command : `${segment} && ${command}`);
   const shellCommand =
-    leaf?.kind === 'reserve' && counted && fixtureHooked !== null
-      ? withCountedReservation(fixtureHooked.fixture, fixtureHooked.main, leaf)
+    leaf?.kind === 'reserve' && fixtureHooked !== null
+      ? (counted ? withCountedReservation : withReservationAfterFixture)(
+          fixtureHooked.fixture,
+          fixtureHooked.main,
+          leaf,
+        )
       : withMbxLeaf(unadmitted, leaf);
   // Only leaves known to be scheduled can exclude zero-hold time. Others keep lifecycle hang protection.
   const queued = mbxIdleGated(leaf, sized.command, { ...process.env, ...env });
@@ -1325,7 +1330,7 @@ async function runCommand(
     at: Date.now(),
     testing: isTesting(),
     fixture: fixture !== null && lifecycle !== null,
-    fixtureFirst: counted && lifecycle !== null,
+    fixtureFirst: leaf?.kind === 'reserve' && fixtureHooked !== null,
     queued,
   });
   if (leaf !== null) {
