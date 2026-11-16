@@ -63,6 +63,11 @@ export type MbxLeaf =
       readonly kind: 'reserve';
       readonly priority: MbxPriority;
       readonly demand: ReservedDemand;
+      /**
+       * Whether its runner starts every thread of its ask and each case takes a core at the leaf's gate (case-gate.ts):
+       * a nextest leaf of a run whose mbx gates its cases. Otherwise its runner is sized to its grant.
+       */
+      readonly gated: boolean;
     };
 
 /** A leaf mbx's pool reserves for. */
@@ -83,11 +88,12 @@ export function runsPrebuiltNextest(command: string): boolean {
  * kept every reservation queued behind it waiting while the pool drained. On 2026-10-31 a downstream gate ran 4.9 of 18
  * cores busy while 25 of its tasks queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores.
  */
-export function mbxLeaf(pool: MbxPool, demand: Demand, command: string): MbxLeaf | null {
+export function mbxLeaf(pool: MbxPool, demand: Demand, command: string, testGate: boolean): MbxLeaf | null {
   const reserve = (reserved: ReservedDemand): MbxLeaf => ({
     kind: 'reserve',
     priority: pool.priority,
     demand: reserved,
+    gated: testGate && reserved.kind === 'nextest',
   });
   switch (demand.kind) {
     case 'vitest':
@@ -112,7 +118,7 @@ export function mbxLeaf(pool: MbxPool, demand: Demand, command: string): MbxLeaf
  * it: the pool's priority, the core count and the environment size a leaf, never its kind.
  */
 export function runsAsCargoLeaf(command: string): boolean {
-  return mbxLeaf({ priority: 'low' }, runnerDemand(command, undefined, 1, {}), command)?.kind === 'cargo';
+  return mbxLeaf({ priority: 'low' }, runnerDemand(command, undefined, 1, {}), command, false)?.kind === 'cargo';
 }
 
 /**
@@ -234,7 +240,7 @@ function reservation(command: string, leaf: ReservedLeaf): string {
   const said = `printf 'cowshed: mbx reserve running cpus=%s asked=%s\\n' "$${CPU_TOKENS_ENV}" "$${WANT_ENV}" >&2; `;
   const ask = `printf '%s\\n' "$${WANT_ENV}" >&${MBX_GRANT_FD} && IFS= read -r ${GRANTED_CPUS_ENV} <&${MBX_GRANT_FD} && exec ${MBX_GRANT_FD}>&-`;
   const held = `export ${GRANTED_CPUS_ENV} MBX_SCHED_DISABLE=1 MBX_SCHED_DIR=`;
-  return `export ${WANT_ENV} && ${ask} && ${held} && eval ${shellQuote(`${grantedSizing(leaf.demand)}${said}${command}`)}`;
+  return `export ${WANT_ENV} && ${ask} && ${held} && eval ${shellQuote(`${grantedSizing(leaf.demand, leaf.gated)}${said}${command}`)}`;
 }
 
 /**

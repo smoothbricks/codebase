@@ -17,6 +17,7 @@ mod bend_driver;
 mod engine;
 mod fixture;
 mod held;
+mod lend;
 mod model;
 mod policy;
 mod pool;

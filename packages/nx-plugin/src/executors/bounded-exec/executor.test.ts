@@ -15,6 +15,7 @@ import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.j
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory, processesOf } from '../../testing.js';
+import { TEST_GATE_ENV, TEST_GATE_SERVED_ENV } from './case-gate.js';
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import { CPU_RISING_CLASS } from './cpu-rise.js';
 import {
@@ -111,6 +112,7 @@ const INHERITED_SIZING_ENV = [
   'MBX_SCHEDULER_PRIORITY',
   RESERVATIONS_ENV,
   RESERVATIONS_UNSERVED_ENV,
+  TEST_GATE_SERVED_ENV,
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
@@ -2046,6 +2048,98 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  //#region smoo/cowshed!n/a-case-starts-on-a-core
+  /**
+   * A prebuilt nextest leaf that asks for six cores and is granted one. Its stand-in runner prints its thread count
+   * and, where it is named a gate, takes two cases through it as mbx's shim does: the second arrives while the first
+   * still holds the grant's one core.
+   */
+  const gatedNextest = async (served: boolean) => {
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-cargo');
+    await mkdir(bin);
+    const endpoint = await standInReservations(() => 1);
+    const cases = join(bin, 'cases.cjs');
+    await writeFile(
+      cases,
+      `const { createConnection } = require('node:net');
+const arrive = (test) => new Promise((resolve, reject) => {
+  const client = createConnection(process.env.${TEST_GATE_ENV});
+  client.setEncoding('utf8');
+  client.on('connect', () => client.write(JSON.stringify({ binary: 'pkg::bin', test }) + '\\n'));
+  client.on('data', (line) => { console.log('ran ' + test + ' on ' + line.trim()); resolve(client); });
+  client.on('error', reject);
+});
+(async () => {
+  const first = await arrive('a');
+  const second = await arrive('b');
+  second.destroy();
+  first.destroy();
+})();
+`,
+    );
+    await writeFile(
+      join(bin, 'cargo'),
+      `#!/bin/sh\nprintf 'cargo threads=%s\\n' "$NEXTEST_TEST_THREADS"\nif [ -n "$${TEST_GATE_ENV}" ]; then exec '${process.execPath}' '${cases}'; fi\n`,
+      { mode: 0o755 },
+    );
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+      [TEST_GATE_SERVED_ENV]: process.env[TEST_GATE_SERVED_ENV],
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env[RESERVATIONS_ENV] = endpoint.socket;
+    if (served) process.env[TEST_GATE_SERVED_ENV] = '1';
+    else delete process.env[TEST_GATE_SERVED_ENV];
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'cargo nextest run --binaries-metadata m.json --test-threads=6',
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: 0,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+      if (served) await endpoint.released(2);
+      return { result, reserves: endpoint.reserves.map(({ cpus, priority, name }) => ({ cpus, priority, name })) };
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await endpoint.close();
+    }
+  };
+
+  it("starts a gated nextest leaf on every thread of its ask and each case on a core: the grant's, or one reserved for that case", async () => {
+    const { result, reserves } = await gatedNextest(true);
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain('cowshed: mbx reserve running cpus=1 asked=6\n');
+    expect(result.terminalOutput).toContain('cargo threads=6\n');
+    expect(result.terminalOutput).toContain('ran a on go\n');
+    expect(result.terminalOutput).toContain('ran b on go\n');
+    expect(result.terminalOutput).toMatch(/cowshed: mbx reserve cases own=1 lent=1 lent_core_s=0 waited_case_s=0\n/);
+    expect(reserves).toEqual([
+      { cpus: 6, priority: 'low', name: null },
+      { cpus: 1, priority: 'low', name: 'nextest:pkg::bin::b' },
+    ]);
+  });
+
+  it("sizes a nextest leaf to its grant where its run's mbx gates no cases, and names it no gate", async () => {
+    const { result, reserves } = await gatedNextest(false);
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain('cargo threads=1\n');
+    expect(result.terminalOutput).not.toContain('mbx reserve cases');
+    expect(reserves).toEqual([{ cpus: 6, priority: 'low', name: null }]);
+  });
+  //#endregion smoo/cowshed!n/a-case-starts-on-a-core
   it.each([
     [
       'its run published why its endpoint did not start',

@@ -13,6 +13,8 @@ export interface NativeTestResult {
   readonly source: ClosedTestResult['source'];
   readonly contradictsCursor?: number;
   readonly durationMs: number | null;
+  /** How long the case waited at its leaf's gate before it ran, which `durationMs` leaves out; absent for none. */
+  readonly waitMs?: number;
   readonly sourceRef: string | null;
   readonly failureOutput: string | null;
 }
@@ -115,6 +117,7 @@ export async function createTestResultWriter(
               source: result.source,
               ...(result.contradictsCursor === undefined ? {} : { contradictsCursor: result.contradictsCursor }),
               durationMs: result.durationMs,
+              ...(result.waitMs === undefined ? {} : { waitMs: result.waitMs }),
               sourceRef: normalizeSourceRef(result.sourceRef, sourceRoot),
               causeRef,
             },

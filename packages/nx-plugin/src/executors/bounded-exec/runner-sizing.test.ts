@@ -401,7 +401,7 @@ describe("a reserved leaf's runner on its mbx grant", () => {
   const run = (demand: ReservedDemand, command: string, granted: string): string => {
     const stub = (name: string): string =>
       `${name}() { printf '${name} %s | tokens=%s rust=%s nextest=%s\\n' "$*" "$BOUNDED_EXEC_CPU_TOKENS" "$RUST_TEST_THREADS" "$NEXTEST_TEST_THREADS"; }; `;
-    const sized = grantedSizing(demand) + sizeRunnerToGrant(demand, command);
+    const sized = grantedSizing(demand, false) + sizeRunnerToGrant(demand, command, false);
     const shell = spawnSync('/bin/sh', ['-c', ['cargo', 'bun', 'stryker', 'script'].map(stub).join('') + sized], {
       env: {
         PATH: process.env.PATH,

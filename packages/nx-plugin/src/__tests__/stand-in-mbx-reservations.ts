@@ -11,7 +11,7 @@ import { ownedSocketDirectory } from '../testing.js';
  * exactly these fields, as the host's installed mbx accepts them.
  */
 type HeardLine =
-  | { type: 'reserve'; id: number; cpus: number; priority: MbxPriority; min?: number }
+  | { type: 'reserve'; id: number; cpus: number; priority: MbxPriority; min?: number; name?: string }
   | { type: 'release'; id: number };
 
 const validLine = typia.createValidateEquals<HeardLine>();
@@ -41,6 +41,8 @@ export interface HeardReserve {
   readonly priority: MbxPriority;
   /** The minimum the request named; null for a request that named none. */
   readonly min: number | null;
+  /** The class the request named; null for a request that named none. */
+  readonly name: string | null;
   readonly connection: number;
 }
 
@@ -65,10 +67,12 @@ export interface StandInReservations {
  * mbx's reservation endpoint at its published interface: a Unix socket that answers each `reserve` line with
  * `answer`'s grant or refusal and records every connection, reserve and release it hears. It stands in for
  * `mbx reservations`, mbx's own and tested in mbx's suite, so a leaf suite pins only what bounded-exec asks and does
- * with the answer.
+ * with the answer. With `gates` it answers `capabilities` as an mbx whose test shim gates its cases does; without, as
+ * one that does not know the request: an error, and the connection's end.
  */
 export async function standInReservations(
   answer: (heard: HeardReserve) => StandInAnswer,
+  gates = false,
 ): Promise<StandInReservations> {
   const directory = await ownedSocketDirectory('mbx-r-stand-in-', 'r.sock');
   const socket = join(directory, 'r.sock');
@@ -87,6 +91,11 @@ export async function standInReservations(
     client.on('data', (text: string) => {
       unread += text;
       for (let end = unread.indexOf('\n'); end !== -1; end = unread.indexOf('\n')) {
+        if (gates && unread.slice(0, end) === '{"type":"capabilities"}') {
+          unread = unread.slice(end + 1);
+          client.write('{"type":"capabilities","test_gate":true}\n');
+          continue;
+        }
         const line = heardLine(unread.slice(0, end));
         unread = unread.slice(end + 1);
         if ('refused' in line) {
@@ -104,6 +113,7 @@ export async function standInReservations(
           cpus: line.cpus,
           priority: line.priority,
           min: line.min ?? null,
+          name: line.name ?? null,
           connection,
         };
         reserves.push(heard);

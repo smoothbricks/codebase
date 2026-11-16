@@ -15,6 +15,14 @@ import {
 } from '../../process-group.js';
 import { AdmissionObservation, type QueueHost } from './admission-queue.js';
 import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
+import {
+  CaseGate,
+  type CaseGateServer,
+  runWallMs,
+  serveCaseGate,
+  TEST_GATE_ENV,
+  TEST_GATE_SERVED_ENV,
+} from './case-gate.js';
 import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment } from './child-exit-diagnostics.js';
 import { type CpuPool, createCpuPool } from './cpu-pool.js';
 import type { CpuRise } from './cpu-rise.js';
@@ -315,7 +323,7 @@ export async function runBoundedExec(
   const lastPeak = directory !== null && inherited !== null ? await readLastPeak(directory) : null;
   // The walls its last run recorded size the minimum its reservation names (suite-minimum.ts), read before the same
   // clear removes them.
-  const lastWalls = directory !== null ? await readLastWalls(directory) : [];
+  const lastWalls = directory !== null ? await readLastWalls(directory) : new Map<string, number>();
   return runUntilNotKilledForMemory(
     (alone) =>
       runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
@@ -334,7 +342,7 @@ export async function runBoundedExec(
  */
 interface Attempt {
   readonly lastPeak: LastPeak | null;
-  readonly lastWalls: readonly number[];
+  readonly lastWalls: ReadonlyMap<string, number>;
   readonly alone: boolean;
 }
 
@@ -608,7 +616,7 @@ async function runCommand(
   // With mbx the leaf's admission is mbx's one pool, not a parent's tokens. A leaf mbx does not admit itself asks for
   // its runner's count, a maximum, and its runner runs on the cores it is granted, which only the command learns
   // (specs/cowshed/05_gateway.md, "Parallelism inside a job"). No grant and no sub-pool beside it.
-  const leaf = mbx === null ? null : mbxLeaf(mbx, demand, requested);
+  const leaf = mbx === null ? null : mbxLeaf(mbx, demand, requested, process.env[TEST_GATE_SERVED_ENV] === '1');
   if (grant !== null) {
     sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
@@ -616,7 +624,7 @@ async function runCommand(
       appendStderr(said);
     }
   } else if (leaf?.kind === 'reserve') {
-    sized = { command: sizeRunnerToGrant(leaf.demand, requested), env: {} };
+    sized = { command: sizeRunnerToGrant(leaf.demand, requested, leaf.gated), env: {} };
   } else if (leaf !== null) {
     sized = sizeRunner(demand, requested, demand.want);
   }
@@ -626,6 +634,28 @@ async function runCommand(
   let pool: CpuPool | null = null;
   let reservation: Reservation | null = null;
   const releaseReservation = (): void => reservation?.release();
+  // A gated nextest leaf's case gate (case-gate.ts; specs/cowshed/05_gateway.md, "A case starts on a core"): served
+  // before the command starts, decided from the leaf's grant on, and closed once the command is gone, when every core a
+  // case still holds goes back to the pool and the leaf says what its cases ran on.
+  let caseGate: CaseGateServer | null = null;
+  let cases: CaseGate | null = null;
+  const caseRequests = new Map<string, Reservation>();
+  let caseGateClosed: Promise<void> | null = null;
+  const closeCaseGate = (): Promise<void> => {
+    caseGateClosed ??= (async () => {
+      const left = (await caseGate?.close()) ?? null;
+      if (left !== null) appendStderr(`bounded-exec: ${left}\n`);
+      for (const held of caseRequests.values()) held.release();
+      caseRequests.clear();
+      const decided = cases;
+      if (decided === null) return;
+      const { own, lent, lentCoreMs, waitedCaseMs } = decided.summary();
+      tell(
+        `cowshed: mbx reserve cases own=${own} lent=${lent} lent_core_s=${Math.round(lentCoreMs / 1000)} waited_case_s=${Math.round(waitedCaseMs / 1000)}\n`,
+      );
+    })();
+    return caseGateClosed;
+  };
   // The run's progress channel (progress-channel.ts), served when the run has an idle bound for its records to restart,
   // and closed once its command is gone. A channel that leaves its socket behind says so; the run's verdict stands.
   let progressChannel: ProgressChannel | null = null;
@@ -728,6 +758,7 @@ async function runCommand(
     appendStderr(message);
     await releaseCpu();
     await closeProgress();
+    await closeCaseGate();
     // The command never started, so its lease holds nothing of its own to keep.
     await releaseLease(false);
     await recordRun(1, null, Date.now() - asked, { kind: 'executor', message: message.trim() }, null, [], [], null);
@@ -779,6 +810,26 @@ async function runCommand(
     }
     progressChannel = served.channel;
   }
+  // A case that arrives before the leaf's grant has no core to take and no leaf to wait for: its connection is refused,
+  // and its shim fails it by name.
+  if (reserved?.leaf.gated === true) {
+    const served = await serveCaseGate({
+      arrived: (id) => cases?.arrived(id) ?? false,
+      ended: (id) => cases?.ended(id),
+      invalid: (detail) => {
+        if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
+        lifecycleFailure = { kind: 'executor', message: `case gate: ${detail}` };
+        appendStderr(`bounded-exec: ${lifecycleFailure.message}\n`);
+        termination = terminate();
+      },
+    });
+    if (!served.ok) {
+      return refuse(
+        `bounded-exec: the leaf's case gate could not be served (${served.error}); refusing to run the command\n`,
+      );
+    }
+    caseGate = served.gate;
+  }
   const native = directory === null ? { command: sized.command, env: {} } : withTestResultReport(sized.command);
   const command =
     directory === null
@@ -797,6 +848,7 @@ async function runCommand(
     ...(await grantMemoryEnvironment(grant?.charged ?? null, process.env)),
     ...(leaf?.kind === 'cargo' ? { MBX_GRANT_FD: String(MBX_GRANT_FD) } : {}),
     ...(progressChannel === null ? {} : { [PROGRESS_SOCKET_ENV]: progressChannel.socket }),
+    ...(caseGate === null ? {} : { [TEST_GATE_ENV]: caseGate.socket }),
   };
   // A fixture rides as segment 0 of the lifecycle. Without the channel (Windows) it is plain shell text ahead
   // of the command: the progress bound runs during it and its own ceiling does not. Under mbx a reserved leaf's
@@ -922,7 +974,13 @@ async function runCommand(
     command,
     resultWriter === null
       ? undefined
-      : (result) => {
+      : (closed) => {
+          // nextest times a case from its shim's start: the wait at the gate is taken off its wall and named beside it.
+          const waitMs = cases?.waitedMs(closed.id) ?? 0;
+          const result =
+            closed.durationMs === null || waitMs === 0
+              ? closed
+              : { ...closed, durationMs: runWallMs(closed.durationMs, waitMs), waitMs };
           const error = resultWriter?.append(result) ?? null;
           if (error !== null && resultFailure === null) {
             resultFailure = error;
@@ -1155,6 +1213,7 @@ async function runCommand(
         return killChildTree();
       })
       .finally(closeProgress)
+      .finally(closeCaseGate)
       .finally(releaseCpu)
       .finally(() => releaseLease(true))
       .finally(releaseReservation)
@@ -1375,7 +1434,7 @@ async function runCommand(
         queue.waiting();
         // A whole-suite test leaf names the fewest threads at which its recorded walls keep a test finishing within
         // its own no-progress bound (specs/cowshed/05_gateway.md, "A minimum for a whole suite").
-        const min = idleTimeoutMs === undefined ? 1 : suiteMinimum(lastWalls, cpus, idleTimeoutMs);
+        const min = idleTimeoutMs === undefined ? 1 : suiteMinimum([...lastWalls.values()], cpus, idleTimeoutMs);
         const named = min > 1 ? ` min=${min}` : '';
         tell(`cowshed: mbx reserve wait start cpus=${cpus}${named} priority=${reservedLeaf.priority}\n`);
         const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min);
@@ -1395,6 +1454,26 @@ async function runCommand(
           if (state.settled || state.expiry !== null) return;
           queue.admitted = true;
           tell(`cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${reservedLeaf.priority}\n`);
+          if (caseGate !== null) {
+            const gate = caseGate;
+            cases = new CaseGate(granted.cpus, (id) => lastWalls.get(id) ?? 0, {
+              start: (id) => gate.start(id),
+              reserve: (id) => {
+                const held = reserveCores(endpoint, 1, 'low', 1, `nextest:${id}`);
+                caseRequests.set(id, held);
+                void held.granted.then((answer) => {
+                  // Released since: the case started on a core of the grant, or ended while it waited.
+                  if (caseRequests.get(id) !== held) return;
+                  if (answer.ok) cases?.granted(id);
+                  else caseRequests.delete(id);
+                });
+              },
+              release: (id) => {
+                caseRequests.get(id)?.release();
+                caseRequests.delete(id);
+              },
+            });
+          }
           channel.end(`${granted.cpus}\n`);
           stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
           void granted.lost.then((why) => {
@@ -1460,6 +1539,7 @@ async function runCommand(
   // The runner is gone, and with it every test that could report on the run's progress channel. Its sub-pool closes
   // first, so no descendant still draws on tokens the grant returns; then the grant goes back to its parent or the host.
   await closeProgress();
+  await closeCaseGate();
   await releaseCpu();
 
   const code = exitCode ?? signalToExitCode(exitSignal);

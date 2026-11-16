@@ -104,6 +104,7 @@ const KEYED = [
 /** What only decides when and on what resources the command runs: a change to one re-keys no task. */
 const SCHEDULING = [
   'executors/bounded-exec/admission-queue.ts',
+  'executors/bounded-exec/case-gate.ts',
   'executors/bounded-exec/cpu-grant.ts',
   'executors/bounded-exec/cpu-pool.ts',
   'executors/bounded-exec/host-memory.darwin.ts',

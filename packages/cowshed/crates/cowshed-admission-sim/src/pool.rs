@@ -48,6 +48,8 @@ pub(crate) struct Arrival {
     pub(crate) charge: Charge,
     pub(crate) kind: Kind,
     pub(crate) priority: Priority,
+    /// What mbx predicted its hold to be when it asked, where the record says.
+    pub(crate) predicted: Option<Secs>,
 }
 
 #[derive(Debug)]
@@ -84,6 +86,7 @@ pub(crate) fn convoy() -> Trace {
                 kind: r.kind,
                 // Every admission of the recorded window was `low`.
                 priority: Priority::Low,
+                predicted: None,
             })
             .collect(),
     }
@@ -98,14 +101,17 @@ pub(crate) enum Estimate {
     Times(f64),
     /// Nothing: no hold has a prediction, and any might never end.
     Unknown,
+    /// What mbx predicted when the request asked, as the record holds it.
+    Recorded,
 }
 
 impl Estimate {
-    fn of(self, hold: Secs) -> Option<Secs> {
+    fn of(self, request: &Arrival) -> Option<Secs> {
         match self {
-            Self::Exact => Some(hold),
-            Self::Times(factor) => Some(hold * factor),
+            Self::Exact => Some(request.hold),
+            Self::Times(factor) => Some(request.hold * factor),
             Self::Unknown => None,
+            Self::Recorded => request.predicted,
         }
     }
 }
@@ -149,32 +155,114 @@ pub(crate) fn need(rule: Rule, charge: Charge) -> Charge {
     }
 }
 
+/// Who holds a live grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Holder {
+    /// A request of the trace, for its hold.
+    Request,
+    /// The cased leaf's reservation, until its last case has ended.
+    Leaf,
+    /// One case of the leaf, on a core the pool granted it alone.
+    Case,
+}
+
 struct Live {
     charge: Charge,
     estimated_end: Secs,
     end: Secs,
+    holder: Holder,
 }
 
-/// Replays `trace` under `rule`. A request recorded as started before the window opened keeps its
-/// recorded start: that history is not the rule's to decide.
-pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed {
-    let n = trace.requests.len();
+/// A reserved nextest leaf of a trace, run case by case instead of for its recorded hold
+/// (05_gateway.md "A case starts on a core").
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CasedLeaf<'a> {
+    /// The leaf's reservation among the trace's requests.
+    pub(crate) request: usize,
+    /// Each case's wall, in the order its runner starts them.
+    pub(crate) cases: &'a [Secs],
+    /// Whether the runner starts every thread of its ask and a case that finds no core of the
+    /// grant free asks the pool for one at `low`; without it the runner has as many threads as
+    /// the grant.
+    pub(crate) gate: bool,
+    /// The longest wall a case may have to ask the pool for a core; a longer one waits for a core
+    /// of the grant.
+    pub(crate) lend_up_to: Secs,
+}
+
+/// One case's run: its wall, when it started, and whether on a core the pool granted it alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CaseRun {
+    pub(crate) wall: Secs,
+    pub(crate) started: Secs,
+    pub(crate) lent: bool,
+}
+
+/// What a cased leaf did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct LeafRun {
+    pub(crate) started: Secs,
+    pub(crate) end: Secs,
+    pub(crate) granted: u32,
+    /// The cases that ran on the leaf's grant, and on a core of their own.
+    pub(crate) own: u32,
+    pub(crate) lent: u32,
+    /// Core-seconds the cases on a core of their own held.
+    pub(crate) lent_core_s: Secs,
+    /// Seconds the cases waited at the gate, summed.
+    pub(crate) waited_case_s: Secs,
+    /// Each case's run, in the order they started.
+    pub(crate) runs: Vec<CaseRun>,
+}
+
+/// A case waiting at the leaf's gate: since when, and its request in the pool, if it has one.
+struct Waiting {
+    case: usize,
+    since: Secs,
+    request: Option<usize>,
+}
+
+/// A cased leaf's state between its grant and its last case's end.
+struct Gate<'a> {
+    leaf: CasedLeaf<'a>,
+    run: LeafRun,
+    running: bool,
+    /// The next case its runner starts.
+    next: usize,
+    waiting: Vec<Waiting>,
+    /// The ends of the cases on the leaf's own cores.
+    own: Vec<Secs>,
+    /// The cases on a core of their own.
+    lent: u32,
+    done: usize,
+}
+
+/// [`replay`], with `leaf` run case by case: its reservation is held from its grant until its
+/// last case has ended, as many cases at once as it was granted cores run on those, and under its
+/// gate each further case its runner has a thread for asks the pool for one core at `low`,
+/// predicted by its own wall, held for that wall and withdrawn when a core of the grant takes the
+/// case first. A core of the grant goes to the waiting case with the longest wall.
+pub(crate) fn replay_cased(
+    trace: &Trace,
+    rule: Rule,
+    estimate: Estimate,
+    leaf: Option<CasedLeaf<'_>>,
+) -> (Replayed, Option<LeafRun>) {
+    // The trace's requests, then one per case that asked the pool for a core.
+    let mut arrivals: Vec<Arrival> = trace.requests.clone();
+    let n = arrivals.len();
+    let mut case_of: Vec<Option<usize>> = vec![None; n];
     let mut started = vec![Secs::NAN; n];
     let mut granted = vec![Charge::default(); n];
     let mut fit_since: Vec<Option<Secs>> = vec![None; n];
     let (mut forced, mut arriving): (Vec<usize>, Vec<usize>) =
-        (0..n).partition(|&i| trace.requests[i].recorded_start < 0.0);
+        (0..n).partition(|&i| arrivals[i].recorded_start < 0.0);
     forced.sort_by(|&a, &b| {
-        trace.requests[a]
+        arrivals[a]
             .recorded_start
-            .total_cmp(&trace.requests[b].recorded_start)
+            .total_cmp(&arrivals[b].recorded_start)
     });
-    arriving.sort_by(|&a, &b| {
-        trace.requests[a]
-            .at
-            .total_cmp(&trace.requests[b].at)
-            .then(a.cmp(&b))
-    });
+    arriving.sort_by(|&a, &b| arrivals[a].at.total_cmp(&arrivals[b].at).then(a.cmp(&b)));
     let (mut forced, mut arriving) = (
         forced.into_iter().peekable(),
         arriving.into_iter().peekable(),
@@ -185,6 +273,22 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
         Rule::Moldable(moldable) => Some(moldable.aging),
         Rule::Mbx => None,
     };
+    let mut gate = leaf.map(|leaf| {
+        assert!(
+            arrivals[leaf.request].recorded_start >= 0.0,
+            "a cased leaf asks inside the window"
+        );
+        Gate {
+            leaf,
+            run: LeafRun::default(),
+            running: false,
+            next: 0,
+            waiting: Vec::new(),
+            own: Vec::new(),
+            lent: 0,
+            done: 0,
+        }
+    });
     let mut live: Vec<Live> = Vec::new();
     let mut queue: Vec<usize> = Vec::new();
     let mut out = Replayed {
@@ -202,13 +306,18 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
     let mut fitting = false;
     loop {
         let next = [
-            forced.peek().map(|&i| trace.requests[i].recorded_start),
-            arriving.peek().map(|&i| trace.requests[i].at),
-            live.iter().map(|l| l.end).min_by(f64::total_cmp),
+            forced.peek().map(|&i| arrivals[i].recorded_start),
+            arriving.peek().map(|&i| arrivals[i].at),
+            live.iter()
+                .map(|l| l.end)
+                .filter(|end| end.is_finite())
+                .min_by(f64::total_cmp),
+            gate.as_ref()
+                .and_then(|gate| gate.own.iter().copied().min_by(f64::total_cmp)),
             aging.and_then(|bound| {
                 queue
                     .iter()
-                    .map(|&i| trace.requests[i].at + bound)
+                    .map(|&i| arrivals[i].at + bound)
                     .filter(|&at| at > now)
                     .min_by(f64::total_cmp)
             }),
@@ -230,12 +339,22 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
             }
         }
         now = next;
+        if let Some(gate) = &mut gate {
+            let ended = live
+                .iter()
+                .filter(|l| l.holder == Holder::Case && l.end <= now)
+                .count();
+            gate.lent -= u32::try_from(ended).unwrap_or(u32::MAX);
+            let own = gate.own.len();
+            gate.own.retain(|&end| end > now);
+            gate.done += ended + own - gate.own.len();
+        }
         live.retain(|l| l.end > now);
         while let Some(&i) = forced.peek()
-            && trace.requests[i].recorded_start <= now
+            && arrivals[i].recorded_start <= now
         {
             forced.next();
-            let request = &trace.requests[i];
+            let request = &arrivals[i];
             started[i] = request.recorded_start;
             granted[i] = request.charge;
             let end = request.recorded_start + request.hold;
@@ -243,106 +362,224 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
                 charge: request.charge,
                 estimated_end: end,
                 end,
+                holder: Holder::Request,
             });
         }
         while let Some(&i) = arriving.peek()
-            && trace.requests[i].at <= now
+            && arrivals[i].at <= now
         {
             arriving.next();
             queue.push(i);
         }
         let mut decided = false;
-        if !queue.is_empty() {
-            let requests: Vec<Request> = queue
-                .iter()
-                .map(|&i| {
-                    let r = &trace.requests[i];
-                    Request {
-                        ticket: u64::try_from(i).unwrap_or(u64::MAX),
-                        class: if r.priority == Priority::Normal {
-                            Class::Gate
-                        } else {
-                            Class::Background
-                        },
-                        priority: r.priority,
-                        since: r.at,
-                        rank: 0.0,
-                        kind: r.kind,
-                        predicted: estimate.of(r.hold),
-                        charge: r.charge,
-                    }
-                })
-                .collect();
-            let leases: Vec<Lease> = live
-                .iter()
-                .map(|l| Lease {
-                    charge: l.charge,
-                    ends: l.estimated_end,
-                })
-                .collect();
-            let grants = admit(rule, &requests, &leases, trace.cap, now);
-            let used_before = live
-                .iter()
-                .fold(Charge::default(), |sum, l| sum.plus(l.charge));
-            let aged_at = |i: usize| now - trace.requests[i].at >= AGING;
-            let mut chosen = vec![false; queue.len()];
-            for grant in &grants {
-                chosen[grant.index] = true;
-            }
-            for (k, &i) in queue.iter().enumerate() {
-                if chosen[k] {
-                    continue;
-                }
-                let waiting = &trace.requests[i];
-                let started: Vec<&Arrival> = grants
-                    .iter()
-                    .map(|g| &trace.requests[queue[g.index]])
-                    .collect();
-                if aged_at(i)
-                    && started
-                        .iter()
-                        .any(|s| s.at > waiting.at && s.priority >= waiting.priority)
-                {
-                    out.aged_passed += 1;
-                }
-                let fresh_low = grants.iter().any(|g| {
-                    trace.requests[queue[g.index]].priority == Priority::Low
-                        && !aged_at(queue[g.index])
-                });
-                if waiting.priority == Priority::Normal
-                    && need(rule, waiting.charge).fits(used_before, trace.cap)
-                    && fresh_low
-                {
-                    out.gate_passed += 1;
-                }
-            }
-            decided = !grants.is_empty();
-            let mut taken = vec![false; queue.len()];
-            for &Grant { index, charge } in &grants {
-                let i = queue[index];
-                let request = &trace.requests[i];
-                taken[index] = true;
-                started[i] = now;
-                granted[i] = charge;
-                if let Some(since) = fit_since[i] {
-                    out.longest_fitting_wait = out.longest_fitting_wait.max(now - since);
-                }
-                let stretch = if charge.cpus == 0 || request.charge.cpus == 0 {
-                    1.0
+        // A leaf granted in a pass puts its first cases at its gate, and those that find no core
+        // of the grant ask at the same instant: one more pass admits them.
+        loop {
+            if let Some(gate) = gate.as_mut().filter(|gate| gate.running) {
+                let ask = arrivals[gate.leaf.request].charge.cpus;
+                let threads = if gate.leaf.gate {
+                    ask
                 } else {
-                    f64::from(request.charge.cpus) / f64::from(charge.cpus)
+                    gate.run.granted
                 };
-                let hold = request.hold * stretch;
-                live.push(Live {
-                    charge,
-                    estimated_end: estimate
-                        .of(request.hold)
-                        .map_or(Secs::INFINITY, |hold| now + hold * stretch),
-                    end: now + hold,
-                });
+                while gate.next < gate.leaf.cases.len()
+                    && gate.own.len() + gate.waiting.len()
+                        < usize::try_from(threads.saturating_sub(gate.lent)).unwrap_or(usize::MAX)
+                {
+                    gate.waiting.push(Waiting {
+                        case: gate.next,
+                        since: now,
+                        request: None,
+                    });
+                    gate.next += 1;
+                }
+                while gate.own.len() < usize::try_from(gate.run.granted).unwrap_or(usize::MAX)
+                    && let Some(longest) = (0..gate.waiting.len()).max_by(|&a, &b| {
+                        gate.leaf.cases[gate.waiting[a].case]
+                            .total_cmp(&gate.leaf.cases[gate.waiting[b].case])
+                            .then(b.cmp(&a))
+                    })
+                {
+                    let waiting = gate.waiting.remove(longest);
+                    if let Some(request) = waiting.request {
+                        queue.retain(|&i| i != request);
+                    }
+                    gate.run.waited_case_s += now - waiting.since;
+                    gate.run.own += 1;
+                    gate.run.runs.push(CaseRun {
+                        wall: gate.leaf.cases[waiting.case],
+                        started: now,
+                        lent: false,
+                    });
+                    gate.own.push(now + gate.leaf.cases[waiting.case]);
+                }
+                if gate.leaf.gate {
+                    for waiting in gate.waiting.iter_mut().filter(|w| w.request.is_none()) {
+                        let wall = gate.leaf.cases[waiting.case];
+                        if wall > gate.leaf.lend_up_to {
+                            continue;
+                        }
+                        waiting.request = Some(arrivals.len());
+                        queue.push(arrivals.len());
+                        arrivals.push(Arrival {
+                            at: now,
+                            recorded_start: now,
+                            hold: wall,
+                            charge: Charge { cpus: 1, memory: 0 },
+                            kind: Kind::NextestTest,
+                            priority: Priority::Low,
+                            predicted: Some(wall),
+                        });
+                        case_of.push(Some(waiting.case));
+                        started.push(Secs::NAN);
+                        granted.push(Charge::default());
+                        fit_since.push(None);
+                    }
+                }
+                if gate.done == gate.leaf.cases.len() {
+                    gate.running = false;
+                    gate.run.end = now;
+                    live.retain(|l| l.holder != Holder::Leaf);
+                }
             }
-            let mut taken = taken.into_iter();
-            queue.retain(|_| !taken.next().unwrap_or(false));
+            let mut leaf_started = false;
+            if !queue.is_empty() {
+                let requests: Vec<Request> = queue
+                    .iter()
+                    .map(|&i| {
+                        let r = &arrivals[i];
+                        Request {
+                            ticket: u64::try_from(i).unwrap_or(u64::MAX),
+                            class: if r.priority == Priority::Normal {
+                                Class::Gate
+                            } else {
+                                Class::Background
+                            },
+                            priority: r.priority,
+                            since: r.at,
+                            rank: 0.0,
+                            kind: r.kind,
+                            // A case's request is named for the case, so mbx predicts it by the
+                            // case's own history whatever it knows of the trace's requests.
+                            predicted: if case_of[i].is_some() {
+                                r.predicted
+                            } else {
+                                estimate.of(r)
+                            },
+                            charge: r.charge,
+                        }
+                    })
+                    .collect();
+                let leases: Vec<Lease> = live
+                    .iter()
+                    .map(|l| Lease {
+                        charge: l.charge,
+                        ends: l.estimated_end,
+                    })
+                    .collect();
+                let grants = admit(rule, &requests, &leases, trace.cap, now);
+                let used_before = live
+                    .iter()
+                    .fold(Charge::default(), |sum, l| sum.plus(l.charge));
+                let aged_at = |i: usize| now - arrivals[i].at >= AGING;
+                let mut chosen = vec![false; queue.len()];
+                for grant in &grants {
+                    chosen[grant.index] = true;
+                }
+                for (k, &i) in queue.iter().enumerate() {
+                    if chosen[k] {
+                        continue;
+                    }
+                    let waiting = &arrivals[i];
+                    let started: Vec<&Arrival> =
+                        grants.iter().map(|g| &arrivals[queue[g.index]]).collect();
+                    if aged_at(i)
+                        && started
+                            .iter()
+                            .any(|s| s.at > waiting.at && s.priority >= waiting.priority)
+                    {
+                        out.aged_passed += 1;
+                    }
+                    let fresh_low = grants.iter().any(|g| {
+                        arrivals[queue[g.index]].priority == Priority::Low
+                            && !aged_at(queue[g.index])
+                    });
+                    if waiting.priority == Priority::Normal
+                        && need(rule, waiting.charge).fits(used_before, trace.cap)
+                        && fresh_low
+                    {
+                        out.gate_passed += 1;
+                    }
+                }
+                decided |= !grants.is_empty();
+                let mut taken = vec![false; queue.len()];
+                for &Grant { index, charge } in &grants {
+                    let i = queue[index];
+                    let request = &arrivals[i];
+                    taken[index] = true;
+                    started[i] = now;
+                    granted[i] = charge;
+                    if let Some(since) = fit_since[i] {
+                        out.longest_fitting_wait = out.longest_fitting_wait.max(now - since);
+                    }
+                    if let Some(gate) = gate.as_mut().filter(|gate| gate.leaf.request == i) {
+                        gate.running = true;
+                        gate.run.started = now;
+                        gate.run.granted = charge.cpus;
+                        leaf_started = true;
+                        live.push(Live {
+                            charge,
+                            estimated_end: Secs::INFINITY,
+                            end: Secs::INFINITY,
+                            holder: Holder::Leaf,
+                        });
+                        continue;
+                    }
+                    if let (Some(case), Some(gate)) = (case_of[i], gate.as_mut()) {
+                        let at = gate
+                            .waiting
+                            .iter()
+                            .position(|w| w.case == case)
+                            .expect("a case's request is withdrawn when its case starts");
+                        let waiting = gate.waiting.remove(at);
+                        gate.run.waited_case_s += now - waiting.since;
+                        gate.run.lent += 1;
+                        gate.run.runs.push(CaseRun {
+                            wall: request.hold,
+                            started: now,
+                            lent: true,
+                        });
+                        gate.run.lent_core_s += request.hold;
+                        gate.lent += 1;
+                        live.push(Live {
+                            charge,
+                            estimated_end: now + request.hold,
+                            end: now + request.hold,
+                            holder: Holder::Case,
+                        });
+                        continue;
+                    }
+                    let stretch = if charge.cpus == 0 || request.charge.cpus == 0 {
+                        1.0
+                    } else {
+                        f64::from(request.charge.cpus) / f64::from(charge.cpus)
+                    };
+                    let hold = request.hold * stretch;
+                    live.push(Live {
+                        charge,
+                        estimated_end: estimate
+                            .of(request)
+                            .map_or(Secs::INFINITY, |hold| now + hold * stretch),
+                        end: now + hold,
+                        holder: Holder::Request,
+                    });
+                }
+                let mut taken = taken.into_iter();
+                queue.retain(|_| !taken.next().unwrap_or(false));
+            }
+            if !leaf_started {
+                break;
+            }
         }
         let used = live
             .iter()
@@ -355,7 +592,7 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
         }
         fitting = false;
         for &i in &queue {
-            if need(rule, trace.requests[i].charge).fits(used, trace.cap) {
+            if need(rule, arrivals[i].charge).fits(used, trace.cap) {
                 fit_since[i].get_or_insert(now);
                 fitting = true;
             } else {
@@ -364,11 +601,24 @@ pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed 
                 }
             }
         }
-        out.end = out.end.max(live.iter().map(|l| l.end).fold(now, f64::max));
+        out.end = out.end.max(
+            live.iter()
+                .map(|l| l.end)
+                .filter(|end| end.is_finite())
+                .fold(now, f64::max),
+        );
     }
+    started.truncate(n);
+    granted.truncate(n);
     out.started = started;
     out.granted = granted;
-    out
+    (out, gate.map(|gate| gate.run))
+}
+
+/// Replays `trace` under `rule`. A request recorded as started before the window opened keeps its
+/// recorded start: that history is not the rule's to decide.
+pub(crate) fn replay(trace: &Trace, rule: Rule, estimate: Estimate) -> Replayed {
+    replay_cased(trace, rule, estimate, None).0
 }
 
 #[cfg(test)]
@@ -415,6 +665,7 @@ mod tests {
                     } else {
                         Priority::Low
                     },
+                    predicted: None,
                 }
             })
             .collect();

@@ -7,6 +7,7 @@ import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
+import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import { CONTROL_MS } from './lease-wait.js';
 import { type MbxPriority, mbxPool } from './mbx-pool.js';
 
@@ -91,6 +92,9 @@ export async function serveRunReservations(
   endpoints.set(context.id, started.endpoint);
   env[RESERVATIONS_ENV] = started.socket;
   delete env[RESERVATIONS_UNSERVED_ENV];
+  // A leaf's runner starts every thread of its ask only where the installed mbx's shim takes each case through its gate.
+  if (await endpointGatesTests(started.socket)) env[TEST_GATE_SERVED_ENV] = '1';
+  else delete env[TEST_GATE_SERVED_ENV];
 }
 
 /** Close the endpoint `context`'s run was served, if it was served one: its standard input's end ends it. */
@@ -199,12 +203,53 @@ export interface Reservation {
 
 type Uint = number & tags.Type<'uint32'>;
 
+type CapabilitiesReply = { type: 'capabilities'; test_gate: boolean };
+const parseCapabilities = typia.json.createValidateParse<CapabilitiesReply>();
+
+/**
+ * Whether the mbx behind the endpoint at `socket` gates test cases: its shim asks the socket `MBX_TEST_GATE` names
+ * before it starts a nextest case (specs/cowshed/05_gateway.md, "A case starts on a core"). Such an mbx answers
+ * `{"type":"capabilities"}` with `test_gate`; one that does not know the request answers an error and closes the
+ * connection, and an endpoint that answers nothing within the control-plane bound gates nothing.
+ */
+export function endpointGatesTests(socket: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and the timer below settles a probe the endpoint never answers
+    const probe = createConnection(socket);
+    let text = '';
+    const settle = (gates: boolean): void => {
+      clearTimeout(timer);
+      probe.destroy();
+      resolve(gates);
+    };
+    const timer = setTimeout(() => settle(false), CONTROL_MS);
+    probe.setEncoding('utf8');
+    probe.on('connect', () => probe.write('{"type":"capabilities"}\n'));
+    probe.on('data', (chunk: string) => {
+      text += chunk;
+      const end = text.indexOf('\n');
+      if (end === -1) return;
+      const reply = parseCapabilities(text.slice(0, end));
+      settle(reply.success && reply.data.test_gate);
+    });
+    probe.on('error', () => settle(false));
+    probe.on('close', () => settle(false));
+  });
+}
 /**
  * The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). `min` is the fewest
  * of its cores a reservation starts on before it has waited mbx's aging bound; absent, it starts on one.
  */
 type ReservationRequest =
-  | { type: 'reserve'; id: Uint; cpus: Uint & tags.Minimum<1>; priority: MbxPriority; min?: Uint & tags.Minimum<2> }
+  | {
+      type: 'reserve';
+      id: Uint;
+      cpus: Uint & tags.Minimum<1>;
+      priority: MbxPriority;
+      min?: Uint & tags.Minimum<2>;
+      /** The class mbx keeps the reservation's run times under and predicts it by. */
+      name?: string;
+    }
   | { type: 'release'; id: Uint };
 
 /** The lines the endpoint answers; an added field is mbx's to add. */
@@ -250,7 +295,7 @@ class Connection {
     this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
   }
 
-  reserve(cpus: number, priority: MbxPriority, min: number): Reservation {
+  reserve(cpus: number, priority: MbxPriority, min: number, name?: string): Reservation {
     if (this.#closed !== null) {
       return { granted: Promise.resolve({ ok: false, refusal: this.#closed }), release() {} };
     }
@@ -262,7 +307,7 @@ class Connection {
     // A minimum of one is no minimum, and mbx refuses one above the ask.
     const gathers = Math.min(min, cpus);
     this.#socket.write(
-      `${stringifyRequest({ type: 'reserve', id, cpus, priority, ...(gathers > 1 ? { min: gathers } : {}) })}\n`,
+      `${stringifyRequest({ type: 'reserve', id, cpus, priority, ...(gathers > 1 ? { min: gathers } : {}), ...(name === undefined ? {} : { name }) })}\n`,
     );
     let released = false;
     return {
@@ -344,9 +389,15 @@ const connections = new Map<string, Connection>();
 /**
  * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, starting on no fewer than `min` of them until
  * mbx's aging bound, over this process's one connection to it, opened by its first request and kept while another one
- * may come.
+ * may come. `name` is the class mbx predicts the reservation by; absent, mbx's own for an unnamed one.
  */
-export function reserveCores(socket: string, cpus: number, priority: MbxPriority, min: number): Reservation {
+export function reserveCores(
+  socket: string,
+  cpus: number,
+  priority: MbxPriority,
+  min: number,
+  name?: string,
+): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
     const opened: Connection = new Connection(socket, () => {
@@ -355,5 +406,5 @@ export function reserveCores(socket: string, cpus: number, priority: MbxPriority
     connections.set(socket, opened);
     connection = opened;
   }
-  return connection.reserve(cpus, priority, min);
+  return connection.reserve(cpus, priority, min, name);
 }

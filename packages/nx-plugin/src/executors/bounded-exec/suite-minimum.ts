@@ -12,29 +12,29 @@ import { join } from 'node:path';
 import { TEST_RESULTS_FILE } from './test-results.js';
 
 /**
- * The walls of the tests the task's last run closed with a duration, from its results in `directory`; none for a task
- * that has not run, whose results are gone or cannot be read. They size a request, never a charge: a leaf with none
- * names no minimum and starts as it did before it had any.
+ * Each test's wall as the task's last run closed it, by the test's id, from its results in `directory`; none for a
+ * task that has not run, whose results are gone or cannot be read. They size a request and order a leaf's cases at its
+ * gate (case-gate.ts), never a charge: a leaf with none names no minimum and starts as it did before it had any.
  */
-export async function readLastWalls(directory: string): Promise<number[]> {
+export async function readLastWalls(directory: string): Promise<Map<string, number>> {
   let text: string;
   try {
     text = await readFile(join(directory, TEST_RESULTS_FILE), 'utf8');
   } catch {
-    return [];
+    return new Map();
   }
-  const walls: number[] = [];
+  const walls = new Map<string, number>();
   for (const line of text.split('\n')) {
     if (line === '') continue;
     let row: unknown;
     try {
       row = JSON.parse(line);
     } catch {
-      return [];
+      return new Map();
     }
-    if (typeof row !== 'object' || row === null || !('durationMs' in row)) continue;
-    const wall = row.durationMs;
-    if (typeof wall === 'number' && Number.isFinite(wall) && wall >= 0) walls.push(wall);
+    if (typeof row !== 'object' || row === null || !('durationMs' in row) || !('id' in row)) continue;
+    const { id, durationMs: wall } = row;
+    if (typeof id === 'string' && typeof wall === 'number' && Number.isFinite(wall) && wall >= 0) walls.set(id, wall);
   }
   return walls;
 }

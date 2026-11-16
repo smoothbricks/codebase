@@ -2066,12 +2066,13 @@ reads `MAKEFLAGS` as well as `CARGO_MAKEFLAGS`, so withholding one would bound n
 most `g` cores at its job's priority from its Nx run's mbx reservation endpoint, `g` being the job's own count from its
 `--want`, never a host figure. The grant is the leaf's admission: its command stays queued until mbx grants it, as soon
 as one core is free, as many of the `g` cores as are free then, and bounded-exec sizes the leaf's runner flags and
-thread variables to that count as the command starts, so the runner runs on what it holds. The memory request is the
-same task identity's last recorded resource peak from existing LMAO job/process spans (13_telemetry.md, "Job resource
-peaks"), passed as the request's `memory`; no cowshed peak ledger or prediction table exists. [INFERENCE] The
-task-identity key needed to select that span is not verified for Nx leaves; until the span carries it, or when no prior
-peak exists, `memory` is omitted. mbx defines an omitted memory request as a zero-byte charge, not a measurement or a
-memory guarantee. This open keying question does not authorize a second store (AGENTS.md, rule 8).
+thread variables to that count as the command starts, so the runner runs on what it holds; a nextest leaf whose cases
+each start on a core ("A case starts on a core") is told its ask instead. The memory request is the same task identity's
+last recorded resource peak from existing LMAO job/process spans (13_telemetry.md, "Job resource peaks"), passed as the
+request's `memory`; no cowshed peak ledger or prediction table exists. [INFERENCE] The task-identity key needed to
+select that span is not verified for Nx leaves; until the span carries it, or when no prior peak exists, `memory` is
+omitted. mbx defines an omitted memory request as a zero-byte charge, not a measurement or a memory guarantee. This open
+keying question does not authorize a second store (AGENTS.md, rule 8).
 
 **An Nx run serves its leaves one reservation endpoint.** The admission is `mbx reserve`'s: the same pool, priority and
 order, and each grant held until its leaf concludes. What changes is the process count. Run as
@@ -2122,10 +2123,59 @@ queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores
 
 **A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
 (`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
-its run's endpoint admits it once for its whole grant, and its test processes run inside that grant, mbx scheduling none
-of them beneath the reservation. Admitted one test process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for a
-ticket of its own: a downstream gate on 2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121
-tests run in 1.18 s unqueued (owner's ruling, 2026-10-30).
+its run's endpoint admits it once for its whole grant, and its test processes run inside that grant or on a core each
+takes for itself ("A case starts on a core"), mbx scheduling none of them beneath the reservation. Admitted one test
+process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for a ticket of its own: a downstream gate on 2026-10-30
+measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121 tests run in 1.18 s unqueued (owner's ruling,
+2026-10-30).
+
+<a id="smoo/cowshed!n/a-case-starts-on-a-core"></a>**A case starts on a core.** A grant never grows, and a runner's
+thread count is fixed when it starts, so a suite granted one core beside its run's short leaves ran its cases in turn
+while the cores those leaves freed stood idle. Measured 2026-11-16 on three land gates of one consumer workspace, from
+mbx's decision log: its host suite of 69 cases asked for 18 cores and was granted 1, 12 and 1; on 12 it ran 304 s, on 1
+it ran 1,067 s and 667 s, and beside those two runs the pool held 6,109 and 8,396 core-seconds no grant used (a mean of
+5.7 and 12.6 of its 18 cores). So a reserved nextest leaf's runner starts every thread of its ask, and each case takes a
+core before it runs:
+
+- **The gate.** bounded-exec serves the leaf a socket and names it to the command in `MBX_TEST_GATE`. mbx's test shim,
+  through which nextest starts every case, connects to it before the case starts, writes one line naming the binary and
+  the test, starts the case when a line answers, and keeps the connection until the case has exited: the connection's
+  end is the case's end, so a case that is killed gives its core back.
+- **The leaf's own cores.** As many cases run on the leaf's grant as it holds cores. They never queue in the pool: a
+  suite of small tests runs on its grant as it did before the gate (the 2026-10-30 measurement above stands).
+- **A core for one case.** While a case waits and no core of the grant is free, bounded-exec holds one request in its
+  name on the run's endpoint: one core at `low`, its class the case (`name`, `nextest:<case id>`), so the pool predicts
+  it by that case's own run times and, among such requests, starts the shortest first. A core of the grant that frees
+  goes to the waiting case with the longest last recorded wall, and that case's request is withdrawn; a core the pool
+  grants is its request's case's and is released when that case ends, so the cores the pool gives come back soonest.
+- **What others wait for.** Such a request is an ordinary `low` request: every `interactive` and `normal` request passes
+  it, it takes its turn among `low` ones in the pool's order, and the pool's laws hold unchanged ("The pool's laws").
+  Nothing is taken back: a request that arrives while a case holds a pool core waits at most until that case ends. The
+  leaf's reservation is as it was: admitted once, never preempted, its count never grown.
+- **Replayed.** The three windows above and a fourth of 2026-11-17 (the same suite granted 2 cores on a cold gate), each
+  replayed through the pool's rule with every other request at its recorded arrival and hold (`cowshed-admission-sim`
+  `lend.rs`). Sized to its grant the replayed leaf holds what the record says: 665 s against 667 s, 629 s against 629 s.
+  Behind its gate the leaf granted one core beside a mean of 12.6 free ends in 267 s, its longest case (352 s with the
+  walls its 13-wide run recorded); where the pool stayed full for 560 s after its grant, 463 s; the leaf granted 12 is
+  unchanged; the cold gate's 629 s becomes 504 s, its longest case. No `low` request started later in any window; an
+  `interactive` one at most 10.3 s; a `normal` one 4.5 s at most where cores stood free, and 81.5 s at most in the full
+  pool, where its run's other requests started 800 s sooner in sum and 674 s later.
+- **A case's wall is its run.** nextest times a case from the shim's start, so its own duration includes the wait. The
+  result bounded-exec records for the case (`test-results.jsonl`) subtracts the wait its gate measured and names it as
+  `waitMs`; the walls that order the cases above, and a suite's minimum, are therefore runs alone.
+- **Progress.** A case waiting at the gate is not progress and stops no clock: the leaf's no-progress bound runs while
+  any case holds a core, as it does for a leaf without a gate, and at least one always does while any waits.
+- **Without a gate.** A run whose endpoint does not answer `{"type":"capabilities"}` with `test_gate` (an mbx whose shim
+  does not gate) sizes the leaf's runner to its grant, as every other reserved leaf is sized. A shim that is named a
+  gate it cannot reach, or whose gate closes before it answers, fails its case by name and starts nothing: a runner
+  started on every thread never runs a case no core was taken for.
+- **What the caller sees.** At its end the leaf says
+  `cowshed: mbx reserve cases own=<n> lent=<n> lent_core_s=<s> waited_case_s=<s>`: the cases that ran on its grant and
+  on a core of their own, the core-seconds those held, and the seconds its cases waited at the gate.
+- **Enforced by** `case-gate.test.ts` (the gate's decisions and its socket), the gated-leaf cases of `executor.test.ts`
+  (a leaf granted one of six cores starts six threads, its second case on a core reserved in its name; without the
+  capability it is sized to its grant), `mbx-reservations.test.ts` (the capability), the replay above, and mbx's own
+  suite for the shim.
 
 <a id="smoo/cowshed!n/build-precedes-reservation"></a>**A leaf's build precedes its reservation.** A reservation holds
 cores only while its command can use them. A reserved leaf's fixture (`fixtureCommand`; for the plugin's nextest runners

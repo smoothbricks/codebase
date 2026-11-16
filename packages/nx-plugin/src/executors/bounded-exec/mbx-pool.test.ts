@@ -43,7 +43,7 @@ describe("mbx's one pool at the leaf", () => {
   it('lets a building Cargo leaf through mbx as it is and reserves any other leaf at its runner count, once', () => {
     const pool = { priority: 'low' } as const;
     const leafOf = (command: string, declared?: number) =>
-      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command);
+      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command, false);
     for (const command of ['cargo test -p x', 'cargo mutants', 'cargo nextest run -p x']) {
       expect(leafOf(command)).toEqual({ kind: 'cargo' });
       expect(withMbxLeaf(command, leafOf(command))).toBe(command);
@@ -74,7 +74,7 @@ describe("mbx's one pool at the leaf", () => {
       'bun node_modules/@smoothbricks/nx-plugin/../nextest-extract/dist/ts/bin/smoo-nx-nextest-binaries.js',
     );
     const leafOf = (command: string, declared: number) =>
-      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command);
+      mbxLeaf(pool, runnerDemand(command, declared, 18, {}), command, false);
     for (const command of [inPlace, bunSpelled]) {
       expect(leafOf(command, 6)).toMatchObject({
         kind: 'reserve',
@@ -104,7 +104,7 @@ describe("mbx's one pool at the leaf", () => {
     const nextest = 'cargo --frozen nextest run --binaries-metadata .cache/nextest/binaries-metadata.json';
     expect(runsPrebuiltNextest(nextest)).toBe(true);
     expect(runsPrebuiltNextest('cargo nextest run -p x')).toBe(false);
-    const leaf = mbxLeaf(pool, runnerDemand(nextest, 6, 18, {}), nextest);
+    const leaf = mbxLeaf(pool, runnerDemand(nextest, 6, 18, {}), nextest, false);
     if (leaf?.kind !== 'reserve') throw new Error('a prebuilt nextest leaf is reserved for');
     // The fixture says whether mbx's scheduler is off for it, as it is under a reservation.
     const fixture = 'echo "built [$MBX_SCHED_DISABLE]" >&2';

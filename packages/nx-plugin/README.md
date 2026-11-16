@@ -2915,6 +2915,9 @@ to the command, which the keyed modules decide. Each entry, and what the executo
 - `parent-grant.js`: what a run asks its parent's pool for and says of the answer, `peak-charge.js` and `cpu-grant.js`:
   the charge the task's last record names and the grant a record states. A grant reaches the command as a token count
   and nothing else, through `runner-sizing.js`; a record that cannot be read refuses the run.
+- `case-gate.js`: the gate a reserved nextest leaf's cases each take a core at, one of its grant or one reserved for the
+  case. It decides when a case starts and on which core; the leaf's thread count still reaches the command through
+  `runner-sizing.js`.
 - `suite-minimum.js`: the minimum a reserved test leaf names on its reservation, from the walls its last run recorded.
   It decides how many cores the leaf waits for before it starts; the grant still reaches the command as a token count
   through `runner-sizing.js`, and a leaf with no recorded wall names none.

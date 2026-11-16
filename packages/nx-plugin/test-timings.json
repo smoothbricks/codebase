@@ -7,6 +7,7 @@
     "src/ensure-built.test.ts": 42774,
     "src/nx-daemon-validity.test.ts": 42427,
     "src/executors/bounded-exec/cargo-progress-host.test.ts": 38973,
+    "src/executors/bounded-exec/case-gate.test.ts": 60,
     "src/cargo-resolve-cache.test.ts": 26366,
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 23230,
     "src/index.test.ts": 20426,

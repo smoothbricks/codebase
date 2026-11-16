@@ -371,9 +371,11 @@ export function sizeRunner(
  * The shell statements that run first in a reserved leaf's reservation and size its runner to the grant, which only
  * the command learns as it starts: `CPU_TOKENS_ENV` becomes the cores mbx granted (`GRANTED_CPUS_ENV`), never more
  * than the leaf asked for (`WANT_ENV`, set before it reserved). The test-thread variables a sizing sets follow from it,
- * under their inherited ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`).
+ * under their inherited ceilings, outranking the target's own as a numeric grant's do (`sizeRunner`). A `gated` nextest
+ * leaf's runner starts every thread of its ask instead: each case takes its core at the leaf's gate (case-gate.ts;
+ * specs/cowshed/05_gateway.md, "A case starts on a core").
  */
-export function grantedSizing(demand: ReservedDemand): string {
+export function grantedSizing(demand: ReservedDemand, gated: boolean): string {
   const asked = `$${WANT_ENV}`;
   const named = `$${GRANTED_CPUS_ENV}`;
   const tokens = `$${CPU_TOKENS_ENV}`;
@@ -382,7 +384,7 @@ export function grantedSizing(demand: ReservedDemand): string {
   const statements = [`export ${CPU_TOKENS_ENV}="$(( ${named} < ${asked} ? ${named} : ${asked} ))"`];
   switch (demand.kind) {
     case 'nextest':
-      statements.push(`export NEXTEST_TEST_THREADS="${tokens}"`);
+      statements.push(`export NEXTEST_TEST_THREADS="${gated ? asked : tokens}"`);
       break;
     case 'process':
       // A process's script may start Cargo, whose test threads take no jobserver token: its whole grant.
@@ -400,13 +402,13 @@ export function grantedSizing(demand: ReservedDemand): string {
 
 /**
  * `command` with a reserved runner's named count read from its grant, `CPU_TOKENS_ENV` as `grantedSizing` sets it,
- * where the runner's shell runs it; the runner then runs on all it holds.
+ * where the runner's shell runs it; the runner then runs on all it holds. A `gated` nextest runner's count is its ask.
  */
-export function sizeRunnerToGrant(demand: ReservedDemand, command: string): string {
+export function sizeRunnerToGrant(demand: ReservedDemand, command: string, gated: boolean): string {
   const granted = `\${${CPU_TOKENS_ENV}}`;
   switch (demand.kind) {
     case 'nextest':
-      return command.replace(TEST_THREADS, `--test-threads=${granted}`);
+      return command.replace(TEST_THREADS, `--test-threads=${gated ? `\${${WANT_ENV}}` : granted}`);
     case 'bun-parallel':
       return command.replace(BUN_PARALLEL, `--parallel=${granted}`);
     case 'stryker': {

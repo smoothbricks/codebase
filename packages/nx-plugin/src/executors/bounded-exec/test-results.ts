@@ -15,6 +15,11 @@ export interface ClosedTestResult {
   readonly contradictsCursor?: ByteOffset;
   /** Null when the native runner reports no duration (for example a skipped test). */
   readonly durationMs: (number & tags.Minimum<0>) | null;
+  /**
+   * How long the case waited for a core at its leaf's gate before it ran (specs/cowshed/05_gateway.md, "A case starts
+   * on a core"), which `durationMs` leaves out; absent for a case that did not wait.
+   */
+  readonly waitMs?: number & tags.Minimum<0>;
   /** Native file:line, never a location inferred from human output. */
   readonly sourceRef: string | null;
   /** UTF-8 byte range [startByte, endByte), relative to the task artifact directory. */

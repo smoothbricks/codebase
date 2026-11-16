@@ -9,6 +9,7 @@
         "./dist/executors/bounded-exec/cpu-grant.js",
         "./dist/executors/bounded-exec/cpu-pool.js",
         "./dist/executors/bounded-exec/disk-lease.js",
+        "./dist/executors/bounded-exec/case-gate.js",
         "./dist/executors/bounded-exec/gateway-lease.js",
         "./dist/executors/bounded-exec/hang-diagnostics.js",
         "./dist/executors/bounded-exec/host-memory.js",
