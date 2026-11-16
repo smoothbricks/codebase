@@ -625,6 +625,128 @@ describe('pure core: applyWorkspaceConfig', () => {
 // Layer 2: Tree-based function tests
 // ---------------------------------------------------------------------------
 
+describe("pure core: Nx 24's list form of a target default", () => {
+  /** A catch-all build entry: no filter, so it applies to every build target, and it caches. */
+  function catchAllBuild(): Record<string, unknown> {
+    return { '//': 'Default outputs are TS emit.', cache: true, inputs: ['default', '^production'] };
+  }
+
+  /** An entry only nx:noop builds take. */
+  function noopBuild(): Record<string, unknown> {
+    return {
+      '//': 'An nx:noop build runs nothing.',
+      filter: { executor: 'nx:noop' },
+      inputs: ['...', { externalDependencies: [] }],
+    };
+  }
+
+  /** The list-form defaults a consumer wrote for build, test, lint and two targets the policy does not own. */
+  function listFormNxJson(build: Record<string, unknown>[]): Record<string, unknown> {
+    return {
+      ...validNxJson(),
+      targetDefaults: {
+        '*': [{ '//': 'every target', filter: { executor: 'nx:run-commands' }, inputs: ['...', 'bunToolchain'] }],
+        build,
+        'tsc-js': [{ '//': 'emit', dependsOn: ['^tsc-js'], inputs: ['production'] }, noopBuild()],
+        test: [
+          { '//': 'tests', cache: true, inputs: ['default', '^production'] },
+          { filter: { executor: '@smoothbricks/nx-plugin:bounded-exec' }, inputs: ['...', 'nxBoundedExec'] },
+        ],
+        lint: [
+          { '//': 'type-aware lint', cache: true, inputs: ['...', '^production', 'nxPluginReach'] },
+          { '//': 'verdicts', filter: { executor: '@smoothbricks/nx-plugin:all-verdicts' }, inputs: ['...', 'v'] },
+          { '//': 'noop lint', filter: { executor: 'nx:noop' }, inputs: ['...', { externalDependencies: [] }] },
+        ],
+      },
+    };
+  }
+
+  it('validates the list form clean and leaves it byte-identical through update', () => {
+    const nxJson = listFormNxJson([catchAllBuild(), noopBuild()]);
+    const before = JSON.stringify(nxJson);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(JSON.stringify(nxJson)).toBe(before);
+  });
+
+  it('reports an entry that sets outputs and removes that member alone', () => {
+    const withOutputs = { ...noopBuild(), outputs: ['{projectRoot}/dist'] };
+    const nxJson = listFormNxJson([catchAllBuild(), withOutputs]);
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults.build.outputs must not be set; @smoothbricks/nx-plugin infers the build aggregate',
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.targetDefaults).build).toEqual([catchAllBuild(), noopBuild()]);
+  });
+
+  it('requires the cache of the entries that apply to every build, and adds a catch-all entry when none exists', () => {
+    const nxJson = listFormNxJson([noopBuild()]);
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults.build.cache must be true in an entry without a filter',
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.targetDefaults).build).toEqual([noopBuild(), { cache: true }]);
+    expect(checkWorkspaceConfig(nxJson)).toEqual([]);
+  });
+
+  it('reports a filtered entry whose cache is not true and removes that member alone', () => {
+    const nxJson = listFormNxJson([catchAllBuild(), { ...noopBuild(), cache: null }]);
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults.build.cache must be true in every entry that sets it',
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(expectRecord(nxJson.targetDefaults).build).toEqual([catchAllBuild(), noopBuild()]);
+  });
+
+  it('reports and removes a test dependsOn in any entry, and a lint entry that drops the inferred inputs', () => {
+    const nxJson = listFormNxJson([catchAllBuild(), noopBuild()]);
+    const defaults = expectRecord(nxJson.targetDefaults);
+    const filteredTest = { filter: { executor: 'nx:noop' }, dependsOn: ['^build'] };
+    const filteredLint = { filter: { executor: 'nx:noop' }, inputs: ['default'] };
+    defaults.test = [{ cache: true }, filteredTest];
+    defaults.lint = [{ cache: true }, filteredLint];
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults.test.dependsOn must not be set; @smoothbricks/nx-plugin infers the test aggregate',
+      'targetDefaults.lint.inputs must not be set; @smoothbricks/nx-plugin infers lint from project sources',
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(defaults.test).toEqual([{ cache: true }, { filter: { executor: 'nx:noop' } }]);
+    expect(defaults.lint).toEqual([{ cache: true }, { filter: { executor: 'nx:noop' } }]);
+  });
+
+  it('refuses a target default that is neither an object nor a list of objects, and leaves it as written', () => {
+    for (const build of ['build', [catchAllBuild(), 'noop']]) {
+      const nxJson = { ...validNxJson(), targetDefaults: { build } };
+      expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+        'targetDefaults.build must be an object or a list of objects; smoo does not rewrite it',
+      ]);
+      applyWorkspaceConfig(nxJson);
+      expect(expectRecord(nxJson.targetDefaults).build).toEqual(build);
+    }
+  });
+
+  it('refuses a targetDefaults that is not an object and leaves it as written', () => {
+    const nxJson = { ...validNxJson(), targetDefaults: [] };
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults must be an object; smoo does not rewrite it',
+      'targetDefaults.build.cache must be true',
+    ]);
+    applyWorkspaceConfig(nxJson);
+    expect(nxJson.targetDefaults).toEqual([]);
+  });
+
+  it('removes only the list entries that name the retired clean executor', () => {
+    const kept = { filter: { executor: 'nx:noop' }, inputs: [] };
+    const nxJson = listFormNxJson([catchAllBuild(), noopBuild()]);
+    const defaults = expectRecord(nxJson.targetDefaults);
+    defaults.clean = [{ executor: '@smoothbricks/nx-plugin:clean-outputs' }, kept];
+    expect(checkWorkspaceConfig(nxJson).map((issue) => issue.message)).toEqual([
+      'targetDefaults.clean names the retired @smoothbricks/nx-plugin:clean-outputs; run smoo monorepo update to remove it',
+    ]);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    expect(defaults.clean).toEqual([kept]);
+  });
+});
 describe('Tree: checkWorkspaceConfigTree', () => {
   it('returns issue when nx.json missing', () => {
     const tree = createTreeWithEmptyWorkspace();

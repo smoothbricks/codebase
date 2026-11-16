@@ -124,6 +124,9 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
 
   // Colon target defaults
   const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+  if (nxJson.targetDefaults !== undefined && targetDefaults === null) {
+    issues.push({ path: 'nx.json', message: 'targetDefaults must be an object; smoo does not rewrite it' });
+  }
   if (targetDefaults) {
     for (const targetName of Object.keys(targetDefaults)) {
       if (targetName.includes(':')) {
@@ -142,11 +145,14 @@ export function checkWorkspaceConfig(nxJson: Record<string, unknown>): NxPolicyI
             'Per-project inference selects current library or build outputs before test typechecking.',
         });
       }
-      if (isRetiredCleanTargetDefault(targetDefaults, targetName)) {
+      if (retiredCleanEntries(targetDefaults, targetName).length !== 0) {
         issues.push({
           path: 'nx.json',
           message: `targetDefaults.clean names the retired ${retiredCleanOutputsExecutor}; run smoo monorepo update to remove it`,
         });
+      }
+      if (targetDefault(nxJson, targetName).form === 'malformed') {
+        issues.push({ path: 'nx.json', message: malformedTargetDefaultMessage(targetName) });
       }
     }
   }
@@ -293,10 +299,22 @@ function validateBuildTargetDefault(
   nxJsonPath: string,
   issues: NxPolicyIssue[],
 ): void {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  const build = targetDefaults ? recordProperty(targetDefaults, 'build') : null;
-  if (build?.cache !== true) {
-    issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true' });
+  const build = targetDefault(nxJson, 'build');
+  if (build.form === 'malformed') {
+    return;
+  }
+  const entries = build.form === 'absent' ? [] : build.entries;
+  if (catchAllValue(entries, 'cache') !== true) {
+    issues.push({
+      path: nxJsonPath,
+      message:
+        build.form === 'list'
+          ? 'targetDefaults.build.cache must be true in an entry without a filter'
+          : 'targetDefaults.build.cache must be true',
+    });
+  }
+  if (entries.some((entry) => 'filter' in entry && 'cache' in entry && entry.cache !== true)) {
+    issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true in every entry that sets it' });
   }
   // dependsOn and outputs are both owned by the inference plugin, and Nx gives
   // targetDefaults precedence over inferred values, so anything set here lands
@@ -319,7 +337,7 @@ function validateBuildTargetDefault(
   // `build` genuinely emits files declares its own outputs in package.json,
   // where the claim is scoped to the project that can honour it.
   for (const property of ['dependsOn', 'outputs'] as const) {
-    if (build !== null && property in build) {
+    if (entries.some((entry) => property in entry)) {
       issues.push({
         path: nxJsonPath,
         message: `targetDefaults.build.${property} must not be set; @smoothbricks/nx-plugin infers the build aggregate`,
@@ -393,25 +411,43 @@ function markdownExclusionMessage(name: 'default' | 'production'): string {
 }
 
 function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
-  const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
-  const build = getOrCreateRecord(targetDefaults, 'build');
-  let changed = setBooleanProperty(build, 'cache', true);
-  for (const property of ['dependsOn', 'outputs'] as const) {
-    if (property in build) {
-      delete build[property];
+  const build = targetDefault(nxJson, 'build');
+  if (build.form === 'malformed') {
+    return false;
+  }
+  if (build.form === 'absent') {
+    const targetDefaults = recordProperty(nxJson, 'targetDefaults');
+    if (nxJson.targetDefaults !== undefined && targetDefaults === null) {
+      return false;
+    }
+    getOrCreateRecord(nxJson, 'targetDefaults').build = { cache: true };
+    return true;
+  }
+  let changed = false;
+  if (catchAllValue(build.entries, 'cache') !== true) {
+    const catchAll = build.entries.filter((entry) => !('filter' in entry)).at(-1);
+    if (catchAll !== undefined) {
+      changed = setBooleanProperty(catchAll, 'cache', true);
+    } else {
+      // A list with no entry for every build gets one that caches; the entries it holds stay as written.
+      build.list.push({ cache: true });
       changed = true;
     }
   }
-  return changed;
+  for (const entry of build.entries) {
+    if ('filter' in entry && 'cache' in entry && entry.cache !== true) {
+      delete entry.cache;
+      changed = true;
+    }
+  }
+  return deleteMembers(build.entries, ['dependsOn', 'outputs']) || changed;
 }
 
 function validateTestTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: string, issues: NxPolicyIssue[]): void {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  const test = targetDefaults ? recordProperty(targetDefaults, 'test') : null;
   // Same clobber as targetDefaults.build.dependsOn: Nx replaces an inferred
   // list rather than merging, so a workspace-wide [^build, build] unwires
   // cargo-test from every Rust test aggregate. Cache stays allowed.
-  if (test !== null && 'dependsOn' in test) {
+  if (targetDefaultEntries(nxJson, 'test').some((entry) => 'dependsOn' in entry)) {
     issues.push({
       path: nxJsonPath,
       message: 'targetDefaults.test.dependsOn must not be set; @smoothbricks/nx-plugin infers the test aggregate',
@@ -420,26 +456,30 @@ function validateTestTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: 
 }
 
 function applyTestTargetDefault(nxJson: Record<string, unknown>): boolean {
-  const targetDefaults = recordProperty(nxJson, 'targetDefaults');
-  const test = targetDefaults ? recordProperty(targetDefaults, 'test') : null;
-  if (test === null || !('dependsOn' in test)) {
-    return false;
-  }
-  delete test.dependsOn;
-  return true;
+  return deleteMembers(targetDefaultEntries(nxJson, 'test'), ['dependsOn']);
 }
 
 const inferredLintProperties = ['executor', 'options', 'dependsOn', 'outputs', 'inputs'] as const;
 
-function preservesInferredLintInputs(inputs: unknown): boolean {
-  return Array.isArray(inputs) && inputs.includes('...') && inputs.includes('^production');
+/**
+ * Whether an entry's inputs keep what lint infers. Every entry spreads what came before it (`...`); an entry for every
+ * lint target also keeps the dependency declarations (`^production`), which a filtered entry inherits by spreading it.
+ */
+function preservesInferredLintInputs(entry: Record<string, unknown>): boolean {
+  const inputs = entry.inputs;
+  return Array.isArray(inputs) && inputs.includes('...') && ('filter' in entry || inputs.includes('^production'));
+}
+
+function offendingLintProperties(entry: Record<string, unknown>): string[] {
+  return inferredLintProperties.filter(
+    (property) => property in entry && !(property === 'inputs' && preservesInferredLintInputs(entry)),
+  );
 }
 
 function validateLintTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: string, issues: NxPolicyIssue[]): void {
-  const defaults = recordProperty(nxJson, 'targetDefaults');
-  const lint = defaults ? recordProperty(defaults, 'lint') : null;
+  const offending = new Set(targetDefaultEntries(nxJson, 'lint').flatMap(offendingLintProperties));
   for (const property of inferredLintProperties) {
-    if (lint !== null && property in lint && !(property === 'inputs' && preservesInferredLintInputs(lint.inputs))) {
+    if (offending.has(property)) {
       issues.push({
         path: nxJsonPath,
         message: `targetDefaults.lint.${property} must not be set; @smoothbricks/nx-plugin infers lint from project sources`,
@@ -449,15 +489,9 @@ function validateLintTargetDefault(nxJson: Record<string, unknown>, nxJsonPath: 
 }
 
 function applyLintTargetDefault(nxJson: Record<string, unknown>): boolean {
-  const defaults = recordProperty(nxJson, 'targetDefaults');
-  const lint = defaults ? recordProperty(defaults, 'lint') : null;
-  if (lint === null) return false;
   let changed = false;
-  for (const property of inferredLintProperties) {
-    if (property in lint && !(property === 'inputs' && preservesInferredLintInputs(lint.inputs))) {
-      delete lint[property];
-      changed = true;
-    }
+  for (const entry of targetDefaultEntries(nxJson, 'lint')) {
+    changed = deleteMembers([entry], offendingLintProperties(entry)) || changed;
   }
   return changed;
 }
@@ -499,20 +533,35 @@ function removeDisallowedTargetDefaults(nxJson: Record<string, unknown>): boolea
   }
   let changed = false;
   for (const targetName of Object.keys(targetDefaults)) {
-    if (
-      targetName.includes(':') ||
-      targetName === inferredTestTypecheckTarget ||
-      isRetiredCleanTargetDefault(targetDefaults, targetName)
-    ) {
+    if (targetName.includes(':') || targetName === inferredTestTypecheckTarget) {
       delete targetDefaults[targetName];
       changed = true;
+      continue;
     }
+    const retired = retiredCleanEntries(targetDefaults, targetName);
+    if (retired.length === 0) {
+      continue;
+    }
+    const value = targetDefaults[targetName];
+    const kept = Array.isArray(value) ? value.filter((entry) => !retired.includes(entry)) : [];
+    if (kept.length === 0) {
+      delete targetDefaults[targetName];
+    } else {
+      targetDefaults[targetName] = kept;
+    }
+    changed = true;
   }
   return changed;
 }
 
-function isRetiredCleanTargetDefault(targetDefaults: Record<string, unknown>, targetName: string): boolean {
-  return targetName === 'clean' && recordProperty(targetDefaults, 'clean')?.executor === retiredCleanOutputsExecutor;
+/** The entries of `targetName`'s default that name the retired clean executor, which the policy removes. */
+function retiredCleanEntries(targetDefaults: Record<string, unknown>, targetName: string): Record<string, unknown>[] {
+  if (targetName !== 'clean') {
+    return [];
+  }
+  return targetDefaultEntries({ targetDefaults }, 'clean').filter(
+    (entry) => entry.executor === retiredCleanOutputsExecutor,
+  );
 }
 
 function isPreciseProductionNamedInput(production: unknown[]): boolean {
@@ -576,6 +625,69 @@ function recordProperty(record: Record<string, unknown>, key: string): Record<st
   return isRecord(value) ? value : null;
 }
 
+/**
+ * A target default as Nx 24 reads it: one record, or a list of records merged in document order, each applying to the
+ * targets its optional `filter` matches; an entry without one applies to every target of the name. Anything else is
+ * not a target default the policy can read, and it is refused by name rather than replaced.
+ */
+type TargetDefault =
+  | { readonly form: 'absent' }
+  | { readonly form: 'record'; readonly entries: readonly Record<string, unknown>[] }
+  | {
+      readonly form: 'list';
+      readonly entries: readonly Record<string, unknown>[];
+      readonly list: Record<string, unknown>[];
+    }
+  | { readonly form: 'malformed' };
+
+function targetDefault(nxJson: Record<string, unknown>, targetName: string): TargetDefault {
+  const value = recordProperty(nxJson, 'targetDefaults')?.[targetName];
+  if (value === undefined) {
+    return { form: 'absent' };
+  }
+  if (isRecord(value)) {
+    return { form: 'record', entries: [value] };
+  }
+  if (Array.isArray(value) && value.every(isRecord)) {
+    return { form: 'list', entries: [...value], list: value };
+  }
+  return { form: 'malformed' };
+}
+
+/** The entries of a readable target default; none for an absent or malformed one, which validation reports. */
+function targetDefaultEntries(nxJson: Record<string, unknown>, targetName: string): readonly Record<string, unknown>[] {
+  const value = targetDefault(nxJson, targetName);
+  return value.form === 'record' || value.form === 'list' ? value.entries : [];
+}
+
+/** What every target of the name receives for `key` from the entries without a filter: Nx merges them, last one wins. */
+function catchAllValue(entries: readonly Record<string, unknown>[], key: string): unknown {
+  let value: unknown;
+  for (const entry of entries) {
+    if (!('filter' in entry) && key in entry) {
+      value = entry[key];
+    }
+  }
+  return value;
+}
+
+/** Remove `members` from every entry that holds them; the entries themselves and their other members stay. */
+function deleteMembers(entries: readonly Record<string, unknown>[], members: readonly string[]): boolean {
+  let changed = false;
+  for (const entry of entries) {
+    for (const member of members) {
+      if (member in entry) {
+        delete entry[member];
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function malformedTargetDefaultMessage(targetName: string): string {
+  return `targetDefaults.${targetName} must be an object or a list of objects; smoo does not rewrite it`;
+}
 function getOrCreateRecord(record: Record<string, unknown>, key: string): Record<string, unknown> {
   const value = record[key];
   if (isRecord(value)) {
