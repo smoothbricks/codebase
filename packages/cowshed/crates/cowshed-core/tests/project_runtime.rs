@@ -2399,6 +2399,110 @@ async fn a_job_s_status_is_answered_while_a_fork_holds_the_router() {
     gate.notify_one();
     fork.await.expect("the fork ends once released");
 }
+
+/// A job's output is its supervisor's to answer whichever session asks (07_api.md, "A job's
+/// calls are its supervisor's to answer"): a second session, which did not admit the job and
+/// holds its own lane to the job's supervisor, follows the running job's stdout from byte zero
+/// after the job wrote it, and receives those bytes.
+#[tokio::test]
+async fn a_second_session_follows_a_running_job_s_output_from_its_start() {
+    use cowshed_core::resident::JobLink;
+    use cowshed_core::runtime::supervisor_socket;
+    let root = test_root();
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let supervisor = scripted_supervisor(&root, spawn_tx);
+    let socket = root.join("s");
+    let listener = supervisor_socket::bind(&socket)
+        .await
+        .expect("bind main's supervisor");
+    let _serving = tokio::spawn(supervisor_socket::serve(
+        listener,
+        supervisor.clone(),
+        None,
+        None,
+    ));
+    let mut sessions = Vec::new();
+    for state in ["admitting", "observing"] {
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut host = FakeHost::new(&root.join(state), events, false, Vec::new());
+        host.supervisors
+            .insert(WorkspaceName::main(), supervisor.clone());
+        host.lanes.set_supervisor(
+            WorkspaceName::main(),
+            JobLink::over(
+                socket.clone(),
+                supervisor_socket::connect(socket.clone(), supervisor.snapshot().clone()),
+            ),
+        );
+        let repo = host.descriptor.repo_id.clone();
+        let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+        let router = runtime.router();
+        let adopted = adopt(&router, &repo).await;
+        sessions.push((runtime, router, repo, adopted));
+    }
+    let (_, admitting, repo, adopted) = &sessions[0];
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    let job = route(
+        admitting,
+        coordinator(repo.clone()),
+        "worker.exec",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "workspaceIncarnation": incarnation,
+            "argv": serde_json::to_value(vec![CommandArg::from("build")]).unwrap(),
+            "mode": "readWrite",
+            "env": {},
+            "stdin": {"kind":"empty"},
+            "stdoutCopy": null,
+            "stderrCopy": null
+        }),
+    )
+    .await
+    .expect("admit the job");
+    let job_id: JobId = serde_json::from_value(job).expect("the job's id");
+    let process = spawned.recv().await.expect("the admitted job spawned");
+    process
+        .send(ProcessEvent::Output {
+            job_id,
+            stream: StreamKind::Stdout,
+            bytes: Bytes::from_static(b"1\n2\n3\n4\n5\n"),
+        })
+        .await
+        .expect("the job writes its output");
+
+    // The observer is the client an embedder holds on a controller of its own: it takes the job
+    // by its id and follows its stdout.
+    let (_, observing, repo, _) = &sessions[1];
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let _connection = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator(repo.clone()),
+        observing.clone(),
+    ));
+    let (cowshed, token) = Cowshed::connect(client.into()).await.expect("handshake");
+    let project = cowshed
+        .open(root.join("observing").join("checkout"))
+        .await
+        .expect("open");
+    let worker = cowshed
+        .coordinator(&project, token)
+        .expect("coordinator")
+        .worker("main")
+        .await
+        .expect("worker");
+    let job = worker.job(job_id).await.expect("the job by its id");
+    let mut stdout = job
+        .logs(JobStream::Stdout, 0, true)
+        .await
+        .expect("follow the job's stdout");
+    let first = stdout
+        .next()
+        .await
+        .expect("the follow yields while the job runs")
+        .expect("the job's first bytes");
+    assert_eq!(&first[..], b"1\n2\n3\n4\n5\n");
+}
 //#endregion smoo/cowshed!n/job-calls-beside-router
 
 /// A job process the test speaks for: the supervisor hands each spawned job's event sender to
