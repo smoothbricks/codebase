@@ -654,6 +654,12 @@ async fn gate(
 ) -> Result<()> {
     let argv = declaration.gate().argv(workspace);
     let mut command = declared_command(main, &argv, environment)?;
+    // The gate's foreground execs end with this land (05_gateway.md, "A job lives with its
+    // requester").
+    let lander = crate::lander::Lander::this().map_err(|error| {
+        CowshedError::internal(format!("cannot name this land to its gate: {error}"))
+    })?;
+    command.env(crate::lander::VARIABLE, lander.to_string());
     command
         .stdin(Stdio::null())
         .stdout(stderr()?)

@@ -1268,7 +1268,9 @@ unchanged.
    process, and holds it through step 5 and its retire: its wait reports, ticket and the gateway's log lines are
    `land-turn`'s, with `<ws>` as the ticket's workspace. The gate (step 4) binds itself to the turn as `land-turn`'s
    command does, from its start, so the gateway keeps the turn until the gate has ended too, however this process ends:
-   a land killed alone leaves its gate holding the turn, never a second land beside it.
+   a land killed alone leaves its gate holding the turn, never a second land beside it. That gate does not run on for
+   nobody: its foreground `cowshed exec`s end with the land (05_gateway.md "A job lives with its requester"), so the
+   gate ends by itself and the turn passes on.
 3. **Rebase.** It first brings main to the head of `[land] push`'s branch: a writer that pushes main without landing it
    (a release workflow's version commits, dispatched under the land turn: 05_gateway.md "A publish holds the land turn")
    can leave the remote ahead, and a land onto the main it left behind would gate, land and run its after commands on a

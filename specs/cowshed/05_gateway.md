@@ -2374,7 +2374,17 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   (11_shell.md, `hold`): when that process ends before its job — `SIGKILL` included, since the kernel closes its
   connection — the supervisor kills the job. `--timeout` releases the hold before it leaves the job running, and
   `--background` takes none: a caller who asks for an unattended job keeps it. A job that cannot be held is killed and
-  its exec fails, rather than run for nobody.
+  its exec fails, rather than run for nobody. <a id="smoo/cowshed!n/gate-ends-with-its-lander"></a>A land's gate has a
+  second requester, its lander, and the exec process alone does not stand for it: the gate is a script the land starts,
+  and a land that ends (a `kill` of the land alone, `SIGKILL` included) leaves that script and the `cowshed exec` under
+  it alive, holding the job and the land turn for a verdict nothing reads. So `cowshed land` names itself to its gate,
+  `COWSHED_LANDER=<pid>:<start time>` in the gate's environment, and every foreground `cowshed exec` that inherits the
+  name watches that process's exit (`ExitWatch`, never a poll) beside its own signals. When the lander has ended, or had
+  already ended or lost its pid to another process when the exec started, the exec says so on stderr and ends as it does
+  on `SIGTERM`: its hold drops, the supervisor kills the job, the gate script's command fails, and the turn passes on
+  once the script has ended. A lander it cannot watch is said on stderr and ends nothing. A train's proof, which no land
+  runs, carries no name and is held by its exec alone. Measured 2026-11-16, twice: a land ended by hand left its gate
+  running for half an hour at gate class, 18 tasks wide, outside every lock.
 
 ### Status
 

@@ -65,6 +65,17 @@ impl InterruptPolicy {
         self.arm_with(JOBS_FATE)
     }
 
+    /// [`Self::arm`] for a `cowshed exec`: under a land's gate it also ends when its lander has
+    /// (05_gateway.md, "A job lives with its requester"). An in-process host's command is its
+    /// host's to end.
+    pub(crate) fn arm_for_exec(self) -> Interrupts {
+        let mut interrupts = self.arm();
+        if self == Self::EndJobs {
+            interrupts.lander = crate::lander::Watch::inherited();
+        }
+        interrupts
+    }
+
     /// The signal watch this policy calls for, for a command a signal is forwarded to: it keeps
     /// running and holds its turn until it ends.
     pub(crate) fn arm_forwarding(self) -> Interrupts {
@@ -443,7 +454,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     let resident =
         matches!(&parsed.command, args::Command::Exec(_)) && !is_land_step(&parsed.command);
     let stdin = if resident {
-        let mut interrupts = interrupts.arm();
+        let mut interrupts = interrupts.arm_for_exec();
         let answered = tokio::select! {
             answered = crate::resident::answer_exec(&parsed, tokio::io::stdin(), &mut output) => answered,
             signal = interrupts.received() => return Err(signal),
@@ -498,7 +509,13 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
     // The long-running services above own their signals, and a resident answer's handlers stay
     // armed from it, so from here on the command is interruptible.
-    let mut interrupts = armed.unwrap_or_else(|| interrupts.arm());
+    let mut interrupts = armed.unwrap_or_else(|| {
+        if matches!(&parsed.command, args::Command::Exec(_)) {
+            interrupts.arm_for_exec()
+        } else {
+            interrupts.arm()
+        }
+    });
     let outcome = {
         let command = async {
             match runtime_dispatch(&parsed.command) {
@@ -569,6 +586,8 @@ pub(crate) struct Interrupts {
     interrupt: Option<Signal>,
     hangup: Option<Signal>,
     terminate: Option<Signal>,
+    /// The land whose gate this exec runs under, when it runs under one.
+    lander: Option<crate::lander::Watch>,
 }
 
 impl Interrupts {
@@ -577,6 +596,7 @@ impl Interrupts {
             interrupt: None,
             hangup: None,
             terminate: None,
+            lander: None,
         }
     }
 
@@ -585,15 +605,24 @@ impl Interrupts {
             interrupt: watch(SignalKind::interrupt(), libc::SIGINT, "SIGINT", fate),
             hangup: watch(SignalKind::hangup(), libc::SIGHUP, "SIGHUP", fate),
             terminate: watch(SignalKind::terminate(), libc::SIGTERM, "SIGTERM", fate),
+            lander: None,
         }
     }
 
     /// The number of the first watched signal to arrive; never resolves when none is watched.
+    /// The end of the land this command's gate ran for is its SIGTERM: nothing reads the gate's
+    /// verdict any more, so the command ends, and its job with it, as on a polite kill.
     pub(crate) async fn received(&mut self) -> i32 {
         tokio::select! {
             () = arrival(&mut self.interrupt) => libc::SIGINT,
             () = arrival(&mut self.hangup) => libc::SIGHUP,
             () = arrival(&mut self.terminate) => libc::SIGTERM,
+            lander = crate::lander::Watch::ended(&mut self.lander) => {
+                cowshed_os::eprintln!(
+                    "cowshed: the land this gate ran for (pid {lander}) has ended; ending this command and the job it holds, as on SIGTERM"
+                );
+                libc::SIGTERM
+            }
         }
     }
 }
