@@ -40,9 +40,11 @@ design, quoted from the spec:
    any function of the directory reader a second caller, add a variant to its root or cursor enums, or add a field to
    the view: each of those cost 2% to 47% on large sets when it was tried (below).
 2. **An unlanded implementation of six small forms** (commits `0ed86b85b1` .. `65411f5e9d` on top of main `7e71e81a54`,
-   in the shed `bitmosaic-small`, whose tip `722a1ee7ca` adds three law files for those forms). It is reference
-   material, not a base to land, and nothing of it is owed a land: the shed is removed when step 4 below is on main.
-   Reusable from it:
+   in the shed `bitmosaic-small`, whose tip `722a1ee7ca` adds three law files for those forms). Its six forms were
+   dropped by decision (2026-11-15): the case they were written for, the columns present in a stored row, is held as a
+   Bitmap over the columns of the row's shape instead. Nothing of the shed is owed a land. The work below starts from
+   it: the shed stays mounted for whoever takes this brief, who reads these parts there and removes it when step 4 is on
+   main. Reusable from it:
    - the shape "a small image is a forest of no chunks whose answers are cold out-of-line functions over the image
      bytes", which keeps the directory loops as they are;
    - its Window reader (`small.rs`: `count_below`, `select_bit`, `select_in_word`, `window_and`, the clipped `word_at`):
