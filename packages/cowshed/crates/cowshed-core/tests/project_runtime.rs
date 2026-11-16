@@ -2503,6 +2503,103 @@ async fn a_second_session_follows_a_running_job_s_output_from_its_start() {
         .expect("the job's first bytes");
     assert_eq!(&first[..], b"1\n2\n3\n4\n5\n");
 }
+
+/// A lane call that waits on the job lasts no longer than its asker (07_api.md, "A job's calls
+/// are its supervisor's to answer"): with a follow past the job's output, or a wait for its end,
+/// outstanding on the lane and the asker gone, the controller's shutdown ends within the one
+/// `hello` the lane proves itself with, while the job runs on under its supervisor.
+#[tokio::test]
+async fn a_controller_whose_asker_left_shuts_down_with_a_follow_or_a_wait_outstanding_on_the_lane()
+{
+    use cowshed_core::resident::JobLink;
+    use cowshed_core::runtime::supervisor_socket;
+    use cowshed_os::deadline::{CONTROL, HANDSHAKE};
+    for waiting in ["job.logs", "job.wait"] {
+        let root = test_root();
+        let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+        let supervisor = scripted_supervisor(&root, spawn_tx);
+        let socket = root.join("s");
+        let listener = supervisor_socket::bind(&socket)
+            .await
+            .expect("bind main's supervisor");
+        let _serving = tokio::spawn(supervisor_socket::serve(
+            listener,
+            supervisor.clone(),
+            None,
+            None,
+        ));
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut host = FakeHost::new(&root, events, false, Vec::new());
+        host.supervisors
+            .insert(WorkspaceName::main(), supervisor.clone());
+        host.lanes.set_supervisor(
+            WorkspaceName::main(),
+            JobLink::over(
+                socket.clone(),
+                supervisor_socket::connect(socket, supervisor.snapshot().clone()),
+            ),
+        );
+        let repo = host.descriptor.repo_id.clone();
+        let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+        let router = runtime.router();
+        let adopted = adopt(&router, &repo).await;
+        let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+        let job = route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.exec",
+            json!({
+                "repoId": repo,
+                "workspace": "main",
+                "workspaceIncarnation": incarnation,
+                "argv": serde_json::to_value(vec![CommandArg::from("build")]).unwrap(),
+                "mode": "readWrite",
+                "env": {},
+                "stdin": {"kind":"empty"},
+                "stdoutCopy": null,
+                "stderrCopy": null
+            }),
+        )
+        .await
+        .expect("admit the job");
+        let _process = spawned.recv().await.expect("the admitted job spawned");
+
+        let mut params = json!({
+            "repoId": repo,
+            "workspace": "main",
+            "workspaceIncarnation": incarnation,
+            "jobId": job
+        });
+        if waiting == "job.logs" {
+            let follow = json!({ "stream": "stdout", "follow": true, "offset": 0 });
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(follow.as_object().unwrap().clone());
+        }
+        let mut asked = Box::pin(router.route(
+            coordinator(repo.clone()),
+            OperationRequest::decode(waiting, &params).expect("the request"),
+            None,
+            None,
+        ));
+        // Polled once, the call is the router's; the job neither writes nor ends, so it waits.
+        tokio::select! {
+            biased;
+            answered = &mut asked => panic!("{waiting} answered while the job waits: {answered:?}"),
+            () = std::future::ready(()) => {}
+        }
+        // The asker leaves: its connection's answer task is dropped with the call unanswered.
+        drop(asked);
+        drop(router);
+        tokio::time::timeout(HANDSHAKE.within + CONTROL.within, runtime.shutdown())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the controller's shutdown waited on a {waiting} its asker had left")
+            })
+            .expect("shutdown");
+    }
+}
 //#endregion smoo/cowshed!n/job-calls-beside-router
 
 /// A job process the test speaks for: the supervisor hands each spawned job's event sender to

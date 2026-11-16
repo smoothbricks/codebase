@@ -4065,9 +4065,16 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         Command::Wait {
             authority,
             job_id,
-            reply,
+            mut reply,
         } => {
-            let _ = reply.send(call(path, &authority, Call::Wait { job_id }, Bytes::new()).await);
+            // A wait nobody reads any more ends, and its connection with it (07_api.md, "A
+            // job's calls are its supervisor's to answer").
+            let answered = tokio::select! {
+                biased;
+                () = reply.closed() => return,
+                answered = call(path, &authority, Call::Wait { job_id }, Bytes::new()) => answered,
+            };
+            let _ = reply.send(answered);
         }
         Command::Ended {
             authority,
@@ -4082,9 +4089,9 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             stream,
             offset,
             follow,
-            reply,
+            mut reply,
         } => {
-            let result = round_trip(
+            let read = round_trip(
                 path,
                 (&authority).into(),
                 Call::LogRead {
@@ -4094,9 +4101,15 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                     follow,
                 },
                 Bytes::new(),
-            )
-            .await
-            .and_then(|(value, bytes)| {
+            );
+            // A read nobody reads any more ends, and its connection with it: a follow may wait
+            // as long as the job stays quiet.
+            let answered = tokio::select! {
+                biased;
+                () = reply.closed() => return,
+                answered = read => answered,
+            };
+            let result = answered.and_then(|(value, bytes)| {
                 let wire: LogChunkWire = decode(value)?;
                 Ok(LogChunk {
                     bytes,
@@ -6285,4 +6298,63 @@ mod held_turn_tests {
         std::fs::remove_dir_all(path.parent().expect("the socket's directory"))
             .expect("remove the test socket's directory");
     }
+}
+
+#[cfg(test)]
+mod abandoned_call_tests {
+    use super::*;
+
+    //#region smoo/cowshed!n/lane-call-ends-with-its-asker
+    /// 07_api.md "A job's calls are its supervisor's to answer": a wait for a job's end, and a
+    /// read following its output, whose asker stopped listening end, and the supervisor
+    /// connection each holds closes with it: the supervisor, which had the request and had not
+    /// answered, reads the end of its connection.
+    #[tokio::test]
+    async fn a_wait_and_a_follow_nobody_reads_any_more_close_their_supervisor_connection() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "abandoned-call",
+        );
+        let path = root.join("s");
+        let listener = UnixListener::bind(&path).expect("a listening socket");
+        let supervisor = connect(
+            path,
+            WorkspaceAuthoritySnapshot {
+                repo_id: crate::repository::RepoId::parse("acme/widget").expect("a repo"),
+                workspace: crate::metadata::WorkspaceName::main(),
+                workspace_incarnation: crate::metadata::WorkspaceIncarnation::new("0".repeat(32))
+                    .expect("an incarnation"),
+                grant_revision: 1,
+                lifecycle_revision: 1,
+            },
+        );
+        let job = JobId::new(7).expect("a job id");
+        for waiting in ["wait", "follow"] {
+            let asker = tokio::spawn({
+                let supervisor = supervisor.clone();
+                async move {
+                    if waiting == "wait" {
+                        let _ = supervisor.wait(job).await;
+                    } else {
+                        let _ = supervisor.log_read(job, StreamKind::Stdout, 0, true).await;
+                    }
+                }
+            });
+            let (mut connection, _) = listener.accept().await.expect("the call's connection");
+            let mut request = [0_u8; 4];
+            connection
+                .read_exact(&mut request)
+                .await
+                .expect("the call's request");
+            asker.abort();
+            let mut rest = Vec::new();
+            tokio::time::timeout(deadline::CONTROL.within, connection.read_to_end(&mut rest))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("the {waiting} kept its connection after its asker left")
+                })
+                .expect("the connection's end");
+        }
+    }
+    //#endregion smoo/cowshed!n/lane-call-ends-with-its-asker
 }

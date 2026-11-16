@@ -2032,6 +2032,18 @@ One boundary answer, no ambiguity:
   listed here. A status read is therefore answered in one supervisor round trip however long a fork runs, and a
   heartbeat's `busy` names an operation only the serial calls queue behind. Any other process may send a supervisor the
   same calls at any time, so the router's order never fenced them.
+  <a id="smoo/cowshed!n/lane-call-ends-with-its-asker"></a>A lane call that waits on the job lasts no longer than its
+  asker. `job.wait` and a following `job.logs` are answered when the job ends or writes, which may be never while their
+  asker is there to hear it: once the connection that asked one is gone (its answer has no reader), the router ends that
+  call, and the supervisor connection the call holds closes with it, so nothing of a departed asker stays parked at the
+  supervisor. `job.status`, `worker.job`, `job.kill`, `job.detach` and a `job.logs` that does not follow are one bounded
+  supervisor round trip and run to their answer whoever still reads it: an effect its asker requested is never lost to
+  the asker's leaving. The router's shutdown waits for a lane task only through the one `hello` that proves its lane,
+  within the handshake bound, which is while the task may still hand its call back to the serial route; past it a lane
+  task holds nothing the shutdown waits on. A `cowshed controller` whose peer closed its end therefore exits 0
+  (06_cli.md) whatever that peer left outstanding. Measured 2026-11-16: an observer's client read a running job's 10
+  bytes, asked for the next page with follow, as a follow does, and closed its connection; the controller stayed up on
+  that follow for as long as the job blocked in `read`, and the embedder waiting for its exit never returned.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step

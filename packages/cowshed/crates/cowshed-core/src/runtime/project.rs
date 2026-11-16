@@ -1370,6 +1370,14 @@ enum JobAsk {
     },
 }
 
+impl JobAsk {
+    /// Whether the call waits on the job itself, for as long as it runs or stays quiet: its
+    /// end, or output past what it has written. Every other call is one bounded round trip.
+    const fn waits(&self) -> bool {
+        matches!(self, Self::Wait | Self::Logs { follow: true, .. })
+    }
+}
+
 impl JobCall {
     /// `request` as a job call its connection's authority covers, decided from the request
     /// alone: the project's repository, and on a worker connection the workspace and incarnation
@@ -1488,19 +1496,29 @@ impl Beside {
         };
         let unreached = self.unreached.clone();
         tokio::spawn(async move {
-            match held.serving(&crate::resident::HostProbe).await {
-                Some(link) => {
-                    let method = command.request().method();
-                    let _span =
-                        cowshed_os::timing::span_named("route-beside", || method.to_owned());
-                    let (_, reply) = command.into_parts();
-                    let _ = reply.send(call.answer(link).await);
+            let Some(link) = held.serving(&crate::resident::HostProbe).await else {
+                // The router stopped: dropping the command fails its call as stopped.
+                let _ = unreached.send(command);
+                return;
+            };
+            // The lane is proven, so the call is never handed back: the router's shutdown waits
+            // for this task no longer (07_api.md, "A job's calls are its supervisor's to answer").
+            drop(unreached);
+            let method = command.request().method();
+            let _span = cowshed_os::timing::span_named("route-beside", || method.to_owned());
+            let (_, mut reply) = command.into_parts();
+            let answered = if call.ask.waits() {
+                // A call that waits on the job ends with its asker; dropping it closes the
+                // supervisor connection it holds.
+                tokio::select! {
+                    biased;
+                    () = reply.closed() => return,
+                    answered = call.answer(link) => answered,
                 }
-                None => {
-                    // The router stopped: dropping the command fails its call as stopped.
-                    let _ = unreached.send(command);
-                }
-            }
+            } else {
+                call.answer(link).await
+            };
+            let _ = reply.send(answered);
         });
         None
     }
