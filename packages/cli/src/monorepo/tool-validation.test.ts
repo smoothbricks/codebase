@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
+import { managedTtscPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import { checkPolicyFailures } from './index.js';
 import {
   applyDevenvPackageDefaults,
@@ -319,6 +321,75 @@ ${extra}  ];
       expect(validateToolConfig(root)).toBe(0);
       const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
       expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a registered ttsc patch whose bytes are not the managed copy', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@fixture/app',
+        version: '0.0.0',
+        private: true,
+        workspaces: ['packages/*', 'tooling'],
+        devDependencies: {
+          '@biomejs/biome': '^3.0.0',
+          '@nx/js': '24.0.3',
+          '@smoothbricks/nx-plugin': '^0.4.0',
+          '@types/bun': '1.3.99',
+          eslint: '^10.0.0',
+          'eslint-stdout': await currentEslintStdoutRange(),
+          nx: '24.1.0',
+          prettier: '^3.7.0',
+          ttsc: managedTtscPatch.version,
+          typescript: '^6.0.0',
+          '@typescript/native': 'npm:typescript@^7.0.2',
+        },
+        patchedDependencies: { [managedTtscPatch.key]: managedTtscPatch.path },
+      });
+      await writeFile(join(root, 'bun.lock'), lockfileWithTtsc(managedTtscPatch.version));
+      await writeJson(join(root, 'tooling/package.json'), {
+        name: '@fixture/tooling',
+        private: true,
+        dependencies: { '@smoothbricks/cli': await currentCliRange() },
+      });
+      const devenvPath = join(root, 'tooling/direnv/devenv.nix');
+      await mkdir(dirname(devenvPath), { recursive: true });
+      await writeFile(
+        devenvPath,
+        `{
+  pkgs,
+  ...
+}: {
+  packages = with pkgs; [
+    bun
+    git
+    git-format-staged
+    jq
+    alejandra
+    coreutils
+    gnutar
+  ];
+}
+`,
+      );
+      await applyToolConfigDefaults(root);
+      const managed = await readFile(join(managedAssetsRoot, 'raw', managedTtscPatch.path));
+      const consumer = join(root, managedTtscPatch.path);
+
+      // Missing: the registration names a file the checkout does not hold.
+      expect(validateToolConfig(root)).toBe(1);
+
+      // Drifted: one byte past the managed copy is another compiler.
+      await mkdir(dirname(consumer), { recursive: true });
+      await writeFile(consumer, Buffer.concat([managed, Buffer.from('\\n')]));
+      expect(validateToolConfig(root)).toBe(1);
+
+      // The managed bytes themselves pass.
+      await writeFile(consumer, managed);
+      expect(validateToolConfig(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

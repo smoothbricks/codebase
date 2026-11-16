@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { managedTtscPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
@@ -157,7 +158,7 @@ export function validateToolConfig(root: string): number {
   return (
     validateRootDevDependencies(context.policy, context.rootPackage) +
     validateCliPinnedPackages(root) +
-    validateTtscPatch(context.rootPackage) +
+    validateTtscPatch(root, context.rootPackage) +
     validateToolingPackage(root, context.policy) +
     validateToolingWorkspace(context.rootPackage) +
     validateDevenvPackages(root)
@@ -359,7 +360,10 @@ function syncTtscPatch(pkg: PackageJson): boolean {
   return changed;
 }
 
-function validateTtscPatch(rootPackage: PackageJson | null): number {
+// The managed patch is compiler code, not derived configuration: a copy whose bytes differ from the one the installed
+// nx-plugin ships builds every TypeScript project with another compiler than the fleet's, so a registered copy must be
+// byte-identical to it.
+function validateTtscPatch(root: string, rootPackage: PackageJson | null): number {
   const patches = rootPackage?.patchedDependencies;
   let failures = 0;
   for (const key of obsoleteTtscPatchKeys(patches)) {
@@ -376,6 +380,15 @@ function validateTtscPatch(rootPackage: PackageJson | null): number {
       `package.json patchedDependencies.${managedTtscPatch.key} must be ${managedTtscPatch.path}; run smoo monorepo update`,
     );
     failures++;
+  } else if (patches?.[managedTtscPatch.key] === managedTtscPatch.path) {
+    const managed = join(managedAssetsRoot, 'raw', managedTtscPatch.path);
+    const consumer = join(root, managedTtscPatch.path);
+    if (!existsSync(consumer) || !readFileSync(consumer).equals(readFileSync(managed))) {
+      console.error(
+        `${managedTtscPatch.path} is not the managed copy @smoothbricks/nx-plugin ships (${managed}); run smoo monorepo update`,
+      );
+      failures++;
+    }
   }
   return failures;
 }
