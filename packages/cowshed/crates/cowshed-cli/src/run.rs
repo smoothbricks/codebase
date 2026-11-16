@@ -456,8 +456,10 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     let stdin = if resident {
         let mut interrupts = interrupts.arm_for_exec();
         let answered = tokio::select! {
-            answered = crate::resident::answer_exec(&parsed, tokio::io::stdin(), &mut output) => answered,
+            // An interrupt already due ends the command before its next step.
+            biased;
             signal = interrupts.received() => return Err(signal),
+            answered = crate::resident::answer_exec(&parsed, tokio::io::stdin(), &mut output) => answered,
         };
         armed = Some(interrupts);
         match answered {
@@ -496,8 +498,9 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // the command as it would during the relay, never waits for the preflight to finish.
     let prepared = match &mut armed {
         Some(interrupts) => tokio::select! {
-            prepared = preflight => prepared,
+            biased;
             signal = interrupts.received() => return Err(signal),
+            prepared = preflight => prepared,
         },
         None => preflight.await,
     };
@@ -527,8 +530,9 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             .map(|exit| exit.code)
         };
         tokio::select! {
-            outcome = command => outcome,
+            biased;
             signal = interrupts.received() => return Err(signal),
+            outcome = command => outcome,
         }
     };
     // A declared land whose daemon an install replaced before its turn ends unmoved with the
