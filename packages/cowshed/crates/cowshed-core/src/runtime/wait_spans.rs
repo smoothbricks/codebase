@@ -312,6 +312,13 @@ impl WaitRecording {
         let original_message_len = failure.message.len();
         let capture = self.capture;
         self.spans.record(&mut failure, SystemTime::now(), |pid| {
+            // A process sampling itself shows its runtime thread waiting for the sampler, never
+            // where the silence was spent (05_gateway.md "Deadlines", Spans).
+            if u32::try_from(pid).is_ok_and(|pid| pid == std::process::id()) {
+                return Err(format!(
+                    "pid {pid} is this process, which carries its controller: a sample it takes of itself shows it waiting for the sampler, so it is not sampled"
+                ));
+            }
             still_ours(pid).and_then(|()| capture(pid))
         });
         if let Some(receipt) = &failure.receipt

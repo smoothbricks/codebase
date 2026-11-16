@@ -1243,7 +1243,21 @@ the handshake bound.
   it is `null` while the actor serves nothing. The router is serial for every call but a job's own (07_api.md, "A job's
   calls are its supervisor's to answer"), so any other call waits behind whatever op it is busy with, and a call has no
   total bound, which would fail a call that is only queued. The client reads past the heartbeats under the 15 s silence
-  bound, measured from when the controller last owed it nothing. A controller silent that long fails every waiting call
+  bound, measured from when the controller last owed it nothing.
+  <a id="smoo/cowshed!n/client-turn-not-controller-silence"></a>That client judges from an actor that does not read the
+  connection itself: a reader task hands it each frame, and the controller of a `cowshed exec` runs in the client's own
+  process on its one runtime thread, so whatever stops that thread stops the heartbeats and their judge together: a
+  relay's write to a consumer that does not read (06_cli.md: a full pipe waits for its reader, with no deadline), a
+  stopped process, a host that does not schedule it. So while an answer is owed the actor takes a turn at least every
+  heartbeat, and a turn that comes more than half a heartbeat late (7.5 s after the turn before it) is the actor's own
+  stall, however far short of the silence bound it ends: the actor gives the controller one heartbeat more from that
+  turn before it judges, the liveness rule of a workspace supervisor's waiter above with the lateness a waiter that does
+  not read its own connection needs. A late turn's heartbeat is one, not a wider bound: a controller that says nothing
+  in it fails SILENT, naming its whole silence. A foreground job that runs, printing or not, whose controller heartbeats
+  whenever the client's thread runs, is therefore never silent. Measured 2026-11-16: a foreground gate exec, 770 s into
+  a healthy gate of about 25 minutes with 841 tasks passed, stood still after a log read's answer; its silence timer,
+  due at 15 s, fired at 18.47 s with the in-process controller's heartbeats unwritten, inside the 20 s only a later turn
+  was then taken for a stall, and the land's gate ended SILENT. A controller silent that long fails every waiting call
   `SILENT`, naming it as the socketpair peer with the pid its hello reported (the socketpair's credentials name the
   process that made the pair, not the controller) and the busy op of its last heartbeat. SILENT ends those waits, never
   by itself the connection: a `cowshed controller` exits once its peer closes its end (06_cli.md), and every other op of
@@ -1282,17 +1296,21 @@ the handshake bound.
   a process-external controller connection fails SILENT samples that controller the same way and seals the
   `cowshed.wait` span itself under the host's telemetry root: the controller's own boundaries never see a wait its peer
   gave up on. It samples the pid the hello reported only while that pid's process started at the instant it read at the
-  handshake; a pid that ended or was recycled since is not sampled, and why is its wait_stack_error. The sample and the
-  seal run off the client's actor, which keeps serving calls, answers and stream closes meanwhile; the waiting calls are
-  told once the silence is recorded, and their error names the sample (`cowshed controller stacks: …`) and carries the
-  receipt, so an embedder's span names it and a later boundary records nothing again. Other command failures use the
-  same final error boundary. The local receipt is reused there: one capture and one seal attempt per failure, even when
-  either failed. The wait's expiry timestamp, elapsed time, bound and exit code are fixed before sampling; diagnostics
-  neither retry the operation nor renew its silence. An in-process controller socketpair retains each typed wait cause
-  in that pair alone, under its response id, before encoding the unchanged error frame. Its reader takes and reattaches
-  the cause before delivering Err. The client's pending-call cap and the connection's open-stream cap bound retained
-  causes. Process-external connections share no custody and encode no private cause. Host exec and a declined resident
-  path therefore retain the same diagnostic facts as a direct resident call, without extending the public error wire.
+  handshake; a pid that ended or was recycled since is not sampled, and why is its wait_stack_error.
+  <a id="smoo/cowshed!n/own-process-not-sampled"></a>A controller that runs in the client's own process (its hello
+  reports the client's pid) is not sampled either: a process sampling itself shows its one runtime thread waiting for
+  the sampler, never where the silence was spent, and holds that thread for the sampler's 2 s and more; its
+  wait_stack_error says so. The sample and the seal run off the client's actor, which keeps serving calls, answers and
+  stream closes meanwhile; the waiting calls are told once the silence is recorded, and their error names the sample
+  (`cowshed controller stacks: …`) and carries the receipt, so an embedder's span names it and a later boundary records
+  nothing again. Other command failures use the same final error boundary. The local receipt is reused there: one
+  capture and one seal attempt per failure, even when either failed. The wait's expiry timestamp, elapsed time, bound
+  and exit code are fixed before sampling; diagnostics neither retry the operation nor renew its silence. An in-process
+  controller socketpair retains each typed wait cause in that pair alone, under its response id, before encoding the
+  unchanged error frame. Its reader takes and reattaches the cause before delivering Err. The client's pending-call cap
+  and the connection's open-stream cap bound retained causes. Process-external connections share no custody and encode
+  no private cause. Host exec and a declined resident path therefore retain the same diagnostic facts as a direct
+  resident call, without extending the public error wire.
 - **Enforcement.** TypeScript: the `deadline/no-unbounded-wait` ESLint rule (`tooling/checks/no-unbounded-wait.ts`,
   wired in `eslint.config.ts` over `packages/*/src`) refuses `fetch` without a `signal`, a socket connect (`net`/`tls`
   `connect`, `createConnection`, `Socket#connect`, `Bun.connect`), a Bun child's `exited`, `events.once` on a child,

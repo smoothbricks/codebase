@@ -1564,16 +1564,58 @@ impl fmt::Display for ControllerHolder {
 struct ControllerSilence {
     idle: Idle,
     busy: Option<codec::Busy>,
+    /// This actor's last turn, on the deadline clock.
+    turned_ns: u64,
+    /// Until when a controller this actor did not run to hear is not judged.
+    spared_ns: u64,
 }
 
 #[cfg(unix)]
 impl ControllerSilence {
     /// The controller now owes an answer it did not owe before: its silence starts now.
     fn start() -> Self {
+        let now = deadline::clock().monotonic_nanos();
         Self {
             idle: deadline::idle(CONTROLLER_CALL, deadline::HEARTBEAT_SILENCE),
             busy: None,
+            turned_ns: now,
+            spared_ns: now,
         }
+    }
+
+    /// This actor takes a turn. While an answer is owed it takes one at least every heartbeat,
+    /// so a turn more than half a heartbeat late shows that it did not run meanwhile: its thread
+    /// was blocked or its process stopped, and with it the reader that hands it the controller's
+    /// frames, and a controller served in this process. Such a stall is not the controller's
+    /// silence, however far short of the silence bound it ends: the controller is given one
+    /// heartbeat more from this turn before it is judged (05_gateway.md "Deadlines").
+    fn turn(&mut self) {
+        let now = deadline::clock().monotonic_nanos();
+        let heartbeat = u64::try_from(deadline::HEARTBEAT.as_nanos()).unwrap_or(u64::MAX);
+        if now.saturating_sub(self.turned_ns) > heartbeat.saturating_add(heartbeat / 2) {
+            self.spared_ns = now.saturating_add(heartbeat);
+        }
+        self.turned_ns = now;
+    }
+
+    /// How much more silence the controller is allowed; none once it has been silent too long.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        let clock = deadline::clock();
+        let spared = self.spared_ns.saturating_sub(clock.monotonic_nanos());
+        let left = self
+            .idle
+            .remaining(clock)
+            .unwrap_or(std::time::Duration::ZERO)
+            .max(std::time::Duration::from_nanos(spared));
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// The silence window ended SILENT: the next one measures from now, so the timer re-arms
+    /// instead of spinning while the abandoned calls stay owed. It keeps the busy op and the
+    /// progress the controller last reported, which its next SILENT still names (05_gateway.md
+    /// "Deadlines").
+    fn restart(&mut self) {
+        self.idle.observe(self.idle.last(), deadline::clock());
     }
 }
 
@@ -1851,15 +1893,14 @@ async fn run_controller_actor(
         mpsc::unbounded_channel::<crate::runtime::wait_spans::WaitReceipt>();
     let mut last_receipt = None;
     let failure = loop {
-        // This actor's own stall is not the controller's silence: a turn later than the silence
-        // allows plus a heartbeat gives the controller one heartbeat more (05_gateway.md
-        // "Deadlines").
-        stalled.idle.look(deadline::HEARTBEAT, deadline::clock());
+        // This actor's own stall is not the controller's silence ([`ControllerSilence::turn`]).
+        stalled.turn();
         let owed = owes(&pending, &streams, &abandoned);
+        // The timer wakes the actor at least every heartbeat, which is what tells a late turn.
         let silence = stalled
-            .idle
-            .remaining(deadline::clock())
-            .unwrap_or(std::time::Duration::ZERO);
+            .remaining()
+            .unwrap_or(std::time::Duration::ZERO)
+            .min(deadline::HEARTBEAT);
         let call = tokio::select! {
             // Every frame the reader has taken off the connection is handled before the silence
             // is judged: the silence arm is polled last.
@@ -2026,10 +2067,9 @@ async fn run_controller_actor(
             // The timer only wakes the actor; the silence decides (cowshed-os::deadline's rule).
             // Tokio's timer can fire a tick early, and then it is re-armed for the rest.
             () = tokio::time::sleep(silence), if owed => {
-                stalled.idle.look(deadline::HEARTBEAT, deadline::clock());
+                stalled.turn();
                 if stalled
-                    .idle
-                    .remaining(deadline::clock())
+                    .remaining()
                     .is_some_and(|left| left >= deadline::TIMER_TICK)
                 {
                     continue;
@@ -2037,11 +2077,7 @@ async fn run_controller_actor(
                 let holder = ControllerHolder { peer: controller.clone(), busy: stalled.busy.clone() };
                 let silent = silent_controller(&stalled.idle.silent(holder, deadline::clock()));
                 silent_windows = silent_windows.saturating_add(1);
-                // The next window measures from now, so the timer re-arms instead of spinning
-                // while the abandoned calls stay owed. It keeps the busy op and the progress the
-                // controller last reported, which its next SILENT still names (05_gateway.md
-                // "Deadlines").
-                stalled.idle.observe(stalled.idle.last(), deadline::clock());
+                stalled.restart();
                 if silent_windows >= 2 && abandoned.len() >= MAX_IN_FLIGHT_REQUESTS {
                     break lost_controller(&silent, last_receipt.take());
                 }
@@ -3513,6 +3549,196 @@ mod tests {
             json!({"state": "running"})
         );
     }
+    //#region smoo/cowshed!n/client-turn-not-controller-silence
+    /// 05_gateway.md "Deadlines": a waiter takes a turn every heartbeat while an answer is owed,
+    /// so a turn that comes late shows it did not run, however short of the silence bound its
+    /// stall was. Measured 2026-11-16: a foreground relay's process stood still after a log
+    /// read's answer, and the controller it carries in-process with it; its silence timer, due
+    /// at 15 s, fired 3.47 s late and failed a healthy 25-minute gate SILENT. Such a waiter gives
+    /// the controller one heartbeat more, the overdue heartbeat arrives in it, and the call is
+    /// answered.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_stalled_short_of_the_bound_plus_a_heartbeat_is_not_silent_for_that_stall() {
+        let (runtime, mut server) = actor_in_memory();
+        let wait = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.wait", empty_params()).await }
+        });
+        let (_, request) = read_rpc_request(&mut server).await;
+        let wait_id = request["id"].as_u64().expect("the wait's id");
+        let read = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.status", empty_params()).await }
+        });
+        let (_, request) = read_rpc_request(&mut server).await;
+        let read_id = request["id"].as_u64().expect("the read's id");
+        let answer =
+            codec::encode_rpc_success(read_id, &json!({"state": "running"}), None).unwrap();
+        write_raw_frame(&mut server, &answer).await;
+        read.await
+            .expect("the read task joins")
+            .expect("the read is answered");
+        // Nothing in this process runs for 18.47 s; the wait stays owed.
+        tokio::time::advance(std::time::Duration::from_millis(18_470)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "the waiter's own stall is not the controller's silence"
+        );
+        let beat = json!({ "progress": 1, "busy": null });
+        write_raw_frame(&mut server, beat.to_string().as_bytes()).await;
+        tokio::time::sleep(deadline::HEARTBEAT * 2).await;
+        let answer =
+            codec::encode_rpc_success(wait_id, &json!({"state": "succeeded"}), None).unwrap();
+        write_raw_frame(&mut server, &answer).await;
+        assert_eq!(
+            wait.await
+                .expect("the wait task joins")
+                .expect("the wait is answered once the job ends"),
+            json!({"state": "succeeded"})
+        );
+    }
+
+    /// 05_gateway.md "Deadlines": the heartbeat a stalled waiter gives is one, not a wider bound.
+    /// A controller that says nothing in it fails the call SILENT by name, and the failure names
+    /// its whole silence, the waiter's stall included.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_still_silent_a_heartbeat_after_the_waiter_s_stall_fails_silent() {
+        let (runtime, mut server) = actor_in_memory();
+        let started = tokio::time::Instant::now();
+        let call = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.wait", empty_params()).await }
+        });
+        let _ = read_rpc_request(&mut server).await;
+        tokio::time::advance(std::time::Duration::from_millis(18_470)).await;
+        let failure = call
+            .await
+            .expect("the call task joins")
+            .expect_err("a controller silent after the waiter's stall fails the call");
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(23_470)
+                && waited < std::time::Duration::from_millis(24_470),
+            "SILENT one heartbeat after the stall: {waited:?}"
+        );
+        let controller = format!(
+            "SILENT: controller call: cowshed controller on a socketpair (pid {CONTROLLER_PID}) showed no progress for 23.4"
+        );
+        assert!(
+            failure.message.starts_with(&controller),
+            "{}",
+            failure.message
+        );
+        drop(server);
+    }
+
+    /// 05_gateway.md "Deadlines", the pair `cowshed exec` runs: the controller's connection is
+    /// served on the runtime thread of its client. A foreground job that prints nothing leaves
+    /// `job.wait` unanswered for as long as it runs; the controller heartbeats and the wait goes
+    /// on, a minute here. Then the thread both share stands still for 18.47 s (a relay's write
+    /// to a consumer that does not read, a stopped process): the client's silence timer and the
+    /// controller's heartbeat come due together, and the client waits for that heartbeat.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_job_s_wait_outlasts_the_bound_and_a_stall_of_the_thread_its_controller_shares()
+    {
+        use crate::api::server::{
+            ConnectionAuthority, RouterHandle, RouterResponse, serve_connection,
+        };
+        let corpus: serde_json::Map<String, Value> =
+            serde_json::from_str(include_str!("operations.corpus.json")).expect("the corpus");
+        let params = serde_json::value::to_raw_value(&corpus["job.wait"]).expect("raw params");
+        let (router, mut commands) = RouterHandle::channel(NonZeroUsize::MIN);
+        let (mut client, server) = tokio::io::duplex(MAX_RPC_BYTES);
+        let (reader, writer) = tokio::io::split(server);
+        let authority = ConnectionAuthority::Coordinator {
+            repo_id: crate::repository::RepoId::parse("acme/widget").expect("repo id"),
+        };
+        let served = tokio::spawn(serve_connection(reader, writer, authority, router));
+        let hello = json!({ "version": HANDSHAKE_VERSION, "nonce": "a".repeat(64) });
+        write_raw_frame(&mut client, hello.to_string().as_bytes()).await;
+        read_rpc_frame(&mut client)
+            .await
+            .expect("the server's hello");
+        let (reader, writer) = tokio::io::split(client);
+        let (runtime, _) = spawn_controller_actor(reader, writer, controller(), None, None);
+        let mut wait = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.call("job.wait", params).await }
+        });
+        let (_, reply) = tokio::select! {
+            command = commands.recv() => command.expect("the routed wait").into_parts(),
+            refused = &mut wait => panic!("the wait ended before it was routed: {refused:?}"),
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(
+            !wait.is_finished(),
+            "a quiet job's wait goes on past the silence bound while its controller heartbeats"
+        );
+        tokio::time::advance(std::time::Duration::from_millis(18_470)).await;
+        tokio::time::sleep(deadline::HEARTBEAT * 2).await;
+        assert!(
+            !wait.is_finished(),
+            "a stall of the thread the controller shares is not the controller's silence"
+        );
+        let _ = reply.send(Ok(RouterResponse::json(json!({ "state": "succeeded" }))));
+        assert_eq!(
+            wait.await
+                .expect("the wait task joins")
+                .expect("the wait is answered once the job ends"),
+            json!({ "state": "succeeded" })
+        );
+        // The split halves of the in-memory stream keep it open: the connection is ended here.
+        served.abort();
+    }
+    //#endregion smoo/cowshed!n/client-turn-not-controller-silence
+
+    //#region smoo/cowshed!n/own-process-not-sampled
+    /// 05_gateway.md "Deadlines", Spans: a silent controller that runs in the client's own
+    /// process is not sampled. Measured 2026-11-16: the report a foreground exec retained as its
+    /// controller's stacks was its own main thread inside the capture. The wait span is sealed
+    /// and says why there is no sample.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_controller_in_the_client_s_own_process_is_not_sampled() {
+        let root = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::scratch_parent(),
+            "own-controller",
+        );
+        let recording = crate::runtime::wait_spans::WaitRecording::new(
+            crate::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
+            |pid| panic!("this process sampled itself as pid {pid}"),
+        );
+        let own = i32::try_from(std::process::id()).expect("a pid fits i32");
+        let holder = ControllerHolder {
+            peer: Peer::paired("cowshed controller", own),
+            busy: None,
+        };
+        let silent = deadline::idle(CONTROLLER_CALL, deadline::HEARTBEAT_SILENCE)
+            .silent(holder, deadline::clock());
+        let failure = recording.record(silent_controller(&silent));
+        let receipt = failure
+            .wait_source()
+            .and_then(|wait| wait.receipt.clone())
+            .expect("the wait is recorded");
+        receipt.span.expect("the wait span is sealed");
+        let refused = receipt
+            .sample
+            .expect("the recording names why there is no sample")
+            .expect_err("a process never samples itself");
+        assert!(refused.contains("is this process"), "{refused}");
+        assert!(
+            failure
+                .message
+                .contains("cowshed controller stack capture failed"),
+            "{}",
+            failure.message
+        );
+    }
+    //#endregion smoo/cowshed!n/own-process-not-sampled
 
     /// A controller connection over a real socketpair whose controller is `pid`, recording its
     /// silences with `recording`.
@@ -3760,7 +3986,15 @@ mod tests {
             crate::runtime::wait_spans::WaitSpans::adopting(root.to_path_buf(), None),
             |pid| Ok(format!("stacks of {pid}").into_bytes()),
         );
-        let controller = i32::try_from(std::process::id()).expect("a pid fits i32");
+        use cowshed_os::fork_lock::Spawn as _;
+        use cowshed_os::test_backstop::ChildBackstop as _;
+        // Another process than its client, as a `cowshed controller` is: one in the client's own
+        // process is not sampled.
+        let mut process = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn_locked()
+            .expect("a stand-in controller process");
+        let controller = i32::try_from(process.id()).expect("a pid fits i32");
         let (runtime, mut server) = recorded_actor_pair(controller, Some(recording));
         let call = tokio::spawn({
             let runtime = Arc::clone(&runtime);
@@ -3794,6 +4028,10 @@ mod tests {
                     && path.to_string_lossy().ends_with(".sample.txt")),
             "the controller was sampled into the telemetry root"
         );
+        process.kill().expect("end the stand-in controller");
+        process
+            .wait_bounded()
+            .expect("reap the stand-in controller");
     }
 
     /// A controller pid is sampled only while it is the process that answered the hello: one that
