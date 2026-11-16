@@ -180,6 +180,51 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
       }
     },
   );
+  it.each(['utility', 'typia'] as const)(
+    "reports a failed build's type error without the errors of a referenced project it has not built, in the %s host",
+    async (host) => {
+      const root = await dialectFixture(host, 'lowered');
+      try {
+        // The host's program reads a referenced project's sources. The plain recheck ttsc ran after a failed host read
+        // its declaration outputs instead, and none exist before the reference is built, so every import from it came
+        // back as TS6305 after the real error.
+        await mkdir(join(root, 'ref/src'), { recursive: true });
+        await writeFile(
+          join(root, 'ref/tsconfig.json'),
+          JSON.stringify({
+            compilerOptions: {
+              composite: true,
+              target: 'ES2022',
+              module: 'NodeNext',
+              rootDir: 'src',
+              outDir: 'dist',
+              types: [],
+            },
+            include: ['src/**/*.ts'],
+          }),
+        );
+        await writeFile(join(root, 'ref/src/index.ts'), "export const greeting: string = 'hello';\n");
+        const tsconfig = JSON.parse(await readFile(join(root, 'tsconfig.lib.json'), 'utf8'));
+        await writeFile(
+          join(root, 'tsconfig.lib.json'),
+          JSON.stringify({ ...tsconfig, references: [{ path: './ref' }] }),
+        );
+        await writeFile(
+          join(root, 'src/wrong.ts'),
+          "import { greeting } from '../ref/src/index.js';\nexport const length: number = greeting;\n",
+        );
+        for (const lane of [['--noEmit'], ['--emit', ...EMIT_OVERRIDES]]) {
+          const build = spawnSync('ttsc', ['-p', 'tsconfig.lib.json', ...lane], { cwd: root, encoding: 'utf8' });
+          const output = `${build.stdout}${build.stderr}`;
+          expect(build.status, output).not.toBe(0);
+          expect(output.match(/TS2322/g)?.length, output).toBe(1);
+          expect(output).not.toContain('TS6305');
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
   it("reads the emitted files of ttsc's utility-plugin lane, keeps its unchanged outputs and prunes a deleted module's", async () => {
     const root = await utilityPluginFixture();
     try {
