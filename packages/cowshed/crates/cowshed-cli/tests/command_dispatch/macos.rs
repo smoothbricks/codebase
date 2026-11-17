@@ -2356,6 +2356,255 @@ async fn real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount() {
     drop(watch);
     fixture.stop_gateway().await;
 }
+
+/// A shed with a build volume of its own, forked in a declared project the runtime serves, with
+/// the gateway's watch on lost mounts armed on the fixture's store: what a removal under the watch
+/// starts from (05_gateway.md, "Lost mounts"; 02_workspaces.md, `rm` step 4).
+struct WatchedRemoval {
+    fixture: Fixture,
+    service: ActorBridge,
+    layout: BuildVolumeLayout,
+    shed: PathBuf,
+    volume: BuildVolumeId,
+    build: PathBuf,
+    watch: cowshed_core::lost_mounts::LostMountWatch,
+    hearing: tokio::sync::mpsc::UnboundedReceiver<cowshed_core::LostMount>,
+    answers: ShedAnswers,
+}
+
+impl WatchedRemoval {
+    async fn armed() -> Self {
+        let mut fixture = Fixture::with(Project::Declared);
+        let mut service = serve_project(&mut fixture, &[]).await;
+        let layout = build_volumes(&fixture);
+        let shed = new_workspace(&mut service, "shed").await;
+        let volume = linked_volume(&layout, &shed);
+        let build = layout
+            .mount(&volume)
+            .canonicalize()
+            .expect("the shed's build mount");
+        for mount in [&shed, &build] {
+            assert!(
+                kernel_mount_at(mount).is_some(),
+                "{} is mounted",
+                mount.display()
+            );
+        }
+        let (heard, hearing) = tokio::sync::mpsc::unbounded_channel();
+        let watch = cowshed_core::lost_mounts::watch(
+            cowshed_core::NativeGatewayInventory::new(fixture.storage.clone()),
+            move |lost| {
+                let _ = heard.send(lost);
+            },
+        )
+        .expect("arm the gateway's watch on lost mounts");
+        Self {
+            fixture,
+            service,
+            layout,
+            shed,
+            volume,
+            build,
+            watch,
+            hearing,
+            answers: ShedAnswers::default(),
+        }
+    }
+
+    /// After a removal that succeeded: the shed is gone, nothing of it is mounted, its image and
+    /// its build image were released, and main, unmounted under the same watch, is remounted, so
+    /// every pass the removal caused ran before that answer. Every remount the watch left to the
+    /// shed's lock has answered by then, and no answer for the shed was a remount: the watch
+    /// pinned and mounted nothing of it, which it does only under the lock, in a remount.
+    async fn finish(mut self) {
+        use cowshed_core::LostMount;
+        use cowshed_core::storage::apfs::Remount;
+
+        let (gone, _, _) = run(&mut self.service, ["path", "shed", "--no-attach"]).await;
+        assert_eq!(
+            gone.expect_err("the removed shed has no path").code,
+            ErrorCode::NotFound
+        );
+        // Nothing of the runtime holds main while the test unmounts it.
+        self.service.shutdown().await.expect("shutdown runtime");
+        let unmount = cowshed_apfs::CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [
+                OsString::from("unmount"),
+                self.fixture.checkout.as_os_str().to_os_string(),
+            ],
+        );
+        let result = self
+            .fixture
+            .runner()
+            .run(&unmount, "fixture unmount")
+            .expect("run diskutil unmount")
+            .output;
+        assert!(result.succeeded(), "diskutil unmount main: {result:?}");
+        let mut main_remounted = false;
+        while !main_remounted || self.answers.unanswered() {
+            match self.hearing.recv().await.expect("the watch runs") {
+                LostMount::Workspace {
+                    workspace,
+                    remount: Ok(Remount::Remounted { .. }),
+                } if workspace.name().as_str() == "main" => main_remounted = true,
+                lost => self.answers.left_to_its_holder(lost),
+            }
+        }
+        for mount in [&self.shed, &self.build] {
+            assert!(
+                kernel_mount_at(mount).is_none(),
+                "{} stays unmounted",
+                mount.display()
+            );
+        }
+        let shed_image = cowshed_core::storage::StorageLayout::new(
+            self.fixture.storage.store(),
+            &RepoId::parse("fixture/dispatch").expect("repository identity"),
+        )
+        .expect("project layout")
+        .session_image(&WorkspaceName::session("shed").expect("shed"))
+        .expect("shed image")
+        .image()
+        .to_owned();
+        assert!(!shed_image.exists(), "rm released the shed's image");
+        assert!(
+            !self.layout.image(&self.volume).exists(),
+            "rm released the shed's build image"
+        );
+        drop(self.watch);
+        self.fixture.stop_gateway().await;
+    }
+}
+
+/// The kernel's mount at `mount`, if any.
+fn kernel_mount_at(mount: &Path) -> Option<cowshed_apfs::mounts::KernelMountSnapshot> {
+    SystemKernelMountSource
+        .mounts()
+        .expect("own fixture mounts")
+        .into_iter()
+        .find(|kernel| kernel.mount_point == mount)
+}
+
+/// What the watch said of the shed being removed. A pass reports a lost mount whose lock a live
+/// operation holds as `Locked` and leaves its remount to one wait, which answers once the holder
+/// lets go; a pass never reports a workspace that stands, so `Standing` is such a wait's answer.
+#[derive(Default)]
+struct ShedAnswers {
+    locked: usize,
+    answered: usize,
+}
+
+impl ShedAnswers {
+    /// What the watch may say of a workspace under removal: that its lock's holder has it, or
+    /// that it stands. Anything else, a remount or a failed one, is the watch acting on it.
+    fn left_to_its_holder(&mut self, lost: cowshed_core::LostMount) {
+        use cowshed_core::LostMount;
+        use cowshed_core::storage::apfs::Remount;
+        match lost {
+            LostMount::Workspace {
+                workspace,
+                remount: Ok(remount @ (Remount::Locked { .. } | Remount::Standing)),
+            } => {
+                if workspace.name().as_str() == "shed" {
+                    match remount {
+                        Remount::Locked { .. } => self.locked += 1,
+                        _ => self.answered += 1,
+                    }
+                }
+            }
+            other => panic!("the watch acted on a workspace under removal: {other}"),
+        }
+    }
+
+    /// A remount the watch left to the shed's lock that has not answered yet.
+    fn unanswered(&self) -> bool {
+        self.locked > 0 && self.answered == 0
+    }
+}
+
+/// A removal holds its workspace's image lock from before it unmounts the build volume the
+/// checkout links, so the watch on lost mounts finds the lock held and mounts nothing of a
+/// workspace being removed (05_gateway.md, "Lost mounts"; 02_workspaces.md, `rm` step 4). Here
+/// the removal and the watch run as they come: the unmount of the shed's build volume wakes the
+/// watch while the removal releases that volume, and without the lock the watch took the shed
+/// and settled its mount again over a build image the removal had just released.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_a_removal_under_the_lost_mount_watch_detaches_and_remounts_nothing() {
+    let mut removal = WatchedRemoval::armed().await;
+    // Forked seconds ago: forced past the age floor alone.
+    succeed(&mut removal.service, ["rm", "shed", "--force"]).await;
+    removal.finish().await;
+}
+
+/// The same removal with its detach of the shed's build image held, as on 2026-11-17, when three
+/// removals refused: the watch read the shed, its volume mounted and its build volume just
+/// unmounted, as having lost its mount, took the free lock and pinned the build volume's device
+/// to mount it again, and every detach of that image by the removal answered `Resource busy`. A
+/// reader of the build volume's raw device holds the detach in its grace, between the volume's
+/// unmount and its image's release, until the watch has answered for the shed: the window the
+/// watch met, held open instead of raced. The watch answers that the lock's holder has the shed,
+/// the reader lets go, the detach goes through and the removal succeeds, and the watch remounts
+/// nothing of the shed.
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_a_removal_under_the_lost_mount_watch_leaves_a_held_build_detach_unpinned() {
+    use cowshed_core::LostMount;
+    use cowshed_core::storage::apfs::Remount;
+
+    let mut removal = WatchedRemoval::armed().await;
+    let device = kernel_mount_at(&removal.build)
+        .expect("the shed's build volume is mounted")
+        .source_device;
+    let raw = device.replacen("/dev/disk", "/dev/rdisk", 1);
+    let mut reader = Some(
+        fs::File::open(&raw)
+            .unwrap_or_else(|error| panic!("open the build volume's raw device {raw}: {error}")),
+    );
+    let WatchedRemoval {
+        service,
+        hearing,
+        answers,
+        ..
+    } = &mut removal;
+    // Forked seconds ago: forced past the age floor alone.
+    let (removed, stdout, stderr) = {
+        let rm = run(service, ["rm", "shed", "--force"]);
+        tokio::pin!(rm);
+        loop {
+            tokio::select! {
+                removed = &mut rm => break removed,
+                lost = hearing.recv() => match lost.expect("the watch runs") {
+                    LostMount::Workspace {
+                        workspace,
+                        remount: Ok(Remount::Locked { .. }),
+                    } if workspace.name().as_str() == "shed" && reader.is_some() => {
+                        cowshed_os::eprintln!(
+                            "removal under the watch: the shed's lock holder has it; the reader of {raw} lets go"
+                        );
+                        reader = None;
+                        answers.locked += 1;
+                    }
+                    lost => answers.left_to_its_holder(lost),
+                },
+            }
+        }
+    };
+    if !matches!(removed, Ok(0)) {
+        // What the watch did meanwhile: it answers once the removal lets the image go.
+        drop(reader.take());
+        let watched = hearing.recv().await.expect("the watch runs");
+        panic!(
+            "cowshed rm shed --force: {removed:?}\nstdout: {}\nstderr: {}\nthe watch meanwhile: {watched}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr),
+        );
+    }
+    assert!(
+        reader.is_none(),
+        "the removal outlasted its reader without the watch answering for the shed"
+    );
+    removal.finish().await;
+}
 /// Making room under IOKit's media match-notification ceiling on the real kernel
 /// (02_workspaces.md, "Making room for an attach"), with a small cap as the decision input rather
 /// than a fake registry: a test namespace makes room by the media its own store's attached images
