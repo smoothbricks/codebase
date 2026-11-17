@@ -1089,6 +1089,26 @@ at daemon start, and the `init-local.js` and `run-command.js` hunks ask the daem
 run, serves `nx show projects` and `nx run` from non-terminal clients, stops it, and requires no `[NX-CONSOLE]` daemon
 log line and no editor run. Stock Nx logs the check and runs all four probes.
 
+## A command's output is read to its end
+
+Without a terminal, stock Nx 24.0.3 runs an `nx:run-commands` command as a child process and takes its result in the
+child's `'exit'` handler, joining the output chunks read so far. Node and Bun can emit `'exit'` before they have read
+the command's last stdout and stderr chunks, so those chunks are missing from the task's terminal output, its cache
+entry and its output file. A test runner prints its summary last: a consumer workspace's gate read a passing shard as a
+run without a summary this way, under load.
+
+The run-commands hunks backport upstream nrwl/nx 5d440a5fe6 ("keep run-commands output written right before a command
+exits", #37762, fixing #37452): a command's result waits for its stdout and stderr to close, at most 1 second past its
+exit, since a process the command leaves behind can hold the pipes open (`whenStdioClosed` and `hasExited` in
+`utils/child-process.js`). The same commit drains the `nx:run-script` executor's output and a crashed batch worker's,
+stops a serial task killed while a command's output drains, stops parallel siblings at a failed command's exit, and
+keeps ready text from hiding a sibling's failure. Output a leftover process writes more than 1 second after the command
+exits is still not captured; nrwl/nx#36863 tracks that case.
+
+`packages/nx-plugin/src/nx-run-commands-output-drain.test.ts` drives the installed `SeriallyRunningTasks` under Node and
+Bun with a command whose last line a leftover process writes only once the command's `'exit'` reached the listeners Nx
+registered first. Drop these hunks when the installed upstream version contains 5d440a5fe6, retaining the regression.
+
 ## Run information after a pre-start failure
 
 Stock Nx's discrete worker reports a hash failure through `endTasks` even when `startTasks` never ran. Its

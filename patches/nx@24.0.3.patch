@@ -3207,6 +3207,279 @@ index 400e96394bbef2f44ca626a1d9445bd539674068..f31f54daa6b87d595fdf6384778313e8
              recursive: true,
              force: true,
          });
+diff --git a/dist/src/executors/run-commands/running-tasks.d.ts b/dist/src/executors/run-commands/running-tasks.d.ts
+index 9813a098eb17d9e799e1583a848f4e2fce945b6f..3d5dfcfc981cac0540758d15fd3fc7a600a2d1a6 100644
+--- a/dist/src/executors/run-commands/running-tasks.d.ts
++++ b/dist/src/executors/run-commands/running-tasks.d.ts
+@@ -36,6 +36,7 @@ export declare class SeriallyRunningTasks implements RunningTask {
+     private code;
+     private error;
+     private outputCallbacks;
++    private killSignal;
+     private exited;
+     private exitTerminalOutput;
+     constructor(options: NormalizedRunCommandsOptions, context: ExecutorContext, tuiEnabled: boolean, task: Pick<Task, 'id' | 'ultracache'>, baseEnv?: NodeJS.ProcessEnv);
+diff --git a/dist/src/executors/run-commands/running-tasks.js b/dist/src/executors/run-commands/running-tasks.js
+index be662a6ea68d9df1a606795b2b39934740467d54..17f40095c4eb0963d704d6fdb16fc5951e0e3b4e 100644
+--- a/dist/src/executors/run-commands/running-tasks.js
++++ b/dist/src/executors/run-commands/running-tasks.js
+@@ -14,6 +14,7 @@ const pseudo_terminal_1 = require("../../tasks-runner/pseudo-terminal");
+ const task_env_1 = require("../../tasks-runner/task-env");
+ const tokens_1 = require("../../tasks-runner/tokens");
+ const task_io_service_1 = require("../../tasks-runner/task-io-service");
++const child_process_2 = require("../../utils/child-process");
+ const exit_codes_1 = require("../../utils/exit-codes");
+ const output_1 = require("../../utils/output");
+ /**
+@@ -110,6 +111,12 @@ class ParallelRunningTasks {
+                         }
+                     });
+                     childProcess.onExit((code, terminalOutput) => {
++                        // A failed command reports only once its output is read, so
++                        // readyWhen text a sibling prints meanwhile must not hide it.
++                        if (code === 0 &&
++                            this.childProcesses.some((p) => p !== childProcess && p.exitedWithFailure)) {
++                            return;
++                        }
+                         res({
+                             childProcess,
+                             result: { code, terminalOutput },
+@@ -137,9 +144,14 @@ class ParallelRunningTasks {
+         }
+         else {
+             const runningProcesses = new Set();
+-            let hasFailure = false;
+-            let failureDetails = null;
++            let failedProcess = null;
+             const terminalOutputs = new Map();
++            const failFast = (childProcess) => {
++                if (failedProcess)
++                    return;
++                failedProcess = childProcess;
++                this.terminateRemainingProcesses(runningProcesses, childProcess);
++            };
+             await Promise.allSettled(this.childProcesses.map(async (childProcess) => {
+                 runningProcesses.add(childProcess);
+                 childProcess.onOutput((terminalOutput) => {
+@@ -147,20 +159,20 @@ class ParallelRunningTasks {
+                         cb(terminalOutput);
+                     }
+                 });
++                // Results wait for the output to drain, which a descendant holding
++                // the pipes can stretch to a second.
++                childProcess.onFailedExit(() => failFast(childProcess));
+                 const { code, terminalOutput } = await childProcess.getResults();
+                 terminalOutputs.set(childProcess, terminalOutput);
+-                if (code !== 0 && !hasFailure) {
+-                    hasFailure = true;
+-                    failureDetails = { childProcess, code, terminalOutput };
+-                    // Immediately terminate all other running processes
+-                    this.terminateRemainingProcesses(runningProcesses, childProcess);
++                if (code !== 0) {
++                    failFast(childProcess);
+                 }
+                 runningProcesses.delete(childProcess);
+             }));
+             let terminalOutput = Array.from(terminalOutputs.values()).join('\r\n');
+-            if (hasFailure && failureDetails) {
++            if (failedProcess) {
+                 // Add failure message
+-                const warning = commandExitedNonZeroWarning(failureDetails.childProcess.command);
++                const warning = commandExitedNonZeroWarning(failedProcess.command);
+                 terminalOutput += warning;
+                 streamChunk(warning, this.streamOutput, process.stderr);
+                 this.emitExit(1, terminalOutput);
+@@ -186,6 +198,9 @@ class SeriallyRunningTasks {
+         this.baseEnv = baseEnv;
+         this.terminalOutputChunks = [];
+         this.currentProcess = null;
++        // A command can be killed after it exits, while its output drains. The
++        // signal then reaches no process, so this is what stops the next command.
++        this.killSignal = null;
+         this.exitCallbacks = [];
+         this.code = 0;
+         this.outputCallbacks = [];
+@@ -253,10 +268,15 @@ class SeriallyRunningTasks {
+         throw new Error('Not implemented');
+     }
+     kill(signal) {
++        this.killSignal = signal ?? 'SIGTERM';
+         return this.currentProcess?.kill(signal);
+     }
+     async run(options, context) {
+         for (const c of options.commands) {
++            if (this.killSignal) {
++                this.code = (0, exit_codes_1.signalToCode)(this.killSignal);
++                break;
++            }
+             const childProcess = await this.createProcess(c, options.color, calculateCwd(options.cwd, context), options.processEnv ?? options.env ?? {}, this.task, options.usePty, options.streamOutput, options.tty, options.envFile, this.baseEnv);
+             this.currentProcess = childProcess;
+             childProcess.onOutput((output, isCommandHeader) => {
+@@ -349,7 +369,10 @@ class RunningNodeProcess {
+         this.terminalOutputChunks = [];
+         this.exitCallbacks = [];
+         this.outputCallbacks = [];
++        this.failedExitCallbacks = [];
+         this.killPromise = null;
++        // Set at 'exit', while the output may still be unread.
++        this.exitedWithFailure = false;
+         // Memoized exit so late getResults()/onExit() callers don't hang.
+         this.exited = false;
+         this.exitCode = 0;
+@@ -367,6 +390,7 @@ class RunningNodeProcess {
+             windowsHide: true,
+             stdio: ['inherit', 'pipe', 'pipe'],
+         });
++        this.stdioClosed = (0, child_process_2.whenStdioClosed)(this.childProcess);
+         this.closedPromise = new Promise((resolve) => {
+             this.childProcess.on('close', resolve);
+         });
+@@ -402,6 +426,10 @@ class RunningNodeProcess {
+         }
+         this.exitCallbacks.push(cb);
+     }
++    /** Runs at a non-zero 'exit', before the rest of the output is read. */
++    onFailedExit(cb) {
++        this.failedExitCallbacks.push(cb);
++    }
+     send(message) {
+         this.childProcess.send(message);
+     }
+@@ -424,10 +452,15 @@ class RunningNodeProcess {
+             return this.killPromise;
+         if (!this.childProcess.pid)
+             return Promise.resolve();
++        // An exited child's pid is free for reuse, so signalling it could reach an
++        // unrelated process.
++        const signalled = (0, child_process_2.hasExited)(this.childProcess)
++            ? Promise.resolve()
++            : (0, native_1.killProcessTreeGraceful)(this.childProcess.pid, signal);
+         // Cache the promise so concurrent callers (e.g. cleanup() after a
+         // fire-and-forget kill from cleanUpUnneededContinuousTasks) await the
+         // same in-progress operation instead of no-oping.
+-        this.killPromise = (0, native_1.killProcessTreeGraceful)(this.childProcess.pid, signal).then(() => 
++        this.killPromise = signalled.then(() => 
+         // Wait for stdio drain and close events before the orchestrator
+         // tears down the event loop via process.exit().
+         Promise.race([
+@@ -451,9 +484,10 @@ class RunningNodeProcess {
+     addListeners(commandConfig) {
+         this.childProcess.stdout.setEncoding('utf8');
+         this.childProcess.stderr.setEncoding('utf8');
++        const exitedWithFailure = () => this.exitedWithFailure;
+         // Separate matchers, so a ready string never spans stdout and stderr
+-        const stdoutReady = readyWhenMatcher(this.readyWhenStatus);
+-        const stderrReady = readyWhenMatcher(this.readyWhenStatus);
++        const stdoutReady = readyWhenMatcher(this.readyWhenStatus, exitedWithFailure);
++        const stderrReady = readyWhenMatcher(this.readyWhenStatus, exitedWithFailure);
+         this.childProcess.stdout.on('data', (data) => {
+             const output = addColorAndPrefix(data, commandConfig);
+             this.terminalOutputChunks.push(output);
+@@ -485,11 +519,19 @@ class RunningNodeProcess {
+             untrackRunningNodeProcess(this);
+             this.emitExit(1, terminalOutput);
+         });
+-        this.childProcess.on('exit', (code, signal) => {
++        this.childProcess.on('exit', async (code, signal) => {
+             if (code === null) {
+                 code = (0, exit_codes_1.signalToCode)(signal);
+             }
+             untrackRunningNodeProcess(this);
++            this.exitedWithFailure = code !== 0;
++            if (this.exitedWithFailure) {
++                for (const cb of this.failedExitCallbacks) {
++                    cb();
++                }
++            }
++            // The last stdout and stderr chunks can still be unread at 'exit'.
++            await this.stdioClosed;
+             if (code === 0 &&
+                 this.readyWhenStatus.length &&
+                 !isReady(this.readyWhenStatus)) {
+@@ -591,23 +633,33 @@ function isReady(readyWhenStatus) {
+ // The output as printed, kept across chunks, matches strings that hold escape
+ // sequences. LogMatcher, absent from the WASM binding, matches text with
+ // escapes inside it.
+-function readyWhenMatcher(readyWhenStatus) {
++function readyWhenMatcher(readyWhenStatus, exitedWithFailure) {
+     const matchers = readyWhenStatus.map((status) => ({
+         status,
+         matcher: native_1.IS_WASM ? null : new native_1.LogMatcher([status.stringToMatch]),
+         tail: '',
++        matched: false,
+     }));
+     return (chunk) => {
++        // The status is shared, so only a chunk with this command's own match
++        // reports ready. Once ready, only a failed command can change the result.
++        if (isReady(readyWhenStatus) && !exitedWithFailure())
++            return false;
++        let matchedNow = false;
+         for (const entry of matchers) {
+             const { status, matcher } = entry;
+-            if (status.found)
++            if (entry.matched)
+                 continue;
+             const printed = entry.tail + chunk;
+-            status.found =
++            entry.matched =
+                 printed.includes(status.stringToMatch) || !!matcher?.feed(chunk);
+             entry.tail = printed.slice(Math.max(0, printed.length - status.stringToMatch.length + 1));
++            if (entry.matched) {
++                status.found = true;
++                matchedNow = true;
++            }
+         }
+-        return isReady(readyWhenStatus);
++        return matchedNow && isReady(readyWhenStatus);
+     };
+ }
+ function loadEnvVarsFile(path, env = {}) {
+diff --git a/dist/src/executors/run-script/run-script.impl.js b/dist/src/executors/run-script/run-script.impl.js
+index 196ee42030c875ceb3d734d9e26ed3b64b47c9b7..4ed3d5227987b9e1531cfed4fb42045b023c4544 100644
+--- a/dist/src/executors/run-script/run-script.impl.js
++++ b/dist/src/executors/run-script/run-script.impl.js
+@@ -6,6 +6,7 @@ const child_process_1 = require("child_process");
+ const path = tslib_1.__importStar(require("path"));
+ const native_1 = require("../../native");
+ const pseudo_terminal_1 = require("../../tasks-runner/pseudo-terminal");
++const child_process_2 = require("../../utils/child-process");
+ const package_manager_1 = require("../../utils/package-manager");
+ async function default_1(options, context) {
+     const pm = (0, package_manager_1.getPackageManagerCommand)();
+@@ -40,13 +41,16 @@ function nodeProcess(command, cwd, env) {
+             env,
+             windowsHide: true,
+         });
++        const stdioClosed = (0, child_process_2.whenStdioClosed)(cp);
+         // Forward stdout/stderr to parent process
+         cp.stdout.pipe(process.stdout);
+         cp.stderr.pipe(process.stderr);
+         cp.on('error', (error) => {
+             rej(error);
+         });
+-        cp.on('exit', (code) => {
++        cp.on('exit', async (code) => {
++            // The last stdout and stderr chunks can still be unread at 'exit'.
++            await stdioClosed;
+             if (code === 0) {
+                 res();
+             }
+@@ -55,9 +59,13 @@ function nodeProcess(command, cwd, env) {
+             }
+         });
+         const exitHandler = (signal) => {
+-            if (cp && cp.pid && !cp.killed) {
++            // An exited child's pid is free for reuse, and its exit code decides
++            // the result, also when the kill is what made it exit.
++            if (cp && cp.pid && !cp.killed && !(0, child_process_2.hasExited)(cp)) {
+                 (0, native_1.killProcessTreeGraceful)(cp.pid, signal).finally(() => {
+-                    res();
++                    if (!(0, child_process_2.hasExited)(cp)) {
++                        res();
++                    }
+                 });
+             }
+         };
 diff --git a/dist/src/hasher/check-task-files.js b/dist/src/hasher/check-task-files.js
 index b027c02a6df7532cce64ae9684bfb76e56bf975b..ce045a0e126de3d349a10d0f367a0bdbbaad820a 100644
 --- a/dist/src/hasher/check-task-files.js
@@ -5924,6 +6197,48 @@ index b068c8bb203fd47d11e0d5cdc411b4444fc244fd..851d4428983a7e32aafd059580cfbc82
              return;
          }
          const { outdatedAgents } = await client_1.daemonClient.getConfigureAiAgentsStatus();
+diff --git a/dist/src/tasks-runner/running-tasks/batch-process.js b/dist/src/tasks-runner/running-tasks/batch-process.js
+index 4c56ddede1856427cf936950e2771bf8f9322e92..9c3b57391a002f29a4f5a72c1d925050a8efe31a 100644
+--- a/dist/src/tasks-runner/running-tasks/batch-process.js
++++ b/dist/src/tasks-runner/running-tasks/batch-process.js
+@@ -6,6 +6,7 @@ const crypto_1 = require("crypto");
+ const path_1 = require("path");
+ const native_1 = require("../../native");
+ const cache_1 = require("../cache");
++const child_process_1 = require("../../utils/child-process");
+ const exit_codes_1 = require("../../utils/exit-codes");
+ const output_1 = require("../../utils/output");
+ const batch_messages_1 = require("../batch/batch-messages");
+@@ -68,6 +69,7 @@ class BatchProcess {
+          * summary is still pointing at.
+          */
+         this.captureNonce = (0, crypto_1.randomBytes)(4).toString('hex');
++        this.stdioClosed = (0, child_process_1.whenStdioClosed)(this.childProcess);
+         this.childProcess.on('message', (message) => {
+             switch (message.type) {
+                 case batch_messages_1.BatchMessageType.CompleteTask: {
+@@ -294,8 +296,8 @@ class BatchProcess {
+      * batch as one fold, so output no task claimed is not lost.
+      *
+      * Not valid to read before `flushCapturedOutput`; that flush ends the stream,
+-     * so a chunk arriving afterwards - a worker's stdout can deliver past the
+-     * exit event `getResults()` settles on - is dropped rather than appended.
++     * so a chunk arriving afterwards - a worker can still write after the
++     * results message `getResults()` settles on - is dropped rather than appended.
+      */
+     getCapturedOutputPath() {
+         return this.capturedOutputPath;
+@@ -341,7 +343,9 @@ class BatchProcess {
+             new Promise((_, rej) => {
+                 this.onExit((code) => {
+                     if (code !== 0) {
+-                        rej(new Error(`"${this.executorName}" exited unexpectedly with code: ${code}`));
++                        // A rejection makes the caller flush the capture, which drops
++                        // whatever the crashed worker wrote that has not been read yet.
++                        this.stdioClosed.then(() => rej(new Error(`"${this.executorName}" exited unexpectedly with code: ${code}`)));
+                     }
+                 });
+             }),
 diff --git a/dist/src/tasks-runner/task-env.js b/dist/src/tasks-runner/task-env.js
 index bded0d604f20417f61fdf18bcf62b09966847d43..2aa4f9cde2f677b89032b439ef90c7c7ee68f977 100644
 --- a/dist/src/tasks-runner/task-env.js
@@ -6948,6 +7263,72 @@ index e654d8c832c5275a2aaa5015887db9167392a694..3e8af252980e6fa141a4af35a51b0681
 +    }
 +    return paths;
 +}
+diff --git a/dist/src/utils/child-process.d.ts b/dist/src/utils/child-process.d.ts
+index d68999b0b603795bbbc4eb6ef916a8ae008e59ce..4ec8ff6292f811b2d12091250d275e6fa68062a8 100644
+--- a/dist/src/utils/child-process.d.ts
++++ b/dist/src/utils/child-process.d.ts
+@@ -1,4 +1,4 @@
+-import { type ExecOptions, type ExecSyncOptions, type SpawnSyncOptions } from 'child_process';
++import { type ChildProcess as NodeChildProcess, type ExecOptions, type ExecSyncOptions, type SpawnSyncOptions } from 'child_process';
+ import { PackageManagerCommands } from './package-manager';
+ import { ChildProcess } from '../native';
+ export declare function getRunNxBaseCommand(packageManagerCommand?: PackageManagerCommands, cwd?: string): string;
+@@ -41,6 +41,13 @@ export declare function runNxAsync(cmd: string, options?: ExecOptions & {
+     silent?: boolean;
+     packageManagerCommand?: PackageManagerCommands;
+ }): Promise<void>;
++export declare function hasExited(child: NodeChildProcess): boolean;
++/**
++ * Settles once `child`'s stdio has closed, which Node reports after 'exit'.
++ * Call it at spawn time: a 'close' emitted before the call is missed. Gives up
++ * 1s after 'exit', since a descendant can keep the pipes open indefinitely.
++ */
++export declare function whenStdioClosed(child: NodeChildProcess): Promise<void>;
+ export declare class PseudoTtyProcess {
+     private childProcess;
+     isAlive: boolean;
+diff --git a/dist/src/utils/child-process.js b/dist/src/utils/child-process.js
+index fc523cf236b7973e2f4e3f65d042a40f5fda40b3..6eb3daf7dc6640b8b7c45cea97d62aee2163c0b7 100644
+--- a/dist/src/utils/child-process.js
++++ b/dist/src/utils/child-process.js
+@@ -7,6 +7,8 @@ exports.readInstalledNxBin = readInstalledNxBin;
+ exports.runNxArgvSync = runNxArgvSync;
+ exports.runNxSync = runNxSync;
+ exports.runNxAsync = runNxAsync;
++exports.hasExited = hasExited;
++exports.whenStdioClosed = whenStdioClosed;
+ const child_process_1 = require("child_process");
+ const fs_1 = require("fs");
+ const path_1 = require("path");
+@@ -160,6 +162,28 @@ async function runNxAsync(cmd, options) {
+         }
+     });
+ }
++function hasExited(child) {
++    return child.exitCode !== null || child.signalCode !== null;
++}
++/**
++ * Settles once `child`'s stdio has closed, which Node reports after 'exit'.
++ * Call it at spawn time: a 'close' emitted before the call is missed. Gives up
++ * 1s after 'exit', since a descendant can keep the pipes open indefinitely.
++ */
++function whenStdioClosed(child) {
++    return new Promise((resolve) => {
++        let timeout;
++        child.once('close', () => {
++            clearTimeout(timeout);
++            resolve();
++        });
++        child.once('exit', () => {
++            // Node runs expired timers before it reads the pipes, so a blocked event
++            // loop would otherwise give up on output that is already there.
++            timeout = setTimeout(() => setImmediate(resolve), 1000);
++        });
++    });
++}
+ class PseudoTtyProcess {
+     constructor(childProcess) {
+         this.childProcess = childProcess;
 diff --git a/dist/src/utils/installed-nx-version.js b/dist/src/utils/installed-nx-version.js
 index 15a5d36aa9116f7b5ddcadbbeca9dccb7cc7fe45..70cd1b78afb4c54e257c7eec99014a9b139c1293 100644
 --- a/dist/src/utils/installed-nx-version.js
