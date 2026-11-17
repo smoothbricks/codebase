@@ -2749,8 +2749,10 @@ every heal runs, under that lock and with the canonical mount policy (01a_apfs.m
 policy"). A workspace standing mounted, or detached, is passed over, so a verb's detach is never undone. A workspace
 whose image lock a live operation holds is that holder's until it lets go: the watch waits for the lock alone, holding
 no lease, as a startup heal left to a holder waits ("Startup contract", step 3), and remounts it only if it is still
-lost then. The watch is the one owner of those waits, one per workspace. When it starts, it makes one pass over every
-workspace of every recorded project, for a mount lost while no gateway watched.
+lost then. A removal is such a holder from before it unmounts the first build volume the workspace owns until its image
+is released (02_workspaces.md, `rm` step 4), so the watch mounts nothing of a workspace being removed. The watch is the
+one owner of those waits, one per workspace. When it starts, it makes one pass over every workspace of every recorded
+project, for a mount lost while no gateway watched.
 
 A workspace whose image lock is gone has nothing to remount: the remount, and the wait for a holder, take only a lock
 that exists (01_storage.md, "Lock order"), so a pass that runs after `unadopt` unbound the project recreates neither the

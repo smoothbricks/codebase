@@ -8155,6 +8155,7 @@ self.finish_retire_intent(&workspace).await?;
         &mut self,
         current: NativeWorkspace,
         nx_check: CheckoutNxCheck,
+        lock: crate::storage::apfs::RetirementLock<H>,
     ) -> Result<()> {
         let workspace = current.derived.workspace.name().clone();
         if matches!(
@@ -8179,7 +8180,7 @@ self.finish_retire_intent(&workspace).await?;
         let git_worktree = is_git_worktree(&current.metadata);
         self.unregister_workspace_in_main(&workspace, git_worktree)
             .await?;
-        self.retire_workspace(current).await
+        self.retire_workspace(current, lock).await
     }
 
     /// Main as the branch a session's work has to reach: what `rm` measures against. It is the
@@ -9477,6 +9478,14 @@ self.finish_retire_intent(&workspace).await?;
                     containment,
                 )
                 .await;
+            // The removal owns the workspace's mounts from here until its image is released: the
+            // watch on lost mounts only tries this lock, so it mounts nothing of a workspace whose
+            // build volume the release below unmounts (05_gateway.md, "Lost mounts").
+            let lock = self
+                .substrate
+                .lock_retirement(&current.derived.workspace)
+                .await
+                .map_err(native_storage_error)?;
             if !workspace.is_main() {
                 self.build_volumes()?
                     .release_owned(
@@ -9488,7 +9497,7 @@ self.finish_retire_intent(&workspace).await?;
                     )
                     .await?;
             }
-            self.finish_retirement(current, nx_check).await?;
+            self.finish_retirement(current, nx_check, lock).await?;
             self.log_retirement(&workspace, &mount, tips, forced);
             Ok(RemoveReport { abandoned })
         }
@@ -11534,7 +11543,11 @@ self.finish_retire_intent(&workspace).await?;
         result
     }
 
-    async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
+    async fn retire_workspace(
+        &mut self,
+        current: NativeWorkspace,
+        lock: crate::storage::apfs::RetirementLock<H>,
+    ) -> Result<()> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
 
@@ -11545,7 +11558,7 @@ self.finish_retire_intent(&workspace).await?;
         let mut commitments = self.commitments.clone();
         let repo_id = self.descriptor.repo_id.clone();
         self.substrate
-            .execute_retire_staged(plan, move |retired| async move {
+            .execute_retire_staged(plan, lock, move |retired| async move {
                 commitments
                     .record(super::supervisor::CommitmentDraft::WorkspaceRetired {
                         repo_id,
@@ -15363,7 +15376,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         destination_incarnation: destination_incarnation.clone(),
                     })
                     .await?;
-                self.finish_retirement(current, CheckoutNxCheck::CloseRecorded)
+                let lock = self
+                    .substrate
+                    .lock_retirement(&current.derived.workspace)
+                    .await
+                    .map_err(native_storage_error)?;
+                self.finish_retirement(current, CheckoutNxCheck::CloseRecorded, lock)
                     .await?;
             }
             self.complete_lifecycle_intent(

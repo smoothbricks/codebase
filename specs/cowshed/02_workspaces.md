@@ -1555,9 +1555,12 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
    mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
-4. Release the session's owned live build volume and current-incarnation seed before its source image
-   (16_build_volumes.md, "Garbage collection"). A volume adopted by the target belongs to that target and stays. A held
-   volume or failed release refuses while the source image and unfinished retirement journal remain.
+4. Take the session's image lock, waiting for it, and hold it until step 5 has released the source. Under it, release
+   the session's owned live build volume and current-incarnation seed before its source image (16_build_volumes.md,
+   "Garbage collection"). A volume adopted by the target belongs to that target and stays. A held volume or failed
+   release refuses while the source image and unfinished retirement journal remain. From the live volume's unmount the
+   workspace stands with its own volume mounted and the build volume its checkout links not, which the gateway's watch
+   reads as a lost mount; the held lock leaves it to the removal (05_gateway.md, "Lost mounts").
 5. **Release the source: commit the release in this operation, free it in the background.** After the final
    dirty/in-progress, HEAD-stability and all-branch containment fences, detach the exact source and remove its scoped
    temporary directory and empty mountpoint through the existing retirement checks. Then commit the release with one

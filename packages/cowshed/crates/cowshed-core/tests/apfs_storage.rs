@@ -2058,10 +2058,14 @@ async fn staged_retire_releases_before_its_fence_and_never_keeps_a_trash_image()
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_retire(&current).expect("retire plan");
+    let lock = substrate
+        .lock_retirement(&current)
+        .await
+        .expect("retirement lock");
     let callback_host = host.clone();
 
     let error = substrate
-        .execute_retire_staged(plan, move |retired| async move {
+        .execute_retire_staged(plan, lock, move |retired| async move {
             assert_eq!(retired.workspace().name().as_str(), "raven");
             assert!(
                 callback_host
@@ -2091,9 +2095,13 @@ async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to
     host.fail_reclaim_once.store(true, Ordering::SeqCst);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_retire(&current).unwrap();
+    let lock = substrate
+        .lock_retirement(&current)
+        .await
+        .expect("retirement lock");
     let callback_host = host.clone();
     let failed = substrate
-        .execute_retire_staged(plan, move |_| async move {
+        .execute_retire_staged(plan, lock, move |_| async move {
             callback_host.record("retirement-commitment");
             Ok::<(), &'static str>(())
         })
@@ -2108,8 +2116,12 @@ async fn failed_direct_source_unlink_does_not_publish_retirement_or_fall_back_to
             .any(|fact| fact.workspace == current)
     );
     let retry = substrate.plan_retire(&current).unwrap();
+    let lock = substrate
+        .lock_retirement(&current)
+        .await
+        .expect("retirement lock");
     substrate
-        .execute_retire_staged(retry, |_| async { Ok::<(), &'static str>(()) })
+        .execute_retire_staged(retry, lock, |_| async { Ok::<(), &'static str>(()) })
         .await
         .expect("same release retries");
 }
@@ -2121,12 +2133,16 @@ async fn cancelling_the_retirement_commitment_never_recreates_released_source_tr
     host.seed(&current);
     let substrate = substrate(host.clone(), CountingLane::default());
     let plan = substrate.plan_retire(&current).unwrap();
+    let lock = substrate
+        .lock_retirement(&current)
+        .await
+        .expect("retirement lock");
     let entered = Arc::new(AtomicBool::new(false));
     let callback_entered = Arc::clone(&entered);
     let callback_host = host.clone();
     let task = tokio::spawn(async move {
         substrate
-            .execute_retire_staged(plan, move |_| async move {
+            .execute_retire_staged(plan, lock, move |_| async move {
                 assert!(
                     callback_host
                         .events()

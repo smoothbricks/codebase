@@ -371,6 +371,18 @@ impl<F> From<ApfsStorageError> for RetireExecutionError<F> {
     }
 }
 
+/// A workspace's image lock, held by its retirement from before it unmounts the first volume the
+/// workspace owns until its image is released. The watch on lost mounts only tries this lock
+/// (05_gateway.md, "Lost mounts"), so a workspace whose build volume its retirement has
+/// unmounted stays that retirement's and is never mounted again under it. Only
+/// [`ApfsSubstrate::lock_retirement`] makes one, and [`ApfsSubstrate::execute_retire_staged`]
+/// takes it.
+#[must_use = "the workspace's image lock is let go when this is dropped"]
+pub struct RetirementLock<H: ApfsExecutionHost> {
+    paths: Vec<PathBuf>,
+    guard: H::LockGuard,
+}
+
 pub type AdoptExecutionError<E> = StagedExecutionError<E>;
 pub type CreateExecutionError<E> = StagedExecutionError<E>;
 pub type ForkExecutionError<E> = StagedExecutionError<E>;
@@ -1813,11 +1825,39 @@ where
         Ok((retired, value))
     }
 
-    /// Retire under the existing image fence by releasing the image, then publish the lifecycle
-    /// commitment (02_workspaces.md, `rm` step 5).
+    /// Take `workspace`'s image lock for its retirement, as every lifecycle operation takes it,
+    /// and finish what an interrupted operation left under it. The retirement holds it across
+    /// the release of the build volumes the workspace owns and hands it to
+    /// [`Self::execute_retire_staged`] (02_workspaces.md, `rm` steps 4 and 5).
+    pub async fn lock_retirement(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<RetirementLock<H>, ApfsStorageError> {
+        let paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+        )?];
+        let holding = LockHolding::of(LockOperation::Retire, workspace.name());
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
+        let mode = self.image_lock_mode;
+        self.lane
+            .dispatch(move || {
+                let guard = lock_images_in(host.as_ref(), &paths, mode, &holding)?;
+                host.recover_pending(&config, &paths)?;
+                Ok(RetirementLock { paths, guard })
+            })
+            .await
+    }
+
+    /// Retire under the image lock the retirement already holds by releasing the image, then
+    /// publish the lifecycle commitment (02_workspaces.md, `rm` step 5). A lock taken for another
+    /// workspace is refused before anything is detached.
     pub async fn execute_retire_staged<F, Fut, E>(
         &self,
         plan: RetirePlan,
+        lock: RetirementLock<H>,
         fence: F,
     ) -> Result<RetiredRef, RetireExecutionError<E>>
     where
@@ -1825,10 +1865,19 @@ where
         Fut: Future<Output = Result<(), E>> + Send,
         E: Send,
     {
-        let locks = operation_lock_paths(&self.config, plan.expected(), plan.operation())?;
-        let holding = operation_holding(plan.operation());
+        let RetirementLock { paths, guard } = lock;
+        if paths != operation_lock_paths(&self.config, plan.expected(), plan.operation())? {
+            return Err(
+                ApfsStorageError::InvalidPlan("retirement lock names another workspace").into(),
+            );
+        }
+        let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
         let retired = self
-            .dispatch_with_locks(locks, holding, true, move |host, config| {
+            .lane
+            .dispatch(move || {
+                // Cancellation drops the waiter, not release's image ownership.
+                let _guard = guard;
                 revalidate(plan.expected(), &host.observe(plan.expected())?)?;
                 let Operation::Retire { workspace, .. } = plan.operation() else {
                     return Err(ApfsStorageError::UnexpectedResult);
