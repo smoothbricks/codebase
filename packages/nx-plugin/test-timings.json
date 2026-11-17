@@ -87,6 +87,7 @@
     "src/built-output-packages.test.ts": 269,
     "src/version-actions.test.ts": 258,
     "src/executors/bounded-exec/hang-diagnostics.test.ts": 235,
+    "src/nx-run-commands-output-drain.test.ts": 210,
     "src/managed-files/setup-devenv-stable-path.test.ts": 200,
     "src/lock-scope.test.ts": 186,
     "src/executors/bounded-exec/pool-sim.property.test.ts": 175,
