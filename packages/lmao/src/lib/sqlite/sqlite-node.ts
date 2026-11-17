@@ -8,6 +8,7 @@ import type {
   SyncSQLiteStatement,
 } from './sqlite-db.js';
 import { openWalDatabase } from './sqlite-wal.js';
+import { carrySinkWriteLock } from './sqlite-write-lock.js';
 
 export { openWalDatabase };
 
@@ -40,7 +41,7 @@ function toSyncStatement(statement: {
  */
 export function createNodeSQLiteDatabase(dbPath: string): SyncSQLiteDatabase {
   const db = openWalDatabase(dbPath, (path) => new DatabaseSync(path));
-  return {
+  const adapter: SyncSQLiteDatabase = {
     exec(sql: string): void {
       db.exec(sql);
     },
@@ -51,6 +52,8 @@ export function createNodeSQLiteDatabase(dbPath: string): SyncSQLiteDatabase {
       db.close();
     },
   };
+  carrySinkWriteLock(db, adapter);
+  return adapter;
 }
 
 function toAsyncStatement(statement: SyncSQLiteStatement): AsyncSQLiteStatement {

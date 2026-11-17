@@ -36,12 +36,22 @@ import {
   walkSpanSegments,
 } from './sqlite-common.js';
 import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
+import { openSinkWriteLock, type SinkWriteLock } from './sqlite-write-lock.js';
 
 const JOURNAL_MODE_SQL = 'PRAGMA journal_mode';
 const DATABASE_LIST_SQL = 'PRAGMA database_list';
 
 /** Journal modes that keep no rollback record, so a killed writer leaves partially applied pages behind. */
 const UNRECOVERABLE_JOURNAL_MODES: Record<string, true> = { memory: true, off: true };
+
+/**
+ * Rows a writer of a shared sink commits per turn at its write lock. A whole test run is one trace, flushed when the
+ * run ends: a single transaction over it (270,000 rows in one measured run, 1.7 s into a 2.7 GB sink) keeps every
+ * sibling's next row waiting for that long. A turn's commit pays the WAL checkpoint its pages bring due, so smaller
+ * turns cost the flush more in total: measured on that sink, 1,024 rows per turn take 3.6 s, 4,096 take 2.3 s with
+ * no turn over 132 ms, and 16,384 take 1.6 s with turns up to 186 ms.
+ */
+const SHARED_FLUSH_ROWS_PER_TURN = 4096;
 
 export interface SQLiteWriterConfig {
   /** Path to SQLite file. Defaults to `DEFAULT_TRACE_DB_PATH` from `./trace-db-path.js`. */
@@ -51,16 +61,25 @@ export interface SQLiteWriterConfig {
 export class SQLiteTraceWriter {
   private knownColumns = new Set<string>();
   private insertStmtCache = new Map<string, SyncSQLiteStatement>();
+  /** Present when `db` is a connection to a sink other processes write too (`./sqlite-write-lock.ts`). */
+  private readonly writeLock: SinkWriteLock | undefined;
 
   constructor(private db: SyncSQLiteDatabase) {
+    this.writeLock = openSinkWriteLock(db);
     this.init();
+  }
+
+  /** Run one write of this writer, alone among the processes sharing the sink when it is shared. */
+  private exclusive<T>(write: () => T): T {
+    return this.writeLock ? this.writeLock.hold(write) : write();
   }
 
   private init(): void {
     // Parallel Bun test workers share one trace DB, so wait for short SQLite writer locks instead of failing setup.
     this.db.exec('PRAGMA busy_timeout = 10000');
     this.requireRecoverableJournal();
-    this.db.exec(SPANS_TABLE_INIT_SQL);
+    // Creating the table writes the schema: a write like any other on a shared sink.
+    this.exclusive(() => this.db.exec(SPANS_TABLE_INIT_SQL));
 
     this.refreshKnownColumns();
   }
@@ -128,20 +147,55 @@ export class SQLiteTraceWriter {
     }
   }
 
-  private writeSegmentRows(segment: SpanSegment): void {
+  /** Write rows `from` (inclusive) to `to` (exclusive) of one segment. */
+  private writeSegmentRows(segment: SpanSegment, from: number, to: number): void {
     this.ensureColumns(segment.buffer._logSchema);
 
     const activeUserFields = getActiveUserFields(segment.buffer._logSchema, this.knownColumns);
     const insertStmt = this.getInsertStatement(activeUserFields);
 
-    for (let row = 0; row < segment.buffer._writeIndex; row++) {
+    for (let row = from; row < to; row++) {
       insertStmt.run(...buildInsertParams(segment, row, activeUserFields));
     }
   }
 
-  private flushAllSegments(rootBuffer: AnySpanBuffer): void {
-    for (const segment of walkSpanSegments(rootBuffer)) {
-      this.writeSegmentRows(segment);
+  private transaction(write: () => void): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      write();
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Write the tree in turns at the write lock, each one transaction of at most `SHARED_FLUSH_ROWS_PER_TURN` rows, so
+   * a sibling process waits for one turn and never for the trace.
+   */
+  private flushInTurns(rootBuffer: AnySpanBuffer, writeLock: SinkWriteLock): void {
+    const segments = walkSpanSegments(rootBuffer);
+    let next = segments.next();
+    let row = 0;
+    while (!next.done) {
+      writeLock.hold(() =>
+        this.transaction(() => {
+          let budget = SHARED_FLUSH_ROWS_PER_TURN;
+          while (budget > 0 && !next.done) {
+            const segment = next.value;
+            const end = Math.min(segment.buffer._writeIndex, row + budget);
+            this.writeSegmentRows(segment, row, end);
+            budget -= end - row;
+            if (end === segment.buffer._writeIndex) {
+              next = segments.next();
+              row = 0;
+            } else {
+              row = end;
+            }
+          }
+        }),
+      );
     }
   }
 
@@ -153,16 +207,18 @@ export class SQLiteTraceWriter {
    * ends, so a tag set after the start replaces the early row.
    */
   writeRow(buffer: AnySpanBuffer, row: 0 | 1): void {
-    this.ensureColumns(buffer._logSchema);
-    const activeUserFields = getActiveUserFields(buffer._logSchema, this.knownColumns);
-    const segment: SpanSegment = {
-      buffer,
-      traceId: buffer.trace_id,
-      spanId: buffer.span_id,
-      parentSpanId: buffer.parent_span_id,
-      rowOffset: 0,
-    };
-    this.getInsertStatement(activeUserFields).run(...buildInsertParams(segment, row, activeUserFields));
+    this.exclusive(() => {
+      this.ensureColumns(buffer._logSchema);
+      const activeUserFields = getActiveUserFields(buffer._logSchema, this.knownColumns);
+      const segment: SpanSegment = {
+        buffer,
+        traceId: buffer.trace_id,
+        spanId: buffer.span_id,
+        parentSpanId: buffer.parent_span_id,
+        rowOffset: 0,
+      };
+      this.getInsertStatement(activeUserFields).run(...buildInsertParams(segment, row, activeUserFields));
+    });
   }
 
   private getInsertStatement(activeUserFields: readonly string[]): SyncSQLiteStatement {
@@ -177,16 +233,27 @@ export class SQLiteTraceWriter {
     return stmt;
   }
 
-  /** Write a root SpanBuffer tree to the database */
+  /**
+   * Write a root SpanBuffer tree to the database.
+   *
+   * One transaction, unless the sink is shared with other writer processes: then the tree is written in bounded
+   * turns (`flushInTurns`), and a reader of another process can see a trace whose later rows are not written yet,
+   * as it already can under `liveChildRows`. A failed turn rolls back alone and the error is thrown.
+   */
   flush(rootBuffer: AnySpanBuffer): void {
     cleanupDebug('sqliteWriter.flush:start', { statementCacheSize: this.insertStmtCache.size });
-    this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.flushAllSegments(rootBuffer);
-      this.db.exec('COMMIT');
+      if (this.writeLock) {
+        this.flushInTurns(rootBuffer, this.writeLock);
+      } else {
+        this.transaction(() => {
+          for (const segment of walkSpanSegments(rootBuffer)) {
+            this.writeSegmentRows(segment, 0, segment.buffer._writeIndex);
+          }
+        });
+      }
       cleanupDebug('sqliteWriter.flush:end', { statementCacheSize: this.insertStmtCache.size });
     } catch (error) {
-      this.db.exec('ROLLBACK');
       cleanupDebug('sqliteWriter.flush:error', { statementCacheSize: this.insertStmtCache.size });
       throw error;
     }
@@ -194,6 +261,7 @@ export class SQLiteTraceWriter {
 
   close(): void {
     cleanupDebug('sqliteWriter.close:start', { statementCacheSize: this.insertStmtCache.size });
+    this.writeLock?.close();
     this.db.close();
     cleanupDebug('sqliteWriter.close:end');
   }

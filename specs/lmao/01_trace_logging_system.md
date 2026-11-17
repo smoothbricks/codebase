@@ -229,6 +229,32 @@ abandoned draft sidecars, releases 32 mixed Node/Bun process openers, kills the 
 committed row, integrity, no remaining drafts and the unchanged gate inode. The same walk runs inside the
 file-link-denying cowshed profile; the fileless and existing-reader cases retain their existing-mode behavior.
 
+### Writers of one sink <a id="smoo/lmao!n/sqlite-shared-writers"></a>
+
+Every test process of a package writes the package's one sink, and a test run is one trace: a live row when the run and
+each test starts and when each test ends, and every row of the run when it ends. SQLite's wait for its writer lock polls
+against `busy_timeout` and fails with SQLITE_BUSY when that bound passes, so it MUST NOT be the wait between these
+processes. A connection that `openWalDatabase` opened carries the sink's write lock, flock(2) on the persistent sibling
+`.<file>.write`, and `SQLiteTraceWriter` holds it around each of its write transactions: a waiter blocks in the kernel
+until the holder unlocks or dies, with no bound and no poll. The lock file is not the sink or the publication gate,
+because flock and SQLite's fcntl locks on one file exclude each other on BSD kernels, and like the gate it MUST NOT be
+unlinked while an opener may run.
+
+A writer holding the write lock commits at most 4,096 rows per hold, so a run's closing flush (270,000 rows in one
+measured run, 1.7 s as one transaction into a 2.7 GB sink) is a sequence of turns, the longest measured there 132 ms,
+and a sibling's next row waits for turns, never for the trace. A reader in another process can therefore see a trace
+whose later rows are not written yet; a failed turn rolls back alone and fails the flush. A writer whose connection
+carries no write lock (an in-memory database, a connection opened without `openWalDatabase`) writes a trace in one
+transaction.
+
+Bun reaches flock through `bun:ffi` in the C library it has loaded. Node has no advisory-lock call and neither runtime
+has one on Windows: there a connection carries no write lock, and its writer waits on SQLite's lock with the 10-second
+`busy_timeout`, as does any writer against a process that writes the sink without the lock.
+
+**Enforced by:** `packages/lmao/src/lib/sqlite/__tests__/sqlite-writer-shared-sink.test.ts` stops one writer process
+inside its commit for four times the SQLite lock wait of eight sibling writer processes and requires every one to exit 0
+with its trace in the sink, and requires a flush at a write lock to take one turn per 4,096 rows.
+
 ## The Op + Span Pattern <a id="smoo/lmao!n/lmao-trace-the-op-span-pattern"></a>
 
 ### defineOp() - Definition Time <a id="smoo/lmao!n/lmao-trace-op---definition-time"></a>

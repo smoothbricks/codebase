@@ -22,12 +22,17 @@
  * Thus the visible file is already WAL, and no coordinated opener replaces or converts an existing sink. Other
  * creators must not write the sink path during publication. The gate is never unlinked: doing so splits its lock.
  *
+ * The connection to the sink carries the sink's write lock (`./sqlite-write-lock.ts`), the persistent sibling
+ * `.<file>.write`: a `SQLiteTraceWriter` given that connection writes in turns with the other processes' writers.
+ *
  * @module sqlite-wal
  */
 
 import { closeSync, existsSync, mkdirSync, openSync, readSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { SyncSQLiteDatabase } from './sqlite-db.js';
+import { openFlockWriteLock } from './sqlite-flock.js';
+import { shareSinkWriteLock } from './sqlite-write-lock.js';
 
 const JOURNAL_MODE_WAL_SQL = 'PRAGMA journal_mode = WAL';
 const PUBLISH_GATE_TIMEOUT_MS = 10_000;
@@ -37,8 +42,9 @@ const PUBLISH_GATE_TIMEOUT_MS = 10_000;
  *
  * `open` is the driver's own constructor (`bun:sqlite`, `node:sqlite`, better-sqlite3), called for the publication
  * gate, private draft and then `dbPath`. A file already at `dbPath` is opened as it is, in whatever journal mode it
- * has. A fileless name (`:memory:`, `''`) has no path to publish, so it is opened directly. Publication assumes no
- * simultaneous same-path openers in different SQLite libraries on threads of one process (POSIX locks are per process).
+ * has. A fileless name (`:memory:`, `''`) has no path to publish, so it is opened directly, and has no write lock: no
+ * other process can reach it. Publication assumes no simultaneous same-path openers in different SQLite libraries on
+ * threads of one process (POSIX locks are per process).
  */
 export function openWalDatabase<D extends SyncSQLiteDatabase>(dbPath: string, open: (path: string) => D): D {
   // SQLite's names for a database with no shared file: `:memory:`, and `''` for a private temporary one.
@@ -50,7 +56,9 @@ export function openWalDatabase<D extends SyncSQLiteDatabase>(dbPath: string, op
   if (!existsSync(dbPath)) {
     publishWalDatabase(dbPath, open);
   }
-  return open(dbPath);
+  const db = open(dbPath);
+  shareSinkWriteLock(db, () => openFlockWriteLock(join(dirname(dbPath), `.${basename(dbPath)}.write`)));
+  return db;
 }
 
 function publishWalDatabase(dbPath: string, open: (path: string) => SyncSQLiteDatabase): void {
