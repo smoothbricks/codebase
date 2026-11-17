@@ -2044,6 +2044,17 @@ One boundary answer, no ambiguity:
   (06_cli.md) whatever that peer left outstanding. Measured 2026-11-16: an observer's client read a running job's 10
   bytes, asked for the next page with follow, as a follow does, and closed its connection; the controller stayed up on
   that follow for as long as the job blocked in `read`, and the embedder waiting for its exit never returned.
+  <a id="smoo/cowshed!n/a-left-call-frees-its-slot"></a>A call whose caller stops waiting frees its slot on both sides
+  while the connection stays open. The client sends `{id, demand: "close"}` for a sent call that is no stream once the
+  caller that asked it is gone, and holds the call's slot until the controller answers that id; a call still queued in
+  the client when its caller leaves is never sent. The controller answers a call so closed at once, with a conflict that
+  says its caller closed it, and stops waiting on the router for it: a call that waits on the job then ends as it does
+  when its connection is gone, closing the supervisor connection it holds, and any other call runs to its answer at the
+  router whoever reads it. A close that crosses the call's answer is no error. So a follow read its reader dropped after
+  the bytes it wanted, or a wait its caller gave up on, holds one of the connection's 64 open calls for one round trip,
+  never for as long as the job stays quiet. Measured 2026-11-17: a consumer workspace's embedder read a worker's one
+  stdout line with a follow once per launch and dropped the stream; each next-page follow stayed open on the quiet
+  worker, and the 64th launch through one controller connection queued its next call behind them and never answered.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step
@@ -2058,12 +2069,12 @@ One boundary answer, no ambiguity:
   controller answers every demand with exactly one frame: an `{id, event}` frame, or the call's answer -- `{}` once the
   events ended or the caller closed it, or the error that ended them. So an unread stream holds the controller to one
   event and the connection to none, and a producer coalesces or holds what its reader has not asked for. A close that
-  crosses the call's end is no error; a second demand while one is unanswered, or a demand naming no open stream, ends
-  the connection. Stream-lane calls do not count against the 64 open calls: a connection holds at most 64 open streams
-  and refuses one past that, and always reads demands. The Rust client exposes a call as `EventStream<O>`; dropping it
-  before its end sends the close. N-API projects it as an `AsyncIterable` generated from the same row: each step of a
-  loop sends one demand, and leaving the loop early (`return`) sends the close, which ends the subscription and never
-  the job it observes.
+  crosses the call's end is no error; a second demand while one is unanswered, or a `next` naming no open stream or a
+  `close` naming no call sent, ends the connection. Stream-lane calls do not count against the 64 open calls: a
+  connection holds at most 64 open streams and refuses one past that, and always reads demands. The Rust client exposes
+  a call as `EventStream<O>`; dropping it before its end sends the close. N-API projects it as an `AsyncIterable`
+  generated from the same row: each step of a loop sends one demand, and leaving the loop early (`return`) sends the
+  close, which ends the subscription and never the job it observes.
 - **Post-terminal publication is independent.** `ExecOptions.stdoutCopy` / `stderrCopy` project
   `OutputPublication {path,policy}`. They clone/reflink/copy the sealed protected artifact after terminal state, never
   hardlink, never change `StreamInfo.storage`, and report publication failure separately from process state.

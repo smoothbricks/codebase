@@ -187,6 +187,27 @@ struct ActorCall {
     /// Where the call's step frames go; `None` asks for none.
     steps: Option<mpsc::UnboundedSender<StepReport>>,
     reply: oneshot::Sender<Result<ActorResponse>>,
+    /// Told the call's wire id once it is sent; a caller that left before then has dropped it.
+    sent: oneshot::Sender<u64>,
+}
+
+/// A sent call's caller while it waits. Dropped before the answer, it asks the actor to close
+/// the call under the wire id the actor told it (07_api.md, "a-left-call-frees-its-slot").
+#[cfg(unix)]
+struct Asking {
+    /// `None` once the answer arrived: nothing is left to close.
+    wire: Option<oneshot::Receiver<u64>>,
+    closes: mpsc::UnboundedSender<u64>,
+}
+
+#[cfg(unix)]
+impl Drop for Asking {
+    fn drop(&mut self) {
+        if let Some(Ok(id)) = self.wire.as_mut().map(oneshot::Receiver::try_recv) {
+            // An actor that already ended holds no call to close.
+            let _ = self.closes.send(id);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -237,31 +258,53 @@ enum ActorLane {
 #[derive(Clone)]
 struct ActorRuntime {
     sender: mpsc::Sender<ActorMessage>,
-    /// Where a dropped stream asks for its call to be closed: unbounded, so a drop never waits
-    /// and never fails while the actor runs, and each open stream sends at most one.
+    /// Where a dropped stream, or a caller that stopped waiting on its call, asks for that call
+    /// to be closed: unbounded, so a drop never waits and never fails while the actor runs, and
+    /// each open stream or call sends at most one.
     closes: mpsc::UnboundedSender<u64>,
 }
 
 #[cfg(unix)]
 impl ActorRuntime {
+    /// Send one call and wait for its answer. A caller that stops waiting, its future dropped,
+    /// has the actor close the call it left, so its slot comes back with the controller's answer
+    /// to the close (07_api.md, "a-left-call-frees-its-slot").
+    async fn ask(
+        &self,
+        method: &'static str,
+        params: Params,
+        lane: ActorLane,
+        steps: Option<mpsc::UnboundedSender<StepReport>>,
+    ) -> Result<ActorResponse> {
+        let (reply, response) = oneshot::channel();
+        let (sent, wire) = oneshot::channel();
+        let mut asking = Asking {
+            wire: Some(wire),
+            closes: self.closes.clone(),
+        };
+        self.sender
+            .send(ActorMessage::Call(ActorCall {
+                method,
+                params,
+                lane,
+                steps,
+                reply,
+                sent,
+            }))
+            .await
+            .map_err(|_| actor_send_error())?;
+        let answered = response.await.map_err(|_| actor_reply_error())?;
+        asking.wire = None;
+        answered
+    }
+
     async fn json(
         &self,
         method: &'static str,
         params: Params,
         steps: Option<mpsc::UnboundedSender<StepReport>>,
     ) -> Result<Value> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(ActorMessage::Call(ActorCall {
-                method,
-                params,
-                lane: ActorLane::Json,
-                steps,
-                reply,
-            }))
-            .await
-            .map_err(|_| actor_send_error())?;
-        match response.await.map_err(|_| actor_reply_error())?? {
+        match self.ask(method, params, ActorLane::Json, steps).await? {
             ActorResponse::Json(value) => Ok(value),
             ActorResponse::Download(_) => Err(CowshedError::internal(
                 "controller actor returned binary data to a JSON-only call",
@@ -306,18 +349,10 @@ impl ControllerRuntime for ActorRuntime {
                 "controller RPC binary request exceeds the 64 KiB frame limit",
             ));
         }
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(ActorMessage::Call(ActorCall {
-                method,
-                params,
-                lane: ActorLane::Upload(bytes),
-                steps: None,
-                reply,
-            }))
-            .await
-            .map_err(|_| actor_send_error())?;
-        match response.await.map_err(|_| actor_reply_error())?? {
+        match self
+            .ask(method, params, ActorLane::Upload(bytes), None)
+            .await?
+        {
             ActorResponse::Json(value) => Ok(value),
             ActorResponse::Download(_) => Err(CowshedError::internal(
                 "controller actor returned binary data to an upload call",
@@ -331,18 +366,10 @@ impl ControllerRuntime for ActorRuntime {
         params: Params,
         expected_offset: u64,
     ) -> Result<BinaryDownload> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .send(ActorMessage::Call(ActorCall {
-                method,
-                params,
-                lane: ActorLane::Download(expected_offset),
-                steps: None,
-                reply,
-            }))
-            .await
-            .map_err(|_| actor_send_error())?;
-        match response.await.map_err(|_| actor_reply_error())?? {
+        match self
+            .ask(method, params, ActorLane::Download(expected_offset), None)
+            .await?
+        {
             ActorResponse::Download(download) => Ok(download),
             ActorResponse::Json(_) => Err(CowshedError::internal(
                 "controller actor omitted binary data from a download call",
@@ -1967,13 +1994,18 @@ async fn run_controller_actor(
                 }
             }
             Some(id) = closes.recv() => {
-                // A stream that already ended has nothing to close.
+                // A stream that already ended has nothing to close, and a call answered
+                // meanwhile neither.
                 if let Some(stream) = streams.get_mut(&id).filter(|stream| !stream.closing) {
                     stream.closing = true;
                     stream.waiting = None;
                     if let Err(error) = send_demand(&mut writer, id, codec::Demand::Close).await {
                         break error;
                     }
+                } else if let Err(error) =
+                    abandon(&mut writer, id, &mut pending, &mut listeners, &mut abandoned).await
+                {
+                    break error;
                 }
                 continue;
             }
@@ -2149,7 +2181,12 @@ async fn run_controller_actor(
             lane,
             steps,
             reply,
+            sent,
         } = call;
+        // A caller that left while its call was queued is never sent.
+        if reply.is_closed() {
+            continue;
+        }
         let id = next_id;
         next_id = next_id.saturating_add(1);
         if let ActorLane::Download(offset) = lane {
@@ -2166,11 +2203,45 @@ async fn run_controller_actor(
         if !owes(&pending, &streams, &abandoned) {
             stalled = ControllerSilence::start();
         }
+        // The caller closes the call under this id once it stops waiting; one that already left
+        // has it closed now.
+        let left = sent.send(id).is_err();
         pending.insert(id, reply);
         if let Some(steps) = steps {
             listeners.insert(id, steps);
         }
+        if left
+            && let Err(error) = abandon(
+                &mut writer,
+                id,
+                &mut pending,
+                &mut listeners,
+                &mut abandoned,
+            )
+            .await
+        {
+            break error;
+        }
     };
+
+    /// Close the sent call `id` its caller stopped waiting on. It holds its slot as abandoned until
+    /// the controller answers it, which a controller that reads the close does at once (07_api.md,
+    /// "a-left-call-frees-its-slot"); a call answered meanwhile has nothing left to close.
+    #[cfg(unix)]
+    async fn abandon(
+        writer: &mut (impl AsyncWrite + Unpin),
+        id: u64,
+        pending: &mut std::collections::HashMap<u64, oneshot::Sender<Result<ActorResponse>>>,
+        listeners: &mut std::collections::HashMap<u64, mpsc::UnboundedSender<StepReport>>,
+        abandoned: &mut std::collections::HashSet<u64>,
+    ) -> Result<()> {
+        if pending.remove(&id).is_none() {
+            return Ok(());
+        }
+        listeners.remove(&id);
+        abandoned.insert(id);
+        send_demand(writer, id, codec::Demand::Close).await
+    }
     // Dropping the write half shuts it: the peer reads end of stream and ends the connection.
     drop(writer);
     messages.close();
@@ -3176,16 +3247,7 @@ mod tests {
         log_calls: AtomicUsize,
         status_calls: AtomicUsize,
         stdin_writes: AtomicUsize,
-        active_calls: AtomicUsize,
         rpc_calls: AtomicUsize,
-    }
-
-    struct ActiveCall<'a>(&'a AtomicUsize);
-
-    impl Drop for ActiveCall<'_> {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
     }
 
     #[async_trait]
@@ -3239,11 +3301,6 @@ mod tests {
             assert_eq!(method, "job.logs");
             let call = self.log_calls.fetch_add(1, Ordering::SeqCst);
             match self.mode.load(Ordering::SeqCst) {
-                1 => {
-                    self.active_calls.fetch_add(1, Ordering::SeqCst);
-                    let _active = ActiveCall(&self.active_calls);
-                    future::pending().await
-                }
                 2 => match call {
                     0 => Ok(BinaryDownload {
                         bytes: b"abc".to_vec(),
@@ -5984,27 +6041,129 @@ mod tests {
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 9);
         drop(stream);
     }
+    /// The one line the quiet job wrote to stdout; it wrote nothing to stderr.
+    #[cfg(unix)]
+    const QUIET_LINE: &[u8] = b"{\"ready\":true}\n";
+
+    /// A client over a real controller connection whose router serves one quiet job: it wrote
+    /// [`QUIET_LINE`] to stdout and nothing to stderr, and runs on. A read short of a stream's
+    /// written end is answered at once; a follow at the end waits, as the router keeps a lane call
+    /// that waits on the job, until nothing reads its reply (07_api.md,
+    /// "lane-call-ends-with-its-asker"), and `held` counts the follows it waits on. `job.status`
+    /// answers the job running. The `Cowshed` keeps the connection.
+    #[cfg(unix)]
+    async fn quiet_job_over_a_connection() -> (Cowshed, JobHandle, watch::Receiver<usize>) {
+        use crate::api::server::{
+            ConnectionAuthority, RouterHandle, RouterResponse, serve_controller_connection,
+        };
+        let (router, mut commands) = RouterHandle::channel(NonZeroUsize::MIN);
+        let (holding, held) = watch::channel(0_usize);
+        let holding = Arc::new(holding);
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let (request, mut reply) = command.into_parts();
+                let params = request.operation().params().expect("the call's params");
+                let answer = match request.method() {
+                    "job.status" => RouterResponse::json(running_job_value()),
+                    "job.logs" => {
+                        let written: &[u8] = if params["stream"] == json!("stdout") {
+                            QUIET_LINE
+                        } else {
+                            b""
+                        };
+                        let offset = request.operation().download_offset().expect("a download");
+                        let start = usize::try_from(offset).expect("the offset fits");
+                        if start >= written.len() {
+                            assert_eq!(params["follow"], json!(true), "a read at the end follows");
+                            let holding = Arc::clone(&holding);
+                            holding.send_modify(|held| *held += 1);
+                            tokio::spawn(async move {
+                                reply.closed().await;
+                                holding.send_modify(|held| *held -= 1);
+                            });
+                            continue;
+                        }
+                        RouterResponse::binary(
+                            json!({ "eof": false, "nextOffset": written.len() }),
+                            Bytes::copy_from_slice(&written[start..]),
+                        )
+                        .expect("one frame")
+                    }
+                    method => panic!("the quiet job's router serves no {method}"),
+                };
+                // A caller that left has nothing to hear.
+                let _ = reply.send(Ok(answer));
+            }
+        });
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        tokio::spawn(serve_controller_connection(
+            server.into(),
+            ConnectionAuthority::Coordinator {
+                repo_id: RepoId::parse("acme/widget").unwrap(),
+            },
+            router,
+        ));
+        let (cowshed, _token) = Cowshed::connect(client.into()).await.expect("handshake");
+        let job = JobHandle {
+            authority: test_authority(),
+            id: JobId::new(7).unwrap(),
+            runtime: Arc::clone(&cowshed.runtime),
+        };
+        (cowshed, job, held)
+    }
+
+    /// Dropping a follow read ends the call it left at the controller, not only the client's own
+    /// wait for it: the router's reply loses its reader (07_api.md, "a-left-call-frees-its-slot").
+    #[cfg(unix)]
     #[tokio::test]
     async fn dropping_stream_cancels_an_in_flight_poll() {
-        let runtime = Arc::new(TestRuntime::default());
-        runtime.mode.store(1, Ordering::SeqCst);
-        let runtime_trait: Arc<dyn ControllerRuntime> = runtime.clone();
-        let stream = poll_job_stream(
-            runtime_trait,
-            test_authority(),
-            JobId::new(7).unwrap(),
-            JobStream::Stdout,
-            0,
-            true,
-        );
-        while runtime.active_calls.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        let (_cowshed, job, mut held) = quiet_job_over_a_connection().await;
+        let mut stdout = job.logs(JobStream::Stdout, 0, true).await.unwrap();
+        assert_eq!(&stdout.next().await.unwrap().unwrap()[..], QUIET_LINE);
+        held.wait_for(|held| *held == 1).await.unwrap();
+        drop(stdout);
+        held.wait_for(|held| *held == 0).await.unwrap();
+    }
 
-        drop(stream);
-        while runtime.active_calls.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
+    /// One follow read past the connection's open calls, each dropped once its first bytes are
+    /// read, as a reader that wants only a job's first line does: the connection still answers
+    /// `job.status`, and the controller holds none of them (07_api.md, "One connection carries
+    /// concurrent calls", "a-left-call-frees-its-slot").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follows_dropped_after_their_first_bytes_leave_every_call_slot_free() {
+        let (_cowshed, job, mut held) = quiet_job_over_a_connection().await;
+        for _ in 0..=MAX_IN_FLIGHT_REQUESTS {
+            let mut stdout = job.logs(JobStream::Stdout, 0, true).await.unwrap();
+            assert_eq!(&stdout.next().await.unwrap().unwrap()[..], QUIET_LINE);
+            held.wait_for(|held| *held >= 1).await.unwrap();
+            drop(stdout);
         }
+        let status = job
+            .status()
+            .await
+            .expect("the connection answers a status read");
+        assert_eq!(status.state, crate::api::dto::JobState::Running);
+        held.wait_for(|held| *held == 0).await.unwrap();
+    }
+
+    /// An attachment whose stdout and stderr its holder drops, as a holder that only writes the
+    /// job's input does, holds no call open for them at the controller, however often it attaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attachment_whose_streams_are_dropped_holds_no_call_open() {
+        let (_cowshed, job, mut held) = quiet_job_over_a_connection().await;
+        for _ in 0..=MAX_IN_FLIGHT_REQUESTS {
+            let (stdin, stdout, stderr) = job.attach(None).await.unwrap().into_parts();
+            // Stdout's next page and stderr's first both wait at their written end.
+            held.wait_for(|held| *held == 2).await.unwrap();
+            drop((stdout, stderr));
+            held.wait_for(|held| *held == 0).await.unwrap();
+            drop(stdin);
+        }
+        job.status()
+            .await
+            .expect("the connection answers a status read");
     }
 
     #[tokio::test]

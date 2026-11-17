@@ -1186,6 +1186,8 @@ impl LocalWaitCauses {
 /// a call past that waits, unrouted, until one completes, at most [`MAX_WAITING_REQUESTS`] of
 /// them, and a call past both is refused. A stream-lane call is open until its caller ends it, so
 /// it counts against [`MAX_OPEN_STREAMS`] instead, and a stream request past that is refused.
+/// A close of a call that is no stream, its caller gone, is that call's answer at once
+/// (07_api.md, "a-left-call-frees-its-slot"), so the call holds its slot no longer.
 ///
 /// Dropping this future owns only connection state: its unanswered requests are abandoned, its
 /// streams end, and routed jobs remain owned by the router actor.
@@ -1292,6 +1294,9 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
     // Where each open stream-lane call's demands go, by call id: a subset of `answers`, entered
     // when its answer starts and removed when that answer ends.
     let mut streams = std::collections::HashMap::<u64, mpsc::UnboundedSender<Demand>>::new();
+    // Where a close of each ordinary call goes, by call id, while it is open or waiting: the
+    // caller that asked it is gone.
+    let mut asked = std::collections::HashMap::<u64, oneshot::Sender<()>>::new();
     // Ordinary calls admitted past the open-call cap, started in order as open ones complete.
     let mut waiting = std::collections::VecDeque::<Admitted>::new();
     let mut incoming = std::pin::pin!(next_frame(reader));
@@ -1315,9 +1320,27 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
                         let delivered = streams
                             .get(&id)
                             .is_some_and(|stream| stream.send(demand).is_ok());
-                        // A close may cross the end its stream answered, so one for a call
-                        // that was sent and has ended is no error; any other demand needs an
-                        // open stream to answer it.
+                        // A close of an ordinary call is its answer now: one still waiting for
+                        // a slot is refused here, an open one's answer task hears it.
+                        if !delivered
+                            && demand == Demand::Close
+                            && let Some(close) = asked.remove(&id)
+                        {
+                            match waiting.iter().position(|call| call.id == id) {
+                                Some(at) => {
+                                    waiting.remove(at);
+                                    answers.spawn(refuse(Arc::clone(&writer), id, closed_by_its_caller(), false));
+                                }
+                                None => {
+                                    // An answer task that ended has nothing to hear.
+                                    let _ = close.send(());
+                                }
+                            }
+                            continue;
+                        }
+                        // A close may cross the end its call answered, so one for a call that
+                        // was sent and has ended is no error; any other demand needs an open
+                        // stream to answer it.
                         if !delivered && (demand == Demand::Next || id >= next_id) {
                             closing = true;
                             let error = protocol_error(
@@ -1355,6 +1378,7 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
                     operation,
                     upload,
                     demands: None,
+                    closed: None,
                 };
                 let open = answers.len() - streams.len();
                 let refusal = if lane == Lane::Stream {
@@ -1370,8 +1394,10 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
                         ))
                     }
                 } else if open < MAX_IN_FLIGHT_REQUESTS {
+                    call.closed = Some(ask(&mut asked, id));
                     None
                 } else if waiting.len() < MAX_WAITING_REQUESTS {
+                    call.closed = Some(ask(&mut asked, id));
                     waiting.push_back(call);
                     continue;
                 } else {
@@ -1400,6 +1426,7 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
                     CowshedError::internal(format!("controller RPC answer task failed: {error}"))
                 })?;
                 streams.remove(&id);
+                asked.remove(&id);
                 outcome?;
                 while answers.len() - streams.len() < MAX_IN_FLIGHT_REQUESTS
                     && let Some(call) = waiting.pop_front()
@@ -1419,13 +1446,33 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// A validated call, ready to route: its id, whether it asked for its steps, its decoded request
-/// and upload frame, and, for a stream-lane call, where its demands arrive.
+/// and upload frame, for a stream-lane call where its demands arrive, and for any other call
+/// where its caller's close arrives.
 struct Admitted {
     id: u64,
     steps: bool,
     operation: OperationRequest,
     upload: Option<Bytes>,
     demands: Option<mpsc::UnboundedReceiver<Demand>>,
+    closed: Option<oneshot::Receiver<()>>,
+}
+
+/// Enter the ordinary call `id` in `asked`: the receiver hears its caller's close.
+fn ask(
+    asked: &mut std::collections::HashMap<u64, oneshot::Sender<()>>,
+    id: u64,
+) -> oneshot::Receiver<()> {
+    let (close, closed) = oneshot::channel();
+    asked.insert(id, close);
+    closed
+}
+
+/// The answer to a call its caller closed before it was answered.
+fn closed_by_its_caller() -> CowshedError {
+    CowshedError::conflict(
+        "the caller closed this call before its answer",
+        "nothing reads this answer; ask again to hear one",
+    )
 }
 
 /// Routes `call` and writes its answer on a task of its own.
@@ -1445,6 +1492,7 @@ fn start<W: AsyncWrite + Unpin + Send + 'static>(
         call.operation,
         call.upload,
         call.demands,
+        call.closed,
     ));
 }
 
@@ -1526,7 +1574,8 @@ async fn refuse<W: AsyncWrite + Unpin + Send + 'static>(
 }
 
 /// Route one request and write its answer -- for a stream-lane call, the events `demands` asks
-/// for, then its end; `Err` ends the connection.
+/// for, then its end; for any other call, `closed` hearing its caller's close is its answer at
+/// once, and the router's reply loses its reader. `Err` ends the connection.
 #[allow(clippy::too_many_arguments)]
 async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
     writer: ConnectionWriter<W>,
@@ -1537,14 +1586,34 @@ async fn answer<W: AsyncWrite + Unpin + Send + 'static>(
     operation: OperationRequest,
     upload: Option<Bytes>,
     demands: Option<mpsc::UnboundedReceiver<Demand>>,
+    closed: Option<oneshot::Receiver<()>>,
 ) -> (u64, Result<()>) {
     let outcome = async {
         let download_offset = operation.download_offset();
-        let response = if steps {
-            route_reporting_steps(&writer, &router, authority, request_id, operation, upload)
-                .await?
-        } else {
-            router.route(authority, operation, upload, None).await
+        let routed = async {
+            if steps {
+                route_reporting_steps(&writer, &router, authority, request_id, operation, upload)
+                    .await
+            } else {
+                Ok(router.route(authority, operation, upload, None).await)
+            }
+        };
+        let response = match closed {
+            // A call that waits on the job then ends at the router as when its connection is
+            // gone; any other runs to its answer there, whoever reads it.
+            Some(closed) => tokio::select! {
+                biased;
+                Ok(()) = closed => {
+                    return write_rpc_error(
+                        &mut *writer.stream.lock().await,
+                        request_id,
+                        &closed_by_its_caller(),
+                    )
+                    .await;
+                }
+                routed = routed => routed?,
+            },
+            None => routed.await?,
         };
         if let Err(error) = &response {
             writer.retain_wait(request_id, error);
