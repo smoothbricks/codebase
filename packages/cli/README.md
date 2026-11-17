@@ -1132,6 +1132,11 @@ tree.
 CI uses explicit lint, test, and build phases. The publish workflow does the same after versioning so GitHub output
 stays readable and validation happens on the exact release commit.
 
+CI defaults to read access for actions and repository contents. Validate grants action writes for managed-file healing,
+status writes for task results, and deployment writes only when preview deployment is enabled. The deployed E2E and
+production jobs add status writes; the cross-target execution job retains the read-only defaults. Production deployment
+does not create a GitHub preview deployment, so it does not receive deployment writes.
+
 CI status deeplinks depend on [GitHub Actions]' top-level job step anchors. The generated CI workflow keeps `# Step N`
 comments next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build
 must stay synchronized with those comments. Composite action internals do not change the top-level step numbers.

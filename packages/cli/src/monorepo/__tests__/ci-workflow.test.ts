@@ -781,7 +781,9 @@ describe('CI workflow definition', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
 
     expect(rendered).toContain('deployment-stage: ${{ steps.deploy.outputs.stage }}');
-    expect(rendered).toContain('  e2e-deployment:\n    name: E2E Tests (Deployed Stage)\n    needs: main');
+    const workflow: unknown = Bun.YAML.parse(rendered);
+    expect(workflow).toHaveProperty('jobs.e2e-deployment.name', 'E2E Tests (Deployed Stage)');
+    expect(workflow).toHaveProperty('jobs.e2e-deployment.needs', 'main');
     expect(rendered).not.toContain('\n\n\n  e2e-deployment:');
     expect(rendered).toContain(
       "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}",
@@ -922,9 +924,9 @@ describe('renderCiWorkflowYaml with deploy configuration', () => {
   });
 
   it('adds a production-on-push job gated on validate and the e2e job', () => {
-    expect(rendered).toContain(
-      '  deploy-production:\n    name: Deploy Production\n    needs: [main, e2e-deployment]\n',
-    );
+    const workflow: unknown = Bun.YAML.parse(rendered);
+    expect(workflow).toHaveProperty('jobs.deploy-production.name', 'Deploy Production');
+    expect(workflow).toHaveProperty('jobs.deploy-production.needs', ['main', 'e2e-deployment']);
     expect(rendered).toContain('    environment: production\n');
     expect(rendered).toContain(
       "    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/trunk' && needs.main.result == 'success' && (needs.e2e-deployment.result == 'success' || needs.e2e-deployment.result == 'skipped') }}",

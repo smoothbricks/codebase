@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { readJson, type Tree, updateJson } from 'nx/src/devkit-exports.js';
 import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import { FsTree, flushChanges } from 'nx/src/generators/tree.js';
+import { cargoCrossTestArchiveFile } from '../cross-check-policy.js';
 import type { PackageJson } from '../workspace-manifest.js';
+import { renderCiWorkflowYaml } from './ci-workflow.js';
 import type { WorkspaceProjects } from './context.js';
 import { generateManagedFiles } from './generator.js';
 import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END, LOCAL_SECTION_MARKER } from './managed-content.js';
@@ -111,6 +113,19 @@ describe('managed-files generator', () => {
       });
       expect(carriers.length).toBeGreaterThan(1);
       generated.write('.github/workflows/producer.yml', producer);
+      const triple = 'aarch64-apple-darwin';
+      generated.write(
+        '.github/workflows/ci-with-deploy.yml',
+        renderCiWorkflowYaml({
+          actionsProvider,
+          deploy: true,
+          browserTests: true,
+          e2eDeployment: true,
+          productionOnPush: true,
+          pushBranches: ['main'],
+          crossTestArchives: [{ triple, path: cargoCrossTestArchiveFile(triple) }],
+        }),
+      );
       flushChanges(root, generated.listChanges());
       const result = Bun.spawnSync(['jactionlint', '--no-online', '--config-file', '/dev/null', '--strict-exit'], {
         cwd: root,
