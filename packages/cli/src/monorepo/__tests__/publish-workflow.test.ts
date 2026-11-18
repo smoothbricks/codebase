@@ -214,11 +214,11 @@ const deployOnlyShape: ProducerShape = {
     privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
   },
 };
-/** The producer is one of three jobs: the Linux candidate before it and the final publisher after it are not its. */
+/** The dedicated producer owns neither the release candidate and publisher nor the isolated readiness probe. */
 const dedicatedShape: ProducerShape = {
   shape: 'dedicated cross producer job',
   job: 'cross-platform',
-  unrelatedJobs: ['linux-release-candidate', 'publish-on-linux'],
+  unrelatedJobs: ['linux-release-candidate', 'publish-on-linux', 'cowshed-bootstrap-readiness'],
   // The publisher credential lives in the final job, which the producer does not own: only the version steps declare.
   owners: { SMOO_RELEASE_PROJECTS: ['🔢 Version release', '🍎 Build selected macOS and iOS release outputs'] },
   options: {
@@ -434,6 +434,40 @@ describe('publish workflow definition', () => {
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       await formattedPublishWorkflow(rendered),
     );
+  });
+
+  it('keeps the hosted readiness mode local to the owning GitHub codebase', () => {
+    const consumer = typia.assert<{
+      on: { workflow_dispatch: { inputs: Record<string, unknown> } };
+      concurrency: { group: string };
+      jobs: Record<string, { if?: string }>;
+    }>(Bun.YAML.parse(renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, repoName: '@example/widgets' })));
+    expect(Object.keys(consumer.on.workflow_dispatch.inputs)).toEqual(['bump', 'projects', 'dry_run']);
+    expect(consumer.concurrency.group).toBe('release-${{ github.ref }}');
+    expect(Object.keys(consumer.jobs)).toEqual(['linux-release-candidate', 'macos-platform', 'publish-on-linux']);
+    expect(Object.values(consumer.jobs).every((job) => job.if === undefined)).toBe(true);
+    expect(renderPublishWorkflowYaml({ ...codebaseWorkflowOptions, actionsProvider: 'forgejo' })).not.toContain(
+      'bootstrap_readiness',
+    );
+  });
+
+  it('makes the explicit readiness choice mutually exclusive with every release job', () => {
+    const workflow = typia.assert<{
+      on: { workflow_dispatch: { inputs: Record<string, { default?: unknown }> } };
+      concurrency: { group: string; 'cancel-in-progress': boolean };
+      jobs: Record<string, { if?: string; permissions: Record<string, string> }>;
+    }>(Bun.YAML.parse(renderPublishWorkflowYaml(codebaseWorkflowOptions)));
+    expect(workflow.on.workflow_dispatch.inputs.bootstrap_readiness.default).toBe(false);
+    expect(workflow.on.workflow_dispatch.inputs.bootstrap_main.default).toBe('');
+    for (const name of ['linux-release-candidate', 'macos-platform', 'publish-on-linux']) {
+      expect(workflow.jobs[name].if).toBe('${{ !inputs.bootstrap_readiness }}');
+    }
+    expect(workflow.jobs['cowshed-bootstrap-readiness'].if).toBe('${{ inputs.bootstrap_readiness }}');
+    expect(workflow.jobs['cowshed-bootstrap-readiness'].permissions).toEqual({ contents: 'read' });
+    expect(workflow.concurrency.group).toBe(
+      "${{ inputs.bootstrap_readiness && format('cowshed-bootstrap-readiness-{0}', github.repository) || format('release-{0}', github.ref) }}",
+    );
+    expect(workflow.concurrency['cancel-in-progress']).toBe(false);
   });
 
   it('writes workflow bytes the repository formatter leaves alone on a second pass', async () => {
@@ -883,10 +917,13 @@ describe('publish workflow definition', () => {
     expect(linuxOnly).toContain(
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
-    expect(native).toContain('  linux-release-candidate:');
-    expect(native).toContain('  macos-platform:\n    runs-on: macos-latest');
-    expect(native).toContain('  publish-on-linux:');
-    expect(native).toContain('  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]');
+    expect(Bun.YAML.parse(native)).toMatchObject({
+      jobs: {
+        'linux-release-candidate': {},
+        'macos-platform': { 'runs-on': 'macos-latest' },
+        'publish-on-linux': { needs: ['linux-release-candidate', 'macos-platform'] },
+      },
+    });
     expect(linuxCandidate).not.toContain('needs:');
     expect(macosPlatform).not.toContain('needs:');
     expect(linuxCandidate).not.toContain('smoo release repair-pending');
@@ -975,6 +1012,7 @@ describe('publish workflow definition', () => {
       'linux-release-candidate': 45,
       'macos-platform': 90,
       'publish-on-linux': 45,
+      'cowshed-bootstrap-readiness': 60,
     };
     for (const [job, minutes] of Object.entries(expectedTimeouts)) {
       expect(workflow.jobs[job]['timeout-minutes']).toBe(minutes);
@@ -986,6 +1024,8 @@ describe('publish workflow definition', () => {
       'macos-platform': true,
       // smoo publish and pending-release repair push release refs.
       'publish-on-linux': true,
+      // The readiness probe reads canonical main and never writes the remote.
+      'cowshed-bootstrap-readiness': false,
     };
     for (const [job, persist] of Object.entries(expectedPersist)) {
       const checkouts = workflow.jobs[job].steps.filter((step) => step.uses?.startsWith('actions/checkout@'));
@@ -995,6 +1035,10 @@ describe('publish workflow definition', () => {
         expect(step.with?.['persist-credentials']).toBe(persist);
       }
     }
+    const readinessUploads = workflow.jobs['cowshed-bootstrap-readiness'].steps.filter((step) =>
+      step.uses?.startsWith('actions/upload-artifact@'),
+    );
+    expect(readinessUploads.map((step) => step.uses)).toEqual([githubActionPins.uploadArtifact.ref]);
     expect(rendered).not.toContain('blob:none');
     expect(rendered).toContain('# No remote is read or written from this job: the clone is complete and the');
     expect(rendered).toContain('# build-platform-outputs fetches the release branch and tags from origin');
@@ -1118,8 +1162,8 @@ describe('publish workflow definition', () => {
       }
 
       // Jobs that are not the producer's render byte for byte as they do without the declaration: none of its names
-      // reached a step there, and a name a step declares for itself keeps that step's value. Each declares one, so
-      // the producer's colliding value had a place to leak.
+      // reached a step there, and a name a step declares for itself keeps that step's value. The release jobs declare
+      // colliding names; the readiness probe must carry none of them.
       for (const name of unrelatedJobs) {
         expect(jobSection(rendered, name)).toBe(jobSection(bare, name));
         let declaring = 0;
@@ -1130,7 +1174,11 @@ describe('publish workflow definition', () => {
           expect({ ...who, leaked }).toEqual({ ...who, leaked: [] });
           declaring += present.length;
         }
-        expect({ shape, job: name, declaring: declaring > 0 }).toEqual({ shape, job: name, declaring: true });
+        expect({ shape, job: name, declaring: declaring > 0 }).toEqual({
+          shape,
+          job: name,
+          declaring: name !== 'cowshed-bootstrap-readiness',
+        });
       }
 
       // GitHub rejects a repeated `env` or a repeated key, and the YAML parser here keeps the last without a word,
@@ -2029,17 +2077,22 @@ it('builds on smoo.github.runsOn but publishes from the GitHub-hosted runner', (
       \${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}`;
 
-  expect(rendered).toContain(`  linux-release-candidate:\n    ${selfHostedRunner}`);
-  expect(rendered).toContain('  macos-platform:\n    runs-on: macos-latest');
   // npmjs signs provenance with the job's OIDC token and then rejects the
   // upload (422) unless the runner is GitHub-hosted, so only the build lane
   // may keep the configured labels.
+  expect(Bun.YAML.parse(rendered)).toMatchObject({
+    jobs: {
+      'linux-release-candidate': Bun.YAML.parse(selfHostedRunner),
+      'macos-platform': { 'runs-on': 'macos-latest' },
+      'publish-on-linux': {
+        needs: ['linux-release-candidate', 'macos-platform'],
+        'runs-on': 'ubuntu-latest',
+        // The runner moved; the OIDC permission that mints provenance did not.
+        permissions: { 'id-token': 'write' },
+      },
+    },
+  });
   expect(rendered.split('fromJSON(\'["nixos-latest-x64","self-hosted"]\')').length - 1).toBe(1);
-  expect(rendered).toContain(
-    '  publish-on-linux:\n    needs: [linux-release-candidate, macos-platform]\n    runs-on: ubuntu-latest',
-  );
-  // The runner moved; the OIDC permission that mints provenance did not.
-  expect(rendered.slice(rendered.indexOf('  publish-on-linux:'))).toContain('id-token: write');
 });
 
 it('publishes single-job workflows from the GitHub-hosted runner, private scopes included', () => {

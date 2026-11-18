@@ -32,6 +32,7 @@ import {
   sourceCheckoutsStepLines,
   TRACE_DB_ARTIFACT_GLOB,
 } from './ci-workflow.js';
+import { renderCowshedBootstrapReadinessJob } from './cowshed-bootstrap-readiness.js';
 import { GITHUB_HOSTED_LINUX_RUNNER, renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
 
 /**
@@ -901,6 +902,25 @@ function renderSingleJobPublishWorkflowSteps(
 }
 
 function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions): string {
+  // Only this repository owns Cowshed and its hosted first-install probe.
+  const readiness = isSmoothBricksCodebasePackageName(options.repoName) && options.actionsProvider !== 'forgejo';
+  const readinessInputs = readiness
+    ? `
+      bootstrap_readiness:
+        type: boolean
+        description: Check a fresh macOS Cowshed host only; all release jobs are disabled in this mode.
+        default: false
+      bootstrap_main:
+        type: string
+        description: Exact current main commit to adopt in readiness mode. Ignored for normal releases.
+        default: ''`
+    : '';
+  const readinessGuard = readiness ? `    if: ${githubExpression('!inputs.bootstrap_readiness')}\n` : '';
+  const concurrencyGroup = readiness
+    ? githubExpression(
+        "inputs.bootstrap_readiness && format('cowshed-bootstrap-readiness-{0}', github.repository) || format('release-{0}', github.ref)",
+      )
+    : `release-${githubExpression('github.ref')}`;
   const deployInput =
     options.deploy === true
       ? `
@@ -915,7 +935,7 @@ function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOpt
 
 on:
   workflow_dispatch:
-    inputs:
+    inputs:${readinessInputs}
       bump:
         type: choice
         description:
@@ -938,7 +958,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${githubExpression('github.ref')}
+  group: ${concurrencyGroup}
   cancel-in-progress: false
 
 defaults:
@@ -947,7 +967,7 @@ defaults:
 
 jobs:
   linux-release-candidate:
-${renderRunsOnLine(options.runsOn)}
+${readinessGuard}${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
     permissions:
       contents: write
@@ -962,7 +982,7 @@ ${renderRunsOnLine(options.runsOn)}
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
   ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
-${renderMacosJobHeaderLines(options)}
+${readinessGuard}${renderMacosJobHeaderLines(options)}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -974,7 +994,7 @@ ${renderMacosJobHeaderLines(options)}
 ${renderMacosPlatformSteps(options)}
 
   publish-on-linux:
-    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
+${readinessGuard}    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
 ${publishJobRunsOnLine(options)}
     timeout-minutes: 45
     permissions:
@@ -986,7 +1006,7 @@ ${publishJobRunsOnLine(options)}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, publisherReach(options))}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
-`;
+${readiness ? renderCowshedBootstrapReadinessJob() : ''}`;
 }
 
 function renderLinuxReleaseCandidateSteps(
