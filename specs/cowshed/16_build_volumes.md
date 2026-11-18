@@ -796,24 +796,24 @@ copy is caught up to (Catch-up); a later qualifying foreground operation can adv
   SEEK_DATA/SEEK_HOLE probes advance only past that region's end, never once per extent. A pure counting test covers
   leading, interior and trailing holes and many extents per region; probe count follows regions, not extents.
 - **Main's live volume moves onto the compacted seed.** After a publication, with main's image lock let go, main's live
-  build volume is replaced by a clone of its own compacted seed under main's image lock and lifecycle lease. This
-  internal move has no public target-only replacement path. It moves only when the live volume holds no write the seed
-  lacks: under its exclusive build claim, with main's Nx daemon stopped, its volume is flushed and its image's
-  modification time compared with the seed's mark (Targets and seeds, "Behind is one comparison of two modification
-  times"), before the replacement is cloned and again once it is cloned, immediately before main's volume is sealed,
-  since a host process the claim does not fence can write while the clone is made. The comparison cannot follow the
-  seal: the unmount writes the image itself (measured 2026-10-26: a volume nothing wrote read 5,188 ms behind its mark
-  once sealed), so it would refuse every move. Between the last comparison and the unmount only a host process outside
-  any cowshed job can write, since the exclusive build hold taken before the first comparison and held through the seal
-  refuses every job admission and the daemon keeper's restart, and that is acceptable because it is the writer no
-  capture fences either (Targets and seeds: the guarantee "is not a kernel-wide filesystem-writer barrier"); one still
-  holding a file open refuses the unforced seal. A later write refuses the move and releases the replacement. A job's
-  hold, an Nx holder, a file open on the volume (a Cargo build included), a detached main, a later write, a seed
-  replaced in between, or a failure of the move leaves main's volume as it is, and the report says why; the compaction
-  has still succeeded, and nothing is killed. Main then writes on in contiguous space, so the seeds later captured from
-  it stay compact; without the move, the next fork's reseed would replace the compacted seed with a capture of main's
-  fragmented volume as soon as main is written. Forks made after the compacted seed is published start compact either
-  way, and their lands carry the compact lineage into main.
+  build volume is replaced by a clone of its own compacted seed under main's image lock and lifecycle lease. This move
+  is internal: `cowshed reseed` replaces a workspace's live volume from its target's seed and refuses main, which has no
+  target (Reseed). It moves only when the live volume holds no write the seed lacks: under its exclusive build claim,
+  with main's Nx daemon stopped, its volume is flushed and its image's modification time compared with the seed's mark
+  (Targets and seeds, "Behind is one comparison of two modification times"), before the replacement is cloned and again
+  once it is cloned, immediately before main's volume is sealed, since a host process the claim does not fence can write
+  while the clone is made. The comparison cannot follow the seal: the unmount writes the image itself (measured
+  2026-10-26: a volume nothing wrote read 5,188 ms behind its mark once sealed), so it would refuse every move. Between
+  the last comparison and the unmount only a host process outside any cowshed job can write, since the exclusive build
+  hold taken before the first comparison and held through the seal refuses every job admission and the daemon keeper's
+  restart, and that is acceptable because it is the writer no capture fences either (Targets and seeds: the guarantee
+  "is not a kernel-wide filesystem-writer barrier"); one still holding a file open refuses the unforced seal. A later
+  write refuses the move and releases the replacement. A job's hold, an Nx holder, a file open on the volume (a Cargo
+  build included), a detached main, a later write, a seed replaced in between, or a failure of the move leaves main's
+  volume as it is, and the report says why; the compaction has still succeeded, and nothing is killed. Main then writes
+  on in contiguous space, so the seeds later captured from it stay compact; without the move, the next fork's reseed
+  would replace the compacted seed with a capture of main's fragmented volume as soon as main is written. Forks made
+  after the compacted seed is published start compact either way, and their lands carry the compact lineage into main.
 - **Leftovers.** `build/.compacting` holds the compaction lock (`lock`) and its working images, the staged clones
   `<seed>.dmg` and the copy `copy.dmg`. No enumeration of images, records or `build/.deleting` reads it, and the
   project's unbinding discards it with the rest of `build/` (02_workspaces.md, "Checkout layouts"). Every `.dmg` in it,
@@ -845,15 +845,17 @@ copy is caught up to (Catch-up); a later qualifying foreground operation can adv
 
 ### Source and build state arrive together
 
-A workspace keeps its own build volume through rebase and gate. In a project without mbx a newer warm baseline arrives
-through a fresh fork; there is no warm build-volume picker. In an mbx project a fork carries only capability-retained
-state, while the live volume of an existing checkout stays warm: seed replacement neither replaces that volume nor
-deletes anything in it. Retired or landed workspaces release their volumes through retirement and garbage collection,
-never a live-cache reset.
+A workspace keeps its own build volume through rebase and gate. A newer baseline arrives through a fresh fork, or
+through `cowshed reseed`, which replaces only the build volume with what a fork of its target would be given now
+(Reseed); there is no picker among other build volumes. In an mbx project a fork carries only capability-retained state,
+while the live volume of an existing checkout stays warm: seed replacement neither replaces that volume nor deletes
+anything in it. Retired or landed workspaces release their volumes through retirement and garbage collection, never a
+live-cache reset.
 
-A land still harmonizes source mtimes with the landing checkout's (Land step 5.3), the only place cowshed changes a
-source file's metadata. Non-mbx compaction's internal move onto the workspace's own seed proves that no write would be
-lost (Seed compaction).
+A land harmonizes the target's source mtimes with the landing checkout's (Land step 5.3), and a reseed without mbx
+harmonizes the workspace's with its target's (Reseed): these are the only places cowshed changes a source file's
+metadata. Non-mbx compaction's internal move onto the workspace's own seed proves that no write would be lost (Seed
+compaction).
 
 Kept declared build state (`[build] keep`) may hold authority: sealed developer-link snapshots and ignored
 patch-development repositories ("Declared build state"). Main keeps its live sealed pins, and the declared-state
@@ -946,6 +948,71 @@ and Cargo restores compiled actions from the host's mbx store. Existing source j
 - **Nx inheritance enforced by**: `directory_mbx_fork_inherits_quiet_nx_state` and its real-APFS twin: a fork of an mbx
   target whose task database nothing holds holds the target's cached outputs and task database, and a fork taken while a
   process holds that database holds neither while the target keeps both.
+
+## Reseed: `cowshed reseed <ws>`
+
+<a id="smoo/cowshed!n/workspace-reseed"></a>A reseed replaces a workspace's live build volume with what a fork of its
+target would be given now, and leaves its source image, branch, HEAD, index, uncommitted and untracked files and grants
+as they are. It is not the fork's reseed (Fork step 2), which refreezes a target's seed from the target's live volume:
+this one leaves every seed of the target as it is. The workspace's **target** is the one its record names it forked from
+(`forkedFrom`), main for a workspace created from main: main for an ordinary workspace, its lane base for a unit of a
+lane. Main is forked from nothing and is refused by name: only seed compaction moves its live volume, onto its own
+compacted seed (Seed compaction), and `cowshed defrag main` rewrites it in place.
+
+It takes the Fork's own steps and seed compaction's swap, no path of its own:
+
+1. The workspace's land lease (02_workspaces.md, "A land and an rm of one workspace exclude each other"), then its image
+   lock and intent lease without waiting, then its live volume's exclusive claim (`<id>.dmg.hold`); the Nx-close
+   protocol stops only the workspace's own daemon, which starts again on its next request, as `cache clear` stops it
+   ("Clearing a checkout's Nx state"); every existing Cargo profile lock is tried without waiting. A land, removal or
+   other lifecycle operation, an admitted job or land holding the volume, another task-database holder or opener, or a
+   Cargo build refuses, naming the holder and changing nothing. Nothing is stopped but the workspace's own daemon.
+2. Under the target's image lock, waited for and said on stderr (no land or seed refresh of the target retires the seed
+   meanwhile), Fork step 3's capture: the target's latest seed, cloned as it stands, with no step 2: a refresh would
+   stop the target's daemon and capture its live volume under the lock every fork of the target waits on. An mbx
+   target's live volume is captured under its jobs' shared hold with the Nx guards, which here leave the target's daemon
+   running, so a running daemon is a holder and the workspace starts without the target's Nx cache and task databases.
+   The new volume is recorded at the seed's tree and placed at the workspace's `HEAD^{tree}`.
+3. Fork steps 3 and 4 once that lock is let go: proven, published, a non-mbx workspace's own seed cloned from it before
+   anything mounts it, mounted without the seed's daemon record and an mbx capture's unguarded rebuildable state.
+4. Without mbx, the source mtime pass (below), before the link names the new volume.
+5. Seed compaction's swap: the old volume sealed without force under its claim (a file open on it refuses, the old link
+   kept), the checkout's link moved onto the new volume, the old volume recorded superseded under the workspace and
+   released through the ordinary release (Garbage collection). A refusal or failure before the link remounts the old
+   volume and releases the new one.
+6. Without mbx, every older seed of the workspace is claimed and retired, as a fork's seed refresh retires the seeds it
+   replaced: its own seed is now the new volume's clone. A workspace that is itself a target, a lane base with live
+   units, strands nothing: each unit's volume is a clone of its own, independent of any seed, and no fork of the
+   workspace reads its seed meanwhile, since every fork of it holds the workspace's image lock while it clones its seed.
+   Its next fork refreshes that seed from its new live volume (Fork step 2).
+
+**Why a target's build state is safe under a source tree that is not the target's.** In an mbx project nothing that is
+judged by modification time travels: Cargo output is never in a build volume, and the Nx cache and task databases a
+guarded capture keeps are keyed by content hash. Without mbx the seed holds Cargo units built from the target's bytes,
+and Cargo judges a path package's unit fresh while every input is older than it, by modification time alone. The
+workspace's checkout is not the target's: a file the workspace changed before the target built a unit, or one the target
+rewrote after the workspace forked (the workspace keeping its older bytes and older time), holds other bytes and is
+older than the unit, so the unit would be reused. So the land's pass (Land step 5.3) runs from the target's checkout
+onto the workspace's, over the workspace's tracked files and declared Nx outputs, every one compared by bytes: equal
+bytes take the target's newer modification time, other bytes the time of the pass. A file whose time equals the target's
+is taken to hold the target's bytes without a read, as at a land: a clone keeps both times, and a write moves the
+writer's. Every unit built from other bytes is then older than its input and rebuilds; every unit built from equal bytes
+is judged as the target judges it. Comparing against the target's checkout as it is now, not at its seed's capture, is
+safe: every later write to it only moves its times forward past the seed's units. The paths are enumerated before step
+1, since enumerating declared outputs runs a job.
+
+The answer is one line with the old and the new BuildVolumeId and the bytes the old one's image had allocated (shared
+with its clones, so not all of it is freed); `--json` answers `ReseedResult`. Each step is a `workspace-reseed` timing
+span (`capture`, `ready`, `source-mtimes`, `seal`, `release`).
+
+- **Enforced by**: `directory_a_reseed_replaces_only_the_build_volume_with_a_clone_of_the_targets_seed`: the checkout
+  links a new volume holding the seed's marker and not the old volume's, recorded at the seed's tree, with HEAD, branch,
+  status and the bytes of an edited and an untracked file unchanged, the old volume and seed released and one new seed;
+  `directory_a_reseed_refuses_a_held_volume_and_main_by_name_and_changes_nothing`: a job's hold and a held image lock
+  refuse by name with every volume as it was, main refuses with `cowshed defrag main`, and the same reseed then
+  succeeds; `directory_a_reseed_leaves_no_unit_newer_than_a_workspace_input_of_other_bytes`: a workspace edit made
+  before the target's build and a target rewrite the workspace lacks, both older than the seed's unit, are newer than it
+  after the reseed, and an input of equal bytes takes the target's time.
 
 ## Land: `cowshed land`
 

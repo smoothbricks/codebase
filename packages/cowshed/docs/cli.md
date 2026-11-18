@@ -133,9 +133,9 @@ commit — never blocks an install; an installed record that cannot be read is a
 installs the invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `path`, `exec`, `grant`, `rm`,
-`forget`, `attach`, `detach`, `resize`, `defrag`, `cache clear`, `rekey`, `gc`, `push`, `rebase`, `land` — first ask the
-daemon whether it runs their build, before they open the project or change anything. A daemon of another build refuses
-them up front (exit 4), naming both builds, with the remedy this verb provides:
+`forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `cache clear`, `rekey`, `gc`, `push`, `rebase`, `land` —
+first ask the daemon whether it runs their build, before they open the project or change anything. A daemon of another
+build refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
 
 ```
 $ cowshed rm raven
@@ -1019,6 +1019,30 @@ The copy needs as much free space on the store volume as the image has allocated
 and it keeps that space: clones taken earlier still share the old blocks, so the space comes back only as they are
 removed. Main fragments again as it is rewritten while new clones share it; stop the rewrites first, or the warning
 returns.
+
+### `cowshed reseed <name>`
+
+Replace a workspace's build volume, and nothing else, with what a fork of its target would be given now: a clone of the
+target's latest seed. The target is the workspace it was forked from and lands into (main for an ordinary shed, its lane
+base for a unit of a lane). Its source image, branch, HEAD, uncommitted and untracked files and grants stay as they are.
+
+```
+$ cowshed reseed raven
+reseeded raven from main's 7c0e…: build volume 3f1a… (64424509440 bytes allocated) -> 9b2d…
+```
+
+Reach for it when a shed's build volume is fragmented (its mount takes minutes) or its build state is stale anyway:
+`defrag` copies both images, and removing the shed to fork it again means carrying its work over by hand. The old volume
+and the shed's old seed are released as a removal releases them; the bytes printed are the old image's allocation,
+shared with its clones, so not all of it comes back.
+
+It refuses, naming the holder and changing nothing, while a land, removal, fork or other lifecycle operation holds the
+shed, a job or land holds its build volume, a process other than the shed's own Nx daemon has a task database open, a
+Cargo build runs, or anything has a file open on the volume. The shed's Nx daemon is stopped and starts again on its
+next request; nothing of the target is stopped. In a project without mbx the shed's tracked files and declared Nx
+outputs take the target checkout's modification times where their bytes are equal and the time of the reseed where they
+differ, so Cargo rebuilds every unit the seed built from other bytes; no byte changes. Main has no target and is
+refused; `cowshed defrag main` rewrites it.
 
 ### `cowshed cache clear [<name|main>]`
 
