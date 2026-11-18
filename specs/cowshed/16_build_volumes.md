@@ -47,13 +47,13 @@ each of them.
    (01a_apfs.md, "Clone cost follows extents, not size"). Non-mbx full seeds preserve their source extent lineage: a
    fork clones its target's seed, a land adopts the landing volume and a seed is captured from it, so every build volume
    inherits its parent's extent map and adds its own churn. SmoothBricks' main seed went from 434,000 to 881,000 extents
-   in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs` outran the
-   120 s deadline. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the build-cache volume
-   instead (item 4). For non-mbx seeds, compaction (Targets and seeds) bounds the remaining lineage. An mbx project
-   keeps that churn off build images instead: Cargo's outputs live in the mbx store, Nx task results in the project's Nx
-   cache, and tests run in place rather than extracting archives, so its live build volume changes little and a fork
-   clones it directly (Fork). Minting a blank seed and copying its retained trees into it, to escape the live volume's
-   lineage, cost a large project's fork about 100 s (9.9 GB copied and hashed) and bought nothing the clone lacks.
+   in four days, and reached 1.2 million extents and 397.7 GB allocated by 2026-10-27, when its `mount_apfs` ran past
+   120 s. Nearly all of that churn was Cargo's `target/`, which an mbx project keeps on the build-cache volume instead
+   (item 4). For non-mbx seeds, compaction (Targets and seeds) bounds the remaining lineage. An mbx project keeps that
+   churn off build images instead: Cargo's outputs live in the mbx store, Nx task results in the project's Nx cache, and
+   tests run in place rather than extracting archives, so its live build volume changes little and a fork clones it
+   directly (Fork). Minting a blank seed and copying its retained trees into it, to escape the live volume's lineage,
+   cost a large project's fork about 100 s (9.9 GB copied and hashed) and bought nothing the clone lacks.
 2. **Without build volumes, a land rebuilds main from scratch, or main is never warm.** A workspace builds and checks
    its work, lands, and then main has to build the same tree again before the next fork can start warm. A warm step for
    main would be a background job that can fail, queue, or be skipped; while it lags, every fork starts cold, and

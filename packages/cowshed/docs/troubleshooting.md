@@ -455,23 +455,40 @@ while main is rewritten under its forks. The fork still succeeded. What to do, i
 `cowshed doctor` lists every image's extent count (`main-extents`, `source-extents`, `build-source-extents`,
 `build-seed-extents`) as information. It never warns on a count: no count predicts the clone time.
 
-## A disk child `did not finish within 120s`
+## A disk child is still running, or `did not finish within` its budget
 
-Every ordinary disk child cowshed starts (`mount_apfs`, `diskutil info` and the like) is killed at a two-minute
-deadline, and the refusal says the child ran and hung — distinct from `could not run executable`, which means it never
-started. A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every
-`hdiutil` verb — is never killed: past the same two minutes it keeps running, still holding its leases, with a warning
-on stderr every 30 s saying what it is still waiting on, because one killed mid-operation can leak its kernel device
-until reboot; this refusal therefore never names one. One host cause cowshed can see is a saturated kernel vnode table.
-`kern.num_vnodes` at `kern.maxvnodes` is not that: the kernel caches vnodes up to the limit and recycles the free ones
-(`kern.free_vnodes`), so at the limit no call waits for another to release a vnode, though each recycled vnode drops its
-file's cached pages (`cowshed doctor` reports `vnode-cache-full` when that limit is under one vnode per 32 KiB of
-memory). The table is saturated when the vnodes _in use_ — `kern.num_vnodes` minus `kern.free_vnodes` — reach the limit:
-nothing is left to recycle, and a mount that takes a second can outlast the deadline. When that is the state of the host
-the refusal names it (`… vnodes in use of kern.maxvnodes …`) and its hint is the limit to set; `cowshed doctor` reports
-it as `vnode-table-saturated`. Raising the limit is the operator's call: `sudo sysctl -w kern.maxvnodes=<n>` now and the
-same command in a boot-time launchd job, since the kernel boots with its default
-([APFS storage §The vnode table](../../../specs/cowshed/01a_apfs.md#the-vnode-table)).
+No disk child has a deadline of cowshed's own. A command that creates or releases a disk-image device —
+`diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past two minutes it keeps running,
+still holding its leases, with a warning on stderr every 30 s saying what it is still waiting on, because one killed
+mid-operation can leak its kernel device until reboot. Every other disk child (`mount_apfs`, `fsck_apfs`,
+`diskutil info` and the like) runs under its caller's budget. One run with a budget
+(`cowshed disk-command --deadline-ms`, 120 s by default) is killed when that budget is spent, and the refusal
+`did not finish within <budget>` says the child ran and hung — distinct from `could not run executable`, which means it
+never started. One run with none, as a fork's and a land's mounts are, is waited for until it ends: past two minutes it
+says so every 30 s, with its pid and what the kernel shows it doing, and a mount also names its device, its image, its
+mount point and the extent count its wait stands for:
+
+```text
+cowshed: warning: /sbin/mount_apfs of /dev/disk277s1 (image …/build/<id>.dmg) at …/.build/<project>/<ws> is still running after 150s as pid 37975, in an uninterruptible kernel wait; it is waited for until it ends or its caller stops waiting, … 150s of that copy is 750000 to 1500000 extents; …
+```
+
+A fresh clone's slow mount is working, not wedged: the read-write mount is the clone's first write and copies the
+image's extent map inside the kernel at 0.1 to 0.2 ms per extent
+([APFS storage, "Clone cost follows extents, not size"](../../../specs/cowshed/01a_apfs.md)). A kill would not stop that
+copy, only throw the finished mount away, and a retry would pay it again. Compare the count with `cowshed doctor`'s
+`source-extents` and `build-source-extents` and let the mount finish. To stop waiting, interrupt the `cowshed` command
+(Ctrl-C or SIGTERM): the mount finishes on its own, and the next fork of that name or `cowshed gc` settles what the
+interrupted fork left. Never `kill` the mount, `umount -f` it or `hdiutil detach -force` its device.
+
+One host cause cowshed can see is a saturated kernel vnode table. `kern.num_vnodes` at `kern.maxvnodes` is not that: the
+kernel caches vnodes up to the limit and recycles the free ones (`kern.free_vnodes`), so at the limit no call waits for
+another to release a vnode, though each recycled vnode drops its file's cached pages (`cowshed doctor` reports
+`vnode-cache-full` when that limit is under one vnode per 32 KiB of memory). The table is saturated when the vnodes _in
+use_ — `kern.num_vnodes` minus `kern.free_vnodes` — reach the limit: nothing is left to recycle, and a mount that takes
+a second can take minutes. When that is the state of the host a refusal names it (`… vnodes in use of kern.maxvnodes …`)
+and its hint is the limit to set; `cowshed doctor` reports it as `vnode-table-saturated`. Raising the limit is the
+operator's call: `sudo sysctl -w kern.maxvnodes=<n>` now and the same command in a boot-time launchd job, since the
+kernel boots with its default ([APFS storage §The vnode table](../../../specs/cowshed/01a_apfs.md#the-vnode-table)).
 
 ## An attach is slow, or stderr says `disk-lease … unleased=`
 

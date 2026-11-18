@@ -510,9 +510,9 @@ Find the symptom in the left column and follow the link.
 - **Fact.** macOS caches vnodes up to `kern.maxvnodes`. At the limit no call waits for another to release a vnode: each
   new vnode reclaims a free one, which drops that file's cached pages
   ([01a_apfs.md §The vnode table](./01a_apfs.md#the-vnode-table)). Saturation is vnodes in use (`kern.num_vnodes` −
-  `kern.free_vnodes`) reaching the limit, when a `mount_apfs` that takes a second on a healthy host passes a two-minute
-  deadline (`sysctl(3)` lists `kern.maxvnodes` and `kern.num_vnodes`, XNU `bsd/kern/kern_sysctl.c` defines
-  `kern.free_vnodes`, and the rest is the code's own comment and measurement).
+  `kern.free_vnodes`) reaching the limit, when a `mount_apfs` that takes a second on a healthy host runs for minutes
+  (`sysctl(3)` lists `kern.maxvnodes` and `kern.num_vnodes`, XNU `bsd/kern/kern_sysctl.c` defines `kern.free_vnodes`,
+  and the rest is the code's own comment and measurement).
 - **Rule.** cowshed names the vnode table as a failure's cause only when vnodes in use reach `kern.maxvnodes`. `doctor`
   also reports a full cache under one vnode per 32 KiB of memory (`vnode-cache-full`) and such a limit with room left
   (`vnode-limit-below-floor`), and prints the raise to that floor as `sudo sysctl -w kern.maxvnodes=<n>` with the
@@ -520,7 +520,7 @@ Find the symptom in the left column and follow the link.
 - **Owners.** [01a_apfs.md §The vnode table](./01a_apfs.md#the-vnode-table) (the floor, the full cache and doctor's
   findings); [01a_apfs.md §Owned-registry release boundary](./01a_apfs.md#owned-registry-release-boundary) (a child
   failure names a saturated vnode table);
-  [docs/troubleshooting.md §A disk child `did not finish within 120s`](../../packages/cowshed/docs/troubleshooting.md#a-disk-child-did-not-finish-within-120s);
+  [docs/troubleshooting.md §A disk child is still running, or `did not finish within` its budget](../../packages/cowshed/docs/troubleshooting.md#a-disk-child-is-still-running-or-did-not-finish-within-its-budget);
   [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair) (names the probe). Code:
   [`cowshed-core/src/vnodes.rs`]; [`cowshed-core/src/error.rs`] `storage_failure`; [`cowshed-cli/src/runtime.rs`]
   `vnode_table_finding`.

@@ -525,6 +525,12 @@ mod command_work_tests {
 }
 
 pub trait CommandRunner {
+    /// Run `request` with no execution budget of its caller's. No deadline of cowshed's own ends
+    /// it: a child that is no disk-image command is waited for until it ends on its own, as a
+    /// disk-image command is, and warned about from [`DISK_CHILD_DEADLINE`] every
+    /// [`DISK_CHILD_WARNING_INTERVAL`] ([`DeadlinePolicy::for_request`]). A caller with a budget
+    /// runs it through [`SystemCommandRunner::run_with_deadline`] or
+    /// [`SystemCommandRunner::run_within`].
     fn run(
         &self,
         request: &CommandRequest,
@@ -639,24 +645,25 @@ pub trait CommandRunner {
     fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()>;
 }
 
-/// The bound every spawned disk child (attach/detach, inventory, mount) answers inside.
+/// When a disk child still running is first said to be, and the budget `cowshed disk-command`
+/// gives a caller that names none.
 ///
-/// Without it a hung `hdiutil`/`diskutil` child wedges the store operation that spawned it
-/// forever — one stuck workspace takes down every other workspace's verbs, and the daemon
-/// startup pass with them. On expiry a child is killed and the item reports a timeout
-/// ("deferred") so the queue continues and the next pass retries it; the per-leg
-/// [`timed_apfs_step`] span such a child was stuck inside terminates with `status=err` and
-/// the waited elapsed instead of never closing.
+/// No disk child has a deadline of cowshed's own (01a_apfs.md, "How the APFS host degrades" §2).
+/// A disk-image command (`diskutil image …`, `hdiutil`, `diskutil eject`) is never killed: killed
+/// mid-operation, its device can stay leaked in the kernel until reboot. Every other disk child
+/// (`mount_apfs`, `fsck_apfs`, `diskutil info`, `diskutil apfs …`) is killed only when its
+/// caller's execution budget is spent ([`SystemCommandRunner::run_with_deadline`],
+/// [`SystemCommandRunner::run_within`]). A child whose caller set no budget
+/// ([`CommandRunner::run`], [`CommandRunner::run_guarded`]; a fork's and a land's mounts among
+/// them) is waited for, still holding its leases, until it ends on its own or its caller stops
+/// waiting, and from this point on says what it is waiting on every
+/// [`DISK_CHILD_WARNING_INTERVAL`]. Its caller stops waiting by ending itself: `cowshed fork` and
+/// `cowshed land` at the SIGINT, SIGHUP or SIGTERM they receive, leaving the child to finish.
 ///
-/// A disk-image command (`diskutil image …`, `hdiutil`) is the exception, and cowshed never kills
-/// one: killed mid-operation, its device can stay leaked in the kernel until reboot
-/// (01a_apfs.md, "How the APFS host degrades" §2). For it this deadline is a warning point: it
-/// is waited for until it ends on its own, still holding its leases, and says what it is waiting
-/// on every [`DISK_IMAGE_WARNING_INTERVAL`].
-///
-/// 120 seconds is generous against normally sub-second disk children and stays inside the
-/// enclosing per-operation budgets even when a pass pays it once per workspace; tests
-/// override it through [`SystemCommandRunner::run_with_deadline`].
+/// A fixed kill here bought nothing: a clone's read-write mount is its first write, which copies
+/// the image's extent map inside `mount(2)`, where no signal reaches it. Measured 2026-11-18, a
+/// live build volume's clone mounted in 100 to 250 s; the kernel finished one such mount 20 s
+/// after its kill, cowshed threw the finished mount away, and the fork's retry paid the copy again.
 pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The wait for an image lease another disk-image command holds (05_gateway.md, "Deadlines"). Its
@@ -665,8 +672,8 @@ pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
 /// services.
 pub const IMAGE_LEASE: Bound = Bound::new(LatencyClass::Ffi, DISK_CHILD_DEADLINE);
 
-/// How often a disk-image command past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
-pub const DISK_IMAGE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+/// How often a disk child waited for past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
+pub const DISK_CHILD_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One monotonic budget covering admission and the owned SAFE child's lifetime.
 /// Constructed before admission (and before the CLI's blocking-runner handoff).
@@ -696,8 +703,8 @@ impl CommandDeadline {
 pub enum PastDeadline {
     /// Kill the child's process group and report [`CommandRunFailure::Deadline`].
     Kill,
-    /// Say what is still running this often, and wait until the child ends on its own. A
-    /// disk-image command's policy: no deadline of cowshed's own kills one.
+    /// Say what is still running this often, and wait until the child ends on its own: the policy
+    /// of a disk-image command, and of any disk child whose caller set no budget.
     WarnEvery(Duration),
 }
 
@@ -712,17 +719,23 @@ pub struct DeadlinePolicy {
 }
 
 impl DeadlinePolicy {
-    /// `request`'s policy at `deadline`: a disk-image command is warned about from `deadline`
-    /// every [`DISK_IMAGE_WARNING_INTERVAL`] and never killed; every other disk child is killed
-    /// at `deadline`.
-    pub fn for_request(request: &CommandRequest, deadline: Duration) -> Self {
+    /// `request`'s policy under its caller's execution budget, `budget`. A disk-image command is
+    /// never killed: it is warned about from `budget`, or from [`DISK_CHILD_DEADLINE`] when its
+    /// caller set none, every [`DISK_CHILD_WARNING_INTERVAL`]. Every other disk child is killed
+    /// when `budget` is spent; when its caller set none it is warned about as a disk-image command
+    /// is, and never killed: cowshed adds no deadline of its own to its caller's (01a_apfs.md,
+    /// "How the APFS host degrades" §2).
+    pub fn for_request(request: &CommandRequest, budget: Option<Duration>) -> Self {
+        let (deadline, past_deadline) = match budget {
+            Some(budget) if !is_disk_image_command(request) => (budget, PastDeadline::Kill),
+            budget => (
+                budget.unwrap_or(DISK_CHILD_DEADLINE),
+                PastDeadline::WarnEvery(DISK_CHILD_WARNING_INTERVAL),
+            ),
+        };
         Self {
             deadline,
-            past_deadline: if is_disk_image_command(request) {
-                PastDeadline::WarnEvery(DISK_IMAGE_WARNING_INTERVAL)
-            } else {
-                PastDeadline::Kill
-            },
+            past_deadline,
             reap: cowshed_os::deadline::REAP,
         }
     }
@@ -795,7 +808,7 @@ impl SystemCommandRunner {
         self.run_admitted(
             request,
             "disk command",
-            CommandDeadline::new(deadline),
+            Some(CommandDeadline::new(deadline)),
             ChildInput::Null,
             |deadline, run| {
                 crate::disk_lease::leased(
@@ -827,7 +840,7 @@ impl SystemCommandRunner {
         self.run_admitted(
             request,
             "detach image",
-            CommandDeadline::new(DISK_CHILD_DEADLINE),
+            None,
             ChildInput::Null,
             |deadline, run| {
                 self.admit(request, gateway_socket, deadline, || {
@@ -872,12 +885,9 @@ impl SystemCommandRunner {
         input: ChildInput,
         gateway_socket: Option<&Path>,
     ) -> Result<CommandOutput, CommandRunError> {
-        let deadline = if is_disk_image_command(request) {
-            CommandDeadline::new(DISK_CHILD_DEADLINE)
-        } else {
-            deadline
-        };
-        self.run_admitted(request, "disk command", deadline, input, |deadline, run| {
+        // A disk-image command's caller sets no budget for it: its deadline would be no kill.
+        let budget = (!is_disk_image_command(request)).then_some(deadline);
+        self.run_admitted(request, "disk command", budget, input, |deadline, run| {
             self.admit(request, gateway_socket, deadline, run)
         })
         .map(|run| run.output)
@@ -918,39 +928,45 @@ impl SystemCommandRunner {
         self.run_admitted(
             request,
             "disk command",
-            CommandDeadline::new(deadline),
+            Some(CommandDeadline::new(deadline)),
             ChildInput::Null,
             lease,
         )
         .map(|run| run.output)
     }
 
-    /// One runner owns admission, spawn, deadline policy and attach-pool bookkeeping.
+    /// One runner owns admission, spawn, deadline policy and attach-pool bookkeeping. `budget` is
+    /// the caller's execution budget, `None` when it set none ([`DeadlinePolicy::for_request`]).
     fn run_admitted(
         &self,
         request: &CommandRequest,
         operation: &'static str,
-        deadline: CommandDeadline,
+        budget: Option<CommandDeadline>,
         input: ChildInput,
         lease: impl FnOnce(
             Option<CommandDeadline>,
             &mut dyn FnMut() -> Result<CommandRun, CommandRunError>,
         ) -> Result<CommandRun, CommandRunError>,
     ) -> Result<CommandRun, CommandRunError> {
-        let policy = DeadlinePolicy::for_request(request, deadline.duration);
-        let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
+        let policy = DeadlinePolicy::for_request(request, budget.map(|budget| budget.duration));
+        let total = budget.filter(|_| policy.past_deadline == PastDeadline::Kill);
         admitted_work(
             |run| lease(total, run),
             || {
-                Self::run_unleased(request, input.clone(), policy, total, &mut |elapsed| {
-                    warn_outlived(request, policy.deadline, elapsed)
-                })
+                Self::run_unleased(
+                    request,
+                    input.clone(),
+                    policy,
+                    total,
+                    &mut |pid, elapsed| warn_overdue(request, policy.deadline, pid, elapsed),
+                )
             },
             |work| measure_command_work(request, operation, work),
         )
     }
 
-    /// Run `request` reading `input` under `policy`, calling `warn` each time a warning is due.
+    /// Run `request` reading `input` under `policy`, calling `warn` with the child's pid and the
+    /// time it has run each time a warning is due.
     /// Every disk child of every entry point spawns here, a caller's own lease
     /// ([`Self::run_within`]) included, so a Disk Arbitration rename is refused here too
     /// ([`crate::disk_lease::refuse_volume_rename`]).
@@ -959,7 +975,7 @@ impl SystemCommandRunner {
         input: ChildInput,
         policy: DeadlinePolicy,
         total: Option<CommandDeadline>,
-        warn: &mut dyn FnMut(Duration),
+        warn: &mut dyn FnMut(u32, Duration),
     ) -> Result<CommandOutput, CommandRunError> {
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         release_authority::refuse_unauthorized_release(request)?;
@@ -1065,7 +1081,7 @@ impl SystemCommandRunner {
                     }
                     DeadlineStep::Warn => {
                         warned += 1;
-                        warn(started.elapsed());
+                        warn(pid, started.elapsed());
                     }
                     DeadlineStep::Kill => {
                         // Closed before the group is killed and its output collected, as at a
@@ -1157,6 +1173,127 @@ fn warn_outlived(request: &CommandRequest, deadline: Duration, elapsed: Duration
     let _ = io::stderr().lock().write_all(line.as_bytes());
 }
 
+/// Say that a disk child is still running past its warning point, by its kind: a disk-image
+/// command names the host's disk-image commands and helpers ([`warn_outlived`]); any other names
+/// its own process and, for a mount, its image ([`warn_waited`]).
+fn warn_overdue(request: &CommandRequest, deadline: Duration, pid: u32, elapsed: Duration) {
+    if is_disk_image_command(request) {
+        warn_outlived(request, deadline, elapsed);
+    } else {
+        warn_waited(request, pid, elapsed);
+    }
+}
+
+/// Say that a disk child whose caller set no budget is still running and still waited for
+/// ([`waited_line`]). Written once and without `eprintln!`, as [`warn_outlived`] is and for its
+/// reasons.
+fn warn_waited(request: &CommandRequest, pid: u32, elapsed: Duration) {
+    use std::io::Write;
+    let state = libc::pid_t::try_from(pid).map_or_else(
+        |error| cowshed_os::process::RunState::Unread(error.to_string()),
+        cowshed_os::process::run_state,
+    );
+    let mount = MountArgs::of(request).map(|args| {
+        let image = image_of_device(args.device);
+        (args, image)
+    });
+    let line = waited_line(request, pid, &state, mount, elapsed);
+    let _ = io::stderr().lock().write_all(line.as_bytes());
+}
+
+/// The line [`warn_waited`] writes: the child, how long it has run, the state the kernel shows its
+/// process in, and why it is still waited for. A mount's also names its device, the image the I/O
+/// Registry holds for that device and its mount point, and reads its wait as the extent-map copy
+/// it most likely is: a clone's read-write mount is its first write, which copies the image's
+/// extent map at 0.1 to 0.2 ms per extent (01a_apfs.md, "Clone cost follows extents, not size";
+/// 16_build_volumes.md, "Seed compaction"). The reader compares the extent count the wait stands
+/// for with the one `cowshed doctor` reports, and tells a mount at work from a wedged one.
+fn waited_line(
+    request: &CommandRequest,
+    pid: u32,
+    state: &cowshed_os::process::RunState,
+    mount: Option<(MountArgs<'_>, io::Result<Option<DiskImageSource>>)>,
+    elapsed: Duration,
+) -> String {
+    let seconds = elapsed.as_secs();
+    let why = format!(
+        "is still running after {seconds}s as pid {pid}, {state}; it is waited for until it ends \
+         or its caller stops waiting, since no disk child has a deadline of cowshed's own, only \
+         its caller's, and its caller set none (01a_apfs.md, \"How the APFS host degrades\" §2)"
+    );
+    let Some((args, image)) = mount else {
+        return format!("cowshed: warning: {} {why}.\n", ShownCommand(request));
+    };
+    let image = match image {
+        Ok(Some(DiskImageSource::File(path))) => format!("image {}", path.display()),
+        Ok(Some(DiskImageSource::Url(url))) => format!("image {url}"),
+        Ok(None) => "no image the I/O Registry lists".to_owned(),
+        Err(error) => format!("its image unread from the I/O Registry: {error}"),
+    };
+    format!(
+        "cowshed: warning: {MOUNT_APFS} of {} ({image}) at {} {why}. A clone's read-write mount \
+         is its first write, which copies the image's extent map at 0.1 to 0.2 ms per extent \
+         (01a_apfs.md, \"Clone cost follows extents, not size\"; 16_build_volumes.md, \"Seed \
+         compaction\"): {seconds}s of that copy is {} to {} extents; `cowshed doctor` counts each \
+         source's as `source-extents` and `build-source-extents`. A kill would not end the copy in \
+         the kernel, only throw the finished mount away.\n",
+        args.device,
+        args.mount_point.display(),
+        seconds * 5_000,
+        seconds * 10_000,
+    )
+}
+
+/// The device and mount point a `mount_apfs` request names ([`mount_request`]'s argv).
+struct MountArgs<'a> {
+    device: &'a str,
+    mount_point: &'a Path,
+}
+
+impl<'a> MountArgs<'a> {
+    fn of(request: &'a CommandRequest) -> Option<Self> {
+        if request.program != Path::new(MOUNT_APFS) {
+            return None;
+        }
+        Some(Self {
+            device: request.args.get(2)?.to_str()?,
+            mount_point: Path::new(request.args.get(3)?),
+        })
+    }
+}
+
+/// The image whose attachment exposes `device`, read from the I/O Registry.
+fn image_of_device(device: &str) -> io::Result<Option<DiskImageSource>> {
+    #[cfg(target_os = "macos")]
+    {
+        let device = device_path(device);
+        Ok(io_registry::attached_disk_images()?
+            .into_iter()
+            .find(|image| {
+                image
+                    .media
+                    .iter()
+                    .any(|media| Some(&media.device) == device.as_ref())
+            })
+            .map(|image| image.source))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("the image exposing {device} is read from the macOS I/O Registry"),
+        ))
+    }
+}
+
+/// A disk child's program and arguments, as its failures name them.
+struct ShownCommand<'a>(&'a CommandRequest);
+
+impl fmt::Display for ShownCommand<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_command(f, self.0.program.as_os_str(), &self.0.args)
+    }
+}
 /// The program and verb a disk-image command names: `diskutil image attach`, `diskutil eject`,
 /// `hdiutil detach`.
 struct DiskImageVerb<'a>(&'a CommandRequest);
@@ -1220,21 +1357,24 @@ impl CommandRunner for SystemCommandRunner {
                 Self::Run(refused.into())
             }
         }
-        let deadline = CommandDeadline::new(DISK_CHILD_DEADLINE);
-        let policy = DeadlinePolicy::for_request(request, DISK_CHILD_DEADLINE);
-        let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
+        // A guarded run's caller sets no budget, as [`CommandRunner::run`]'s does not.
+        let policy = DeadlinePolicy::for_request(request, None);
         let output = crate::disk_lease::leased(
             self.namespace,
             &request.program,
             &request.args,
-            total,
+            None,
             || {
                 if !check().map_err(Guarded::Check)? {
                     return Ok(None);
                 }
-                Self::run_unleased(request, ChildInput::Null, policy, total, &mut |elapsed| {
-                    warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
-                })
+                Self::run_unleased(
+                    request,
+                    ChildInput::Null,
+                    policy,
+                    None,
+                    &mut |pid, elapsed| warn_overdue(request, policy.deadline, pid, elapsed),
+                )
                 .map(Some)
                 .map_err(Guarded::Run)
             },
@@ -1254,7 +1394,7 @@ impl CommandRunner for SystemCommandRunner {
         self.run_admitted(
             request,
             operation,
-            CommandDeadline::new(DISK_CHILD_DEADLINE),
+            None,
             ChildInput::Null,
             |deadline, run| self.admit(request, None, deadline, run),
         )
@@ -8249,8 +8389,8 @@ mod tests {
         // Hang injection: a shell-builtin spin stands in for a hung disk child that never
         // answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`) do not exist on all
         // Linux runners (NixOS provides only `/bin/sh`), so the hang and the follow-up probe
-        // must use `/bin/sh` builtins only. A child that is no disk-image command is killed at
-        // the deadline, and the queue continues; a disk-image command is never killed (the tests
+        // must use `/bin/sh` builtins only. A child that is no disk-image command is killed when
+        // its caller's budget is spent, and the queue continues; a disk-image command is never killed (the tests
         // below), only warned about. The child's identity comes from the runner that spawned and
         // reaped it, never from the child: a loaded host can kill the shell at 250 ms before it
         // runs a single builtin, and a pid the child had to write itself was then empty. The spin
@@ -8420,9 +8560,9 @@ mod tests {
         );
     }
 
-    /// The policy itself, at its real constants: a disk-image command past the 120 s deadline is
-    /// warned about every 30 s and never killed, however long it runs; every other disk child is
-    /// killed at the deadline.
+    /// The policy itself, at its real constants: a disk-image command past its 120 s warning point,
+    /// whether its caller set that budget or none, is warned about every 30 s and never killed,
+    /// however long it runs.
     #[test]
     fn a_disk_image_command_is_warned_about_at_the_deadline_and_never_killed() {
         let at = Duration::from_secs;
@@ -8435,10 +8575,15 @@ mod tests {
             CommandRequest::new(DISKUTIL, ["eject", "disk9"]),
             CommandRequest::new(DISKUTIL, ["eject", "force", "/dev/disk9"]),
         ] {
-            let policy = DeadlinePolicy::for_request(&image, DISK_CHILD_DEADLINE);
+            let policy = DeadlinePolicy::for_request(&image, Some(DISK_CHILD_DEADLINE));
+            assert_eq!(
+                DeadlinePolicy::for_request(&image, None),
+                policy,
+                "{image:?}"
+            );
             assert_eq!(
                 policy.past_deadline,
-                PastDeadline::WarnEvery(DISK_IMAGE_WARNING_INTERVAL),
+                PastDeadline::WarnEvery(DISK_CHILD_WARNING_INTERVAL),
                 "{image:?}"
             );
             assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait);
@@ -8459,15 +8604,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What ends a disk child that is no disk-image command is its caller's execution budget: it
+    /// is killed when that budget is spent, shorter or longer than the disk-child warning point,
+    /// and never at that point itself. A caller that set none waits for it, as for a disk-image
+    /// command.
+    #[test]
+    fn a_disk_child_is_killed_only_when_its_callers_budget_is_spent() {
+        let at = Duration::from_secs;
         for ordinary in [
-            CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse"]),
+            CommandRequest::new(
+                MOUNT_APFS,
+                [
+                    "-o",
+                    "nobrowse,owners,noatime",
+                    "/dev/disk9s1",
+                    "/private/tmp/m",
+                ],
+            ),
+            CommandRequest::new(FSCK_APFS, ["-q", "/dev/rdisk9s1"]),
             CommandRequest::new(DISKUTIL, ["apfs", "resizeContainer", "disk9s1", "0"]),
             CommandRequest::new(DISKUTIL, ["info", "-plist", "disk9s1"]),
         ] {
-            let policy = DeadlinePolicy::for_request(&ordinary, DISK_CHILD_DEADLINE);
+            let policy = DeadlinePolicy::for_request(&ordinary, Some(at(600)));
             assert_eq!(policy.past_deadline, PastDeadline::Kill, "{ordinary:?}");
-            assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait, "{ordinary:?}");
-            assert_eq!(policy.step(at(120), 0), DeadlineStep::Kill, "{ordinary:?}");
+            assert_eq!(policy.step(at(120), 0), DeadlineStep::Wait, "{ordinary:?}");
+            assert_eq!(policy.step(at(599), 0), DeadlineStep::Wait, "{ordinary:?}");
+            assert_eq!(policy.step(at(600), 0), DeadlineStep::Kill, "{ordinary:?}");
+            let short = DeadlinePolicy::for_request(&ordinary, Some(at(5)));
+            assert_eq!(short.step(at(5), 0), DeadlineStep::Kill, "{ordinary:?}");
+            assert_eq!(
+                DeadlinePolicy::for_request(&ordinary, None).past_deadline,
+                PastDeadline::WarnEvery(DISK_CHILD_WARNING_INTERVAL),
+                "{ordinary:?}"
+            );
+        }
+    }
+
+    /// A mount waited for past its warning point says which device and image it mounts, where,
+    /// how long it has run, what the kernel shows its process doing, and the extent count its wait
+    /// stands for at the spec's cost per extent; any other waited disk child names its argv and
+    /// its process, and claims no extent copy.
+    #[test]
+    fn a_waited_mount_names_its_device_image_and_the_extents_its_wait_copies() {
+        use cowshed_os::process::RunState;
+        let mount = CommandRequest::new(
+            MOUNT_APFS,
+            [
+                "-o",
+                "nobrowse,owners,noatime",
+                "/dev/disk277s1",
+                "/private/var/folders/cowshed/502/mnt/p/.build/p/batch",
+            ],
+        );
+        let image = PathBuf::from("/private/cowshed/store/p/build/b.dmg");
+        let line = waited_line(
+            &mount,
+            37_975,
+            &RunState::Uninterruptible,
+            MountArgs::of(&mount).map(|args| (args, Ok(Some(DiskImageSource::File(image))))),
+            Duration::from_secs(150),
+        );
+        for said in [
+            "cowshed: warning: /sbin/mount_apfs of /dev/disk277s1 \
+             (image /private/cowshed/store/p/build/b.dmg) \
+             at /private/var/folders/cowshed/502/mnt/p/.build/p/batch \
+             is still running after 150s as pid 37975, in an uninterruptible kernel wait;",
+            "its caller set none",
+            "150s of that copy is 750000 to 1500000 extents",
+            "`build-source-extents`",
+            "only throw the finished mount away.\n",
+        ] {
+            assert!(line.contains(said), "{said:?} in {line:?}");
+        }
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+
+        let unread = waited_line(
+            &mount,
+            37_975,
+            &RunState::Uninterruptible,
+            MountArgs::of(&mount)
+                .map(|args| (args, Err(io::Error::other("registry walk refused")))),
+            Duration::from_secs(150),
+        );
+        assert!(
+            unread.contains("(its image unread from the I/O Registry: registry walk refused)"),
+            "{unread:?}"
+        );
+
+        let info = CommandRequest::new(DISKUTIL, ["info", "-plist", "disk9s1"]);
+        assert!(MountArgs::of(&info).is_none());
+        let line = waited_line(
+            &info,
+            7,
+            &RunState::Sleeping,
+            None,
+            Duration::from_secs(150),
+        );
+        assert!(
+            line.contains("is still running after 150s as pid 7, sleeping;"),
+            "{line:?}"
+        );
+        assert!(line.contains("\"/usr/sbin/diskutil\""), "{line:?}");
+        assert!(!line.contains("extent"), "{line:?}");
+    }
+    /// A clone's read-write `mount_apfs` is its first write and copies the image's extent map in
+    /// the kernel: 100 to 250 s for a live build volume's clone, measured 2026-11-18, and a kill
+    /// ends nothing there (the kernel finished one such mount 20 s after its kill, and it was
+    /// thrown away). No disk child has a deadline of cowshed's own, only its caller's execution
+    /// budget (01a_apfs.md, "How the APFS host degrades" §2): run with none, as a fork's and a
+    /// land's mounts are ([`CommandRunner::run`]), it is warned about from the disk-child warning
+    /// point every warning interval, at the real constants, and never killed.
+    #[test]
+    fn a_mount_with_no_caller_budget_is_warned_about_and_never_killed() {
+        let at = Duration::from_secs;
+        let mount = CommandRequest::new(
+            MOUNT_APFS,
+            [
+                "-o",
+                "nobrowse,owners,noatime",
+                "/dev/disk277s1",
+                "/private/var/folders/cowshed/502/mnt/p/.build/p/main",
+            ],
+        );
+        let policy = DeadlinePolicy::for_request(&mount, None);
+        assert_eq!(policy.step(at(119), 0), DeadlineStep::Wait);
+        assert_eq!(policy.step(at(120), 0), DeadlineStep::Warn);
+        assert_eq!(policy.step(at(149), 1), DeadlineStep::Wait);
+        assert_eq!(policy.step(at(150), 1), DeadlineStep::Warn);
+        // The slowest mount measured, 251 s, and an hour: one more warning each, never a kill.
+        for (elapsed, warned) in [(251, 4), (3_600, 116)] {
+            assert_eq!(
+                policy.step(at(elapsed), warned),
+                DeadlineStep::Warn,
+                "{elapsed}s"
+            );
+            assert_eq!(
+                policy.step(at(elapsed), warned + 1),
+                DeadlineStep::Wait,
+                "{elapsed}s"
+            );
         }
     }
 
@@ -8540,7 +8817,7 @@ mod tests {
 
         let deadline = Duration::from_millis(10);
         assert!(matches!(
-            DeadlinePolicy::for_request(&disk_image_request(), deadline).past_deadline,
+            DeadlinePolicy::for_request(&disk_image_request(), Some(deadline)).past_deadline,
             PastDeadline::WarnEvery(_)
         ));
         let policy = DeadlinePolicy {
@@ -8574,7 +8851,7 @@ mod tests {
                     ChildInput::Null,
                     policy,
                     None,
-                    &mut |_| {
+                    &mut |_, _| {
                         warnings += 1;
                         // Disconnect means the observer is done or unwinding; never abandon the child.
                         let _ = warned.send(());
@@ -8746,7 +9023,7 @@ mod tests {
             reap: cowshed_os::deadline::REAP,
         };
         assert!(matches!(
-            DeadlinePolicy::for_request(&disk_image_request(), policy.deadline).past_deadline,
+            DeadlinePolicy::for_request(&disk_image_request(), Some(policy.deadline)).past_deadline,
             PastDeadline::WarnEvery(_)
         ));
         let mut warnings = 0;
@@ -8755,7 +9032,7 @@ mod tests {
             ChildInput::Null,
             policy,
             None,
-            &mut |elapsed| {
+            &mut |_, elapsed| {
                 assert!(elapsed >= policy.deadline);
                 let pid = loop {
                     match fs::read_to_string(&pid_file) {
@@ -8800,9 +9077,9 @@ mod tests {
         let output = SystemCommandRunner::run_unleased(
             &request,
             ChildInput::Null,
-            DeadlinePolicy::for_request(&request, DISK_CHILD_DEADLINE),
+            DeadlinePolicy::for_request(&request, Some(DISK_CHILD_DEADLINE)),
             None,
-            &mut |_| panic!("no deadline warning for a child that exits at once"),
+            &mut |_, _| panic!("no deadline warning for a child that exits at once"),
         )
         .expect("the child's exit answers the run, whatever its own child still holds");
         let held: libc::pid_t = String::from_utf8(output.stderr)

@@ -873,12 +873,16 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    next attach of that image reconnected to the wedged helper and hung again. A late child that succeeds is a success;
    one that fails is the caller's failure as always, and an attach's own failure path detaches whatever device it
    produced. Other disk children (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) use the caller's execution
-   budget, never a second fixed disk-child timeout. A hung DiskImages2 verb keeps its own operation and image lease
-   pending instead of leaking a device until reboot; the gateway's disk-phase eviction lets unrelated host work continue
-   without killing it (05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that stops waiting
-   leaves the detached command to finish. Callers outside cowshed get the same runner through `cowshed disk-command`
-   (06_cli.md). The orphaned-helper `kill -9` does not contradict this: an orphan serves no device, so killing it
-   strands nothing.
+   budget, never a second fixed disk-child timeout. One whose caller sets no budget, as a fork's and a land's mounts, is
+   waited for until it ends or its caller stops waiting, and from the disk-image warning point says so at the same
+   cadence with its pid and kernel state, and for a mount its device, image, mount point and the extent count its wait
+   stands for ("Clone cost follows extents, not size"): a kill would not end a mount's extent-map copy in the kernel,
+   only discard the finished mount, and a retry pays the copy again. A hung DiskImages2 verb keeps its own operation and
+   image lease pending instead of leaking a device until reboot; the gateway's disk-phase eviction lets unrelated host
+   work continue without killing it (05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that
+   stops waiting leaves the detached command to finish. Callers outside cowshed get the same runner through
+   `cowshed disk-command` (06_cli.md). The orphaned-helper `kill -9` does not contradict this: an orphan serves no
+   device, so killing it strands nothing.
 
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
    and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach

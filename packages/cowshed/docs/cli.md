@@ -1580,7 +1580,7 @@ A command that creates or releases a disk-image device — `diskutil image …`,
 is never killed: past 120 s it keeps running with a warning on stderr every 30 s, because one killed mid-operation can
 leak its kernel device until reboot. It ignores hangup, interrupt and terminate and writes its output to files the
 runner reads back, so killing `disk-command` or closing its pipes leaves the operation to finish; the next caller reads
-the result from the host. Every other verb is killed at 120 s.
+the result from the host. Every other verb is killed when its `--deadline-ms` budget, 120 s by default, is spent.
 
 Failures of the runner itself use the `exec` wrapper codes with a `cowshed:` line on stderr and nothing on stdout: 104
 when the tool does not exist on this host, 103 when an ordinary verb hit its deadline, 100 when the tool could not be
