@@ -3564,6 +3564,34 @@ pub struct NxStateClearResult {
     pub workspace_data_entries: u64,
 }
 
+/// What `cowshed reseed` did (16_build_volumes.md, "Reseed"): the workspace's build volume
+/// replaced by a clone of `clonedFrom` (its target's latest seed, or an mbx target's live volume),
+/// the bytes the previous volume's image had allocated (shared with its clones, so not all freed),
+/// and, in a project without mbx, what the source mtime pass changed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReseedResult {
+    pub workspace: WorkspaceName,
+    pub target: WorkspaceName,
+    pub cloned_from: String,
+    pub previous_volume: String,
+    pub previous_bytes: u64,
+    pub volume: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mtimes: Option<ReseedSourceMtimes>,
+}
+
+/// The source mtime pass of a reseed without mbx (16_build_volumes.md, "Reseed"): the workspace's
+/// files that are regular files in both checkouts, those given the target's newer mtime for equal
+/// bytes, those compared by bytes, and those whose bytes differ, given the time of the pass.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReseedSourceMtimes {
+    pub examined: u64,
+    pub advanced: u64,
+    pub compared: u64,
+    pub republished: u64,
+}
 /// What `cowshed cache clear` deleted from the project's accepted-task store the gateway serves
 /// (03_caches.md, "Nx accepted-task artifact service"): the archives in its entries directory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4784,6 +4812,7 @@ result_bodies!(
     ResizeResult,
     DefragmentResult,
     NxStateClearResult,
+    ReseedResult,
     CacheClearReport,
     SlotResult,
     WorkspaceInfo,

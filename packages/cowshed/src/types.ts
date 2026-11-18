@@ -229,6 +229,8 @@ export interface Coordinator {
   resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult>;
   /** Rewrites the workspace's image contiguously; a busy workspace refuses before its image is touched. */
   defragment(workspace: string): Promise<Api.DefragmentResult>;
+  /** Replaces the workspace's build volume with a clone of its target's seed; its source, branch and uncommitted files stay. */
+  reseed(workspace: string): Promise<Api.ReseedResult>;
   /** Deletes the workspace's Nx cache and task database contents on its build volume. */
   clearNxState(workspace: string): Promise<Api.NxStateClearResult>;
   /** Rebuilds one keyless workspace's CA identity at its preserved incarnation. */

@@ -39,6 +39,8 @@ pub enum Holding {
     Remove,
     /// Detaching an idle workspace to make room under IOKit's media cap (media_room.rs).
     MakeRoom,
+    /// Replacing the workspace's build volume (`cowshed reseed`).
+    Reseed,
 }
 
 impl Holding {
@@ -47,6 +49,7 @@ impl Holding {
             Self::Land => "landed",
             Self::Remove => "removed",
             Self::MakeRoom => "detached to make room for an attach",
+            Self::Reseed => "reseeded",
         }
     }
 }
@@ -128,6 +131,7 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
         Holding::Land => "land",
         Holding::Remove => "remove",
         Holding::MakeRoom => "detach",
+        Holding::Reseed => "reseed",
     };
     match holder {
         Some(holder) => CowshedError::conflict(
@@ -144,6 +148,7 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
                      the workspace if the land kept it"
                 }
                 Holding::Remove => "wait for the removal to end",
+                Holding::Reseed => "wait for the reseed to end; it replaces only the build volume",
                 Holding::MakeRoom => {
                     "wait for that detach to end; it detaches only a workspace nothing uses, which \
                      attaches again on its next use"

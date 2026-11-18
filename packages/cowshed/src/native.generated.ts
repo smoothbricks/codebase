@@ -89,6 +89,7 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorDefragment,
     NativeCoordinatorRekey,
     NativeCoordinatorClearNxState,
+    NativeCoordinatorReseed,
     NativeCoordinatorDetach,
     NativeCoordinatorAssignSlot,
     NativeCoordinatorDestroy,
@@ -533,6 +534,24 @@ export async function coordinatorRepoMirror(
   args: CoordinatorRepoMirrorArguments,
 ): Promise<Api.MirrorInfo> {
   return R.readMirrorInfo(await handle.repoMirror(JSON.stringify(args)));
+}
+
+/** A handle that serves `coordinator.reseed`. */
+export interface NativeCoordinatorReseed {
+  reseed(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `coordinator.reseed` caller names; its handle binds the rest. */
+export type CoordinatorReseedArguments = Pick<Api.WorkspaceRequest, 'workspace'>;
+
+/**
+ * Replaces a workspace's build volume with a clone of its target's seed.
+ */
+export async function coordinatorReseed(
+  handle: NativeCoordinatorReseed,
+  args: CoordinatorReseedArguments,
+): Promise<Api.ReseedResult> {
+  return R.readReseedResult(await handle.reseed(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.resize`. */

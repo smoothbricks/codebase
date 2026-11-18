@@ -25,7 +25,7 @@ use cowshed_core::api::{
     LandReport, LandTurnName, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta,
     ProjectGrants, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RebaseReport,
     RefLockPath, RekeyResult, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
-    RemoveReport, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
+    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode,
     StdinSource as CoreStdinSource, UnlandedPaths, UnprovenWorkspace, UtcTimestamp, WorkspaceInfo,
     WorkspacePath, WorkspaceState, validate_command_argv,
 };
@@ -154,6 +154,8 @@ pub trait CliService: Send {
         volume: ResizeVolume,
     ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
+    /// Replace the workspace's build volume with a clone of its target's seed (`coordinator.reseed`).
+    async fn reseed(&mut self, workspace: &str) -> Result<ReseedResult>;
     /// Delete the workspace's Nx state on its build volume (`coordinator.clearNxState`).
     async fn clear_nx_state(
         &mut self,
@@ -248,6 +250,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
+        | Command::Reseed(_)
         | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
@@ -322,6 +325,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
+        | Command::Reseed(_)
         | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
@@ -431,6 +435,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         },
         Command::Resize(args) => named([Some(args.workspace.as_str())]),
         Command::Rekey(args) => named([Some(args.workspace.as_str())]),
+        Command::Reseed(args) => named([Some(args.workspace.as_str())]),
         Command::Land(args) => named([Some(args.workspace.as_str())]),
         Command::Path(args) => named([args.workspace.as_deref()]),
         Command::Attach(args) => named([args.workspace.as_deref()]),
@@ -943,6 +948,10 @@ impl CliService for ActorBridge {
 
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
         self.coordinator()?.defragment(workspace).await
+    }
+
+    async fn reseed(&mut self, workspace: &str) -> Result<ReseedResult> {
+        self.coordinator()?.reseed(workspace).await
     }
 
     async fn clear_nx_state(
@@ -2024,6 +2033,41 @@ where
             let workspace = resolve_workspace(service, workspace, "cache clear").await?;
             let report = clear_caches(service, &workspace).await?;
             emit_cache_clear_report(output, json, report)?;
+            Ok(success())
+        }
+        Command::Reseed(args) => {
+            let result = service.reseed(&args.workspace).await?;
+            if json {
+                output.success(result.clone()).map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(
+                        format!(
+                            "reseeded {} from {}'s {}: build volume {} ({} bytes allocated) -> {}",
+                            result.workspace,
+                            result.target,
+                            result.cloned_from,
+                            result.previous_volume,
+                            result.previous_bytes,
+                            result.volume,
+                        )
+                        .as_bytes(),
+                    )
+                    .map_err(output_error)?;
+            }
+            if let Some(mtimes) = &result.source_mtimes {
+                output
+                    .guidance(&format!(
+                        "{} source mtimes: {} files examined, {} given {}'s newer mtime, {} compared by bytes, {} of other bytes given the reseed's time",
+                        result.workspace,
+                        mtimes.examined,
+                        mtimes.advanced,
+                        result.target,
+                        mtimes.compared,
+                        mtimes.republished,
+                    ))
+                    .map_err(output_error)?;
+            }
             Ok(success())
         }
         Command::Rekey(args) => {

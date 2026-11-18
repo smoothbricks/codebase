@@ -15,8 +15,8 @@ use super::dto::{
     JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobRecord, JobTail, JobTailLimits,
     LandOptions, LandReport, MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta,
     PushOptions, PushReport, RebaseOptions, RebaseReport, RekeyResult, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, UnprovenWorkspace,
     WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::dto::{
@@ -323,6 +323,8 @@ operations! {
     coordinator json "coordinator.rekey" CoordinatorRekey(WorkspaceRequest) -> RekeyResult;
     /// Deletes a workspace's Nx cache and task database contents on its build volume.
     coordinator json "coordinator.clearNxState" CoordinatorClearNxState(WorkspaceRequest) -> NxStateClearResult;
+    /// Replaces a workspace's build volume with a clone of its target's seed.
+    coordinator json "coordinator.reseed" CoordinatorReseed(WorkspaceRequest) -> ReseedResult;
     /// Detaches a workspace.
     coordinator json "coordinator.detach" CoordinatorDetach(WorkspaceRequest) -> EmptyResult;
     /// Assigns a workspace's gateway port slot.

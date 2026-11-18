@@ -215,6 +215,8 @@ type ReaderName =
   | 'REMOVED_WORKSPACE'
   | 'REMOVE_PROJECT_REPORT'
   | 'REMOVE_REPORT'
+  | 'RESEED_RESULT'
+  | 'RESEED_SOURCE_MTIMES'
   | 'RESIZE_RESULT'
   | 'RESIZE_VOLUME'
   | 'RE_ADOPTION'
@@ -1336,6 +1338,7 @@ const READERS: Readers<ReaderName> = {
       ['land', 'LEAF'],
       ['move-onto-seed', 'LEAF'],
       ['clear-nx-state', 'LEAF'],
+      ['reseed', 'LEAF'],
       ['repair-ports', 'LEAF'],
       ['grant', 'LEAF'],
       ['mint-template', 'LEAF'],
@@ -1655,6 +1658,27 @@ const READERS: Readers<ReaderName> = {
     ],
   },
   REMOVE_REPORT: { kind: 'record', fields: [['abandoned', 'ABANDONED_WORK']] },
+  RESEED_RESULT: {
+    kind: 'record',
+    fields: [
+      ['workspace', 'LEAF'],
+      ['target', 'LEAF'],
+      ['clonedFrom', 'LEAF'],
+      ['previousVolume', 'LEAF'],
+      ['previousBytes', 'LEAF'],
+      ['volume', 'LEAF'],
+      ['sourceMtimes', 'RESEED_SOURCE_MTIMES'],
+    ],
+  },
+  RESEED_SOURCE_MTIMES: {
+    kind: 'record',
+    fields: [
+      ['examined', 'LEAF'],
+      ['advanced', 'LEAF'],
+      ['compared', 'LEAF'],
+      ['republished', 'LEAF'],
+    ],
+  },
   RESIZE_RESULT: {
     kind: 'record',
     fields: [
@@ -2170,6 +2194,9 @@ export const readRemoveProjectReport = (json: string): Api.RemoveProjectReport =
 
 export const readRemoveReport = (json: string): Api.RemoveReport =>
   V.assertRemoveReport(project(JSON.parse(json), 'REMOVE_REPORT', READERS));
+
+export const readReseedResult = (json: string): Api.ReseedResult =>
+  V.assertReseedResult(project(JSON.parse(json), 'RESEED_RESULT', READERS));
 
 export const readResizeResult = (json: string): Api.ResizeResult =>
   V.assertResizeResult(project(JSON.parse(json), 'RESIZE_RESULT', READERS));

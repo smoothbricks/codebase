@@ -46,14 +46,16 @@ type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
 mod compaction;
 mod nx_clear;
+mod reseed;
 mod seed_move;
 mod source_mtimes;
 pub(crate) use compaction::{
     Admission, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS, SEED_COMPACTION_EXTENTS,
     SEED_COMPACTION_WAIT,
 };
-pub(crate) use seed_move::SeedMoveWorkspace;
-pub(crate) use source_mtimes::SourcePaths;
+pub(crate) use reseed::{ReseedPlan, main_reseed_refusal};
+pub(crate) use seed_move::ReplacedWorkspace;
+pub(crate) use source_mtimes::{Harmonized, SourcePaths};
 
 pub(crate) use compaction::lands_hold;
 /// A workspace at one incarnation: whose seed a seed is.
@@ -1315,40 +1317,18 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let operation_elapsed = refreshed.outcome.operation_elapsed();
         let captured = self
             .blocking(move |host, layout| {
-                let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)?
-                else {
-                    return Ok(None);
-                };
-                let started = Instant::now();
-                let captured = host
-                    .capture_fork_build_volume(
-                        layout,
-                        &seed,
-                        // The fork's intent answers for the volume until it publishes `destination`.
-                        &Registration::new(
-                            BuildVolumeRecord {
-                                checked_out: Some(placed),
-                                ..BuildVolumeRecord::new(
-                                    record.tree.clone(),
-                                    BuildVolumeRole::Linked {
-                                        checkout: destination,
-                                    },
-                                )
-                            },
-                            Registrant::Intent,
-                        ),
-                    )
-                    .map_err(storage)?;
-                Ok(Some(CapturedFork {
-                    from: seed,
-                    tree: record.tree,
+                // The fork's intent answers for the volume until it publishes `destination`.
+                capture_seed(
+                    host,
+                    layout,
                     source,
-                    operation_elapsed: operation_elapsed.max(captured.capture_elapsed),
-                    captured,
-                    started,
-                    own_seed: true,
-                    nx: ForkNx::Inherit,
-                }))
+                    Destination {
+                        name: destination,
+                        registrant: Registrant::Intent,
+                        placed: Some(placed),
+                    },
+                    operation_elapsed,
+                )
             })
             .await;
         (captured, superseded)
@@ -1369,55 +1349,19 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         placed: GitOid,
     ) -> Result<Option<CapturedFork>> {
         self.blocking(move |host, layout| {
-            let held = HeldVolume::for_seed(host, layout, live)?;
-            let record = layout.read_record(held.id())?;
-            let started = Instant::now();
-            let (mount, _) = host
-                .mount_build_volume(layout, held.id())
-                .map_err(storage)?;
-            let state = BuildVolumeState::read(&mount)?;
-            let guards = match hold_nx(host.census(), &mount, &state)? {
-                Ok(guards) => Some(guards),
-                Err(skip) => {
-                    cowshed_os::eprintln!(
-                        "cowshed: {destination} starts without {}'s Nx cache and task database: {skip}; its tasks read the project's Nx cache instead",
-                        source.name
-                    );
-                    None
-                }
-            };
-            let captured = host
-                .capture_fork_build_volume(
-                    layout,
-                    held.id(),
-                    &Registration::new(
-                        BuildVolumeRecord {
-                            checked_out: Some(placed),
-                            ..BuildVolumeRecord::new(
-                                record.tree.clone(),
-                                BuildVolumeRole::Linked {
-                                    checkout: destination,
-                                },
-                            )
-                        },
-                        Registrant::Intent,
-                    ),
-                )
-                .map_err(storage)?;
-            Ok(Some(CapturedFork {
-                from: held.id().clone(),
-                tree: record.tree,
+            capture_live(
+                host,
+                layout,
                 source,
-                operation_elapsed: captured.capture_elapsed,
-                captured,
-                started,
-                own_seed: false,
-                nx: if guards.is_some() {
-                    ForkNx::Inherit
-                } else {
-                    ForkNx::Discard
+                live,
+                Destination {
+                    name: destination,
+                    registrant: Registrant::Intent,
+                    placed: Some(placed),
                 },
-            }))
+                SourceDaemon::Stop,
+            )
+            .map(Some)
         })
         .await
     }
@@ -1435,54 +1379,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         captured: Result<Option<CapturedFork>>,
         destination: Owner,
     ) -> Result<Option<PreparedFork>> {
-        let Some(CapturedFork {
-            from,
-            tree,
-            captured,
-            started,
-            source,
-            operation_elapsed,
-            own_seed,
-            nx,
-        }) = captured?
-        else {
+        let Some(captured) = captured? else {
             return Ok(None);
         };
         self.blocking(move |host, layout| {
-            let own_seed = own_seed.then(|| {
-                (
-                    BuildVolumeId::mint(),
-                    Registration::new(
-                        BuildVolumeRecord::new(
-                            tree,
-                            BuildVolumeRole::Seed {
-                                target: destination.name,
-                                incarnation: destination.incarnation,
-                            },
-                        ),
-                        Registrant::Intent,
-                    ),
-                )
-            });
-            let (live, mount, elapsed) = host
-                .ready_fork_build_volume(
-                    layout,
-                    captured,
-                    own_seed
-                        .as_ref()
-                        .map(|(seed, registration)| (seed, registration)),
-                    nx,
-                )
-                .map_err(storage)?;
-            Ok(Some(PreparedFork {
-                from,
-                own_seed: own_seed.map(|(seed, _)| seed),
-                live,
-                mount,
-                started,
-                source,
-                operation_elapsed: operation_elapsed.max(elapsed),
-            }))
+            ready(host, layout, captured, destination, Registrant::Intent).map(Some)
         })
         .await
     }
@@ -1693,10 +1594,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             let started = Instant::now();
             let report = source_mtimes::harmonize(&source, &target, &paths)?;
             cowshed_os::eprintln!(
-                "cowshed: {name} source mtimes: {} tracked + {} output paths, {} regular files \
-                 examined, {} advanced, {} outputs compared, {} republished in {:?}",
-                paths.tracked.len(),
-                paths.outputs.len(),
+                "cowshed: {name} source mtimes: {} equal + {} compared paths, {} regular files \
+                 examined, {} advanced, {} compared by bytes, {} republished in {:?}",
+                paths.equal.len(),
+                paths.compared.len(),
                 report.examined,
                 report.advanced,
                 report.compared,
@@ -2787,13 +2688,7 @@ pub(crate) fn plan(
             }
             Ok(_) => {}
         }
-        let allocated = std::fs::metadata(&image).and_then(|metadata| {
-            if metadata.is_dir() {
-                crate::storage::directory::allocated_tree_bytes(&image)
-            } else {
-                Ok(metadata.blocks().saturating_mul(512))
-            }
-        });
+        let allocated = allocated_image_bytes(&image);
         match allocated {
             Ok(bytes) => plan.doomed.push(Doomed {
                 id,
@@ -2809,6 +2704,16 @@ pub(crate) fn plan(
         }
     }
     Ok(plan)
+}
+
+/// The bytes build image `image` has allocated: a directory store's tree, or a disk image's blocks.
+fn allocated_image_bytes(image: &Path) -> std::io::Result<u64> {
+    let metadata = fs::metadata(image)?;
+    if metadata.is_dir() {
+        crate::storage::directory::allocated_tree_bytes(image)
+    } else {
+        Ok(metadata.blocks().saturating_mul(512))
+    }
 }
 
 /// Every seed recorded for `owner` at its incarnation, published or still registered: what a new
@@ -3713,6 +3618,183 @@ fn mint_seed_image<H: RuntimeStorageHost>(
 
 type CaptureAttempt = std::result::Result<(u64, Option<Duration>, SupersededSeeds), CaptureSkip>;
 
+/// Whose live volume a capture makes (16_build_volumes.md, "Fork" step 3; "Reseed"): the workspace
+/// it is linked to, who answers for it until that workspace links it, and the tree its checkout has
+/// (`None` when cowshed cannot read it: a record without `checkedOut` never reads as moved).
+pub(super) struct Destination {
+    pub name: WorkspaceName,
+    pub registrant: Registrant,
+    pub placed: Option<GitOid>,
+}
+
+impl Destination {
+    fn registration(self, tree: Option<GitOid>) -> Registration {
+        Registration::new(
+            BuildVolumeRecord {
+                checked_out: self.placed,
+                ..BuildVolumeRecord::new(
+                    tree,
+                    BuildVolumeRole::Linked {
+                        checkout: self.name,
+                    },
+                )
+            },
+            self.registrant,
+        )
+    }
+}
+
+/// Fork step 3 (16_build_volumes.md, "Fork"; "Reseed"): `source`'s latest seed captured into a new
+/// live volume of `destination`, registered but not yet proven, published or mounted. The caller
+/// holds `source`'s image lock, so no land or seed refresh of `source` retires the seed meanwhile.
+/// A source with no seed gives none.
+pub(super) fn capture_seed(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    source: Owner,
+    destination: Destination,
+    operation_elapsed: Option<Duration>,
+) -> Result<Option<CapturedFork>> {
+    let Some((seed, record)) = layout.seed_of(&source.name, &source.incarnation)? else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let captured = host
+        .capture_fork_build_volume(
+            layout,
+            &seed,
+            &destination.registration(record.tree.clone()),
+        )
+        .map_err(storage)?;
+    Ok(Some(CapturedFork {
+        from: seed,
+        tree: record.tree,
+        source,
+        operation_elapsed: operation_elapsed.max(captured.capture_elapsed),
+        captured,
+        started,
+        own_seed: true,
+        nx: ForkNx::Inherit,
+    }))
+}
+
+/// An mbx fork's capture (16_build_volumes.md, "Fork" step 3): the target's live volume itself,
+/// cloned under the shared hold its jobs take, so they keep running. No seed is refreshed or
+/// minted and nothing is copied: [`ready`]'s mount moves aside what is not the destination's
+/// ([`crate::build_volume::BuildVolumeState::discard_rebuildable`]). The clone is taken under the
+/// Nx guards a seed's capture takes ([`hold_nx`]), so when no Nx process holds the target's task
+/// database the destination keeps the target's Nx cache and the database that indexes it; when
+/// one does (with [`SourceDaemon::Keep`], the target's own running daemon too), it starts without
+/// them and says why on stderr.
+pub(super) fn capture_live(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    source: Owner,
+    live: BuildVolumeId,
+    destination: Destination,
+    daemon: SourceDaemon,
+) -> Result<CapturedFork> {
+    let held = HeldVolume::for_seed(host, layout, live)?;
+    let record = layout.read_record(held.id())?;
+    let started = Instant::now();
+    let (mount, _) = host
+        .mount_build_volume(layout, held.id())
+        .map_err(storage)?;
+    let state = BuildVolumeState::read(&mount)?;
+    let guards = match hold_nx(host.census(), &mount, &state, daemon)? {
+        Ok(guards) => Some(guards),
+        Err(skip) => {
+            cowshed_os::eprintln!(
+                "cowshed: {} starts without {}'s Nx cache and task database: {skip}; its tasks read the project's Nx cache instead",
+                destination.name,
+                source.name
+            );
+            None
+        }
+    };
+    let captured = host
+        .capture_fork_build_volume(
+            layout,
+            held.id(),
+            &destination.registration(record.tree.clone()),
+        )
+        .map_err(storage)?;
+    Ok(CapturedFork {
+        from: held.id().clone(),
+        tree: record.tree,
+        source,
+        operation_elapsed: captured.capture_elapsed,
+        captured,
+        started,
+        own_seed: false,
+        nx: if guards.is_some() {
+            ForkNx::Inherit
+        } else {
+            ForkNx::Discard
+        },
+    })
+}
+
+/// Fork steps 3 and 4 once the source's image lock is let go (16_build_volumes.md, "Fork";
+/// "Reseed"): the captured live volume proven and published, then, for a non-mbx capture, the
+/// destination's own seed, registered by `registrant`, cloned from it before anything mounts it,
+/// so the seed holds exactly what the source's seed held and the destination is a target others
+/// can fork from, and the live volume mounted with no daemon record and, for an mbx capture, none
+/// of its source's unguarded rebuildable state. The seed comes before the link: a crash between
+/// them leaves an unlinked volume, never a target without a seed.
+pub(super) fn ready(
+    host: &impl RuntimeStorageHost,
+    layout: &BuildVolumeLayout,
+    captured: CapturedFork,
+    destination: Owner,
+    registrant: Registrant,
+) -> Result<PreparedFork> {
+    let CapturedFork {
+        from,
+        tree,
+        captured,
+        started,
+        source,
+        operation_elapsed,
+        own_seed,
+        nx,
+    } = captured;
+    let own_seed = own_seed.then(|| {
+        (
+            BuildVolumeId::mint(),
+            Registration::new(
+                BuildVolumeRecord::new(
+                    tree,
+                    BuildVolumeRole::Seed {
+                        target: destination.name,
+                        incarnation: destination.incarnation,
+                    },
+                ),
+                registrant,
+            ),
+        )
+    });
+    let (live, mount, elapsed) = host
+        .ready_fork_build_volume(
+            layout,
+            captured,
+            own_seed
+                .as_ref()
+                .map(|(seed, registration)| (seed, registration)),
+            nx,
+        )
+        .map_err(storage)?;
+    Ok(PreparedFork {
+        from,
+        own_seed: own_seed.map(|(seed, _)| seed),
+        live,
+        mount,
+        started,
+        source,
+        operation_elapsed: operation_elapsed.max(elapsed),
+    })
+}
+
 /// Freeze `source` as `target`'s seed, retaining mbx state under shared custody or capturing
 /// non-mbx warm state under its Nx/Cargo guards. Claim every older seed ([`claim_superseded`]) for its
 /// retirement once the target's image lock is let go: the fork this refresh serves never waits
@@ -3744,7 +3826,7 @@ fn capture(
         Ok(claim) => claim,
         Err(reason) => return Ok(Err(reason)),
     };
-    let _opens = match hold_nx(host.census(), &mount, &state)? {
+    let _opens = match hold_nx(host.census(), &mount, &state, SourceDaemon::Stop)? {
         Ok(opens) => opens,
         Err(skip) => return Ok(Err(skip)),
     };
@@ -3867,18 +3949,30 @@ fn database_holder(holder: cowshed_os::process::Holder) -> DatabaseHolder {
     }
 }
 
+/// Whether a capture's Nx guards stop the source's daemon when nothing else holds a task database
+/// (a fork, a seed capture), or leave it running (a reseed, 16_build_volumes.md "Reseed"), so a
+/// running daemon is a holder and the capture goes without the source's Nx state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceDaemon {
+    Stop,
+    Keep,
+}
+
 /// The Nx guards a capture of a mounted volume holds until its clone is fixed
 /// (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional writers" step 2):
-/// the volume's daemon stopped when nothing else holds a task database open, every task
-/// database's open lock taken so no Nx process opens one, and a last look that none holds one.
-/// While the answered locks live, no Nx process writes the volume's Nx cache or task databases.
+/// the volume's daemon stopped when nothing else holds a task database open (unless `daemon`
+/// keeps it), every task database's open lock taken so no Nx process opens one, and a last look
+/// that none holds one. While the answered locks live, no Nx process writes the volume's Nx cache
+/// or task databases.
 fn hold_nx(
     census: &crate::census::CensusScope,
     mount: &Path,
     state: &BuildVolumeState,
+    daemon: SourceDaemon,
 ) -> Result<std::result::Result<nx::Opens, CaptureSkip>> {
-    if let Err(busy) = nx::close(census, mount, state)
-        .map_err(|error| io("close the volume's Nx state", mount, &error))?
+    if daemon == SourceDaemon::Stop
+        && let Err(busy) = nx::close(census, mount, state)
+            .map_err(|error| io("close the volume's Nx state", mount, &error))?
     {
         return Ok(Err(capture_skip(busy)));
     }
@@ -5802,7 +5896,7 @@ mod tests {
         scratch: &Scratch<H>,
         owner: Owner,
         checkout: PathBuf,
-    ) -> SeedMoveWorkspace {
+    ) -> ReplacedWorkspace {
         let layout = crate::storage::StorageLayout::with_mount_root(
             scratch.root.path().join("store"),
             scratch.root.path().join("mnt"),
@@ -5812,7 +5906,7 @@ mod tests {
         let image = layout.canonical_image(&owner.name).unwrap();
         fs::create_dir_all(image.image().parent().unwrap()).unwrap();
         fs::write(image.image(), b"source-image-identity").unwrap();
-        SeedMoveWorkspace {
+        ReplacedWorkspace {
             intent_lease: layout
                 .project()
                 .sessions
@@ -10763,4 +10857,415 @@ fn main() {
         );
         scratch.release_all();
     }
+
+    //#region smoo/cowshed!n/workspace-reseed
+    type Tested = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    /// Main with a seed whose volume holds `seed-marker`, and `topic`, a workspace of its, whose live
+    /// volume holds `old-marker` and whose own seed is a clone of that volume.
+    #[cfg(target_os = "macos")]
+    struct ReseedFixture {
+        scratch: Scratch<crate::storage::directory::DirectoryExecutionHost>,
+        main: Owner,
+        main_checkout: PathBuf,
+        main_live: BuildVolumeId,
+        main_seed: BuildVolumeId,
+        main_tree: GitOid,
+        topic: Owner,
+        topic_checkout: PathBuf,
+        topic_live: BuildVolumeId,
+        topic_mount: PathBuf,
+        topic_seed: BuildVolumeId,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seed_of_owner(
+        scratch: &Scratch<crate::storage::directory::DirectoryExecutionHost>,
+        live: &BuildVolumeId,
+        owner: &Owner,
+        tree: Option<GitOid>,
+    ) -> std::result::Result<BuildVolumeId, Box<dyn std::error::Error>> {
+        let seed = BuildVolumeId::mint();
+        scratch.host.clone_build_volume(
+            &scratch.layout,
+            live,
+            &seed,
+            &registered(BuildVolumeRecord::new(
+                tree,
+                BuildVolumeRole::Seed {
+                    target: owner.name.clone(),
+                    incarnation: owner.incarnation.clone(),
+                },
+            )),
+        )?;
+        Ok(seed)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reseed_fixture(
+        name: &str,
+    ) -> std::result::Result<ReseedFixture, Box<dyn std::error::Error>> {
+        let scratch = Scratch::data_directory(name);
+        let main = owner("main", '0');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        fs::write(main_mount.join("seed-marker"), b"main's build")?;
+        let main_tree = commit(&main_checkout, &[("lib.rs", "main\n")]);
+        let main_seed = seed_of_owner(&scratch, &main_live, &main, Some(main_tree.clone()))?;
+        let topic = owner("topic", '1');
+        let (topic_checkout, topic_live, topic_mount) = scratch.linked_checkout("topic", 1);
+        fs::write(topic_mount.join("old-marker"), b"topic's build")?;
+        let topic_tree = commit(&topic_checkout, &[("lib.rs", "topic\n")]);
+        let topic_seed = seed_of_owner(&scratch, &topic_live, &topic, Some(topic_tree))?;
+        let main_lock = scratch.image_lock(&main.name);
+        fs::create_dir_all(main_lock.parent().ok_or("an image lock has a parent")?)?;
+        Ok(ReseedFixture {
+            scratch,
+            main,
+            main_checkout,
+            main_live,
+            main_seed,
+            main_tree,
+            topic,
+            topic_checkout,
+            topic_live,
+            topic_mount,
+            topic_seed,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reseed_plan(
+        fixture: &ReseedFixture,
+        workspace: &Owner,
+        checkout: &Path,
+        paths: SourcePaths,
+    ) -> ReseedPlan {
+        ReseedPlan {
+            workspace: seed_move_workspace(
+                &fixture.scratch,
+                workspace.clone(),
+                checkout.to_owned(),
+            ),
+            target: fixture.main.clone(),
+            target_checkout: fixture.main_checkout.clone(),
+            target_lock: fixture.scratch.image_lock(&fixture.main.name),
+            paths,
+        }
+    }
+
+    /// What a reseed must leave as it is in a checkout: HEAD, the branch, the status git reports
+    /// and the bytes of every named file.
+    fn source_state(
+        checkout: &Path,
+        files: &[&str],
+    ) -> std::result::Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let mut state = Vec::new();
+        for args in [
+            &["rev-parse", "HEAD"][..],
+            &["symbolic-ref", "HEAD"][..],
+            &["status", "--porcelain=v1", "--untracked-files=all"][..],
+        ] {
+            let output = crate::git::git_command_at(checkout)
+                .args(args)
+                .output_bounded()?;
+            if !output.status.success() {
+                return Err(format!("git {args:?} in {}: {output:?}", checkout.display()).into());
+            }
+            state.push(output.stdout);
+        }
+        for file in files {
+            state.push(fs::read(checkout.join(file))?);
+        }
+        Ok(state)
+    }
+
+    /// A reseed replaces only the workspace's build volume: the checkout links a new volume cloned
+    /// from its target's latest seed (it holds the seed's marker, not the old volume's), recorded at
+    /// the seed's tree and placed at the checkout's; HEAD, branch, status and the bytes of a
+    /// committed, an edited and an untracked file are as they were; the old volume and the
+    /// workspace's old seed are released, and the workspace has one new seed of its own.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_reseed_replaces_only_the_build_volume_with_a_clone_of_the_targets_seed()
+    -> Tested {
+        let fixture = reseed_fixture("reseed-replaces")?;
+        let topic_checkout = &fixture.topic_checkout;
+        fs::write(topic_checkout.join("lib.rs"), "topic, edited\n")?;
+        fs::write(topic_checkout.join("notes.txt"), "uncommitted\n")?;
+        let files = ["lib.rs", "notes.txt"];
+        let before = source_state(topic_checkout, &files)?;
+        let placed = head_tree(topic_checkout)?;
+
+        let reseeded = fixture
+            .scratch
+            .volumes
+            .reseed_workspace(reseed_plan(
+                &fixture,
+                &fixture.topic,
+                topic_checkout,
+                SourcePaths::default(),
+            ))
+            .await?;
+
+        let layout = &fixture.scratch.layout;
+        assert_eq!(reseeded.previous, fixture.topic_live);
+        assert_eq!(reseeded.cloned_from, fixture.main_seed);
+        assert_ne!(reseeded.volume, fixture.topic_live);
+        assert!(reseeded.previous_bytes > 0, "{reseeded:?}");
+        assert_eq!(
+            layout.linked(topic_checkout)?,
+            Some(reseeded.volume.clone())
+        );
+        let mount = layout.mount(&reseeded.volume);
+        assert_eq!(fs::read(mount.join("seed-marker"))?, b"main's build");
+        assert!(
+            !mount.join("old-marker").exists(),
+            "the old volume's bytes do not travel"
+        );
+        let record = layout.read_record(&reseeded.volume)?;
+        assert_eq!(record.tree, Some(fixture.main_tree.clone()));
+        assert_eq!(record.checked_out, Some(placed));
+        assert_eq!(record.role, linked("topic"));
+        assert_eq!(
+            source_state(topic_checkout, &files)?,
+            before,
+            "the source is untouched"
+        );
+        assert!(
+            !layout.image(&fixture.topic_live).exists(),
+            "the old volume is released"
+        );
+        assert!(
+            !layout.image(&fixture.topic_seed).exists(),
+            "the old seed is retired"
+        );
+        let seeds = seeds_of(layout, &fixture.topic)?;
+        assert_eq!(seeds.len(), 1, "{seeds:?}");
+        assert_ne!(seeds[0], fixture.topic_seed);
+        assert_eq!(
+            layout.read_record(&seeds[0])?.tree,
+            Some(fixture.main_tree.clone())
+        );
+        assert!(
+            layout.image(&fixture.main_seed).exists(),
+            "the target's seed stays"
+        );
+        assert_eq!(
+            layout.linked(&fixture.main_checkout)?,
+            Some(fixture.main_live.clone())
+        );
+        fixture.scratch.release_all();
+        Ok(())
+    }
+
+    /// A reseed refuses, naming the holder and changing nothing, while a job holds the workspace's
+    /// build volume or another lifecycle operation holds its image lock; main is refused by name,
+    /// with what to run instead. Once nothing holds it, the same reseed replaces the volume.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_reseed_refuses_a_held_volume_and_main_by_name_and_changes_nothing()
+    -> Tested {
+        let fixture = reseed_fixture("reseed-refusals")?;
+        let layout = &fixture.scratch.layout;
+        let volumes = || -> std::result::Result<Vec<BuildVolumeId>, Box<dyn std::error::Error>> {
+            let mut listed = layout.list()?;
+            listed.sort();
+            Ok(listed)
+        };
+        let listed = volumes()?;
+        let reseed = || {
+            fixture.scratch.volumes.reseed_workspace(reseed_plan(
+                &fixture,
+                &fixture.topic,
+                &fixture.topic_checkout,
+                SourcePaths::default(),
+            ))
+        };
+        let unchanged = || -> Tested {
+            assert_eq!(
+                layout.linked(&fixture.topic_checkout)?,
+                Some(fixture.topic_live.clone())
+            );
+            assert_eq!(
+                fs::read(fixture.topic_mount.join("old-marker"))?,
+                b"topic's build"
+            );
+            assert_eq!(volumes()?, listed, "nothing was minted or released");
+            Ok(())
+        };
+
+        let job = layout.admit(&fixture.topic_live)?;
+        let Err(refusal) = reseed().await else {
+            return Err("a volume a job holds was reseeded".into());
+        };
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(&std::process::id().to_string()),
+            "{refusal}"
+        );
+        assert!(
+            refusal
+                .message
+                .contains(&layout.hold_path(&fixture.topic_live).display().to_string()),
+            "{refusal}"
+        );
+        unchanged()?;
+        drop(job);
+
+        let locked = fixture.scratch.lock(&fixture.topic).await;
+        let Err(refusal) = reseed().await else {
+            return Err("a workspace another operation holds was reseeded".into());
+        };
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(
+                &fixture
+                    .scratch
+                    .image_lock(&fixture.topic.name)
+                    .display()
+                    .to_string()
+            ),
+            "{refusal}"
+        );
+        unchanged()?;
+        drop(locked);
+
+        let Err(refusal) = fixture
+            .scratch
+            .volumes
+            .reseed_workspace(reseed_plan(
+                &fixture,
+                &fixture.main,
+                &fixture.main_checkout,
+                SourcePaths::default(),
+            ))
+            .await
+        else {
+            return Err("main was reseeded".into());
+        };
+        assert_eq!(refusal.code, crate::ErrorCode::Usage, "{refusal}");
+        assert!(refusal.message.contains("main"), "{refusal}");
+        assert!(refusal.hint.contains("cowshed defrag main"), "{refusal}");
+        assert_eq!(
+            layout.linked(&fixture.main_checkout)?,
+            Some(fixture.main_live.clone())
+        );
+        unchanged()?;
+
+        let reseeded = reseed().await?;
+        assert_ne!(reseeded.volume, fixture.topic_live);
+        assert_eq!(
+            layout.linked(&fixture.topic_checkout)?,
+            Some(reseeded.volume)
+        );
+        fixture.scratch.release_all();
+        Ok(())
+    }
+
+    /// Without mbx a seed holds Cargo units built from the target's bytes, which Cargo judges fresh
+    /// while every input is older than the unit: mtime alone, as
+    /// `source_mtimes_make_cargo_rebuild_a_unit_the_fast_forward_left_stale` shows with real Cargo.
+    /// Two workspace files hold other bytes than the target's and are older than the unit the target
+    /// built: one the workspace edited before the target's build, one the target rewrote after the
+    /// workspace forked (the workspace keeping the old bytes and the old time). The pairing reuses
+    /// the target's unit. After a reseed every workspace input whose bytes differ is newer than every
+    /// unit of the new volume, an input with the target's bytes takes the target's newer mtime, and
+    /// no byte of the source changes.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_reseed_leaves_no_unit_newer_than_a_workspace_input_of_other_bytes()
+    -> Tested {
+        use source_mtimes::tests::{mtime, put};
+        let scratch = Scratch::data_directory("reseed-mtimes");
+        let main = owner("main", '0');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        let hour = Duration::from_secs(3600);
+        let long_ago = SystemTime::now() - 2 * hour;
+        let manifest = b"[package]\nname = \"reseed_probe\"\n";
+        put(&main_checkout.join("Cargo.toml"), manifest, long_ago + hour);
+        // Both checkouts held these bytes at these times when the workspace forked.
+        put(&main_checkout.join("src/main.rs"), b"A", long_ago);
+        // The target rewrote this one after the fork.
+        put(
+            &main_checkout.join("src/lib.rs"),
+            b"new",
+            long_ago + hour / 2,
+        );
+        // The unit the target built from its own bytes, after them.
+        let unit = std::path::Path::new("target/debug/.fingerprint/reseed_probe/bin-reseed_probe");
+        put(
+            &main_mount.join(unit),
+            b"built from A",
+            long_ago + hour + hour / 2,
+        );
+        let main_seed = seed_of_owner(&scratch, &main_live, &main, None)?;
+
+        let topic = owner("topic", '1');
+        let (topic_checkout, topic_live, _) = scratch.linked_checkout("topic", 1);
+        put(&topic_checkout.join("Cargo.toml"), manifest, long_ago);
+        // The workspace edited this one after the fork, before the target's build.
+        put(
+            &topic_checkout.join("src/main.rs"),
+            b"B",
+            long_ago + hour / 6,
+        );
+        put(&topic_checkout.join("src/lib.rs"), b"old", long_ago);
+        let built = mtime(&main_mount.join(unit));
+        for file in ["src/main.rs", "src/lib.rs"] {
+            assert!(
+                mtime(&topic_checkout.join(file)) < built,
+                "the hazard: {file} holds other bytes and is older than the unit built from the target's"
+            );
+        }
+
+        let main_lock = scratch.image_lock(&main.name);
+        fs::create_dir_all(main_lock.parent().ok_or("an image lock has a parent")?)?;
+        let reseeded = scratch
+            .volumes
+            .reseed_workspace(ReseedPlan {
+                workspace: seed_move_workspace(&scratch, topic, topic_checkout.clone()),
+                target: main,
+                target_checkout: main_checkout.clone(),
+                target_lock: main_lock,
+                // Listed as a land lists tracked files: the reseed compares them all by bytes.
+                paths: SourcePaths {
+                    equal: ["Cargo.toml", "src/lib.rs", "src/main.rs"]
+                        .map(PathBuf::from)
+                        .to_vec(),
+                    compared: Vec::new(),
+                },
+            })
+            .await?;
+        assert_eq!(reseeded.cloned_from, main_seed);
+        assert_ne!(reseeded.volume, topic_live);
+        let unit_now = mtime(&scratch.layout.mount(&reseeded.volume).join(unit));
+        assert_eq!(unit_now, built, "the clone keeps the unit's mtime");
+        for (file, bytes) in [("src/main.rs", &b"B"[..]), ("src/lib.rs", b"old")] {
+            assert!(
+                mtime(&topic_checkout.join(file)) > unit_now,
+                "{file} is newer than the unit built from the target's bytes, so Cargo rebuilds it"
+            );
+            assert_eq!(fs::read(topic_checkout.join(file))?, bytes);
+        }
+        assert_eq!(
+            mtime(&topic_checkout.join("Cargo.toml")),
+            mtime(&main_checkout.join("Cargo.toml")),
+            "equal bytes take the target's newer mtime"
+        );
+        assert_eq!(fs::read(topic_checkout.join("Cargo.toml"))?, manifest);
+        let harmonized = reseeded
+            .source_mtimes
+            .ok_or("a reseed without mbx compares mtimes")?;
+        assert_eq!(
+            (
+                harmonized.examined,
+                harmonized.advanced,
+                harmonized.republished
+            ),
+            (3, 1, 2)
+        );
+        scratch.release_all();
+        Ok(())
+    }
+    //#endregion smoo/cowshed!n/workspace-reseed
 }

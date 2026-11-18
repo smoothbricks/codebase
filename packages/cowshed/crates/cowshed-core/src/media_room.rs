@@ -222,6 +222,7 @@ pub fn attach_demand(operation: &OperationRequest) -> AttachDemand {
         Op::CoordinatorDefragment(request)
         | Op::CoordinatorRekey(request)
         | Op::CoordinatorClearNxState(request)
+        | Op::CoordinatorReseed(request)
         | Op::CoordinatorWorker(request)
         | Op::CoordinatorRefreshBuildState(request) => one(&request.workspace),
         Op::CoordinatorExec(params) | Op::WorkerExec(params) => one(&params.workspace),

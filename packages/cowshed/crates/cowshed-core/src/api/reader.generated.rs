@@ -649,6 +649,7 @@ static LOCK_OPERATION: Reader = Reader::External(&[
     ("land", &LEAF),
     ("move-onto-seed", &LEAF),
     ("clear-nx-state", &LEAF),
+    ("reseed", &LEAF),
     ("repair-ports", &LEAF),
     ("grant", &LEAF),
     ("mint-template", &LEAF),
@@ -855,6 +856,21 @@ static REPOSITORY_BINDING: Reader = Reader::Record(&[
     ("version", &LEAF),
     ("identities", &SEQ__BOUND_IDENTITY),
     ("formerIdentities", &LEAF),
+]);
+static RESEED_RESULT: Reader = Reader::Record(&[
+    ("workspace", &LEAF),
+    ("target", &LEAF),
+    ("clonedFrom", &LEAF),
+    ("previousVolume", &LEAF),
+    ("previousBytes", &LEAF),
+    ("volume", &LEAF),
+    ("sourceMtimes", &RESEED_SOURCE_MTIMES),
+]);
+static RESEED_SOURCE_MTIMES: Reader = Reader::Record(&[
+    ("examined", &LEAF),
+    ("advanced", &LEAF),
+    ("compared", &LEAF),
+    ("republished", &LEAF),
 ]);
 static RESIZE_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
@@ -1253,6 +1269,10 @@ impl Projected for crate::api::dto::RemoveProjectReport {
 
 impl Projected for crate::api::dto::RemoveReport {
     const READER: &'static Reader = &REMOVE_REPORT;
+}
+
+impl Projected for crate::api::dto::ReseedResult {
+    const READER: &'static Reader = &RESEED_RESULT;
 }
 
 impl Projected for crate::api::dto::ResizeResult {

@@ -408,6 +408,10 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorDefragment(this.#native, { workspace }));
   }
 
+  async reseed(workspace: string): Promise<Api.ReseedResult> {
+    return callNativeAsync(() => N.coordinatorReseed(this.#native, { workspace }));
+  }
+
   async clearNxState(workspace: string): Promise<Api.NxStateClearResult> {
     return callNativeAsync(() => N.coordinatorClearNxState(this.#native, { workspace }));
   }

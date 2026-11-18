@@ -825,6 +825,16 @@ impl ProjectRuntimeHost for FakeHost {
             "the fake runtime host keeps no CA identity for {workspace} to rotate"
         )))
     }
+    async fn reseed(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<cowshed_core::api::dto::ReseedResult> {
+        self.workspace(&workspace)?;
+        Err(CowshedError::environment_missing(
+            "this lifecycle test host has no build-volume storage",
+            "use the directory reseed fixture",
+        ))
+    }
 
     async fn clear_nx_state(
         &mut self,

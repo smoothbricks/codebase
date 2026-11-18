@@ -2274,6 +2274,7 @@ export type LockOperation =
   | 'land'
   | 'move-onto-seed'
   | 'clear-nx-state'
+  | 'reseed'
   | 'repair-ports'
   | 'grant'
   | 'mint-template';
@@ -2974,6 +2975,34 @@ export type RepositoryBinding = {
   readonly version: number & tags.Type<'uint32'>;
   readonly identities: ReadonlyArray<BoundIdentity>;
   readonly formerIdentities?: ReadonlyArray<RepoId>;
+};
+
+/**
+ * What `cowshed reseed` did (16_build_volumes.md, "Reseed"): the workspace's build volume
+ * replaced by a clone of `clonedFrom` (its target's latest seed, or an mbx target's live volume),
+ * the bytes the previous volume's image had allocated (shared with its clones, so not all freed),
+ * and, in a project without mbx, what the source mtime pass changed.
+ */
+export type ReseedResult = {
+  readonly workspace: WorkspaceName;
+  readonly target: WorkspaceName;
+  readonly clonedFrom: string;
+  readonly previousVolume: string;
+  readonly previousBytes: number & tags.Type<'uint64'>;
+  readonly volume: string;
+  readonly sourceMtimes?: ReseedSourceMtimes;
+};
+
+/**
+ * The source mtime pass of a reseed without mbx (16_build_volumes.md, "Reseed"): the workspace's
+ * files that are regular files in both checkouts, those given the target's newer mtime for equal
+ * bytes, those compared by bytes, and those whose bytes differ, given the time of the pass.
+ */
+export type ReseedSourceMtimes = {
+  readonly examined: number & tags.Type<'uint64'>;
+  readonly advanced: number & tags.Type<'uint64'>;
+  readonly compared: number & tags.Type<'uint64'>;
+  readonly republished: number & tags.Type<'uint64'>;
 };
 
 /**

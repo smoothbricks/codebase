@@ -914,6 +914,26 @@ impl Serves<CoordinatorClearNxState> for Coordinator {
     }
 }
 
+impl Serves<CoordinatorReseed> for Coordinator {
+    const BOUND: &'static [&'static str] = &["repoId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<WorkspaceRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            workspace: WorkspaceName,
+        }
+        let Caller { workspace } = decode::<CoordinatorReseed, Caller>(arguments)?;
+        Ok(WorkspaceRequest {
+            repo_id: owned(authority.repo_id),
+            workspace,
+        })
+    }
+}
+
 impl Serves<CoordinatorDetach> for Coordinator {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -1816,6 +1836,7 @@ pub(crate) fn each_served(check: &mut impl EachServed, handles: &Handles<'_>) {
     check.served::<CoordinatorDefragment, _>(handles.coordinator, &[]);
     check.served::<CoordinatorRekey, _>(handles.coordinator, &[]);
     check.served::<CoordinatorClearNxState, _>(handles.coordinator, &[]);
+    check.served::<CoordinatorReseed, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDetach, _>(handles.coordinator, &[]);
     check.served::<CoordinatorAssignSlot, _>(handles.coordinator, &[]);
     check.served::<CoordinatorDestroy, _>(handles.coordinator, &[]);

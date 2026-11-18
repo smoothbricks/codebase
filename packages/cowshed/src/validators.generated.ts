@@ -1419,6 +1419,19 @@ export const assertRepositoryBindingList = typia.createAssertEquals<readonly Api
 export const parseRepositoryBindingList = (json: string): readonly Api.RepositoryBinding[] =>
   assertRepositoryBindingList(JSON.parse(json));
 
+export const assertReseedResult = typia.createAssertEquals<Api.ReseedResult>();
+export const parseReseedResult = (json: string): Api.ReseedResult => assertReseedResult(JSON.parse(json));
+export const assertReseedResultList = typia.createAssertEquals<readonly Api.ReseedResult[]>();
+export const parseReseedResultList = (json: string): readonly Api.ReseedResult[] =>
+  assertReseedResultList(JSON.parse(json));
+
+export const assertReseedSourceMtimes = typia.createAssertEquals<Api.ReseedSourceMtimes>();
+export const parseReseedSourceMtimes = (json: string): Api.ReseedSourceMtimes =>
+  assertReseedSourceMtimes(JSON.parse(json));
+export const assertReseedSourceMtimesList = typia.createAssertEquals<readonly Api.ReseedSourceMtimes[]>();
+export const parseReseedSourceMtimesList = (json: string): readonly Api.ReseedSourceMtimes[] =>
+  assertReseedSourceMtimesList(JSON.parse(json));
+
 export const assertResidentBytes = typia.createAssertEquals<Api.ResidentBytes>();
 export const parseResidentBytes = (json: string): Api.ResidentBytes => assertResidentBytes(JSON.parse(json));
 export const assertResidentBytesList = typia.createAssertEquals<readonly Api.ResidentBytes[]>();

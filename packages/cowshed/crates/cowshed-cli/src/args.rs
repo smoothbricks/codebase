@@ -55,7 +55,7 @@ pub static COMMAND_GROUPS: &[CommandGroup] = &[
     },
     CommandGroup {
         heading: "storage and cache commands",
-        commands: &[&GC, &RESIZE, &DEFRAG, &CACHE],
+        commands: &[&GC, &RESIZE, &DEFRAG, &RESEED, &CACHE],
     },
     CommandGroup {
         heading: "commands for tools and embedders",
@@ -116,6 +116,7 @@ pub enum Command {
     Mount(MountArgs),
     Resize(ResizeArgs),
     Defrag(DefragArgs),
+    Reseed(ReseedArgs),
     Rekey(RekeyArgs),
     Cache(CacheCommand),
     Gc(GcArgs),
@@ -194,6 +195,7 @@ impl Command {
             | Self::Attach(_)
             | Self::Resize(_)
             | Self::Defrag(_)
+            | Self::Reseed(_)
             | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -620,6 +622,11 @@ pub struct DefragArgs {
     pub workspace: String,
 }
 
+/// `reseed <ws>` — replace a workspace's build volume with a clone of its target's seed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReseedArgs {
+    pub workspace: String,
+}
 /// `cache clear [<ws>]` — delete a workspace's Nx state and the project's Nx store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheCommand {
@@ -1037,6 +1044,7 @@ pub fn cli_command() -> ClapCommand {
                 .arg(value_once("build")),
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
+        .subcommand(leaf("reseed").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(
             leaf("cache")
@@ -1294,6 +1302,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
         "defrag" => parse_defrag(leaf)?,
+        "reseed" => parse_reseed(leaf)?,
         "cache" => parse_cache(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
@@ -3711,6 +3720,25 @@ fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const RESEED: CommandSpec = CommandSpec {
+    name: "reseed",
+    missing: "reseed requires a workspace",
+    args: "<ws>",
+    trailing: "",
+    summary: "replace a workspace's build volume with its target's seed",
+    about: &[
+        "Replaces only the workspace's build volume with what a fork of its target would be given now: a clone of the target's latest seed (in an mbx project, of the target's live volume, keeping only capability-retained state). The target is the workspace it was forked from and lands into, as its record names it: main for an ordinary workspace, its lane base for a unit of a lane. The source image, branch, HEAD, uncommitted and untracked files and grants stay as they are. Reach for it when a workspace's build volume is fragmented or its build state stale, instead of `defrag`, which rewrites both images, or removing the workspace to fork it again.",
+        "It refuses, naming the holder and changing nothing, while a land, removal, fork or other lifecycle operation holds the workspace, a job or land holds its build volume, a process other than its own Nx daemon has a task database open, a Cargo build holds a profile lock, or anything has a file open on the volume. The workspace's own Nx daemon is stopped and starts again on its next request; nothing of the target is stopped. Without mbx the workspace's tracked files and declared Nx outputs take the target checkout's mtimes where their bytes are equal and the time of the reseed where they differ, so Cargo rebuilds every unit the seed built from other bytes; no byte of the source changes. The old volume and the workspace's old seed are released as a removal releases them. Main is refused: it has no target.",
+    ],
+    options: &[],
+};
+
+fn parse_reseed(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &RESEED;
+    Ok(Command::Reseed(ReseedArgs {
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+    }))
+}
 const CACHE: CommandSpec = CommandSpec {
     name: "cache",
     missing: "cache action is required",
@@ -6056,6 +6084,7 @@ mod tests {
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
             (&["defrag", "main"], Required),
+            (&["reseed", "raven"], Required),
             (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
@@ -6235,6 +6264,7 @@ mod tests {
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["defrag"], "defrag requires a workspace"),
+            (&["reseed"], "reseed requires a workspace"),
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),

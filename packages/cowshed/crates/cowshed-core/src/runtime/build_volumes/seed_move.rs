@@ -18,8 +18,10 @@ use crate::storage::recovery::{LIFECYCLE_INTENTS_FILE, LifecycleIntentJournal};
 use crate::{CowshedError, Result};
 use cowshed_apfs::store_lock::LockMode;
 
+/// A workspace whose live build volume an operation replaces (seed compaction's move, a reseed):
+/// its checkout, whose build link moves, and the image lock and intent lease the replacement holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SeedMoveWorkspace {
+pub(crate) struct ReplacedWorkspace {
     pub owner: Owner,
     pub checkout: PathBuf,
     pub image: ImagePaths,
@@ -36,7 +38,7 @@ struct ImageObservation {
 /// An immutable observation, never authority to delete an image after its identity changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SeedMovePlan {
-    workspace: SeedMoveWorkspace,
+    workspace: ReplacedWorkspace,
     source_identity: (u64, u64),
     previous: BuildVolumeId,
     previous_record: BuildVolumeRecord,
@@ -61,7 +63,7 @@ pub(crate) struct MovedVolume {
 }
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
-    pub async fn plan_move_onto_seed(&self, workspace: SeedMoveWorkspace) -> Result<SeedMovePlan> {
+    pub async fn plan_move_onto_seed(&self, workspace: ReplacedWorkspace) -> Result<SeedMovePlan> {
         self.blocking(move |_, layout| observe(layout, workspace))
             .await
     }
@@ -89,30 +91,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         sealing: impl FnOnce() + Send + 'static,
     ) -> Result<MovedVolume> {
         self.blocking(move |host, layout| {
-            let locks = [
-                plan.workspace.image.lock().to_owned(),
-                plan.workspace.intent_lease.clone(),
-            ];
-            let holding = crate::api::held_lock::LockHolding::of(
-                crate::api::held_lock::LockOperation::MoveOntoSeed,
-                &plan.workspace.owner.name,
-            );
-            let Some(_locked) = host
-                .lock_images(&locks, LockMode::Try, &holding)
-                .map_err(storage)?
-            else {
-                let mut holders = Vec::new();
-                for lock in &locks {
-                    let open = nx::holders(host.census(), lock).map_err(|error| io("name seed move lock holders", lock, &error))?;
-                    if !open.is_empty() {
-                        holders.push(format!("{} held by {}", lock.display(), named(&open)));
-                    }
+            let holding = crate::api::held_lock::LockOperation::MoveOntoSeed;
+            let _locked = match lock_workspace(host, &plan.workspace, holding)? {
+                Ok(locked) => locked,
+                Err(held) => {
+                    return Err(CowshedError::conflict(
+                        format!("cannot move {} onto its seed: lifecycle/image lock {held}", plan.workspace.owner.name),
+                        "let the named lifecycle operation finish, then retry the seed move",
+                    ));
                 }
-                return Err(CowshedError::conflict(
-                    format!("cannot move {} onto its seed: lifecycle/image lock {}", plan.workspace.owner.name,
-                        if holders.is_empty() { "held by a process this user cannot see".to_owned() } else { holders.join("; ") }),
-                    "let the named lifecycle operation finish, then retry the seed move",
-                ));
             };
             require_current(layout, &plan)?;
             let claim = match host.claim_build_volume(layout, &plan.previous).map_err(storage)? {
@@ -207,6 +194,39 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
     }
 }
 
+/// Take `workspace`'s image lock and intent lease without waiting, for `operation`; when another
+/// operation holds either, answer which, with each visible holder, for the caller's refusal.
+pub(super) fn lock_workspace<H: RuntimeStorageHost>(
+    host: &H,
+    workspace: &ReplacedWorkspace,
+    operation: crate::api::held_lock::LockOperation,
+) -> Result<std::result::Result<H::LockGuard, String>> {
+    let locks = [
+        workspace.image.lock().to_owned(),
+        workspace.intent_lease.clone(),
+    ];
+    let holding = crate::api::held_lock::LockHolding::of(operation, &workspace.owner.name);
+    if let Some(locked) = host
+        .lock_images(&locks, LockMode::Try, &holding)
+        .map_err(storage)?
+    {
+        return Ok(Ok(locked));
+    }
+    let mut holders = Vec::new();
+    for lock in &locks {
+        let open = nx::holders(host.census(), lock)
+            .map_err(|error| io("name lifecycle lock holders", lock, &error))?;
+        if !open.is_empty() {
+            holders.push(format!("{} held by {}", lock.display(), named(&open)));
+        }
+    }
+    Ok(Err(if holders.is_empty() {
+        "held by a process this user cannot see".to_owned()
+    } else {
+        holders.join("; ")
+    }))
+}
+
 fn require_current(layout: &BuildVolumeLayout, plan: &SeedMovePlan) -> Result<()> {
     let current = observe(layout, plan.workspace.clone())?;
     if &current != plan {
@@ -251,7 +271,7 @@ fn require_no_newer_write(
     }
 }
 
-fn observe(layout: &BuildVolumeLayout, workspace: SeedMoveWorkspace) -> Result<SeedMovePlan> {
+fn observe(layout: &BuildVolumeLayout, workspace: ReplacedWorkspace) -> Result<SeedMovePlan> {
     let journal_path = layout.project_root().join(LIFECYCLE_INTENTS_FILE);
     let journal = LifecycleIntentJournal::load(&journal_path)?;
     for name in journal.forming() {

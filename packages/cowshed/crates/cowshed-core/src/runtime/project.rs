@@ -283,6 +283,9 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::NxStateClearResult>;
+    /// Replace the workspace's build volume with what a fork of its target is given now
+    /// (16_build_volumes.md, "Reseed").
+    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult>;
     async fn remove(
         &mut self,
         workspace: WorkspaceName,
@@ -1814,6 +1817,11 @@ impl ProjectActor {
                 respond::<operations::CoordinatorClearNxState>(
                     &self.host.clear_nx_state(params.workspace).await?,
                 )
+            }
+            Op::CoordinatorReseed(params) => {
+                self.require_repo(&params.repo_id)?;
+                self.host.make_media_room(demand).await;
+                respond::<operations::CoordinatorReseed>(&self.host.reseed(params.workspace).await?)
             }
             Op::CoordinatorDetach(params) => {
                 self.require_repo(&params.repo_id)?;
@@ -6334,7 +6342,7 @@ self.finish_retire_intent(&workspace).await?;
                 timed_async(
                     "land",
                     "source-paths",
-                    self.land_source_paths(workspace, landing),
+                    self.source_paths(workspace, landing),
                 )
                 .await?
             }
@@ -6839,7 +6847,7 @@ self.finish_retire_intent(&workspace).await?;
             });
         }
         let workspace =
-            self.seed_move_participant(main, current.derived.workspace.incarnation().clone())?;
+            self.replaced_workspace(main, current.derived.workspace.incarnation().clone())?;
         let moved = match volumes.plan_move_onto_seed(workspace).await {
             Ok(plan) if plan.seed() == seed => volumes.move_onto_seed(plan).await,
             Ok(plan) => {
@@ -6865,14 +6873,15 @@ self.finish_retire_intent(&workspace).await?;
         }
     }
 
-    /// The workspace whose live volume compaction moves (16_build_volumes.md, "Seed compaction").
-    fn seed_move_participant(
+    /// The workspace whose live volume compaction moves or a reseed replaces (16_build_volumes.md,
+    /// "Seed compaction", "Reseed").
+    fn replaced_workspace(
         &self,
         name: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-    ) -> Result<super::build_volumes::SeedMoveWorkspace> {
+    ) -> Result<super::build_volumes::ReplacedWorkspace> {
         use crate::storage::recovery::INTENT_LEASE_SUFFIX;
-        Ok(super::build_volumes::SeedMoveWorkspace {
+        Ok(super::build_volumes::ReplacedWorkspace {
             checkout: self.workspace_mount_path(&name)?,
             image: self
                 .layout
@@ -7011,17 +7020,18 @@ self.finish_retire_intent(&workspace).await?;
         Ok(peers)
     }
 
-    /// Enumerate the tracked inputs and every declared Nx output before quiescing the landing.
-    /// The result lives only for this land; the index and resolved graph remain its authorities.
-    async fn land_source_paths(
+    /// Enumerate a checkout's tracked inputs and every declared Nx output, before its build volume is
+    /// quiesced (a land's landing checkout) or claimed (a reseed's workspace). The result lives only
+    /// for that operation; the index and resolved graph remain its authorities.
+    async fn source_paths(
         &mut self,
         workspace: &WorkspaceName,
         landing: &Path,
     ) -> Result<crate::runtime::build_volumes::SourcePaths> {
         let git = crate::git::GitRepository::from_root(self.git.store_root(), landing);
         let mut paths = crate::runtime::build_volumes::SourcePaths {
-            tracked: git.tracked_paths().await?,
-            outputs: Vec::new(),
+            equal: git.tracked_paths().await?,
+            compared: Vec::new(),
         };
         let state = crate::build_volume::BuildVolumeState::read(
             &landing.join(crate::build_volume::BUILD_LINK),
@@ -7101,13 +7111,13 @@ self.finish_retire_intent(&workspace).await?;
                 let Some(outputs) = outputs else {
                     cowshed_os::eprintln!(
                         "cowshed: {} resolves no @smoothbricks/nx-plugin, so no policy names its \
-                         declared outputs: the land reconciles its tracked files only",
+                         declared outputs: only its tracked files are reconciled",
                         root.display()
                     );
                     continue;
                 };
                 paths
-                    .outputs
+                    .compared
                     .extend(outputs.into_iter().map(|path| relative_root.join(path)));
             }
         }
@@ -16112,6 +16122,115 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 
     /// Delete the Nx state on the workspace's build volume (16_build_volumes.md, "Clearing a
+    /// Replace the workspace's build volume with what a fork of its target is given now
+    /// (16_build_volumes.md, "Reseed"). Its target is the workspace its record says it was forked
+    /// from (`forkedFrom`), main for one created from main. It refuses running work instead of
+    /// stopping it; nothing of the target is stopped.
+    async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult> {
+        self.validate_binding().await?;
+        if workspace.is_main() {
+            return Err(super::build_volumes::main_reseed_refusal());
+        }
+        // A land or removal of the workspace refuses the reseed by name, and the reseed them.
+        let _land_lease = super::land_lease::take(
+            &self.layout.project().sessions,
+            workspace.as_str(),
+            super::land_lease::Holding::Reseed,
+        )?;
+        let current = self.current(&workspace).await?;
+        let mounted = |current: &NativeWorkspace| {
+            matches!(
+                current.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            )
+        };
+        if !mounted(&current) {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} is detached, so its build link cannot be read"),
+                format!("cowshed attach {workspace}, then retry `cowshed reseed {workspace}`"),
+            ));
+        }
+        let target = current
+            .metadata
+            .info_snapshot
+            .forked_from
+            .clone()
+            .unwrap_or_else(WorkspaceName::main);
+        let target_current = match self.current(&target).await {
+            Ok(target_current) => target_current,
+            Err(error) if error.code == ErrorCode::NotFound => {
+                return Err(CowshedError::not_found(
+                    format!(
+                        "{workspace} was forked from {target}, which no longer exists, so it has no seed to reseed from"
+                    ),
+                    format!(
+                        "fork a new workspace from what {workspace} lands into and carry its work over"
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !mounted(&target_current) {
+            return Err(CowshedError::conflict(
+                format!(
+                    "{workspace}'s target {target} is detached, so its seed and checkout cannot be read"
+                ),
+                format!("cowshed attach {target}, then retry `cowshed reseed {workspace}`"),
+            ));
+        }
+        let checkout = self.workspace_mount_path(&workspace)?;
+        let target_checkout = self.workspace_mount_path(&target)?;
+        let volumes = self.build_volumes()?;
+        // Only a project without mbx pairs mtime-judged Cargo units with the workspace's sources;
+        // the enumeration runs a job, so it comes before the reseed claims the volume.
+        let mbx = volumes
+            .state_of(&target_checkout)?
+            .is_some_and(|(_, state)| state.mbx.is_some());
+        let paths = if mbx {
+            super::build_volumes::SourcePaths::default()
+        } else {
+            self.source_paths(&workspace, &checkout).await?
+        };
+        let target_lock = self
+            .layout
+            .canonical_image(&target)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let replaced = self.replaced_workspace(
+            workspace.clone(),
+            current.derived.workspace.incarnation().clone(),
+        )?;
+        let reseeded = volumes
+            .reseed_workspace(super::build_volumes::ReseedPlan {
+                workspace: replaced,
+                target: super::build_volumes::Owner {
+                    name: target.clone(),
+                    incarnation: target_current.derived.workspace.incarnation().clone(),
+                },
+                target_checkout,
+                target_lock,
+                paths,
+            })
+            .await?;
+        let count = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+        Ok(crate::api::dto::ReseedResult {
+            workspace,
+            target,
+            cloned_from: reseeded.cloned_from.to_string(),
+            previous_volume: reseeded.previous.to_string(),
+            previous_bytes: reseeded.previous_bytes,
+            volume: reseeded.volume.to_string(),
+            source_mtimes: reseeded.source_mtimes.map(|harmonized| {
+                crate::api::dto::ReseedSourceMtimes {
+                    examined: count(harmonized.examined),
+                    advanced: count(harmonized.advanced),
+                    compared: count(harmonized.compared),
+                    republished: count(harmonized.republished),
+                }
+            }),
+        })
+    }
     /// checkout's Nx state"). It refuses running work instead of stopping it.
     async fn clear_nx_state(
         &mut self,
@@ -17042,7 +17161,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         timed_async(
                             "land",
                             "source-paths",
-                            self.land_source_paths(&workspace, &source_mount),
+                            self.source_paths(&workspace, &source_mount),
                         )
                         .await?,
                     )

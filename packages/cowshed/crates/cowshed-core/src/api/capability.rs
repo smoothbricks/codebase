@@ -5,8 +5,9 @@ use super::dto::{
     JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
     MirrorInfo, NxStateClearResult, ProjectGrantDelta, ProjectGrants, PushOptions, PushReport,
     RebaseOptions, RebaseReport, RekeyResult, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, SealedJob, StdinSource,
-    StepReport, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob,
+    StdinSource, StepReport, UnprovenWorkspace, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -2710,6 +2711,13 @@ impl Coordinator {
 
     /// Delete a workspace's Nx cache and task database contents on its build volume, refused
     /// while a job, land or live Nx holds them. `nx reset` cannot: it unlinks the build links.
+    /// Replace a workspace's build volume with a clone of its target's seed, leaving its source,
+    /// branch and uncommitted files as they are; refused while a job, land or live Nx or Cargo
+    /// holds it, and for main.
+    pub async fn reseed(&self, workspace: &str) -> Result<ReseedResult> {
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
+    }
     pub async fn clear_nx_state(&self, workspace: &str) -> Result<NxStateClearResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorClearNxState>(&*self.runtime, &request).await

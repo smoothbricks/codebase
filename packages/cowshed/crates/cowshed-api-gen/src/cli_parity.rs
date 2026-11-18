@@ -263,6 +263,9 @@ pub const PARITY: &[Row] = &[
     row("defrag", "", field(&[("coordinator.defragment", "")], &[member("Coordinator.defragment")])),
     row("defrag", "workspace", field(&[("coordinator.defragment", "workspace")], &[argument("Coordinator.defragment", 0, "")])),
 
+    row("reseed", "", field(&[("coordinator.reseed", "")], &[member("Coordinator.reseed")])),
+    row("reseed", "workspace", field(&[("coordinator.reseed", "workspace")], &[argument("Coordinator.reseed", 0, "")])),
+
 
     row("rekey", "", field(&[("coordinator.rekey", "")], &[member("Coordinator.rekey")])),
     row("rekey", "workspace", field(&[("coordinator.rekey", "workspace")], &[argument("Coordinator.rekey", 0, "")])),

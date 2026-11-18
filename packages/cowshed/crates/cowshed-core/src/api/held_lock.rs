@@ -163,6 +163,8 @@ pub enum LockOperation {
     MoveOntoSeed,
     /// `cowshed cache clear` of a workspace's Nx state.
     ClearNxState,
+    /// `cowshed reseed` of a workspace's build volume from its target's seed.
+    Reseed,
     /// Moving a workspace off a port block another holds.
     RepairPorts,
     /// Changing a workspace's grants.
@@ -197,6 +199,7 @@ impl LockOperation {
             Self::Land => "land",
             Self::MoveOntoSeed => "move-onto-seed",
             Self::ClearNxState => "clear-nx-state",
+            Self::Reseed => "reseed",
             Self::RepairPorts => "repair-ports",
             Self::Grant => "grant",
             Self::MintTemplate => "mint-template",

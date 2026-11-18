@@ -1,12 +1,14 @@
-//! Land source harmonization (16_build_volumes.md, "Land", step 5.3): before the landing volume is
-//! published as the target's seed, the target's sources take the landing checkout's view of time,
-//! so Cargo's mtime freshness judges every adopted unit as the landing checkout would.
+//! Source harmonization (16_build_volumes.md, "Land", step 5.3, and "Reseed"): before a build volume
+//! built against one checkout is paired with another, the other's sources take the first's view of
+//! time, so Cargo's mtime freshness judges every unit as the checkout it was built against would.
 //!
-//! A fast-forward rewrites only the files it changes. A file the landing checkout rewrote on a
+//! A land's fast-forward rewrites only the files it changes. A file the landing checkout rewrote on a
 //! rebase holds the same bytes in the target but an older mtime, older than a unit the landing
-//! volume built from the bytes it held before; a declared output can even hold other bytes. The
-//! pass reads both trees through held directories and never follows a link, so a planted link can
-//! neither redirect a read nor a timestamp write outside either checkout.
+//! volume built from the bytes it held before; a declared output can even hold other bytes. A
+//! reseed pairs a workspace with its target's seed, built from the target's bytes, so any of the
+//! workspace's files can hold other bytes. The pass reads both trees through held directories and
+//! never follows a link, so a planted link can neither redirect a read nor a timestamp write
+//! outside either checkout.
 
 use std::cmp::Ordering;
 use std::ffi::CStr;
@@ -22,57 +24,75 @@ use super::io as io_error;
 use crate::copy::FileComparison;
 use crate::{CowshedError, Result};
 
-/// The paths a land reconciles, by provenance. Both are relative to the checkout root.
+/// The paths a pass reconciles, by what is known of their bytes. Both are relative to the checkout
+/// root.
 #[derive(Debug, Default)]
 pub(crate) struct SourcePaths {
-    /// The index's tracked files: the fast-forward made their bytes equal, so the newer mtime wins.
-    pub tracked: Vec<PathBuf>,
-    /// Every declared Nx output file (packages/nx-plugin README, "Cowshed Build-State Output
-    /// Policy"): generated and ignored, so its bytes can differ. An output that is also tracked is
-    /// reconciled as an output.
-    pub outputs: Vec<PathBuf>,
+    /// Files whose bytes the caller knows equal in both checkouts (a land's tracked files, which the
+    /// fast-forward made equal), so the newer mtime wins.
+    pub equal: Vec<PathBuf>,
+    /// Files whose bytes can differ, decided by comparing them: a land's declared Nx outputs
+    /// (packages/nx-plugin README, "Cowshed Build-State Output Policy"), generated and ignored, and
+    /// every path of a reseed. A path in both lists is compared.
+    pub compared: Vec<PathBuf>,
 }
 
-/// What one pass did, for the land's report.
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(super) struct Harmonized {
+impl SourcePaths {
+    /// Every path compared by its bytes: a reseed's workspace shares no fast-forward with its
+    /// target, so nothing is known equal.
+    pub(crate) fn all_compared(self) -> Self {
+        let Self {
+            equal,
+            mut compared,
+        } = self;
+        compared.extend(equal);
+        Self {
+            equal: Vec::new(),
+            compared,
+        }
+    }
+}
+
+/// What one pass did, for the land's and the reseed's report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Harmonized {
     /// Paths that are regular files in both checkouts.
     pub examined: usize,
-    /// Files given the landing checkout's newer mtime.
+    /// Files given the source checkout's newer mtime.
     pub advanced: usize,
-    /// Outputs whose timestamps differed, so their bytes were compared.
+    /// Compared files whose timestamps differed, so their bytes were compared.
     pub compared: usize,
-    /// Outputs whose bytes differ, given the time of this pass.
+    /// Compared files whose bytes differ, given the time of this pass.
     pub republished: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Provenance {
-    Tracked,
-    Output,
+    Equal,
+    Compared,
 }
 
-/// Give each file under `target` the landing (`source`) checkout's mtime where that is newer, and
-/// a declared output whose bytes differ the time of this pass (never moving a newer one back).
-/// Equal timestamps are skipped without reading a byte; a path that is not a regular file in both
-/// checkouts (absent, a link, a directory, beneath a link) is left alone.
-pub(super) fn harmonize(source: &Path, target: &Path, paths: &SourcePaths) -> Result<Harmonized> {
+/// Give each file under `target` the `source` checkout's mtime where that is newer, and a compared
+/// file whose bytes differ the time of this pass (never moving a newer one back). Equal timestamps
+/// are skipped without reading a byte; a path that is not a regular file in both checkouts (absent,
+/// a link, a directory, beneath a link) is left alone.
+pub(crate) fn harmonize(source: &Path, target: &Path, paths: &SourcePaths) -> Result<Harmonized> {
     let published = SystemTime::now();
     let mut entries: Vec<(&Path, Provenance)> =
-        Vec::with_capacity(paths.tracked.len() + paths.outputs.len());
+        Vec::with_capacity(paths.equal.len() + paths.compared.len());
     entries.extend(
         paths
-            .tracked
+            .equal
             .iter()
-            .map(|path| (path.as_path(), Provenance::Tracked)),
+            .map(|path| (path.as_path(), Provenance::Equal)),
     );
     entries.extend(
         paths
-            .outputs
+            .compared
             .iter()
-            .map(|path| (path.as_path(), Provenance::Output)),
+            .map(|path| (path.as_path(), Provenance::Compared)),
     );
-    // Paths in order, each path's Output first, so dedup keeps the output.
+    // Paths in order, each path's Compared first, so dedup keeps the comparison.
     entries.sort_unstable_by(|left, right| match left.0.cmp(right.0) {
         Ordering::Equal => right.1.cmp(&left.1),
         unequal => unequal,
@@ -120,8 +140,8 @@ pub(super) fn harmonize(source: &Path, target: &Path, paths: &SourcePaths) -> Re
             continue;
         }
         let equal = match provenance {
-            Provenance::Tracked => true,
-            Provenance::Output => {
+            Provenance::Equal => true,
+            Provenance::Compared => {
                 report.compared += 1;
                 landing_len == target_len
                     && comparison
@@ -246,12 +266,12 @@ fn invalid(relative: &Path) -> CowshedError {
             "source path {} is not a plain path relative to the checkout",
             relative.display()
         ),
-        "the land's tracked and declared-output lists name checkout-relative files only",
+        "the land's and the reseed's lists name checkout-relative files only",
     )
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::runtime::build_volumes) mod tests {
     use super::*;
     use crate::temp_parent::canonical_parent;
     use crate::temp_root::TempRoot;
@@ -270,7 +290,7 @@ mod tests {
         (scratch, source, target)
     }
 
-    fn put(path: &Path, bytes: &[u8], modified: SystemTime) {
+    pub(in crate::runtime::build_volumes) fn put(path: &Path, bytes: &[u8], modified: SystemTime) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
         File::options()
@@ -281,14 +301,14 @@ mod tests {
             .unwrap();
     }
 
-    fn mtime(path: &Path) -> SystemTime {
+    pub(in crate::runtime::build_volumes) fn mtime(path: &Path) -> SystemTime {
         fs::symlink_metadata(path).unwrap().modified().unwrap()
     }
 
     fn tracked(paths: &[&str]) -> SourcePaths {
         SourcePaths {
-            tracked: paths.iter().map(PathBuf::from).collect(),
-            outputs: Vec::new(),
+            equal: paths.iter().map(PathBuf::from).collect(),
+            compared: Vec::new(),
         }
     }
 
@@ -346,9 +366,9 @@ mod tests {
             &source,
             &target,
             &SourcePaths {
-                // An output that is also tracked is reconciled as an output.
-                tracked: vec![PathBuf::from("gen/codec.rs")],
-                outputs: ["gen/codec.rs", "gen/same.rs", "gen/kept.rs"]
+                // A path in both lists is compared.
+                equal: vec![PathBuf::from("gen/codec.rs")],
+                compared: ["gen/codec.rs", "gen/same.rs", "gen/kept.rs"]
                     .into_iter()
                     .map(PathBuf::from)
                     .collect(),
@@ -499,8 +519,8 @@ mod tests {
                 .collect()
         };
         let paths = SourcePaths {
-            tracked: list("tracked"),
-            outputs: list("outputs"),
+            equal: list("tracked"),
+            compared: list("outputs"),
         };
         let started = Instant::now();
         let report = harmonize(&root, &root, &paths).unwrap();
@@ -509,8 +529,8 @@ mod tests {
         println!(
             "source_mtime_stat_cost: same-checkout pass (open+fstat both sides, no compare, no write) \
              over {} tracked + {} output paths: {} regular files examined in {elapsed:?}",
-            paths.tracked.len(),
-            paths.outputs.len(),
+            paths.equal.len(),
+            paths.compared.len(),
             report.examined,
         );
     }
