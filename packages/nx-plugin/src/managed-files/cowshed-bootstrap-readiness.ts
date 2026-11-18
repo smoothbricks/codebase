@@ -95,7 +95,7 @@ export function renderCowshedBootstrapReadinessJob(): string {
           mkdir "$PROBE_ROOT/install"
           printf '{"private":true,"dependencies":{"@smoothbricks/cowshed":"file:../cowshed-0.5.2.tgz"}}\n' \
             > "$PROBE_ROOT/install/package.json"
-          bun --cwd "$PROBE_ROOT/install" install
+          (cd "$PROBE_ROOT/install" && bun install)
           python3 - <<'PY'
           import json, os, pathlib
           root = pathlib.Path(os.environ["PROBE_ROOT"])
