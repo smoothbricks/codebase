@@ -534,4 +534,41 @@ pub(in crate::runtime::build_volumes) mod tests {
             report.examined,
         );
     }
+
+    /// Run by hand to price a reseed's pass (16_build_volumes.md, "Reseed"): every path of the
+    /// JSON listing compared by bytes, from COWSHED_MTIME_BENCH_SOURCE (the target's checkout) onto
+    /// COWSHED_MTIME_BENCH_ROOT (the workspace's), which it writes: point it at copies.
+    #[test]
+    #[ignore = "a measurement over two real checkouts: COWSHED_MTIME_BENCH_SOURCE, COWSHED_MTIME_BENCH_ROOT and COWSHED_MTIME_BENCH_PATHS"]
+    fn reseed_source_mtime_cost() {
+        let var =
+            |name: &str| PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name}")));
+        let listing: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("COWSHED_MTIME_BENCH_PATHS")).unwrap()).unwrap();
+        let list = |key: &str| -> Vec<PathBuf> {
+            listing[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array"))
+                .iter()
+                .map(|path| PathBuf::from(path.as_str().expect("a path string")))
+                .collect()
+        };
+        let paths = SourcePaths {
+            equal: list("tracked"),
+            compared: list("outputs"),
+        }
+        .all_compared();
+        let started = Instant::now();
+        let report = harmonize(
+            &var("COWSHED_MTIME_BENCH_SOURCE"),
+            &var("COWSHED_MTIME_BENCH_ROOT"),
+            &paths,
+        )
+        .unwrap();
+        println!(
+            "reseed_source_mtime_cost: {} paths compared: {report:?} in {:?}",
+            paths.compared.len(),
+            started.elapsed(),
+        );
+    }
 }
