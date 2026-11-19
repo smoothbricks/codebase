@@ -2,6 +2,7 @@ import type { tags } from 'typia';
 
 /** Peer wait classes from specs/cowshed/05_gateway.md, "Deadlines". */
 export const CONTROL_MS = 5_000;
+export const REAP_MS = 5_000;
 export const HEARTBEAT_MS = 5_000;
 export const HEARTBEAT_SILENCE_MS = 15_000;
 

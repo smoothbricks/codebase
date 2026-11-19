@@ -7,7 +7,7 @@ import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src
 import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
-import { type Ended, type EndpointEffect, type EndpointEvent, endpointStep, STARTING } from './endpoint-life.js';
+import { type Ended, type EndpointEffect, type EndpointEvent, endpointStep, spawned } from './endpoint-life.js';
 import { type MbxPriority, mbxHold, mbxPool } from './mbx-pool.js';
 
 /**
@@ -144,7 +144,7 @@ async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
   const socket = join(directory, ENDPOINT_SOCKET);
   const server = spawn('mbx', ['reservations', socket], { env, stdio: ['pipe', 'pipe', 'pipe'] });
   const remove = (): Promise<void> => rm(directory, { recursive: true, force: true });
-  let life = STARTING;
+  let life = spawned(server.pid);
   let probe: Socket | undefined;
   let timer: NodeJS.Timeout | undefined;
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib es2022.

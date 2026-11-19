@@ -6,9 +6,9 @@ import {
   type EndpointLife,
   endpointStep,
   gatesTests,
-  STARTING,
+  spawned,
 } from './endpoint-life.js';
-import { CONTROL_MS } from './lease-wait.js';
+import { CONTROL_MS, REAP_MS } from './lease-wait.js';
 
 /**
  * The life of a run's reservation endpoint (endpoint-life.ts) judged over generated interleavings of what its shell
@@ -16,6 +16,7 @@ import { CONTROL_MS } from './lease-wait.js';
  * order. No process, socket, timer or clock runs here; the machine's one timer is the `expired` event.
  */
 
+const PID = 4242;
 const RUNS = { seed: 20261119, numRuns: 2000 };
 
 const stdout = (text: string): EndpointEvent => ({ type: 'stdout', text });
@@ -91,7 +92,7 @@ interface Step {
  */
 function live(trace: readonly EndpointEvent[]): Step[] {
   const steps: Step[] = [];
-  let life = STARTING;
+  let life = spawned(PID);
   let served = false;
   for (const event of trace) {
     if (event.type === 'run-end' && !served) continue;
@@ -109,6 +110,22 @@ const count = (steps: readonly Step[], what: EndpointEffect['do']): number =>
 const firstLine = (text: string): string | null => (text.includes('\n') ? text.slice(0, text.indexOf('\n')) : null);
 
 /** Each property holds for every generated order of events. */
+/** Whether the machine's timer is armed before and after each step: an `arm` starts it, a `disarm` or its expiry ends it. */
+function timers(steps: readonly Step[]): { readonly before: boolean; readonly after: boolean }[] {
+  let armed = false;
+  return steps.map((step) => {
+    const before = armed;
+    if (step.event.type === 'expired') armed = false;
+    for (const effect of step.effects) {
+      if (effect.do === 'arm') {
+        expect(armed).toBe(false);
+        armed = true;
+      }
+      if (effect.do === 'disarm') armed = false;
+    }
+    return { before, after: armed };
+  });
+}
 const everyOrder = (holds: (steps: readonly Step[]) => void): void =>
   fc.assert(
     fc.property(traceArb, (trace) => holds(live(trace))),
@@ -118,6 +135,7 @@ const everyOrder = (holds: (steps: readonly Step[]) => void): void =>
 describe("the life of a run's reservation endpoint", () => {
   it('walks its ordinary paths', () => {
     const arm: EndpointEffect = { do: 'arm', ms: CONTROL_MS };
+    const reap: EndpointEffect = { do: 'arm', ms: REAP_MS };
     const disarm: EndpointEffect = { do: 'disarm' };
     const cases: { name: string; events: EndpointEvent[]; effects: EndpointEffect[][] }[] = [
       {
@@ -127,7 +145,7 @@ describe("the life of a run's reservation endpoint", () => {
           [],
           [{ do: 'probe' }, arm],
           [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
-          [{ do: 'close-stdin' }, arm],
+          [{ do: 'close-stdin' }, reap],
           [disarm, { do: 'conclude', ended: { how: 'mbx reservations ended with status 0', clean: true } }],
         ],
       },
@@ -140,7 +158,7 @@ describe("the life of a run's reservation endpoint", () => {
         name: 'a child that says anything else is killed, and refused once it has ended',
         events: [stdout('mbx 1.2.3\nlistening\n'), close(null, 'SIGKILL')],
         effects: [
-          [{ do: 'kill' }, arm],
+          [{ do: 'kill' }, reap],
           [disarm, { do: 'refuse', why: 'mbx reservations said "mbx 1.2.3", not that it was listening' }],
         ],
       },
@@ -174,16 +192,49 @@ describe("the life of a run's reservation endpoint", () => {
         effects: [
           [{ do: 'probe' }, arm],
           [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
-          [{ do: 'close-stdin' }, arm],
-          [{ do: 'kill' }],
+          [{ do: 'close-stdin' }, reap],
+          [{ do: 'kill' }, reap],
           [
             disarm,
             {
               do: 'conclude',
               ended: {
-                how: `mbx reservations ended on SIGKILL, killed after it outlived its standard input by ${CONTROL_MS}ms`,
+                how: `mbx reservations ended on SIGKILL, killed after it outlived its standard input by ${REAP_MS}ms`,
                 clean: false,
               },
+            },
+          ],
+        ],
+      },
+      {
+        name: 'an endpoint that a kill does not end either is left as it is, and its end says so',
+        events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, EXPIRED, close(null, 'SIGKILL')],
+        effects: [
+          [{ do: 'probe' }, arm],
+          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'close-stdin' }, reap],
+          [{ do: 'kill' }, reap],
+          [
+            {
+              do: 'conclude',
+              ended: {
+                how: `mbx reservations outlived its standard input by ${REAP_MS}ms; pid ${PID} had not ended ${REAP_MS}ms after it was killed and is left as it is`,
+                clean: false,
+              },
+            },
+          ],
+          [],
+        ],
+      },
+      {
+        name: 'a child refused for its first line that a kill does not end is refused all the same, and named',
+        events: [stdout('mbx 1.2.3\n'), EXPIRED],
+        effects: [
+          [{ do: 'kill' }, reap],
+          [
+            {
+              do: 'refuse',
+              why: `mbx reservations said "mbx 1.2.3", not that it was listening; pid ${PID} had not ended ${REAP_MS}ms after it was killed and is left as it is`,
             },
           ],
         ],
@@ -242,7 +293,9 @@ describe("the life of a run's reservation endpoint", () => {
           expect(step.effects.map((effect) => effect.do)).toContain('kill');
           for (const effect of effectsOf(steps)) {
             if (effect.do === 'refuse') {
-              expect(effect.why).toBe(`mbx reservations said ${JSON.stringify(line)}, not that it was listening`);
+              expect(effect.why).toStartWith(
+                `mbx reservations said ${JSON.stringify(line)}, not that it was listening`,
+              );
             }
           }
         }
@@ -281,18 +334,33 @@ describe("the life of a run's reservation endpoint", () => {
 
   it('arms one timer at a time, and leaves none armed once it has ended', () => {
     everyOrder((steps) => {
-      let armed = false;
-      for (const step of steps) {
-        if (step.event.type === 'expired') armed = false;
-        for (const effect of step.effects) {
-          if (effect.do === 'arm') {
-            expect(armed).toBe(false);
-            armed = true;
-          }
-          if (effect.do === 'disarm') armed = false;
-        }
-        if (step.after.phase === 'ended') expect(armed).toBe(false);
-      }
+      const armed = timers(steps);
+      steps.forEach((step, at) => {
+        if (step.after.phase === 'ended') expect(armed[at]?.after).toBe(false);
+      });
+    });
+  });
+
+  it("waits for its child's end only under an armed timer, and for no more than two of them", () => {
+    everyOrder((steps) => {
+      const armed = timers(steps);
+      steps.forEach((step, at) => {
+        if (step.after.phase === 'ending') expect(armed[at]?.after).toBe(true);
+      });
+      const last = steps.at(-1)?.after;
+      if (last?.phase !== 'ending') return;
+      const [once] = endpointStep(last, EXPIRED);
+      expect(endpointStep(once, EXPIRED)[0].phase).toBe('ended');
+    });
+  });
+
+  it('does nothing at an expiry no armed timer could send, so no outcome is read from a clock', () => {
+    everyOrder((steps) => {
+      const armed = timers(steps);
+      steps.forEach((step, at) => {
+        if (step.event.type !== 'expired' || armed[at]?.before === true) return;
+        expect({ after: step.after, effects: step.effects }).toEqual({ after: step.before, effects: [] });
+      });
     });
   });
 });

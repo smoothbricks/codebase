@@ -1,5 +1,5 @@
 import typia from 'typia';
-import { CONTROL_MS } from './lease-wait.js';
+import { CONTROL_MS, REAP_MS } from './lease-wait.js';
 
 /**
  * The life of an Nx run's mbx reservation endpoint in the run that started it (mbx-reservations.ts;
@@ -22,12 +22,19 @@ import { CONTROL_MS } from './lease-wait.js';
  * event.
  */
 export type EndpointLife =
-  | { readonly phase: 'starting'; readonly out: string; readonly said: string }
-  | { readonly phase: 'probing'; readonly reply: string; readonly said: string; readonly gone: Ended | null }
-  | { readonly phase: 'serving'; readonly said: string }
+  | { readonly phase: 'starting'; readonly out: string; readonly said: string; readonly pid: number | undefined }
+  | {
+      readonly phase: 'probing';
+      readonly reply: string;
+      readonly said: string;
+      readonly pid: number | undefined;
+      readonly gone: Ended | null;
+    }
+  | { readonly phase: 'serving'; readonly said: string; readonly pid: number | undefined }
   | { readonly phase: 'gone'; readonly ended: Ended }
   | {
       readonly phase: 'ending';
+      readonly pid: number | undefined;
       readonly said: string;
       /** Whether the child was sent SIGKILL; otherwise its standard input was closed. */
       readonly killed: boolean;
@@ -80,7 +87,10 @@ export type EndpointStep = readonly [EndpointLife, readonly EndpointEffect[]];
 /** What is kept of the endpoint's stderr to say why it ended: its last bytes. */
 const SAID_BYTES = 4096;
 
-export const STARTING: EndpointLife = { phase: 'starting', out: '', said: '' };
+/** The life of a child just spawned; `pid` is what names it should it not end when killed. */
+export function spawned(pid: number | undefined): EndpointLife {
+  return { phase: 'starting', out: '', said: '', pid };
+}
 const ENDED: EndpointLife = { phase: 'ended' };
 
 type CapabilitiesReply = { type: 'capabilities'; test_gate: boolean };
@@ -169,18 +179,19 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
       if (line === null) return [{ ...life, out }, []];
       if (line === 'listening') {
         return [
-          { phase: 'probing', reply: '', said: life.said, gone: null },
+          { phase: 'probing', reply: '', said: life.said, pid: life.pid, gone: null },
           [{ do: 'probe' }, { do: 'arm', ms: CONTROL_MS }],
         ];
       }
       return [
         {
           phase: 'ending',
+          pid: life.pid,
           said: life.said,
           killed: true,
           refusing: `mbx reservations said ${JSON.stringify(line)}, not that it was listening`,
         },
-        [{ do: 'kill' }, { do: 'arm', ms: CONTROL_MS }],
+        [{ do: 'kill' }, { do: 'arm', ms: REAP_MS }],
       ];
     }
     case 'run-end':
@@ -192,7 +203,7 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
 
 function probing(life: EndpointLife & { phase: 'probing' }, event: EndpointEvent): EndpointStep {
   const served: EndpointLife =
-    life.gone === null ? { phase: 'serving', said: life.said } : { phase: 'gone', ended: life.gone };
+    life.gone === null ? { phase: 'serving', said: life.said, pid: life.pid } : { phase: 'gone', ended: life.gone };
   const ended = endOf(life.said, event);
   if (ended !== null) return [{ ...life, gone: life.gone ?? ended }, []];
   switch (event.type) {
@@ -223,8 +234,8 @@ function serving(life: EndpointLife & { phase: 'serving' }, event: EndpointEvent
       return [{ ...life, said: saying(life.said, event.text) }, []];
     case 'run-end':
       return [
-        { phase: 'ending', said: life.said, killed: false, refusing: null },
-        [{ do: 'close-stdin' }, { do: 'arm', ms: CONTROL_MS }],
+        { phase: 'ending', said: life.said, pid: life.pid, killed: false, refusing: null },
+        [{ do: 'close-stdin' }, { do: 'arm', ms: REAP_MS }],
       ];
     default:
       return [life, []];
@@ -236,15 +247,23 @@ function ending(life: EndpointLife & { phase: 'ending' }, event: EndpointEvent):
   if (ended !== null) {
     if (life.refusing !== null) return [ENDED, [{ do: 'disarm' }, { do: 'refuse', why: life.refusing }]];
     const outlived: Ended = life.killed
-      ? { how: `${ended.how}, killed after it outlived its standard input by ${CONTROL_MS}ms`, clean: false }
+      ? { how: `${ended.how}, killed after it outlived its standard input by ${REAP_MS}ms`, clean: false }
       : ended;
     return [ENDED, [{ do: 'disarm' }, { do: 'conclude', ended: outlived }]];
   }
   switch (event.type) {
     case 'stderr':
       return [{ ...life, said: saying(life.said, event.text) }, []];
-    case 'expired':
-      return [{ ...life, killed: true }, [{ do: 'kill' }]];
+    case 'expired': {
+      // Its standard input's end did not end it within the reap bound: kill it, and wait that bound once more.
+      if (!life.killed) return [{ ...life, killed: true }, [{ do: 'kill' }, { do: 'arm', ms: REAP_MS }]];
+      // Neither did the kill: it is stuck in the kernel, or something it started holds its pipes. The wait ends and
+      // says so; the child is left as it is (05_gateway.md, "A child's exit and its output are reap-class waits").
+      const left = `${life.pid === undefined ? 'it' : `pid ${life.pid}`} had not ended ${REAP_MS}ms after it was killed and is left as it is`;
+      if (life.refusing !== null) return [ENDED, [{ do: 'refuse', why: `${life.refusing}; ${left}` }]];
+      const how = `mbx reservations outlived its standard input by ${REAP_MS}ms; ${left}`;
+      return [ENDED, [{ do: 'conclude', ended: { how, clean: false } }]];
+    }
     default:
       return [life, []];
   }
