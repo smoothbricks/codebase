@@ -5196,6 +5196,8 @@ fn cache_entry(name: &str) -> String {
 fn cached(checkout: &Path, name: &str) -> Option<Vec<u8>> {
     fs::read(checkout.join(".nx/cache").join(name)).ok()
 }
+/// An exempt index reader stays open through the retiring land and its first fork. Nx restores
+/// the checked outputs from cache; a separate shell check supplies a seed marker, not an Nx hit.
 /// The retiring land first proves ownership, frozen-seed identity and tree, immediate reclamation
 /// of the old volume, its new label and the exact linked mounts (16_build_volumes.md, steps 5–7).
 /// What main runs after a land reaches main's seed (16_build_volumes.md, "Targets and seeds"):
@@ -5207,7 +5209,7 @@ fn cached(checkout: &Path, name: &str) -> Option<Vec<u8>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
-    let (mut fixture, mut service, ..) = build_nx_project().await;
+    let (mut fixture, mut service, _, node) = build_nx_project().await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
     let main = fixture.checkout.clone();
@@ -5217,8 +5219,50 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     let landing = linked_volume(&layout, &topic);
     assert_ne!(landing, previous);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    let report = land(&mut service, "topic", true, &[&cache_entry("landed")]).await;
-    assert!(report.build_volume.adoption.is_adopted(), "{report:?}");
+    let [(previous_seed, _)] = seeds_of_main(&layout)
+        .try_into()
+        .expect("main has one seed");
+    let index_name = "codegraph.db";
+    let index_bytes = b"an index nothing in the land knows\n";
+    let index = link::linked(&topic)
+        .expect("read the build link")
+        .expect("topic links its build volume")
+        .join(index_name);
+    fs::write(&index, index_bytes).expect("write the index to the landing volume");
+    let holder = Holder(
+        Command::new("/usr/bin/tail")
+            .arg("-f")
+            .arg(&index)
+            .stdin(fs::File::open(&index).expect("open the index for its holder"))
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn an index holder"),
+    );
+    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
+    let holds_index = |path: &Path| {
+        nx::holders(&fixture.storage.census(), path)
+            .expect("query the index's holders")
+            .iter()
+            .any(|holder| holder.pid == pid)
+    };
+    assert!(
+        holds_index(&index),
+        "the holder holds the index from its spawn"
+    );
+
+    let marker_check = cache_entry("landed");
+    let nx_check = nx_run_many(&node, "build test");
+    let report = land(&mut service, "topic", true, &[&marker_check, &nx_check]).await;
+    let Adoption::Adopted { check, .. } = &report.build_volume.adoption else {
+        panic!("an exempt cache reader skipped adoption: {report:?}");
+    };
+    assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
+    assert_eq!(check.misses, [], "{report:?}");
+    assert_eq!(check.failed, [], "{report:?}");
+    let [unattributed] = check.unattributed.as_slice() else {
+        panic!("only the shell marker check is unattributed: {report:?}");
+    };
+    assert_eq!(unattributed.check, marker_check);
     assert!(report.retired, "{report:?}");
     assert!(
         matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
@@ -5236,7 +5280,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         panic!("main keeps exactly its latest seed: {seeds:?}");
     };
     assert!(
-        *seed != landing && *seed != previous,
+        *seed != landing && *seed != previous && *seed != previous_seed,
         "{seed} is a new volume"
     );
     assert_eq!(
@@ -5263,14 +5307,40 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         Some(&b"landed\n"[..]),
         "main adopted the landing volume, with what the land's check left on it"
     );
+    let adopted_index = link::linked(&main)
+        .expect("read main's build link")
+        .expect("main links the adopted volume")
+        .join(index_name);
+    assert_eq!(fs::read(&adopted_index).expect("main's index"), index_bytes);
+    assert!(
+        holds_index(&adopted_index),
+        "the same reader holds main's adopted index"
+    );
     let warm = new_workspace(&mut service, "warm").await;
     assert_eq!(
         cached(&warm, "landed").as_deref(),
         Some(&b"landed\n"[..]),
         "a fork clones the seed frozen from the adopted volume"
     );
+    let captured = link::linked(&warm)
+        .expect("read the fork's build link")
+        .expect("the fork links its captured build volume");
+    assert_eq!(
+        fs::read(captured.join(index_name)).expect("fork's index"),
+        index_bytes
+    );
+    assert!(
+        holds_index(&adopted_index),
+        "the same reader stayed open through the fork"
+    );
+    drop(holder);
 
-    let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
+    let [(landed_seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
+    assert_eq!(
+        record.tree.as_ref().map(|tree| tree.as_str()),
+        Some(landed_tree.as_str()),
+        "the warm fork preserves the seed's landed tree"
+    );
 
     // Main's own work on the adopted volume, after the seed was frozen: an admitted job writes it.
     fs::write(main.join("a/src.txt"), b"src, changed in main\n").unwrap();
@@ -5814,102 +5884,6 @@ async fn directory_a_foreign_database_holder_skips_adoption_with_its_pid_and_arg
         adoption => panic!("a held database skips the adoption: {adoption:?}"),
     }
     assert_eq!(linked_volume(&layout, &fixture.checkout), before);
-    drop(holder);
-    service.shutdown().await.expect("stop the runtime");
-    fixture.stop_gateway().await;
-}
-
-/// An open cache outside the named Nx/Cargo writer exclusion does not delay capture or adoption.
-/// The land replaces main's previous seed while the reader remains alive, and a subsequent fork
-/// inherits the cache bytes without requiring that reader to close (16_build_volumes.md, Land
-/// step 5.4). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
-#[tokio::test(flavor = "multi_thread")]
-async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substrate_lifecycle() {
-    let (mut fixture, mut service, _, node) = build_nx_project().await;
-    let layout = build_volumes(&fixture);
-    let nx_check = nx_run_many(&node, "build test");
-    let topic = new_workspace(&mut service, "topic").await;
-    fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
-    git(&topic, &["commit", "-q", "-am", "change a"]);
-    let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    // The fork reseeded main first: the land must replace that seed while the reader stays open.
-    let [(previous_seed, _)] = seeds_of_main(&layout)
-        .try_into()
-        .expect("main has one seed");
-    let landing = linked_volume(&layout, &topic);
-    let index = link::linked(&topic)
-        .expect("read the build link")
-        .expect("topic links its build volume")
-        .join("codegraph.db");
-    fs::write(&index, b"an index nothing in the land knows\n").unwrap();
-    let holder = Holder(
-        Command::new("/usr/bin/tail")
-            .arg("-f")
-            .arg(&index)
-            // Open from its spawn, so it is a holder once `spawn` returns.
-            .stdin(fs::File::open(&index).expect("open the index for its holder"))
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn an index holder"),
-    );
-    let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    assert!(
-        nx::holders(&fixture.storage.census(), &index)
-            .expect("query the index's holders")
-            .iter()
-            .any(|holder| holder.pid == pid),
-        "the holder holds the index from its spawn"
-    );
-
-    let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    assert!(
-        matches!(report.build_volume.seed, LandSeed::Frozen { .. }),
-        "an exempt cache reader must not refuse seed capture: {report:?}"
-    );
-    match &report.build_volume.adoption {
-        Adoption::Adopted { check, .. } => {
-            assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
-            assert_eq!(check.misses, [], "{report:?}");
-            assert_eq!(check.failed, [], "{report:?}");
-        }
-        Adoption::Skipped { reason } => {
-            panic!("an exempt cache reader skipped adoption: {reason:?}")
-        }
-    }
-    assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
-    let [(seed, record)] = seeds_of_main(&layout)
-        .try_into()
-        .expect("main keeps exactly one seed");
-    assert_ne!(
-        seed, previous_seed,
-        "the land replaces the seed while the exempt reader remains alive"
-    );
-    assert_eq!(
-        record.tree.as_ref().map(|tree| tree.as_str()),
-        Some(landed_tree.as_str()),
-        "the captured seed records the tree main adopted"
-    );
-    assert!(
-        fs::read(&index).is_ok_and(|bytes| bytes == b"an index nothing in the land knows\n"),
-        "main's adopted volume carries the index the holder kept open"
-    );
-
-    // A fork captures or reuses main's current seed without waiting for the same reader.
-    let after = new_workspace(&mut service, "after").await;
-    let captured = link::linked(&after)
-        .expect("read the fork's build link")
-        .expect("the fork links its captured build volume");
-    assert_eq!(
-        fs::read(captured.join("codegraph.db")).unwrap().as_slice(),
-        b"an index nothing in the land knows\n",
-        "the fork inherits the actual cache bytes while the original reader remains open"
-    );
-    let [(_, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
-    assert_eq!(
-        record.tree.as_ref().map(|tree| tree.as_str()),
-        Some(landed_tree.as_str()),
-        "the seed records the tree main adopted"
-    );
     drop(holder);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
