@@ -14,7 +14,8 @@ import { CONTROL_MS, REAP_MS } from './lease-wait.js';
  *   is refused, by how it ended when it ends within the reap bound, and it is killed when it does not.
  * - `probing`, for the endpoint's answer to `{"type":"capabilities"}` on the probe's connection, or that connection's
  *   end: whether the installed mbx's shim gates test cases (05_gateway.md, "A case starts on a core"). The start is
- *   then answered served, which publishes the socket to the run's tasks.
+ *   then answered served, which publishes the socket to the run's tasks. A child that ends first is refused by how it
+ *   ended: no task is told of an endpoint that is gone.
  * - `serving`, for the run's end. A child that ends first is `gone`, and the run's end says how.
  * - `ending`, for the child's end once a pipe of it closed (its standard input by the run, its standard output by
  *   itself) or it was killed, with the reap timer armed.
@@ -24,13 +25,7 @@ import { CONTROL_MS, REAP_MS } from './lease-wait.js';
  */
 export type EndpointLife =
   | { readonly phase: 'starting'; readonly out: string; readonly said: string; readonly pid: number | undefined }
-  | {
-      readonly phase: 'probing';
-      readonly reply: string;
-      readonly said: string;
-      readonly pid: number | undefined;
-      readonly gone: Ended | null;
-    }
+  | { readonly phase: 'probing'; readonly reply: string; readonly said: string; readonly pid: number | undefined }
   | { readonly phase: 'serving'; readonly said: string; readonly pid: number | undefined }
   | { readonly phase: 'gone'; readonly ended: Ended }
   | {
@@ -183,7 +178,7 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
       if (line === null) return [{ ...life, out }, []];
       if (line === 'listening') {
         return [
-          { phase: 'probing', reply: '', said: life.said, pid: life.pid, gone: null },
+          { phase: 'probing', reply: '', said: life.said, pid: life.pid },
           [{ do: 'probe' }, { do: 'arm', ms: CONTROL_MS }],
         ];
       }
@@ -213,10 +208,9 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
 }
 
 function probing(life: EndpointLife & { phase: 'probing' }, event: EndpointEvent): EndpointStep {
-  const served: EndpointLife =
-    life.gone === null ? { phase: 'serving', said: life.said, pid: life.pid } : { phase: 'gone', ended: life.gone };
+  const served: EndpointLife = { phase: 'serving', said: life.said, pid: life.pid };
   const ended = endOf(life.said, event);
-  if (ended !== null) return [{ ...life, gone: life.gone ?? ended }, []];
+  if (ended !== null) return [ENDED, [{ do: 'disarm' }, { do: 'hang-up' }, { do: 'refuse', why: ended.how }]];
   switch (event.type) {
     case 'stderr':
       return [{ ...life, said: saying(life.said, event.text) }, []];

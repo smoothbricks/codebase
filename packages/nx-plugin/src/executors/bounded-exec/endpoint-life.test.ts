@@ -206,6 +206,21 @@ describe("the life of a run's reservation endpoint", () => {
         effects: [[{ do: 'refuse', why: 'mbx reservations could not run: spawn mbx ENOENT' }], []],
       },
       {
+        name: 'an endpoint whose child ends before its probe answers is refused by how it ended, and never served',
+        events: [stdout('listening\n'), stderr('mbx: pool store is locked\n'), close(1), probe(GATES), PROBE_END],
+        effects: [
+          [{ do: 'probe' }, arm],
+          [],
+          [
+            disarm,
+            { do: 'hang-up' },
+            { do: 'refuse', why: 'mbx reservations ended with status 1: mbx: pool store is locked' },
+          ],
+          [],
+          [],
+        ],
+      },
+      {
         name: "an endpoint that ends while it serves is said at its run's end, and nothing is signalled",
         events: [stdout('listening\n'), probe(NO_GATE), close(null, 'SIGTERM'), RUN_END],
         effects: [
@@ -309,6 +324,16 @@ describe("the life of a run's reservation endpoint", () => {
     });
   });
 
+  it('waits on nothing of a child that has ended, and serves no endpoint whose child ended first', () => {
+    everyOrder((steps) => {
+      const ended = steps.findIndex((step) => step.event.type === 'close' || step.event.type === 'error');
+      if (ended === -1) return;
+      for (const step of steps.slice(ended)) {
+        expect(['gone', 'ended']).toContain(step.after.phase);
+        expect(step.effects.map((effect) => effect.do)).not.toContain('serve');
+      }
+    });
+  });
   it('serves only a child whose first line is `listening`, however its output is cut, and names any other first line', () => {
     everyOrder((steps) => {
       let out = '';
