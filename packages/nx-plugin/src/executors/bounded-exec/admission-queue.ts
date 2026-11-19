@@ -26,6 +26,8 @@ export interface ObservationHost {
   step(event: BoundEvent): void;
   /** Whether the command is running a test. */
   testing(): boolean;
+  /** Same sleep-excluding clock as the executor's idle bound. */
+  awakeNow(): number;
   readonly queueHost: QueueHost | undefined;
 }
 
@@ -41,7 +43,7 @@ export class AdmissionObservation {
    * and ends nothing: the bounds decide, and an idle expiry names it.
    */
   private failure: string | null = null;
-  /** When the last successful snapshot completed (`Date.now()`): credit runs to it and no further. */
+  /** When the last successful snapshot completed on the awake clock: credit runs to it and no further. */
   private confirmedAt: number | null = null;
   private readonly abort = new AbortController();
   private timer: NodeJS.Timeout | undefined;
@@ -64,12 +66,12 @@ export class AdmissionObservation {
   queueWait(reserved: boolean): AdmissionQueueWait | null {
     return this.admitted || (this.requests.length === 0 && !reserved)
       ? null
-      : { waitedMs: admissionWaitMs(this.wait, performance.now()), requests: this.requests };
+      : { waitedMs: admissionWaitMs(this.wait, this.host.awakeNow()), requests: this.requests };
   }
 
   /** A reserved leaf's request began to wait on its run's endpoint. */
   waiting(): void {
-    this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: performance.now(), waiting: true });
+    this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: this.host.awakeNow(), waiting: true });
   }
 
   /** Only mbx's activity report says whether a Cargo leaf's compiler or test waits in the pool: poll it. */
@@ -82,7 +84,7 @@ export class AdmissionObservation {
 
   /** The run ended: the wait stops counting and no snapshot is taken or credited again. */
   stop(): void {
-    this.wait = stepAdmissionWait(this.wait, { kind: 'stop', at: performance.now() });
+    this.wait = stepAdmissionWait(this.wait, { kind: 'stop', at: this.host.awakeNow() });
     clearInterval(this.timer);
     this.abort.abort();
   }
@@ -101,11 +103,11 @@ export class AdmissionObservation {
     }
     this.failure = detail;
     this.requests = [];
-    this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: performance.now(), waiting: false });
+    this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: this.host.awakeNow(), waiting: false });
     // The wait since the last confirmed snapshot is unconfirmed: the idle bound resumes from that snapshot.
     this.host.step({
       kind: 'admission-queue',
-      at: this.confirmedAt ?? Date.now(),
+      at: this.confirmedAt ?? this.host.awakeNow(),
       waiting: false,
       testing: this.host.testing(),
     });
@@ -129,9 +131,8 @@ export class AdmissionObservation {
       }
       this.lastSnapshotDiagnostics = diagnostics;
       const waiting = snapshot.requests.length > 0;
-      const observedAt = Date.now();
-      const observedWaitAt = performance.now();
-      this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: observedWaitAt, waiting });
+      const observedAt = this.host.awakeNow();
+      this.wait = stepAdmissionWait(this.wait, { kind: 'snapshot', at: observedAt, waiting });
       this.failure = null;
       this.confirmedAt = observedAt;
       if (waiting) {
@@ -142,7 +143,7 @@ export class AdmissionObservation {
           this.lastDiagnosticAt === null ||
           Date.now() - this.lastDiagnosticAt >= HANG_CAPTURE_MS
         ) {
-          const waitedMs = admissionWaitMs(this.wait, observedWaitAt);
+          const waitedMs = admissionWaitMs(this.wait, observedAt);
           this.host.tell(`cowshed: mbx ${describeAdmissionQueue({ waitedMs, requests: snapshot.requests })}\n`);
           this.lastDiagnostic = positions;
           this.lastDiagnosticAt = Date.now();

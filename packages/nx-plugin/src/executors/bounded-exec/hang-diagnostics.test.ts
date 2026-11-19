@@ -28,8 +28,8 @@ const exited = (stdout: string, code = 0, stderr = ''): HangProbeResult => ({ st
 const request = (): HangCaptureRequest => ({
   pid: ROOT,
   pgid: ROOT,
-  expiresAtMs: Date.now() + BOUNDED_TEST_IDLE_TIMEOUT_MS,
-  deadlineMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+  awakeExpiresAtMs: performance.now() + BOUNDED_TEST_IDLE_TIMEOUT_MS,
+  awakeNow: () => performance.now(),
 });
 
 /**
@@ -288,7 +288,8 @@ describe('pre-expiry hang diagnostics', () => {
     expect((await captureHangDiagnostics(request(), throwing)).text).toContain('probe rejected');
   });
 
-  it('returns at its own deadline even when the probe never answers, and starts no later probe', async () => {
+  //#region smoo/cowshed!n/awake-idle-bound
+  it('lets an unanswered probe keep its remaining diagnostic budget on wake, then aborts it at expiry', async () => {
     let calls = 0;
     let signal: AbortSignal | undefined;
     const unresponsive: HangDiagnosticHost = {
@@ -300,13 +301,31 @@ describe('pre-expiry hang diagnostics', () => {
         return new Promise<HangProbeResult>(() => {});
       },
     };
-    // The probe is held off by construction, so the 1 ms deadline timer is the only event that can end this capture.
-    const capture = await captureHangDiagnostics({ ...request(), deadlineMs: 1 }, unresponsive);
-    expect(capture.outcome).toBe('incomplete');
-    expect(capture.text).toContain('1ms deadline reached during ps before');
-    expect(signal?.aborted).toBe(true);
-    expect(calls).toBe(1);
+    jest.useFakeTimers();
+    let awake = 0;
+    try {
+      const limit = 1_000;
+      const capture = captureHangDiagnostics(
+        { ...request(), awakeExpiresAtMs: limit, awakeNow: () => awake },
+        unresponsive,
+      );
+      jest.advanceTimersByTime(limit); // Only the timer advances during sleep.
+      expect(signal?.aborted).toBe(false);
+      awake = limit - 1;
+      jest.advanceTimersByTime(limit - 1);
+      expect(signal?.aborted).toBe(false);
+      awake = limit;
+      jest.advanceTimersByTime(1);
+      const result = await capture;
+      expect(result.outcome).toBe('incomplete');
+      expect(result.text).toContain('1000ms deadline reached during ps before');
+      expect(signal?.aborted).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
+  //#endregion smoo/cowshed!n/awake-idle-bound
 
   it('cancels a pending probe when its progress generation ends without starting another', async () => {
     const controller = new AbortController();
@@ -341,7 +360,7 @@ describe('pre-expiry hang diagnostics', () => {
   });
 
   it('starts no process probe after the pre-expiry window or with no remaining budget', async () => {
-    for (const bounds of [{ expiresAtMs: Date.now() - 1 }, { deadlineMs: 0 }]) {
+    for (const bounds of [{ awakeExpiresAtMs: performance.now() - 1 }, { awakeExpiresAtMs: performance.now() }]) {
       const { host, calls } = scriptedHost([]);
       const capture = await captureHangDiagnostics({ ...request(), ...bounds }, host);
       expect(capture.outcome).toBe('incomplete');
@@ -456,7 +475,7 @@ describe('pre-expiry hang diagnostics', () => {
           return new Promise<void>(() => {});
         },
       };
-      const capturing = captureHangDiagnostics({ ...request(), deadlineMs: 1_100 }, waiting);
+      const capturing = captureHangDiagnostics({ ...request(), awakeExpiresAtMs: performance.now() + 1_100 }, waiting);
       await asleep;
       jest.advanceTimersByTime(1_100);
       const capture = await capturing;

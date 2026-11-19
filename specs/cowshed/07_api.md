@@ -1965,11 +1965,19 @@ a pid that is not positive throws the addon's own error with `code: "usage"`, an
 one with `code: "environment-missing"`, each with its message, naming the pid and the system error, and hint.
 
 The entry is the source module `src/process-lineage.ts`, the type's one owner, compiled on its own by
-`cowshed:lineage-js` into `dist/lineage` from `src/process-lineage.ts`, `src/addon.ts` and `src/platform.ts` alone: no
-generated or typia module, and no other target first. It loads the addon at its first call, never at import, through the
-same `loadAddon` search (`src/addon.ts`) the root entry's eager `loadNativeModule` uses. bounded-exec's admission
-observer imports its type and loads it lazily, so nx-plugin compiles against `dist/lineage` without the package's whole
-build (11_shell.md, "Cargo test-runner boundaries").
+`cowshed:lineage-js` into `dist/lineage` from `src/process-lineage.ts`, `src/addon.ts` and `src/platform.ts` alongside
+the awake-clock entry: no generated or typia module or full API build. It loads the addon at its first call, never at
+import, through the same `loadAddon` search (`src/addon.ts`) the root entry's eager `loadNativeModule` uses.
+bounded-exec's admission observer imports its type and loads it lazily, so nx-plugin compiles against `dist/lineage`
+without the package's whole build (11_shell.md, "Cargo test-runner boundaries").
+
+### Awake clock
+
+`@smoothbricks/cowshed/awake-clock` exports `awakeTimeMs(): number`, monotonic elapsed milliseconds from a process-local
+origin. On Darwin, Rust's `Instant` uses `CLOCK_UPTIME_RAW`; on Linux it uses `CLOCK_MONOTONIC`. Neither includes host
+suspension. This direct addon read starts no process or controller and performs no I/O. Its standalone JavaScript entry
+shares `cowshed:lineage-js` and `loadAddon` with process lineage, and first loads the addon on a call. Darwin's Node
+bounded executor reads this clock because libuv's `mach_continuous_time` includes suspension.
 
 ### NAPI streaming (frozen)
 

@@ -267,6 +267,85 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).not.toContain('Command timed out after');
   });
 
+  //#region smoo/cowshed!n/awake-idle-bound
+  it('preserves the remaining idle and capture budgets on wake, then ends genuine awake silence', async () => {
+    const workspace = await createWorkspace();
+    await workspace.write('suspend.js', `${OWNED_GROUP_LINE}\n${LIFELINE}`);
+    const owned: { group?: number } = {};
+    const ownGroup = ownFixtureGroup(owned);
+    const { promise: ready, resolve: started } = Promise.withResolvers<void>();
+    const captures: number[] = [];
+    const signals: NodeJS.Signals[] = [];
+    const real = createProcessTreeKiller();
+    const killer: ProcessTreeKiller = {
+      async kill(pid, signal) {
+        signals.push(signal);
+        await real.kill(pid, signal);
+      },
+    };
+    const limit = BOUNDED_TEST_IDLE_TIMEOUT_MS;
+    jest.useFakeTimers();
+    let awake = 0;
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => awake);
+    const move = async (awakeMs: number, timerMs = awakeMs): Promise<void> => {
+      awake += awakeMs;
+      jest.advanceTimersByTime(timerMs);
+      await Promise.resolve();
+    };
+    try {
+      const run = runBoundedExec(
+        { command: 'node suspend.js', idleTimeoutMs: limit },
+        {
+          ...workspace.context,
+          stdout(chunk) {
+            ownGroup(chunk);
+            if (owned.group !== undefined) started();
+          },
+        },
+        killer,
+        null,
+        null,
+        (request) => {
+          captures.push(request.awakeExpiresAtMs - request.awakeNow());
+          const capturedAtMs = Date.now();
+          return Promise.resolve({
+            startedAtMs: capturedAtMs,
+            capturedAtMs,
+            offsetFromExpiryMs: request.awakeExpiresAtMs - request.awakeNow(),
+            outcome: 'holders',
+            lockWaits: [],
+            cpuRising: [],
+            text: 'awake pre-expiry capture\n',
+          });
+        },
+      );
+      await ready;
+      const beforeSleep = 20_000;
+      await move(beforeSleep);
+      // Both timers are eligible to run after resume, but the host spent no awake time during suspension.
+      await move(0, limit);
+      const onWake = { captures: captures.length, signals: signals.length };
+      await move(limit - beforeSleep - HANG_CAPTURE_MS);
+      const inCaptureWindow = { captures: [...captures], signals: signals.length };
+      await move(HANG_CAPTURE_MS - 1);
+      const beforeExpiry = signals.length;
+      await move(1);
+      const result = await run;
+      releaseFixtureGroup(owned);
+
+      expect(onWake).toEqual({ captures: 0, signals: 0 });
+      expect(inCaptureWindow).toEqual({ captures: [HANG_CAPTURE_MS], signals: 0 });
+      expect(beforeExpiry).toBe(0);
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain(`idleTimeoutMs=${limit}`);
+      expect(result.terminalOutput).toContain('awake pre-expiry capture');
+      expect(signals).toEqual(['SIGTERM']);
+    } finally {
+      clock.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+  //#endregion smoo/cowshed!n/awake-idle-bound
   it('runs the fixture first, then the command', async () => {
     const workspace = await createWorkspace();
 
@@ -465,7 +544,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
               return {
                 startedAtMs: capturedAtMs,
                 capturedAtMs,
-                offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+                offsetFromExpiryMs: request.awakeExpiresAtMs - request.awakeNow(),
                 outcome: 'holders',
                 lockWaits: [],
                 cpuRising: [],
@@ -510,7 +589,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             return {
               startedAtMs: capturedAtMs,
               capturedAtMs,
-              offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+              offsetFromExpiryMs: request.awakeExpiresAtMs - request.awakeNow(),
               outcome: 'holders',
               lockWaits: [],
               cpuRising,
@@ -723,7 +802,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
               return {
                 startedAtMs: capturedAtMs,
                 capturedAtMs,
-                offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+                offsetFromExpiryMs: request.awakeExpiresAtMs - request.awakeNow(),
                 outcome: 'holders',
                 lockWaits: [],
                 cpuRising: [],

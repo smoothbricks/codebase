@@ -9,5 +9,5 @@
     "lib": ["es2024"],
     "types": []
   },
-  "files": ["src/process-lineage.ts", "src/addon.ts", "src/platform.ts"]
+  "files": ["src/process-lineage.ts", "src/awake-clock.ts", "src/addon.ts", "src/platform.ts"]
 }

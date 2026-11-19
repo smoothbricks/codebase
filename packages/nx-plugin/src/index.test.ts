@@ -1606,7 +1606,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('orders only a Cargo-leaf bounded target after the manifest-owned cowshed producers, keys none of their bytes, and never loads the addon', async () => {
+  it('orders Darwin idle runs and Cargo leaves after the manifest-owned cowshed producers, keys none of their bytes, and never loads the addon', async () => {
     const workspace = await createWorkspace();
     const bounded: TargetConfiguration = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1619,7 +1619,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const ownerTargets: Record<string, TargetConfiguration> = {
       lint: bounded,
       'api-generator': { executor: 'nx:run-commands', options: { command: 'generate-api' } },
-      'api-check': { ...bounded, dependsOn: ['...', 'api-generator'] },
+      'api-check': {
+        ...bounded,
+        options: { command: 'check-api', timeoutMs: 120_000 },
+        dependsOn: ['...', 'api-generator'],
+      },
       'tsc-js': { dependsOn: ['...', 'api-check'] },
       'lineage-js': {
         executor: 'nx:run-commands',
@@ -1630,7 +1634,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       },
       build: { dependsOn: ['tsc-js'] },
       'release-check': { executor: '@smoothbricks/nx-plugin:bounded-exec', cache: false },
-      // The bounded observer loads the addon only while a Cargo leaf waits for mbx admission.
+      // A Cargo leaf also loads native process lineage while it waits for admission.
       'cargo-check': { ...bounded, options: { command: 'cargo test -p cowshed-napi', idleTimeoutMs: 180000 } },
       // The package's loader reads napi-debug's addon under NAPI_DEBUG_ADDON=1.
       'host-napi-test': {
@@ -1745,12 +1749,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           const tasks = createTaskGraph(graph, {}, [node.name], [name], undefined, {});
           expect(findCycles(tasks)).toBeNull();
           const direct = (tasks.dependencies[id] ?? []).map((edge) => edge.id);
-          expect(direct.includes('lineage-owner:napi-native'), id).toBe(cargoLeaves.has(id));
-          expect(direct.includes('lineage-owner:lineage-js'), id).toBe(cargoLeaves.has(id));
+          const readsAddon = cargoLeaves.has(id) || typeof target.options?.idleTimeoutMs === 'number';
+          expect(direct.includes('lineage-owner:napi-native'), id).toBe(readsAddon);
+          expect(direct.includes('lineage-owner:lineage-js'), id).toBe(readsAddon);
           expect(
             target.dependsOn?.filter((dependency) => JSON.stringify(dependency) === JSON.stringify(addon)) ?? [],
             id,
-          ).toHaveLength(cargoLeaves.has(id) ? 1 : 0);
+          ).toHaveLength(readsAddon ? 1 : 0);
           expect(target.inputs ?? [], id).not.toContainEqual({
             dependentTasksOutputFiles: '**/*.node',
             transitive: true,

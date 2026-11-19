@@ -9,17 +9,17 @@ SmoothBricks' PATH launcher imports the built CLI from `packages/cli/dist`, ex
 loads no source transformer and has no source fallback. Shell entry, not each CLI invocation, owns missing or stale
 outputs: after the install and developer-link tasks, `tooling/direnv/enter-shell.ts` emits the Nx plugin, CLI and their
 required `workspace:*` runtime entries, dependency first and once per package. The cowshed dependency supplies only its
-native-free `process-lineage` entry through its independent `tsc --build tsconfig.lineage.json --force` producer, not
-its full API or that API's dependencies. The forced build repairs missing public outputs even when incremental
-build-info still exists; a current bootstrap marker skips the compiler entirely. Other packages use
-`ttsc -p tsconfig.lib.json --emit`. Bootstrap invokes neither Nx nor smoo, so it needs no project graph or pre-existing
-CLI build.
+native-free `process-lineage` and `awake-clock` entries through its independent
+`tsc --build tsconfig.lineage.json --force` producer, not its full API or that API's dependencies. The forced build
+repairs missing public outputs even when incremental build-info still exists; a current bootstrap marker skips the
+compiler entirely. Other packages use `ttsc -p tsconfig.lib.json --emit`. Bootstrap invokes neither Nx nor smoo, so it
+needs no project graph or pre-existing CLI build.
 
 The environment-capture pass (`DEVENV_SKIP_TASKS`) builds nothing. The entry proper finishes bootstrap before runtime
 pin synchronization can call `smoo monorepo init --runtime-only`. Install, postinstall and developer-link setup run
 their raw scripts, not the CLI. The existing `node_modules/.cache/smoo/dist-verified` marker gates emit; absent or empty
-`dist`, missing markers or newer source/config files rebuild. The lineage entry specifically requires both its public
-`dist/lineage/process-lineage.d.ts` and JavaScript file: a non-empty full-API `dist/ts` cannot stand in for it.
+`dist`, missing markers or newer source/config files rebuild. Both entries require their own declaration and JavaScript
+files in `dist/lineage`: a non-empty full-API `dist/ts` cannot stand in for them.
 
 Each package's `node_modules/.cache/smoo/dist-verified` marker also records the SHA-256 of the output tree it verified:
 paths, kinds, bytes and link text. Only an emit of the plugin's dependency closure that leaves a member's output bytes

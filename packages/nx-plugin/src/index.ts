@@ -2563,29 +2563,29 @@ async function createProjectTargets(
     }
   }
 
-  // bounded-exec's admission observer loads cowshed's process-lineage entry, and through it the addon, only while a
-  // Cargo leaf waits for mbx admission (specs/cowshed/11_shell.md, "Cargo test-runner boundaries"; mbx-queue.ts). Such
-  // a target runs after the local producers so the observer finds them. Its reading only decides whether that wait is
-  // credited against the idle bound, so the producers' bytes key no target (README, "Bounded exec key"): a command that
-  // reads them keys them itself. A command named in either the declaration or the inference counts.
-  // Declarations retain these prerequisites with Nx's ordinary "..." merge token.
-  // The canonical release-check instead judges prebuilt shipping artifacts and must remain dependency-free.
-  const observerProducers = [...nativeToolDependsOn(nativeTools, 'cowshed'), ...lineageProducer];
-  if (observerProducers.length > 0) {
+  // The Darwin Node idle clock and the Cargo admission observer both load the local cowshed addon. They can fail
+  // a run but do not change a passing command, so none keys its bytes (README, "Bounded exec key"). Declarations
+  // retain these prerequisites with Nx's ordinary "..." merge token. The wall-only release-check judges already
+  // built shipping artifacts and remains dependency-free.
+  const addonProducers = [...nativeToolDependsOn(nativeTools, 'cowshed'), ...lineageProducer];
+  if (addonProducers.length > 0) {
     for (const name of new Set([...Object.keys(targets), ...Object.keys(declaredTargets)])) {
       const declared = declaredTargets[name];
       const executor =
         isRecord(declared) && declared.executor !== undefined ? declared.executor : targets[name]?.executor;
       if (executor !== '@smoothbricks/nx-plugin:bounded-exec' || name === 'release-check') continue;
-      // Nx discards an incompatible executor's inferred configuration; only the observer prerequisites belong below it.
-      if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) {
-        targets[name] = {};
-      }
       const runs = [...targetOptionSets(declared), ...targetOptionSets(targets[name])];
-      if (!runs.some((options) => runsAsCargoLeaf(boundedCommandLine(options) ?? ''))) continue;
+      const needsAddon = runs.some(
+        (options) =>
+          runsAsCargoLeaf(boundedCommandLine(options) ?? '') ||
+          (hostPlatform?.targetFamily === 'macos' && typeof options.idleTimeoutMs === 'number'),
+      );
+      if (!needsAddon) continue;
+      // Nx discards an incompatible executor's inferred configuration; only the runtime prerequisites belong below it.
+      if (targets[name]?.executor !== undefined && targets[name]?.executor !== executor) targets[name] = {};
       targets[name] ??= {};
       const target = targets[name];
-      target.dependsOn = [...(target.dependsOn ?? []), ...observerProducers];
+      target.dependsOn = [...(target.dependsOn ?? []), ...addonProducers];
     }
   }
 

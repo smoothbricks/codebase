@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { type ProcessEntry, withDescendants } from '../../testing.js';
+import { atClockDeadline } from './awake-clock.js';
 import {
   CPU_RISING_CLASS,
   type CpuRise,
@@ -87,8 +88,8 @@ export interface HangDiagnostics {
 export interface HangCaptureRequest {
   pid: number;
   pgid: number | null;
-  expiresAtMs: number;
-  deadlineMs: number;
+  awakeExpiresAtMs: number;
+  awakeNow(): number;
   signal?: AbortSignal;
 }
 
@@ -111,16 +112,14 @@ interface ObservedProcess extends ProcessEntry {
   raw: string;
 }
 
-const host: HangDiagnosticHost = { platform: process.platform, probe: runProbe, sleep: sleepUnlessAborted };
-
-function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+function sleepUnlessAborted(ms: number, signal: AbortSignal, now: () => number): Promise<void> {
   return new Promise((resolve) => {
     const done = (): void => {
-      clearTimeout(timer);
+      cancelTimer();
       signal.removeEventListener('abort', done);
       resolve();
     };
-    const timer = setTimeout(done, ms);
+    const cancelTimer = atClockDeadline(now() + ms, now, done);
     signal.addEventListener('abort', done, { once: true });
     if (signal.aborted) done();
   });
@@ -129,11 +128,17 @@ function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
 /** A pre-expiry observation, never an assertion that an open file is a contested lock. */
 export function captureHangDiagnostics(
   request: HangCaptureRequest,
-  source: HangDiagnosticHost = host,
+  source: HangDiagnosticHost = {
+    platform: process.platform,
+    probe: (file, args, timeoutMs, signal) => runProbe(file, args, timeoutMs, signal, undefined, request.awakeNow),
+    sleep: (ms, signal) => sleepUnlessAborted(ms, signal, request.awakeNow),
+  },
 ): Promise<HangDiagnostics> {
   const startedAtMs = Date.now();
-  const budgetMs = Math.max(0, Math.min(HANG_CAPTURE_MS, request.deadlineMs, request.expiresAtMs - startedAtMs));
-  const endsAtMs = startedAtMs + budgetMs;
+  const { awakeNow, awakeExpiresAtMs } = request;
+  const startedAwake = awakeNow();
+  const endsAtMs = Math.min(startedAwake + HANG_CAPTURE_MS, awakeExpiresAtMs);
+  const budgetMs = Math.max(0, Math.min(HANG_CAPTURE_MS, awakeExpiresAtMs - startedAwake));
   const controller = new AbortController();
   const lines = [
     `Hang snapshot: pid=${request.pid} pgid=${request.pgid ?? 'unknown'} startedAtMs=${startedAtMs}`,
@@ -149,11 +154,11 @@ export function captureHangDiagnostics(
     const finish = (outcome: HangDiagnostics['outcome']): void => {
       if (finished) return;
       finished = true;
-      clearTimeout(timer);
+      cancelTimer();
       request.signal?.removeEventListener('abort', cancelled);
       controller.abort();
       const capturedAtMs = Date.now();
-      const offsetFromExpiryMs = request.expiresAtMs - capturedAtMs;
+      const offsetFromExpiryMs = awakeExpiresAtMs - awakeNow();
       resolve({
         startedAtMs,
         capturedAtMs,
@@ -164,10 +169,12 @@ export function captureHangDiagnostics(
         text: `${lines.join('\n')}\nHang snapshot outcome=${outcome} capturedAtMs=${capturedAtMs} offsetFromExpiryMs=${offsetFromExpiryMs}\n`,
       });
     };
-    const timer = setTimeout(() => {
-      lines.push(`Capture incomplete: ${budgetMs}ms deadline reached during ${during()}; no empty-holder conclusion.`);
+    const cancelTimer = atClockDeadline(endsAtMs, awakeNow, () => {
+      lines.push(
+        `Capture incomplete: ${Math.ceil(budgetMs)}ms deadline reached during ${during()}; no empty-holder conclusion.`,
+      );
       finish('incomplete');
-    }, budgetMs);
+    });
     const cancelled = (): void => {
       if (finished) return;
       lines.push(`Capture cancelled during ${during()}; its progress generation is no longer current.`);
@@ -189,7 +196,7 @@ export function captureHangDiagnostics(
       const result = await source.probe(
         file,
         args,
-        Math.max(0, Math.min(limitMs, endsAtMs - Date.now())),
+        Math.max(0, Math.min(limitMs, endsAtMs - awakeNow())),
         controller.signal,
       );
       active.delete(name);
@@ -273,7 +280,7 @@ export function captureHangDiagnostics(
       const name = `stack sample pid ${pid}`;
       // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
       const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-file', '/dev/stdout'];
-      const result = await probe(name, 'sudo', args, endsAtMs - Date.now() - CENSUS_LIMIT_MS);
+      const result = await probe(name, 'sudo', args, endsAtMs - awakeNow() - CENSUS_LIMIT_MS);
       if (finished) return;
       const report = callGraph(result.stdout);
       if (result.status === 'exited' && result.code === 0 && report !== '') {
@@ -302,7 +309,7 @@ export function captureHangDiagnostics(
      */
     const kernelWaits = async (tree: readonly ObservedProcess[]): Promise<void> => {
       const waiting = tree.filter((entry) => entry.stat.startsWith('U')).slice(0, MAX_SAMPLED_LEAVES);
-      const limitMs = endsAtMs - Date.now() - CENSUS_LIMIT_MS;
+      const limitMs = endsAtMs - awakeNow() - CENSUS_LIMIT_MS;
       await Promise.all(
         waiting.map(async ({ pid }) => {
           const name = `fs_usage pid ${pid}`;
@@ -323,7 +330,7 @@ export function captureHangDiagnostics(
       const before = await census('ps before');
       if (finished) return;
       if (before === null) return finish('incomplete');
-      const beforeAtMs = Date.now();
+      const beforeAtMs = awakeNow();
       let incomplete = false;
       let observed = before.length > 0;
       if (source.platform === 'darwin') {
@@ -389,7 +396,7 @@ export function captureHangDiagnostics(
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);
         lines.push(`Stack samples not provided on ${source.platform}; no blocking call is observed.`);
       }
-      const settleMs = Math.min(beforeAtMs + CPU_INTERVAL_MS, endsAtMs - CENSUS_LIMIT_MS) - Date.now();
+      const settleMs = Math.min(beforeAtMs + CPU_INTERVAL_MS, endsAtMs - CENSUS_LIMIT_MS) - awakeNow();
       if (settleMs > 0) {
         active.add('CPU interval');
         await source.sleep(settleMs, controller.signal);
@@ -399,7 +406,7 @@ export function captureHangDiagnostics(
       const after = await census('ps after');
       if (finished) return;
       if (after === null) return finish('incomplete');
-      const afterAtMs = Date.now();
+      const afterAtMs = awakeNow();
       if (
         before.length !== after.length ||
         before.some(
@@ -481,6 +488,7 @@ export function runProbe(
   timeoutMs: number,
   signal: AbortSignal,
   environment?: NodeJS.ProcessEnv,
+  now: () => number = () => performance.now(),
 ): Promise<HangProbeResult> {
   // Keep the package's es2022-compatible event-completion convention.
   return new Promise((resolve) => {
@@ -496,7 +504,7 @@ export function runProbe(
     const finish = (result: HangProbeResult): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cancelTimer();
       signal.removeEventListener('abort', aborted);
       child.stdout.destroy();
       child.stderr.destroy();
@@ -518,7 +526,7 @@ export function runProbe(
       finish({ status, detail: detail + killFailure, stdout, stderr });
     };
     const aborted = (): void => stop('capture deadline reached');
-    const timer = setTimeout(() => stop(`probe exceeded ${timeoutMs}ms`), timeoutMs);
+    const cancelTimer = atClockDeadline(now() + timeoutMs, now, () => stop(`probe exceeded ${timeoutMs}ms`));
     signal.addEventListener('abort', aborted, { once: true });
     const append = (stream: 'stdout' | 'stderr', chunk: string): void => {
       bytes += Buffer.byteLength(chunk);

@@ -949,24 +949,26 @@ not move, and a task Nx does not cache has a verdict its hash does not decide, s
 for running it. After a passing gate, task hashes that cannot be read from the run summary are said and the land goes on
 without publishing them: the cache never blocks a land (05_gateway.md, "/nx/v1/cache/{hash}").
 
-Every test target, the groups included, is bounded by progress alone: the run ends when the time since its last progress
-reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and names
-the tests still running. Progress is a finished test, or a record a running test reports on the run's progress channel:
-a Unix socket the executor serves for the run, in a fresh 0700 directory, and names in the command's environment as
-`BOUNDED_EXEC_PROGRESS_SOCKET`. Each line on it is one record and must be `moved`; anything else fails the run as a
-broken reporter. The executor ends its side of a connection after reading every record the client wrote, so a client
-that waits for that end knows its records counted. A test whose harness enforces its own no-progress bound over what its
-run does (an agent harness's "nothing in the run moved", over its span log and the runtime's stderr) reports each
-movement that check sees, so a long test that keeps moving is never ended for being the last one still running. The
-run's CPU never restarts the bound: a test whose tree gains CPU and reports no progress, a compile inside a test, is
-ended at the bound and named by the snapshot below. There is no count-multiplied outer wall-clock budget and no per-test
-bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test carries one of
-its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a
-filter that selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
-production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds, and so do
-the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a stopped FSEvents stream), which
-`sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host target names each owned host
-file.
+<a id="smoo/cowshed!n/awake-idle-bound"></a>Every test target, the groups included, is bounded by progress alone: the
+run ends when the awake time since its last progress reaches its configured `idleTimeoutMs`
+(`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and names the tests still running. On Darwin and
+Linux, host suspension spends neither the idle budget nor its pre-expiry diagnostic window; a timer notification before
+its awake deadline arms the remaining budget, without restarting it. Human-readable timestamps use wall time. Progress
+is a finished test, or a record a running test reports on the run's progress channel: a Unix socket the executor serves
+for the run, in a fresh 0700 directory, and names in the command's environment as `BOUNDED_EXEC_PROGRESS_SOCKET`. Each
+line on it is one record and must be `moved`; anything else fails the run as a broken reporter. The executor ends its
+side of a connection after reading every record the client wrote, so a client that waits for that end knows its records
+counted. A test whose harness enforces its own no-progress bound over what its run does (an agent harness's "nothing in
+the run moved", over its span log and the runtime's stderr) reports each movement that check sees, so a long test that
+keeps moving is never ended for being the last one still running. The run's CPU never restarts the bound: a test whose
+tree gains CPU and reports no progress, a compile inside a test, is ended at the bound and named by the snapshot below.
+There is no count-multiplied outer wall-clock budget and no per-test bound kills a test: a Bun leg deletes Bun's own
+5000 ms per-test deadline with `--timeout=0`, and no test carries one of its own (`packages/nx-plugin/README.md`,
+"Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that selects nothing fails rather than
+passing a run of no test. The RAM host walk and real-process CPU-pool production-wiring proofs run in `test-host`,
+outside the four pure Bun shards, with the existing case bounds, and so do the Nx daemon proofs that apply their own
+Seatbelt profile (a refused daemon stop, a stopped FSEvents stream), which `sandbox_apply` refuses inside a cowshed job.
+The shards exclude `*-host.test.ts`; the host target names each owned host file.
 
 Drain fixtures read report publications on native directory-write events and await the serving task and resident's
 completion directly. CPU-admission holders announce readiness on stdout before blocking on their open stdin; consumers

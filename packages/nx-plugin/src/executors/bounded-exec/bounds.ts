@@ -20,8 +20,8 @@ export interface BoundLimits {
 }
 
 /**
- * When each armed bound expires, in the clock's milliseconds; `null` when it is not armed. `queued`: the run waits for
- * its pool's grant, so none is armed yet but a fixture ceiling started at spawn (`fixtureFirst`).
+ * When each armed bound expires: idle on the awake clock, fixture and total on the wall clock. A null bound is not
+ * armed. A queued run waits for its pool's grant, so only a fixture started at spawn can have a ceiling then.
  */
 export interface Bounds {
   readonly idle: number | null;
@@ -44,13 +44,20 @@ export type BoundEvent =
   | {
       readonly kind: 'spawn';
       readonly at: number;
+      readonly wallAt: number;
       readonly testing: boolean;
       readonly fixture: boolean;
       readonly queued: boolean;
       readonly fixtureFirst: boolean;
     }
   /** Each admission begins a hold; the first one starts the queued leaf's ceilings. */
-  | { readonly kind: 'granted'; readonly at: number; readonly testing: boolean; readonly fixture: boolean }
+  | {
+      readonly kind: 'granted';
+      readonly at: number;
+      readonly wallAt: number;
+      readonly testing: boolean;
+      readonly fixture: boolean;
+    }
   | { readonly kind: 'released'; readonly at: number }
   /** A successful public snapshot proved whether a live task process is queued; `at` is completion, not poll start. */
   | { readonly kind: 'admission-queue'; readonly at: number; readonly waiting: boolean; readonly testing: boolean }
@@ -83,12 +90,12 @@ export const UNARMED: Bounds = {
   idleRemaining: null,
 };
 
-/** The bounds a command that starts running at `at` arms. */
-function armed(limits: BoundLimits, at: number, testing: boolean, fixture: boolean): Bounds {
+/** The bounds a command arms when it starts running. */
+function armed(limits: BoundLimits, event: Extract<BoundEvent, { kind: 'spawn' | 'granted' }>): Bounds {
   return {
-    idle: testing && limits.idleMs !== undefined ? at + limits.idleMs : null,
-    fixture: fixture && limits.fixtureMs !== undefined ? at + limits.fixtureMs : null,
-    total: limits.totalMs !== undefined ? at + limits.totalMs : null,
+    idle: event.testing && limits.idleMs !== undefined ? event.at + limits.idleMs : null,
+    fixture: event.fixture && limits.fixtureMs !== undefined ? event.wallAt + limits.fixtureMs : null,
+    total: limits.totalMs !== undefined ? event.wallAt + limits.totalMs : null,
     queued: false,
     admissionWaiting: false,
     holds: null,
@@ -106,13 +113,13 @@ export function stepBounds(bounds: Bounds, limits: BoundLimits, event: BoundEven
             queued: true,
             holds: 0,
             idleRemaining: limits.idleMs ?? null,
-            fixture: event.fixtureFirst && limits.fixtureMs !== undefined ? event.at + limits.fixtureMs : null,
+            fixture: event.fixtureFirst && limits.fixtureMs !== undefined ? event.wallAt + limits.fixtureMs : null,
           }
-        : armed(limits, event.at, event.testing, event.fixture);
+        : armed(limits, event);
     case 'granted': {
       if (bounds.holds === null) return bounds;
       if (bounds.queued) {
-        const admitted = armed(limits, event.at, event.testing, event.fixture);
+        const admitted = armed(limits, event);
         return {
           ...admitted,
           holds: 1,
@@ -177,11 +184,17 @@ export function stepBounds(bounds: Bounds, limits: BoundLimits, event: BoundEven
 }
 
 /** The bound that expires first, or `null` when none is armed. A tie names the total, then the fixture, then idle. */
-export function earliestBound(bounds: Bounds): { readonly kind: BoundKind; readonly at: number } | null {
-  let earliest: { kind: BoundKind; at: number } | null = null;
+export function earliestBound(
+  bounds: Bounds,
+  awakeNow: number,
+  wallNow: number,
+): { readonly kind: BoundKind; readonly remainingMs: number } | null {
+  let earliest: { kind: BoundKind; remainingMs: number } | null = null;
   for (const kind of ['total', 'fixture', 'idle'] as const) {
     const at = bounds[kind];
-    if (at !== null && (earliest === null || at < earliest.at)) earliest = { kind, at };
+    if (at === null) continue;
+    const remainingMs = at - (kind === 'idle' ? awakeNow : wallNow);
+    if (earliest === null || remainingMs < earliest.remainingMs) earliest = { kind, remainingMs };
   }
   return earliest;
 }

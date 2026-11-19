@@ -1550,26 +1550,24 @@ A wildcard without a caret selects the current project instead. For example, a w
 this local relationship explicit for inferred `tsc-js` targets that also have inferred `cargo-wasm`. Package-managed
 JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
 
-A self-hosted workspace that owns the plugin's cowshed dependency builds its declared `napi-native` and independent
-`lineage-js` producers before **every bounded-exec task that runs as an mbx Cargo leaf**: a command whose runner Cargo
-builds (`cargo test`, `cargo nextest run` without `--binaries-metadata` or `--archive-file`, `cargo mutants`), as the
-executor classifies it (`runsAsCargoLeaf`, from the command line `boundedCommand` composes, in the declaration's or the
-inference's options or any configuration's). Only such a leaf's admission wait is read from mbx's activity report and
-its waiters' native lineage, the one load of cowshed's `process-lineage` entry and its addon (specs/cowshed/11_shell.md,
-"Cargo test-runner boundaries"); a Bun suite, a script or a nextest run of prebuilt binaries is reserved instead and
-never loads them, so it takes no edge. What the observer reads decides only whether that wait is credited against the
-idle bound (Bounded exec key, below), so no bounded target keys the addon or lineage bytes for it: a command that itself
-reads a producer's output depends on that producer and keys its output, as cowshed's Cargo runners do for the `dist/ts`
-entry and host addon their Node embedder loads (`nx.json` `targetDefaults`). Native tool discovery resolves the local
-owner from the linked package manifest, not a repository path or project-name alias; an installed consumer takes no
-local producer edge because its package ships the addon and lineage entry. The plugin's compile and typecheck targets
-require only `lineage-js`, never the addon or cowshed's full API build. Its runtime-only cowshed project dependency is
-excluded from ordinary caret build edges, avoiding the executor bootstrap cycle. Declarations that replace `dependsOn`
-keep the inferred preconditions with Nx’s `"..."` token. When a declaration changes an inferred executor to
-bounded-exec, its compatible inferred base contains only these runtime prerequisites; the incompatible executor’s
-command and inputs do not leak across the normal Nx override. The canonical dependency-free `release-check` is the
-exception: it judges already assembled shipping artifacts and verifies the addon is present, without compiling at
-runtime or disabling the observer (specs/cowshed/06_cli.md, `release-check`).
+A self-hosted workspace that owns the plugin's cowshed dependency builds its `napi-native` and independent `lineage-js`
+producers before every Darwin `bounded-exec` task with an idle bound, to supply Node's awake clock
+(specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On both Darwin and Linux it also builds them before
+a bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
+`--archive-file`, or `cargo mutants`, as the executor classifies the command in the declaration, inference, or any
+configuration. Only those leaves read mbx's activity report and its waiters' native lineage (specs/cowshed/11_shell.md,
+"Cargo test-runner boundaries"). Neither reading changes a passing run, so no bounded target keys these bytes for those
+reads (Bounded exec key, below); a command that itself reads a producer's output depends on that producer and keys its
+output, as cowshed's Cargo runners do for the `dist/ts` entry and host addon their Node embedder loads (`nx.json`
+`targetDefaults`). Native tool discovery resolves the local owner from the linked package manifest, not a repository
+path or project-name alias; an installed consumer takes no local producer edge because its package ships the addon and
+both runtime entries. The plugin's compile and typecheck targets require only `lineage-js`, never the addon or cowshed's
+full API build. Its runtime-only cowshed project dependency is excluded from ordinary caret build edges, avoiding the
+executor bootstrap cycle. Declarations that replace `dependsOn` keep the inferred preconditions with Nx’s `"..."` token.
+When a declaration changes an inferred executor to bounded-exec, its compatible inferred base contains only these
+runtime prerequisites; the incompatible executor’s command and inputs do not leak across the normal Nx override. The
+canonical dependency-free `release-check` is the exception: it judges already assembled shipping artifacts and verifies
+the addon is present, without compiling at runtime or disabling the observer (specs/cowshed/06_cli.md, `release-check`).
 
 A target of a napi package whose run sets `NAPI_DEBUG_ADDON=1`, in its declaration or inference, loads the package's
 dev-profile addon from `napi-debug`'s `.cache/native-debug`: it depends on `napi-debug` and keys
@@ -2138,24 +2136,28 @@ line or dot, or a Vitest default-reporter file/test result. Timed Vitest `✓` a
 duration for skipped files. Reporter headers, failure stack locations and final summary counts do not count. Output that
 finishes no test is not progress: the nextest `SLOW` warning, repeated every slow-timeout period for a test still
 running, and a hung test heartbeat both keep printing. A suite that keeps finishing tests therefore runs as long as it
-needs, however slow the host, and a test that never returns ends the run 180 s after the last test that finished.
+needs, however slow the host, and a test that never returns ends the run after 180 s of awake idle time following the
+last test that finished.
 
-A running test may also report its own progress. Each run with an idle bound is served a progress channel, a Unix socket
-in a fresh 0700 directory named in the command's environment as `BOUNDED_EXEC_PROGRESS_SOCKET` (`progress-channel.ts`).
-Each line a client writes there is one record and must be `moved`; the record restarts the bound exactly as a finished
-test does, and anything else fails the run as a broken reporter. The executor ends its side of a connection when the
-client ends its own, after reading every record on it, so a client that waits for that end knows its records counted. An
-agent harness that enforces its own no-progress bound over what its run does reports each movement that check sees, so a
-long test that keeps moving is not ended for being the last one running. The run's CPU is never a record: a compile
-inside a test reports nothing and still ends at the bound, where the snapshot names it. bun prints nothing per passing
-test when it believes an agent runs it, so the executor asks a lone `bun test` for `--dots`, one dot per finished test.
-Without a recognised execution lifecycle, the clock starts at command spawn; a command that reports no tests makes
-progress only by exiting. nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound
-kills a test or fails one that passed. Bun has a per-test deadline of its own, 5000 ms unless the command sets one, and
-it reads no bunfig for it, so every bun leg deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means
-no deadline, measured on the pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a loaded host
-makes the work take; one that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute
-ceiling, is for commands that report no tests; a target names at least one of the two.
+On macOS and Linux the idle clock excludes host suspension, including for its final ten-second diagnostic window. An
+early timer notification is not an expiry: the executor arms the remaining awake budget. Wall timestamps and the
+explicit fixture and total ceilings still use wall time. A running test may also report its own progress. Each run with
+an idle bound is served a progress channel, a Unix socket in a fresh 0700 directory named in the command's environment
+as `BOUNDED_EXEC_PROGRESS_SOCKET` (`progress-channel.ts`). Each line a client writes there is one record and must be
+`moved`; the record restarts the bound exactly as a finished test does, and anything else fails the run as a broken
+reporter. The executor ends its side of a connection when the client ends its own, after reading every record on it, so
+a client that waits for that end knows its records counted. An agent harness that enforces its own no-progress bound
+over what its run does reports each movement that check sees, so a long test that keeps moving is not ended for being
+the last one running. The run's CPU is never a record: a compile inside a test reports nothing and still ends at the
+bound, where the snapshot names it. bun prints nothing per passing test when it believes an agent runs it, so the
+executor asks a lone `bun test` for `--dots`, one dot per finished test. Without a recognised execution lifecycle, the
+clock starts at command spawn; a command that reports no tests makes progress only by exiting. nextest's slow-timeout
+and the serial groups' code-time classes only warn; no per-test bound kills a test or fails one that passed. Bun has a
+per-test deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it, so every bun leg
+deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the pinned Bun
+1.4.2). A test waits for the event it is waiting for, however long a loaded host makes the work take; one that never
+returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no
+tests; a target names at least one of the two.
 
 With mbx admission, a supported Cargo/nextest test leaf inherits a private grant pipe: mbx writes `g` on every admission
 and `r` on permit drop (`MBX_GRANT_FD=5`). The executor counts overlapping holds: while no hold exists it pauses the

@@ -14,6 +14,7 @@ import {
   signalProcessGroup,
 } from '../../process-group.js';
 import { AdmissionObservation, type QueueHost } from './admission-queue.js';
+import { atClockDeadline, openAwakeClock } from './awake-clock.js';
 import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
 import {
   type CaseGateServer,
@@ -426,6 +427,14 @@ async function runCommand(
     return { success: false, terminalOutput: outputChunks.join('') };
   };
 
+  let awakeNow = (): number => performance.now();
+  if (idleTimeoutMs !== undefined) {
+    try {
+      awakeNow = await openAwakeClock();
+    } catch (error) {
+      return refuseUnstarted(`bounded-exec: cannot read its awake idle clock: ${String(error)}\n`);
+    }
+  }
   // The fixture pair names one segment: a fixture with no build budget, or a budget with no fixture, is a
   // target that does not say what it runs, so it does not run. Units are counted at the end of that segment.
   if (
@@ -700,6 +709,7 @@ async function runCommand(
     tell,
     step: (event) => stepTo(event),
     testing: () => isTesting(),
+    awakeNow,
     queueHost,
   });
   // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
@@ -805,7 +815,7 @@ async function runCommand(
   if (idleTimeoutMs !== undefined) {
     const served = await serveProgressChannel({
       moved: () => {
-        if (fixtureDone) stepTo({ kind: 'reported', at: Date.now(), testing: isTesting() });
+        if (fixtureDone) stepTo({ kind: 'reported', at: awakeNow(), testing: isTesting() });
       },
       invalid: (detail) => {
         if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
@@ -1024,56 +1034,57 @@ async function runCommand(
   let fixtureDone = fixture === null || lifecycle === null;
   // Whether a segment past the fixture ever announced: without one, the shell's exit is the fixture's.
   let mainStarted = fixture === null || lifecycle === null;
-  let captureTimer: NodeJS.Timeout | undefined;
-  let idleCapture: { expiresAtMs: number; controller: AbortController; result: IdleDiagnosticResult } | undefined;
+  let cancelCaptureTimer: (() => void) | undefined;
+  let idleCapture:
+    | { scheduledExpiryAtMs: number; controller: AbortController; result: IdleDiagnosticResult }
+    | undefined;
   const cancelCapture = (): void => {
-    clearTimeout(captureTimer);
+    cancelCaptureTimer?.();
     idleCapture?.controller.abort();
   };
-  const scheduleCapture = (expiresAtMs: number): void => {
+  const scheduleCapture = (awakeExpiresAtMs: number): void => {
     const capture: NonNullable<typeof idleCapture> = {
-      expiresAtMs,
+      scheduledExpiryAtMs: Date.now() + Math.ceil(Math.max(0, awakeExpiresAtMs - awakeNow())),
       controller: new AbortController(),
       result: { kind: 'pending', startedAtMs: null },
     };
     idleCapture = capture;
-    captureTimer = setTimeout(
-      () => {
-        if (state.settled || state.expiry !== null || idleCapture !== capture) return;
-        const group = child.pid;
-        if (group === undefined) {
-          idleCapture.result = { kind: 'failed', detail: 'runner PID unavailable; no holder conclusion' };
-          return;
-        }
-        idleCapture.result = { kind: 'pending', startedAtMs: Date.now() };
-        void runnerPid
-          .then((pid) => {
-            if (pid === null)
-              throw new Error('runner PID unavailable: its waiter named no command; no holder conclusion');
-            return captureDiagnostics({
-              pid,
-              pgid: process.platform === 'win32' ? null : group,
-              expiresAtMs: capture.expiresAtMs,
-              deadlineMs: Math.max(0, Math.min(HANG_CAPTURE_MS, capture.expiresAtMs - Date.now())),
-              signal: capture.controller.signal,
-            });
-          })
-          .then(
-            (snapshot) => {
-              if (idleCapture === capture) idleCapture.result = { kind: 'captured', snapshot };
-            },
-            (error: unknown) => {
-              if (idleCapture === capture) {
-                idleCapture.result = {
-                  kind: 'failed',
-                  detail: error instanceof Error ? error.message : String(error),
-                };
-              }
-            },
-          );
-      },
-      Math.max(0, expiresAtMs - Date.now() - HANG_CAPTURE_MS),
-    );
+    cancelCaptureTimer = atClockDeadline(awakeExpiresAtMs - HANG_CAPTURE_MS, awakeNow, () => {
+      if (state.settled || state.expiry !== null || idleCapture !== capture) return;
+      const group = child.pid;
+      if (group === undefined) {
+        idleCapture.result = { kind: 'failed', detail: 'runner PID unavailable; no holder conclusion' };
+        return;
+      }
+      idleCapture.result = { kind: 'pending', startedAtMs: Date.now() };
+      capture.scheduledExpiryAtMs = Date.now() + Math.ceil(Math.max(0, awakeExpiresAtMs - awakeNow()));
+      void runnerPid
+        .then((pid) => {
+          if (capture.controller.signal.aborted || awakeNow() >= awakeExpiresAtMs) return;
+          if (pid === null)
+            throw new Error('runner PID unavailable: its waiter named no command; no holder conclusion');
+          return captureDiagnostics({
+            pid,
+            pgid: process.platform === 'win32' ? null : group,
+            awakeExpiresAtMs,
+            awakeNow,
+            signal: capture.controller.signal,
+          });
+        })
+        .then(
+          (snapshot) => {
+            if (snapshot !== undefined && idleCapture === capture) idleCapture.result = { kind: 'captured', snapshot };
+          },
+          (error: unknown) => {
+            if (idleCapture === capture) {
+              idleCapture.result = {
+                kind: 'failed',
+                detail: error instanceof Error ? error.message : String(error),
+              };
+            }
+          },
+        );
+    });
   };
   const expiredAs = (kind: BoundKind): ExpiredBound =>
     kind === 'idle'
@@ -1082,25 +1093,27 @@ async function runCommand(
         ? { kind, limitMs: fixture?.timeoutMs ?? 0 }
         : { kind, limitMs: timeoutMs ?? 0 };
   let checkingIdle = false;
+  const nextBound = () => earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds, awakeNow(), Date.now());
   const armBoundTimer = (): void => {
     clearTimeout(boundTimer);
     if (state.settled || state.expiry !== null) return;
-    const next = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
+    const next = nextBound();
     if (next !== null) {
-      boundTimer = setTimeout(
-        () => {
-          void confirmExpiry(next.kind, next.at);
-        },
-        Math.max(0, next.at - Date.now()),
-      );
+      if (next.kind === 'idle' && idleCapture !== undefined && next.remainingMs > 0) {
+        idleCapture.scheduledExpiryAtMs = Date.now() + Math.ceil(next.remainingMs);
+      }
+      boundTimer = setTimeout(() => void confirmExpiry(), Math.ceil(Math.max(0, next.remainingMs)));
     }
   };
-  const confirmExpiry = async (kind: BoundKind, at: number): Promise<void> => {
+  const confirmExpiry = async (): Promise<void> => {
     if (state.settled || state.expiry !== null) return;
-    const scheduled = earliestBound(checkingIdle ? { ...bounds, idle: null } : bounds);
-    if (scheduled?.kind !== kind || scheduled.at !== at) return;
-    if (kind === 'idle' && leaf?.kind === 'cargo') {
-      if (checkingIdle) return;
+    const scheduled = nextBound();
+    if (scheduled === null) return;
+    if (scheduled.remainingMs > 0) {
+      armBoundTimer();
+      return;
+    }
+    if (scheduled.kind === 'idle' && leaf?.kind === 'cargo') {
       checkingIdle = true;
       armBoundTimer();
       try {
@@ -1112,14 +1125,14 @@ async function runCommand(
       }
     }
     if (state.settled || state.expiry !== null) return;
-    const next = earliestBound(bounds);
-    if (next !== null && next.at <= Date.now()) expire(expiredAs(next.kind));
+    const next = nextBound();
+    if (next !== null && next.remainingMs <= 0) expire(expiredAs(next.kind));
     else armBoundTimer();
   };
   const stepTo = (event: BoundEvent): void => {
     if (state.settled || state.expiry !== null) return;
     const idleBefore = bounds.idle;
-    bounds = stepBounds(
+    const next = stepBounds(
       bounds,
       {
         ...(idleTimeoutMs === undefined ? {} : { idleMs: idleTimeoutMs }),
@@ -1128,6 +1141,8 @@ async function runCommand(
       },
       event,
     );
+    if (next === bounds) return;
+    bounds = next;
     if (bounds.idle !== idleBefore) {
       cancelCapture();
       idleCapture = undefined;
@@ -1140,7 +1155,7 @@ async function runCommand(
   // through appendStderr as well, and re-arming on those would let a teardown
   // message extend the very bound that just fired.
   const updateIdle = (finished: boolean, wasTesting: boolean): void => {
-    stepTo({ kind: 'progress', at: Date.now(), testing: isTesting(), wasTesting, finished });
+    stepTo({ kind: 'progress', at: awakeNow(), testing: isTesting(), wasTesting, finished });
   };
   const scanProgress = (stream: 'stdout' | 'stderr', text: Buffer | string): void => {
     if (!fixtureDone) return;
@@ -1318,7 +1333,7 @@ async function runCommand(
       appendStderr(
         `Hang diagnostics: runner pid=${runner ?? 'unavailable'} pgid=${
           process.platform === 'win32' ? 'unavailable' : (child.pid ?? 'unavailable')
-        } expiryAtMs=${Date.now()} scheduledExpiryAtMs=${idleCapture?.expiresAtMs ?? 'unavailable'}\n`,
+        } expiryAtMs=${Date.now()} scheduledExpiryAtMs=${idleCapture?.scheduledExpiryAtMs ?? 'unavailable'}\n`,
       );
       if (observed?.kind === 'captured') {
         appendStderr(
@@ -1406,7 +1421,8 @@ async function runCommand(
   // fire on a command the fixture already handed over to.
   stepTo({
     kind: 'spawn',
-    at: Date.now(),
+    at: awakeNow(),
+    wallAt: Date.now(),
     testing: isTesting(),
     fixture: fixture !== null && lifecycle !== null,
     fixtureFirst: leaf?.kind === 'reserve' && fixtureHooked !== null,
@@ -1487,7 +1503,7 @@ async function runCommand(
             );
           }
           channel.end(`${granted.cpus}\n`);
-          stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
+          stepTo({ kind: 'granted', at: awakeNow(), wallAt: Date.now(), testing: isTesting(), fixture: !fixtureDone });
           void granted.lost.then((why) => {
             if (state.settled || cpuReleased !== null) return;
             appendStderr(
@@ -1507,9 +1523,15 @@ async function runCommand(
               said = true;
               tell(`cowshed: mbx cargo granted elapsed=${Date.now() - startedAt}ms\n`);
             }
-            stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
+            stepTo({
+              kind: 'granted',
+              at: awakeNow(),
+              wallAt: Date.now(),
+              testing: isTesting(),
+              fixture: !fixtureDone,
+            });
           } else if (byte === 114) {
-            stepTo({ kind: 'released', at: Date.now() });
+            stepTo({ kind: 'released', at: awakeNow() });
           } else {
             failGrant(descriptorFailure(`unexpected byte ${byte}`));
             return;

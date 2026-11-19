@@ -32,6 +32,11 @@
       "types": "./dist/lineage/process-lineage.d.ts",
       "import": "./dist/lineage/process-lineage.js",
       "default": "./dist/lineage/process-lineage.js"
+    },
+    "./awake-clock": {
+      "types": "./dist/lineage/awake-clock.d.ts",
+      "import": "./dist/lineage/awake-clock.js",
+      "default": "./dist/lineage/awake-clock.js"
     }
   },
   "files": [
@@ -293,10 +298,11 @@
         ]
       },
       "build": {
-        "//": "Replaces the inferred build's native edges: build is the TypeScript library and its dependencies. The CLI is its own target, cli-native, the host's development build under .cache/bin/<platform> that the package launcher runs, so an ordinary build compiles no Rust; the shipping trees come from each platform target's production configuration.",
+        "//": "Replaces the inferred build's native edges: build is the TypeScript library, its standalone addon entries and their dependencies. The CLI is its own target, cli-native, the host's development build under .cache/bin/<platform> that the package launcher runs, so an ordinary build compiles no Rust; the shipping trees come from each platform target's production configuration.",
         "dependsOn": [
           "^build",
-          "tsc-js"
+          "tsc-js",
+          "lineage-js"
         ]
       },
       "refresh-harnesses": {
@@ -918,9 +924,10 @@
             "target": "build"
           }
         ],
-        "//": "The process-lineage entry (specs/cowshed/07_api.md section Process lineage) compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no cowshed target and nx-plugin compiles against it without cowshed's whole build. It writes dist/lineage/.build-inputs.json through build-inputs' smoo-nx-build-inputs, its one dependency, naming the files it compiles, so a consumer that links cowshed judges dist/lineage by content (specs/cli/01_workspace_reconciliation.md). A cache miss forces this small program to emit so existing build-info cannot hide a missing public output.",
+        "//": "The process-lineage and awake-clock entries (specs/cowshed/07_api.md) compiled on its own into dist/lineage, apart from tsc-js's dist/ts: its closure is src/process-lineage.ts, src/awake-clock.ts, src/addon.ts and src/platform.ts, with no generated or typia module, so it depends on no cowshed target and nx-plugin compiles against it without cowshed's whole build. It writes dist/lineage/.build-inputs.json through build-inputs' smoo-nx-build-inputs, its one dependency, naming the files it compiles, so a consumer that links cowshed judges dist/lineage by content (specs/cli/01_workspace_reconciliation.md). A cache miss forces this small program to emit so existing build-info cannot hide a missing public output.",
         "inputs": [
           "{projectRoot}/src/process-lineage.ts",
+          "{projectRoot}/src/awake-clock.ts",
           "{projectRoot}/src/addon.ts",
           "{projectRoot}/src/platform.ts",
           "{projectRoot}/tsconfig.lineage.json",
@@ -940,7 +947,7 @@
           "{projectRoot}/dist/lineage"
         ],
         "options": {
-          "command": "tsc --build tsconfig.lineage.json --force && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --input src/process-lineage.ts --input src/addon.ts --input src/platform.ts --input tsconfig.lineage.json --input ../../tsconfig.base.json --output dist/lineage",
+          "command": "tsc --build tsconfig.lineage.json --force && node ../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js --input src/process-lineage.ts --input src/awake-clock.ts --input src/addon.ts --input src/platform.ts --input tsconfig.lineage.json --input ../../tsconfig.base.json --output dist/lineage",
           "cwd": "{projectRoot}"
         }
       },

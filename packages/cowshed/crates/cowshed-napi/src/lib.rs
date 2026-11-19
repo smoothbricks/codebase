@@ -13,9 +13,10 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicI32, Ordering},
     },
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -629,6 +630,12 @@ pub fn process_lineages(env: Env, pids: Vec<i32>) -> napi::Result<Vec<ProcessLin
     Ok(lineages)
 }
 
+/// Process-relative monotonic milliseconds, excluding host suspension on Darwin and Linux.
+#[napi(js_name = "awakeTimeMs")]
+pub fn awake_time_ms() -> f64 {
+    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+    ORIGIN.elapsed().as_secs_f64() * 1_000.0
+}
 type HostReaped = tokio::sync::oneshot::Receiver<io::Result<std::process::ExitStatus>>;
 
 /// How a host connection's process ended, once the thread that reaps it has said so.

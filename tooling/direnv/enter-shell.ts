@@ -247,7 +247,7 @@ async function isStale(
   });
   const built =
     program === 'process-lineage'
-      ? ['process-lineage.d.ts', 'process-lineage.js'].every((file) =>
+      ? ['process-lineage.d.ts', 'process-lineage.js', 'awake-clock.d.ts', 'awake-clock.js'].every((file) =>
           outputs.some((listed) => listed.name === file && listed.isFile()),
         )
       : outputs.length > 0;

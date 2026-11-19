@@ -246,8 +246,10 @@ root=$(dirname "$(dirname "$0")")
 [ "$*" = '--build tsconfig.lineage.json --force' ]
 printf 'lineage\n' >> "$root/compiler-order"
 mkdir -p dist/lineage
-printf 'export {};\n' > dist/lineage/process-lineage.d.ts
-printf 'export {};\n' > dist/lineage/process-lineage.js
+for entry in process-lineage awake-clock; do
+  printf 'export {};\n' > "dist/lineage/$entry.d.ts"
+  printf 'export {};\n' > "dist/lineage/$entry.js"
+done
 `,
     );
     writeFileSync(
@@ -260,6 +262,8 @@ if [ ! -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.d.ts" ]; 
   exit 79
 fi
 [ -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.js" ]
+[ -f "$root/packages/renamed-runtime/dist/lineage/awake-clock.d.ts" ]
+[ -f "$root/packages/renamed-runtime/dist/lineage/awake-clock.js" ]
 [ "$PWD" != "$root/packages/renamed-runtime" ]
 mkdir -p dist
 printf 'export {};' > dist/index.js
@@ -277,7 +281,7 @@ basename "$PWD" >> "$root/compiler-order"
     expect(warm.status, `${warm.stdout}${warm.stderr}`).toBe(0);
     expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli']);
 
-    rmSync(join(owner, 'dist/lineage/process-lineage.d.ts'));
+    rmSync(join(owner, 'dist/lineage/awake-clock.d.ts'));
     const repaired = enter();
     expect(repaired.status, `${repaired.stdout}${repaired.stderr}`).toBe(0);
     expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli', 'lineage']);
