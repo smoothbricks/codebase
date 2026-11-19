@@ -75,7 +75,7 @@ const traceArb: fc.Arbitrary<EndpointEvent[]> = fc
       [stdout('listening\n'), probe(GATES), RUN_END],
       [stdout('mbx: unknown command\n')],
     ),
-    fc.array(eventArb, { maxLength: 16 }),
+    fc.array(eventArb, { maxLength: 16, size: 'max' }),
   )
   .map(([reached, rest]) => [...reached, ...rest]);
 

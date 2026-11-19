@@ -4,11 +4,18 @@ import { createConnection, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
-import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import { type Ended, type EndpointEffect, type EndpointEvent, endpointStep, spawned } from './endpoint-life.js';
 import { type MbxPriority, mbxHold, mbxPool } from './mbx-pool.js';
+import {
+  type Connection,
+  type ConnectionEffect,
+  type ConnectionEvent,
+  connectionStep,
+  opened,
+  type ReservationRefusal,
+} from './reservation-connection.js';
 
 /**
  * mbx's reservation endpoint of one Nx run (specs/cowshed/05_gateway.md, "Parallelism inside a job"). A reserved leaf
@@ -225,14 +232,6 @@ export type Granted =
   | { readonly ok: true; readonly cpus: number; readonly lost: Promise<string> }
   | { readonly ok: false; readonly refusal: ReservationRefusal };
 
-/** Why a reservation holds no cores: the endpoint asked, and the connect error's code when it could not be reached. */
-export interface ReservationRefusal {
-  readonly endpoint: string;
-  /** The code of the error that ended the connection (`ENOENT`: the endpoint's socket is gone), else null. */
-  readonly errno: string | null;
-  readonly message: string;
-}
-
 /** One request for cores on a run's endpoint. */
 export interface Reservation {
   /** Settles once the pool grants or refuses it, or its connection ends first. */
@@ -241,157 +240,95 @@ export interface Reservation {
   release(): void;
 }
 
-type Uint = number & tags.Type<'uint32'>;
-
 /**
- * The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). `min` is the fewest
- * of its cores a reservation starts on before it has waited mbx's aging bound; absent, it starts on one.
+ * The socket of one connection to an endpoint, shared by every reservation this process makes there. It is the shell
+ * of that connection's machine (reservation-connection.ts): it feeds its callers' requests and its socket's events to
+ * `connectionStep` and executes the effects each step answers, keeping each request's answer and each grant's loss to
+ * settle; it decides nothing itself.
  */
-type ReservationRequest =
-  | {
-      type: 'reserve';
-      id: Uint;
-      cpus: Uint & tags.Minimum<1>;
-      priority: MbxPriority;
-      min?: Uint & tags.Minimum<2>;
-      /** The class mbx keeps the reservation's run times under and predicts it by. */
-      name?: string;
-    }
-  | { type: 'release'; id: Uint };
-
-/** The lines the endpoint answers; an added field is mbx's to add. */
-type ReservationReply =
-  | { type: 'granted'; id: Uint; cpus: Uint & tags.Minimum<1> }
-  | { type: 'refused'; id: Uint; error: string }
-  | { type: 'error'; error: string };
-
-const stringifyRequest = typia.json.createStringify<ReservationRequest>();
-const parseReply = typia.json.createValidateParse<ReservationReply>();
-
-/** A request's place on its connection: waiting for its answer, or held until released or lost. */
-type Entry =
-  | { readonly kind: 'waiting'; readonly answer: (granted: Granted) => void }
-  | { readonly kind: 'held'; readonly lose: (why: string) => void };
-
-/**
- * One connection to an endpoint, shared by every reservation this process makes there. It keeps the process alive only
- * while one of them waits or holds.
- */
-class Connection {
+class EndpointSocket {
   readonly #socket: Socket;
-  readonly #entries = new Map<number, Entry>();
+  readonly #answers = new Map<number, (granted: Granted) => void>();
+  readonly #losses = new Map<number, (why: string) => void>();
+  #connection: Connection;
   #nextId = 1;
-  #unread = '';
-  #closed: ReservationRefusal | null = null;
 
   constructor(
-    private readonly endpoint: string,
+    endpoint: string,
     private readonly forget: () => void,
   ) {
+    this.#connection = opened(endpoint);
     // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and a reservation's answer waits as long as the pool's admission holds it, as `mbx reserve`'s did; the connection's end answers every request still waiting
     this.#socket = createConnection(endpoint);
     this.#socket.setEncoding('utf8');
     this.#socket.unref();
-    this.#socket.on('data', (text: string) => this.#read(text));
+    this.#socket.on('data', (text: string) => this.#feed({ type: 'data', text }));
     this.#socket.on('error', (error) =>
-      this.#close(
-        `mbx reservation endpoint ${this.endpoint}: ${error.message}`,
-        'code' in error && typeof error.code === 'string' ? error.code : null,
-      ),
+      this.#feed({
+        type: 'error',
+        message: error.message,
+        code: 'code' in error && typeof error.code === 'string' ? error.code : null,
+      }),
     );
-    this.#socket.on('close', () => this.#close(`mbx reservation endpoint ${this.endpoint} closed the connection`));
+    this.#socket.on('close', () => this.#feed({ type: 'close' }));
   }
 
   reserve(cpus: number, priority: MbxPriority, min: number, name?: string): Reservation {
-    if (this.#closed !== null) {
-      return { granted: Promise.resolve({ ok: false, refusal: this.#closed }), release() {} };
-    }
     const id = this.#nextId++;
-    let answer!: (granted: Granted) => void;
-    const granted = new Promise<Granted>((resolve) => (answer = resolve));
-    this.#entries.set(id, { kind: 'waiting', answer });
-    this.#socket.ref();
-    // A minimum of one is no minimum, and mbx refuses one above the ask.
-    const gathers = Math.min(min, cpus);
-    this.#socket.write(
-      `${stringifyRequest({ type: 'reserve', id, cpus, priority, ...(gathers > 1 ? { min: gathers } : {}), ...(name === undefined ? {} : { name }) })}\n`,
-    );
-    let released = false;
+    const granted = new Promise<Granted>((resolve) => this.#answers.set(id, resolve));
+    this.#feed({ type: 'reserve', id, cpus, priority, min, name });
     return {
       granted,
       release: () => {
-        if (released) return;
-        released = true;
-        const entry = this.#entries.get(id);
-        if (entry === undefined) return;
-        this.#entries.delete(id);
-        if (entry.kind === 'waiting')
-          entry.answer({ ok: false, refusal: this.#refusal('released while it waited', null) });
-        this.#socket.write(`${stringifyRequest({ type: 'release', id })}\n`);
-        if (this.#entries.size === 0) this.#socket.unref();
+        // A grant given back is no longer one to lose.
+        this.#losses.delete(id);
+        this.#feed({ type: 'release', id });
       },
     };
   }
 
-  #read(text: string): void {
-    this.#unread += text;
-    for (let end = this.#unread.indexOf('\n'); end !== -1; end = this.#unread.indexOf('\n')) {
-      const line = this.#unread.slice(0, end);
-      this.#unread = this.#unread.slice(end + 1);
-      const parsed = parseReply(line);
-      if (!parsed.success) {
-        this.#close(`mbx reservation endpoint ${this.endpoint} answered ${JSON.stringify(line)}, which is no reply`);
+  #feed(event: ConnectionEvent): void {
+    const [next, effects] = connectionStep(this.#connection, event);
+    this.#connection = next;
+    for (const effect of effects) this.#execute(effect);
+  }
+
+  #execute(effect: ConnectionEffect): void {
+    switch (effect.do) {
+      case 'ref':
+        this.#socket.ref();
+        return;
+      case 'unref':
+        this.#socket.unref();
+        return;
+      case 'write':
+        this.#socket.write(effect.line);
+        return;
+      case 'answer': {
+        const settle = this.#answers.get(effect.id);
+        this.#answers.delete(effect.id);
+        if (!effect.answer.ok) {
+          settle?.(effect.answer);
+          return;
+        }
+        const lost = new Promise<string>((resolve) => this.#losses.set(effect.id, resolve));
+        settle?.({ ok: true, cpus: effect.answer.cpus, lost });
         return;
       }
-      this.#answer(parsed.data);
-      if (this.#closed !== null) return;
+      case 'lose':
+        this.#losses.get(effect.id)?.(effect.why);
+        this.#losses.delete(effect.id);
+        return;
+      case 'hang-up':
+        this.forget();
+        this.#socket.destroy();
+        return;
     }
-  }
-
-  #answer(reply: ReservationReply): void {
-    if (reply.type === 'error') {
-      this.#close(`mbx reservation endpoint ${this.endpoint} closed this connection: ${reply.error}`);
-      return;
-    }
-    const entry = this.#entries.get(reply.id);
-    // Released before its answer arrived: the endpoint drops what it won.
-    if (entry === undefined) return;
-    if (entry.kind === 'held') {
-      this.#close(`mbx reservation endpoint ${this.endpoint} answered reservation ${reply.id} twice`);
-      return;
-    }
-    if (reply.type === 'granted') {
-      let lose!: (why: string) => void;
-      const lost = new Promise<string>((resolve) => (lose = resolve));
-      this.#entries.set(reply.id, { kind: 'held', lose });
-      entry.answer({ ok: true, cpus: reply.cpus, lost });
-      return;
-    }
-    this.#entries.delete(reply.id);
-    entry.answer({ ok: false, refusal: this.#refusal(reply.error, null) });
-    if (this.#entries.size === 0) this.#socket.unref();
-  }
-
-  #refusal(message: string, errno: string | null): ReservationRefusal {
-    return { endpoint: this.endpoint, errno, message };
-  }
-
-  #close(why: string, errno: string | null = null): void {
-    if (this.#closed !== null) return;
-    const refusal = this.#refusal(why, errno);
-    this.#closed = refusal;
-    this.forget();
-    for (const entry of this.#entries.values()) {
-      if (entry.kind === 'waiting') entry.answer({ ok: false, refusal });
-      else entry.lose(refusal.message);
-    }
-    this.#entries.clear();
-    this.#socket.destroy();
   }
 }
 
 /** This process's connection to each endpoint it has asked. */
-const connections = new Map<string, Connection>();
+const connections = new Map<string, EndpointSocket>();
 
 /**
  * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, starting on no fewer than `min` of them until
@@ -407,11 +344,11 @@ export function reserveCores(
 ): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
-    const opened: Connection = new Connection(socket, () => {
-      if (connections.get(socket) === opened) connections.delete(socket);
+    const fresh: EndpointSocket = new EndpointSocket(socket, () => {
+      if (connections.get(socket) === fresh) connections.delete(socket);
     });
-    connections.set(socket, opened);
-    connection = opened;
+    connections.set(socket, fresh);
+    connection = fresh;
   }
   return connection.reserve(cpus, priority, min, name);
 }

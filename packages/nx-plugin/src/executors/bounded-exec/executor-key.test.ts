@@ -89,6 +89,7 @@ const KEYED = [
   'executors/bounded-exec/pool-environment.ts',
   'executors/bounded-exec/progress-channel.ts',
   'executors/bounded-exec/progress.ts',
+  'executors/bounded-exec/reservation-connection.ts',
   'executors/bounded-exec/runner-lifecycle.ts',
   'executors/bounded-exec/runner-sizing.ts',
   'executors/bounded-exec/runtime-pin.ts',
