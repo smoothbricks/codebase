@@ -113,6 +113,7 @@
     "src/executors/bounded-exec/runtime-pin.test.ts": 40,
     "src/executors/bounded-exec/mbx-pool.test.ts": 39,
     "src/executors/wrangler-deploy/hasher.test.ts": 38,
+    "src/executors/bounded-exec/endpoint-life.test.ts": 56,
     "src/nx-daemon-sync-schedule.test.ts": 36,
     "src/executors/scriptc-native/executor.test.ts": 33,
     "src/cargo-retention-hook.test.ts": 31,

@@ -1,14 +1,13 @@
-import { type ChildProcessByStdio, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { rm } from 'node:fs/promises';
 import { createConnection, type Socket } from 'node:net';
 import { join } from 'node:path';
-import type { Readable, Writable } from 'node:stream';
 import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
-import { CONTROL_MS } from './lease-wait.js';
+import { type Ended, type EndpointEffect, type EndpointEvent, endpointStep, STARTING } from './endpoint-life.js';
 import { type MbxPriority, mbxHold, mbxPool } from './mbx-pool.js';
 
 /**
@@ -54,17 +53,16 @@ export function describeUnserved(endpoint: Exclude<RunEndpoint, { kind: 'served'
 
 const ENDPOINT_DIRECTORY = 'mbx-r-';
 const ENDPOINT_SOCKET = 'r.sock';
-/** What is kept of the endpoint's stderr to say why it ended: its last bytes. */
-const SAID_BYTES = 4096;
 
-/** A run's endpoint: the `mbx reservations` process, the directory its socket is in, and how it ended once it has. */
+/** A run's endpoint once it serves. */
 interface Endpoint {
-  readonly server: ChildProcessByStdio<Writable, Readable, Readable>;
-  readonly directory: string;
-  readonly ended: Promise<string>;
+  /** The run's end, which ends the endpoint: how it ended, once its socket's directory is removed. */
+  end(): Promise<Ended>;
 }
 
-type Started = { ok: true; endpoint: Endpoint; socket: string } | { ok: false; error: string };
+type Started =
+  | { readonly ok: true; readonly endpoint: Endpoint; readonly socket: string; readonly gates: boolean }
+  | { readonly ok: false; readonly error: string };
 
 /** The endpoints this process serves, by Nx run id, until that run's `postTasksExecution`. */
 const endpoints = new Map<string, Endpoint>();
@@ -95,7 +93,7 @@ export async function serveRunReservations(
   env[RESERVATIONS_ENV] = started.socket;
   delete env[RESERVATIONS_UNSERVED_ENV];
   // A leaf's runner starts every thread of its ask only where the installed mbx's shim takes each case through its gate.
-  if (await endpointGatesTests(started.socket)) env[TEST_GATE_SERVED_ENV] = '1';
+  if (started.gates) env[TEST_GATE_SERVED_ENV] = '1';
   else delete env[TEST_GATE_SERVED_ENV];
 }
 
@@ -118,9 +116,8 @@ async function learnHeldGate(env: NodeJS.ProcessEnv): Promise<void> {
     delete env[TEST_GATE_SERVED_ENV];
     return;
   }
-  const gates = await endpointGatesTests(started.socket);
-  await endEndpoint(started.endpoint);
-  if (gates) env[TEST_GATE_SERVED_ENV] = '1';
+  await started.endpoint.end();
+  if (started.gates) env[TEST_GATE_SERVED_ENV] = '1';
   else delete env[TEST_GATE_SERVED_ENV];
 }
 
@@ -131,83 +128,96 @@ export async function closeRunReservations(context: Pick<PostTasksExecutionConte
     return;
   }
   endpoints.delete(context.id);
-  const ended = await endEndpoint(endpoint);
-  if (ended !== 'mbx reservations ended with status 0') {
-    logger.warn(`bounded-exec: this run's mbx reservation endpoint did not close cleanly: ${ended}`);
+  const ended = await endpoint.end();
+  if (!ended.clean) {
+    logger.warn(`bounded-exec: this run's mbx reservation endpoint did not close cleanly: ${ended.how}`);
   }
 }
 
-/** End `endpoint` by its standard input's end and remove its socket's directory; how it ended. */
-async function endEndpoint(endpoint: Endpoint): Promise<string> {
-  endpoint.server.stdin.end();
-  const ended = await endedWithin(endpoint, CONTROL_MS);
-  await rm(endpoint.directory, { recursive: true, force: true });
-  return ended;
-}
-
-/** Start `mbx reservations` by its PATH name in an owned socket directory, and wait until it says it listens. */
+/**
+ * Start `mbx reservations` by its PATH name in an owned socket directory, and answer once its life answers its start
+ * (endpoint-life.ts). This is that machine's shell: it feeds the child's and the probe's events to `endpointStep` and
+ * executes the effects each step answers, and decides nothing itself.
+ */
 async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
   const directory = await ownedSocketDirectory(ENDPOINT_DIRECTORY, ENDPOINT_SOCKET);
   const socket = join(directory, ENDPOINT_SOCKET);
   const server = spawn('mbx', ['reservations', socket], { env, stdio: ['pipe', 'pipe', 'pipe'] });
-  let said = '';
-  server.stderr.setEncoding('utf8');
-  server.stderr.on('data', (text: string) => {
-    said = (said + text).slice(-SAID_BYTES);
-  });
-  // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a child that runs ends with its run's postTasksExecution, which ends its standard input and bounds its exit (`endedWithin`); one that cannot run says so at once
-  const ended = new Promise<string>((resolve) => {
-    server.once('error', (error) => resolve(`mbx reservations could not run: ${error.message}`));
-    server.once('close', (code, signal) => {
-      const last = said.trim().split('\n').at(-1) ?? '';
-      resolve(
-        `mbx reservations ended ${signal === null ? `with status ${code}` : `on ${signal}`}${last === '' ? '' : `: ${last}`}`,
-      );
-    });
-  });
-  const endpoint: Endpoint = { server, directory, ended };
-  const listening = await saysListening(server.stdout, ended);
-  if (listening !== null) {
-    server.kill('SIGKILL');
-    await endedWithin(endpoint, CONTROL_MS);
-    await rm(directory, { recursive: true, force: true });
-    return { ok: false, error: listening };
-  }
-  return { ok: true, endpoint, socket };
-}
-
-/**
- * Null once the endpoint's first line is `listening`; otherwise why not: the line it said instead, or how it ended.
- * The wait has no bound of its own. The endpoint is this run's child, so its end is an event the run reads, and how
- * long a process takes to start is the host's load, which no control bound covers (specs/cowshed/05_gateway.md,
- * "Deadlines": a bound covers what "the kernel completes whatever the peer's load").
- */
-function saysListening(stdout: Readable, ended: Promise<string>): Promise<string | null> {
-  return new Promise<string | null>((resolve) => {
-    let text = '';
-    stdout.setEncoding('utf8');
-    stdout.on('data', (chunk: string) => {
-      text += chunk;
-      const end = text.indexOf('\n');
-      if (end === -1) return;
-      const line = text.slice(0, end);
-      resolve(line === 'listening' ? null : `mbx reservations said ${JSON.stringify(line)}, not that it was listening`);
-    });
-    void ended.then(resolve);
-  });
-}
-
-/** How the endpoint ended, killing it once `ms` pass first. */
-async function endedWithin(endpoint: Endpoint, ms: number): Promise<string> {
+  const remove = (): Promise<void> => rm(directory, { recursive: true, force: true });
+  let life = STARTING;
+  let probe: Socket | undefined;
   let timer: NodeJS.Timeout | undefined;
-  const late = new Promise<null>((resolve) => (timer = setTimeout(() => resolve(null), ms)));
-  const ended = await Promise.race([endpoint.ended, late]);
-  clearTimeout(timer);
-  if (ended !== null) {
-    return ended;
-  }
-  endpoint.server.kill('SIGKILL');
-  return `${await endpoint.ended}, killed after it outlived its standard input by ${ms}ms`;
+  // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib es2022.
+  let answer!: (started: Started) => void;
+  let conclude!: (ended: Ended) => void;
+  let fail!: (error: unknown) => void;
+  let failEnd!: (error: unknown) => void;
+  const started = new Promise<Started>((resolve, reject) => {
+    answer = resolve;
+    fail = reject;
+  });
+  const ended = new Promise<Ended>((resolve, reject) => {
+    conclude = resolve;
+    failEnd = reject;
+  });
+  const endpoint: Endpoint = {
+    end() {
+      feed({ type: 'run-end' });
+      return ended;
+    },
+  };
+  const execute = (effect: EndpointEffect): void => {
+    switch (effect.do) {
+      case 'probe': {
+        // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and the life ends the probe (`hang-up`)
+        const connection = createConnection(socket);
+        probe = connection;
+        connection.setEncoding('utf8');
+        connection.on('connect', () => connection.write('{"type":"capabilities"}\n'));
+        connection.on('data', (text: string) => feed({ type: 'probe', text }));
+        connection.on('error', () => feed({ type: 'probe-end' }));
+        connection.on('close', () => feed({ type: 'probe-end' }));
+        return;
+      }
+      case 'hang-up':
+        probe?.destroy();
+        return;
+      case 'arm':
+        timer = setTimeout(() => feed({ type: 'expired' }), effect.ms);
+        return;
+      case 'disarm':
+        clearTimeout(timer);
+        return;
+      case 'kill':
+        server.kill('SIGKILL');
+        return;
+      case 'close-stdin':
+        server.stdin.end();
+        return;
+      case 'serve':
+        answer({ ok: true, endpoint, socket, gates: effect.gates });
+        return;
+      case 'refuse':
+        void remove().then(() => answer({ ok: false, error: effect.why }), fail);
+        return;
+      case 'conclude':
+        void remove().then(() => conclude(effect.ended), failEnd);
+        return;
+    }
+  };
+  const feed = (event: EndpointEvent): void => {
+    const [next, effects] = endpointStep(life, event);
+    life = next;
+    for (const effect of effects) execute(effect);
+  };
+  server.stdout.setEncoding('utf8');
+  server.stdout.on('data', (text: string) => feed({ type: 'stdout', text }));
+  server.stdout.on('end', () => feed({ type: 'stdout-end' }));
+  server.stderr.setEncoding('utf8');
+  server.stderr.on('data', (text: string) => feed({ type: 'stderr', text }));
+  server.once('error', (error) => feed({ type: 'error', message: error.message }));
+  server.once('close', (code, signal) => feed({ type: 'close', code, signal }));
+  return started;
 }
 
 /** The pool's answer to one reservation: the cores it holds and a promise of why it was lost, or why there are none. */
@@ -233,39 +243,6 @@ export interface Reservation {
 
 type Uint = number & tags.Type<'uint32'>;
 
-type CapabilitiesReply = { type: 'capabilities'; test_gate: boolean };
-const parseCapabilities = typia.json.createValidateParse<CapabilitiesReply>();
-
-/**
- * Whether the mbx behind the endpoint at `socket` gates test cases: its shim asks the socket `MBX_TEST_GATE` names
- * before it starts a nextest case (specs/cowshed/05_gateway.md, "A case starts on a core"). Such an mbx answers
- * `{"type":"capabilities"}` with `test_gate`; one that does not know the request answers an error and closes the
- * connection, and an endpoint that answers nothing within the control-plane bound gates nothing.
- */
-export function endpointGatesTests(socket: string): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and the timer below settles a probe the endpoint never answers
-    const probe = createConnection(socket);
-    let text = '';
-    const settle = (gates: boolean): void => {
-      clearTimeout(timer);
-      probe.destroy();
-      resolve(gates);
-    };
-    const timer = setTimeout(() => settle(false), CONTROL_MS);
-    probe.setEncoding('utf8');
-    probe.on('connect', () => probe.write('{"type":"capabilities"}\n'));
-    probe.on('data', (chunk: string) => {
-      text += chunk;
-      const end = text.indexOf('\n');
-      if (end === -1) return;
-      const reply = parseCapabilities(text.slice(0, end));
-      settle(reply.success && reply.data.test_gate);
-    });
-    probe.on('error', () => settle(false));
-    probe.on('close', () => settle(false));
-  });
-}
 /**
  * The lines a client writes (mbx's `docs/scheduling.md`, "Serve reservations to many commands"). `min` is the fewest
  * of its cores a reservation starts on before it has waited mbx's aging bound; absent, it starts on one.

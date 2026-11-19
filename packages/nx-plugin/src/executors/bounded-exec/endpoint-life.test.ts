@@ -1,0 +1,298 @@
+import { describe, expect, it } from 'bun:test';
+import fc from 'fast-check';
+import {
+  type EndpointEffect,
+  type EndpointEvent,
+  type EndpointLife,
+  endpointStep,
+  gatesTests,
+  STARTING,
+} from './endpoint-life.js';
+import { CONTROL_MS } from './lease-wait.js';
+
+/**
+ * The life of a run's reservation endpoint (endpoint-life.ts) judged over generated interleavings of what its shell
+ * can observe: the real `endpointStep` decides, and each property states what must hold after every event of every
+ * order. No process, socket, timer or clock runs here; the machine's one timer is the `expired` event.
+ */
+
+const RUNS = { seed: 20261119, numRuns: 2000 };
+
+const stdout = (text: string): EndpointEvent => ({ type: 'stdout', text });
+const stderr = (text: string): EndpointEvent => ({ type: 'stderr', text });
+const probe = (text: string): EndpointEvent => ({ type: 'probe', text });
+const close = (code: number | null, signal: string | null = null): EndpointEvent => ({ type: 'close', code, signal });
+const unspawned = (message: string): EndpointEvent => ({ type: 'error', message });
+const STDOUT_END: EndpointEvent = { type: 'stdout-end' };
+const PROBE_END: EndpointEvent = { type: 'probe-end' };
+const RUN_END: EndpointEvent = { type: 'run-end' };
+const EXPIRED: EndpointEvent = { type: 'expired' };
+
+const GATES = '{"type":"capabilities","test_gate":true}\n';
+const NO_GATE = '{"type":"capabilities","test_gate":false}\n';
+/** What an mbx that does not know the request answers before it closes the connection. */
+const UNKNOWN = '{"type":"error","error":"unknown request type"}\n';
+
+/** Chunks as a pipe delivers them: whole lines, lines cut anywhere, several at once, and anything else. */
+const chunks = (whole: readonly string[]): fc.Arbitrary<string> =>
+  fc.oneof(
+    fc.constantFrom(...whole),
+    fc
+      .tuple(fc.constantFrom(...whole), fc.nat(), fc.boolean())
+      .map(([text, at, head]) => (head ? text.slice(0, at % (text.length + 1)) : text.slice(at % (text.length + 1)))),
+    fc.string({ maxLength: 8 }),
+  );
+
+const eventArb: fc.Arbitrary<EndpointEvent> = fc.oneof(
+  { weight: 5, arbitrary: chunks(['listening\n', 'listening\nagain\n', 'mbx: unknown command\n', '\n']).map(stdout) },
+  { weight: 1, arbitrary: fc.constant(STDOUT_END) },
+  { weight: 2, arbitrary: chunks(['mbx: reservations need scheduler.enabled\n', 'warning\n']).map(stderr) },
+  { weight: 1, arbitrary: fc.string({ maxLength: 8 }).map(unspawned) },
+  {
+    weight: 2,
+    arbitrary: fc.oneof(
+      fc.integer({ min: 0, max: 2 }).map((code) => close(code)),
+      fc.constantFrom('SIGKILL', 'SIGTERM').map((signal) => close(null, signal)),
+    ),
+  },
+  { weight: 4, arbitrary: chunks([GATES, NO_GATE, UNKNOWN, '\n']).map(probe) },
+  { weight: 1, arbitrary: fc.constant(PROBE_END) },
+  { weight: 2, arbitrary: fc.constant(RUN_END) },
+  { weight: 2, arbitrary: fc.constant(EXPIRED) },
+);
+
+/**
+ * Any order of events, after a start that got as far as one of these: a uniformly random order seldom says
+ * `listening` whole before its child ends, so the later phases would go unvisited.
+ */
+const traceArb: fc.Arbitrary<EndpointEvent[]> = fc
+  .tuple(
+    fc.constantFrom<EndpointEvent[]>(
+      [],
+      [stdout('listening\n')],
+      [stdout('listening\n'), probe(GATES)],
+      [stdout('listening\n'), probe(GATES), RUN_END],
+      [stdout('mbx: unknown command\n')],
+    ),
+    fc.array(eventArb, { maxLength: 16 }),
+  )
+  .map(([reached, rest]) => [...reached, ...rest]);
+
+interface Step {
+  readonly event: EndpointEvent;
+  readonly before: EndpointLife;
+  readonly after: EndpointLife;
+  readonly effects: readonly EndpointEffect[];
+}
+
+/**
+ * `trace` as a run delivers it. Its own end reaches the endpoint only once its start was answered served: the run
+ * holds no endpoint before that, so a `run-end` earlier in the trace is one that could not be sent.
+ */
+function live(trace: readonly EndpointEvent[]): Step[] {
+  const steps: Step[] = [];
+  let life = STARTING;
+  let served = false;
+  for (const event of trace) {
+    if (event.type === 'run-end' && !served) continue;
+    const [after, effects] = endpointStep(life, event);
+    steps.push({ event, before: life, after, effects });
+    served ||= effects.some((effect) => effect.do === 'serve');
+    life = after;
+  }
+  return steps;
+}
+
+const effectsOf = (steps: readonly Step[]): EndpointEffect[] => steps.flatMap((step) => step.effects);
+const count = (steps: readonly Step[], what: EndpointEffect['do']): number =>
+  effectsOf(steps).filter((effect) => effect.do === what).length;
+const firstLine = (text: string): string | null => (text.includes('\n') ? text.slice(0, text.indexOf('\n')) : null);
+
+/** Each property holds for every generated order of events. */
+const everyOrder = (holds: (steps: readonly Step[]) => void): void =>
+  fc.assert(
+    fc.property(traceArb, (trace) => holds(live(trace))),
+    RUNS,
+  );
+
+describe("the life of a run's reservation endpoint", () => {
+  it('walks its ordinary paths', () => {
+    const arm: EndpointEffect = { do: 'arm', ms: CONTROL_MS };
+    const disarm: EndpointEffect = { do: 'disarm' };
+    const cases: { name: string; events: EndpointEvent[]; effects: EndpointEffect[][] }[] = [
+      {
+        name: 'an endpoint that listens and gates is served, and ends with its run',
+        events: [stdout('listen'), stdout('ing\nserving\n'), probe(GATES), RUN_END, close(0)],
+        effects: [
+          [],
+          [{ do: 'probe' }, arm],
+          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'close-stdin' }, arm],
+          [disarm, { do: 'conclude', ended: { how: 'mbx reservations ended with status 0', clean: true } }],
+        ],
+      },
+      {
+        name: 'an endpoint whose probe ends unanswered is served and gates nothing',
+        events: [stdout('listening\n'), PROBE_END, PROBE_END],
+        effects: [[{ do: 'probe' }, arm], [disarm, { do: 'serve', gates: false }], []],
+      },
+      {
+        name: 'a child that says anything else is killed, and refused once it has ended',
+        events: [stdout('mbx 1.2.3\nlistening\n'), close(null, 'SIGKILL')],
+        effects: [
+          [{ do: 'kill' }, arm],
+          [disarm, { do: 'refuse', why: 'mbx reservations said "mbx 1.2.3", not that it was listening' }],
+        ],
+      },
+      {
+        name: 'a child that ends without a line is refused by how it ended and the last thing it said',
+        events: [stderr('mbx: warning\nmbx: reservations need '), stderr('scheduler.enabled\n'), close(1)],
+        effects: [
+          [],
+          [],
+          [{ do: 'refuse', why: 'mbx reservations ended with status 1: mbx: reservations need scheduler.enabled' }],
+        ],
+      },
+      {
+        name: 'a child that could not be spawned is refused by its error, and its close says nothing more',
+        events: [unspawned('spawn mbx ENOENT'), close(-2)],
+        effects: [[{ do: 'refuse', why: 'mbx reservations could not run: spawn mbx ENOENT' }], []],
+      },
+      {
+        name: "an endpoint that ends while it serves is said at its run's end, and nothing is signalled",
+        events: [stdout('listening\n'), probe(NO_GATE), close(null, 'SIGTERM'), RUN_END],
+        effects: [
+          [{ do: 'probe' }, arm],
+          [disarm, { do: 'hang-up' }, { do: 'serve', gates: false }],
+          [],
+          [{ do: 'conclude', ended: { how: 'mbx reservations ended on SIGTERM', clean: false } }],
+        ],
+      },
+      {
+        name: 'an endpoint that outlives its standard input is killed, and its end says so',
+        events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, close(null, 'SIGKILL')],
+        effects: [
+          [{ do: 'probe' }, arm],
+          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'close-stdin' }, arm],
+          [{ do: 'kill' }],
+          [
+            disarm,
+            {
+              do: 'conclude',
+              ended: {
+                how: `mbx reservations ended on SIGKILL, killed after it outlived its standard input by ${CONTROL_MS}ms`,
+                clean: false,
+              },
+            },
+          ],
+        ],
+      },
+    ];
+    for (const { name, events, effects } of cases) {
+      expect({ name, effects: live(events).map((step) => step.effects) }).toEqual({ name, effects });
+    }
+  });
+
+  //#region smoo/cowshed!n/a-case-starts-on-a-core
+  it('takes only a `capabilities` answer with `test_gate` as an mbx that gates test cases', () => {
+    expect(gatesTests(GATES.trimEnd())).toBe(true);
+    expect(gatesTests(NO_GATE.trimEnd())).toBe(false);
+    expect(gatesTests(UNKNOWN.trimEnd())).toBe(false);
+    expect(gatesTests('{"type":"capabilities"}')).toBe(false);
+    expect(gatesTests('listening')).toBe(false);
+    expect(gatesTests('{"type":"capabilities","test_gate":true')).toBe(false);
+  });
+
+  it("serves with the gate its probe's first line answers, and with none when the probe ends first", () => {
+    everyOrder((steps) => {
+      let reply = '';
+      for (const step of steps) {
+        if (step.before.phase !== 'probing') continue;
+        if (step.event.type === 'probe') reply += step.event.text;
+        const serve = step.effects.find((effect) => effect.do === 'serve');
+        const line = firstLine(reply);
+        if (step.event.type === 'probe' && line !== null)
+          expect(serve).toEqual({ do: 'serve', gates: gatesTests(line) });
+        else if (serve !== undefined) expect(serve).toEqual({ do: 'serve', gates: false });
+      }
+    });
+  });
+  //#endregion smoo/cowshed!n/a-case-starts-on-a-core
+
+  it("answers its start once, and its run's end once and only after it served", () => {
+    everyOrder((steps) => {
+      expect(count(steps, 'serve') + count(steps, 'refuse')).toBeLessThanOrEqual(1);
+      expect(count(steps, 'conclude')).toBeLessThanOrEqual(count(steps, 'serve'));
+      const ended = steps.findIndex((step) => step.after.phase === 'ended');
+      if (ended !== -1) expect(effectsOf(steps.slice(ended + 1))).toEqual([]);
+    });
+  });
+
+  it('serves only a child whose first line is `listening`, however its output is cut, and names any other first line', () => {
+    everyOrder((steps) => {
+      let out = '';
+      for (const step of steps) {
+        if (step.before.phase !== 'starting' || step.event.type !== 'stdout') continue;
+        out += step.event.text;
+        const line = firstLine(out);
+        if (line === null) expect(step.after.phase).toBe('starting');
+        else if (line === 'listening') expect(step.effects.map((effect) => effect.do)).toContain('probe');
+        else {
+          expect(step.effects.map((effect) => effect.do)).toContain('kill');
+          for (const effect of effectsOf(steps)) {
+            if (effect.do === 'refuse') {
+              expect(effect.why).toBe(`mbx reservations said ${JSON.stringify(line)}, not that it was listening`);
+            }
+          }
+        }
+      }
+      if (count(steps, 'serve') === 1) expect(firstLine(out)).toBe('listening');
+    });
+  });
+
+  it('refuses a child that ends before its first line by how it ended', () => {
+    everyOrder((steps) => {
+      for (const step of steps) {
+        if (step.before.phase !== 'starting') continue;
+        if (step.event.type === 'close') {
+          const ended = step.event.signal === null ? `with status ${step.event.code}` : `on ${step.event.signal}`;
+          expect(step.effects).toHaveLength(1);
+          expect(step.effects[0]).toMatchObject({ do: 'refuse', why: expect.stringContaining(`ended ${ended}`) });
+        }
+        if (step.event.type === 'error') {
+          expect(step.effects).toEqual([
+            { do: 'refuse', why: `mbx reservations could not run: ${step.event.message}` },
+          ]);
+        }
+      }
+    });
+  });
+
+  it('kills only a child that said something else, or one whose timer ran out', () => {
+    everyOrder((steps) => {
+      for (const step of steps) {
+        if (!step.effects.some((effect) => effect.do === 'kill')) continue;
+        expect(['stdout', 'expired']).toContain(step.event.type);
+        expect(step.after.phase).toBe('ending');
+      }
+    });
+  });
+
+  it('arms one timer at a time, and leaves none armed once it has ended', () => {
+    everyOrder((steps) => {
+      let armed = false;
+      for (const step of steps) {
+        if (step.event.type === 'expired') armed = false;
+        for (const effect of step.effects) {
+          if (effect.do === 'arm') {
+            expect(armed).toBe(false);
+            armed = true;
+          }
+          if (effect.do === 'disarm') armed = false;
+        }
+        if (step.after.phase === 'ended') expect(armed).toBe(false);
+      }
+    });
+  });
+});

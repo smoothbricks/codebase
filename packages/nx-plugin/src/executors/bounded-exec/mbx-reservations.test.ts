@@ -7,7 +7,6 @@ import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.j
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import {
   closeRunReservations,
-  endpointGatesTests,
   RESERVATIONS_ENV,
   RESERVATIONS_UNSERVED_ENV,
   reserveCores,
@@ -15,20 +14,6 @@ import {
 } from './mbx-reservations.js';
 
 describe("a leaf's reservation on its run's mbx endpoint", () => {
-  //#region smoo/cowshed!n/a-case-starts-on-a-core
-  it('learns from the endpoint whether its mbx gates test cases, and takes an mbx that does not know the question as one that does not', async () => {
-    const gating = await standInReservations(() => 1, true);
-    const older = await standInReservations(() => 1);
-    try {
-      expect(await endpointGatesTests(gating.socket)).toBe(true);
-      expect(await endpointGatesTests(older.socket)).toBe(false);
-      expect(await endpointGatesTests(join(dirname(older.socket), 'absent.sock'))).toBe(false);
-    } finally {
-      await gating.close();
-      await older.close();
-    }
-  });
-  //#endregion smoo/cowshed!n/a-case-starts-on-a-core
   it('asks for many reservations over one connection, each granted its cores, and releases each once', async () => {
     const endpoint = await standInReservations((heard) => Math.min(heard.cpus, 4));
     try {
