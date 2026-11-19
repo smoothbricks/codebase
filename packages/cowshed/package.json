@@ -715,7 +715,6 @@
         ],
         "dependsOn": [
           "...",
-          "cargo-test",
           "napi-debug",
           "tsc-js",
           {
@@ -987,8 +986,9 @@
       },
       "test": {
         "executor": "nx:noop",
-        "//": "Replaces the inferred test. cargo-test is the ordinary crate suite alone, reached here through napi-test. The root's host-e2e aggregate owns the serial real-image groups and host-napi-test, and gate reaches them without adding them to ordinary test. They replay from cache unless their own inputs change.",
+        "//": "Replaces the inferred test. This joins the ordinary Rust crate suite and the built-addon tests without making one wait for the other. The root's host-e2e aggregate owns the serial real-image groups and host-napi-test, and gate reaches them without adding them to ordinary test. They replay from cache unless their own inputs change.",
         "dependsOn": [
+          "cargo-test",
           "napi-test",
           "launcher-test",
           "cache-advisor-test",
