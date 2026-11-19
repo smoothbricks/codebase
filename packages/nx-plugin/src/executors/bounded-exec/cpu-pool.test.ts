@@ -326,7 +326,7 @@ describe('the parent-held CPU pool', () => {
   //#region smoo/cowshed!n/a-case-starts-on-a-core
   it("grants a lent request only when no leaf's request waits: a leaf that asks after it is granted first", async () => {
     const { parent } = await openPool(1);
-    const granted = { ok: true, lease: 'granted', tokens: 1 };
+    const granted: PoolReply = { ok: true, lease: 'granted', tokens: 1 };
     const holder = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
     expect(await holder.next()).toEqual(QUEUED);
     expect(await holder.next()).toEqual(granted);

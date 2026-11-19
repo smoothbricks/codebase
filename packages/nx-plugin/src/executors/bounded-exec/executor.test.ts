@@ -2177,7 +2177,7 @@ const arrive = (test) => new Promise((resolve, reject) => {
     try {
       const result = await withPool(nextestWant, async (pool) => {
         const parent = inheritedFrom(pool);
-        const siblings = [];
+        const siblings: { release: () => void }[] = [];
         for (const want of [4, 2, 1]) {
           const sibling = await takeParentCpuTokens(parent, want, null);
           if (!sibling.granted) throw new Error(`the pool refused a sibling ${want} tokens: ${sibling.reason}`);
