@@ -2942,8 +2942,9 @@ decides what a token count does to the command's parallelism flags and test-thre
 writes the pool endpoint, its count and the jobserver flags into `MAKEFLAGS` and `CARGO_MAKEFLAGS` (`cpu-pool.js` serves
 the pool and writes none of them), and `withProgressReport` adds `--dots` to `bun test` and `-json` to `go test`. They
 stay keyed until those functions move into modules of their own. A module that comes to decide what a value does to the
-command, its environment or a passing verdict leaves `outputNeutral` in the same commit; `executor-key.test.ts` names
-the keyed modules and refuses a neutral one that writes those variables.
+command, its environment or a passing verdict leaves `outputNeutral` in the same commit. The
+[executor-key law](../../specs/cowshed/laws/executor_key.bend) shows when a module is keyed: a neutral boundary stops
+its path, not a separate path that reaches the same module without crossing it.
 
 ## Test Fixtures That Run Nx
 

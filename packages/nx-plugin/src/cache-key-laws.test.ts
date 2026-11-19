@@ -17,6 +17,7 @@ import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import typia from 'typia';
 import * as model from './__tests__/cache-key-model.js';
+import * as executor from './__tests__/executor-key-model.js';
 import { REPOSITORY, runInRepositoryNx } from './__tests__/repository-nx.js';
 import { packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { isRecord } from './type-guards.js';
@@ -540,5 +541,39 @@ describe('the cache-key model, on its enumerated corpus and its seeded draws', (
       ),
       ...failures('key_complete_can_fail', model.corpus_key_complete_can_fail(), model.law_key_complete_can_fail),
     ]).toEqual([]);
+  });
+
+  it('stops neutral executor paths without hiding a new keyed path to the same module', () => {
+    const len = executor.PROP_LEN_CUT_DOES_NOT_HIDE_OTHER_PATHS;
+    expect([
+      ...failures(
+        'neutral_stops_path',
+        draws<Parameters<typeof executor.law_neutral_stops_path>>(
+          executor.SEED_NEUTRAL_STOPS_PATH,
+          executor.PROPS_NEUTRAL_STOPS_PATH,
+          (rng) => [executor.gen_ListBool(rng, len), executor.gen_ListBool(rng, len)],
+        ),
+        executor.law_neutral_stops_path,
+      ),
+      ...failures(
+        'cut_does_not_hide_other_paths',
+        draws<Parameters<typeof executor.law_cut_does_not_hide_other_paths>>(
+          executor.SEED_CUT_DOES_NOT_HIDE_OTHER_PATHS,
+          executor.PROPS_CUT_DOES_NOT_HIDE_OTHER_PATHS,
+          (rng) => [
+            executor.gen_ListBool(rng, len),
+            executor.gen_ListBool(rng, len),
+            executor.gen_ListListBool(rng, len),
+          ],
+        ),
+        executor.law_cut_does_not_hide_other_paths,
+      ),
+    ]).toEqual([]);
+
+    const stopped = list([true, false]);
+    const open = list([false, false]);
+    expect(executor.closure_keys(list([stopped]))).toBe(false);
+    expect(executor.closure_keys(list([stopped, open]))).toBe(true);
+    expect(executor.closure_keys(list([open, stopped]))).toBe(true);
   });
 });
