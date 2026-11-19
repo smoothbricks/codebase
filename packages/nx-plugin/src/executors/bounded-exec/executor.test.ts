@@ -16,7 +16,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
 import { ownedSocketDirectory, processesOf } from '../../testing.js';
 import { TEST_GATE_ENV, TEST_GATE_SERVED_ENV } from './case-gate.js';
-import { type CpuPool, createCpuPool } from './cpu-pool.js';
+import { type CpuPool, createCpuPool, takeParentCpuTokens } from './cpu-pool.js';
 import { CPU_RISING_CLASS } from './cpu-rise.js';
 import {
   type BoundedExecContext,
@@ -2138,6 +2138,81 @@ const arrive = (test) => new Promise((resolve, reject) => {
     expect(result.terminalOutput).toContain('cargo threads=1\n');
     expect(result.terminalOutput).not.toContain('mbx reserve cases');
     expect(reserves).toEqual([{ cpus: 6, priority: 'low', name: null }]);
+  });
+
+  it("starts a second case of a nextest leaf granted one of its run pool's eight tokens on a lent token once its siblings release theirs", async () => {
+    // A held job's Nx run on 2026-11-19: one host suite was granted 1 of the run pool's 8 tokens beside its siblings,
+    // which took 4, 2 and 1, and ran its cases one at a time to its end, long after they had released theirs.
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-cargo');
+    await mkdir(bin);
+    const cases = join(bin, 'cases.cjs');
+    // The second case arrives when the first holds the grant's one token, and the first ends only once the second ran.
+    await writeFile(
+      cases,
+      `const { createConnection } = require('node:net');
+const arrive = (test) => new Promise((resolve, reject) => {
+  const client = createConnection(process.env.${TEST_GATE_ENV});
+  client.setEncoding('utf8');
+  client.on('connect', () => client.write(JSON.stringify({ binary: 'pkg::bin', test }) + '\\n'));
+  client.on('data', (line) => { console.log('ran ' + test + ' on ' + line.trim()); resolve(client); });
+  client.on('error', reject);
+});
+(async () => {
+  const first = await arrive('a');
+  const second = await arrive('b');
+  second.destroy();
+  first.destroy();
+})();
+`,
+    );
+    await writeFile(
+      join(bin, 'cargo'),
+      `#!/bin/sh\nprintf 'cargo threads=%s\\n' "$NEXTEST_TEST_THREADS"\nif [ -n "$${TEST_GATE_ENV}" ]; then exec '${process.execPath}' '${cases}'; fi\n`,
+      { mode: 0o755 },
+    );
+    const saved = { PATH: process.env.PATH, [TEST_GATE_SERVED_ENV]: process.env[TEST_GATE_SERVED_ENV] };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env[TEST_GATE_SERVED_ENV] = '1';
+    try {
+      const result = await withPool(nextestWant, async (pool) => {
+        const parent = inheritedFrom(pool);
+        const siblings = [];
+        for (const want of [4, 2, 1]) {
+          const sibling = await takeParentCpuTokens(parent, want, null);
+          if (!sibling.granted) throw new Error(`the pool refused a sibling ${want} tokens: ${sibling.reason}`);
+          siblings.push(sibling);
+        }
+        // The siblings end once the leaf's first case runs: from then on seven of the pool's eight tokens are free.
+        process.stdout.write = captureWrite([], (text) => {
+          if (text.includes('ran a on go')) for (const sibling of siblings) sibling.release();
+        });
+        return runBoundedExec(
+          {
+            command: `cargo nextest run --binaries-metadata m.json --test-threads=${nextestWant}`,
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            killAfterMs: 0,
+          },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          parent,
+        );
+      });
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput).toMatch(
+        /cowshed: cpu-pool wait done elapsed=\d+ms status=ok tokens=1\/8 runner=nextest/,
+      );
+      expect(result.terminalOutput).toContain(`cargo threads=${nextestWant}\n`);
+      expect(result.terminalOutput).toContain('ran a on go\n');
+      expect(result.terminalOutput).toContain('ran b on go\n');
+      expect(result.terminalOutput).toMatch(/cowshed: cpu-pool cases own=1 lent=1 lent_core_s=0 waited_case_s=\d+\n/);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
   it.each([

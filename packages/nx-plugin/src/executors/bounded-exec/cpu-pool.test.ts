@@ -323,6 +323,30 @@ describe('the parent-held CPU pool', () => {
     expect(await next.next()).toEqual({ ok: true, lease: 'granted', tokens: 2 });
   });
 
+  //#region smoo/cowshed!n/a-case-starts-on-a-core
+  it("grants a lent request only when no leaf's request waits: a leaf that asks after it is granted first", async () => {
+    const { parent } = await openPool(1);
+    const granted = { ok: true, lease: 'granted', tokens: 1 };
+    const holder = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await holder.next()).toEqual(QUEUED);
+    expect(await holder.next()).toEqual(granted);
+    const lent = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1, lend: true }));
+    expect(await lent.next()).toEqual(QUEUED);
+    const leaf = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await leaf.next()).toEqual(QUEUED);
+    holder.socket.destroy();
+    expect(await leaf.next()).toEqual(granted);
+    leaf.socket.destroy();
+    expect(await lent.next()).toEqual(granted);
+  });
+
+  it('refuses a lent request for more than one token', async () => {
+    const { parent } = await openPool(2);
+    const lent = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2, lend: true }));
+    expect(await lent.next()).toMatchObject({ ok: false, code: 'invalid-request' });
+  });
+  //#endregion smoo/cowshed!n/a-case-starts-on-a-core
+
   it('heartbeats a queued child on its actor every heartbeat until a holder returns the token', async () => {
     jest.useFakeTimers();
     try {

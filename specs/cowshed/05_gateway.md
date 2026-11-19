@@ -2169,13 +2169,30 @@ core before it runs:
   does not gate) sizes the leaf's runner to its grant, as every other reserved leaf is sized. A shim that is named a
   gate it cannot reach, or whose gate closes before it answers, fails its case by name and starts nothing: a runner
   started on every thread never runs a case no core was taken for.
+- **Inside a hold.** A held job's Nx run sees no mbx pool and serves a run pool of the job's `k` cores ("Held jobs",
+  Inside the hold; "Without mbx, every Nx run budgets itself"), whose grants are whole and never grow either. Measured
+  2026-11-19 in a downstream workspace under `cowshed exec --host --want 8`: a host suite of about 75 cases, 7 min 28 s
+  run alone, started beside 28 sibling test targets of one Nx run, was granted 1 of the pool's 8 tokens and ran its
+  cases one after another to its end; its siblings had finished minutes earlier and 83% of the host stood idle. So a
+  nextest leaf of a run pool that is granted fewer tokens than it asked takes the same gate, decided by the same rule:
+  its runner starts every thread of its ask, as many cases run on its grant as it holds tokens, and a waiting case's
+  request is one lent token of the pool its leaf's grant came from, released when the case ends or withdrawn when a
+  token of the grant frees for it. A lent request waits behind every leaf's request, so a leaf never waits behind a
+  case; a leaf that arrives when cases hold every free token waits until the first of them ends, as it waits for any
+  holder. A leaf granted its whole ask is served no gate. The run learns that the installed mbx's shim gates as a run
+  with mbx's pool does: before its tasks it starts `mbx reservations` once without the hold's `MBX_SCHED_DISABLE` and
+  `MBX_SCHED_DIR`, asks `{"type":"capabilities"}`, and ends it; nothing is reserved through it. A run with no mbx, or
+  one whose mbx does not answer `test_gate`, sizes the leaf to its grant.
 - **What the caller sees.** At its end the leaf says
-  `cowshed: mbx reserve cases own=<n> lent=<n> lent_core_s=<s> waited_case_s=<s>`: the cases that ran on its grant and
-  on a core of their own, the core-seconds those held, and the seconds its cases waited at the gate.
+  `cowshed: mbx reserve cases own=<n> lent=<n> lent_core_s=<s> waited_case_s=<s>`, or `cowshed: cpu-pool cases …` with
+  the same fields for a leaf of a run pool: the cases that ran on its grant and on a core of their own, the core-seconds
+  those held, and the seconds its cases waited at the gate.
 - **Enforced by** `case-gate.test.ts` (the gate's decisions and its socket), the gated-leaf cases of `executor.test.ts`
   (a leaf granted one of six cores starts six threads, its second case on a core reserved in its name; without the
-  capability it is sized to its grant), `mbx-reservations.test.ts` (the capability), the replay above, and mbx's own
-  suite for the shim.
+  capability it is sized to its grant; a leaf granted one of a run pool's eight tokens starts a second case on a lent
+  token once its siblings release theirs, and a leaf that asks afterwards is granted before any further case),
+  `cpu-pool.test.ts` (a lent request waits behind a leaf that asks after it), `mbx-reservations.test.ts` (the
+  capability, with mbx's pool and under a hold), the replay above, and mbx's own suite for the shim.
 
 <a id="smoo/cowshed!n/build-precedes-reservation"></a>**A leaf's build precedes its reservation.** A reservation holds
 cores only while its command can use them. A reserved leaf's fixture (`fixtureCommand`; for the plugin's nextest runners
@@ -2264,17 +2281,19 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   budgeting the run: Stryker started 31 workers per package and cargo-mutants a jobserver of one task per core, side by
   side, and Stryker for three packages and a fourth target were SIGKILLed within 20 seconds. The pool serves its own
   FIFO queue, granting the head `min(want, free)` once one token is free, every grant whole: no request holds part of a
-  grant while it waits for more, so no two deadlock on each other's tokens. Its fifo holds the free count: a socket
-  child takes the fifo's bytes first and the implicit token last, and its close writes them back, so a Cargo reading the
-  fifo and a nested runner holding a grant never count one token twice. A granted `bounded-exec` serves its grant the
-  same way, as a pool its own nested runners take from; no runner asks the gateway. A pool's end ends accounting, never
-  work: a command whose lending parent exits runs on to its own exit and is judged by that exit alone. The run's pool
-  runs on a thread of its own ("Deadlines"); the run's `postTasksExecution` closes it, and a run that dies first takes
-  it with its process. The plugin's `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps each asking
-  31 of a 4-token run pool, the first granted 4 and the second queued until the first returned them. Its
-  `cpu-pool.silence.ts`, which the `test-pool-silence` target runs, queues a runner in another process on a 1-token run
-  pool and blocks the thread that served the run for the silence bound plus a heartbeat (20 s): the runner stays queued
-  and is granted once the holder returns its token.
+  grant while it waits for more, so no two deadlock on each other's tokens. A request may ask as lent (`lend`, one token
+  for one test case; "A case starts on a core", Inside a hold): lent requests queue behind every other request, among
+  themselves in arrival order, so the pool grants one only when no leaf's request waits, and it is charged no memory.
+  Its fifo holds the free count: a socket child takes the fifo's bytes first and the implicit token last, and its close
+  writes them back, so a Cargo reading the fifo and a nested runner holding a grant never count one token twice. A
+  granted `bounded-exec` serves its grant the same way, as a pool its own nested runners take from; no runner asks the
+  gateway. A pool's end ends accounting, never work: a command whose lending parent exits runs on to its own exit and is
+  judged by that exit alone. The run's pool runs on a thread of its own ("Deadlines"); the run's `postTasksExecution`
+  closes it, and a run that dies first takes it with its process. The plugin's `run-cpu-pool.test.ts` holds that shape
+  over a real socket: two sweeps each asking 31 of a 4-token run pool, the first granted 4 and the second queued until
+  the first returned them. Its `cpu-pool.silence.ts`, which the `test-pool-silence` target runs, queues a runner in
+  another process on a 1-token run pool and blocks the thread that served the run for the silence bound plus a heartbeat
+  (20 s): the runner stays queued and is granted once the holder returns its token.
 
   The run's pool also charges memory, since leaves whose peaks together exceed the run's memory must not start side by
   side. Each leaf is charged its task's last recorded memory peak, and a leaf is granted only while the charged peaks of
