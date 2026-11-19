@@ -114,51 +114,6 @@ pub(crate) fn select_reseed_target(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ErrorCode, metadata::WorkspaceIncarnation};
-    use proptest::prelude::*;
-
-    //#region smoo/cowshed!n/workspace-reseed
-    proptest! {
-        #[test]
-        fn only_verified_non_main_parent_absence_selects_main_for_reseed(
-            label in "lane-[a-z0-9]{1,8}",
-            incarnation in "[a-f0-9]{32}",
-            mount_id in any::<u64>(),
-            error in prop_oneof![
-                Just(CowshedError::environment_missing("read failed", "repair the store")),
-                Just(CowshedError::integrity("invalid metadata", "repair the workspace")),
-                Just(CowshedError::conflict("parent is busy", "wait for its work to finish")),
-                Just(CowshedError::not_found("no published parent", "cowshed ls")),
-            ],
-        ) {
-            let workspace = WorkspaceName::new("unit").unwrap();
-            let parent = WorkspaceName::new(label).unwrap();
-            let owner = Owner { name: parent.clone(), incarnation: WorkspaceIncarnation::new(incarnation).unwrap() };
-            let mounted = select_reseed_target(&workspace, &parent,
-                Ok(ReseedParent::Published { owner: owner.clone(), mount: MountState::Mounted { mount_id } }),
-            ).unwrap().expect("a mounted parent stays selected");
-            prop_assert_eq!(mounted, owner.clone());
-
-            let detached = select_reseed_target(&workspace, &parent,
-                Ok(ReseedParent::Published { owner, mount: MountState::Detached }),
-            ).unwrap_err();
-            prop_assert_eq!(detached.code, ErrorCode::Conflict);
-            let attach = format!("cowshed attach {parent}");
-            prop_assert!(detached.hint.contains(&attach));
-            let unpublished = select_reseed_target(&workspace, &parent, Ok(ReseedParent::Unpublished)).unwrap_err();
-            prop_assert_eq!(unpublished.code, ErrorCode::Conflict);
-
-            prop_assert!(select_reseed_target(&workspace, &parent, Ok(ReseedParent::Absent)).unwrap().is_none());
-            let main = WorkspaceName::main();
-            prop_assert_eq!(select_reseed_target(&workspace, &main, Ok(ReseedParent::Absent)).unwrap_err().code, ErrorCode::NotFound);
-            prop_assert_eq!(select_reseed_target(&workspace, &parent, Err(error.clone())).unwrap_err(), error);
-        }
-    }
-    //#endregion smoo/cowshed!n/workspace-reseed
-}
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Replace the build volume `plan`'s workspace links with what a fork of its target is given
     /// now (16_build_volumes.md, "Reseed"), leaving its source image, branch, uncommitted files and
@@ -479,4 +434,49 @@ fn abandon(host: &impl RuntimeStorageHost, layout: &BuildVolumeLayout, prepared:
             ),
         }
     }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ErrorCode, metadata::WorkspaceIncarnation};
+    use proptest::prelude::*;
+
+    //#region smoo/cowshed!n/workspace-reseed
+    proptest! {
+        #[test]
+        fn only_verified_non_main_parent_absence_selects_main_for_reseed(
+            label in "lane-[a-z0-9]{1,8}",
+            incarnation in "[a-f0-9]{32}",
+            mount_id in any::<u64>(),
+            error in prop_oneof![
+                Just(CowshedError::environment_missing("read failed", "repair the store")),
+                Just(CowshedError::integrity("invalid metadata", "repair the workspace")),
+                Just(CowshedError::conflict("parent is busy", "wait for its work to finish")),
+                Just(CowshedError::not_found("no published parent", "cowshed ls")),
+            ],
+        ) {
+            let workspace = WorkspaceName::new("unit").unwrap();
+            let parent = WorkspaceName::new(label).unwrap();
+            let owner = Owner { name: parent.clone(), incarnation: WorkspaceIncarnation::new(incarnation).unwrap() };
+            let mounted = select_reseed_target(&workspace, &parent,
+                Ok(ReseedParent::Published { owner: owner.clone(), mount: MountState::Mounted { mount_id } }),
+            ).unwrap().expect("a mounted parent stays selected");
+            prop_assert_eq!(mounted, owner.clone());
+
+            let detached = select_reseed_target(&workspace, &parent,
+                Ok(ReseedParent::Published { owner, mount: MountState::Detached }),
+            ).unwrap_err();
+            prop_assert_eq!(detached.code, ErrorCode::Conflict);
+            let attach = format!("cowshed attach {parent}");
+            prop_assert!(detached.hint.contains(&attach));
+            let unpublished = select_reseed_target(&workspace, &parent, Ok(ReseedParent::Unpublished)).unwrap_err();
+            prop_assert_eq!(unpublished.code, ErrorCode::Conflict);
+
+            prop_assert!(select_reseed_target(&workspace, &parent, Ok(ReseedParent::Absent)).unwrap().is_none());
+            let main = WorkspaceName::main();
+            prop_assert_eq!(select_reseed_target(&workspace, &main, Ok(ReseedParent::Absent)).unwrap_err().code, ErrorCode::NotFound);
+            prop_assert_eq!(select_reseed_target(&workspace, &parent, Err(error.clone())).unwrap_err(), error);
+        }
+    }
+    //#endregion smoo/cowshed!n/workspace-reseed
 }
