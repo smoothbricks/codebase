@@ -15,6 +15,7 @@
     "src/ensure-built-receipt.test.ts": 13062,
     "src/process-group.test.ts": 12949,
     "src/cargo-source-hash.test.ts": 11786,
+    "src/bun-patch-keys.test.ts": 10011,
     "src/cargo-closure-input.test.ts": 8855,
     "src/cargo-retention.test.ts": 7977,
     "src/nx-daemon-claim.test.ts": 7812,
