@@ -1,5 +1,5 @@
 import typia from 'typia';
-import { CONTROL_MS, REAP_MS } from './lease-wait.js';
+import { REAP_MS } from './lease-wait.js';
 
 /**
  * The life of an Nx run's mbx reservation endpoint in the run that started it (mbx-reservations.ts;
@@ -61,7 +61,7 @@ export type EndpointEvent =
   /** The probe's connection ended or failed. */
   | { readonly type: 'probe-end' }
   | { readonly type: 'run-end' }
-  /** The timer the last `arm` started has run out. */
+  /** The reap timer the last `arm` started has run out. */
   | { readonly type: 'expired' };
 
 /** What the shell does. `refuse` and `conclude` remove the socket's directory before they answer. */
@@ -177,10 +177,7 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
       const line = firstLine(out);
       if (line === null) return [{ ...life, out }, []];
       if (line === 'listening') {
-        return [
-          { phase: 'probing', reply: '', said: life.said, pid: life.pid },
-          [{ do: 'probe' }, { do: 'arm', ms: CONTROL_MS }],
-        ];
+        return [{ phase: 'probing', reply: '', said: life.said, pid: life.pid }, [{ do: 'probe' }]];
       }
       return [
         {
@@ -210,7 +207,7 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
 function probing(life: EndpointLife & { phase: 'probing' }, event: EndpointEvent): EndpointStep {
   const served: EndpointLife = { phase: 'serving', said: life.said, pid: life.pid };
   const ended = endOf(life.said, event);
-  if (ended !== null) return [ENDED, [{ do: 'disarm' }, { do: 'hang-up' }, { do: 'refuse', why: ended.how }]];
+  if (ended !== null) return [ENDED, [{ do: 'hang-up' }, { do: 'refuse', why: ended.how }]];
   switch (event.type) {
     case 'stderr':
       return [{ ...life, said: saying(life.said, event.text) }, []];
@@ -218,12 +215,10 @@ function probing(life: EndpointLife & { phase: 'probing' }, event: EndpointEvent
       const reply = life.reply + event.text;
       const line = firstLine(reply);
       if (line === null) return [{ ...life, reply }, []];
-      return [served, [{ do: 'disarm' }, { do: 'hang-up' }, { do: 'serve', gates: gatesTests(line) }]];
+      return [served, [{ do: 'hang-up' }, { do: 'serve', gates: gatesTests(line) }]];
     }
     case 'probe-end':
-      return [served, [{ do: 'disarm' }, { do: 'serve', gates: false }]];
-    case 'expired':
-      return [served, [{ do: 'hang-up' }, { do: 'serve', gates: false }]];
+      return [served, [{ do: 'serve', gates: false }]];
     case 'run-end':
       return unanswered(life.phase);
     default:

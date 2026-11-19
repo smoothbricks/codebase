@@ -169,7 +169,7 @@ async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
   const execute = (effect: EndpointEffect): void => {
     switch (effect.do) {
       case 'probe': {
-        // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and the life ends the probe (`hang-up`)
+        // eslint-disable-next-line deadline/no-unbounded-wait -- WHY unbounded: a Unix-socket connect completes or fails at once, and the probe ends at its answer, its connection's end or the child's end (endpoint-life.ts), which the endpoint's death brings: it is this run's child
         const connection = createConnection(socket);
         probe = connection;
         connection.setEncoding('utf8');

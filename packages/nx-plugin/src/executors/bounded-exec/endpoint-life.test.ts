@@ -8,7 +8,7 @@ import {
   gatesTests,
   spawned,
 } from './endpoint-life.js';
-import { CONTROL_MS, REAP_MS } from './lease-wait.js';
+import { REAP_MS } from './lease-wait.js';
 
 /**
  * The life of a run's reservation endpoint (endpoint-life.ts) judged over generated interleavings of what its shell
@@ -134,7 +134,6 @@ const everyOrder = (holds: (steps: readonly Step[]) => void): void =>
 
 describe("the life of a run's reservation endpoint", () => {
   it('walks its ordinary paths', () => {
-    const arm: EndpointEffect = { do: 'arm', ms: CONTROL_MS };
     const reap: EndpointEffect = { do: 'arm', ms: REAP_MS };
     const disarm: EndpointEffect = { do: 'disarm' };
     const cases: { name: string; events: EndpointEvent[]; effects: EndpointEffect[][] }[] = [
@@ -143,8 +142,8 @@ describe("the life of a run's reservation endpoint", () => {
         events: [stdout('listen'), stdout('ing\nserving\n'), probe(GATES), RUN_END, close(0)],
         effects: [
           [],
-          [{ do: 'probe' }, arm],
-          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'probe' }],
+          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
           [{ do: 'close-stdin' }, reap],
           [disarm, { do: 'conclude', ended: { how: 'mbx reservations ended with status 0', clean: true } }],
         ],
@@ -152,7 +151,7 @@ describe("the life of a run's reservation endpoint", () => {
       {
         name: 'an endpoint whose probe ends unanswered is served and gates nothing',
         events: [stdout('listening\n'), PROBE_END, PROBE_END],
-        effects: [[{ do: 'probe' }, arm], [disarm, { do: 'serve', gates: false }], []],
+        effects: [[{ do: 'probe' }], [{ do: 'serve', gates: false }], []],
       },
       {
         name: 'a child that says anything else is killed, and refused once it has ended',
@@ -209,13 +208,9 @@ describe("the life of a run's reservation endpoint", () => {
         name: 'an endpoint whose child ends before its probe answers is refused by how it ended, and never served',
         events: [stdout('listening\n'), stderr('mbx: pool store is locked\n'), close(1), probe(GATES), PROBE_END],
         effects: [
-          [{ do: 'probe' }, arm],
+          [{ do: 'probe' }],
           [],
-          [
-            disarm,
-            { do: 'hang-up' },
-            { do: 'refuse', why: 'mbx reservations ended with status 1: mbx: pool store is locked' },
-          ],
+          [{ do: 'hang-up' }, { do: 'refuse', why: 'mbx reservations ended with status 1: mbx: pool store is locked' }],
           [],
           [],
         ],
@@ -224,8 +219,8 @@ describe("the life of a run's reservation endpoint", () => {
         name: "an endpoint that ends while it serves is said at its run's end, and nothing is signalled",
         events: [stdout('listening\n'), probe(NO_GATE), close(null, 'SIGTERM'), RUN_END],
         effects: [
-          [{ do: 'probe' }, arm],
-          [disarm, { do: 'hang-up' }, { do: 'serve', gates: false }],
+          [{ do: 'probe' }],
+          [{ do: 'hang-up' }, { do: 'serve', gates: false }],
           [],
           [{ do: 'conclude', ended: { how: 'mbx reservations ended on SIGTERM', clean: false } }],
         ],
@@ -234,8 +229,8 @@ describe("the life of a run's reservation endpoint", () => {
         name: 'an endpoint that outlives its standard input is killed, and its end says so',
         events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, close(null, 'SIGKILL')],
         effects: [
-          [{ do: 'probe' }, arm],
-          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'probe' }],
+          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
           [{ do: 'close-stdin' }, reap],
           [{ do: 'kill' }, reap],
           [
@@ -254,8 +249,8 @@ describe("the life of a run's reservation endpoint", () => {
         name: 'an endpoint that a kill does not end either is left as it is, and its end says so',
         events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, EXPIRED, close(null, 'SIGKILL')],
         effects: [
-          [{ do: 'probe' }, arm],
-          [disarm, { do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'probe' }],
+          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
           [{ do: 'close-stdin' }, reap],
           [{ do: 'kill' }, reap],
           [
@@ -415,6 +410,17 @@ describe("the life of a run's reservation endpoint", () => {
     });
   });
 
+  it('arms its timer only to reap its child: its start and its probe wait for events alone', () => {
+    everyOrder((steps) => {
+      const armed = timers(steps);
+      steps.forEach((step, at) => {
+        for (const effect of step.effects) {
+          if (effect.do === 'arm') expect(effect.ms).toBe(REAP_MS);
+        }
+        if (step.after.phase !== 'ending') expect(armed[at]?.after).toBe(false);
+      });
+    });
+  });
   it('does nothing at an expiry no armed timer could send, so no outcome is read from a clock', () => {
     everyOrder((steps) => {
       const armed = timers(steps);
