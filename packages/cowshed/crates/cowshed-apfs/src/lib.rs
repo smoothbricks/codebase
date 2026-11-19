@@ -2597,7 +2597,6 @@ pub enum ApfsError {
     /// refused unmount or detach itself.
     CaptureSourceBusy {
         image: PathBuf,
-        mount_point: PathBuf,
         held: CaptureHold,
         refusal: Box<ApfsError>,
     },
@@ -2609,7 +2608,10 @@ pub enum CaptureHold {
     /// The unmount was refused: each process of this user that had the volume open when it was
     /// refused (empty when none of them is visible: the kernel or another user's process holds
     /// it).
-    Volume(Vec<cowshed_os::process::Holder>),
+    Volume {
+        mount_point: PathBuf,
+        holders: Vec<cowshed_os::process::Holder>,
+    },
     /// The unmount was accepted, so no file on the volume was open, but the image's device
     /// still refused its unforced detach when the detach grace ended.
     Device,
@@ -2797,8 +2799,11 @@ impl fmt::Display for ApfsError {
             }
             Self::CaptureSourceBusy {
                 image,
-                mount_point,
-                held: CaptureHold::Volume(holders),
+                held:
+                    CaptureHold::Volume {
+                        mount_point,
+                        holders,
+                    },
                 refusal,
             } => {
                 write!(
@@ -2823,14 +2828,12 @@ impl fmt::Display for ApfsError {
             }
             Self::CaptureSourceBusy {
                 image,
-                mount_point,
                 held: CaptureHold::Device,
                 refusal,
             } => write!(
                 f,
-                "{} must be detached to be cloned; its volume at {} unmounted with no file open, but the image's device still refused the unforced detach when the detach grace ended, held by something this user cannot see; nothing was forced: run the command again (detach refused: {refusal})",
-                image.display(),
-                mount_point.display()
+                "{}: its volume is unmounted with no file open, but the image's device still refused the unforced detach when the detach grace ended, held by something this user cannot see; nothing was forced: run the command again (detach refused: {refusal})",
+                image.display()
             ),
         }
     }
@@ -4109,7 +4112,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.mount(&attachment.0, mount, MountAccess::ReadOnly, false)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     pub fn unmount_retained_when_idle(
         &self,
         attachment: &RetainedAttachment,
@@ -4123,6 +4126,32 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         attachment: &RetainedAttachment,
     ) -> Result<(), ApfsError> {
         self.detach(&attachment.0, DetachIntent::WhenIdle)
+    }
+
+    /// After an accepted unforced unmount of a capture source, wait out a device dissent
+    /// without forcing. A dissent still standing at grace expiry is not a volume holder.
+    pub fn detach_after_unmount(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
+        self.detach(attachment, DetachIntent::WithinGrace)
+            .map_err(|refusal| {
+                if detach_was_dissented(&refusal) {
+                    ApfsError::CaptureSourceBusy {
+                        image: attachment.image().to_owned(),
+                        held: CaptureHold::Device,
+                        refusal: Box::new(refusal),
+                    }
+                } else {
+                    refusal
+                }
+            })
+    }
+
+    /// Apply the same unforced device release to a retained re-adoption input.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn detach_retained_after_unmount(
+        &self,
+        attachment: &RetainedAttachment,
+    ) -> Result<(), ApfsError> {
+        self.detach_after_unmount(&attachment.0)
     }
 
     /// Detach an owned whole device under `intent`.
@@ -10698,25 +10727,79 @@ mod tests {
         assert_eq!(*backend.sleeper.waits(), [Duration::from_millis(10)]);
     }
 
+    //#region smoo/cowshed!n/re-adoption-device-grace
+    /// A re-adoption releases its source without force. Once the unforced unmount is accepted
+    /// no file on the volume is open, and what still refuses the image's detach is a holder of
+    /// the device (a system daemon reading the container the unmount just changed), which lets
+    /// go by itself: the release waits it out within the grace and never forces.
+    #[test]
+    fn an_unforced_release_waits_out_a_device_holder_that_lets_go_within_the_grace() {
+        let attachment = RetainedAttachment(unmount_test_attachment());
+        let image = attachment.0.image.clone();
+        let backend = graced_backend([
+            holding_verified_volume(&image),
+            unmount_ok(),
+            holding_verified_volume(&image),
+            dissent(),
+            holding_verified_volume(&image),
+            dissent(),
+            holding_verified_volume(&image),
+            ok([]),
+            no_images(),
+        ]);
+
+        backend
+            .unmount_retained_when_idle(&attachment)
+            .and_then(|()| backend.detach_retained_after_unmount(&attachment))
+            .expect("the holder let go inside the grace");
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3, "two dissents, then the accepted retry");
+        for request in requests.iter() {
+            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+        }
+        assert_eq!(
+            unmounts(backend.runner())
+                .iter()
+                .map(|(_, _, mode)| *mode)
+                .collect::<Vec<_>>(),
+            [UnmountMode::Normal]
+        );
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+    }
+
     /// A dissent that outlasts the grace is handed back as the dissent itself, never forced: the
     /// seal refuses rather than tearing the device away from whatever holds it.
     #[test]
     fn a_within_grace_detach_answers_the_dissent_standing_when_the_grace_ends() {
-        let image = temp_path("detach-within-grace-busy", IMAGE_EXTENSION);
+        let attachment = unmount_test_attachment();
+        let image = attachment.image();
         let backend = graced_backend([
-            holding(&image, "/dev/disk4"),
+            holding_verified_volume(image),
+            unmount_ok(),
+            holding_verified_volume(image),
             dissent(),
-            holding(&image, "/dev/disk4"),
+            holding_verified_volume(image),
             dissent(),
-            holding(&image, "/dev/disk4"),
+            holding_verified_volume(image),
             dissent(),
         ]);
 
-        let error = backend
-            .detach_device_checked(&image, "/dev/disk4", DetachIntent::WithinGrace)
-            .unwrap_err();
-
-        assert!(detach_was_dissented(&error), "{error}");
+        backend
+            .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            .expect("the unmount is accepted");
+        let error = backend.detach_after_unmount(&attachment).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ApfsError::CaptureSourceBusy { image: source, held: CaptureHold::Device, refusal }
+                    if source == image && detach_was_dissented(refusal)
+            ),
+            "{error}"
+        );
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 3, "three unforced attempts and no force");
         for request in requests.iter() {
@@ -10727,16 +10810,7 @@ mod tests {
             [Duration::from_millis(10), Duration::from_millis(10)]
         );
 
-        // The seal reports it as the device's refusal: the unmount already proved no file open,
-        // so it names no holders and does not claim the volume is in use.
-        let busy = ApfsError::CaptureSourceBusy {
-            image: image.clone(),
-            mount_point: PathBuf::from("/tmp/cowshed-build-mount"),
-            held: CaptureHold::Device,
-            refusal: Box::new(error),
-        };
-        assert!(detach_was_dissented(&busy));
-        let said = busy.to_string();
+        let said = error.to_string();
         assert!(
             said.contains("unmounted with no file open")
                 && said.contains("refused the unforced detach when the detach grace ended")
@@ -10745,6 +10819,7 @@ mod tests {
             "{said}"
         );
     }
+    //#endregion smoo/cowshed!n/re-adoption-device-grace
 
     /// Only a dissent is transient. A tool that failed for any other reason is failing now and
     /// will fail in ten seconds, so waiting on it would only delay the report.

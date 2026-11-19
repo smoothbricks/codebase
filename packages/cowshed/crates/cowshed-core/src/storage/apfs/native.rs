@@ -3495,17 +3495,20 @@ where
             .map_err(ApfsStorageError::from)
     }
 
-    /// A re-adoption detach was refused: name each process of this user that holds the volume.
+    /// The unmount refused: name the processes that hold the volume, if it was mounted.
     #[cfg(target_os = "macos")]
-    fn capture_refusal(
+    fn capture_unmount_refusal(
         &self,
         source: &Path,
-        mount_point: &Path,
+        mount_point: Option<&Path>,
         refusal: ApfsError,
     ) -> ApfsStorageError {
         if !cowshed_apfs::detach_was_dissented(&refusal) {
             return refusal.into();
         }
+        let Some(mount_point) = mount_point else {
+            return refusal.into();
+        };
         let holders = match self.mounted_at(mount_point) {
             Ok(Some(_)) => match crate::build_volume::nx::volume_holders(&self.census, mount_point)
             {
@@ -3533,8 +3536,10 @@ where
         };
         ApfsError::CaptureSourceBusy {
             image: source.to_owned(),
-            mount_point: mount_point.to_owned(),
-            held: cowshed_apfs::CaptureHold::Volume(holders),
+            held: cowshed_apfs::CaptureHold::Volume {
+                mount_point: mount_point.to_owned(),
+                holders,
+            },
             refusal: Box::new(refusal),
         }
         .into()

@@ -714,8 +714,7 @@ where
         Ok(())
     }
 
-    /// Unmount and detach `image` without force. A refusal of a mounted image names the
-    /// processes that hold it.
+    /// Unmount and detach the image without force. Only device dissent earns the grace.
     fn detach_without_force(&self, image: &Path) -> Result<(), ApfsStorageError> {
         let Some(attachment) = self.backend.existing_attachment(image)? else {
             return Ok(());
@@ -726,20 +725,15 @@ where
             .into_iter()
             .find(|mounted| mounted.source_device == attachment.volume_device())
             .map(|mounted| mounted.mount_point);
-        let released = self
-            .backend
+        self.backend
             .unmount_verified(&attachment, DetachIntent::WhenIdle)
-            .and_then(|()| self.backend.detach(&attachment, DetachIntent::WhenIdle));
-        match (released, mount) {
-            (Ok(()), _) => Ok(()),
-            (Err(refusal), Some(mount)) => Err(self.capture_refusal(image, &mount, refusal)),
-            (Err(refusal), None) => Err(refusal.into()),
-        }
+            .map_err(|refusal| self.capture_unmount_refusal(image, mount.as_deref(), refusal))?;
+        self.backend.detach_after_unmount(&attachment)?;
+        Ok(())
     }
 
     /// Unmount and detach the re-adoption input at `path` (one `source` records) without force,
-    /// through the retained-input attachment API. A refusal of a mounted input names the
-    /// processes that hold it.
+    /// through the retained-input attachment API. Only device dissent earns the grace.
     fn release_retained(
         &self,
         source: &ReAdoptSource,
@@ -755,15 +749,11 @@ where
             .into_iter()
             .find(|mounted| mounted.source_device == attachment.volume_device())
             .map(|mounted| mounted.mount_point);
-        let released = self
-            .backend
+        self.backend
             .unmount_retained_when_idle(&attachment)
-            .and_then(|()| self.backend.detach_retained_when_idle(&attachment));
-        match (released, mount) {
-            (Ok(()), _) => Ok(()),
-            (Err(refusal), Some(mount)) => Err(self.capture_refusal(path, &mount, refusal)),
-            (Err(refusal), None) => Err(refusal.into()),
-        }
+            .map_err(|refusal| self.capture_unmount_refusal(path, mount.as_deref(), refusal))?;
+        self.backend.detach_retained_after_unmount(&attachment)?;
+        Ok(())
     }
 
     /// Attach the retained input at `path` read-only and mount it at `mount`. An exact read-only

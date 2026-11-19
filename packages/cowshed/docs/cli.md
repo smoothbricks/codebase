@@ -418,7 +418,9 @@ next: cowshed fork <ws>
 
 Use `cowshed adopt <checkout> --re-adopt` to reclaim guest-freed space. Default adopt remains idempotent. Run
 re-adoption from outside the checkout, after every source and build-volume holder has exited; it lists each holder's PID
-and command and refuses, rather than killing a process or forcing an unmount.
+and command and refuses, rather than killing a process or forcing an unmount. Once the unmount succeeds, a device
+dissent is retried through the APFS detach grace without force. If the device still refuses, re-adoption reports that
+refusal rather than claiming the volume is in use.
 
 Re-adoption replaces main through the same staged copy, verification and checkout handoff as adopt. It copies the old
 image's filesystem entries, not its free guest blocks, into a fresh sparse RAW image, and the copy includes all of

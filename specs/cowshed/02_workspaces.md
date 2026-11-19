@@ -140,6 +140,10 @@ refused, naming its format and path.
    registrations. Preserve the sheds' links to the same main checkout path. Detach the exact old source without force,
    retain its backing image and sidecars under the recorded retained name, then attach that image read-only at the
    recorded source staging mount. The original checkout becomes the publication target, not the copy source.
+   <a id="smoo/cowshed!n/re-adoption-device-grace"></a>A verified volume unmount uses `WhenIdle`. After it succeeds,
+   device detach uses `WithinGrace` (01a_apfs.md, "Release authority"), never force. A dissent still standing when the
+   grace ends names the device refusal, not a volume holder. The same rule applies when releasing the retained inputs
+   and when discarding a staged copy that can no longer be verified.
 3. Mint a fresh sparse RAW image behind `PendingFence` and copy the entire source filesystem, including ignored build
    state and all of `.git`, directly into its staging mount. Preserve sparse leaves through metadata clones or
    hole-aware copies; do not materialize the nominal image capacity or use an intermediate full checkout on Data. The
