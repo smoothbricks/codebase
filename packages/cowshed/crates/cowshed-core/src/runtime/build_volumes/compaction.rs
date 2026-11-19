@@ -453,6 +453,23 @@ mod tests {
     use super::*;
     use cowshed_os::test_backstop::ChildBackstop as _;
 
+    //#region smoo/cowshed!n/build-seed-compaction-admission
+    proptest::proptest! {
+        #[test]
+        fn storage_copies_check_admission_at_the_first_chunk_and_each_gib_after(
+            first in proptest::num::u32::ANY,
+            since_check in 0..(1_u64 << 30),
+        ) {
+            let first = u64::from(first);
+            let mut answers = [Admission::Copy, Admission::Wait, Admission::Stop("turn proof unavailable".into())].into_iter();
+            let mut admit = between_checks(Box::new(move || answers.next().expect("only the two checkpoints ask")));
+            proptest::prop_assert_eq!(admit(first), ControlFlow::Continue(()));
+            proptest::prop_assert_eq!(admit(first + since_check), ControlFlow::Continue(()));
+            proptest::prop_assert_eq!(admit(first + (1 << 30)), ControlFlow::Break("turn proof unavailable".to_owned()));
+        }
+    }
+    //#endregion smoo/cowshed!n/build-seed-compaction-admission
+
     #[test]
     fn a_gateway_that_is_not_running_holds_no_land_turn_and_one_unread_stops_the_copy() {
         use crate::api::dto::{LandTurnName, LandTurnQueue};

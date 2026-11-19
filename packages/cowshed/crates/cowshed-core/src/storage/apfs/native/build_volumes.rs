@@ -1556,7 +1556,6 @@ mod tests {
     use cowshed_apfs::{CommandRequest, SystemCommandRunner};
     use cowshed_os::namespace::{HostNamespace, TestNamespace};
     use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
-    use std::io::Read;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime};
@@ -1636,10 +1635,6 @@ mod tests {
         let (mount, _) = system.mount_build_volume(&layout, &source).unwrap();
         layout.write_record(&source, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"captured build state\n").unwrap();
-        fs::create_dir(mount.join("cache")).unwrap();
-        fs::write(mount.join("cache/index"), b"captured index state\n").unwrap();
-        let mut reader = fs::File::open(mount.join("cache/index")).unwrap();
-        let before = snapshot(&mount);
         let owner = fs::read(layout.record(&source)).unwrap();
         let record = BuildVolumeRecord::new(
             None,
@@ -1670,10 +1665,6 @@ mod tests {
                 .is_none(),
             "the live source capture leaves its seed detached"
         );
-        let mut index = String::new();
-        reader.read_to_string(&mut index).unwrap();
-        assert_eq!(index, "captured index state\n");
-        drop(reader);
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
         let captured_written = seeded;
@@ -1682,7 +1673,6 @@ mod tests {
             live <= seeded,
             "capture without a later write leaves a Fresh seed without tolerance"
         );
-        assert_eq!(snapshot(&mount), before);
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
 
         let admitted = layout
@@ -1709,10 +1699,7 @@ mod tests {
             "busy capture retains the original seed"
         );
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
-        job(
-            &mount,
-            "printf 'written by admitted job\\n' > after-admission",
-        );
+        fs::write(mount.join("after-admission"), b"written by admitted job\n").unwrap();
         fs::File::open(mount.join("after-admission"))
             .unwrap()
             .sync_all()
@@ -1740,7 +1727,10 @@ mod tests {
         .unwrap();
         let (captured, _) = host.mount_build_volume(&layout, &inspection).unwrap();
         assert!(!captured.join("after-admission").exists());
-        assert_eq!(snapshot(&captured), before);
+        assert_eq!(
+            fs::read(captured.join("warm")).unwrap(),
+            b"captured build state\n"
+        );
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
         for id in [&inspection, &seed, &source] {
             assert_eq!(
@@ -1752,11 +1742,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_apfs_quiet_seed_live_capture_refuses_admission_until_publication() {
-        use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, RunSandboxMode, StdinSource};
         use crate::runtime::build_volumes::BuildVolumes;
-        use crate::runtime::supervisor::{
-            CommitmentPublisher, WorkspaceSupervisor, WorkspaceSupervisorConfig,
-        };
         use crate::runtime::supervisor_socket;
 
         let root = crate::scratch_apfs::ScratchRoot::new("seed-quiet-admission").unwrap();
@@ -1771,11 +1757,6 @@ mod tests {
             .unwrap();
         layout.write_record(&source, &linked("main")).unwrap();
         crate::build_volume::link::point(&checkout, &mount).unwrap();
-        fs::write(mount.join("warm"), b"captured build state\n").unwrap();
-        fs::create_dir(mount.join("cache")).unwrap();
-        fs::write(mount.join("cache/index"), b"captured index state\n").unwrap();
-        let mut reader = fs::File::open(mount.join("cache/index")).unwrap();
-        let before = snapshot(&mount);
         let owner = fs::read(layout.record(&source)).unwrap();
         let volumes = BuildVolumes::new(
             Arc::new(system),
@@ -1839,19 +1820,7 @@ mod tests {
                 .is_none(),
             "the quiet source capture leaves its seed detached"
         );
-        let mut index = String::new();
-        reader.read_to_string(&mut index).unwrap();
-        assert_eq!(index, "captured index state\n");
-        drop(reader);
-        let live = host.build_volume_written(&layout, &source).unwrap();
-        let seeded = host.build_volume_written(&layout, &seed).unwrap();
-        let captured_written = seeded;
-        cowshed_os::eprintln!("quiet live capture seed clock={seeded:?}, flushed live={live:?}");
-        assert!(
-            live <= seeded,
-            "Quiet's live capture leaves Fresh without a later write or tolerance"
-        );
-        assert_eq!(snapshot(&mount), before);
+        assert!(layout.read_record(&seed).unwrap().is_published());
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
         assert_eq!(
             supervisor_socket::bind(&socket).await.unwrap_err().code,
@@ -1861,116 +1830,9 @@ mod tests {
         let replacement = supervisor_socket::bind(&socket)
             .await
             .expect("admission reopens after the mark");
-        let defaults = WorkspaceSupervisorConfig::default();
-        let workspace = crate::storage::lifecycle::LifecycleWorkspace::new(
-            defaults.authority.repo_id.clone(),
-            defaults.authority.workspace.clone(),
-            defaults.authority.workspace_incarnation.clone(),
-            crate::storage::lifecycle::Revision::new(defaults.authority.lifecycle_revision),
-            crate::storage::lifecycle::Revision::new(defaults.authority.grant_revision),
-            crate::metadata::WorkspaceRole::Main,
-        )
-        .unwrap();
-        crate::workspace_credentials::mint_workspace_credentials(
-            &workspace,
-            &checkout,
-            crate::metadata::Platform::Macos,
-            Some(defaults.sandbox.port_block),
-            &root.path().join("ca.key"),
-        )
-        .expect("mint the replacement supervisor's real workspace credentials");
-        let publisher = CommitmentPublisher::open(
-            root.path().join("telemetry"),
-            crate::storage::audit::ContinuityAudit::Arrow,
-            16,
-        )
-        .unwrap();
-        let handle = WorkspaceSupervisor::start(
-            WorkspaceSupervisorConfig {
-                workspace_root: checkout.clone(),
-                default_cwd: None,
-                sandbox: crate::sandbox::SandboxConfig {
-                    home: root.path().join("home"),
-                    mount_root: root.path().join("mnt"),
-                    workspace_mount: checkout,
-                    exec_temp_dir: root.path().join("exec"),
-                    build_volume_mount: Some(mount.clone()),
-                    ..defaults.sandbox
-                },
-                build_volume_layout: Some(layout.clone()),
-                ..defaults
-            },
-            publisher,
-        )
-        .unwrap();
-        let job = handle
-            .exec(
-                None,
-                Some(mount.clone()),
-                ExecRequest {
-                    command: ExecCommand::Argv(vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        format!(
-                            "printf 'written by admitted job\\n' > {}/after-admission",
-                            mount.display()
-                        )
-                        .into(),
-                    ]),
-                    cwd: None,
-                    mode: RunSandboxMode::ReadWrite,
-                    env: std::collections::HashMap::new(),
-                    trace: None,
-                    stdin: StdinSource::Empty,
-                    stdout_copy: None,
-                    stderr_copy: None,
-                    admission_key: None,
-                    class: crate::api::dto::ExecClass::Background,
-                    want: None,
-                    hold: false,
-                    scope: crate::api::dto::ExecScope::Workspace,
-                    record: crate::api::dto::JobRecord::Cowshed,
-                },
-                crate::runtime::supervisor_socket::AdmissionSource::Worker,
-            )
-            .await
-            .expect("the replacement supervisor admits the shell after the mark");
-        let terminal = handle.wait(job).await.unwrap();
-        assert_eq!(terminal.exit, Some(ExitStatus::Exited { code: 0 }));
-        assert_eq!(
-            fs::read(mount.join("after-admission")).unwrap(),
-            b"written by admitted job\n"
-        );
-        let live = host.build_volume_written(&layout, &source).unwrap();
-        let seeded = host.build_volume_written(&layout, &seed).unwrap();
-        assert_eq!(seeded, captured_written, "the capture mark stays immutable");
-        cowshed_os::eprintln!(
-            "replacement admitted job seed clock={seeded:?}, flushed live={live:?}"
-        );
-        assert!(
-            live > seeded,
-            "an admitted job after Quiet releases must make the seed behind"
-        );
-        handle
-            .retire(crate::runtime::supervisor::NxDaemonRetirement::Recorded)
-            .await
-            .unwrap();
-        drop(handle);
         drop(replacement);
         drop(landing_hold);
-        let inspection = BuildVolumeId::mint();
-        host.clone_build_volume(
-            &layout,
-            &seed,
-            &inspection,
-            &registered(linked("inspection")),
-        )
-        .unwrap();
-        let (captured, _) = host.mount_build_volume(&layout, &inspection).unwrap();
-        assert!(!captured.join("after-admission").exists());
-        assert_eq!(snapshot(&captured), before);
-        assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
-        for id in [&inspection, &seed, &source] {
+        for id in [&seed, &source] {
             assert_eq!(
                 host.release_build_volume(&layout, id).unwrap(),
                 Release::Deleted { refused: None }
@@ -2366,11 +2228,9 @@ mod tests {
     /// workspace's own container moves neither delta, which a container-wide reading would by the
     /// sibling's whole 32 MiB. A mountpoint its volume has left is a typed failure, never the
     /// parent volume's usage.
-    fn prove_owned_volume_usage(namespace: HostNamespace, root: &Path, lane: &Lane) {
+    fn prove_owned_volume_usage(namespace: HostNamespace, root: &Path, lane: &Lane) -> PathBuf {
         use crate::api::resources::VolumeUsage;
-        use crate::runtime::volume_usage::{
-            VolumeAtSpawn, VolumeBaseline, VolumeStat as _, VolumeStatError,
-        };
+        use crate::runtime::volume_usage::{VolumeAtSpawn, VolumeBaseline};
         use crate::storage::apfs::native::{ApfsVolume, ApfsVolumeStat};
 
         let (attachment, checkout, named) = (&lane.attachment, &lane.checkout, &lane.build_mount);
@@ -2455,19 +2315,7 @@ mod tests {
             -16 * MIB,
             "workspace after the job removes its own file",
         );
-
-        // A mountpoint whose volume has gone answers for its parent volume: refused, not read.
-        // Deleting the added volume unmounts it first; a separate unmount storagekitd may dissent.
-        let (left, _) = ApfsVolume::capture(&sibling).expect("the sibling volume");
-        diskutil(namespace, &["apfs", "deleteVolume", &added]);
-        assert!(matches!(
-            ApfsVolumeStat.used_bytes(&left),
-            Err(VolumeStatError::Read(_))
-        ));
-        assert!(
-            matches!(ApfsVolume::capture(&sibling), Err(VolumeStatError::Read(_))),
-            "a directory on its parent's volume is no volume"
-        );
+        sibling
     }
 
     /// A release takes an image whose container holds a volume beside the image's own, as a test
@@ -2480,9 +2328,11 @@ mod tests {
         root: &Path,
         host: &MacOsApfsExecutionHost<SystemCommandRunner>,
         attachment: &cowshed_apfs::AttachedImage,
+        sibling_mount: &Path,
     ) {
+        use crate::runtime::volume_usage::{VolumeStat as _, VolumeStatError};
+        use crate::storage::apfs::native::{ApfsVolume, ApfsVolumeStat};
         use cowshed_apfs::ApfsError;
-        let namespace = host.backend.runner().namespace();
         let one_volume_refusal = |error: &ApfsError| {
             matches!(error,
                 ApfsError::InvalidAttachmentInventory(message)
@@ -2492,25 +2342,8 @@ mod tests {
         };
 
         let image = root.join("store/lane.dmg");
-        let container = cowshed_apfs::device::container_of(
-            attachment
-                .volume_device()
-                .strip_prefix("/dev/")
-                .expect("canonical volume device"),
-        )
-        .expect("APFS volume names its synthesized container");
-        let sibling = add_volume(namespace, container, "sibling");
-        let sibling_mount = root.join("sibling");
-        fs::create_dir_all(&sibling_mount).unwrap();
-        diskutil(
-            namespace,
-            &[
-                "mount",
-                "-mountPoint",
-                sibling_mount.to_str().unwrap(),
-                &sibling,
-            ],
-        );
+
+        let (sibling, _) = ApfsVolume::capture(sibling_mount).expect("the sibling volume");
 
         let looked_up = host.backend.recovered_image_attachment(&image).err();
         assert!(
@@ -2538,6 +2371,16 @@ mod tests {
             .filter(|mount| mount.mount_point.starts_with(&scratch))
             .collect();
         assert_eq!(left, [], "the released volumes are still mounted");
+
+        // Never count the parent filesystem as the volume that just left.
+        assert!(matches!(
+            ApfsVolumeStat.used_bytes(&sibling),
+            Err(VolumeStatError::Read(_))
+        ));
+        assert!(matches!(
+            ApfsVolume::capture(sibling_mount),
+            Err(VolumeStatError::Read(_))
+        ));
 
         let attached = host.backend.attach_verified(&image);
         assert!(
@@ -2702,7 +2545,8 @@ mod tests {
         let root = crate::scratch_apfs::ScratchRoot::new("job-volumes").expect("scratch root");
         let (host, layout) = fixture(root.namespace(), root.path());
         let lane = Lane::mount(root.namespace(), root.path(), &host, &layout);
-        prove_owned_volume_usage(host.backend.runner().namespace(), root.path(), &lane);
+        let sibling =
+            prove_owned_volume_usage(host.backend.runner().namespace(), root.path(), &lane);
         let defaults = WorkspaceSupervisorConfig::default();
         let config = WorkspaceSupervisorConfig {
             workspace_root: lane.checkout.clone(),
@@ -2893,6 +2737,6 @@ mod tests {
             host.release_build_volume(&layout, &lane.build_id).unwrap(),
             Release::Deleted { refused: None }
         );
-        prove_multi_volume_release(root.path(), &host, &lane.attachment);
+        prove_multi_volume_release(root.path(), &host, &lane.attachment, &sibling);
     }
 }

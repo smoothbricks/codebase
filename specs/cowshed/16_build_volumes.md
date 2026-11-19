@@ -566,16 +566,16 @@ was frozen, though its hash equals the target's: the seed has no row for it. A f
 what the target ran, not only for what last landed in it, so the seed follows the live volume. Refreezing once more at
 the end of the land would not do it: it would capture only output restoration and miss everything the target runs later.
 
-**Behind is one comparison of two modification times.** An image's modification time is the instant of the last write it
-holds: the image driver writes the image file as its volume is written, and a clone keeps its source's modification
-time. Capture fixes the cloned image's clock as the immutable seed freshness mark before the clone's own extent-map
-write. It does not sample a later live-source clock and claim that a cache write after the snapshot was captured.
-Supervised admission remains closed through publication: a direct capture retains its exclusive build hold, and a land
-retains its stopped supervisor socket lease and shared GC hold. A seed is behind when the live volume's image, its
-volume flushed first, was modified after the seed's mark. A fork's own seed keeps its clone's clock, taken before the
-live volume mounts; the mount's own writes can leave it reading behind, and the next fork from that workspace reseeds it
-as any behind seed — no flush on the fork path samples a live clock to pre-pay that. Output restoration and later work
-on an adopted volume reach the seed through the next fork's reseed.
+<a id="smoo/cowshed!n/build-seed-freshness"></a> **Behind is one comparison of two modification times.** An image's
+modification time is the instant of the last write it holds: the image driver writes the image file as its volume is
+written, and a clone keeps its source's modification time. Capture fixes the cloned image's clock as the immutable seed
+freshness mark before the clone's own extent-map write. It does not sample a later live-source clock and claim that a
+cache write after the snapshot was captured. Supervised admission remains closed through publication: a direct capture
+retains its exclusive build hold, and a land retains its stopped supervisor socket lease and shared GC hold. A seed is
+behind when the live volume's image, its volume flushed first, was modified after the seed's mark. A fork's own seed
+keeps its clone's clock, taken before the live volume mounts; the mount's own writes can leave it reading behind, and
+the next fork from that workspace reseeds it as any behind seed — no flush on the fork path samples a live clock to
+pre-pay that. Output restoration and later work on an adopted volume reach the seed through the next fork's reseed.
 
 **A non-mbx reseed excludes the named non-transactional writers, not every open file.** It runs under the target's image
 lock, which every fork of the target holds while it clones the seed, so a reseed never deletes a seed a fork is cloning:
@@ -764,13 +764,14 @@ copy is caught up to (Catch-up); a later qualifying foreground operation can adv
   the store at or above its floor plus margin (05_gateway.md, `STORE_FLOOR_PERCENT` plus `PRESSURE_MARGIN_PERCENT`); a
   catch-up only while the store is at or above that line. Otherwise, or when the free space cannot be read, it stops as
   a land-turn read failure stops it: the copy is removed and the seed is as it was.
-- **It holds for lands.** After its first chunk and every GiB after that, the copy, and a catch-up's writes and its
-  punches of at most 8 MiB alike, ask the gateway whether a land holds or waits for any repository's turn
-  (05_gateway.md, "Land turns"); a land that starts the compaction still holds its own turn. A gate-class job outside a
-  land does not hold it: a class is a nice, not a lock (05_gateway.md, "Classes"). While a land runs, the writer holds
-  where it is, says once on its span what it waits for, and checks again every **15 s**; it says how long it waited when
-  it goes on. If the gateway's answer cannot be read, it stops, and the copy is removed. The seed is left as it was. A
-  gateway that is not running holds no land turn: the turns are its own state.
+- <a id="smoo/cowshed!n/build-seed-compaction-admission"></a>**It holds for lands.** After its first chunk and every GiB
+  after that, the copy, and a catch-up's writes and its punches of at most 8 MiB alike, ask the gateway whether a land
+  holds or waits for any repository's turn (05_gateway.md, "Land turns"); a land that starts the compaction still holds
+  its own turn. A gate-class job outside a land does not hold it: a class is a nice, not a lock (05_gateway.md,
+  "Classes"). While a land runs, the writer holds where it is, says once on its span what it waits for, and checks again
+  every **15 s**; it says how long it waited when it goes on. If the gateway's answer cannot be read, it stops, and the
+  copy is removed. The seed is left as it was. A gateway that is not running holds no land turn: the turns are its own
+  state.
 - **Publication.** Under main's image lock again, main's seed is refreshed once more exactly as a fork of main refreshes
   it, so a write main's live volume took during the copy reaches the seed now rather than at the next fork. The copy is
   published only if the seed it holds is still main's latest. It is registered as a new seed of main at that seed's tree
@@ -942,12 +943,15 @@ as an edit would. An mbx fork inherits the retained paths, as its target's live 
 target's Nx cache and task databases when the capture held the Nx guards: other rebuildable package state starts empty,
 and Cargo restores compiled actions from the host's mbx store. Existing source jobs neither refuse nor stop the capture.
 
-- **Enforced by**: `directory_mbx_fork_clones_the_live_volume_and_mints_no_seed` and its real-APFS twin: two forks of an
-  mbx target with no land between them mint no seed and no volume but their own, and hold the retained state without the
-  rebuildable state or clone-invalid files while the target's job keeps writing.
-- **Nx inheritance enforced by**: `directory_mbx_fork_inherits_quiet_nx_state` and its real-APFS twin: a fork of an mbx
-  target whose task database nothing holds holds the target's cached outputs and task database, and a fork taken while a
-  process holds that database holds neither while the target keeps both.
+- **Enforced by**: `directory_mbx_fork_clones_the_live_volume_and_mints_no_seed`: two forks of an mbx target with no
+  land between them mint no seed and no volume but their own, and hold the retained state without rebuildable state or
+  clone-invalid files while the source job keeps writing.
+  `real_apfs_mbx_fork_clones_warm_state_while_the_live_volume_is_held` proves a mounted image can be cloned while a
+  source job holds it: the kernel snapshot carries the retained bytes and quiet Nx task data, and the original writer
+  stays live without changing the fork.
+- **Nx inheritance enforced by**: `directory_mbx_fork_inherits_quiet_nx_state`: a fork of an mbx target whose task
+  database nothing holds inherits the cached outputs and task database; a fork taken while a process holds that database
+  holds neither while the target keeps both.
 
 ## Reseed: `cowshed reseed <ws>`
 

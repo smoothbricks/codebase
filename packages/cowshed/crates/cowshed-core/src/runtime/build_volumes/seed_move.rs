@@ -256,8 +256,8 @@ fn require_no_newer_write(
     let mark = host
         .build_volume_written(layout, &plan.seed)
         .map_err(storage)?;
-    match live.duration_since(mark) {
-        Ok(behind) if !behind.is_zero() => Err(CowshedError::conflict(
+    match super::newer_write(live, mark) {
+        Some(behind) => Err(CowshedError::conflict(
             format!(
                 "cannot move {} onto seed {}: its build volume {} was written {} ms after the seed's mark, and the move would discard that write",
                 plan.workspace.owner.name,
@@ -267,7 +267,7 @@ fn require_no_newer_write(
             ),
             "the next fork's reseed refreezes the seed from that volume; nothing was replaced",
         )),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 

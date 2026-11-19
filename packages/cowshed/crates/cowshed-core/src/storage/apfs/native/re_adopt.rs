@@ -1205,10 +1205,11 @@ mod tests {
             "publish the seed detached"
         );
         let (seed_mount, _) = host.mount_build_volume(&layout, &seed).unwrap();
-        let mut expected = state.with_seed_retention(&retention);
-        expected.mbx = Some(mbx.clone());
-        assert_eq!(BuildVolumeState::read(&seed_mount).unwrap(), expected);
-        for path in &expected.paths {
+        let seeded = BuildVolumeState::read(&seed_mount).unwrap();
+        assert_eq!(seeded.paths, retention);
+        assert_eq!(seeded.mbx.as_deref(), Some(mbx.as_path()));
+        assert_eq!(seeded.fingerprint, state.fingerprint);
+        for path in &retention {
             assert_eq!(
                 seed_mount
                     .join(path.volume.as_path())

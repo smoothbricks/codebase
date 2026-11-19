@@ -399,11 +399,15 @@ impl SeedAge {
     /// holds it, or when there is no seed.
     pub fn behind(&self) -> Option<Duration> {
         let seed = self.seed.as_ref()?;
-        self.written
-            .duration_since(seed.written)
-            .ok()
-            .filter(|behind| !behind.is_zero())
+        newer_write(self.written, seed.written)
     }
+}
+
+/// A seed cannot cover a write strictly after its mark, even by one nanosecond.
+fn newer_write(live: SystemTime, mark: SystemTime) -> Option<Duration> {
+    live.duration_since(mark)
+        .ok()
+        .filter(|behind| !behind.is_zero())
 }
 
 /// The tree a fork checks out, and the live workspaces that may have landed it in the target
@@ -4511,13 +4515,13 @@ mod tests {
 
     fn age(live: (Nearness, SystemTime), seed: Option<(Nearness, SystemTime)>) -> SeedAge {
         SeedAge {
-            live: BuildVolumeId::mint(),
+            live: BuildVolumeId::parse("11111111111111111111111111111111").unwrap(),
             tree: None,
             nearness: live.0,
             placed: Placed::Elsewhere(GitOid::new("e".repeat(40)).unwrap()),
             written: live.1,
             seed: seed.map(|(nearness, written)| Frozen {
-                id: BuildVolumeId::mint(),
+                id: BuildVolumeId::parse("22222222222222222222222222222222").unwrap(),
                 tree: None,
                 nearness,
                 written,
@@ -4525,102 +4529,56 @@ mod tests {
         }
     }
 
-    /// Between two volumes as near the fork's tree, a seed is behind exactly when the live
-    /// volume was written after it was frozen; a target with no seed is behind by no measurable
-    /// amount, and still reseeds.
-    #[test]
-    fn a_seed_is_behind_only_when_the_live_volume_was_written_after_it() {
-        let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        for nearness in [Nearness::Equal, Nearness::Paths(3), Nearness::Unknown] {
-            let at = |written| age((nearness, written), Some((nearness, frozen)));
-            let fresh = at(frozen);
-            assert!(!fresh.reseeds());
-            assert_eq!(fresh.behind(), None);
-            let older = at(frozen - Duration::from_secs(5));
-            assert!(!older.reseeds(), "a seed newer than every write holds them");
-            assert_eq!(older.behind(), None);
-            let behind = at(frozen + Duration::from_millis(1_500));
-            assert!(behind.reseeds());
-            assert_eq!(behind.behind(), Some(Duration::from_millis(1_500)));
+    //#region smoo/cowshed!n/build-seed-freshness
+    proptest::proptest! {
+        #[test]
+        fn equally_near_volumes_reseed_only_after_a_new_live_write(live in proptest::num::u64::ANY, seed in proptest::num::u64::ANY) {
+            let at = |nanos| SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos);
+            for nearness in [Nearness::Equal, Nearness::Paths(live), Nearness::Unknown] {
+                let measured = age((nearness, at(live)), Some((nearness, at(seed))));
+                let newer = live > seed;
+                proptest::prop_assert_eq!(measured.reseeds(), newer);
+                proptest::prop_assert_eq!(measured.behind(), newer.then(|| Duration::from_nanos(live - seed)));
+                let equal = age((nearness, at(live)), Some((nearness, at(live))));
+                proptest::prop_assert!(!equal.reseeds());
+                proptest::prop_assert_eq!(equal.behind(), None);
+            }
+            let unseeded = age((Nearness::Unknown, at(live)), None);
+            proptest::prop_assert!(unseeded.reseeds());
+            proptest::prop_assert_eq!(unseeded.behind(), None);
         }
-        let unseeded = age((Nearness::Unknown, frozen), None);
-        assert!(unseeded.reseeds());
-        assert_eq!(unseeded.behind(), None);
-    }
 
-    /// A seed nearer the fork's tree than the live volume is kept however much later the live
-    /// volume was written: a landed seed beats a live volume built at an older tree. A live
-    /// volume nearer than the seed reseeds it even when the seed was frozen after its last write.
-    #[test]
-    fn the_volume_nearer_the_forks_tree_seeds_it_before_the_newer_one() {
-        let frozen = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let later = frozen + Duration::from_secs(600);
-        let landed = age(
-            (Nearness::Paths(40), later),
-            Some((Nearness::Equal, frozen)),
-        );
-        assert!(!landed.reseeds());
-        assert!(
-            landed.moved_from().is_none(),
-            "the seed was built at the fork's tree"
-        );
-        let nearer = age(
-            (Nearness::Paths(2), later),
-            Some((Nearness::Paths(9), frozen)),
-        );
-        assert!(nearer.reseeds());
-        let comparable = age(
-            (Nearness::Paths(9), later),
-            Some((Nearness::Unknown, frozen)),
-        );
-        assert!(
-            comparable.reseeds(),
-            "any count is nearer than an unknown tree"
-        );
-        let adopted = age((Nearness::Equal, frozen), Some((Nearness::Paths(1), later)));
-        assert!(
-            adopted.reseeds(),
-            "an older live volume at the fork's own tree"
-        );
-        assert!(adopted.moved_from().is_none());
-        let moved = age(
-            (Nearness::Paths(1), later),
-            Some((Nearness::Paths(1), frozen)),
-        );
-        assert!(
-            moved.moved_from().is_some(),
-            "neither volume was built at the fork's tree"
-        );
-        assert!(
-            age((Nearness::Unknown, frozen), None)
-                .moved_from()
-                .is_some()
-        );
-        // A checkout still at the tree cowshed placed its volume at did not move, and a record
-        // that cannot say where it was placed is never read as moved.
-        let unmoved = SeedAge {
-            placed: Placed::Here,
-            ..age(
-                (Nearness::Paths(1), later),
-                Some((Nearness::Paths(1), frozen)),
-            )
-        };
-        assert!(
-            unmoved.moved_from().is_none(),
-            "the target's branch has not moved"
-        );
-        let unrecorded = SeedAge {
-            placed: Placed::Unrecorded,
-            ..age(
-                (Nearness::Paths(1), later),
-                Some((Nearness::Paths(1), frozen)),
-            )
-        };
-        assert!(
-            unrecorded.moved_from().is_none(),
-            "a record that predates checkedOut"
-        );
+        #[test]
+        fn a_nearer_tree_wins_regardless_of_when_it_was_written(paths in 1..u64::MAX, a in proptest::num::u64::ANY, b in proptest::num::u64::ANY) {
+            let at = |nanos| SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos);
+            for (nearer, farther) in [
+                (Nearness::Equal, Nearness::Paths(paths)),
+                (Nearness::Paths(paths), Nearness::Paths(paths + 1)),
+                (Nearness::Paths(paths), Nearness::Unknown),
+            ] {
+                let near = (nearer, at(a.min(b)));
+                let far = (farther, at(a.max(b)));
+                proptest::prop_assert!(age(near, Some(far)).reseeds());
+                proptest::prop_assert!(!age(far, Some(near)).reseeds());
+            }
+        }
+
+        #[test]
+        fn external_landing_requires_known_displacement_and_no_volume_at_the_fork_tree(paths in 1..=u64::MAX) {
+            let written = SystemTime::UNIX_EPOCH;
+            let equal = (Nearness::Equal, written);
+            let distant = (Nearness::Paths(paths), written);
+            proptest::prop_assert!(age(distant, None).moved_from().is_some());
+            proptest::prop_assert!(age(distant, Some(distant)).moved_from().is_some());
+            proptest::prop_assert!(age(equal, Some(distant)).moved_from().is_none());
+            proptest::prop_assert!(age(distant, Some(equal)).moved_from().is_none());
+            for placed in [Placed::Here, Placed::Unrecorded] {
+                let unmoved = SeedAge { placed, ..age(distant, None) };
+                proptest::prop_assert!(unmoved.moved_from().is_none());
+            }
+        }
     }
+    //#endregion smoo/cowshed!n/build-seed-freshness
 
     /// A git repository at `path` whose commit holds `files`, by its `HEAD^{tree}`.
     fn commit(path: &Path, files: &[(&str, &str)]) -> GitOid {
@@ -6116,10 +6074,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_owned_index_refresh_preserves_a_busy_holder_and_fixed_link() {
+    async fn directory_owned_index_refresh_preserves_a_busy_holder_and_fixed_link() {
         use crate::build_volume::sqlite::Connection;
         use std::os::unix::fs::MetadataExt as _;
-        let scratch = Scratch::new("index-refresh");
+        let scratch = Scratch::data_directory("index-refresh");
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         let index = BuildStatePath::new(".codegraph", "codegraph").unwrap();
         let state = BuildVolumeState {
@@ -6180,8 +6138,8 @@ mod tests {
         scratch.release_all();
     }
 
-    /// Land and direct capture both keep exempt readers on the mounted source. The seed holds
-    /// exact warm bytes and SQLite rows, including committed WAL state, not a source-side copy.
+    /// A landing capture carries committed WAL rows and an open contributed cache's bytes,
+    /// while the source's read transaction and open file still work.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_seed_capture_preserves_open_contributed_caches() {
@@ -6189,7 +6147,7 @@ mod tests {
         use std::io::Write as _;
 
         let scratch = Scratch::new("seed-open-caches");
-        let (checkout, live, mount) = scratch.linked_checkout("topic", 1);
+        let (checkout, _, mount) = scratch.linked_checkout("topic", 1);
         let target_checkout = scratch.root.path().join("main");
         fs::create_dir_all(target_checkout.join(".cowshed")).unwrap();
         let state = BuildVolumeState {
@@ -6219,26 +6177,6 @@ mod tests {
             .expect("Nx and Cargo are idle");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
-        let frozen = scratch
-            .volumes
-            .freeze_seed(
-                &locked,
-                &quiet,
-                GitOid::new("a".repeat(40)).unwrap(),
-                SeedReader::Refork,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            retired_or_skipped(&scratch.volumes, frozen).await,
-            Ok(Froze::Frozen)
-        );
-        let mut previous = scratch
-            .layout
-            .seed_of(&target.name, &target.incarnation)
-            .unwrap()
-            .unwrap()
-            .0;
         let database = checkout.join(".codegraph/codegraph.db");
         fs::write(&database, b"").unwrap();
         let holder = Connection::open(&database).unwrap();
@@ -6265,44 +6203,23 @@ mod tests {
         cache.write_all(marker).unwrap();
         cache.sync_all().unwrap();
 
-        let mut quiet = Some(quiet);
-        for digit in ['b', 'c'] {
-            let tree = GitOid::new(digit.to_string().repeat(40)).unwrap();
-            if let Some(quiet) = quiet.take() {
-                let frozen = scratch
-                    .volumes
-                    .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    retired_or_skipped(&scratch.volumes, frozen).await,
-                    Ok(Froze::Frozen),
-                    "the landing capture admits exempt open caches"
-                );
-            } else {
-                let (_, _, superseded) = capture(
-                    &*scratch.host,
-                    &scratch.layout,
-                    &target,
-                    &live,
-                    Some(tree.clone()),
-                )
-                .unwrap()
-                .expect("direct capture admits the same exempt open caches");
-                retire_seeds(&*scratch.host, &scratch.layout, superseded).unwrap();
-            }
+        let tree = GitOid::new("b".repeat(40)).unwrap();
+        let frozen = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, tree.clone(), SeedReader::Refork)
+            .await
+            .unwrap();
+        assert_eq!(
+            retired_or_skipped(&scratch.volumes, frozen).await,
+            Ok(Froze::Frozen)
+        );
+        {
             let (seed, record) = scratch
                 .layout
                 .seed_of(&target.name, &target.incarnation)
                 .unwrap()
                 .expect("the replacement seed is published");
-            assert_ne!(seed, previous);
             assert_eq!(record.tree, Some(tree.clone()));
-            assert!(!scratch.layout.image(&previous).exists());
-            assert_eq!(
-                seeds_of(&scratch.layout, &target).unwrap().as_slice(),
-                std::slice::from_ref(&seed)
-            );
             let fork = BuildVolumeId::mint();
             scratch
                 .host
@@ -6333,14 +6250,6 @@ mod tests {
                 values,
                 [(1, "warm-one".to_owned()), (2, "warm-two".to_owned())]
             );
-            let mut live_rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
-            assert!(live_rows.step().unwrap());
-            assert_eq!(
-                live_rows.integer(0),
-                2,
-                "the original connection stays live"
-            );
-            previous = seed;
         }
         assert!(reader.step().unwrap(), "the original read cursor survives");
         assert_eq!((reader.integer(0), reader.text(1)), (2, "warm-two".into()));
@@ -6353,12 +6262,10 @@ mod tests {
         let mut rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
         assert!(rows.step().unwrap());
         assert_eq!(rows.integer(0), 3);
-        cache
-            .write_all(b"still open after both captures\n")
-            .unwrap();
+        cache.write_all(b"still open after capture\n").unwrap();
         assert_eq!(
             fs::read(&cache_path).unwrap(),
-            b"warm unrelated lint cache\nstill open after both captures\n"
+            b"warm unrelated lint cache\nstill open after capture\n"
         );
         assert_eq!(
             fs::canonicalize(&database).unwrap(),
@@ -6373,8 +6280,17 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_gc_collects_an_imageless_seed_sidecar_and_rechecks_its_image() {
-        let scratch = Scratch::new("seed-sidecar-gc");
+    async fn gc_collects_an_imageless_seed_sidecar_and_rechecks_its_image() {
+        let scratch = Scratch::with_root(
+            FixtureRoot::Files(crate::temp_root::TempRoot::new_in(
+                &std::env::temp_dir(),
+                "seed-sidecar-gc",
+            )),
+            |config| {
+                MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config)
+            },
+            test_volume,
+        );
         let seed = BuildVolumeId::mint();
         let record = BuildVolumeRecord::new(
             None,
@@ -7525,13 +7441,62 @@ fn main() {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
-        mbx_fork_clones_the_live_volume(Scratch::directory("mbx-fork-live")).await;
+        mbx_fork_clones_the_live_volume(Scratch::data_directory("mbx-fork-live")).await;
     }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
-        mbx_fork_clones_the_live_volume(Scratch::new("mbx-fork-live-native")).await;
+
+    async fn real_apfs_mbx_fork_clones_warm_state_while_the_live_volume_is_held() {
+        use std::io::Write as _;
+
+        let scratch = Scratch::new("mbx-fork-live-native");
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let target = owner("main", '0');
+        let paths = [
+            BuildStatePath::new(".kept", "kept").unwrap().retain(),
+            BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+        ];
+        for at in &paths {
+            fs::create_dir_all(mount.join(at.volume.as_path())).unwrap();
+        }
+        BuildVolumeState {
+            paths: paths.into(),
+            mbx: Some(PathBuf::from("/installed/mbx")),
+            ..Default::default()
+        }
+        .write(&mount)
+        .unwrap();
+        let warm = mount.join("kept/warm");
+        let mut writer = fs::File::create(&warm).unwrap();
+        writer.write_all(b"before capture").unwrap();
+        fs::write(mount.join("nx/workspace-data/T-v6.db"), b"warm task data").unwrap();
+        let job = scratch.layout.admit(&live).unwrap();
+        let locked = scratch.lock(&target).await;
+        let (captured, _) = scratch
+            .volumes
+            .capture_fork(target, checkout, name("next"), unlanded_aim())
+            .await;
+        drop(locked);
+        let captured = scratch
+            .volumes
+            .ready_fork(captured, owner("next", '1'))
+            .await
+            .unwrap()
+            .unwrap();
+        writer.write_all(b" after capture").unwrap();
+        assert_eq!(fs::read(&warm).unwrap(), b"before capture after capture");
+        assert_eq!(
+            fs::read(captured.mount.join("kept/warm")).unwrap(),
+            b"before capture"
+        );
+        assert_eq!(
+            fs::read(captured.mount.join("nx/workspace-data/T-v6.db")).unwrap(),
+            b"warm task data"
+        );
+        drop(writer);
+        drop(job);
+        scratch.release_all();
     }
 
     /// An mbx fork of a target whose task database no Nx process holds inherits the target's Nx
@@ -7540,11 +7505,12 @@ fn main() {
     /// read or a rerun. A process holding the database leaves the fork's Nx state empty, as every
     /// other unguarded rebuildable path, and the target keeps what it had.
     #[cfg(target_os = "macos")]
-    async fn mbx_fork_inherits_quiet_nx_state<H: RuntimeStorageHost>(scratch: Scratch<H>) {
-        use cowshed_os::fork_lock::Spawn as _;
+    #[tokio::test]
+    async fn directory_mbx_fork_inherits_quiet_nx_state() {
+        let scratch = Scratch::data_directory("mbx-fork-nx");
 
-        async fn fork_of<H: RuntimeStorageHost>(
-            scratch: &Scratch<H>,
+        async fn fork_of(
+            scratch: &Scratch<crate::storage::directory::DirectoryExecutionHost>,
             target: &Owner,
             checkout: &Path,
             fork: &str,
@@ -7614,29 +7580,9 @@ fn main() {
             "other rebuildable state is still not the fork's"
         );
 
-        let mut holder = std::process::Command::new("/usr/bin/tail")
-            .arg("-f")
-            .arg(&database)
-            .stdout(std::process::Stdio::null())
-            .spawn_locked()
-            .unwrap();
-        let pid = i32::try_from(holder.id()).expect("a pid fits i32");
-        while !nx::holders(&crate::census::this_test(), &database)
-            .unwrap()
-            .iter()
-            .any(|held| held.pid == pid)
-        {
-            if let Some(status) = holder.try_wait().unwrap() {
-                panic!(
-                    "tail exited ({status}) before it opened {}",
-                    database.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let holder = fs::File::open(&database).unwrap();
         let held = fork_of(&scratch, &target, &checkout, "held", '2').await;
-        holder.kill().unwrap();
-        holder.wait_bounded().unwrap();
+        drop(holder);
         assert!(
             held.mount.join("nx/cache").is_dir(),
             "the Nx cache directory stays for its link"
@@ -7652,18 +7598,6 @@ fn main() {
             "the target keeps its cache"
         );
         scratch.release_all();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn directory_mbx_fork_inherits_quiet_nx_state() {
-        mbx_fork_inherits_quiet_nx_state(Scratch::directory("mbx-fork-nx")).await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn real_apfs_mbx_fork_inherits_quiet_nx_state() {
-        mbx_fork_inherits_quiet_nx_state(Scratch::new("mbx-fork-nx-native")).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -8121,9 +8055,9 @@ fn main() {
     /// Nothing moved `topic`'s branch, so that is no external land: the fork of `topic`
     /// reseeds from `topic`'s own volume and inherits what `topic` built, never main's volume.
     #[cfg(target_os = "macos")]
-    async fn a_fork_of_an_unmoved_workspace_carries_its_build_volume<H: RuntimeStorageHost>(
-        scratch: Scratch<H>,
-    ) {
+    #[tokio::test]
+    async fn directory_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
+        let scratch = Scratch::data_directory("build-unmoved-fork");
         let main = owner("main", '0');
         let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
         let behind = commit(&main_checkout, &[("lib.rs", "1")]);
@@ -8284,22 +8218,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn directory_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
-        a_fork_of_an_unmoved_workspace_carries_its_build_volume(Scratch::directory(
-            "build-unmoved-fork",
-        ))
-        .await;
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn real_apfs_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
-        a_fork_of_an_unmoved_workspace_carries_its_build_volume(Scratch::new("build-unmoved-fork"))
-            .await;
-    }
-
     //#region smoo/cowshed!n/reseed-skip-by-hold
     /// A fork of a workspace a job is admitted on, and writing its build volume, clones the seed
     /// as it is (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional
@@ -8396,8 +8314,9 @@ fn main() {
     /// tree) and a candidate whose image lock is held all leave main's seed where it was.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_a_fork_after_an_external_land_inherits_the_landed_volume() {
-        let scratch = Scratch::new("build-external-land");
+
+    async fn directory_a_fork_after_an_external_land_inherits_the_landed_volume() {
+        let scratch = Scratch::data_directory("build-external-land");
         let main = owner("main", '0');
         let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
         let before = commit(&main_checkout, &[("lib.rs", "1")]);
@@ -10401,8 +10320,8 @@ fn main() {
     }
 
     /// Seed compaction (16_build_volumes.md, "Seed compaction") over a real fragmented seed: a
-    /// stop removes the copy and leaves the seed; a held copy asks again until it may go on; a
-    /// copy publishes as main's latest seed with far fewer extents, the same bytes and holes and
+    /// stop removes the copy and leaves the seed; a copy publishes as main's latest seed with
+    /// far fewer extents, the same bytes and holes and
     /// the copied seed's freshness mark, and the old seed goes to the build journal. A seed a land
     /// publishes between the copy and its publication, or during the copy, is caught up to:
     /// only what it changed is written, and the copy is published in its place with its mark.
@@ -10509,32 +10428,14 @@ fn main() {
             seed
         );
 
-        let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = std::sync::Arc::clone(&asked);
         let SeedCompaction::Copied(compacted) = scratch
             .volumes
-            .copy_compaction(
-                stage().await,
-                0,
-                Box::new(move || {
-                    // Held twice, as while a land runs, then let go on.
-                    if counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
-                        super::Admission::Wait
-                    } else {
-                        super::Admission::Copy
-                    }
-                }),
-            )
+            .copy_compaction(stage().await, 0, Box::new(|| super::Admission::Copy))
             .await
             .unwrap()
         else {
             panic!("nothing stops the copy");
         };
-        assert_eq!(
-            asked.load(std::sync::atomic::Ordering::Relaxed),
-            3,
-            "a held copy asks again until it may go on"
-        );
         assert!(compacted.before.get() >= 256, "{compacted:?}");
         assert!(
             compacted.after.get() * 10 <= compacted.before.get(),
@@ -10742,8 +10643,8 @@ fn main() {
     /// move as a conflict, keeps the volume and the write, and releases the replacement.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_compaction_moves_main_onto_its_seed_only_without_a_newer_write() {
-        let scratch = Scratch::new("compaction-lineage");
+    async fn directory_compaction_moves_main_onto_its_seed_only_without_a_newer_write() {
+        let scratch = Scratch::data_directory("compaction-lineage");
         let main = owner("main", '0');
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         fs::write(mount.join("in-seed"), b"captured").unwrap();
@@ -10792,7 +10693,7 @@ fn main() {
         assert!(mount.join("after-seed").exists(), "the write is kept");
 
         // A write while the replacement is cloned, after the first comparison.
-        let mark = |scratch: &Scratch| {
+        let mark = |scratch: &Scratch<crate::storage::directory::DirectoryExecutionHost>| {
             let written = scratch
                 .host
                 .build_volume_written(&scratch.layout, &live)

@@ -499,33 +499,15 @@ mod macos {
 
         #[tokio::test]
         async fn real_apfs_forget_refuses_a_busy_image_then_preserves_it_detached() {
-            use cowshed_apfs::{ApfsBackend, CommandRequest, MountAccess};
+            use cowshed_apfs::{ApfsBackend, MountAccess};
+            use std::os::unix::fs::MetadataExt as _;
             let root = crate::scratch_apfs::ScratchRoot::new("pr").unwrap();
             let repo = RepoId::parse("acme/forget-native").unwrap();
             let (storage, project) = recorded(root.path(), root.namespace(), &repo);
             let runner = SystemCommandRunner::new(storage.namespace());
             let image = project.join("main.dmg");
-            let count = || {
-                let output = runner
-                    .run(
-                        &CommandRequest::new(
-                            "/usr/sbin/ioclasscount",
-                            [
-                                "AppleDiskImageDevice",
-                                "DIDeviceIOUserClient",
-                                "AppleAPFSVolume",
-                                "IOMedia",
-                            ],
-                        ),
-                        "count image classes",
-                    )
-                    .unwrap()
-                    .output;
-                assert!(output.succeeded(), "{output:?}");
-                String::from_utf8(output.stdout).unwrap()
-            };
-            cowshed_os::eprintln!("forget-native before: {}", count().trim());
             crate::blank_image::blank_image(root.namespace(), &image);
+            let image_inode = fs::metadata(&image).unwrap().ino();
             let mount = root.path().join("mnt");
             fs::create_dir(&mount).unwrap();
             let backend = MacOsApfsBackend::new(runner);
@@ -559,7 +541,13 @@ mod macos {
             let report = forget_project(storage.clone(), repo.clone()).await.unwrap();
             assert!(!project.exists());
             assert_eq!(report.images, 1);
-            assert!(report.archive.join("main.dmg").is_file());
+            let retained = fs::metadata(report.archive.join("main.dmg")).unwrap();
+            assert!(retained.is_file());
+            assert_eq!(
+                retained.ino(),
+                image_inode,
+                "forget archives the original backing file"
+            );
             assert_eq!(
                 fs::read(report.archive.join("repository.json")).unwrap(),
                 b"retained corrupt binding"
@@ -567,7 +555,6 @@ mod macos {
             assert!(!runner.attached_disk_images().unwrap().iter().any(
                 |entry| matches!(&entry.source, DiskImageSource::File(path) if path == &image || path.starts_with(&report.archive))
             ));
-            cowshed_os::eprintln!("forget-native after: {}", count().trim());
         }
     }
 }
