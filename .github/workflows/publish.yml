@@ -575,7 +575,8 @@ jobs:
             "https://releases.nixos.org/nix/nix-2.34.7/nix-2.34.7-$system.tar.xz" --output "$payload"
           printf '%s  %s\n' "$checksum" "$payload" | shasum -a 256 -c -
           tar -xJf "$payload" -C "$nix_root"
-          printf 'experimental-features = nix-command flakes\naccept-flake-config = true\n' > "$nix_root/nix.conf"
+          # Cachix configures this disposable CI user's cache through the multi-user daemon.
+          printf 'experimental-features = nix-command flakes\naccept-flake-config = true\ntrusted-users = root %s\n' "$(id -un)" > "$nix_root/nix.conf"
           "$nix_root/nix-2.34.7-$system/install" --daemon --yes --no-channel-add \
             --nix-extra-conf-file "$nix_root/nix.conf" 2>&1 | tee "$PROBE_ROOT/evidence/nix-install.log"
           /usr/bin/dscl . -read /Groups/nixbld > "$PROBE_ROOT/evidence/nix-build-group.txt"
@@ -612,6 +613,19 @@ jobs:
           printf '%s\n' "$stable_bin" >> "$GITHUB_PATH"
           printf 'COWSHED_BUN_PROFILE_BIN=%s\n' "$stable_bin" >> "$GITHUB_ENV"
           printf '%s\n' "$stable_bin" > "$PROBE_ROOT/evidence/bun-profile-bin.txt"
+
+      - name: Install locked direnv in a native-discoverable host profile
+        run: |
+          set -euo pipefail
+          # Native capability discovery ignores ambient PATH and searches host profiles.
+          direnv_bin="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$COWSHED_BUN_PROFILE_BIN/direnv")"
+          direnv_store="$(dirname "$(dirname "$direnv_bin")")"
+          host_profile="$HOME/.local/state/nix/profile"
+          mkdir -p "$(dirname "$host_profile")"
+          nix profile add --profile "$host_profile" "$direnv_store"
+          cmp "$direnv_bin" "$host_profile/bin/direnv"
+          "$host_profile/bin/direnv" version | tee "$PROBE_ROOT/evidence/direnv-version.txt"
+          printf '%s\n' "$direnv_store" > "$PROBE_ROOT/evidence/direnv-store.txt"
 
       - name: Install published Cowshed 0.5.2 with its dependencies
         run: |
@@ -699,8 +713,9 @@ jobs:
           test -z "$checkout_status"
           git -C "$main_path" rev-parse HEAD 'HEAD^{tree}' > "$PROBE_ROOT/evidence/adopted-source.txt"
           test -x "$COWSHED_BUN_PROFILE_BIN/bun"
+          # Gateway start can reload projects; check adopted main only after its health wait.
+          "$COWSHED_NATIVE" --json gateway start | tee "$PROBE_ROOT/evidence/gateway-adopted.json"
           "$COWSHED_NATIVE" --project "$main_path" --json doctor | tee "$PROBE_ROOT/evidence/doctor-adopted.json"
-          "$COWSHED_NATIVE" --json gateway status | tee "$PROBE_ROOT/evidence/gateway-adopted.json"
           printf 'Published Cowshed setup, gateway health, and pinned main adoption passed.\n' \
             > "$PROBE_ROOT/evidence/readiness.txt"
 
