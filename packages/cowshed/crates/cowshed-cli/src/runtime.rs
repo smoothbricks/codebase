@@ -2055,6 +2055,14 @@ where
                     )
                     .map_err(output_error)?;
             }
+            if let Some(parent) = &result.missing_fork_parent {
+                output
+                    .guidance(&format!(
+                        "{} used {} because its recorded fork parent {parent} no longer exists",
+                        result.workspace, result.target,
+                    ))
+                    .map_err(output_error)?;
+            }
             if let Some(mtimes) = &result.source_mtimes {
                 output
                     .guidance(&format!(

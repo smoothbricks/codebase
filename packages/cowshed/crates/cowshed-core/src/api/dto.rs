@@ -3573,6 +3573,9 @@ pub struct NxStateClearResult {
 pub struct ReseedResult {
     pub workspace: WorkspaceName,
     pub target: WorkspaceName,
+    /// The recorded non-main fork parent whose canonical image was absent, if main was used instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_fork_parent: Option<WorkspaceName>,
     pub cloned_from: String,
     pub previous_volume: String,
     pub previous_bytes: u64,

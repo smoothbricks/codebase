@@ -1663,6 +1663,7 @@ const READERS: Readers<ReaderName> = {
     fields: [
       ['workspace', 'LEAF'],
       ['target', 'LEAF'],
+      ['missingForkParent', 'LEAF'],
       ['clonedFrom', 'LEAF'],
       ['previousVolume', 'LEAF'],
       ['previousBytes', 'LEAF'],

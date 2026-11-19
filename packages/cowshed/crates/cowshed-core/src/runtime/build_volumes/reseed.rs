@@ -28,9 +28,8 @@ use cowshed_apfs::store_lock::LockMode;
 /// The timing scope of a reseed's steps: not `reseed`, which names the fork's seed refresh.
 const SCOPE: &str = "workspace-reseed";
 
-/// What a reseed of `workspace` reads: its target (the workspace it was forked from and lands
-/// into), where the target's checkout and image lock are, and the workspace's paths the mtime pass
-/// compares against the target's checkout.
+/// The selected target, its checkout and its image lock, and the workspace's paths the mtime
+/// pass compares against the target's checkout (16_build_volumes.md, "Reseed").
 #[derive(Debug)]
 pub(crate) struct ReseedPlan {
     pub workspace: ReplacedWorkspace,

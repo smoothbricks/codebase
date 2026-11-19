@@ -860,6 +860,7 @@ static REPOSITORY_BINDING: Reader = Reader::Record(&[
 static RESEED_RESULT: Reader = Reader::Record(&[
     ("workspace", &LEAF),
     ("target", &LEAF),
+    ("missingForkParent", &LEAF),
     ("clonedFrom", &LEAF),
     ("previousVolume", &LEAF),
     ("previousBytes", &LEAF),

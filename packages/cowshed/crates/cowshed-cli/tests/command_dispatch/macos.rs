@@ -6397,6 +6397,87 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     fixture.stop_gateway().await;
 }
 
+//#region smoo/cowshed!n/workspace-reseed
+#[tokio::test(flavor = "multi_thread")]
+async fn real_apfs_reseed_uses_main_only_after_its_recorded_parent_is_gone() {
+    let mut fixture = Fixture::with(Project::Declared);
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let layout = build_volumes(&fixture);
+    new_workspace(&mut service, "lane").await;
+    let main_volume = linked_volume(&layout, &fixture.checkout);
+    succeed(&mut service, ["fork", "lane", "unit"]).await;
+    let unit = service
+        .path("unit", false)
+        .await
+        .expect("unit is mounted")
+        .mount;
+    let original_volume = linked_volume(&layout, &unit);
+    fs::write(unit.join("tracked"), b"staged source\n").expect("edit the unit");
+    git(&unit, &["add", "tracked"]);
+    fs::write(unit.join("tracked"), b"dirty source\n").expect("edit the unit again");
+    fs::write(unit.join("untracked"), b"untracked source\n").expect("write an untracked file");
+    let source_state = || {
+        (
+            git_stdout(&unit, &["rev-parse", "HEAD"]),
+            git_stdout(&unit, &["symbolic-ref", "HEAD"]),
+            git_stdout(&unit, &["ls-files", "--stage"]),
+            git_stdout(&unit, &["status", "--porcelain=v1"]),
+            fs::read(unit.join("tracked")).expect("read the dirty file"),
+            fs::read(unit.join("untracked")).expect("read the untracked file"),
+        )
+    };
+    let source_before = source_state();
+
+    let (stdout, stderr) = succeed(&mut service, ["--json", "reseed", "unit"]).await;
+    let envelope: JsonEnvelope<cowshed_core::api::dto::ReseedResult> =
+        serde_json::from_slice(&stdout).expect("decode the reseed result");
+    let report = envelope.result().expect("the reseed succeeded");
+    assert_eq!(report.target.as_str(), "lane");
+    assert!(report.missing_fork_parent.is_none(), "{report:?}");
+    assert!(!stderr.contains("recorded fork parent"), "{stderr}");
+    let lane_seed = BuildVolumeId::parse(&report.cloned_from).expect("a seed id");
+    assert!(matches!(
+        layout.read_record(&lane_seed).expect("read the captured seed's record").role,
+        BuildVolumeRole::Seed { target, .. } if target.as_str() == "lane"
+    ));
+    let from_lane = linked_volume(&layout, &unit);
+    assert_ne!(from_lane, original_volume);
+
+    succeed(&mut service, ["detach", "lane"]).await;
+    let (refused, _, _) = run(&mut service, ["reseed", "unit"]).await;
+    let refused = refused.expect_err("a detached parent is not a missing parent");
+    assert_eq!(refused.code, ErrorCode::Conflict, "{refused}");
+    assert!(
+        refused.message.contains("target lane is detached"),
+        "{refused}"
+    );
+    assert_eq!(linked_volume(&layout, &unit), from_lane);
+
+    succeed(&mut service, ["rm", "lane", "--force"]).await;
+    let main_seed = seeds_of_main(&layout).pop().expect("main has a seed").0;
+    let (stdout, stderr) = succeed(&mut service, ["reseed", "unit"]).await;
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(
+        stdout.contains(&format!("reseeded unit from main's {main_seed}")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("recorded fork parent lane no longer exists"),
+        "{stderr}"
+    );
+    let from_main = linked_volume(&layout, &unit);
+    assert_ne!(from_main, from_lane);
+    assert_eq!(linked_volume(&layout, &fixture.checkout), main_volume);
+    assert_eq!(source_state(), source_before);
+    let (main, _, _) = run(&mut service, ["reseed", "main"]).await;
+    assert_eq!(
+        main.expect_err("main cannot reseed itself").code,
+        ErrorCode::Usage
+    );
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+//#endregion smoo/cowshed!n/workspace-reseed
 /// Re-adoption (02_workspaces.md, "Re-adoption: space reclamation"): RAW replacement and
 /// interrupted RAW recovery are independent real walks over fresh projects.
 /// - `adopt --re-adopt` replaces an adopted main with a fresh RAW image under a new incarnation,

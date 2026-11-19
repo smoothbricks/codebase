@@ -2986,6 +2986,10 @@ export type RepositoryBinding = {
 export type ReseedResult = {
   readonly workspace: WorkspaceName;
   readonly target: WorkspaceName;
+  /**
+   * The recorded non-main fork parent whose canonical image was absent, if main was used instead.
+   */
+  readonly missingForkParent?: WorkspaceName;
   readonly clonedFrom: string;
   readonly previousVolume: string;
   readonly previousBytes: number & tags.Type<'uint64'>;

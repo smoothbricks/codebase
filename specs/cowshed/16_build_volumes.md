@@ -954,10 +954,11 @@ and Cargo restores compiled actions from the host's mbx store. Existing source j
 <a id="smoo/cowshed!n/workspace-reseed"></a>A reseed replaces a workspace's live build volume with what a fork of its
 target would be given now, and leaves its source image, branch, HEAD, index, uncommitted and untracked files and grants
 as they are. It is not the fork's reseed (Fork step 2), which refreezes a target's seed from the target's live volume:
-this one leaves every seed of the target as it is. The workspace's **target** is the one its record names it forked from
-(`forkedFrom`), main for a workspace created from main: main for an ordinary workspace, its lane base for a unit of a
-lane. Main is forked from nothing and is refused by name: only seed compaction moves its live volume, onto its own
-compacted seed (Seed compaction), and `cowshed defrag main` rewrites it in place.
+this one leaves every seed of the target as it is. The **seed target** is the recorded fork parent (`forkedFrom`), main
+for a workspace created from main. If the recorded non-main parent's canonical image is absent, main supplies the build
+state without changing the recorded parent or the landing target. A parent that still exists but is detached, busy,
+unpublished or unreadable does not select main. Main itself is refused by name: only seed compaction moves its live
+volume, onto its own compacted seed (Seed compaction), and `cowshed defrag main` rewrites it in place.
 
 It takes the Fork's own steps and seed compaction's swap, no path of its own:
 
@@ -1001,9 +1002,10 @@ is judged as the target judges it. Comparing against the target's checkout as it
 safe: every later write to it only moves its times forward past the seed's units. The paths are enumerated before step
 1, since enumerating declared outputs runs a job.
 
-The answer is one line with the old and the new BuildVolumeId and the bytes the old one's image had allocated (shared
-with its clones, so not all of it is freed); `--json` answers `ReseedResult`. Each step is a `workspace-reseed` timing
-span (`capture`, `ready`, `source-mtimes`, `seal`, `release`).
+The answer names the selected target, the old and new BuildVolumeIds and the old image's allocated bytes (shared with
+its clones, so not all freed). If main supplied the build state because the recorded parent was absent, stderr explains
+why; `--json` answers `ReseedResult` with `target: "main"` and `missingForkParent` naming the absent parent. Each step
+is a `workspace-reseed` timing span (`capture`, `ready`, `source-mtimes`, `seal`, `release`).
 
 - **Enforced by**: `directory_a_reseed_replaces_only_the_build_volume_with_a_clone_of_the_targets_seed`: the checkout
   links a new volume holding the seed's marker and not the old volume's, recorded at the seed's tree, with HEAD, branch,
@@ -1013,6 +1015,9 @@ span (`capture`, `ready`, `source-mtimes`, `seal`, `release`).
   succeeds; `directory_a_reseed_leaves_no_unit_newer_than_a_workspace_input_of_other_bytes`: a workspace edit made
   before the target's build and a target rewrite the workspace lacks, both older than the seed's unit, are newer than it
   after the reseed, and an input of equal bytes takes the target's time.
+- **Target selection enforced by**: `real_apfs_reseed_uses_main_only_after_its_recorded_parent_is_gone`: a dirty unit
+  uses its lane's seed while the lane is present, refuses while the lane is detached, and uses main's seed after
+  retirement, reporting the reason without changing the unit's source bytes or Git state.
 
 ## Land: `cowshed land`
 

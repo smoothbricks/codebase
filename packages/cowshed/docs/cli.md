@@ -1023,8 +1023,10 @@ returns.
 ### `cowshed reseed <name>`
 
 Replace a workspace's build volume, and nothing else, with what a fork of its target would be given now: a clone of the
-target's latest seed. The target is the workspace it was forked from and lands into (main for an ordinary shed, its lane
-base for a unit of a lane). Its source image, branch, HEAD, uncommitted and untracked files and grants stay as they are.
+target's latest seed. The target is the recorded fork parent (main for an ordinary shed, its lane base for a unit of a
+lane). If the recorded non-main parent no longer exists, reseed uses main and says why; a detached or unpublished parent
+does not qualify. This does not change where the workspace lands. Its source image, branch, HEAD, index, uncommitted and
+untracked files and grants stay as they are.
 
 ```
 $ cowshed reseed raven

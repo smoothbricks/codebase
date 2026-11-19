@@ -16123,9 +16123,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     /// Delete the Nx state on the workspace's build volume (16_build_volumes.md, "Clearing a
     /// Replace the workspace's build volume with what a fork of its target is given now
-    /// (16_build_volumes.md, "Reseed"). Its target is the workspace its record says it was forked
-    /// from (`forkedFrom`), main for one created from main. It refuses running work instead of
-    /// stopping it; nothing of the target is stopped.
+    /// (16_build_volumes.md, "Reseed"). The recorded fork parent is the target unless its
+    /// canonical image is gone, in which case main supplies only the build state. It refuses
+    /// running work instead of stopping it; nothing of the target is stopped.
     async fn reseed(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::ReseedResult> {
         self.validate_binding().await?;
         if workspace.is_main() {
@@ -16150,23 +16150,41 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 format!("cowshed attach {workspace}, then retry `cowshed reseed {workspace}`"),
             ));
         }
-        let target = current
+        let fork_parent = current
             .metadata
             .info_snapshot
             .forked_from
             .clone()
             .unwrap_or_else(WorkspaceName::main);
-        let target_current = match self.current(&target).await {
-            Ok(target_current) => target_current,
-            Err(error) if error.code == ErrorCode::NotFound => {
-                return Err(CowshedError::not_found(
-                    format!(
-                        "{workspace} was forked from {target}, which no longer exists, so it has no seed to reseed from"
-                    ),
-                    format!(
-                        "fork a new workspace from what {workspace} lands into and carry its work over"
-                    ),
-                ));
+        let (target, target_current, missing_fork_parent) = match self.current(&fork_parent).await {
+            Ok(parent) => (fork_parent, parent, None),
+            Err(error) if !fork_parent.is_main() && error.code == ErrorCode::NotFound => {
+                // A published lookup also excludes pending images. Only absence of the
+                // canonical image, not an unpublished or unreadable parent, permits main.
+                let host = self.substrate.shared_host();
+                let repo = self.descriptor.repo_id.clone();
+                let name = fork_parent.clone();
+                let record = crate::storage::lifecycle::dispatch_blocking(move || {
+                    host.canonical_metadata(&repo, &name)
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("reseed parent metadata task failed: {error}"))
+                })?
+                .map_err(native_storage_error)?;
+                if record.is_some() {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "{workspace}'s fork parent {fork_parent} has a canonical image but no published workspace snapshot"
+                        ),
+                        format!(
+                            "cowshed doctor --json; retry `cowshed reseed {workspace}` once {fork_parent} is published"
+                        ),
+                    ));
+                }
+                let main = WorkspaceName::main();
+                let main_current = self.current(&main).await?;
+                (main, main_current, Some(fork_parent))
             }
             Err(error) => return Err(error),
         };
@@ -16217,6 +16235,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Ok(crate::api::dto::ReseedResult {
             workspace,
             target,
+            missing_fork_parent,
             cloned_from: reseeded.cloned_from.to_string(),
             previous_volume: reseeded.previous.to_string(),
             previous_bytes: reseeded.previous_bytes,
