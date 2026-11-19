@@ -64,7 +64,6 @@ mod temp_parent;
 
 #[path = "support/calm_pressure.rs"]
 mod calm_pressure;
-#[cfg(target_os = "macos")]
 #[path = "support/napi_client.rs"]
 mod napi_client;
 #[cfg(target_os = "macos")]
@@ -108,6 +107,7 @@ enum Event {
     /// A write's offset in the job's input, and its bytes.
     StdinWrite(u64, Vec<u8>),
     StdinClose,
+    JobDetach(JobId),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -282,6 +282,7 @@ struct FakeHost {
     /// When set, a stdin write is taken only once this is notified, as a job that has not yet
     /// read its input holds the write that would overfill it.
     stdin_gate: Option<Arc<Notify>>,
+    stdin_write_answers: std::collections::VecDeque<Result<()>>,
     /// When set, a create holds inside its clone step until this is notified.
     create_gate: Option<Arc<Notify>>,
     /// When set, a gc's answer waits for this, as its held-bundle sweep would.
@@ -336,6 +337,7 @@ impl FakeHost {
             supervisors: std::collections::BTreeMap::new(),
             lanes: cowshed_core::resident::JobLanes::default(),
             stdin_gate: None,
+            stdin_write_answers: std::collections::VecDeque::new(),
             create_gate: None,
             gc_gate: None,
             bundles: Vec::new(),
@@ -1245,13 +1247,14 @@ impl ProjectRuntimeHost for FakeHost {
             }));
         }
         let gate = self.stdin_gate.clone();
+        let answer = self.stdin_write_answers.pop_front().unwrap_or(Ok(()));
         let events = self.events.clone();
         Ok(Box::pin(async move {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
             events.send(Event::StdinWrite(offset, bytes.to_vec())).ok();
-            Ok(())
+            answer
         }))
     }
 
@@ -1357,9 +1360,11 @@ impl ProjectRuntimeHost for FakeHost {
         &mut self,
         workspace: WorkspaceName,
         incarnation: WorkspaceIncarnation,
-        _job: JobId,
+        job: JobId,
     ) -> Result<()> {
-        self.require_incarnation(&workspace, &incarnation)
+        self.require_incarnation(&workspace, &incarnation)?;
+        self.events.send(Event::JobDetach(job)).ok();
+        Ok(())
     }
 
     async fn read_log(
@@ -5725,6 +5730,87 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
             Event::StdinClose,
             Event::StdinClose,
         ]
+    );
+}
+
+/// The JS ABI only: the real controller delivers the Node view's bytes to the typed host and
+/// carries that host's refusal back, through the generated addon and the public error wrapper.
+#[tokio::test]
+#[ignore = "requires the built addon and JS package from cowshed:napi-test"]
+async fn napi_attachment_projects_the_input_view() {
+    let root = TempRoot::new_in(&std::env::temp_dir(), "cowshed-napi-attachment");
+    let (events, mut observed) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, events, false, Vec::new());
+    host.held_job = Some(HeldJob::new(incarnation(1)));
+    host.stdin_write_answers = [
+        Ok(()),
+        Err(CowshedError::stdin_refusal(
+            cowshed_core::StdinRefusal::Ended { cursor: 3 },
+            "stdin has ended",
+            "do not write after EOF",
+        )),
+    ]
+    .into();
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    adopt(&router, &repo).await;
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let connection = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator(repo),
+        router,
+    ));
+    let (): () = napi_client::answer(
+        client.into(),
+        &root.join("checkout"),
+        r#"
+        const { default: assert } = await import('node:assert/strict');
+        const worker = await coordinator.worker('main');
+        const job = await worker.exec({ argv: ['attachment-oracle'], stdin: { kind: 'open' } });
+        const attachment = await job.attach();
+        const backing = new Uint8Array([0x11, 0, 0xff, 0x80, 0x22]);
+        const writing = attachment.write(backing.subarray(1, 4));
+        backing.fill(0x33);
+        await writing;
+        await attachment.end();
+        await assert.rejects(attachment.write(Uint8Array.of(0x44)), (error) => {
+            assert.ok(error instanceof CowshedError);
+            assert.equal(error.code, 'conflict');
+            assert.ok(error.hint.length > 0);
+            assert.deepEqual(error.stdin, { reason: 'ended', cursor: 3 });
+            assert.ok(error.cause instanceof Error);
+            assert.deepEqual(error.cause.stdin, error.stdin);
+            assert.equal(error.retry, undefined);
+            assert.equal(error.cause.retry, undefined);
+            return true;
+        });
+        await attachment.detach();
+        return null;
+        "#,
+    )
+    .await;
+    connection
+        .await
+        .expect("join the controller")
+        .expect("serve the connection");
+    let attachment_calls: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::StdinWrite(..) | Event::StdinClose | Event::JobDetach(_)
+            )
+        })
+        .collect();
+    assert_eq!(
+        attachment_calls,
+        [
+            Event::StdinWrite(0, vec![0, 0xff, 0x80]),
+            Event::StdinClose,
+            Event::StdinWrite(3, vec![0x44]),
+            Event::JobDetach(JobId::new(1).expect("the fixture job id")),
+        ],
+        "the generated methods reached the typed host with exactly the supplied view",
     );
 }
 

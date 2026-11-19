@@ -189,10 +189,12 @@ No mounts, no root, no network — pure functions with table-driven cases:
   bytes, streams, and normalized workspace-relative file paths without shell interpolation. Pure path cases reject
   absolute paths, traversal, symlinks, non-regular files, and ambiguous source combinations; job/trace DTO goldens carry
   kind, delivered bytes, completion, and optional relative path but never inline contents.
-- **Built-addon scripted Node peers**: `cowshed:napi-test` keeps exact stdout, exit-code and empty-stderr oracles for
-  binary delivery, typed refusals, attachment detach and job progress. Scripted Node fixtures retain `NO_COLOR` and the
-  rest of their inherited environment but omit `FORCE_COLOR`, so contradictory outer Nx color settings cannot inject
-  Node warnings. Nested Node peers inherit that coherent input; warnings are never filtered or suppressed.
+- **Built-addon Node peers**: `cowshed:napi-test` keeps stdout, exit-code and stderr oracles for native projections such
+  as log downloads and job progress. The attachment peer uses the real controller over an inherited socket and a typed
+  project-runtime fixture: `write`, `end` and `detach` reach their host operations, a write snapshots just its
+  `Uint8Array` view, and a typed stdin refusal survives both the native `Error` and the public `CowshedError`. The core
+  and supervisor tests own delivery, EOF ordering and process lifetime. Node fixtures omit `FORCE_COLOR` but retain
+  `NO_COLOR`, so contradictory outer Nx color settings cannot inject a warning; stderr is not filtered.
 - **Shell AST redirect eligibility**: use the production parser against a matrix proving only a simple literal
   in-workspace `>`/`2>` can classify as `Redirect`, and then only when a trusted supervisor-controlled actual writable
   descriptor interposes with exact combined-quota accounting. Append, fd duplication, pipelines, lists, subshells,

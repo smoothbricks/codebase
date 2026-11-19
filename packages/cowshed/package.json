@@ -708,13 +708,22 @@
           "default",
           "^dependencyDefault",
           "{workspaceRoot}/patches/**/*",
-          "!{workspaceRoot}/patches/**/*.md"
+          "!{workspaceRoot}/patches/**/*.md",
+          "{workspaceRoot}/.config/nextest.toml",
+          "{workspaceRoot}/packages/nx-plugin/nextest.toml",
+          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts"
         ],
         "dependsOn": [
           "...",
           "cargo-test",
           "napi-debug",
           "tsc-js",
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-build"
+          },
           "^build"
         ],
         "options": {
@@ -723,6 +732,8 @@
           "env": {
             "NAPI_DEBUG_ADDON": "1"
           },
+          "fixtureCommand": "bun ../scripts/host-controller-test.ts --ensure-binaries",
+          "fixtureTimeoutMs": 3600000,
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }

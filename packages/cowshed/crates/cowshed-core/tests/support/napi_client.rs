@@ -28,7 +28,7 @@ pub async fn answer<T: serde::de::DeserializeOwned>(
     ))
     .expect("a module URL");
     let client = format!(
-        "import {{ connectCoordinator, coordinatorEndpoint }} from {module};\n\
+        "import {{ CowshedError, connectCoordinator, coordinatorEndpoint }} from {module};\n\
          const coordinator = await connectCoordinator(coordinatorEndpoint(3), {checkout});\n\
          const document = JSON.stringify(await (async () => {{\n{body}\n}})());\n\
          await new Promise((resolve, reject) => process.stdout.write(document + '\\n', error => error ? reject(error) : resolve()));\n\
@@ -52,7 +52,6 @@ pub async fn answer<T: serde::de::DeserializeOwned>(
             ])
             .arg(node)
             .arg(client)
-            .env_remove("NAPI_DEBUG_ADDON")
             .env_remove("FORCE_COLOR")
             .current_dir(&package)
             .stdin(std::process::Stdio::from(endpoint))
