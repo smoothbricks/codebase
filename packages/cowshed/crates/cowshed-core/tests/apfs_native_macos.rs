@@ -231,9 +231,12 @@ mod kernel_unmount {
             owned_id
         );
         for _ in 0..2 {
-            backend
-                .unmount_verified(&owned, DetachIntent::WhenIdle)
-                .expect("fresh kernel namespace unmount and repeated no-effect unmount");
+            assert_eq!(
+                backend
+                    .unmount_within_grace(&owned)
+                    .expect("fresh kernel namespace unmount and repeated no-effect unmount"),
+                cowshed_apfs::Unmounted::Unforced,
+            );
             assert!(kernel_mount_at(&mount).is_none());
             let retained = backend
                 .existing_attachment(&image)

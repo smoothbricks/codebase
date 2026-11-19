@@ -2321,42 +2321,10 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     assert!(host.reclaim_image(image.image()).is_err());
 }
 
-/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: still
-/// mounted, and still the actor's to detach once the holder lets go. The holder is real — a file
-/// open on the volume — so the refusal is the native unmount's resource-busy result. The separate
-/// real held-file release test proves escalation after the unchanged grace; this test proves that
-/// `WhenIdle` leaves the volume and its contents to their owner.
+/// A real open file makes the actor's idle detach refuse as Busy without losing custody.
+/// With the same holder still open, explicit Release forces the mount off after grace.
 #[test]
-fn real_apfs_dissented_when_idle_detach_leaves_the_mount_to_the_actor() {
-    let fixture = RealFixture::new("detach-dissent");
-    let image = fixture.layout().main_image().expect("image");
-    fixture.published_image(image.image());
-    let host = fixture.host();
-    let workspace = workspace();
-    let mount = fixture.main_mount();
-    std::fs::create_dir_all(&mount).expect("mount point");
-    let attachment = host.attach_verified(image.image()).expect("attachment");
-    host.mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        .expect("mount");
-    host.retain_mounted(&workspace, attachment).expect("retain");
-    let holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
-
-    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
-        .expect_err("a dissented WhenIdle detach must fail");
-    assert!(
-        kernel_mount_at(&mount).is_some(),
-        "WhenIdle never forces: the volume stays mounted"
-    );
-
-    drop(holder);
-    host.detach_mounted(&workspace, DetachIntent::Release)
-        .expect("the workspace is still the actor's to detach");
-    assert!(kernel_mount_at(&mount).is_none());
-    assert!(!attached(image.image()));
-}
-
-#[test]
-fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
+fn real_apfs_idle_detach_refuses_and_release_detaches_the_same_open_volume() {
     let fixture = RealFixture::new("native-release-held-file");
     let image = fixture.layout().main_image().expect("image");
     fixture.published_image(image.image());
@@ -2370,6 +2338,29 @@ fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
     host.retain_mounted(&workspace, attachment).expect("retain");
     let mut holder = std::fs::File::create(mount.join("held")).expect("hold the volume");
 
+    let before = kernel_mount_at(&mount).expect("retained mounted volume");
+    let refusal = host
+        .detach_mounted(&workspace, DetachIntent::WhenIdle)
+        .expect_err("the actor cannot idle-detach while the file is open");
+    assert!(
+        matches!(
+            &refusal,
+            ApfsStorageError::Apfs(ApfsError::UnmountFailed {
+                source: cowshed_apfs::mounts::NativeUnmountError::Busy(_),
+                ..
+            })
+        ),
+        "unexpected refusal: {refusal}"
+    );
+    assert_eq!(
+        kernel_mount_at(&mount),
+        Some(before),
+        "WhenIdle leaves the original mount to its actor"
+    );
+    assert!(
+        attached(image.image()),
+        "WhenIdle leaves the backing image attached"
+    );
     host.detach_mounted(&workspace, DetachIntent::Release)
         .expect("release waits its grace, then forces the owned volume");
     assert!(kernel_mount_at(&mount).is_none());
@@ -2385,10 +2376,6 @@ fn real_apfs_release_detaches_a_volume_held_open_after_its_grace() {
 /// nowhere are typed skips, the empty mountpoint is refused as no store image, and nothing the
 /// host owns changes name. The mounted workspace is renamed through its device, under the raw pin
 /// the rename takes, and the kernel then reports the label.
-/// Before mounting, detached capture refuses the attached image without publishing a copy.
-/// Once mounted, a holder can dissent to WhenIdle without surrendering the actor's attachment;
-/// with the holder still open, Release waits its grace, then forces the owned volume off: the
-/// mount and attachment are gone and the held file can no longer write.
 #[test]
 fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let fixture = RealFixture::new("native-rename-pinned");
@@ -2427,24 +2414,6 @@ fn real_apfs_rename_names_the_pinned_device_and_skips_what_is_not_mounted() {
     let mount = fixture.main_mount();
     std::fs::create_dir_all(&mount).expect("mount point");
     let attachment = host.attach_verified(image.image()).expect("attachment");
-    let destination = fixture.root().join("destination.dmg");
-    assert!(
-        attached(image.image()),
-        "the kernel has the source image attached"
-    );
-    let cloned = host
-        .backend()
-        .prepare_clone(image.image(), &destination, ImageCapture::Detached)
-        .and_then(|admitted| admitted.clone_image());
-    assert!(
-        cloned.is_err(),
-        "an attached image must never be captured detached: {cloned:?}"
-    );
-    assert!(!destination.exists(), "no unsealed image may be published");
-    assert!(
-        attached(image.image()),
-        "refusal leaves the source attachment alone"
-    );
     assert_eq!(
         host.label_image_volume(image.image(), label)
             .expect("an attached, unmounted volume is a typed skip"),
@@ -3008,46 +2977,6 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
     assert!(host.list(&repo()).is_err());
 }
 
-#[test]
-fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
-    let fixture = RealFixture::new("unmount-twice");
-    let image = fixture.root().join("owned.dmg");
-    let mount = fixture.root().join("mounted");
-    fixture.blank_image(&image);
-    let backend = MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace()));
-    let (attachment, _) = backend
-        .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
-        .expect("mount owned image");
-    assert_eq!(
-        kernel_mount_at(&mount).expect("owned mount").source_device,
-        attachment.volume_device()
-    );
-    for _ in 0..2 {
-        assert_eq!(
-            backend
-                .unmount_within_grace(&attachment)
-                .expect("idempotent exact-volume unmount"),
-            cowshed_apfs::Unmounted::Unforced
-        );
-        assert!(
-            kernel_mount_at(&mount).is_none(),
-            "the owned namespace must be released"
-        );
-        let still = backend
-            .existing_attachment(&image)
-            .expect("current owned mapping")
-            .expect("namespace unmount must not detach the image");
-        assert_eq!(
-            (still.whole_device(), still.volume_device()),
-            (attachment.whole_device(), attachment.volume_device())
-        );
-    }
-    backend
-        .detach(&attachment, DetachIntent::Release)
-        .expect("release owned image");
-    assert!(!attached(&image));
-}
-
 /// Independent exact-whole image-driver detach attempts release after cowshed has checked its
 /// identity and before fsck opens diskN. A pathname check alone loses that race;
 /// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
@@ -3386,13 +3315,13 @@ fn hold_twice(fixture: &RealFixture, image: &Path) {
 /// lookup refused it as `matching image has multiple inventory entries`, the sweep included.
 /// Cowshed never adds a third attachment to such a path. The next mint releases every attachment
 /// of both leftovers through `release_image`, the release every image detach ends in,
-/// removes their files, and mints the template, which it leaves detached under its name.
+/// removes their files, and publishes a detached template that the workspace mounts a clone of.
 #[test]
-fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
+fn real_apfs_a_workspace_mint_releases_every_leftover_template_attachment() {
     let fixture = RealFixture::new("template-leftovers");
-    let store = fixture.root().join("store");
+    let store = fixture.root();
     let capacity = blank_image::CAPACITY;
-    let template = blank_template_path(&store, capacity);
+    let template = blank_template_path(store, capacity);
     let reused = template.with_file_name(format!(
         "{}-minting.dmg",
         template
@@ -3410,30 +3339,33 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
         "{refused}"
     );
     assert_eq!(kernel_attachments(&reused).len(), 2);
-    let orphaned = blank_template_staged_stem(&store, capacity).with_extension("dmg");
+    let orphaned = blank_template_staged_stem(store, capacity).with_extension("dmg");
     fixture.blank_image(&orphaned);
     attach_behind_cowshed(&orphaned);
     std::fs::remove_file(&orphaned).expect("remove the attached image's file");
     assert!(attached(&orphaned));
 
-    let minted = blank_template(
-        &MacOsApfsBackend::new(SystemCommandRunner::new(fixture.host_namespace())),
-        &store,
-        &fixture.host_namespace().label_prefix(),
-        capacity,
-        &cowshed_core::held_lock::ImageLockTaker {
-            census: &cowshed_core::census::CensusScope::new(
-                fixture.host_namespace(),
-                Arc::from(store.as_path()),
-            ),
-            holding: &cowshed_core::api::held_lock::LockHolding::store(
-                cowshed_core::api::held_lock::LockOperation::MintTemplate,
-            ),
-        },
-    )
-    .expect("mint over the leftovers");
-
-    assert_eq!(minted, template);
+    let host = fixture.host();
+    let image = fixture
+        .layout()
+        .main_image()
+        .expect("canonical workspace image");
+    std::fs::create_dir_all(image.image().parent().expect("image parent"))
+        .expect("canonical image directory");
+    let mount = fixture.main_mount();
+    let workspace = host
+        .create_attached(capacity, image.image(), &mount)
+        .expect("mint a workspace after releasing the template leftovers");
+    assert_eq!(
+        kernel_mount_at(&mount)
+            .expect("newly minted workspace mount")
+            .source_device,
+        workspace.volume_device(),
+    );
+    assert_eq!(
+        cowshed_apfs::volume_name(&mount).expect("new workspace volume label"),
+        fixture.host_namespace().label_prefix().as_str(),
+    );
     assert!(template.is_file());
     assert!(!attached(&template));
     for leftover in [&reused, &orphaned] {
@@ -3451,6 +3383,9 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
         .filter(|path| path.to_string_lossy().contains("-minting"))
         .collect::<Vec<_>>();
     assert_eq!(staging, Vec::<PathBuf>::new());
+    host.backend()
+        .detach(&workspace, DetachIntent::Release)
+        .expect("release minted workspace");
 }
 
 /// Release the owner's real attachment before cowshed can open its raw volume, then attach a
@@ -4393,14 +4328,10 @@ fn system_mount_source_observes_the_live_root_mount() {
     assert!(mounts.iter().all(|mount| mount.mount_id != 0));
 }
 
-/// One real volume remounted under every combination of the two flags the check reads, each read
-/// back from the kernel: browsing is the user's choice, honoring ownership is not. The ownership-free
-/// combination is the wrong-flags mount the host heals by its mountpoint, so the heal is proven here
-/// on this same volume and marker, once the verification attachment has released its raw pin.
+/// A real browsable mount with owners joins by its marker. On the same volume a mount
+/// ignoring owners refuses that join; healing releases the wrong-flags attachment.
 #[test]
-fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
-    // The pool's one scenario image, attached once for the whole lane run: this test only
-    // mounts its already-attached volume under each flag combination and reads the kernel.
+fn real_apfs_browsable_mount_joins_but_noowners_mount_is_healed() {
     let pool = blank_image::pool_root();
     let layout = StorageLayout::new(&pool, &repo()).expect("pool layout");
     let canonical = layout.main_image().expect("canonical");
@@ -4418,28 +4349,24 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &pool, &mount),
     )
     .expect("native APFS host");
-    let mounted = shared.mount_at(&mount, "nobrowse,owners");
+    let mounted = shared.mount_at(&mount, "owners");
+    let flags = kernel_mount_at(&mount).expect("browsable mount in the kernel");
+    assert!(
+        flags.browse() && flags.owners_honoured(),
+        "actual flags: {flags:?}"
+    );
     host.write_marker(&mount, &workspace(), None, &identity_at(&pool))
         .expect("mount marker");
+    assert!(matches!(
+        host.mounts(&repo())
+            .expect("browsable mount facts")
+            .as_slice(),
+        [MountJoin::Proven(_)]
+    ));
     drop(mounted);
-    for (options, expected_valid) in [
-        ("nobrowse,owners", true),
-        ("nobrowse,noowners", false),
-        ("owners", true),
-    ] {
-        let mounted = shared.mount_at(&mount, options);
-        let joins = host
-            .mounts(&repo())
-            .expect("flags are a per-workspace finding");
-        assert_eq!(
-            matches!(joins.as_slice(), [MountJoin::Proven(_)]),
-            expected_valid,
-            "{options}: {joins:?}"
-        );
-        drop(mounted);
-    }
-
     let _mounted = shared.mount_at(&mount, "noowners");
+    let flags = kernel_mount_at(&mount).expect("ownership-free mount in the kernel");
+    assert!(!flags.owners_honoured(), "actual flags: {flags:?}");
     let joins = host
         .mounts(&repo())
         .expect("flags are a per-workspace finding");

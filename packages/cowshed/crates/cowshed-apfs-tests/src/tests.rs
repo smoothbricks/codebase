@@ -405,57 +405,6 @@ fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
     finish_real_image_test(Ok(()), outer_cleanup);
 }
 
-/// A question about one image is the kernel matching that image's `DiskImageURL` to the file URL
-/// cowshed spells for its path, so the two spellings must agree for every path a store holds:
-/// a store's owner and repository components percent-encode, and a file URL escapes a literal
-/// `%` as it does a space or a `#`. The answer is exactly the whole inventory's entries for the
-/// image, and a path the kernel does not hold has none.
-#[cfg(target_os = "macos")]
-#[test]
-fn real_apfs_one_image_is_matched_by_the_url_its_driver_registered() {
-    let root = ScratchRoot::new("image-url").expect("scratch root");
-    let system = runner(root.namespace());
-    let backend = MacOsApfsBackend::new(system);
-    let image = root.path().join("a b%2F#c").with_extension(IMAGE_EXTENSION);
-    let absent = root.path().join("a b%2F#d").with_extension(IMAGE_EXTENSION);
-    let mount = root.path().join("volume");
-    let _paths = TestPaths(vec![mount.clone()]);
-    let mut cleanup = RealImageCleanup::new(&backend, image.clone());
-    let result = (|| -> Result<(), ApfsError> {
-        crate::blank_image::blank_image(root.namespace(), &image);
-        let attached = cleanup.track(
-            backend
-                .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?
-                .0,
-        );
-        let whole: Vec<_> = system
-            .attached_disk_images()
-            .map_err(ApfsError::KernelInventory)?
-            .into_iter()
-            .filter(|held| held.source == DiskImageSource::File(image.clone()))
-            .collect();
-        assert_eq!(whole.len(), 1, "the image is attached once: {whole:?}");
-        assert_eq!(
-            system
-                .attachments_of(&image)
-                .map_err(ApfsError::KernelInventory)?,
-            whole
-        );
-        assert!(
-            system
-                .attachments_of(&absent)
-                .map_err(ApfsError::KernelInventory)?
-                .is_empty()
-        );
-        let recovered = backend
-            .recovered_image_attachment(&image)?
-            .expect("the attached image is recovered");
-        assert_eq!(recovered.whole_device(), attached.whole_device());
-        Ok(())
-    })();
-    finish_real_image_test(result, cleanup);
-}
-
 #[cfg(target_os = "macos")]
 fn lease_test_image(staged_stem: PathBuf, volume_name: &str) -> CreateImageRequest {
     CreateImageRequest {
@@ -540,10 +489,9 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
     let root = ScratchRoot::new("leases").expect("scratch root");
     let system = runner(root.namespace());
     let backend = MacOsApfsBackend::new(system);
-    let image_a = root
-        .path()
-        .join("lease-held")
-        .with_extension(IMAGE_EXTENSION);
+    // In-kernel inventory uses the literal path; a space, literal %2F and # must survive.
+    let image_a = root.path().join("a b%2F#c").with_extension(IMAGE_EXTENSION);
+    let absent = root.path().join("a b%2F#d").with_extension(IMAGE_EXTENSION);
     let stem_b = root.path().join("lease-free");
     let image_b = stem_b.with_extension(IMAGE_EXTENSION);
     let mount_b = root.path().join("lease-free-mount");
@@ -564,6 +512,29 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
         let attachment = cleanup_a.track(backend.attach_verified(&image_a)?);
         assert!(attachment.whole_device().starts_with("/dev/disk"));
         assert!(attachment.volume_device().starts_with("/dev/disk"));
+        let inventory: Vec<_> = system
+            .attached_disk_images()
+            .map_err(ApfsError::KernelInventory)?
+            .into_iter()
+            .filter(|held| matches!(&held.source, DiskImageSource::File(path) if path == &image_a))
+            .collect();
+        assert_eq!(inventory.len(), 1, "the literal path has one attachment");
+        assert_eq!(
+            system
+                .attachments_of(&image_a)
+                .map_err(ApfsError::KernelInventory)?,
+            inventory
+        );
+        assert!(
+            system
+                .attachments_of(&absent)
+                .map_err(ApfsError::KernelInventory)?
+                .is_empty()
+        );
+        let recovered = backend
+            .recovered_image_attachment(&image_a)?
+            .expect("recover literal image path");
+        assert_eq!(recovered.whole_device(), attachment.whole_device());
         // Before A's lease is held below, since resizing takes it.
         let refused = system
             .grow_image(&image_a, capacity("2g"))
@@ -630,10 +601,10 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
             }
         }
 
+        let (backend, order, mount_b) = (&backend, &order, &mount_b);
         let (detach_started, detach_waiting) = mpsc::channel();
         let (progress, steps) = mpsc::channel();
-        std::thread::scope(|scope| -> Result<(), ApfsError> {
-            let (backend, order, mount_b) = (&backend, &order, &mount_b);
+        std::thread::scope(move |scope| -> Result<(), ApfsError> {
             let detach_a = scope.spawn(move || {
                 detach_started.send(()).expect("the test awaits A's detach");
                 let detached = backend.detach(attachment, DetachIntent::Release);

@@ -629,6 +629,21 @@ pub fn hold_mount(path: &std::path::Path) -> io::Result<HeldMount> {
 mod tests {
     use super::*;
 
+    //#region smoo/cowshed!n/mount-flag-independence
+    proptest::proptest! {
+        #[test]
+        fn workspace_mount_ownership_is_independent_of_other_flags(
+            other_flags in proptest::prelude::any::<u64>(),
+        ) {
+            let mut mount = KernelMountSnapshot::new(1, "/workspace", "/dev/disk1s1", false, true);
+            mount.flags = other_flags & !MNT_IGNORE_OWNERS;
+            proptest::prop_assert!(mount.owners_honoured());
+            mount.flags |= MNT_IGNORE_OWNERS;
+            proptest::prop_assert!(!mount.owners_honoured());
+        }
+    }
+    //#endregion smoo/cowshed!n/mount-flag-independence
+
     #[test]
     fn a_stated_root_has_identity_but_no_native_unmount_authority() {
         let identity = FilesystemId::new([7, 26]);

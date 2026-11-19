@@ -1199,11 +1199,13 @@ refusal; a held RW capture also succeeds unchanged. Restart-derived facts check 
 Workspace grant refusal, workspace grant persistence and project-policy persistence share one adopted CLI fixture,
 retaining both refused and successful restart checks before a real port race and gateway-grant reconciliation. Current
 create/fork refusal, legacy no-artifact recovery, missing-revision refusal/retry and adopt/create/fork port-publication
-checks share one adopted project, retaining every runtime shutdown and scoped recovery opening. An attached source's
-detached-capture refusal precedes its mount and rename checks; registered-host idle-detach dissent precedes its final
-release. Busy resize and defrag run their original refusal oracles on the mounted-growth fixture before its holder is
-released and growth succeeds. The raw-pin witness also checks independent forced release between verification and mount;
-the mount-flag truth table heals its final ownership-free mount by mountpoint. Declared first-touch and warm-fork
+checks share one adopted project, retaining every runtime shutdown and scoped recovery opening. The per-image lease
+witness also checks exact-path recovery and detached capture refusal with its existing attachment. One registered-host
+scenario proves idle-detach dissent before explicit release of the same still-open file. Busy resize and defrag retain
+their refusal oracles on the mounted-growth fixture. The raw-pin witness checks independent forced release between
+verification and mount. <a id="smoo/cowshed!n/mount-flag-independence"></a>Ownership classification is independent of
+all other flags, including visibility; generated flag words prove the law. The real volume proves a browsable mount with
+owners joins by its marker and healing releases the mount that ignores owners. Declared first-touch and warm-fork
 assertions share the build-volume naming/reclamation walk. Push preservation and checked-land refusal/success share the
 plain-Git lifecycle walk, keeping the original Git-reference and no-write refusal oracles. Capacity-only refusal uses
 the existing recording host over a sparse RAW file, and an invalid first-mint capacity uses the pure filesystem store:

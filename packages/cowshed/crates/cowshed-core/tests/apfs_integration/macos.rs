@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
+use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
-    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DiskImageSource, ImageCapture,
-    MacOsApfsBackend, SystemCommandRunner, volume_name,
+    ApfsBackend, AttachedImage, CommandRunner, ImageCapture, MacOsApfsBackend, SystemCommandRunner,
+    volume_name,
 };
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
@@ -523,13 +523,6 @@ struct KillWindow {
 impl KillWindow {
     /// A kill window over a store seeded with the run's blank template.
     fn new(label: &str) -> Result<Self, Box<dyn Error>> {
-        let world = Self::unseeded(label)?;
-        seed(world.namespace, &world.store);
-        Ok(world)
-    }
-
-    /// A kill window over a store with no blank template yet: its first mint makes one.
-    fn unseeded(label: &str) -> Result<Self, Box<dyn Error>> {
         let root = ScratchRoot::new(label)?;
         let store = root.path().join("store");
         let checkout = root.path().join("checkout");
@@ -537,6 +530,7 @@ impl KillWindow {
         fs::create_dir_all(&checkout)?;
         fs::write(checkout.join("tracked"), b"original source\n")?;
         let namespace = root.namespace();
+        seed(namespace, &store);
         let config = ApfsSubstrateConfig::new(HostNamespace::Test(namespace), &store, &checkout)
             .with_capacity(CAPACITY);
         let repo = RepoId::parse(&format!("cowshed/kill-{}", std::process::id()))?;
@@ -753,54 +747,6 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_clone_and_attach() {
 
     assert_eq!(adopted.incarnation(), world.main.incarnation());
     world.assert_adopted().expect("adopted");
-}
-
-/// Killed while minting the store's first blank template, between formatting it and detaching
-/// it: the minter's staging image is still attached when the next adopt comes. That adopt's mint
-/// releases and removes it, mints the template afresh — verified, detached, renamed into place —
-/// and clones main from it.
-#[test]
-fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached() {
-    let world = KillWindow::unseeded("adopt-kill-template").expect("kill window");
-    let backend = world.host().backend();
-    let stem = blank_template_staged_stem(&world.store, CAPACITY);
-    let leftover = stem.with_extension("dmg");
-    fs::create_dir_all(stem.parent().expect("a template has a directory"))
-        .expect("template directory");
-    let request = CreateImageRequest {
-        staged_stem: stem,
-        capacity: CAPACITY,
-        volume_name: HostNamespace::Test(world.namespace).label_prefix(),
-        // SAFETY: `getuid`/`getgid` read this process's credentials and cannot fail.
-        owner_uid: unsafe { libc::getuid() },
-        owner_gid: unsafe { libc::getgid() },
-    };
-    backend
-        .create_blank_image(&request)
-        .expect("the template's blank image");
-    drop(
-        backend
-            .format_attached(&leftover, &request)
-            .expect("formatted and still attached"),
-    );
-
-    world.adopt().expect("adopt mints the template, then main");
-
-    world.assert_adopted().expect("adopted");
-    assert!(blank_template_path(&world.store, CAPACITY).is_file());
-    assert!(!leftover.exists(), "the killed minter's image is removed");
-    assert!(
-        SystemCommandRunner::new(HostNamespace::Test(world.namespace))
-            .attached_disk_images()
-            .expect("kernel disk-image inventory")
-            .iter()
-            .all(|attached| attached.source != DiskImageSource::File(leftover.clone())),
-        "and released"
-    );
-    assert_eq!(
-        volume_name(&world.checkout).expect("main's label"),
-        HostNamespace::Test(world.namespace).label_prefix().as_str()
-    );
 }
 
 /// An interrupted OS attachment can leave an unmounted device. Plant that state by unmounting
