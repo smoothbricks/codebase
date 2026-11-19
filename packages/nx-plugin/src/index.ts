@@ -3010,62 +3010,8 @@ function createNapiTargets(
   // The task that builds the executable recordInputs runs, when this workspace builds it.
   const buildInputsTool = nativeToolDependsOn(nativeTools, 'build-inputs');
   const recordedInputs = [...(cargoInputs ?? []), ...buildInputsToolInputs(nativeTools)];
-  const hasHostPlatformTarget = config.targets.some((triple) => {
-    const convention = NAPI_TARGET_CONVENTIONS[triple];
-    return convention !== undefined && sameNapiPlatform(convention, hostPlatform);
-  });
   const targets: Record<string, TargetConfiguration> = {};
-
-  // The addon the test suite loads. A plain dev build shares target/debug with
-  // cargo-test's dependency graph, so after the tests compile this is nearly
-  // free, where a `--target <triple>` platform build compiles the graph again
-  // under target/<triple>/. The output lives OUTSIDE dist/ because packages
-  // publish `files: ["dist"]` wholesale: an addon the test run wrote under
-  // dist/ would ship in place of the release build. native.ts resolves this
-  // directory only when the napi-test target sets NAPI_DEBUG_ADDON=1, so
-  // production loads never see it.
-  targets['napi-debug'] = {
-    executor: 'nx:run-commands',
-    metadata: CARGO_PRODUCER_METADATA,
-    cache: true,
-    dependsOn: ['^build'],
-    inputs: cargoInputs,
-    outputs: ['{projectRoot}/.cache/native-debug/'],
-    options: {
-      cwd: cargoCwd,
-      command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputDir('.cache/native-debug')}`,
-    },
-  };
-
-  if (!hasHostPlatformTarget) {
-    // The platform target for this host triple is the same compilation, so a
-    // second cargo-napi invocation only buys a duplicate dependency graph
-    // (a plain build and a `--target` build write different target/
-    // subdirectories); native.ts already resolves the identical
-    // platform-suffixed filename from <tree>/<platform-dir> after <tree>/host,
-    // in the one tree its package's source authority selects (.cache/native-dev
-    // in a checkout, dist/native installed).
-    const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(null, profile, runOutputDirectory)}`;
-    const hostOutputs = nativeOutputPaths('host');
-    targets['cargo-napi'] = {
-      executor: 'nx:run-commands',
-      metadata: CARGO_PRODUCER_METADATA,
-      cache: true,
-      dependsOn: ['^build', ...buildInputsTool],
-      inputs: recordedInputs,
-      outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
-      options: {
-        cwd: cargoCwd,
-        command: hostBuild('dev'),
-        outputDir: hostOutputs.dev,
-      },
-      configurations: {
-        [RELEASE_CONFIGURATION]: { command: hostBuild('release'), outputDir: hostOutputs.release },
-      },
-    };
-  }
-
+  const debugDirectory = '.cache/native-debug';
   for (const triple of config.targets) {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
     if (!convention) {
@@ -3073,13 +3019,33 @@ function createNapiTargets(
     }
     const targetName = `napi-${convention.architecture}-${convention.targetFamily}`;
     const outputs = nativeOutputPaths(convention.outputName);
+    const fileName = `${config.binaryName}.${convention.outputName}.node`;
+    if (sameNapiPlatform(convention, hostPlatform)) {
+      const source = `${outputs.dev}/${fileName}`;
+      const destination = `${debugDirectory}/${fileName}`;
+      const staging = `${destination}.partial`;
+      targets['napi-debug'] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        // An empty configuration selects the producer's default instead of inheriting `production` from the run.
+        dependsOn: [{ target: targetName, configuration: '' }],
+        inputs: [
+          { externalDependencies: [] },
+          { dependentTasksOutputFiles: posix.join(projectRoot, source), transitive: false },
+        ],
+        outputs: [`{projectRoot}/${destination}`],
+        options: {
+          cwd: projectRoot,
+          command: `mkdir -p ${debugDirectory} && cp ${source} ${staging} && mv -f ${staging} ${destination}`,
+        },
+      };
+    }
     if (convention.targetFamily === 'linux') {
       // Every host builds a Linux addon the same way: devenv's zig through
       // cargo-zigbuild, glibc pinned by the triple suffix. The napi CLI cannot
       // carry that suffix (it looks for the artifact under
       // target/<triple>.2.17/), so the executor names the `.node` itself.
-      const nodeFile = (directory: string): string =>
-        `{projectRoot}/${directory}/${config.binaryName}.${convention.outputName}.node`;
+      const nodeFile = (directory: string): string => `{projectRoot}/${directory}/${fileName}`;
       targets[targetName] = {
         executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
         metadata: CARGO_PRODUCER_METADATA,
@@ -3120,6 +3086,41 @@ function createNapiTargets(
       },
     };
   }
+
+  if (!targets['napi-debug']) {
+    // No declared platform target serves this host: retain the direct builds for both checkout consumers.
+    targets['napi-debug'] = {
+      executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
+      cache: true,
+      dependsOn: ['^build'],
+      inputs: cargoInputs,
+      outputs: [`{projectRoot}/${debugDirectory}/`],
+      options: {
+        cwd: cargoCwd,
+        command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputDir(debugDirectory)}`,
+      },
+    };
+    const hostBuild = (profile: CargoProfile): string =>
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(null, profile, runOutputDirectory)}`;
+    const hostOutputs = nativeOutputPaths('host');
+    targets['cargo-napi'] = {
+      executor: 'nx:run-commands',
+      metadata: CARGO_PRODUCER_METADATA,
+      cache: true,
+      dependsOn: ['^build', ...buildInputsTool],
+      inputs: recordedInputs,
+      outputs: [`{projectRoot}/${OUTPUT_DIR_OPTION}/`],
+      options: {
+        cwd: cargoCwd,
+        command: hostBuild('dev'),
+        outputDir: hostOutputs.dev,
+      },
+      configurations: {
+        [RELEASE_CONFIGURATION]: { command: hostBuild('release'), outputDir: hostOutputs.release },
+      },
+    };
+  }
   return targets;
 }
 
@@ -3150,11 +3151,8 @@ function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean):
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
-    // Deliberately NOT `build`: the aggregate drags the host-platform binaries
-    // onto the test critical path, and a `--target <triple>` platform build
-    // compiles the whole graph again. tsc-js supplies dist/ts for the suite's
-    // own imports; napi-debug supplies the addon from the graph cargo-test
-    // already built.
+    // Name only what the suite reads, not `build` with its unrelated host binaries.
+    // tsc-js supplies dist/ts; napi-debug supplies the development addon.
     dependsOn: ['cargo-test', 'napi-debug', 'tsc-js', '^build'],
     options: {
       // cwd is src/, not the package root: `bun test <arg>` treats the arg as a

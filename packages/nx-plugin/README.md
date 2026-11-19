@@ -1573,6 +1573,11 @@ A target of a napi package whose run sets `NAPI_DEBUG_ADDON=1`, in its declarati
 dev-profile addon from `napi-debug`'s `.cache/native-debug`: it depends on `napi-debug` and keys
 `{dependentTasksOutputFiles: "**/*.node", transitive: false}`.
 
+<a id="smoo/nx-plugin!n/debug-addon-staging"></a>When the package declares this host's platform addon, `napi-debug`
+copies that producer's development `.node` to `.cache/native-debug` as a separate file. It keys only on the selected
+producer's addon bytes, never on its receipt, declarations or Cargo sources, and never depends on a release build.
+Without a declared host platform addon, `napi-debug` builds its own addon as before.
+
 <a id="smoo/nx-plugin!n/executor-build-edge"></a>A self-hosted workspace that owns this plugin's package also orders
 **every target that runs one of the plugin's executors**, in every project but the plugin, after the plugin's own
 `build`. An executor is a file that build writes (`dist/executors/<name>/executor.js`), so a task that starts before it

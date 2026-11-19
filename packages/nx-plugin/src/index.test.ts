@@ -2782,19 +2782,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // A crate whose project also builds the debug cdylib takes no napi-debug edge: no test binary loads that addon
       // (only a target that sets NAPI_DEBUG_ADDON=1 does, through the package's loader).
       expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, rootBuild]);
-      // The addon build consumes only its dependencies' outputs; it is not
-      // ordered behind the test compile.
-      expect(native['napi-debug']?.dependsOn).toEqual(['^build']);
-      // The addon depends on the package's napi block and the napi CLI's version,
-      // never on the package version or the whole lockfile: a release bumps both
-      // before it builds, and that must not recompile the native code.
-      const napiInputs = native['napi-debug']?.inputs ?? [];
+      // The platform addon build keys on the package's napi block and the napi CLI's version, never on the package
+      // version or the whole lockfile: a release bumps both before it builds, and that must not recompile native code.
+      const napiInputs = native['napi-arm64-macos']?.inputs ?? [];
       expect(napiInputs).toContainEqual({ externalDependencies: ['@napi-rs/cli'] });
       expect(
         napiInputs.some((input) => typeof input === 'object' && 'runtime' in input && input.runtime.includes('.napi')),
       ).toBe(true);
       for (const [name, target] of Object.entries(native)) {
-        if (!name.startsWith('napi-') || target.cache !== true) continue;
+        if (!name.startsWith('napi-') || name === 'napi-debug' || target.cache !== true) continue;
         expect(target.inputs).toContain(CARGO_CLOSURE_INPUT);
         expect(target.inputs).not.toContain('{workspaceRoot}/**/*.rs');
         expect(target.inputs).toEqual(expect.arrayContaining(cargoToolchainInputs()));
@@ -2812,11 +2808,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // compiles with the pinned rustc but never spells `cargo --frozen`, so
       // the sweep that gives every other cargo target its identity skips it.
       expect(napiInputs).toEqual(expect.arrayContaining(cargoToolchainInputs()));
-      expect(native['napi-debug']?.options).toMatchObject({
-        cwd: '.',
-        command:
-          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
-      });
       const platformBuild = (release: string): string =>
         `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/{args.outputDir} && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/{args.outputDir}`;
       expect(native['napi-arm64-macos']?.options).toMatchObject({
@@ -3513,6 +3504,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ...CARGO_PRODUCER_METADATA,
         smooTaskKind: 'build',
       });
+      //#region smoo/nx-plugin!n/debug-addon-staging
+      expect(unservedHostTargets['napi-debug']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        dependsOn: ['^build'],
+        outputs: ['{projectRoot}/.cache/native-debug/'],
+        options: {
+          cwd: 'packages/cowshed',
+          command:
+            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
+        },
+      });
+      //#endregion smoo/nx-plugin!n/debug-addon-staging
       expectNoOverlappingOutputs(workspace.context.workspaceRoot, 'packages/cowshed', unservedHostTargets);
       // A platform no scriptc platform covers has no build-inputs executable for the napi commands to run.
       const unservedFailure = await inferProjectTargets(
@@ -3622,6 +3626,35 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         // `build`: the declared CLI build, and the addon platform target this machine runs.
         expect(inferred['cli-native']?.dependsOn).toEqual([`cli${hostSuffix}`]);
         expect(inferred['napi-native']?.dependsOn).toEqual([`napi${hostSuffix}`]);
+        //#region smoo/nx-plugin!n/debug-addon-staging
+        const producer = `napi${hostSuffix}`;
+        const fileName = hostSuffix === '-x64-linux' ? 'cowshed.linux-x64-gnu.node' : 'cowshed.darwin-arm64.node';
+        const developmentDir = hostSuffix === '-x64-linux' ? 'linux-x64-gnu' : 'darwin-arm64';
+        const source = `packages/cowshed/.cache/native-dev/${developmentDir}/${fileName}`;
+        expect(inferred['napi-debug']).toMatchObject({
+          cache: true,
+          inputs: [{ externalDependencies: [] }, { dependentTasksOutputFiles: source, transitive: false }],
+          outputs: [`{projectRoot}/.cache/native-debug/${fileName}`],
+        });
+        const graph: ProjectGraph = {
+          nodes: { cowshed: { name: 'cowshed', type: 'lib', data: { root: 'packages/cowshed', targets: inferred } } },
+          dependencies: {},
+        };
+        const debug = 'cowshed:napi-debug';
+        const development = `cowshed:${producer}`;
+        const shipping = `${development}:${RELEASE_CONFIGURATION}`;
+        const local = createTaskGraph(graph, {}, ['cowshed'], ['napi-native', 'napi-debug'], undefined, {});
+        expect(findCycles(local)).toBeNull();
+        expect(local.dependencies[debug]?.map((edge) => edge.id)).toEqual([development]);
+        expect(local.dependencies['cowshed:napi-native']?.map((edge) => edge.id)).toEqual([development]);
+        expect(local.tasks[shipping]).toBeUndefined();
+        const mixed = createTaskGraph(graph, {}, ['cowshed'], ['napi-native', 'napi-debug'], RELEASE_CONFIGURATION, {});
+        expect(findCycles(mixed)).toBeNull();
+        expect(mixed.dependencies[debug]?.map((edge) => edge.id)).toEqual([development]);
+        expect(mixed.dependencies[`cowshed:napi-native:${RELEASE_CONFIGURATION}`]?.map((edge) => edge.id)).toEqual([
+          shipping,
+        ]);
+        //#endregion smoo/nx-plugin!n/debug-addon-staging
         expect(inferred.build?.dependsOn).toEqual([
           '^build',
           'cli-native',
@@ -3649,21 +3682,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(linuxArm64Targets['cli-native']).toBeUndefined();
       expect(linuxArm64Targets['napi-native']?.dependsOn).toEqual(['napi-arm64-linux']);
       expect(linuxArm64Targets.build?.dependsOn).toEqual(['^build', 'napi-native', 'tsc-js', 'napi-arm64-linux']);
-      // The test suite runs against the dev-profile addon, never a release
-      // platform build: napi-debug shares target/debug with cargo-test, keeps
-      // the release binaries off the test critical path, and lives outside
-      // dist/ so the wholesale-packaged dist/ tree can never ship it.
-      expect(targets['napi-debug']).toMatchObject({
-        executor: 'nx:run-commands',
-        cache: true,
-        dependsOn: ['^build'],
-        outputs: ['{projectRoot}/.cache/native-debug/'],
-        options: {
-          cwd: 'packages/cowshed',
-          command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
-        },
-      });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       // The per-crate runner is a frozen cargo command, so cargo-fetch is its own precondition beside the workspace test
       // build. It waits for no napi-debug: its tests load no debug addon.
