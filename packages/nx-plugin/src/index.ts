@@ -169,6 +169,13 @@ const WORKSPACE_TSCONFIG_BASE_INPUT = '{workspaceRoot}/tsconfig.base.json';
  */
 const TYPECHECK_COMPILER_ENV = 'SMOO_TYPECHECK_TSC';
 const TYPECHECK_COMPILER_INPUT = { env: TYPECHECK_COMPILER_ENV };
+/**
+ * The named input a project defines as the compiler identity of its inferred `typecheck`: {@link TYPECHECK_COMPILER_INPUT}
+ * where that target runs the native compiler, undefined where it runs ttsc, whose compiler the workspace keys, or where
+ * a declared `typecheck` replaces the inferred command. A workspace `typecheck` default that replaces the inferred
+ * inputs names it to key exactly the compiler its command runs, and defines it empty in `nx.json` for the rest.
+ */
+const TYPECHECK_COMPILER_NAMED_INPUT = 'typecheckCompiler';
 function typecheckCommand(args: string): string {
   return `"\${${TYPECHECK_COMPILER_ENV}:?is unset, enter the devenv shell (devenv.smoo.nix builds the typecheck compiler)}" ${args}`;
 }
@@ -2655,6 +2662,21 @@ async function createProjectTargets(
     }
   }
 
+  // The inferred typecheck's compiler, named only where its command is the one inferred here: a declared typecheck
+  // that runs another command runs something this inference does not know. Nx keeps the inferred command under a
+  // declaration that names the same executor and no command, and replaces it under any other executor, under a
+  // top-level `command` (its run-commands shorthand) or under `options.command`/`options.commands`.
+  const declaredTypecheck = declaredTargets.typecheck;
+  const declaredTypecheckOptions = isRecord(declaredTypecheck) ? declaredTypecheck.options : undefined;
+  const typecheckCompilerInputs =
+    targets.typecheck === undefined ||
+    (isRecord(declaredTypecheck) &&
+      ((declaredTypecheck.executor !== undefined && declaredTypecheck.executor !== targets.typecheck.executor) ||
+        declaredTypecheck.command !== undefined)) ||
+    (isRecord(declaredTypecheckOptions) &&
+      (declaredTypecheckOptions.command !== undefined || declaredTypecheckOptions.commands !== undefined))
+      ? []
+      : typecheck.inputs;
   // A declared target REPLACES the inferred input list, pin included, so a
   // repository that hand-writes `inputs` for a cargo target silently loses its
   // toolchain identity. Name the identity once here so such a declaration can
@@ -2666,6 +2688,7 @@ async function createProjectTargets(
   // task in the repository to serve projects that can never reference it.
   const namedInputs: Record<string, NonNullable<TargetConfiguration['inputs']>> = {
     [BUN_LOCK_SCOPE_NAMED_INPUT]: [bunLockInput(projectRoot)],
+    ...(typecheckCompilerInputs.length === 0 ? {} : { [TYPECHECK_COMPILER_NAMED_INPUT]: [...typecheckCompilerInputs] }),
     ...(versionless === null
       ? {}
       : {

@@ -1363,6 +1363,11 @@ Concrete targets come from concrete files:
   and never compiles one, and the inference guesses no workspace target. A declaration of another shape refuses the
   inference by its manifest path. Its compiler is the installed ttsc, which `bun.lock` and the patches in the check
   inputs already key. A project that depends only on typia stays on the pinned compiler.
+- A project whose inferred `typecheck` runs the native compiler defines the named input `typecheckCompiler` as
+  `[{ "env": "SMOO_TYPECHECK_TSC" }]`; a ttsc-routed project, and one whose declared `typecheck` runs another command
+  (another executor, a top-level `command`, or `options.command`/`options.commands`), defines none. A workspace whose
+  `targetDefaults.typecheck` replaces the inferred inputs names it to key the compiler the command runs, and defines the
+  fallback in `nx.json` empty, for the projects that define none: `{ "namedInputs": { "typecheckCompiler": [] } }`.
 - A direct dependency whose ttsc plugin lowers by environment variables declares them in its manifest,
   `"smoo": { "compileEnv": ["NODE_ENV"] }` (`@smoothbricks/lmao-ttsc` does: it compiles trace statements away unless
   `NODE_ENV` is `test`). The transformed JavaScript is then a function of those variables, so `tsc-js` and every scriptc

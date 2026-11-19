@@ -464,11 +464,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       await workspace.write('packages/example/node_modules/plain/package.json', '{"name":"plain"}\n');
 
-      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+      const project = await inferProject(workspace, 'packages/example/package.json');
+      const targets = project?.targets ?? {};
 
       expect(targets.typecheck?.options).toMatchObject({ command: 'ttsc -p tsconfig.lib.json --noEmit' });
       expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'tools:plugins']);
       expect(targets.typecheck?.inputs).not.toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+      // ttsc is the workspace's to key: the project names no native compiler identity.
+      expect(project?.namedInputs).not.toHaveProperty('typecheckCompiler');
       expect(targets['typecheck-tests']?.options).toMatchObject({ command: 'ttsc -p tsconfig.test.json --noEmit' });
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck', 'tools:plugins']);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
@@ -476,6 +479,38 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
     } finally {
       await workspace.cleanup();
+    }
+  });
+
+  it('names the native typecheck compiler only where the command Nx runs is the inferred one', async () => {
+    const cases: readonly (readonly [declared: Record<string, unknown>, named: boolean])[] = [
+      [{ inputs: ['...', '{projectRoot}/extra.json'] }, true],
+      [{ executor: 'nx:run-commands' }, true],
+      [{ executor: 'nx:noop' }, false],
+      [{ command: 'tsc -p tsconfig.json --noEmit' }, false],
+      [{ options: { command: 'tsc -p tsconfig.json --noEmit' } }, false],
+      [{ options: { commands: ['tsc -p tsconfig.json --noEmit'] } }, false],
+    ];
+    for (const [declared, named] of cases) {
+      const workspace = await createWorkspace();
+      try {
+        await workspace.write(
+          'packages/example/package.json',
+          `${JSON.stringify({ name: 'example', nx: { targets: { typecheck: declared } } })}\n`,
+        );
+        await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+
+        const project = await inferProject(workspace, 'packages/example/package.json');
+
+        // The inferred target always names the compiler; only a declaration that keeps its command keeps that key.
+        expect(project?.targets?.typecheck?.inputs).toContainEqual({ env: 'SMOO_TYPECHECK_TSC' });
+        expect([declared, project?.namedInputs?.typecheckCompiler]).toEqual([
+          declared,
+          named ? [{ env: 'SMOO_TYPECHECK_TSC' }] : undefined,
+        ]);
+      } finally {
+        await workspace.cleanup();
+      }
     }
   });
 
@@ -916,6 +951,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(project?.namedInputs).toEqual({
         // Every package.json project names its own lock scope for workspace-wide inputs.
         bunLockScope: [{ externalDependencies: ['bun-lock:packages/example'] }],
+        // Its typecheck runs the native compiler, so it names that compiler for a workspace default that replaces inputs.
+        typecheckCompiler: [{ env: 'SMOO_TYPECHECK_TSC' }],
         versionlessProduction: [
           'production',
           '!{projectRoot}/package.json',
