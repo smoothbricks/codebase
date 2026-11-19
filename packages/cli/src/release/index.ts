@@ -6,11 +6,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
 import {
+  type ExpandedNxTargetRuns,
+  expandNxTargetRuns,
   type GithubApiProcessResult,
   type GithubApiProcessRunner,
   githubCiApplyOutputs,
   githubCiNxRunMany,
   NodeGithubApiProcessRunner,
+  type NxRunManyOptions,
 } from '../github-ci/index.js';
 import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
@@ -172,14 +175,17 @@ export interface ReleaseRepairPendingOptions {
   ref?: string;
 }
 
-export interface ReleasePlatformOutputsOptions {
+interface ReleasePlatformSelection {
   bump: string;
   /** Same selector as `release version`. */
   projects?: string;
+  targets: string;
+}
+
+export interface ReleasePlatformOutputsOptions extends ReleasePlatformSelection {
   githubOutput?: string;
   output: string;
   ref?: string;
-  targets: string;
 }
 
 export interface ReleaseTrustPublisherOptions {
@@ -350,15 +356,7 @@ export async function releaseCollectPlatformOutputs(
 ): Promise<void> {
   const restoreRef = await gitHead(root);
   const releaseRef = await fetchReleaseRepairRef(root, PLATFORM_OUTPUTS_LABEL, options.ref);
-  const packages = releasePackages(root);
-  const packagesAtHead = await releasePackagesAtHead(root, packages);
-  const bump = releaseBumpArg(options.bump);
-  const selection = parseReleaseProjectSelection(
-    options.projects,
-    packages.map((pkg) => pkg.projectName),
-  );
-  const currentPackages =
-    packagesAtHead.length > 0 ? packagesAtHead : await releasePlatformPackages(root, packages, bump, selection);
+  const currentPackages = await currentPlatformPackages(root, options);
   console.log(
     currentPackages.length === 0
       ? `${PLATFORM_OUTPUTS_LABEL}: no current release packages selected.`
@@ -371,12 +369,10 @@ export async function releaseCollectPlatformOutputs(
   // architecture of a matrix producer, whose legs each commit separately.
   const currentSourceSha = options.ref ? await gitSha(root, options.ref) : await gitHead(root);
   const currentRuns = await githubCiNxRunMany(root, {
-    targets: options.targets,
-    projects: releasePackageProjects(currentPackages),
+    ...currentPlatformRunOptions(currentPackages, options.targets),
     configuration: RELEASE_CONFIGURATION,
     collectOutputs: join(outputRoot, 'current'),
     collectOutputsSourceSha: currentSourceSha,
-    allowEmptyProjects: true,
   });
 
   // Only a macOS runner can produce these, and the Linux publishing job that
@@ -391,11 +387,41 @@ export async function releaseCollectPlatformOutputs(
     restoreRef,
   );
   if (options.githubOutput) {
-    const projects = [
-      ...new Set(currentRuns.runs.flatMap((run) => run.projects.map((project) => project.project))),
-    ].sort((left, right) => left.localeCompare(right));
-    await appendFile(options.githubOutput, `projects=${projects.join(',')}\n`);
+    await writePlatformProjectOutput(options.githubOutput, currentRuns);
   }
+}
+
+/** Select exactly the current producer's projects without running targets or inspecting pending repairs. */
+export async function releaseSelectPlatformProjects(
+  root: string,
+  options: ReleasePlatformSelection & { githubOutput: string },
+): Promise<void> {
+  await fetchReleaseBranchAndTags(root, 'Select release platform projects');
+  const packages = await currentPlatformPackages(root, options);
+  const runs = expandNxTargetRuns(await readProjectTargets(root), currentPlatformRunOptions(packages, options.targets));
+  await writePlatformProjectOutput(options.githubOutput, runs);
+}
+
+async function currentPlatformPackages(root: string, options: ReleasePlatformSelection): Promise<ReleasePackage[]> {
+  const packages = releasePackages(root);
+  const packagesAtHead = await releasePackagesAtHead(root, packages);
+  const bump = releaseBumpArg(options.bump);
+  const selection = parseReleaseProjectSelection(
+    options.projects,
+    packages.map((pkg) => pkg.projectName),
+  );
+  return packagesAtHead.length > 0 ? packagesAtHead : releasePlatformPackages(root, packages, bump, selection);
+}
+
+function currentPlatformRunOptions(packages: ReleasePackage[], targets: string): NxRunManyOptions {
+  return { targets, projects: releasePackageProjects(packages), allowEmptyProjects: true };
+}
+
+async function writePlatformProjectOutput(path: string, runs: ExpandedNxTargetRuns): Promise<void> {
+  const projects = [...new Set(runs.runs.flatMap((run) => run.projects.map((project) => project.project)))].sort(
+    (left, right) => left.localeCompare(right),
+  );
+  await appendFile(path, `projects=${projects.join(',')}\n`);
 }
 
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
@@ -1510,20 +1536,19 @@ async function askPublishRun(
     : { ok: false, reason: `gh ${args.join(' ')} answered no status and conclusion: ${result.stdout.trim()}` };
 }
 
-// These helpers serve two commands. Hardcoding "Repair pending releases" made
-// `release build-platform-outputs` announce a repair it was not performing: it
-// plans pending targets only because macOS artifacts cannot be built by the
-// Linux publishing job that repairs them. The label says which command is
-// speaking.
-async function fetchReleaseRepairRef(root: string, label: string, requestedRef?: string): Promise<string> {
+async function fetchReleaseBranchAndTags(root: string, label: string): Promise<string> {
   const branch = await releaseBranch(root);
   const remote = await releaseRemote(root, branch);
   console.log(`${label}: fetching ${remote}/${branch} and tags.`);
   await fetchReleaseRefs(root, remote, branch);
+  return `${remote}/${branch}`;
+}
+
+async function fetchReleaseRepairRef(root: string, label: string, requestedRef?: string): Promise<string> {
+  const remoteRef = await fetchReleaseBranchAndTags(root, label);
   if (requestedRef) {
     return requestedRef;
   }
-  const remoteRef = `${remote}/${branch}`;
   return (await gitRefExists(root, remoteRef)) ? remoteRef : gitHead(root);
 }
 

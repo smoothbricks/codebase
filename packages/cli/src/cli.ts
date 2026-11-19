@@ -318,6 +318,23 @@ function buildProgram(): Command {
       },
     );
   release
+    .command('select-platform-projects')
+    .description('Select current release projects owning the requested platform targets without building them')
+    .addOption(bumpOption().makeOptionMandatory())
+    .option(
+      '--projects <projects>',
+      'comma-separated Nx projects to release, or all for every owned release package; blank releases package-local changes',
+    )
+    .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
+    .requiredOption(
+      '--github-output <path>',
+      'append selected current platform projects to a GitHub Actions output file',
+    )
+    .action(async (options: { bump: string; projects?: string; targets: string; githubOutput: string }) => {
+      const { releaseSelectPlatformProjects } = await import('./release/index.js');
+      await releaseSelectPlatformProjects(await findRepoRoot(), options);
+    });
+  release
     .command('version')
     .description('Bump release package versions and create the release commit; writes no tags')
     .addOption(bumpOption().default('auto'))

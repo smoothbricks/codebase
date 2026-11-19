@@ -3136,13 +3136,14 @@ authenticated Git transport; its checkout names that reason.
 | Validate, E2E, cross-test execution, deploy-only, preview cleanup | No                           | Complete history and blobs make historical reads local; these jobs do not push or fetch later private refs.                                                                             |
 | Linux release candidate                                           | No                           | The candidate is versioned locally and transferred as a Git bundle, not pushed.                                                                                                         |
 | macOS / cross-platform release producer                           | Yes                          | `releaseCollectPlatformOutputs` fetches private candidate/repair refs after checkout (`packages/cli/src/release/index.ts:335`); a full initial clone cannot contain refs created later. |
+| macOS release tests                                               | Yes                          | The platform project selector also fetches the release branch and tags; the test job does not push.                                                                                     |
 | Release publisher and pending-release healer                      | Yes                          | Publishing and repair fetch and push release refs.                                                                                                                                      |
 | Managed-file healer                                               | Yes                          | It pushes the regenerated review branch.                                                                                                                                                |
 
 Job timeouts remain generous and finite: Validate and compact release jobs use 45 minutes; Apple/cross-platform
-production and combined platform releases use 90 minutes to accommodate cold native builds; production deployment and
-managed-file healing use 30 minutes; deployed E2E and preview cleanup use 15 minutes. Cross-target test execution uses
-30 minutes. These are job hang bounds, not replacements for package test deadlines.
+production, native macOS release tests, and combined platform releases use 90 minutes to accommodate cold native builds;
+production deployment and managed-file healing use 30 minutes; deployed E2E and preview cleanup use 15 minutes.
+Cross-target test execution uses 30 minutes. These are job hang bounds, not replacements for package test deadlines.
 
 Forgejo artifact steps use managed local JavaScript actions, not GitHub clients or absolute `uses:` URLs. They fetch and
 verify the pinned GHES-gate-free upstream commit before running its original bundled entry point under the runner's Node

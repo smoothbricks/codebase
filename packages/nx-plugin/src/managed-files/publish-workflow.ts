@@ -911,6 +911,23 @@ function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOpt
         default: none`
       : '';
   const steps = definePublishWorkflow(options).steps;
+  const isCross = options.platformProducer?.kind === 'linux-cross';
+  const platformJob = isCross ? 'cross-platform' : 'macos-platform';
+  const jobs = [
+    renderPlatformJob(
+      platformJob,
+      renderMacosJobHeaderLines(options),
+      renderMacosPlatformSteps(options),
+      options,
+      isCross ? 'internal' : 'public',
+    ),
+  ];
+  const needs = ['linux-release-candidate', platformJob];
+  if (!isCross) {
+    const testJob = 'macos-platform-tests';
+    jobs.push(renderPlatformJob(testJob, macosRunsOnLine(options), renderMacosTestSteps(options), options, 'public'));
+    needs.push(testJob);
+  }
   return `name: Publish
 
 on:
@@ -961,20 +978,10 @@ ${renderRunsOnLine(options.runsOn)}
     steps:
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
-  ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}:
-${renderMacosJobHeaderLines(options)}
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      id-token: none
-    env:
-      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, options.platformProducer?.kind === 'linux-cross' ? 'internal' : 'public')}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
-    steps:
-${renderMacosPlatformSteps(options)}
+${jobs.join('\n\n')}
 
   publish-on-linux:
-    needs: [linux-release-candidate, ${options.platformProducer?.kind === 'linux-cross' ? 'cross-platform' : 'macos-platform'}]
+    needs: [${needs.join(', ')}]
 ${publishJobRunsOnLine(options)}
     timeout-minutes: 45
     permissions:
@@ -1134,7 +1141,7 @@ function renderLinuxReleaseCandidateSteps(
   return lines.join('\n').trimEnd();
 }
 
-function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): string {
+function renderMacosReleaseSetup(options: PublishWorkflowDefinitionOptions, lane: 'build' | 'test') {
   let stepNumber = 3;
   const lines = [
     '      # --- Setup --------------------------------------------------------------',
@@ -1146,7 +1153,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        with:',
     `          ref: ${githubExpression('github.sha')}`,
     '          fetch-depth: 0',
-    '          # build-platform-outputs fetches the release branch and tags from origin',
+    `          # ${lane === 'build' ? 'build-platform-outputs' : 'select-platform-projects'} fetches the release branch and tags from origin`,
     '          # (packages/cli/src/release/index.ts:335). This job pushes nothing, but a private origin refuses',
     '          # that fetch without the checkout credential, so it stays persisted.',
     '          persist-credentials: true',
@@ -1169,7 +1176,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '      - name: 🧱 Setup Nix/devenv',
     '        id: setup',
     ...setupDevenvUsesLines(),
-    ...(macosPlatformArchitectures(options).length >= 2
+    ...(lane === 'build' && macosPlatformArchitectures(options).length >= 2
       ? [`          cache-scope: macos-platform-${githubExpression('matrix.arch')}`]
       : []),
   );
@@ -1209,14 +1216,13 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          smoo release version --bump "${githubExpression('inputs.bump')}" --projects "$SMOO_RELEASE_PROJECTS" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
     '          "$GITHUB_OUTPUT"',
   );
-  const architectures = macosPlatformArchitectures(options);
-  const isMatrix = architectures.length >= 2;
-  const testArchitecture = macosTestArchitecture(architectures);
+  return { lines, stepNumber };
+}
+
+function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): string {
+  let { lines, stepNumber } = renderMacosReleaseSetup(options, 'build');
+  const isMatrix = macosPlatformArchitectures(options).length >= 2;
   const legLabel = isMatrix ? ` (${githubExpression('matrix.arch')})` : '';
-  const testCondition =
-    isMatrix && testArchitecture !== undefined
-      ? `matrix.arch == '${testArchitecture}' && steps.platform-outputs.outputs.projects != ''`
-      : `steps.platform-outputs.outputs.projects != ''`;
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
@@ -1227,24 +1233,9 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
-    )}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
+    )}" --projects "$SMOO_RELEASE_PROJECTS" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options, isMatrix ? githubExpression('matrix.arch') : undefined)}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
   );
-  if (options.platformProducer?.kind !== 'linux-cross') {
-    lines.push('', `      # Step ${stepNumber++}`, '      - name: 🧪 Unit test selected macOS and iOS packages');
-    if (isMatrix) {
-      lines.push(
-        '        # Only the runner-native leg can execute what it built; the foreign',
-        '        # architecture ships as an artifact without running here.',
-      );
-    }
-    lines.push(
-      `        if: ${testCondition}`,
-      '        run:',
-      '          smoo github-ci nx-run-many --targets test --projects',
-      `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
-    );
-  }
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
@@ -1273,6 +1264,58 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   return mergeProducerStepEnvironment(lines, options.platformProducer).join('\n').trimEnd();
 }
 
+function renderPlatformJob(
+  name: string,
+  runner: string,
+  steps: string,
+  options: PublishWorkflowDefinitionOptions,
+  cacheReach: CacheReach,
+): string {
+  return `  ${name}:
+${runner}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: none
+    env:
+      LMAO_GIT_REVISION: ${githubExpression('github.sha')}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options, cacheReach)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
+    steps:
+${steps}`;
+}
+
+function renderMacosTestSteps(options: PublishWorkflowDefinitionOptions): string {
+  let { lines, stepNumber } = renderMacosReleaseSetup(options, 'test');
+  const architectures = macosPlatformArchitectures(options);
+  const testArchitecture = architectures.length >= 2 ? macosTestArchitecture(architectures) : undefined;
+  lines.push(
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧭 Select macOS and iOS release test projects',
+    '        id: platform-projects',
+    '        env:',
+    `          SMOO_RELEASE_PROJECTS: ${githubExpression('inputs.projects')}`,
+    '        run:',
+    `          smoo release select-platform-projects --bump "${githubExpression('inputs.bump')}" --projects "$SMOO_RELEASE_PROJECTS"`,
+    `          --targets "${macosPlatformTargetSelector(options, testArchitecture)}" --github-output "$GITHUB_OUTPUT"`,
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧪 Unit test selected macOS and iOS packages',
+    "        if: steps.platform-projects.outputs.projects != ''",
+    '        env:',
+    `          SMOO_PLATFORM_PROJECTS: ${githubExpression('steps.platform-projects.outputs.projects')}`,
+    '        run: smoo github-ci nx-run-many --targets test --projects "$SMOO_PLATFORM_PROJECTS"',
+    '',
+    '      # --- Cleanup ------------------------------------------------------------',
+    '',
+    `      # Step ${stepNumber}`,
+    ...yamlLinesForStep(
+      { kind: PublishWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv', number: stepNumber },
+      options,
+    ),
+  );
+  return lines.join('\n').trimEnd();
+}
 function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions): string {
   const mode = 'needs.linux-release-candidate.outputs.mode';
   let stepNumber = 2;
@@ -1465,9 +1508,8 @@ function hasMacosPlatformTargets(options: PublishWorkflowDefinitionOptions): boo
 }
 
 /**
- * The architecture `macos-latest` runs natively. Only that leg can execute the
- * binaries it just built, so it owns the unit-test step; keep this beside the
- * `runs-on` label it describes.
+ * The architecture macos-latest runs natively, preferred when selecting
+ * the build matrix leg whose projects need tests.
  */
 const MACOS_RUNNER_ARCHITECTURE = 'arm64';
 
@@ -1494,9 +1536,7 @@ function macosTestArchitecture(architectures: readonly string[]): string | undef
 function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): string {
   if (options.platformProducer?.kind === 'linux-cross') return renderRunsOnLine(options.runsOn);
   const architectures = macosPlatformArchitectures(options);
-  const lines = [
-    options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOnLine(options.macosRunsOn),
-  ];
+  const lines = [macosRunsOnLine(options)];
   if (architectures.length >= 2) {
     lines.push(
       '    strategy:',
@@ -1510,14 +1550,20 @@ function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): s
   return lines.join('\n');
 }
 
+function macosRunsOnLine(options: PublishWorkflowDefinitionOptions): string {
+  return options.macosRunsOn === undefined ? '    runs-on: macos-latest' : renderRunsOnLine(options.macosRunsOn);
+}
+
 /** Per-leg target selector, or every macOS family when there is no matrix. */
-function macosPlatformTargetSelector(options: PublishWorkflowDefinitionOptions): string {
+function macosPlatformTargetSelector(
+  options: PublishWorkflowDefinitionOptions,
+  architecture: string | undefined,
+): string {
   const families = macosPlatformFamilies(options);
   const selectors = families.length > 0 ? families : [...MACOS_PLATFORM_TARGET_GLOBS];
-  if (macosPlatformArchitectures(options).length < 2) {
-    return selectors.join(',');
-  }
-  return selectors.map((glob) => `*-${githubExpression('matrix.arch')}-${glob.slice(2)}`).join(',');
+  return architecture === undefined
+    ? selectors.join(',')
+    : selectors.map((glob) => `*-${architecture}-${glob.slice(2)}`).join(',');
 }
 
 /** Artifact names the final job downloads, one per rendered macOS leg. */

@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { listReleasePackages } from '../../lib/workspace.js';
 import type { ReleasePackageInfo } from '../core.js';
 import { commitReleaseWithFirstReleases, manifestWithVersion } from '../first-release.js';
-import { releasePackagesAtRef } from '../index.js';
-import { git, gitOutput, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
+import { releasePackagesAtRef, releaseSelectPlatformProjects } from '../index.js';
+import { git, gitOutput, tag, withFixtureRepo, writePackage, writeWorkspace } from './helpers/fixture-repo.js';
 
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
 const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '1.0.0' };
@@ -130,6 +130,66 @@ describe('release packages at a ref', () => {
 });
 
 const REPOSITORY = 'https://github.com/example/first-release.git';
+
+// PUBLISH.md §Native release validation: current release selection intersects the producer target selector.
+it('selects only current release owners of the producer targets without building them', async () => {
+  await withFixtureRepo(async (root) => {
+    await writeWorkspace(root);
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'fixture',
+        version: '0.0.0',
+        private: true,
+        repository: REPOSITORY,
+        workspaces: ['packages/*'],
+      }),
+    );
+    const build = { executor: 'nx:run-commands', options: { command: 'touch unexpected-platform-build' } };
+    for (const [pkg, targets] of [
+      [a, { 'addon-arm64-macos': build, 'framework-arm64-ios': build }],
+      [b, { 'addon-x64-macos': build }],
+      [c, { 'addon-arm64-macos': build }],
+    ] as const) {
+      await mkdir(join(root, pkg.path), { recursive: true });
+      await writeFile(
+        join(root, pkg.path, 'package.json'),
+        JSON.stringify({
+          name: pkg.name,
+          version: pkg.version,
+          repository: REPOSITORY,
+          nx: { name: pkg.projectName, tags: ['npm:public'], targets },
+        }),
+      );
+    }
+    await git(root, ['add', 'package.json', 'nx.json', 'packages']);
+    await git(root, ['commit', '-m', 'chore: fixture workspace']);
+    await git(root, [
+      'commit',
+      '--allow-empty',
+      '-m',
+      'chore(release): publish',
+      '-m',
+      '- project: a 1.0.0',
+      '-m',
+      '- project: b 1.0.0',
+    ]);
+    const head = await gitOutput(root, ['rev-parse', 'HEAD']);
+    const workflowBranch = process.env.GITHUB_REF_NAME?.trim();
+    if (workflowBranch && workflowBranch !== 'main') await git(root, ['branch', workflowBranch]);
+    await git(root, ['remote', 'add', 'origin', '.']);
+
+    const githubOutput = join(root, 'github-output');
+    const options = { bump: 'auto', projects: 'all', githubOutput };
+    await releaseSelectPlatformProjects(root, { ...options, targets: '*-arm64-macos,*-arm64-ios' });
+    await releaseSelectPlatformProjects(root, { ...options, targets: '*-x64-macos' });
+    await releaseSelectPlatformProjects(root, { ...options, targets: '*-x64-ios' });
+    expect(await readFile(githubOutput, 'utf8')).toBe('projects=a\nprojects=b\nprojects=\n');
+    expect(await Bun.file(join(root, 'unexpected-platform-build')).exists()).toBe(false);
+    expect(await gitOutput(root, ['rev-parse', 'HEAD'])).toBe(head);
+    expect(await gitOutput(root, ['status', '--porcelain', '--untracked-files=no'])).toBe('');
+  });
+});
 
 /**
  * The commit smoo writes when a release has first releases in it: Nx staged what it versioned, smoo writes the rest, and
