@@ -1989,9 +1989,9 @@ impl NativeGatewayInventory {
             if !active_names.contains(&WorkspaceName::main())
                 && let Some(image) = existing_main_image(&layout)?
                 && let Some(metadata) =
-                    Self::pending_metadata(store, &repo, &WorkspaceName::main(), &image)?
+                    Self::unlisted_metadata(store, &repo, &WorkspaceName::main(), &image)?
             {
-                let record = ClaimRecord::PendingFence(sidecar_path(&image));
+                let record = Self::unlisted_claim(&metadata, &image);
                 claim_granted_blocks(&mut claims, &repo, &metadata, &record)?;
             }
             let entries = match fs::read_dir(sessions) {
@@ -2008,13 +2008,14 @@ impl NativeGatewayInventory {
                 }
             };
             for image in crate::storage::discover_session_images(entries) {
-                // Published images were already validated above. Only pending sidecars
-                // need reading after the canonical directory enumeration.
+                // Listed images were already validated above. What the listing did not hold is
+                // read after the canonical directory enumeration: a pending fence, or a
+                // workspace a fork activated since the listing was read.
                 if !active_names.contains(image.workspace())
                     && let Some(metadata) =
-                        Self::pending_metadata(store, &repo, image.workspace(), image.path())?
+                        Self::unlisted_metadata(store, &repo, image.workspace(), image.path())?
                 {
-                    let record = ClaimRecord::PendingFence(sidecar_path(image.path()));
+                    let record = Self::unlisted_claim(&metadata, image.path());
                     claim_granted_blocks(&mut claims, &repo, &metadata, &record)?;
                 }
             }
@@ -2071,9 +2072,15 @@ impl NativeGatewayInventory {
         Ok(PortClaims { claims, unreadable })
     }
 
-    /// The metadata of a canonical image nothing has published: its pending fence, or `None` for
-    /// an orphan session image that has no sidecar.
-    fn pending_metadata(
+    /// The metadata of a canonical image the project's Active listing did not hold: its pending
+    /// fence, the record of a workspace activated since that listing was read, or `None` for an
+    /// orphan session image that has no sidecar and for an image retired since.
+    ///
+    /// The scan takes no lock, and activation is one sidecar rewrite (02_workspaces.md,
+    /// "Publication and crash recovery"): an `Active` record here is a fork or an adoption that
+    /// finished between this scan's two reads of the project, in any project of the store. It
+    /// owns its block like every published workspace, so it is claimed, never refused.
+    fn unlisted_metadata(
         store_root: &Path,
         repo: &RepoId,
         workspace: &WorkspaceName,
@@ -2119,15 +2126,16 @@ impl NativeGatewayInventory {
                 message: "canonical pending metadata identity does not match its image".to_owned(),
             });
         }
-        if metadata.publication_state != PublicationState::PendingFence {
-            return Err(GatewayInventoryError::InvalidMetadata {
-                path: sidecar,
-                message: "canonical image was not present in the published inventory".to_owned(),
-            });
-        }
         Ok(Some(metadata))
     }
 
+    /// The record naming the grant of an image [`Self::unlisted_metadata`] read.
+    fn unlisted_claim(metadata: &DetachedWorkspaceMetadata, image: &Path) -> ClaimRecord {
+        match metadata.publication_state {
+            PublicationState::PendingFence => ClaimRecord::PendingFence(sidecar_path(image)),
+            PublicationState::Active => ClaimRecord::Published,
+        }
+    }
     fn all_attached_blocking(&self) -> Result<AttachedInventory, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
         let mut inventory = AttachedInventory::default();
@@ -3117,12 +3125,26 @@ mod tests {
 
     use super::*;
 
+    /// Where a scan of one project stops after reading its published records: the project, the
+    /// scan's word that it has read them, and the test's word to go on.
+    type ScanPause = (
+        RepoId,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
     #[derive(Default)]
     struct FixtureSource {
         projects: Mutex<BTreeMap<RepoId, ProjectInventoryFacts>>,
         /// Projects whose kernel mount reading fails the way a volume without the workspace's
         /// marker, mounted at its checkout, fails it. Their records stay readable.
         unidentifiable_mounts: Mutex<BTreeSet<RepoId>>,
+        /// A scan of this project stops once it has read the project's published records, says
+        /// so, and goes on when told to: what a test does in between lands after the scan's
+        /// snapshot and before its walk of the session images.
+        // WHY lock: a one-shot slot of a test source shared behind `Arc<dyn InventorySource>`,
+        // taken in one synchronous statement; no await and no child runs under it.
+        after_snapshot: Mutex<Option<ScanPause>>,
     }
 
     impl FixtureSource {
@@ -3181,6 +3203,16 @@ mod tests {
                 {
                     records.push(metadata);
                 }
+            }
+
+            let pause = self
+                .after_snapshot
+                .lock()
+                .expect("fixture source")
+                .take_if(|(paused, ..)| paused == repo);
+            if let Some((_, taken, resume)) = pause {
+                taken.send(()).expect("the test awaits the snapshot");
+                resume.blocking_recv().expect("the test resumes the scan");
             }
             Ok(records)
         }
@@ -4042,7 +4074,7 @@ mod tests {
             metadata.publication_state = state;
             metadata.write_for_image(image.image()).expect("state");
             if state == PublicationState::PendingFence {
-                let pending = NativeGatewayInventory::pending_metadata(
+                let pending = NativeGatewayInventory::unlisted_metadata(
                     fixture.storage.store(),
                     &repo,
                     &workspace,
@@ -4066,7 +4098,7 @@ mod tests {
             }
             fs::remove_file(image.image()).expect("commit retirement after directory capture");
             assert!(
-                NativeGatewayInventory::pending_metadata(
+                NativeGatewayInventory::unlisted_metadata(
                     fixture.storage.store(),
                     &repo,
                     &workspace,
@@ -4078,7 +4110,7 @@ mod tests {
             fs::write(sidecar_path(image.image()), b"record disappeared mid-read")
                 .expect("bad retired record");
             assert!(
-                NativeGatewayInventory::pending_metadata(
+                NativeGatewayInventory::unlisted_metadata(
                     fixture.storage.store(),
                     &repo,
                     &workspace,
@@ -4089,7 +4121,7 @@ mod tests {
             );
             fs::write(image.image(), b"recreated image").expect("restore canonical publication");
             assert!(
-                NativeGatewayInventory::pending_metadata(
+                NativeGatewayInventory::unlisted_metadata(
                     fixture.storage.store(),
                     &repo,
                     &workspace,
@@ -4215,6 +4247,58 @@ mod tests {
                     .expect("second block"),
             ]
         );
+    }
+
+    /// A fork activates its workspace with one sidecar rewrite, from `PendingFence` to `Active`
+    /// (02_workspaces.md, "Publication and crash recovery"), under no lock an allocation scan
+    /// takes. An activation that lands after the scan read the project's Active workspaces and
+    /// before it walks the project's session images is a published workspace the scan had not
+    /// listed: its block is reserved, and no project's allocation is refused over it.
+    #[tokio::test]
+    async fn a_workspace_activated_during_the_port_scan_reserves_its_block() {
+        let fixture = Fixture::new("activated-mid-scan");
+        let (_repo_a, repo_b, source) = two_project_store(&fixture);
+        let (fact, _) = fixture.workspace(
+            &repo_b,
+            WorkspaceName::new("raven").expect("workspace"),
+            "33333333333333333333333333333333",
+            7,
+            false,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo_b).expect("layout");
+        let image = canonical_image_paths(&layout, &fact.workspace)
+            .expect("image paths")
+            .image()
+            .to_owned();
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(&image).expect("metadata");
+        let block = metadata
+            .grants
+            .port_block
+            .expect("the fenced clone's block");
+        metadata.publication_state = PublicationState::PendingFence;
+        metadata.write_for_image(&image).expect("pending fence");
+        let (taken, snapshot_taken) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *source.after_snapshot.lock().expect("fixture source") = Some((repo_b, taken, resumed));
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+        let activate = async {
+            snapshot_taken
+                .await
+                .expect("the scan read the project's Active workspaces");
+            metadata.publication_state = PublicationState::Active;
+            metadata.write_for_image(&image).expect("activation");
+            resume
+                .send(())
+                .expect("the scan waits to walk the session images");
+        };
+        let (reserved, ()) = tokio::join!(inventory.all_reserved_port_blocks(), activate);
+        let reserved = reserved
+            .expect("an activation between the scan's two reads refuses no project's allocation");
+        assert_eq!(reserved.overlapping(block), Some(block));
+        assert_eq!(reserved.blocks().count(), 3);
     }
 
     #[tokio::test]

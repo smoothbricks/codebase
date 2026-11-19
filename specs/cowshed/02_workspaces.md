@@ -694,9 +694,13 @@ post-callback validation finish. Activation is one atomic sidecar rewrite from `
 attachment is then retained. The normal path has no staging mount, detach, image rename, canonical reattach, or remount.
 
 On macOS, a complete canonical `PendingFence` image reserves its persisted `portBlock` even after its creator exits.
-Allocation scans include those reservations without making the workspace visible or runnable. A dead creator's PID claim
-may be reclaimed, but that never releases a block still owned by an image. Resuming `fork` reuses the stored grant
-rather than allocating a temporary second block. Duplicate ownership remains an integrity refusal.
+Allocation scans include those reservations without making the workspace visible or runnable. A scan takes no lock and
+reads each project's `Active` workspaces before its canonical images, so an activation, in any project of the store, can
+land between the two: a canonical image the scan finds `Active` that its listing did not hold is a workspace published
+since, whose block is reserved like every published workspace's, never a refusal of the scan or of the allocation it
+serves. A dead creator's PID claim may be reclaimed, but that never releases a block still owned by an image. Resuming
+`fork` reuses the stored grant rather than allocating a temporary second block. Duplicate ownership remains an integrity
+refusal.
 
 Every cowshed process that opens a project shares its intent journal. Each change re-reads and rewrites the journal
 under an exclusive lock on `lifecycle-intents.json.lock`, so no process writes back a copy that predates another
