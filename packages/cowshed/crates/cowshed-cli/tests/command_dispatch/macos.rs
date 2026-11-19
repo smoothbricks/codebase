@@ -2281,7 +2281,11 @@ impl WatchedRemoval {
             },
         )
         .expect("arm the gateway's watch on lost mounts");
-        let previous_volume = unmount_for_watch(&fixture, &shed);
+        let previous_volume = unmount_for_watch(
+            &fixture,
+            &shed,
+            &workspace_image(&fixture, &WorkspaceName::session("shed").expect("shed")),
+        );
         match hearing.recv().await.expect("the watch runs") {
             cowshed_core::LostMount::Workspace {
                 workspace,
@@ -2292,7 +2296,7 @@ impl WatchedRemoval {
                     }),
             } => {
                 assert_eq!(workspace.name().as_str(), "shed");
-                assert_watched_remount(&shed, &mount_point, &device, &previous_volume);
+                assert_watched_remount(&fixture, &shed, &mount_point, &device, &previous_volume);
             }
             other => panic!("the watch did not heal the shed: {other}"),
         }
@@ -2326,7 +2330,11 @@ impl WatchedRemoval {
         );
         // Nothing of the runtime holds main while the test unmounts it.
         self.service.shutdown().await.expect("shutdown runtime");
-        let volume = unmount_for_watch(&self.fixture, &self.fixture.checkout);
+        let volume = unmount_for_watch(
+            &self.fixture,
+            &self.fixture.checkout,
+            &workspace_image(&self.fixture, &WorkspaceName::main()),
+        );
         let mut main_remounted = false;
         while !main_remounted || self.answers.unanswered() {
             match self.hearing.recv().await.expect("the watch runs") {
@@ -2338,7 +2346,13 @@ impl WatchedRemoval {
                             mount_point,
                         }),
                 } if workspace.name().as_str() == "main" => {
-                    assert_watched_remount(&self.fixture.checkout, &mount_point, &device, &volume);
+                    assert_watched_remount(
+                        &self.fixture,
+                        &self.fixture.checkout,
+                        &mount_point,
+                        &device,
+                        &volume,
+                    );
                     main_remounted = true;
                 }
                 lost => self.answers.left_to_its_holder(lost),
@@ -2351,15 +2365,10 @@ impl WatchedRemoval {
                 mount.display()
             );
         }
-        let shed_image = cowshed_core::storage::StorageLayout::new(
-            self.fixture.storage.store(),
-            &RepoId::parse("fixture/dispatch").expect("repository identity"),
-        )
-        .expect("project layout")
-        .session_image(&WorkspaceName::session("shed").expect("shed"))
-        .expect("shed image")
-        .image()
-        .to_owned();
+        let shed_image = workspace_image(
+            &self.fixture,
+            &WorkspaceName::session("shed").expect("shed"),
+        );
         assert!(!shed_image.exists(), "rm released the shed's image");
         assert!(
             !self.layout.image(&self.volume).exists(),
@@ -2370,10 +2379,66 @@ impl WatchedRemoval {
     }
 }
 
-fn unmount_for_watch(fixture: &Fixture, mount: &Path) -> String {
-    let volume = kernel_mount_at(mount)
-        .unwrap_or_else(|| panic!("{} is mounted before unmount", mount.display()))
+/// The canonical image of `workspace` in the fixture project.
+fn workspace_image(fixture: &Fixture, workspace: &WorkspaceName) -> PathBuf {
+    cowshed_core::storage::StorageLayout::new(
+        fixture.storage.store(),
+        &RepoId::parse("fixture/dispatch").expect("repository identity"),
+    )
+    .expect("project layout")
+    .canonical_image(workspace)
+    .expect("workspace image")
+    .image()
+    .to_owned()
+}
+
+/// What a remount keeps of an APFS volume: the workspace image the kernel attaches it from and
+/// the volume's APFS UUID, never its BSD name. A remount of a lost mount releases the unmounted
+/// survivor and attaches the image afresh (02_workspaces.md,
+/// `smoo/cowshed!n/unmounted-attachment-survivor`; 05_gateway.md, "Lost mounts"), so the kernel
+/// may hand the volume another slot. The UUID alone is no identity either: a fork's clone
+/// registers its source's volume UUIDs, and the image tells the two apart.
+#[derive(Debug, Eq, PartialEq)]
+struct VolumeIdentity {
+    image: PathBuf,
+    uuid: String,
+}
+
+/// The identity of the volume mounted at `mount`, proven the volume of the one attachment the
+/// kernel holds for `image`.
+fn mounted_volume(fixture: &Fixture, mount: &Path, image: &Path) -> VolumeIdentity {
+    let device = kernel_mount_at(mount)
+        .unwrap_or_else(|| panic!("{} is mounted", mount.display()))
         .source_device;
+    let attachment = MacOsApfsBackend::new(fixture.runner())
+        .existing_attachment(image)
+        .unwrap_or_else(|error| panic!("read the attachment of {}: {error}", image.display()))
+        .unwrap_or_else(|| panic!("{} is attached", image.display()));
+    assert_eq!(
+        device,
+        attachment.volume_device(),
+        "{} is mounted from its own image {}",
+        mount.display(),
+        image.display()
+    );
+    let identifier = device
+        .strip_prefix("/dev/")
+        .unwrap_or_else(|| panic!("{device} is a device path"));
+    let uuid = cowshed_apfs::registered_apfs_containers()
+        .expect("read the registered APFS volumes")
+        .into_iter()
+        .flat_map(|container| container.volumes)
+        .find(|volume| volume.identifier == identifier)
+        .unwrap_or_else(|| panic!("{device} is a registered APFS volume"))
+        .volume_uuid;
+    VolumeIdentity {
+        image: attachment.image().to_owned(),
+        uuid,
+    }
+}
+
+fn unmount_for_watch(fixture: &Fixture, mount: &Path, image: &Path) -> VolumeIdentity {
+    let volume = mounted_volume(fixture, mount, image);
     let unmount = cowshed_apfs::CommandRequest::new(
         "/usr/sbin/diskutil",
         [OsString::from("unmount"), mount.as_os_str().to_os_string()],
@@ -2391,13 +2456,20 @@ fn unmount_for_watch(fixture: &Fixture, mount: &Path) -> String {
     volume
 }
 
-fn assert_watched_remount(expected: &Path, reported: &Path, whole_device: &str, volume: &str) {
+fn assert_watched_remount(
+    fixture: &Fixture,
+    expected: &Path,
+    reported: &Path,
+    whole_device: &str,
+    volume: &VolumeIdentity,
+) {
     assert!(whole_device.starts_with("/dev/disk"), "{whole_device}");
     assert_eq!(reported, expected);
     let kernel = kernel_mount_at(expected)
         .unwrap_or_else(|| panic!("{} is mounted again", expected.display()));
     assert_eq!(
-        kernel.source_device, volume,
+        mounted_volume(fixture, expected, &volume.image),
+        *volume,
         "the same APFS volume is remounted"
     );
     assert!(
