@@ -1156,6 +1156,7 @@
   "devDependencies": {
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/lmao": "workspace:*",
+    "@smoothbricks/nextest-extract": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "catalog:",
     "nx": "24.0.3",

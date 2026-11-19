@@ -2,11 +2,7 @@
 
 import { expect, it } from 'bun:test';
 import { join } from 'node:path';
-import {
-  cargoTargetDirectory,
-  NEXTEST_BINARIES_METADATA,
-  NEXTEST_CARGO_METADATA,
-} from '../../nextest-extract/src/nextest-binaries.js';
+import { cargoTargetDirectory, NEXTEST_BINARIES_METADATA, NEXTEST_CARGO_METADATA } from '@smoothbricks/nextest-extract';
 
 it('projects the public attachment through the built addon and controller', async () => {
   const checkout = join(import.meta.dir, '../../..');
