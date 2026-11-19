@@ -334,6 +334,7 @@
           "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
           "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
           "{projectRoot}/**/*.rs",
+          "!{projectRoot}/crates/cowshed-cli/tests/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
           "{projectRoot}/crates/**/*.js",
           "{projectRoot}/**/Cargo.toml",
@@ -347,15 +348,21 @@
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
-          "{projectRoot}/package.json",
+          {
+            "json": "{projectRoot}/package.json",
+            "excludeFields": [
+              "devDependencies.@smoothbricks/nextest-extract"
+            ]
+          },
           {
             "externalDependencies": [
-              "bun-lock:packages/cowshed"
+              "@napi-rs/cli",
+              "bun-lock-runtime:packages/build-inputs"
             ]
           },
           "cargoToolchain"
         ],
-        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees. The binary is cached by its sources alone and replayed for every commit that left them unchanged; the commit it is installed as is cli-record-arm64-macos's record beside it (specs/cowshed/05_gateway.md, Build records and the basis), so this target's outputs are the binary and its input record by name, never the directory the record shares.",
+        "//": "outputDir is the tree this configuration writes: .cache/bin/<platform> by default, dist/bin/<platform> in production (specs/cowshed/06_cli.md, Launcher). One option feeds the declared output, napi's --output-dir and the receipt's --output, so the three cannot name different trees. The compile and receipt use the N-API CLI and build-inputs, not the CLI integration targets or their Nextest tooling. The binary is cached by its sources alone and replayed for every commit that left them unchanged; the commit it is installed as is cli-record-arm64-macos's record beside it (specs/cowshed/05_gateway.md, Build records and the basis), so this target's outputs are the binary and its input record by name, never the directory the record shares.",
         "outputs": [
           "{projectRoot}/{options.outputDir}/cowshed",
           "{projectRoot}/{options.outputDir}/.build-inputs.json"
