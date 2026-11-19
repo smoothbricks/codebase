@@ -1069,7 +1069,9 @@ without redelivery only when retained bytes prove it identical; mismatched or ol
 refusal. A partial pump failure returns `stdin: { reason: "deliveryUnknown", cursor }`, naming the last known delivered
 prefix, with no safe-retry metadata. No later write or close disguises that uncertainty.
 
-The public N-API `job.attach({ cursor? })` returns an input view whose `write(Uint8Array)`, `end()` and `detach()`
+<a id="smoo/cowshed!n/node-attachment-input-view"></a>The public N-API `job.attach({ cursor? })` returns an input view.
+It reads the job's delivered stdin cursor and opens no output follows. The accepted `cursor` option is a journal cursor,
+not an input offset; use `job.logs` or `job.tail` to read output. The view's `write(Uint8Array)`, `end()` and `detach()`
 project the core's stateful capability methods through the generator, without a second cursor implementation. Each
 JavaScript write preserves its view's byte offset and length and snapshots that supplied view once before the
 runtime-thread handoff; its bounded frames then await delivery. EOF, detachment and process-group cancellation are
@@ -1898,15 +1900,13 @@ export interface JobHandle {
   // Without follow, continue at nextOffset until bytes is empty or eof is true.
   // Follow waits for output notifications at the current end while the job is running.
   logs(args: { stream: JobStream; offset: number; follow: boolean; signal?: AbortSignal }): Promise<JobLogs>;
-  attach(opts?: { cursor?: JobJournalCursor; signal?: AbortSignal }): Promise<JobAttachment>;
+  attach(opts?: { cursor?: JobJournalCursor }): Promise<JobAttachment>;
   detach(): Promise<void>;
   kill(): Promise<void>;
   wait(opts?: { signal?: AbortSignal }): Promise<JobInfo>;
 }
 
 export interface JobAttachment {
-  readonly stdout: AsyncIterable<Uint8Array>;
-  readonly stderr: AsyncIterable<Uint8Array>;
   write(chunk: Uint8Array): Promise<void>;
   end(): Promise<void>; // explicit stdin EOF; never implicit job cancellation
   detach(): Promise<void>; // closes this view; the job continues

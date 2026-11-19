@@ -168,13 +168,6 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         offset: u64,
         follow: bool,
     ) -> Result<RawByteStream>;
-    /// A view of the job's raw streams, each resumed at its offset in `cursor`.
-    async fn attach(
-        &self,
-        authority: Arc<WorkspaceAuthority>,
-        id: JobId,
-        cursor: JobJournalCursor,
-    ) -> Result<JobAttachment>;
     async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()>;
     /// Opens a stream-lane call: its events, one per demand, until its end.
     async fn stream(&self, method: &'static str, params: Params) -> Result<RawEventStream>;
@@ -498,46 +491,6 @@ impl ControllerRuntime for ActorRuntime {
             offset,
             follow,
         ))
-    }
-
-    async fn attach(
-        &self,
-        authority: Arc<WorkspaceAuthority>,
-        id: JobId,
-        cursor: JobJournalCursor,
-    ) -> Result<JobAttachment> {
-        // Writes continue the job's input where it stands, whoever wrote what came before.
-        let input_cursor = invoke::<operations::JobStatus>(self, &authority.job(id))
-            .await?
-            .stdin
-            .bytes;
-        let stdout = self
-            .logs(
-                Arc::clone(&authority),
-                id,
-                JobStream::Stdout,
-                cursor.stdout,
-                true,
-            )
-            .await?;
-        let stderr = self
-            .logs(
-                Arc::clone(&authority),
-                id,
-                JobStream::Stderr,
-                cursor.stderr,
-                true,
-            )
-            .await?;
-        let runtime: Arc<dyn ControllerRuntime> = Arc::new(self.clone());
-        Ok(JobAttachment {
-            authority: Arc::clone(&authority),
-            id,
-            stdin: JobStdin::new(authority, id, Arc::clone(&runtime), input_cursor),
-            stdout,
-            stderr,
-            runtime,
-        })
     }
 
     async fn kill(&self, authority: &WorkspaceAuthority, id: JobId) -> Result<()> {
@@ -3156,17 +3109,35 @@ impl JobHandle {
 
     /// Attaches to the running or ended job without starting a process: its stdin, and its two
     /// raw streams resumed at `cursor`, or at byte zero when it is omitted.
-    #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
     pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment> {
-        self.runtime
-            .attach(
-                Arc::clone(&self.authority),
-                self.id,
-                cursor.unwrap_or_default(),
-            )
-            .await
+        let stdin = self.attach_stdin(None).await?;
+        let cursor = cursor.unwrap_or_default();
+        let stdout = self.logs(JobStream::Stdout, cursor.stdout, true).await?;
+        let stderr = self.logs(JobStream::Stderr, cursor.stderr, true).await?;
+        Ok(JobAttachment {
+            authority: Arc::clone(&self.authority),
+            id: self.id,
+            stdin,
+            stdout,
+            stderr,
+            runtime: Arc::clone(&self.runtime),
+        })
     }
 
+    /// Opens an input-only view at the job's current delivered cursor, without reading output.
+    /// The journal cursor is accepted for the Node binding; it does not set the stdin cursor.
+    #[doc(hidden)]
+    #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
+    pub async fn attach_stdin(&self, cursor: Option<JobJournalCursor>) -> Result<JobStdin> {
+        let _ = cursor;
+        let offset = self.status().await?.stdin.bytes;
+        Ok(JobStdin::new(
+            Arc::clone(&self.authority),
+            self.id,
+            Arc::clone(&self.runtime),
+            offset,
+        ))
+    }
     #[cfg_attr(any(), cowshed_api(napi = "JobAttachment.detach"))]
     pub async fn detach(&self) -> Result<()> {
         invoke::<operations::JobDetach>(&*self.runtime, &self.authority.job(self.id))
@@ -3254,6 +3225,7 @@ mod tests {
         mode: AtomicU8,
         log_calls: AtomicUsize,
         status_calls: AtomicUsize,
+        attachment_stdin_offset: Option<u64>,
         stdin_writes: AtomicUsize,
         rpc_calls: AtomicUsize,
     }
@@ -3269,7 +3241,18 @@ mod tests {
             match method {
                 "job.status" => {
                     let call = self.status_calls.fetch_add(1, Ordering::SeqCst);
-                    if self.mode.load(Ordering::SeqCst) == 4 && call == 0 {
+
+                    if let Some(bytes) = self.attachment_stdin_offset {
+                        let mut status = running_job_value();
+                        status["stdin"] = serde_json::to_value(crate::api::dto::StdinInfo {
+                            kind: crate::api::dto::StdinKind::Stream,
+                            bytes,
+                            workspace_path: None,
+                            complete: false,
+                        })
+                        .expect("the job's open stdin status");
+                        Ok(status)
+                    } else if self.mode.load(Ordering::SeqCst) == 4 && call == 0 {
                         Ok(running_job_value())
                     } else {
                         Ok(terminal_job_value())
@@ -3291,10 +3274,15 @@ mod tests {
         async fn upload(
             &self,
             method: &'static str,
-            _params: Params,
+            params: Params,
             _bytes: Bytes,
         ) -> Result<Value> {
             if method == "job.attachWrite" {
+                if let Some(offset) = self.attachment_stdin_offset {
+                    let request: StdinWriteRequest = serde_json::from_str(params.get())
+                        .expect("the core's typed stdin write request");
+                    assert_eq!(request.offset, offset, "the write resumes delivered stdin");
+                }
                 self.stdin_writes.fetch_add(1, Ordering::SeqCst);
             }
             Ok(json!({}))
@@ -3368,16 +3356,8 @@ mod tests {
             _offset: u64,
             _follow: bool,
         ) -> Result<RawByteStream> {
+            self.log_calls.fetch_add(1, Ordering::SeqCst);
             Err(CowshedError::internal("unexpected test logs"))
-        }
-
-        async fn attach(
-            &self,
-            _authority: Arc<WorkspaceAuthority>,
-            _id: JobId,
-            _cursor: JobJournalCursor,
-        ) -> Result<JobAttachment> {
-            Err(CowshedError::internal("unexpected test attach"))
         }
 
         async fn kill(&self, _authority: &WorkspaceAuthority, _id: JobId) -> Result<()> {
@@ -6174,6 +6154,37 @@ mod tests {
             .expect("the connection answers a status read");
     }
 
+    //#region smoo/cowshed!n/node-attachment-input-view
+    #[tokio::test]
+    async fn input_attachment_resumes_delivered_stdin_without_opening_output_reads() {
+        for cursor in [
+            None,
+            Some(JobJournalCursor {
+                stdout: 9,
+                stderr: 13,
+            }),
+        ] {
+            let runtime = Arc::new(TestRuntime {
+                attachment_stdin_offset: Some(4096),
+                ..TestRuntime::default()
+            });
+            let job = JobHandle {
+                authority: test_authority(),
+                id: JobId::new(7).unwrap(),
+                runtime: runtime.clone(),
+            };
+            let stdin = job.attach_stdin(cursor).await.expect("input attachment");
+            stdin
+                .write(Bytes::from_static(b"input"))
+                .await
+                .expect("write stdin");
+            assert_eq!(runtime.status_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.rpc_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.stdin_writes.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+    //#endregion smoo/cowshed!n/node-attachment-input-view
     #[tokio::test]
     async fn attachment_parts_support_concurrent_stdin_stdout_and_stderr() {
         let runtime = Arc::new(TestRuntime::default());

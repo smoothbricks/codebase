@@ -149,10 +149,8 @@ pub fn parse(source: &str) -> syn::Result<Vec<Method>> {
             };
             let answer = match type_argument(result, "Result") {
                 Some(Type::Tuple(tuple)) if tuple.elems.is_empty() => Answer::Unit,
-                Some(ty) if simple_name(ty).as_deref() == Some("JobAttachment") => {
-                    Answer::Attachment
-                }
-                _ => return Err(fail("a projected capability answers unit or JobAttachment")),
+                Some(ty) if simple_name(ty).as_deref() == Some("JobStdin") => Answer::Attachment,
+                _ => return Err(fail("a projected capability answers unit or JobStdin")),
             };
             if answer == Answer::Attachment && (class != "JobHandle" || receiver != Receiver::Job) {
                 return Err(fail("a JobHandle mints its attachment"));
@@ -321,7 +319,7 @@ mod tests {
             }
             impl JobHandle {
                 #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
-                pub async fn attach(&self, resume: Option<JobJournalCursor>) -> Result<JobAttachment> {}
+                pub async fn attach_stdin(&self, resume: Option<JobJournalCursor>) -> Result<JobStdin> {}
                 #[cfg_attr(any(), cowshed_api(napi = "JobAttachment.detach"))]
                 pub async fn detach(&self) -> Result<()> {}
             }
@@ -338,6 +336,7 @@ mod tests {
         assert!(rust.contains("stdin.write(payload).await?;"), "{rust}");
         assert!(rust.contains("stdin.finish_input().await?;"), "{rust}");
         assert!(rust.contains("inner.detach().await?;"), "{rust}");
+        assert!(rust.contains("let result = inner.attach_stdin("), "{rust}");
         assert!(
             rust.contains("optional_argument::<cowshed_core::api::JobJournalCursor>"),
             "{rust}"
@@ -381,7 +380,7 @@ mod tests {
             }
             impl JobHandle {
                 #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
-                pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment> { core_attach(cursor).await }
+                pub async fn attach_stdin(&self, cursor: Option<JobJournalCursor>) -> Result<JobStdin> { core_attach(cursor).await }
             }
         "#).expect("capabilities");
         assert_eq!(methods[0].name, "end");
@@ -405,6 +404,19 @@ mod tests {
                 .is_empty()
         );
     }
+
+    //#region smoo/cowshed!n/node-attachment-input-view
+    #[test]
+    fn a_full_rust_attachment_is_not_a_native_attachment_answer() {
+        let error = parse(r#"
+            impl JobHandle {
+                #[cfg_attr(any(), cowshed_api(napi = "JobHandle.attach"))]
+                pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment> {}
+            }
+        "#).expect_err("the generated input view must not start output streams");
+        assert!(error.to_string().contains("JobStdin"), "{error}");
+    }
+    //#endregion smoo/cowshed!n/node-attachment-input-view
 
     #[test]
     fn an_owned_or_wrong_receiver_is_refused() {

@@ -22,9 +22,8 @@ use std::{
 use bytes::Bytes;
 use cowshed_core::{
     Coordinator as CoreCoordinator, Cowshed, CowshedError, EventStream, Host as CoreHost,
-    JobAttachment as CoreJobAttachment, JobHandle as CoreJobHandle, JobStdin as CoreJobStdin,
-    Project as CoreProject, WorkspaceHandle as CoreWorkspaceHandle,
-    WorkspaceRef as CoreWorkspaceRef,
+    JobHandle as CoreJobHandle, JobStdin as CoreJobStdin, Project as CoreProject,
+    WorkspaceHandle as CoreWorkspaceHandle, WorkspaceRef as CoreWorkspaceRef,
     api::{
         call::{self, Arguments, NamesJob, Serves},
         operations::{AdoptView, LogsChunk, Operation, StreamOperation, WorkerView, WorkspaceView},
@@ -851,10 +850,7 @@ pub struct JobAttachment {
     stdin: Arc<CoreJobStdin>,
 }
 
-fn attachment(job: Arc<CoreJobHandle>, attachment: CoreJobAttachment) -> JobAttachment {
-    let (stdin, stdout, stderr) = attachment.into_parts();
-    drop(stdout);
-    drop(stderr);
+fn attachment(job: Arc<CoreJobHandle>, stdin: CoreJobStdin) -> JobAttachment {
     JobAttachment {
         inner: job,
         stdin: Arc::new(stdin),

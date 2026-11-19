@@ -719,7 +719,7 @@ impl JobHandle {
         let inner = Arc::clone(&self.inner);
         super::spawn_promise(env, async move {
             let result = inner
-                .attach(super::optional_argument::<
+                .attach_stdin(super::optional_argument::<
                     cowshed_core::api::JobJournalCursor,
                 >("JobHandle.attach", cursor.as_deref())?)
                 .await?;
