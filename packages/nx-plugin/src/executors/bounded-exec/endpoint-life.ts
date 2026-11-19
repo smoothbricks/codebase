@@ -10,13 +10,14 @@ import { CONTROL_MS, REAP_MS } from './lease-wait.js';
  * The run waits in four phases, each for events only:
  *
  * - `starting`, for the child's first line on its standard output, or its end. `listening` opens the probe; any other
- *   line is refused and the child killed.
+ *   line is refused and the child killed. A child whose standard output ends without a line can say none: its start
+ *   is refused, by how it ended when it ends within the reap bound, and it is killed when it does not.
  * - `probing`, for the endpoint's answer to `{"type":"capabilities"}` on the probe's connection, or that connection's
  *   end: whether the installed mbx's shim gates test cases (05_gateway.md, "A case starts on a core"). The start is
  *   then answered served, which publishes the socket to the run's tasks.
  * - `serving`, for the run's end. A child that ends first is `gone`, and the run's end says how.
- * - `ending`, for the child's end once its standard input closed or it was killed, with the one timer of this
- *   machine armed.
+ * - `ending`, for the child's end once a pipe of it closed (its standard input by the run, its standard output by
+ *   itself) or it was killed, with the reap timer armed.
  *
  * The start is answered once (`serve` or `refuse`) and a served endpoint's end once (`conclude`); `ended` takes no
  * event.
@@ -36,9 +37,12 @@ export type EndpointLife =
       readonly phase: 'ending';
       readonly pid: number | undefined;
       readonly said: string;
-      /** Whether the child was sent SIGKILL; otherwise its standard input was closed. */
+      /** Whether the child was sent SIGKILL; otherwise a pipe of it closed and its end is awaited. */
       readonly killed: boolean;
-      /** Why its start is refused once it has ended; null for a served endpoint ending with its run. */
+      /**
+       * Why its start is refused; null for a served endpoint ending with its run. An unkilled child that ends is
+       * refused by how it ended instead, which says more.
+       */
       readonly refusing: string | null;
     }
   | { readonly phase: 'ended' };
@@ -194,6 +198,13 @@ function starting(life: EndpointLife & { phase: 'starting' }, event: EndpointEve
         [{ do: 'kill' }, { do: 'arm', ms: REAP_MS }],
       ];
     }
+    case 'stdout-end': {
+      const unsaid = `mbx reservations closed its standard output ${life.out === '' ? '' : `after ${JSON.stringify(life.out)}, `}without saying it was listening`;
+      return [
+        { phase: 'ending', pid: life.pid, said: life.said, killed: false, refusing: unsaid },
+        [{ do: 'arm', ms: REAP_MS }],
+      ];
+    }
     case 'run-end':
       return unanswered(life.phase);
     default:
@@ -245,7 +256,9 @@ function serving(life: EndpointLife & { phase: 'serving' }, event: EndpointEvent
 function ending(life: EndpointLife & { phase: 'ending' }, event: EndpointEvent): EndpointStep {
   const ended = endOf(life.said, event);
   if (ended !== null) {
-    if (life.refusing !== null) return [ENDED, [{ do: 'disarm' }, { do: 'refuse', why: life.refusing }]];
+    if (life.refusing !== null) {
+      return [ENDED, [{ do: 'disarm' }, { do: 'refuse', why: life.killed ? life.refusing : ended.how }]];
+    }
     const outlived: Ended = life.killed
       ? { how: `${ended.how}, killed after it outlived its standard input by ${REAP_MS}ms`, clean: false }
       : ended;
@@ -255,8 +268,11 @@ function ending(life: EndpointLife & { phase: 'ending' }, event: EndpointEvent):
     case 'stderr':
       return [{ ...life, said: saying(life.said, event.text) }, []];
     case 'expired': {
-      // Its standard input's end did not end it within the reap bound: kill it, and wait that bound once more.
-      if (!life.killed) return [{ ...life, killed: true }, [{ do: 'kill' }, { do: 'arm', ms: REAP_MS }]];
+      // A closed pipe did not end it within the reap bound: kill it, and wait that bound once more.
+      if (!life.killed) {
+        const refusing = life.refusing === null ? null : `${life.refusing}, and had not ended ${REAP_MS}ms later`;
+        return [{ ...life, killed: true, refusing }, [{ do: 'kill' }, { do: 'arm', ms: REAP_MS }]];
+      }
       // Neither did the kill: it is stuck in the kernel, or something it started holds its pipes. The wait ends and
       // says so; the child is left as it is (05_gateway.md, "A child's exit and its output are reap-class waits").
       const left = `${life.pid === undefined ? 'it' : `pid ${life.pid}`} had not ended ${REAP_MS}ms after it was killed and is left as it is`;

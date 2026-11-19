@@ -172,6 +172,35 @@ describe("the life of a run's reservation endpoint", () => {
         ],
       },
       {
+        name: 'a child whose output ends without a line is refused by how it ended, once it has',
+        events: [stderr('mbx: reservations need scheduler.enabled\n'), STDOUT_END, close(1)],
+        effects: [
+          [],
+          [reap],
+          [
+            disarm,
+            { do: 'refuse', why: 'mbx reservations ended with status 1: mbx: reservations need scheduler.enabled' },
+          ],
+        ],
+      },
+      {
+        name: 'a child that closes its output without a line and runs on is killed, and refused for what it did',
+        events: [stdout('listenin'), STDOUT_END, stdout('g\n'), EXPIRED, close(null, 'SIGKILL')],
+        effects: [
+          [],
+          [reap],
+          [],
+          [{ do: 'kill' }, reap],
+          [
+            disarm,
+            {
+              do: 'refuse',
+              why: `mbx reservations closed its standard output after "listenin", without saying it was listening, and had not ended ${REAP_MS}ms later`,
+            },
+          ],
+        ],
+      },
+      {
         name: 'a child that could not be spawned is refused by its error, and its close says nothing more',
         events: [unspawned('spawn mbx ENOENT'), close(-2)],
         effects: [[{ do: 'refuse', why: 'mbx reservations could not run: spawn mbx ENOENT' }], []],
@@ -322,6 +351,13 @@ describe("the life of a run's reservation endpoint", () => {
     });
   });
 
+  it('waits for a first line only while its child can still say one', () => {
+    everyOrder((steps) => {
+      const silent = steps.findIndex((step) => ['stdout-end', 'close', 'error'].includes(step.event.type));
+      if (silent === -1) return;
+      for (const step of steps.slice(silent)) expect(step.after.phase).not.toBe('starting');
+    });
+  });
   it('kills only a child that said something else, or one whose timer ran out', () => {
     everyOrder((steps) => {
       for (const step of steps) {
