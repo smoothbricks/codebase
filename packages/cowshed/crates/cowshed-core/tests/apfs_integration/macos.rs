@@ -11,8 +11,8 @@ use std::time::Instant;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
-    ApfsBackend, AttachedImage, CommandRunner, ImageCapture, MacOsApfsBackend, SystemCommandRunner,
-    volume_name,
+    ApfsBackend, AttachedImage, CommandRunner, DiskImageSource, ImageCapture, MacOsApfsBackend,
+    SystemCommandRunner, volume_name,
 };
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
