@@ -6274,6 +6274,7 @@ mod tests {
         drop(rows);
         drop(holder);
         drop(cache);
+        drop(quiet);
         drop(locked);
         scratch.release_all();
     }
@@ -7446,7 +7447,6 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-
     async fn real_apfs_mbx_fork_clones_warm_state_while_the_live_volume_is_held() {
         use std::io::Write as _;
 
@@ -8314,7 +8314,6 @@ fn main() {
     /// tree) and a candidate whose image lock is held all leave main's seed where it was.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-
     async fn directory_a_fork_after_an_external_land_inherits_the_landed_volume() {
         let scratch = Scratch::data_directory("build-external-land");
         let main = owner("main", '0');
