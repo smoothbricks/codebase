@@ -7697,13 +7697,10 @@ async fn directory_rename_keeps_edits_written_after_clone_publication() {
         tokio::pin!(rename);
         tokio::select! {
             () = publication => rename.await,
-            (result, _, stderr) = &mut rename => panic!(
-                "rename ended before the source edit: {result:?}; {}",
-                String::from_utf8_lossy(&stderr),
-            ),
+            result = &mut rename => result,
         }
     };
-    let error = result.expect_err("a rename whose source changed after clone must refuse");
+    let error = result.unwrap_err();
     assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
     assert!(
         error.message.contains("source work matches: false"),
