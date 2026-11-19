@@ -2082,15 +2082,16 @@ for those starts, and kept the host's vnode table recycling. So the plugin's `pr
 pool (`MBX_SCHEDULER=1`, no enclosing reservation), starts one `mbx reservations <socket>`
 ([Serve reservations to many commands](https://mr-boxington.jdx.dev/scheduling#serve-reservations-to-many-commands)) by
 its PATH name, the canonical mbx environment's, which leads with the installed mbx (14_nix.md, "mbx"), on a socket in an
-owned directory of the job's socket namespace, waits up to the control-plane bound for its `listening` line, and
-publishes the socket in `MBX_RESERVATIONS_SOCKET`, which every task inherits. Its `postTasksExecution` closes the
-endpoint's standard input, which ends it with every grant it still serves. The endpoint lives as long as the run's
-client: Nx runs the plugin's task hooks in the process that runs the tasks, never in a daemon (`patches/README.md`, "A
-run's task hooks run in its own process"), so the endpoint is a child of that run that ends with it (14_nix.md, "mbx"),
-and a daemon that stops under the run (`patches/README.md`, "A job's client never starts a daemon") takes no endpoint
-along. Run in the daemon, the endpoint was the daemon's child and ended with it: a land gate whose daemon stopped
-mid-run on 2026-11-09 failed each later reserved leaf with `connect ENOENT …/mbx-r-*/r.sock`. Each task's `bounded-exec`
-opens one connection to it per process and asks on it for each reserved leaf,
+owned directory of the job's socket namespace, waits for its `listening` line or its end, with no bound on its start,
+since a process's start takes what the host's load makes it take and "Deadlines" bounds only what the kernel completes
+whatever the peer's load, and publishes the socket in `MBX_RESERVATIONS_SOCKET`, which every task inherits. Its
+`postTasksExecution` closes the endpoint's standard input, which ends it with every grant it still serves. The endpoint
+lives as long as the run's client: Nx runs the plugin's task hooks in the process that runs the tasks, never in a daemon
+(`patches/README.md`, "A run's task hooks run in its own process"), so the endpoint is a child of that run that ends
+with it (14_nix.md, "mbx"), and a daemon that stops under the run (`patches/README.md`, "A job's client never starts a
+daemon") takes no endpoint along. Run in the daemon, the endpoint was the daemon's child and ended with it: a land gate
+whose daemon stopped mid-run on 2026-11-09 failed each later reserved leaf with `connect ENOENT …/mbx-r-*/r.sock`. Each
+task's `bounded-exec` opens one connection to it per process and asks on it for each reserved leaf,
 `{"type":"reserve","id":n,"cpus":c,"priority":p}`; the answer is the cores granted, and the leaf's end releases them
 (`{"type":"release","id":n}`) once its subtree is retired (11_shell.md, "Job admission and class placement"). A request
 carries only the fields the host's installed mbx accepts, since the endpoint is the host's mbx ("Pool selection and

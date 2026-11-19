@@ -176,27 +176,24 @@ async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
   return { ok: true, endpoint, socket };
 }
 
-/** Null once the endpoint's first line is `listening`; otherwise why not, within the control-plane bound. */
+/**
+ * Null once the endpoint's first line is `listening`; otherwise why not: the line it said instead, or how it ended.
+ * The wait has no bound of its own. The endpoint is this run's child, so its end is an event the run reads, and how
+ * long a process takes to start is the host's load, which no control bound covers (specs/cowshed/05_gateway.md,
+ * "Deadlines": a bound covers what "the kernel completes whatever the peer's load").
+ */
 function saysListening(stdout: Readable, ended: Promise<string>): Promise<string | null> {
   return new Promise<string | null>((resolve) => {
     let text = '';
-    const timer = setTimeout(
-      () => resolve(`mbx reservations did not say it was listening within ${CONTROL_MS}ms`),
-      CONTROL_MS,
-    );
     stdout.setEncoding('utf8');
     stdout.on('data', (chunk: string) => {
       text += chunk;
       const end = text.indexOf('\n');
       if (end === -1) return;
-      clearTimeout(timer);
       const line = text.slice(0, end);
       resolve(line === 'listening' ? null : `mbx reservations said ${JSON.stringify(line)}, not that it was listening`);
     });
-    void ended.then((why) => {
-      clearTimeout(timer);
-      resolve(why);
-    });
+    void ended.then(resolve);
   });
 }
 
