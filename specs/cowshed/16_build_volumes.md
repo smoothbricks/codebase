@@ -1015,9 +1015,9 @@ is a `workspace-reseed` timing span (`capture`, `ready`, `source-mtimes`, `seal`
   succeeds; `directory_a_reseed_leaves_no_unit_newer_than_a_workspace_input_of_other_bytes`: a workspace edit made
   before the target's build and a target rewrite the workspace lacks, both older than the seed's unit, are newer than it
   after the reseed, and an input of equal bytes takes the target's time.
-- **Target selection enforced by**: `real_apfs_reseed_uses_main_only_after_its_recorded_parent_is_gone`: a dirty unit
-  uses its lane's seed while the lane is present, refuses while the lane is detached, and uses main's seed after
-  retirement, reporting the reason without changing the unit's source bytes or Git state.
+- **Target selection enforced by**: `only_verified_non_main_parent_absence_selects_main_for_reseed`: a mounted parent
+  supplies its own identity, detached and unpublished parents refuse, only verified absence of a non-main parent selects
+  main, and lookup failures propagate intact. The build-swap and mtime cases above cover the rest of reseed.
 
 ## Land: `cowshed land`
 

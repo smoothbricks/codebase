@@ -16156,46 +16156,55 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .forked_from
             .clone()
             .unwrap_or_else(WorkspaceName::main);
-        let (target, target_current, missing_fork_parent) = match self.current(&fork_parent).await {
-            Ok(parent) => (fork_parent, parent, None),
+        use super::build_volumes::{
+            Owner, ReseedParent, require_reseed_mount, select_reseed_target,
+        };
+        let parent = match self.current(&fork_parent).await {
+            Ok(parent) => Ok(ReseedParent::Published {
+                owner: Owner {
+                    name: fork_parent.clone(),
+                    incarnation: parent.derived.workspace.incarnation().clone(),
+                },
+                mount: parent.derived.mount_state,
+            }),
             Err(error) if !fork_parent.is_main() && error.code == ErrorCode::NotFound => {
-                // A published lookup also excludes pending images. Only absence of the
-                // canonical image, not an unpublished or unreadable parent, permits main.
+                // A published lookup also excludes pending images. Read canonical evidence before
+                // deciding whether the parent is absent.
                 let host = self.substrate.shared_host();
                 let repo = self.descriptor.repo_id.clone();
                 let name = fork_parent.clone();
-                let record = crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::storage::lifecycle::dispatch_blocking(move || {
                     host.canonical_metadata(&repo, &name)
                 })
                 .await
                 .map_err(|error| {
                     CowshedError::internal(format!("reseed parent metadata task failed: {error}"))
                 })?
-                .map_err(native_storage_error)?;
-                if record.is_some() {
-                    return Err(CowshedError::conflict(
-                        format!(
-                            "{workspace}'s fork parent {fork_parent} has a canonical image but no published workspace snapshot"
-                        ),
-                        format!(
-                            "cowshed doctor --json; retry `cowshed reseed {workspace}` once {fork_parent} is published"
-                        ),
-                    ));
-                }
-                let main = WorkspaceName::main();
-                let main_current = self.current(&main).await?;
-                (main, main_current, Some(fork_parent))
+                .map_err(native_storage_error)
+                .map(|record| match record {
+                    Some(_) => ReseedParent::Unpublished,
+                    None => ReseedParent::Absent,
+                })
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         };
-        if !mounted(&target_current) {
-            return Err(CowshedError::conflict(
-                format!(
-                    "{workspace}'s target {target} is detached, so its seed and checkout cannot be read"
-                ),
-                format!("cowshed attach {target}, then retry `cowshed reseed {workspace}`"),
-            ));
-        }
+        let (target_owner, missing_fork_parent) =
+            match select_reseed_target(&workspace, &fork_parent, parent)? {
+                Some(owner) => (owner, None),
+                None => {
+                    let main = WorkspaceName::main();
+                    let snapshot = self.current(&main).await?;
+                    require_reseed_mount(&workspace, &main, &snapshot.derived.mount_state)?;
+                    (
+                        Owner {
+                            name: main,
+                            incarnation: snapshot.derived.workspace.incarnation().clone(),
+                        },
+                        Some(fork_parent),
+                    )
+                }
+            };
+        let target = target_owner.name.clone();
         let checkout = self.workspace_mount_path(&workspace)?;
         let target_checkout = self.workspace_mount_path(&target)?;
         let volumes = self.build_volumes()?;
@@ -16222,10 +16231,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let reseeded = volumes
             .reseed_workspace(super::build_volumes::ReseedPlan {
                 workspace: replaced,
-                target: super::build_volumes::Owner {
-                    name: target.clone(),
-                    incarnation: target_current.derived.workspace.incarnation().clone(),
-                },
+                target: target_owner,
                 target_checkout,
                 target_lock,
                 paths,

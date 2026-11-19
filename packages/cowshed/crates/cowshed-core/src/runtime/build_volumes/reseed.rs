@@ -20,8 +20,10 @@ use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, BuildVolumeState,
     Registrant, cargo, link, nx,
 };
+use crate::metadata::WorkspaceName;
 use crate::storage::apfs::ApfsStorageError;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRelease};
+use crate::storage::lifecycle::MountState;
 use crate::{CowshedError, Result};
 use cowshed_apfs::store_lock::LockMode;
 
@@ -60,6 +62,103 @@ pub(crate) fn main_reseed_refusal() -> CowshedError {
     )
 }
 
+/// The lookup evidence for a reseed's recorded parent. Only verified canonical absence is `Absent`.
+#[derive(Debug)]
+pub(crate) enum ReseedParent {
+    Published { owner: Owner, mount: MountState },
+    Unpublished,
+    Absent,
+}
+
+/// A published target must be mounted to supply its build link and source mtimes.
+pub(crate) fn require_reseed_mount(
+    workspace: &WorkspaceName,
+    target: &WorkspaceName,
+    mount: &MountState,
+) -> Result<()> {
+    if !matches!(mount, MountState::Mounted { .. }) {
+        return Err(CowshedError::conflict(
+            format!(
+                "{workspace}'s target {target} is detached, so its seed and checkout cannot be read"
+            ),
+            format!("cowshed attach {target}, then retry `cowshed reseed {workspace}`"),
+        ));
+    }
+    Ok(())
+}
+
+/// Decide from the recorded parent's lookup: `None` directs the shell to look up main instead.
+pub(crate) fn select_reseed_target(
+    workspace: &WorkspaceName,
+    parent: &WorkspaceName,
+    observed: Result<ReseedParent>,
+) -> Result<Option<Owner>> {
+    match observed? {
+        ReseedParent::Published { owner, mount } => {
+            require_reseed_mount(workspace, parent, &mount)?;
+            Ok(Some(owner))
+        }
+        ReseedParent::Unpublished => Err(CowshedError::conflict(
+            format!(
+                "{workspace}'s fork parent {parent} has a canonical image but no published workspace snapshot"
+            ),
+            format!(
+                "cowshed doctor --json; retry `cowshed reseed {workspace}` once {parent} is published"
+            ),
+        )),
+        ReseedParent::Absent if !parent.is_main() => Ok(None),
+        ReseedParent::Absent => Err(CowshedError::not_found(
+            format!("workspace {parent} does not exist"),
+            "cowshed ls",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ErrorCode, metadata::WorkspaceIncarnation};
+    use proptest::prelude::*;
+
+    //#region smoo/cowshed!n/workspace-reseed
+    proptest! {
+        #[test]
+        fn only_verified_non_main_parent_absence_selects_main_for_reseed(
+            label in "lane-[a-z0-9]{1,8}",
+            incarnation in "[a-f0-9]{32}",
+            mount_id in any::<u64>(),
+            error in prop_oneof![
+                Just(CowshedError::environment_missing("read failed", "repair the store")),
+                Just(CowshedError::integrity("invalid metadata", "repair the workspace")),
+                Just(CowshedError::conflict("parent is busy", "wait for its work to finish")),
+                Just(CowshedError::not_found("no published parent", "cowshed ls")),
+            ],
+        ) {
+            let workspace = WorkspaceName::new("unit").unwrap();
+            let parent = WorkspaceName::new(label).unwrap();
+            let owner = Owner { name: parent.clone(), incarnation: WorkspaceIncarnation::new(incarnation).unwrap() };
+            let mounted = select_reseed_target(&workspace, &parent,
+                Ok(ReseedParent::Published { owner: owner.clone(), mount: MountState::Mounted { mount_id } }),
+            ).unwrap().expect("a mounted parent stays selected");
+            prop_assert_eq!(mounted, owner.clone());
+
+            let detached = select_reseed_target(&workspace, &parent,
+                Ok(ReseedParent::Published { owner, mount: MountState::Detached }),
+            ).unwrap_err();
+            prop_assert_eq!(detached.code, ErrorCode::Conflict);
+            let attach = format!("cowshed attach {parent}");
+            prop_assert!(detached.hint.contains(&attach));
+            let unpublished = select_reseed_target(&workspace, &parent, Ok(ReseedParent::Unpublished)).unwrap_err();
+            prop_assert_eq!(unpublished.code, ErrorCode::Conflict);
+
+            prop_assert!(select_reseed_target(&workspace, &parent, Ok(ReseedParent::Absent)).unwrap().is_none());
+            let main = WorkspaceName::main();
+            prop_assert_eq!(select_reseed_target(&workspace, &main, Ok(ReseedParent::Absent)).unwrap_err().code, ErrorCode::NotFound);
+            prop_assert_eq!(select_reseed_target(&workspace, &parent, Err(error.clone())).unwrap_err(), error);
+        }
+    }
+    //#endregion smoo/cowshed!n/workspace-reseed
+}
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
     /// Replace the build volume `plan`'s workspace links with what a fork of its target is given
     /// now (16_build_volumes.md, "Reseed"), leaving its source image, branch, uncommitted files and

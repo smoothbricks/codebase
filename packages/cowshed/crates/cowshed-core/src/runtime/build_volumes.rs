@@ -53,7 +53,9 @@ pub(crate) use compaction::{
     Admission, CompactionTurn, Published, SEED_COMPACTION_CATCH_UPS, SEED_COMPACTION_EXTENTS,
     SEED_COMPACTION_WAIT,
 };
-pub(crate) use reseed::{ReseedPlan, main_reseed_refusal};
+pub(crate) use reseed::{
+    ReseedParent, ReseedPlan, main_reseed_refusal, require_reseed_mount, select_reseed_target,
+};
 pub(crate) use seed_move::ReplacedWorkspace;
 pub(crate) use source_mtimes::{Harmonized, SourcePaths};
 
