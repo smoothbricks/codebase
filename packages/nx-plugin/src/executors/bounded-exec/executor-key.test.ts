@@ -74,6 +74,7 @@ function keyedModules(): string[] {
  * pool environment, the mbx leaf wrapping, the command line (schema.ts), the verdict and its test results.
  */
 const KEYED = [
+  'executors/bounded-exec/awake-clock.ts',
   'executors/bounded-exec/bounds.ts',
   'executors/bounded-exec/child-exit-diagnostics.ts',
   'executors/bounded-exec/cpu-rise.ts',
