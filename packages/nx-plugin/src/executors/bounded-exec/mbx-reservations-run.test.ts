@@ -28,7 +28,8 @@ afterAll(() => installation.retire());
 
 /**
  * `mbx reservations <socket>` at its command line: it records its pid and every reserve it hears, grants each one
- * core, and ends when its standard input ends, as mbx's does. Any other mbx command is refused.
+ * core, answers a request it does not know with an error that closes the connection, and ends when its standard
+ * input ends, as mbx's does. Any other mbx command is refused.
  */
 const standInMbx = (endpoints: string, heard: string) => `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');
@@ -48,7 +49,11 @@ const server = createServer((client) => {
     for (let end = text.indexOf('\\n'); end !== -1; end = text.indexOf('\\n')) {
       const line = JSON.parse(text.slice(0, end));
       text = text.slice(end + 1);
-      if (line.type !== 'reserve') continue;
+      if (line.type === 'release') continue;
+      if (line.type !== 'reserve') {
+        client.end(JSON.stringify({ type: 'error', error: 'unknown request type ' + line.type }) + '\\n');
+        return;
+      }
       appendFileSync(${JSON.stringify(heard)}, line.cpus + '\\n');
       client.write(JSON.stringify({ type: 'granted', id: line.id, cpus: 1 }) + '\\n');
     }
