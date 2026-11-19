@@ -471,32 +471,47 @@ re-hashes only one whose stat moved; a moved link, and at most once per safety i
 in the background, which finds a file added beside them and restarts the daemon when a file changed. Only changed bytes
 restart the daemon (`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files, or a link moved to a copy with
 the same bytes, keeps it. A plugin package installed inside the workspace changes only with its lockfile and is not
-watched this way. A local plugin — one whose entry resolves to source inside the checkout, outside `node_modules` —
-reloads its worker instead of the daemon:
+watched this way. A local plugin is one whose entry resolves to source inside the checkout, outside `node_modules`. A
+module loaded into a process cannot be evicted: purging `require.cache` does not unload an ESM module, so a local plugin
+would keep serving the code it first loaded after its source changed. Where it loads decides what a change to it
+replaces:
 
-A local plugin is always loaded in a plugin worker, even under `NX_ISOLATE_PLUGINS=false`, because a module loaded into
-the daemon's own process cannot be evicted: purging `require.cache` does not unload an ESM module, so an in-process
-local plugin would keep serving the code it first loaded after its source changed. Installed plugins keep whatever the
-isolation setting already gives them. For a local plugin there is no in-process fallback: a worker that cannot start or
-be reached fails the load with the existing worker-startup error, because an in-process copy could never be evicted and
-would silently break the reload this section promises. An installed plugin keeps its existing fallback. Before it loads
-the plugin, the worker registers a Node load hook and records every file under the checkout the loader actually loads
-for it — the entry and its transitive static, lazy and computed dynamic imports, CJS and ESM alike, `node_modules`
-excluded — with a digest of each source as loaded. That record is the plugin's closure: no static import walk re-derives
-it, and nothing hashes the repository. When a closure is first registered, the daemon compares each digest against the
-file's current bytes once, so a file changed between the worker loading it and the registration is already stale instead
-of being served until its next change. From then on, every watcher batch reaches the decision already content-filtered,
-the native workspace context having dropped same-byte rewrites when it hashed the batch. The changed paths are
-intersected with each local plugin's closure — a pure decision, which changed paths reload which plugin — and only a
-plugin whose closure they touch has its worker retired and reloaded and the cached plugin set's identity generation
-advanced, so the recompute that batch already schedules builds the graph from the new code. On Nx 24 the retired worker
-leaves Nx's isolated-plugin cache, so that recompute's load starts a new worker for that plugin alone and reuses every
-other plugin's. A closure member under an ignored path never reaches that filtered batch, so an observed member like it
-is judged on the raw watcher stream (the context's watch events) instead: the event's file is compared with the digest
-recorded when the worker loaded it, the same bytes keep the worker, and changed bytes retire it and invalidate the
-graph. Only ignored closure members are judged this way, each against its own recorded digest; no other file is hashed
-for it. The daemon itself is not restarted and keeps its process; every other plugin keeps the worker and state it had.
-Bun has no module customization hooks, so a daemon whose CLI runs under Bun spawns these workers with the `node` on PATH
+- **A Node daemon with isolation off (`NX_ISOLATE_PLUGINS=false`) holds every local plugin in its own process**, as it
+  holds the installed ones, and starts no worker (`holdLocalPlugin`). The daemon registers the Node load hook once and
+  keeps one closure for all of them: every file under the checkout the loader loads, `node_modules` excluded, with a
+  digest of each source as loaded. A watcher batch that touches the closure, or a raw event for an ignored member whose
+  bytes differ from its digest, restarts the daemon (`LOCAL_PLUGIN_CHANGED`) as a lockfile change does: a client waiting
+  on it reconnects to the successor and resends, and a kept daemon stops for its keeper to start the next. A local
+  plugin whose load failed may have left a module behind, so the next source change of any file restarts that daemon
+  too. Each resident worker is a process and its heap for the daemon's whole life, once per checkout and per shed, and a
+  plugin source changes rarely. `nx-daemon-validity.test.ts` starts such a daemon over a CJS and an ESM local plugin,
+  requires that it has no child process, and requires a successor serving the new code after a tracked and after an
+  ignored helper changes.
+- **Every other process loads a local plugin in a plugin worker**, whatever the isolation setting: a daemon with
+  isolation on, a daemon whose CLI runs under Bun (Bun has no module customization hooks, so nothing there can observe
+  what a plugin loaded), and a client with no daemon, which cannot answer a change by restarting. There a local plugin
+  reloads its worker instead of the daemon, as the rest of this section describes.
+
+Installed plugins keep whatever the isolation setting already gives them. For a local plugin in a worker there is no
+in-process fallback: a worker that cannot start or be reached fails the load with the existing worker-startup error,
+because an in-process copy could never be evicted and would silently break the reload this section promises. An
+installed plugin keeps its existing fallback. Before it loads the plugin, the worker registers a Node load hook and
+records every file under the checkout the loader actually loads for it — the entry and its transitive static, lazy and
+computed dynamic imports, CJS and ESM alike, `node_modules` excluded — with a digest of each source as loaded. That
+record is the plugin's closure: no static import walk re-derives it, and nothing hashes the repository. When a closure
+is first registered, the daemon compares each digest against the file's current bytes once, so a file changed between
+the worker loading it and the registration is already stale instead of being served until its next change. From then on,
+every watcher batch reaches the decision already content-filtered, the native workspace context having dropped same-byte
+rewrites when it hashed the batch. The changed paths are intersected with each local plugin's closure — a pure decision,
+which changed paths reload which plugin — and only a plugin whose closure they touch has its worker retired and reloaded
+and the cached plugin set's identity generation advanced, so the recompute that batch already schedules builds the graph
+from the new code. On Nx 24 the retired worker leaves Nx's isolated-plugin cache, so that recompute's load starts a new
+worker for that plugin alone and reuses every other plugin's. A closure member under an ignored path never reaches that
+filtered batch, so an observed member like it is judged on the raw watcher stream (the context's watch events) instead:
+the event's file is compared with the digest recorded when the worker loaded it, the same bytes keep the worker, and
+changed bytes retire it and invalidate the graph. Only ignored closure members are judged this way, each against its own
+recorded digest; no other file is hashed for it. The daemon itself is not restarted and keeps its process; every other
+plugin keeps the worker and state it had. A daemon whose CLI runs under Bun spawns these workers with the `node` on PATH
 rather than its own executable. `nx-daemon-validity.test.ts` walks the reload end to end in one daemon: a CJS and an ESM
 local plugin whose helpers change, and a third local plugin that must not reload.
 

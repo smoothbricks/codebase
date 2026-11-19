@@ -201,6 +201,13 @@ function nx(workspace: string, env: Record<string, string>, ...args: string[]): 
   return result.stdout;
 }
 
+/** Runs the installed nx under Node, as a consumer's shell does: a daemon this client starts is a Node process. */
+function nodeNx(workspace: string, env: Record<string, string>, ...args: string[]): string {
+  const result = spawnSync('node', [nxEntry, ...args], { cwd: workspace, env, encoding: 'utf8' });
+  expect(result.status, `node nx ${args.join(' ')} failed:\n${result.stdout}\n${result.stderr}`).toBe(0);
+  return result.stdout;
+}
+
 /** A fixture-owned `node_modules`: every entry links to the repository's, except `nx`, which links to `nxPackage`. */
 async function linkedModules(workspace: string, nxPackage: string): Promise<void> {
   const modules = join(workspace, 'node_modules');
@@ -1144,8 +1151,8 @@ it('restarts a daemon once a file a linked plugin publishes changes its bytes, i
 /**
  * A plugin that lives in the checkout is part of the graph's identity: once a file it loaded changes, the same daemon
  * must serve a graph from the new code, with no reset and no restart, and a local plugin none of whose files changed
- * must not be reloaded either. The fixture environment sets NX_ISOLATE_PLUGINS=false, so the walk also proves a local
- * plugin is never kept in the daemon's own process, where a loaded ESM module cannot be evicted at all. The ESM plugin's
+ * must not be reloaded either. The fixture's daemon runs under Bun, which cannot observe a process's module loads, so
+ * it keeps its local plugins in workers although the fixture environment sets NX_ISOLATE_PLUGINS=false. The ESM plugin's
  * helper sits under an ignored directory: no content-filtered watcher batch ever reports it, so its change can only
  * be judged on the raw watcher stream, against the digest recorded when the worker loaded it.
  */
@@ -1284,6 +1291,83 @@ it('reloads only the local plugins whose loaded files changed, in the same daemo
   );
 });
 
+/**
+ * With isolation off, a Node daemon holds its local plugins in its own process: each plugin records the pid of the
+ * process that loaded it, and that pid is the daemon's, so no worker loaded it. A module the daemon loaded cannot be
+ * evicted, so a change to a file a local plugin loaded, tracked or ignored, restarts the daemon, and the next graph
+ * request is answered by a successor that runs the new code.
+ */
+it('holds local plugins in a Node daemon whose isolation is off, and restarts it when a file they loaded changes', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-held-plugin-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      const tooling = join(workspace, 'tooling');
+      await mkdir(tooling);
+      await mkdir(join(tooling, 'ignored'));
+      await writeFile(join(workspace, '.gitignore'), 'tooling/ignored/\n');
+      await writeFile(
+        join(tooling, 'cjs-plugin.cjs'),
+        cjsLocalPlugin('local-cjs-plugin', './cjs-helper.cjs', 'cjs-evals.log') +
+          "require('node:fs').writeFileSync(require('node:path').join(__dirname, 'cjs-loader.pid'), String(process.pid));\n",
+      );
+      await writeFile(
+        join(tooling, 'esm-plugin.mjs'),
+        ESM_LOCAL_PLUGIN +
+          "import { writeFileSync } from 'node:fs';\n" +
+          "writeFileSync(join(dirname(fileURLToPath(import.meta.url)), 'esm-loader.pid'), String(process.pid));\n",
+      );
+      await writeFile(join(tooling, 'bridge.mjs'), ESM_BRIDGE);
+      await writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-one'));
+      await writeFile(join(tooling, 'ignored', 'esm-helper.mjs'), esmLocalHelper('esm-one'));
+      await writeFile(
+        join(workspace, 'nx.json'),
+        JSON.stringify({ plugins: ['./tooling/cjs-plugin.cjs', './tooling/esm-plugin.mjs'] }),
+      );
+      const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true', NX_ISOLATE_PLUGINS: 'false' };
+      const targets = (): string[] => {
+        const shown = nodeNx(workspace, env, 'show', 'project', 'p', '--json');
+        const json = shown.trim().split('\n').at(-1) ?? '';
+        return Object.keys(typia.json.assertParse<ShownProject>(json).targets).sort();
+      };
+      const loaders = async (): Promise<number[]> =>
+        Promise.all(
+          ['cjs-loader.pid', 'esm-loader.pid'].map(async (file) => Number(await readFile(join(tooling, file), 'utf8'))),
+        );
+
+      nodeNx(workspace, env, 'daemon', '--start');
+      const record = await daemonRecord(workspace);
+      if (record === null) throw new Error('nx daemon --start left no daemon record');
+      const first = await readyDaemon(workspace, record);
+      expect(targets(), 'the first graph does not come from the two local plugins').toEqual(['cjs-one', 'esm-one']);
+      expect(await loaders(), 'a daemon whose isolation is off loaded a local plugin in another process').toEqual([
+        first.record.processId,
+        first.record.processId,
+      ]);
+
+      const second = await restarted(workspace, first, "a held CJS plugin's helper changing", () =>
+        writeFile(join(tooling, 'cjs-helper.cjs'), cjsLocalHelper('cjs-two')),
+      );
+      expect(targets(), 'the graph after the CJS helper changed still comes from the old plugin code').toEqual([
+        'cjs-two',
+        'esm-one',
+      ]);
+      expect(await loaders(), 'the successor loaded a local plugin in another process').toEqual([
+        second.record.processId,
+        second.record.processId,
+      ]);
+
+      await restarted(workspace, second, "a held ESM plugin's ignored helper changing", () =>
+        writeFile(join(tooling, 'ignored', 'esm-helper.mjs'), esmLocalHelper('esm-two')),
+      );
+      expect(targets(), 'the graph after the ignored ESM helper changed still comes from the old module').toEqual([
+        'cjs-two',
+        'esm-two',
+      ]);
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
 it('keeps an idle daemon off the lockfiles, record, and socket between its safety polls', async () => {
   await withNxFixture(
     'nx-daemon-validity-idle-',

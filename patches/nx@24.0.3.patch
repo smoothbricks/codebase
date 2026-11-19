@@ -1806,7 +1806,7 @@ index 63638e921d68af659ca03f65e82a98c1e2e3f853..b329afc3da3053a3460c44c6ae671304
   * Applies changes a caller learned of on its own to the workspace context,
   * then schedules the recomputation as for a batch the context applied.
 diff --git a/dist/src/daemon/server/project-graph-incremental-recomputation.js b/dist/src/daemon/server/project-graph-incremental-recomputation.js
-index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..8e3192fef166f49c246aef0ff87b4084683cb840 100644
+index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..af5865170398b5da1cd43ef4f1e6118e1d77a12b 100644
 --- a/dist/src/daemon/server/project-graph-incremental-recomputation.js
 +++ b/dist/src/daemon/server/project-graph-incremental-recomputation.js
 @@ -4,6 +4,7 @@ exports.currentSourceMaps = exports.currentProjectGraph = exports.currentProject
@@ -1850,7 +1850,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..8e3192fef166f49c246aef0ff87b4084
  }
  async function getCachedSerializedProjectGraphPromise(socket) {
      // Subscribe the requesting client to the graph-construction topic
-@@ -238,13 +240,18 @@ function summarize(files) {
+@@ -238,11 +240,18 @@ function summarize(files) {
  }
  /**
   * Takes in changes the workspace context handed out: restarts the daemon if
@@ -1865,13 +1865,13 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..8e3192fef166f49c246aef0ff87b4084
 +        const changed = (0, restart_checks_1.changedPaths)(batch);
 +        if ((0, restart_checks_1.restartDaemonIfIgnoreFilesChanged)(changed) ||
 +            (0, restart_checks_1.restartDaemonIfLockFilesChanged)(changed)) {
++            return;
++        }
++        if ((0, local_plugin_source_1.invalidateLocalPluginSources)(workspace_root_1.workspaceRoot, changed)) {
              return;
          }
-+        (0, local_plugin_source_1.invalidateLocalPluginSources)(workspace_root_1.workspaceRoot, changed);
          logger_1.serverLogger.watcherLog(`File changes detected (seq ${batch.seq}):\n` +
-             `Created:\n${summarize((0, restart_checks_1.fileNames)(batch.createdFiles))}\n` +
-             `Updated:\n${summarize((0, restart_checks_1.fileNames)(batch.updatedFiles))}\n` +
-@@ -268,6 +275,22 @@ async function flushPendingWorkspaceChanges() {
+@@ -268,6 +277,22 @@ async function flushPendingWorkspaceChanges() {
      }
      routeAppliedChanges(batch);
  }
@@ -1895,7 +1895,7 @@ index 8f441c4d4258be48c9080b4ae200bf1c0034f3f1..8e3192fef166f49c246aef0ff87b4084
   * Applies changes a caller learned of on its own to the workspace context,
   * then schedules the recomputation as for a batch the context applied.
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
-index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178ccec8fbe42f 100644
+index e99e10b616b35b81b1060b25eeb0acc2351c4776..66d6e21694a0a8607e7841167dd8d31c2776a5bc 100644
 --- a/dist/src/daemon/server/restart-checks.d.ts
 +++ b/dist/src/daemon/server/restart-checks.d.ts
 @@ -1,6 +1,6 @@
@@ -1906,7 +1906,7 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178cce
  /**
   * The daemon's own process file, workspace-relative. It lives under the
   * hardcoded-ignored .nx/workspace-data, so the watch admits it explicitly;
-@@ -15,8 +15,24 @@ export declare function changedPaths(batch: ChangeBatch): string[];
+@@ -15,8 +15,25 @@ export declare function changedPaths(batch: ChangeBatch): string[];
   * needs a daemon restart to take effect. True when it stopped the daemon.
   */
  export declare function restartDaemonIfIgnoreFilesChanged(paths: string[]): boolean;
@@ -1922,6 +1922,7 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178cce
 +export declare function registerDaemonForRestartChecks(server: Server, sockets: Iterable<Socket>, socketPath: string): void;
 +export declare function recordInstallationBaseline(): Promise<void>;
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
++export declare function restartDaemonForLocalPlugins(): void;
  /**
   * Stops this daemon when the events show another process has written the
   * daemon's process file. True when it stopped the daemon.
@@ -1932,10 +1933,10 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..e94e74921349d081353fc14498178cce
 +/** Stops the daemon, naming `reason` in its log: its file watcher stopped delivering. */
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
-index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900b0bdac05 100644
+index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc0805f8e936 100644
 --- a/dist/src/daemon/server/restart-checks.js
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -1,22 +1,46 @@
+@@ -1,22 +1,47 @@
  "use strict";
  Object.defineProperty(exports, "__esModule", { value: true });
 -exports.relativeServerProcess = void 0;
@@ -1943,6 +1944,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900
  exports.registerDaemonForRestartChecks = registerDaemonForRestartChecks;
 +exports.recordInstallationBaseline = recordInstallationBaseline;
 +exports.restartDaemonIfLockFilesChanged = restartDaemonIfLockFilesChanged;
++exports.restartDaemonForLocalPlugins = restartDaemonForLocalPlugins;
 +exports.stopDaemonIfReplaced = stopDaemonIfReplaced;
 +exports.stopDaemonIfOutdated = stopDaemonIfOutdated;
 +exports.stopDaemonIfWorkspaceGone = stopDaemonIfWorkspaceGone;
@@ -1988,7 +1990,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900
  /**
   * The daemon's own process file, workspace-relative. It lives under the
   * hardcoded-ignored .nx/workspace-data, so the watch admits it explicitly;
-@@ -45,6 +69,8 @@ const IGNORE_FILE_NAMES = ['.gitignore', '.nxignore'];
+@@ -45,6 +70,8 @@ const IGNORE_FILE_NAMES = ['.gitignore', '.nxignore'];
   * needs a daemon restart to take effect. True when it stopped the daemon.
   */
  function restartDaemonIfIgnoreFilesChanged(paths) {
@@ -1997,7 +1999,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900
      for (const path of paths) {
          const basename = path.slice(path.lastIndexOf('/') + 1);
          if (IGNORE_FILE_NAMES.includes(basename)) {
-@@ -54,24 +80,445 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
+@@ -54,24 +81,451 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
      }
      return false;
  }
@@ -2350,6 +2352,12 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..94c06c88dfac8df73dd1c12f5c09b900
 +    restartDaemon('LINKED_PLUGIN_CHANGED', notice);
 +}
 +// Applied paths have been hashed by the native workspace context; same-byte
++// A local plugin this daemon loaded into its own process cannot be evicted, so
++// a change to a file it loaded restarts the daemon. Clients wait for the
++// successor and resend, as after a lockfile change.
++function restartDaemonForLocalPlugins() {
++    restartDaemon('LOCAL_PLUGIN_CHANGED');
++}
 +// rewrites were dropped already. No lockfile is read on this watcher path.
 +function restartDaemonIfLockFilesChanged(paths) {
 +    if (!paths.some((path) => LOCK_FILE_NAMES.includes(path))) {
@@ -4205,7 +4213,7 @@ index 93f05fdfa622883efbb45dba383fd419938a605c..34ec5d92356d4262c233dfbef88804a0
   * Returns specified plugins (from nx.json) and default plugins (project.json,
   * package.json, etc.) as separate arrays. This separation is needed for
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca92d014885 100644
+index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddda3152a6b 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
 @@ -4,6 +4,7 @@ exports.loadingMethod = void 0;
@@ -4226,13 +4234,15 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
  /**
   * Stuff for specified NX Plugins.
   */
-@@ -65,11 +69,11 @@ function resetIsolationFallbackForTesting() {
+@@ -65,11 +69,13 @@ function resetIsolationFallbackForTesting() {
      isolationRefusedInThisProcess = false;
  }
  /**
 - * Loads a plugin in a worker, falling back to this process when the worker's
 - * socket was refused.
-+ * Loads local source in restartable workers. Installed plugins follow the
++ * Loads local source where a change to it can take effect: in restartable
++ * workers, or, in a daemon with isolation off, in the daemon's own process,
++ * which restarts when a file it loaded changes. Installed plugins follow the
 + * isolation setting and may fall back to this process on worker socket refusal.
   *
 - * Isolation is preferred: it is what keeps two plugins with conflicting
@@ -4242,7 +4252,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
   * been told about the Nx socket root refuses the worker's socket, and failing
   * the whole command over that is worse than running the plugins here. The
   * fallback is narrow on purpose. It needs a failure to start or reach the
-@@ -80,15 +84,30 @@ function resetIsolationFallbackForTesting() {
+@@ -80,15 +86,34 @@ function resetIsolationFallbackForTesting() {
   * error.
   */
  const loadingMethod = async (plugin, root, index) => {
@@ -4256,11 +4266,15 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
 +        throw new error_types_1.LoadPluginError(moduleName, error);
 +    }
 +    const local = (0, local_plugin_source_1.localPluginPath)(root, resolved.pluginPath) !== null;
-+    // ESM modules cannot be evicted in-process. Local source therefore needs a
-+    // restartable worker even when installed plugins run in this process.
 +    if (!local && (!(0, enabled_1.isIsolationEnabled)() || isolationRefusedInThisProcess)) {
          return (0, in_process_loader_1.loadNxPlugin)(plugin, root, index);
      }
++    // ESM modules cannot be evicted in-process. A daemon with isolation off
++    // holds local source itself and restarts when it changes; every other
++    // process needs a restartable worker.
++    if (local && !(0, enabled_1.isIsolationEnabled)() && (0, local_plugin_source_1.canHoldLocalPlugins)()) {
++        return (0, local_plugin_source_1.holdLocalPlugin)(root, () => (0, in_process_loader_1.loadNxPlugin)(plugin, root, index), () => require('../../daemon/server/restart-checks').restartDaemonForLocalPlugins());
++    }
      // Awaited here rather than handed on, because the worker failure surfaces on
      // this promise and the fallback has to happen before the caller sees it.
      try {
@@ -4268,14 +4282,14 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
 +        return await (0, isolation_1.loadIsolatedNxPlugin)(plugin, root, index, resolved);
      }
      catch (e) {
-+        // A local plugin loaded here could never be evicted, so it has no fallback.
++        // A local plugin's worker is its reload, so it has no fallback.
 +        if (local) {
 +            throw e;
 +        }
          // Proof, kept separate from policy. The errno the worker saw is what makes
          // the message certain; whether that errno is also grounds for degrading is a
          // different question, and conflating them made the warning assert a sandbox
-@@ -127,6 +146,13 @@ const loadingMethod = async (plugin, root, index) => {
+@@ -127,6 +152,13 @@ const loadingMethod = async (plugin, root, index) => {
      }
  };
  exports.loadingMethod = loadingMethod;
@@ -4289,7 +4303,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
  /**
   * Returns all plugins (specified + default) as a flat list.
   * Specified plugins come first, followed by default plugins.
-@@ -147,8 +173,8 @@ async function getPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
+@@ -147,8 +179,8 @@ async function getPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
   */
  async function getPluginsSeparated(nxJson, root = workspace_root_1.workspaceRoot) {
      const pluginsConfiguration = nxJson.plugins ?? [];
@@ -4300,7 +4314,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
      if (cachedSeparatedPlugins &&
          pluginsConfigurationHash === currentPluginsConfigurationHash) {
          return cachedSeparatedPlugins;
-@@ -281,7 +307,9 @@ async function loadPlugins(loader, pluginConfigurations, root, assignIndexes) {
+@@ -281,7 +313,9 @@ async function loadPlugins(loader, pluginConfigurations, root, assignIndexes) {
  }
  async function capabilitiesOfConfiguredPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
      if (!(0, is_on_daemon_1.isOnDaemon)() && (0, client_1.isDaemonEnabled)()) {
@@ -4311,7 +4325,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
      }
      const recorded = (0, nx_plugin_capabilities_1.capabilitiesOfNxPluginsReadFromCache)();
      if (recorded) {
-@@ -311,7 +339,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+@@ -311,7 +345,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
          // Cleared so the next call retries instead of re-awaiting this rejection.
          pendingDefaultPluginPromise = undefined;
          const errorMessage = errors
@@ -4320,7 +4334,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
      }
-@@ -348,7 +376,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+@@ -348,7 +382,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
      if (errors.length > 0) {
          // Wants are not retracted: a newer load may own the declaration by now.
          const errorMessage = errors
@@ -4329,7 +4343,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..bca08e11b1daef7a6da85b7fdd4dbca9
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
      }
-@@ -363,6 +391,12 @@ function reasonToError(reason) {
+@@ -363,6 +397,12 @@ function reasonToError(reason) {
          if ('stack' in reason) {
              error.stack = String(reason.stack);
          }
@@ -4806,10 +4820,10 @@ index 9fa6b993ac4dbe918c163092c12f77f87eaccb27..d93538310c4dc2622cde88cd9da983bc
                              target[key] = value;
 diff --git a/dist/src/project-graph/plugins/local-plugin-source.d.ts b/dist/src/project-graph/plugins/local-plugin-source.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1a84106509d0e05a2f0d6c595b79ecc781ff21d1
+index 0000000000000000000000000000000000000000..9aaee0e0b5b3a14dacfc4ca1a618b9f1f391cc59
 --- /dev/null
 +++ b/dist/src/project-graph/plugins/local-plugin-source.d.ts
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,26 @@
 +export interface LocalPluginSourceReceipt {
 +    readonly path: string;
 +    readonly hash: string;
@@ -4828,16 +4842,20 @@ index 0000000000000000000000000000000000000000..1a84106509d0e05a2f0d6c595b79ecc7
 +export declare function recordLocalPluginSources(source: LocalPluginSource | undefined, loaded: readonly LocalPluginSourceReceipt[] | undefined): void;
 +export declare function invalidateLocalPluginSources(root: string, changedFiles: readonly string[]): void;
 +/** The paths among `paths` that a local plugin of `root` loaded, in order. */
-+export declare function localPluginSourceMembers(root: string, paths: readonly string[]): string[];
++export declare function invalidateLocalPluginSources(root: string, changedFiles: readonly string[]): boolean;
++/** Whether this process can hold local plugins in its own module cache: a Node daemon. */
++export declare function canHoldLocalPlugins(): boolean;
++/** Loads a local plugin into this process; `restart` runs once when a file its closure loaded changes. */
++export declare function holdLocalPlugin<T>(root: string, load: () => Promise<T>, restart: () => void): Promise<T>;
 +export declare function invalidateIgnoredLocalPluginSources(root: string, changedFiles: readonly string[]): boolean;
 +export declare function getLocalPluginGeneration(): number;
 +export declare function trackLocalPluginLoads(root: string): () => LocalPluginSourceReceipt[];
 diff --git a/dist/src/project-graph/plugins/local-plugin-source.js b/dist/src/project-graph/plugins/local-plugin-source.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..acc04ca3d6da95a0992bf96df3587a78b4d3098b
+index 0000000000000000000000000000000000000000..813c7134e970f00e7003a0708cc483f55c320d33
 --- /dev/null
 +++ b/dist/src/project-graph/plugins/local-plugin-source.js
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,209 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.localPluginPath = localPluginPath;
@@ -4850,12 +4868,48 @@ index 0000000000000000000000000000000000000000..acc04ca3d6da95a0992bf96df3587a78
 +exports.localPluginSourceMembers = localPluginSourceMembers;
 +exports.pluginsAffectedBySourceHashes = pluginsAffectedBySourceHashes;
 +exports.trackLocalPluginLoads = trackLocalPluginLoads;
++exports.canHoldLocalPlugins = canHoldLocalPlugins;
++exports.holdLocalPlugin = holdLocalPlugin;
 +const { createHash } = require("node:crypto");
 +const { readFileSync } = require("node:fs");
 +const { relative, resolve, sep, isAbsolute } = require("node:path");
 +const { fileURLToPath } = require("node:url");
 +const sourcesByRoot = new Map();
 +let generation = 0;
++// The one closure of every local plugin this process holds in its own module
++// cache: a daemon with isolation off. Its loads are observed as a worker's are.
++let held;
++let takeHeldLoads;
++// Only a daemon can answer a changed closure by restarting, and only Node
++// observes module loads.
++function canHoldLocalPlugins() {
++    return !!global.NX_DAEMON && !process.versions.bun && typeof require('node:module').registerHooks === 'function';
++}
++// Loads a local plugin into this process. Its closure joins the held one, and
++// `restart` runs once when a file of that closure changes. A load that failed
++// may have left a module no one can evict, so the next source change restarts.
++async function holdLocalPlugin(root, load, restart) {
++    if (!held?.active) {
++        held = createLocalPluginSource(root, restart);
++        takeHeldLoads ??= trackLocalPluginLoads(resolve(root));
++    }
++    const source = held;
++    try {
++        return await load();
++    }
++    catch (error) {
++        source.failed = true;
++        throw error;
++    }
++    finally {
++        recordHeldLoads();
++    }
++}
++// Lazy and computed imports load after the plugin did: take what the hook saw
++// before each judgment.
++function recordHeldLoads() {
++    if (held?.active) recordLocalPluginSources(held, takeHeldLoads());
++}
 +// A resolved package-manager link into workspace source is local; installed
 +// packages and links into another checkout retain their installation policy.
 +function localPluginPath(root, file) {
@@ -4926,15 +4980,22 @@ index 0000000000000000000000000000000000000000..acc04ca3d6da95a0992bf96df3587a78
 +        }
 +    }
 +}
++// True when the held closure changed: the daemon is restarting and no
++// recompute follows.
 +function invalidateLocalPluginSources(root, changedFiles) {
++    recordHeldLoads();
 +    const sources = sourcesByRoot.get(resolve(root));
-+    if (!sources) return;
++    if (!sources) return false;
 +    const affected = pluginsAffectedByChanges(sources, changedFiles);
++    if (held?.active && held.failed && changedFiles.length > 0 && !affected.includes(held)) affected.push(held);
++    const restarting = affected.includes(held);
 +    for (const source of affected) source.invalidate();
++    return restarting;
 +}
 +// The paths among `paths` that a local plugin of `root` loaded, in order.
 +function localPluginSourceMembers(root, paths) {
 +    const sources = sourcesByRoot.get(resolve(root));
++    recordHeldLoads();
 +    if (!sources) return [];
 +    return paths.filter((path) => [...sources.keys()].some((source) => source.files.has(path)));
 +}
@@ -4954,6 +5015,7 @@ index 0000000000000000000000000000000000000000..acc04ca3d6da95a0992bf96df3587a78
 +    return affected;
 +}
 +function invalidateIgnoredLocalPluginSources(root, changedFiles) {
++    recordHeldLoads();
 +    const sources = sourcesByRoot.get(resolve(root));
 +    if (!sources) return false;
 +    const currentHashes = new Map();

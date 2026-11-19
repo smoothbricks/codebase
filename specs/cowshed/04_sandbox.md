@@ -1055,17 +1055,16 @@ slow way.
 Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
 admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
 `XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. The managed shell turns Nx's plugin
-isolation off (`NX_ISOLATE_PLUGINS=false`, `tooling/direnv/devenv.smoo.nix`), so its daemon loads installed
-project-graph plugins in its own process. A plugin whose entry resolves to source inside the checkout is the one
-exception: the patched Nx always loads it in a plugin worker — the `node` on PATH where the CLI runs under Bun —
-whatever that flag says, and with no in-process fallback: a worker that cannot start fails the load rather than running
-local source in the daemon. An installed plugin keeps its existing fallback. A module loaded into the daemon's own
-process cannot be evicted (Node cannot unload an ESM module), so a local plugin loaded there would keep serving its
-first-loaded code after its source changed; in a worker, only the affected plugin is retired and reloaded once a file it
-loaded changes — a file the workspace ignores included, judged against the digest recorded when it was loaded — while
-the daemon keeps serving (`patches/README.md`, "Event-driven daemon validity"). Where isolation is on, as in a fixture
-that asks for it, and for these workers alike, socket placement is still a Cowshed runtime binding, not a per-project
-flag or filesystem grant.
+isolation off (`NX_ISOLATE_PLUGINS=false`, `tooling/direnv/devenv.smoo.nix`), so its daemon loads project-graph plugins
+in its own process and starts no plugin worker: the installed ones, and under Node also the ones whose entry resolves to
+source inside the checkout. A module loaded into the daemon's own process cannot be evicted (Node cannot unload an ESM
+module), so such a daemon restarts once a file a local plugin loaded changes, a file the workspace ignores included,
+judged against the digest recorded when it was loaded; the next request is answered by its successor. A daemon with
+isolation on, a daemon whose CLI runs under Bun and a client with no daemon load local source in a plugin worker instead
+(the `node` on PATH where the CLI runs under Bun) with no in-process fallback: a worker that cannot start fails the
+load. There only the affected plugin is retired and reloaded while the daemon keeps serving (`patches/README.md`,
+"Event-driven daemon validity"). Where isolation is on, as in a fixture that asks for it, and for these workers alike,
+socket placement is still a Cowshed runtime binding, not a per-project flag or filesystem grant.
 
 The plugins' task hooks run in the run's own client, never in its daemon, so what a `preTasksExecution` starts for the
 run (its CPU pool and reservation endpoints) is a child of the run that ends with it, and a daemon that stops under the
@@ -1074,9 +1073,10 @@ run takes none of it along (`patches/README.md`, "A run's task hooks run in its 
 say, so the environment a `preTasksExecution` publishes reaches the run's task processes whether or not the client has a
 daemon (`patches/README.md`, "Event-driven daemon validity"; `packages/nx-plugin/src/nx-local-plugin-hook-env.test.ts`).
 
-A graph-request failure, including a local plugin load refusal, is answered without stopping the daemon. A source fix
-can retry graph preparation without replacing that daemon or unrelated plugin workers. Other daemon and protocol errors
-keep their existing exit policy (`patches/README.md`, "Event-driven daemon validity").
+A graph-request failure, including a local plugin load refusal, is answered without stopping the daemon. Where local
+plugins load in workers, a source fix can retry graph preparation without replacing that daemon or unrelated plugin
+workers; a daemon that holds them itself restarts at the fix. Other daemon and protocol errors keep their existing exit
+policy (`patches/README.md`, "Event-driven daemon validity").
 
 A TypeScript fixture running inside that job keeps its workspace outside every checkout in the job's private `TMPDIR`.
 Its short socket parent alias lies in the already-admitted runtime namespace and points to real leaves in the fixture's
