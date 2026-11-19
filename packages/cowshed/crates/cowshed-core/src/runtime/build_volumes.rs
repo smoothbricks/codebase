@@ -6132,7 +6132,7 @@ mod tests {
         drop(holder);
         assert_eq!(
             fs::canonicalize(&database).unwrap(),
-            mount.join("codegraph/codegraph.db")
+            fs::canonicalize(mount.join("codegraph/codegraph.db")).unwrap()
         );
         assert_eq!(scratch.layout.list().unwrap(), [live]);
         scratch.release_all();
@@ -6269,7 +6269,7 @@ mod tests {
         );
         assert_eq!(
             fs::canonicalize(&database).unwrap(),
-            mount.join("codegraph/codegraph.db")
+            fs::canonicalize(mount.join("codegraph/codegraph.db")).unwrap()
         );
         drop(rows);
         drop(holder);
