@@ -57,14 +57,52 @@ export function renderCowshedBootstrapReadinessJob(): string {
           test -z "$checkout_status"
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD 'HEAD^{tree}' > "$PROBE_ROOT/evidence/source.txt"
 
-      - name: Prepare the canonical Nix/devenv toolchain
-        timeout-minutes: 25
-        uses: ./.github/actions/setup-devenv
-        env:
-          GH_TOKEN: ${'$'}{{ github.token }}
+      - name: Install the official multi-user Nix host prerequisite
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test ! -e /nix
+          test ! -L /nix
+          case "$(uname -m)" in
+            arm64) system=aarch64-darwin; checksum=71e18301c4ea78c667f2753159156b5bdb899993720e8aa7bcca97e8312d3d6b ;;
+            x86_64) system=x86_64-darwin; checksum=8bf3dadfd65be182ad3141b1224bbc82e0f2a61d4f36781938b5e6ede029c2a3 ;;
+            *) echo "::error::Unsupported macOS architecture"; exit 1 ;;
+          esac
+          nix_root="$PROBE_ROOT/nix"
+          mkdir "$nix_root"
+          payload="$nix_root/nix-2.34.7-$system.tar.xz"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 \
+            "https://releases.nixos.org/nix/nix-2.34.7/nix-2.34.7-$system.tar.xz" --output "$payload"
+          printf '%s  %s\n' "$checksum" "$payload" | shasum -a 256 -c -
+          tar -xJf "$payload" -C "$nix_root"
+          printf 'experimental-features = nix-command flakes\naccept-flake-config = true\n' > "$nix_root/nix.conf"
+          "$nix_root/nix-2.34.7-$system/install" --daemon --yes --no-channel-add \
+            --nix-extra-conf-file "$nix_root/nix.conf" 2>&1 | tee "$PROBE_ROOT/evidence/nix-install.log"
+          /usr/bin/dscl . -read /Groups/nixbld > "$PROBE_ROOT/evidence/nix-build-group.txt"
+          /bin/launchctl print system/org.nixos.nix-daemon > "$PROBE_ROOT/evidence/nix-daemon.txt"
+          /nix/var/nix/profiles/default/bin/nix --store daemon store ping
+          /nix/var/nix/profiles/default/bin/nix --version > "$PROBE_ROOT/evidence/nix-version.txt"
+          {
+            printf '%s\n' /nix/var/nix/profiles/default/bin
+            printf '%s\n' "$HOME/.nix-profile/bin"
+          } >> "$GITHUB_PATH"
+          printf 'NIX_REMOTE=daemon\nDEVENV_WORKDIR=%s\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Enable the canonical public devenv binary cache
+        uses: ${githubActionPins.cachix.ref} # ${githubActionPins.cachix.version}
         with:
-          records-workflow: CI
-          records-job: main
+          name: devenv
+          skipPush: true
+
+      - name: Install the canonical locked devenv
+        timeout-minutes: 25
+        working-directory: ${'$'}{{ github.workspace }}/tooling/direnv
+        run: ./github-actions-bootstrap.sh install-devenv
+
+      - name: Prepare the canonical devenv shell
+        timeout-minutes: 25
+        working-directory: ${'$'}{{ github.workspace }}/tooling/direnv
+        run: ./github-actions-bootstrap.sh build-shell
 
       - name: Use the existing rooted Bun profile
         run: |

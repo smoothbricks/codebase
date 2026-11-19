@@ -25,7 +25,7 @@ import { renderRunsOnLine } from './github-runs-on.js';
 
 export const githubActionPins: Readonly<
   Record<
-    'checkout' | 'nxSetShas' | 'cacheSave' | 'uploadArtifact' | 'downloadArtifact',
+    'checkout' | 'nxSetShas' | 'cacheSave' | 'uploadArtifact' | 'downloadArtifact' | 'cachix',
     {
       readonly ref: string;
       readonly version: string;
@@ -51,6 +51,10 @@ export const githubActionPins: Readonly<
   downloadArtifact: {
     ref: 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
     version: 'v8.0.1',
+  },
+  cachix: {
+    ref: 'cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866',
+    version: 'v17',
   },
 };
 
