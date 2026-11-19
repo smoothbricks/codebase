@@ -29,6 +29,8 @@ export interface Ask {
   readonly parallelism: number | null;
   readonly alone: boolean;
   readonly task: string | undefined;
+  /** Its cases each ask the pool for a token of their own (case-gate.ts). */
+  readonly gated: boolean;
 }
 
 /**
@@ -43,6 +45,7 @@ export async function askParentPool(inherited: InheritedCpuPool | null, ask: Ask
     parallelism: ask.parallelism ?? undefined,
     alone: ask.alone ? true : undefined,
     task: ask.task,
+    gated: ask.gated ? true : undefined,
   });
   if (answer.granted) {
     return { grant: answer, refusal: null, wait: undefined, said: [] };

@@ -58,7 +58,13 @@ describe("an Nx run's own CPU pool", () => {
     expect(granted.granted && granted.answer.tokens).toBe(4);
     if (granted.granted) granted.release();
 
-    await closeRunCpuPool({ id: 'run-477' });
+    const reports = jest.spyOn(process.stderr, 'write');
+    try {
+      await closeRunCpuPool({ id: 'run-477' });
+      expect(reports).toHaveBeenCalledWith('cowshed: cpu-pool idle beside_starved_core_s=0.000 starved=2 lent=0\n');
+    } finally {
+      reports.mockRestore();
+    }
     // The run's end closes its pool: nothing is left to grant from it.
     const late = await takeParentCpuTokens(pool, 1, null);
     expect(late.granted === false && late.cause).toBe('absent');

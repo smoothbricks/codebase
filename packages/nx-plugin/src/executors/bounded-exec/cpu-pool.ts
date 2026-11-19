@@ -10,7 +10,7 @@ import type { CaseCore } from './case-gate.js';
 import { holdLease, type Unleased } from './gateway-lease.js';
 import { type LiveUsageReading, type RunMemory, readLiveUsage } from './host-memory.js';
 import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
-import { admit } from './pool-admission.js';
+import { admit, IdleBesideStarved, place } from './pool-admission.js';
 import { type InheritedCpuPool, poolEnvironment } from './pool-environment.js';
 
 /**
@@ -51,6 +51,36 @@ export interface CpuPool {
   close(): Promise<CloseOutcome>;
 }
 
+/** What a pool says when it closes: the token-time idle beside starved holds, and the grants that made them. */
+export interface PoolSummary {
+  /** Token-milliseconds no socket grant held while a hold was starved (pool-admission.ts, `IdleBesideStarved`). */
+  readonly idleBesideStarvedMs: number;
+  /** Leaves granted fewer tokens than they asked, whether gated or not. */
+  readonly starved: number;
+  /** Lent tokens granted, one per test case. */
+  readonly lent: number;
+}
+
+/** When a pool lends: its clock, and how long after a leaf's grant returns it grants no lent request. */
+export interface Lending {
+  readonly settleMs: number;
+  readonly now: () => number;
+}
+
+/**
+ * The settle time (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets itself"): Nx starts a run's next
+ * task when one ends, and that task's leaf takes what its predecessor freed before any case is lent it.
+ */
+const LEND_SETTLE_MS = 3_000;
+const LENDING: Lending = { settleMs: LEND_SETTLE_MS, now: () => performance.now() };
+
+/** The line a run's pool says of `summary` when it closes; null for a pool that starved no leaf and lent nothing. */
+export function describeIdle(summary: PoolSummary): string | null {
+  return summary.starved === 0 && summary.lent === 0
+    ? null
+    : `cowshed: cpu-pool idle beside_starved_core_s=${(summary.idleBesideStarvedMs / 1000).toFixed(3)} starved=${summary.starved} lent=${summary.lent}\n`;
+}
+
 export type CloseOutcome = { ok: true } | { ok: false; error: string };
 
 /**
@@ -67,6 +97,10 @@ interface CpuPoolRequest {
   alone?: boolean;
   /** One token for one test case of a leaf that holds a grant: granted only while no other request waits. */
   lend?: boolean;
+  /** A lent request's leaf's predicted work left, in ms. */
+  left?: number & typia.tags.Type<'uint64'>;
+  /** A leaf whose cases each ask for a token of their own (`lend`): what it lacks of its ask is not idle beside it. */
+  gated?: boolean;
 }
 
 /** A grant whose charge alone exceeds the run's memory, made while nothing else held memory: the run's memory. */
@@ -113,6 +147,9 @@ type Phase =
       readonly slot: boolean;
       readonly memory: number;
       readonly alone: boolean;
+      readonly tokens: number;
+      readonly starved: boolean;
+      readonly lend: boolean;
     }
   | { readonly kind: 'done' };
 
@@ -131,6 +168,8 @@ interface Waiter {
   readonly task?: string | undefined;
   readonly alone?: boolean | undefined;
   readonly lend?: boolean | undefined;
+  readonly left?: number | undefined;
+  readonly gated?: boolean | undefined;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -163,6 +202,8 @@ export interface AskContext {
   readonly task?: string | undefined;
   /** The kernel killed the command for memory: it is run again, granted only while nothing else holds a grant. */
   readonly alone?: boolean | undefined;
+  /** Its cases each ask the pool for a token of their own. */
+  readonly gated?: boolean | undefined;
 }
 
 /**
@@ -180,7 +221,7 @@ export async function takeParentCpuTokens(
   memory: number | null,
   context: AskContext = {},
 ): Promise<TokenGrant> {
-  const { parallelism, task, alone } = context;
+  const { parallelism, task, alone, gated } = context;
   if (!Number.isSafeInteger(want) || want < 1) {
     throw new RangeError(`a child asks its parent pool for a positive count, not ${want} (pool ${parent.tokens})`);
   }
@@ -203,6 +244,7 @@ export async function takeParentCpuTokens(
     ...(memory === null ? {} : { memory, ...(parallelism === undefined ? {} : { parallelism }) }),
     ...(task === undefined ? {} : { task }),
     ...(alone === true ? { alone: true } : {}),
+    ...(gated === true ? { gated: true } : {}),
   };
   const lease = await holdLease(parent.socket, request, 'the parent CPU pool', new CpuLeaseWait());
   if (!lease.granted) {
@@ -249,11 +291,11 @@ export async function takeParentCpuTokens(
  * request waits. `release` gives the token back, or withdraws the request while it waits. A pool that refuses, falls
  * silent or is gone grants nothing: the case waits for a token of its leaf's own grant.
  */
-export function lendParentToken(parent: InheritedCpuPool, task: string): CaseCore {
+export function lendParentToken(parent: InheritedCpuPool, task: string, left: number): CaseCore {
   const withdrawn = new AbortController();
   const lease = holdLease(
     parent.socket,
-    { op: 'cpu-pool', want: 1, lend: true, task: task.slice(0, MAX_TASK_LENGTH) },
+    { op: 'cpu-pool', want: 1, lend: true, left: Math.max(0, Math.round(left)), task: task.slice(0, MAX_TASK_LENGTH) },
     'the parent CPU pool',
     new CpuLeaseWait(),
     undefined,
@@ -435,7 +477,8 @@ export async function createCpuPool(
   closed: Promise<void>,
   memory: RunMemory | null,
   liveUsage: (bound: string) => LiveUsageReading = readLiveUsage,
-): Promise<{ ok: true; pool: CpuPool } | { ok: false; error: string }> {
+  lending: Lending = LENDING,
+): Promise<{ ok: true; pool: CpuPool; summary: () => PoolSummary } | { ok: false; error: string }> {
   if (!Number.isSafeInteger(tokens) || tokens < 1) {
     throw new RangeError(`a CPU pool holds a positive safe integer of tokens, not ${tokens}`);
   }
@@ -466,6 +509,15 @@ export async function createCpuPool(
   // The children holding a grant, and whether one of them runs alone.
   let holders = 0;
   let aloneHolder = false;
+  // The tokens socket grants hold, the leaves that hold fewer than they asked and take no gate, and what the pool says
+  // of both when it closes.
+  let heldTokens = 0;
+  let starvedHolders = 0;
+  let partialGrants = 0;
+  let lentGrants = 0;
+  const idle = new IdleBesideStarved(lending.now());
+  // A leaf return arms this one-shot window. A later leaf return replaces it; a case return does not.
+  let settle: NodeJS.Timeout | undefined;
   // The readability wait while the queue's head finds no token, else undefined.
   let watch: FifoWatch | undefined;
   let closing = false;
@@ -556,6 +608,7 @@ export async function createCpuPool(
       inHand + (slotLent ? 0 : 1),
       memory === null ? null : { capacity: memory.bytes, held: heldMemory },
       { holders, alone: aloneHolder },
+      settle === undefined,
     );
     queue.splice(0, admission.grants.length);
     for (const { request, tokens: granted, charge, oversized } of admission.grants) {
@@ -566,8 +619,23 @@ export async function createCpuPool(
       if (slot) slotLent = true;
       heldMemory += charge;
       holders += 1;
+      heldTokens += granted;
+      const partial = granted < request.want;
+      const starved = partial && request.gated !== true;
+      if (partial) partialGrants += 1;
+      if (starved) starvedHolders += 1;
+      if (request.lend === true) lentGrants += 1;
       if (request.alone === true) aloneHolder = true;
-      request.child.phase = { kind: 'holding', bytes, slot, memory: charge, alone: request.alone === true };
+      request.child.phase = {
+        kind: 'holding',
+        bytes,
+        slot,
+        memory: charge,
+        alone: request.alone === true,
+        tokens: granted,
+        starved,
+        lend: request.lend === true,
+      };
       request.child.socket.write(
         frame(
           memory === null
@@ -594,6 +662,7 @@ export async function createCpuPool(
       stopWatching();
     }
     returnTokens(inHand);
+    idle.observe(lending.now(), tokens - heldTokens, starvedHolders > 0 || queue.at(-1)?.lend === true);
   }
 
   const refuse = (child: Child, error: string): void => {
@@ -623,6 +692,17 @@ export async function createCpuPool(
         if (child.phase.slot) slotLent = false;
         heldMemory -= child.phase.memory;
         holders -= 1;
+        heldTokens -= child.phase.tokens;
+        if (child.phase.starved) starvedHolders -= 1;
+        // What a leaf returns is its successor's first: Nx starts the run's next task as this one ends.
+        if (!closing && !child.phase.lend && lending.settleMs > 0) {
+          clearTimeout(settle);
+          settle = setTimeout(() => {
+            settle = undefined;
+            drain(0);
+          }, lending.settleMs);
+          settle.unref();
+        }
         if (child.phase.alone) aloneHolder = false;
         if (!closing) returnTokens(child.phase.bytes);
       }
@@ -699,18 +779,10 @@ export async function createCpuPool(
         task: request.task,
         alone: request.alone,
         lend: request.lend,
+        left: request.left,
+        gated: request.gated,
       };
-      if (request.alone === true) {
-        // A leaf the kernel killed has waited once already: it goes ahead of the leaves that have not run.
-        const at = queue.findIndex((waiting) => waiting.alone !== true);
-        queue.splice(at === -1 ? queue.length : at, 0, waiter);
-      } else if (request.lend === true) {
-        queue.push(waiter);
-      } else {
-        // A leaf's request goes ahead of every lent one: a case is lent only a token no leaf waits for.
-        const at = queue.findIndex((waiting) => waiting.lend === true);
-        queue.splice(at === -1 ? queue.length : at, 0, waiter);
-      }
+      queue.splice(place(queue, waiter), 0, waiter);
       socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);
     });
@@ -724,6 +796,8 @@ export async function createCpuPool(
     shut ??= (async (): Promise<CloseOutcome> => {
       closing = true;
       clearInterval(heartbeat);
+      clearTimeout(settle);
+      idle.observe(lending.now(), 0, false);
       stopWatching();
       await started;
       for (const socket of children) {
@@ -821,5 +895,10 @@ export async function createCpuPool(
       environment: poolEnvironment(socketPath, tokens, fifoPath),
       close: shutdown,
     },
+    summary: () => ({
+      idleBesideStarvedMs: idle.tokenMs(lending.now()),
+      starved: partialGrants,
+      lent: lentGrants,
+    }),
   };
 }

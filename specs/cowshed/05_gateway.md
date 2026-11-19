@@ -2300,18 +2300,31 @@ runners in turn, which waited 261, 473, 664 and 887 s for it, and the run took 2
   side, and Stryker for three packages and a fourth target were SIGKILLed within 20 seconds. The pool serves its own
   FIFO queue, granting the head `min(want, free)` once one token is free, every grant whole: no request holds part of a
   grant while it waits for more, so no two deadlock on each other's tokens. A request may ask as lent (`lend`, one token
-  for one test case; "A case starts on a core", Inside a hold): lent requests queue behind every other request, among
-  themselves in arrival order, so the pool grants one only when no leaf's request waits, and it is charged no memory.
-  Its fifo holds the free count: a socket child takes the fifo's bytes first and the implicit token last, and its close
-  writes them back, so a Cargo reading the fifo and a nested runner holding a grant never count one token twice. A
-  granted `bounded-exec` serves its grant the same way, as a pool its own nested runners take from; no runner asks the
-  gateway. A pool's end ends accounting, never work: a command whose lending parent exits runs on to its own exit and is
-  judged by that exit alone. The run's pool runs on a thread of its own ("Deadlines"); the run's `postTasksExecution`
-  closes it, and a run that dies first takes it with its process. The plugin's `run-cpu-pool.test.ts` holds that shape
-  over a real socket: two sweeps each asking 31 of a 4-token run pool, the first granted 4 and the second queued until
-  the first returned them. Its `cpu-pool.silence.ts`, which the `test-pool-silence` target runs, queues a runner in
-  another process on a 1-token run pool and blocks the thread that served the run for the silence bound plus a heartbeat
-  (20 s): the runner stays queued and is granted once the holder returns its token.
+  for one test case; "A case starts on a core", Inside a hold) and names its leaf's predicted work left (`left`: the sum
+  of the last recorded walls of the leaf's cases, less those of the cases that finished running). Lent requests queue
+  behind every other request, the one whose leaf has the most work left first and arrival order among equals, so the
+  tokens nobody asks for go to the suite that would otherwise end last. The pool grants a lent request only when no
+  leaf's request waits and no leaf's grant has returned within the settle time (3 s): Nx starts a run's next task when
+  one ends, and that task's leaf takes what its predecessor freed before any case does; a token a case returns is lent
+  again at once. A lent token is charged no memory. A leaf whose cases ask for themselves says so in its own request
+  (`gated`). When it closes, a run's pool that granted a leaf fewer tokens than it asked, or lent any, says
+  `cowshed: cpu-pool idle beside_starved_core_s=<s> starved=<n> lent=<n>`: the token-seconds no socket grant held while
+  an ungated leaf held fewer tokens than it asked or a lent request waited, the count of leaves granted fewer than they
+  asked (including gated leaves), and the lent tokens granted. Tokens a Cargo holds from the fifo are not seen and count
+  as idle. The rule is `pool-admission.ts` (`place`, `admit`, `IdleBesideStarved`), held by `pool-admission.test.ts` as
+  tables and as a property over random arrivals: no lent request is granted while a leaf's request waits or inside the
+  settle time, and a granted lent request never has less work left than one left waiting; `cpu-pool.test.ts` holds the
+  same over a real socket on a clock the test moves. Its fifo holds the free count: a socket child takes the fifo's
+  bytes first and the implicit token last, and its close writes them back, so a Cargo reading the fifo and a nested
+  runner holding a grant never count one token twice. A granted `bounded-exec` serves its grant the same way, as a pool
+  its own nested runners take from; no runner asks the gateway. A pool's end ends accounting, never work: a command
+  whose lending parent exits runs on to its own exit and is judged by that exit alone. The run's pool runs on a thread
+  of its own ("Deadlines"); the run's `postTasksExecution` closes it, and a run that dies first takes it with its
+  process. The plugin's `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps each asking 31 of a
+  4-token run pool, the first granted 4 and the second queued until the first returned them. Its `cpu-pool.silence.ts`,
+  which the `test-pool-silence` target runs, queues a runner in another process on a 1-token run pool and blocks the
+  thread that served the run for the silence bound plus a heartbeat (20 s): the runner stays queued and is granted once
+  the holder returns its token.
 
   The run's pool also charges memory, since leaves whose peaks together exceed the run's memory must not start side by
   side. Each leaf is charged its task's last recorded memory peak, and a leaf is granted only while the charged peaks of

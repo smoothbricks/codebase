@@ -345,6 +345,78 @@ describe('the parent-held CPU pool', () => {
     const lent = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2, lend: true }));
     expect(await lent.next()).toMatchObject({ ok: false, code: 'invalid-request' });
   });
+
+  it('lends a freed token to the waiting case whose leaf has the most work left', async () => {
+    const { parent } = await openPool(1);
+    const granted: PoolReply = { ok: true, lease: 'granted', tokens: 1 };
+    const lend = (left: number) =>
+      childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1, lend: true, left }));
+    const holder = lend(0);
+    expect(await holder.next()).toEqual(QUEUED);
+    expect(await holder.next()).toEqual(granted);
+    const short = lend(10);
+    expect(await short.next()).toEqual(QUEUED);
+    const long = lend(500);
+    expect(await long.next()).toEqual(QUEUED);
+    holder.socket.destroy();
+    expect(await long.next()).toEqual(granted);
+    long.socket.destroy();
+    expect(await short.next()).toEqual(granted);
+  });
+
+  it('leaves the token a leaf returns to the next leaf for the settle time: a case that waited before it is lent none', async () => {
+    const made = await createCpuPool(1, NEVER, null, undefined, { settleMs: 3_600_000, now: () => performance.now() });
+    if (!made.ok) throw new Error(made.error);
+    pools.push(made.pool);
+    const parent = readInheritedCpuPool(made.pool.environment);
+    if (parent === null) throw new Error('the pool environment names no endpoint');
+    const leaf = JSON.stringify({ op: 'cpu-pool', want: 1 });
+    const holder = childOf(parent.socket, leaf);
+    expect(await holder.next()).toEqual(QUEUED);
+    expect(await holder.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    const waiting = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1, lend: true }));
+    expect(await waiting.next()).toEqual(QUEUED);
+    holder.socket.destroy();
+    await holder.closed;
+    const next = childOf(parent.socket, leaf);
+    expect(await next.next()).toEqual(QUEUED);
+    const first = await Promise.race([waiting.next().then(() => 'the case'), next.next().then(() => 'the next leaf')]);
+    expect(first).toBe('the next leaf');
+  });
+
+  it('says how long tokens stood idle beside a leaf granted fewer than it asked', async () => {
+    const clock = { now: 0 };
+    const made = await createCpuPool(4, NEVER, null, undefined, { settleMs: 0, now: () => clock.now });
+    if (!made.ok) throw new Error(made.error);
+    pools.push(made.pool);
+    const parent = readInheritedCpuPool(made.pool.environment);
+    if (parent === null) throw new Error('the pool environment names no endpoint');
+    const ask = (request: Record<string, unknown>) =>
+      childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', ...request }));
+    const wide = ask({ want: 3 });
+    expect(await wide.next()).toEqual(QUEUED);
+    expect(await wide.next()).toEqual({ ok: true, lease: 'granted', tokens: 3 });
+    const starved = ask({ want: 4 });
+    expect(await starved.next()).toEqual(QUEUED);
+    expect(await starved.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    // Ten seconds with every token held, then the wide leaf ends: three tokens free beside the starved one, of which
+    // a case takes one, so two stand idle for the twenty seconds that follow.
+    clock.now = 10_000;
+    wide.socket.destroy();
+    const lentCase = ask({ want: 1, lend: true });
+    expect(await lentCase.next()).toEqual(QUEUED);
+    expect(await lentCase.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    clock.now = 30_000;
+    lentCase.socket.destroy();
+    starved.socket.destroy();
+    const after = ask({ want: 4 });
+    expect(await after.next()).toEqual(QUEUED);
+    expect(await after.next()).toEqual({ ok: true, lease: 'granted', tokens: 4 });
+    expect(made.summary()).toEqual({ idleBesideStarvedMs: 2 * 20_000, starved: 1, lent: 1 });
+    expect(await made.pool.close()).toEqual({ ok: true });
+    clock.now = 60_000;
+    expect(made.summary()).toEqual({ idleBesideStarvedMs: 2 * 20_000, starved: 1, lent: 1 });
+  });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
 
   it('heartbeats a queued child on its actor every heartbeat until a holder returns the token', async () => {

@@ -28,6 +28,10 @@ export interface PoolAsk {
   readonly parallelism?: number | undefined;
   /** A leaf the kernel killed for memory, run again: granted while nothing else holds a grant, and alone. */
   readonly alone?: boolean | undefined;
+  /** One token for one test case of a leaf that holds a grant: granted only while no leaf's request waits. */
+  readonly lend?: boolean | undefined;
+  /** A lent request's leaf's predicted work left, in ms: its cases' last recorded walls, less those that ran. */
+  readonly left?: number | undefined;
 }
 
 /** Who holds a grant when the pool decides: how many leaves, and whether one of them runs alone. */
@@ -56,11 +60,12 @@ export interface PoolGrant<Ask extends PoolAsk> {
 
 /**
  * The grants of the queue's first requests, in its order, and what the first request left waiting waits for: free
- * tokens (`cpu`), the run's memory (`memory`) or the grants others hold (`alone`). `waiting` is null when every request was granted.
+ * tokens (`cpu`), the run's memory (`memory`), the grants others hold (`alone`) or, a lent request, the settle time
+ * after a leaf's grant returned (`settle`). `waiting` is null when every request was granted.
  */
 export interface Admission<Ask extends PoolAsk> {
   readonly grants: readonly PoolGrant<Ask>[];
-  readonly waiting: 'cpu' | 'memory' | 'alone' | null;
+  readonly waiting: 'cpu' | 'memory' | 'alone' | 'settle' | null;
 }
 
 /** The bytes `ask` is charged when it is lent `tokens`: its peak, scaled up when that is more than it was measured under. */
@@ -86,6 +91,7 @@ export function admit<Ask extends PoolAsk>(
   available: number,
   memory: MemoryLedger | null,
   holding: Holding = NOTHING_HELD,
+  lendable = true,
 ): Admission<Ask> {
   const grants: PoolGrant<Ask>[] = [];
   if (holding.alone) {
@@ -96,6 +102,9 @@ export function admit<Ask extends PoolAsk>(
   for (const request of queue) {
     if (request.alone === true && holding.holders + grants.length > 0) {
       return { grants, waiting: 'alone' };
+    }
+    if (request.lend === true && !lendable) {
+      return { grants, waiting: 'settle' };
     }
     const oversized = memory !== null && request.memory > memory.capacity;
     const room = memory === null ? Number.POSITIVE_INFINITY : memory.capacity - held;
@@ -116,4 +125,52 @@ export function admit<Ask extends PoolAsk>(
     }
   }
   return { grants, waiting: null };
+}
+
+/**
+ * Where a request joins the queue (specs/cowshed/05_gateway.md, "Without mbx, every Nx run budgets itself"). A leaf the
+ * kernel killed, run again alone, has waited once already and goes ahead of the leaves that have not run. A leaf goes
+ * behind the leaves and ahead of every lent request: a case is lent only a token no leaf waits for. A lent request goes
+ * among the lent ones behind those whose leaves have as much work left or more, so a free token goes to the leaf that
+ * would otherwise end last, in arrival order among equals.
+ */
+export function place(queue: readonly PoolAsk[], ask: PoolAsk): number {
+  const before = (found: number): number => (found === -1 ? queue.length : found);
+  if (ask.alone === true) {
+    return before(queue.findIndex((waiting) => waiting.alone !== true));
+  }
+  if (ask.lend !== true) {
+    return before(queue.findIndex((waiting) => waiting.lend === true));
+  }
+  const left = ask.left ?? 0;
+  return before(queue.findIndex((waiting) => waiting.lend === true && (waiting.left ?? 0) < left));
+}
+
+/**
+ * The token-time a pool's tokens stood idle beside a starved hold: a leaf holding fewer tokens than it asked that
+ * cannot ask for more, or a case waiting for a lent token. The pool tells it the idle count and whether a hold is
+ * starved at each change, on its own clock; what is counted is the idle count over the time a starved hold stood.
+ */
+export class IdleBesideStarved {
+  #at: number;
+  #idle = 0;
+  #starved = false;
+  #tokenMs = 0;
+
+  constructor(now: number) {
+    this.#at = now;
+  }
+
+  /** From `now` on, `idle` tokens are free and a hold is `starved` or none is. */
+  observe(now: number, idle: number, starved: boolean): void {
+    this.#tokenMs = this.tokenMs(now);
+    this.#at = now;
+    this.#idle = idle;
+    this.#starved = starved;
+  }
+
+  /** The token-milliseconds counted up to `now`. */
+  tokenMs(now: number): number {
+    return this.#tokenMs + (this.#starved ? this.#idle * (now - this.#at) : 0);
+  }
 }

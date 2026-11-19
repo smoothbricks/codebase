@@ -1,5 +1,14 @@
 import { expect, it } from 'bun:test';
-import { type Admission, admit, type MemoryLedger, type PoolAsk, type PoolGrant } from './pool-admission.js';
+import fc from 'fast-check';
+import {
+  type Admission,
+  admit,
+  IdleBesideStarved,
+  type MemoryLedger,
+  type PoolAsk,
+  type PoolGrant,
+  place,
+} from './pool-admission.js';
 
 const GiB = 1024 ** 3;
 /** A downstream CI runner's run: a 32 GiB cgroup. */
@@ -278,3 +287,80 @@ it('grants a leaf the kernel killed only while nothing holds a grant, ahead of t
     });
   }
 });
+
+//#region smoo/cowshed!n/a-case-starts-on-a-core
+const NOTHING = { holders: 0, alone: false };
+const lent = (left?: number): PoolAsk => ({ want: 1, memory: 0, lend: true, ...(left === undefined ? {} : { left }) });
+
+it('places a lent request behind every leaf, the leaf with the most work left first', () => {
+  const leaf: PoolAsk = { want: 4, memory: 0 };
+  const again: PoolAsk = { want: 4, memory: 0, alone: true };
+  const cases = [
+    { name: 'a leaf joins the end of the leaves', queue: [leaf], ask: leaf, at: 1 },
+    { name: 'a leaf goes ahead of every lent request', queue: [leaf, lent(9), lent(3)], ask: leaf, at: 1 },
+    { name: 'a lent request goes behind every leaf', queue: [leaf, leaf], ask: lent(9), at: 2 },
+    { name: 'more work left goes first', queue: [leaf, lent(9), lent(3)], ask: lent(5), at: 2 },
+    { name: 'equal work left keeps arrival order', queue: [lent(5), lent(5)], ask: lent(5), at: 2 },
+    { name: 'no named work left is none', queue: [lent(5)], ask: lent(), at: 1 },
+    { name: 'a leaf run again alone goes ahead of the leaves', queue: [leaf, lent(9)], ask: again, at: 0 },
+  ] satisfies { name: string; queue: PoolAsk[]; ask: PoolAsk; at: number }[];
+  for (const check of cases) {
+    expect(place(check.queue, check.ask), check.name).toBe(check.at);
+  }
+});
+
+it('grants no lent request inside the settle time, and every leaf as before', () => {
+  const queue: PoolAsk[] = [{ want: 2, memory: 0 }, lent(9)];
+  const tokens = (admission: Admission<PoolAsk>) => ({
+    grants: admission.grants.map((grant) => grant.tokens),
+    waiting: admission.waiting,
+  });
+  expect(tokens(admit(queue, 8, null, NOTHING, true))).toEqual({ grants: [2, 1], waiting: null });
+  expect(tokens(admit(queue, 8, null, NOTHING, false))).toEqual({ grants: [2], waiting: 'settle' });
+});
+
+it('lends only tokens no leaf waits for, to the most work left, over random arrivals', () => {
+  const arrival = fc.record({
+    lend: fc.boolean(),
+    want: fc.integer({ min: 1, max: 8 }),
+    left: fc.integer({ min: 0, max: 1000 }),
+  });
+  fc.assert(
+    fc.property(
+      fc.array(arrival, { maxLength: 24 }),
+      fc.integer({ min: 0, max: 8 }),
+      fc.boolean(),
+      (arrivals, free, lendable) => {
+        const queue: PoolAsk[] = [];
+        for (const { lend, want, left } of arrivals) {
+          const ask: PoolAsk = lend ? lent(left) : { want, memory: 0 };
+          queue.splice(place(queue, ask), 0, ask);
+        }
+        const { grants } = admit(queue, free, null, NOTHING, lendable);
+        const waiting = queue.slice(grants.length);
+        const lentGrants = grants.filter((grant) => grant.request.lend === true);
+        expect(grants.reduce((sum, grant) => sum + grant.tokens, 0)).toBeLessThanOrEqual(free);
+        if (lentGrants.length === 0) return;
+        expect(lendable).toBe(true);
+        expect(waiting.filter((ask) => ask.lend !== true)).toEqual([]);
+        const least = Math.min(...lentGrants.map((grant) => grant.request.left ?? 0));
+        expect(Math.max(0, ...waiting.map((ask) => ask.left ?? 0))).toBeLessThanOrEqual(least);
+      },
+    ),
+    { seed: 20261119 },
+  );
+});
+
+it('counts the token-time idle beside a starved hold, and none beside holds that have what they asked', () => {
+  const idle = new IdleBesideStarved(1_000);
+  idle.observe(1_000, 3, false);
+  // Ten seconds idle beside nobody starved count for nothing.
+  idle.observe(11_000, 3, true);
+  idle.observe(31_000, 1, true);
+  idle.observe(36_000, 0, true);
+  idle.observe(40_000, 2, false);
+  expect(idle.tokenMs(50_000)).toBe(3 * 20_000 + 5_000);
+  idle.observe(50_000, 2, true);
+  expect(idle.tokenMs(51_000)).toBe(3 * 20_000 + 5_000 + 2_000);
+});
+//#endregion smoo/cowshed!n/a-case-starts-on-a-core

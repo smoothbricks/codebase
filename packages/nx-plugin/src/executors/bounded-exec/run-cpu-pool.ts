@@ -160,6 +160,8 @@ function servePoolThread(tokens: number, memory: RunMemory): Promise<ServedPool>
         finish({ ok: false, error: report.error });
         now.served({ ok: false, error: report.error });
       } else if (now.kind === 'closing' && report.kind === 'closed') {
+        // What the run's pool left idle beside starved holds, said with the run's end.
+        if (report.idle !== null) process.stderr.write(report.idle);
         finish(report.outcome);
         now.closed(report.outcome);
       } else {

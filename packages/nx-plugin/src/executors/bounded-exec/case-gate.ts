@@ -75,6 +75,7 @@ export class CaseGate {
   #lent = 0;
   #lentCoreMs = 0;
   #waitedCaseMs = 0;
+  #ranWallMs = 0;
 
   constructor(
     private readonly own: number,
@@ -114,6 +115,7 @@ export class CaseGate {
     const state = this.#cases.get(id);
     if (state === undefined) return;
     this.#cases.delete(id);
+    if (state.kind !== 'waiting') this.#ranWallMs += this.wall(id);
     switch (state.kind) {
       case 'waiting':
         this.effects.release(id);
@@ -142,6 +144,11 @@ export class CaseGate {
   /** How long the case waited at the gate before it started, in ms; zero for one that never did. */
   waitedMs(id: string): number {
     return this.#waited.get(id) ?? 0;
+  }
+
+  /** The last recorded walls of the cases that ran and ended, summed. */
+  ranWallMs(): number {
+    return this.#ranWallMs;
   }
 
   summary(): CaseGateSummary {
@@ -180,18 +187,22 @@ export interface GatedCases {
 /**
  * The gate of a leaf that holds `own` cores, over whichever pool `ask` asks: mbx's, through the run's reservation
  * endpoint, or the run's own token pool (cpu-pool.ts, `lendParentToken`). `start` answers a case's connection.
+ * `walls` are the cases' last recorded walls; a request is told the work the leaf has left, their sum less the walls
+ * of the cases that ran, by which a token pool lends to the leaf that would otherwise end last.
  */
 export function gateCases(
   own: number,
-  wall: (id: string) => number,
+  walls: ReadonlyMap<string, number>,
   start: (id: string) => void,
-  ask: (id: string) => CaseCore,
+  ask: (id: string, leftMs: number) => CaseCore,
 ): GatedCases {
   const requests = new Map<string, CaseCore>();
-  const cases: CaseGate = new CaseGate(own, wall, {
+  let total = 0;
+  for (const wall of walls.values()) total += wall;
+  const cases: CaseGate = new CaseGate(own, (id) => walls.get(id) ?? 0, {
     start,
     reserve: (id) => {
-      const held = ask(id);
+      const held = ask(id, Math.max(0, total - cases.ranWallMs()));
       requests.set(id, held);
       void held.granted.then((granted) => {
         // Released since: the case started on a core of the grant, or ended while it waited.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createConnection, type Socket } from 'node:net';
-import { CaseGate, type CaseGateEffects, GO, runWallMs, serveCaseGate } from './case-gate.js';
+import { CaseGate, type CaseGateEffects, GO, gateCases, runWallMs, serveCaseGate } from './case-gate.js';
 
 /** A gate over `own` cores whose effects are recorded in order, on a clock the test moves. */
 function gateOf(own: number, walls: Record<string, number> = {}) {
@@ -157,6 +157,33 @@ describe('a reserved nextest leaf whose cases each start on a core', () => {
     } finally {
       expect(await served.gate.close()).toBeNull();
     }
+  });
+
+  it("names each waiting case's request the work its leaf has left: its recorded walls less the cases that ran", () => {
+    const asked: [string, number][] = [];
+    const walls = new Map([
+      ['a', 100],
+      ['b', 50],
+      ['c', 30],
+    ]);
+    const { cases } = gateCases(
+      1,
+      walls,
+      () => {},
+      (id, left) => {
+        asked.push([id, left]);
+        return { granted: new Promise<boolean>(() => {}), release: () => {} };
+      },
+    );
+    cases.arrived('a');
+    cases.arrived('b');
+    // `a` ran and ended: `b` takes the grant's core, and `c` asks with `a`'s wall gone from what is left.
+    cases.ended('a');
+    cases.arrived('c');
+    expect(asked).toEqual([
+      ['b', 180],
+      ['c', 80],
+    ]);
   });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
 });

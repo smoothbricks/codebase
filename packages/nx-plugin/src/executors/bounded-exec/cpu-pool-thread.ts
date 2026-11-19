@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { type CloseOutcome, createCpuPool } from './cpu-pool.js';
+import { type CloseOutcome, createCpuPool, describeIdle } from './cpu-pool.js';
 import type { RunMemory } from './host-memory.js';
 
 /**
@@ -24,7 +24,7 @@ export interface CpuPoolThreadData {
 export type CpuPoolThreadReport =
   | { readonly kind: 'serving'; readonly environment: Record<string, string> }
   | { readonly kind: 'failed'; readonly error: string }
-  | { readonly kind: 'closed'; readonly outcome: CloseOutcome };
+  | { readonly kind: 'closed'; readonly outcome: CloseOutcome; readonly idle: string | null };
 
 const host = parentPort;
 if (host === null) {
@@ -37,7 +37,7 @@ const made = await createCpuPool(data.tokens, new Promise<void>(() => {}), data.
 if (made.ok) {
   const { pool } = made;
   host.once('message', () => {
-    void pool.close().then((outcome) => report({ kind: 'closed', outcome }));
+    void pool.close().then((outcome) => report({ kind: 'closed', outcome, idle: describeIdle(made.summary()) }));
   });
   report({ kind: 'serving', environment: pool.environment });
 } else {

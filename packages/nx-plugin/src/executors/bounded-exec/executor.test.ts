@@ -2214,6 +2214,60 @@ const arrive = (test) => new Promise((resolve, reject) => {
       }
     }
   });
+
+  it('tells its pool that its cases ask for themselves, and each case request the work its leaf has left', async () => {
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-cargo');
+    await mkdir(bin);
+    const cases = join(bin, 'cases.cjs');
+    await writeFile(
+      cases,
+      `const { createConnection } = require('node:net');
+const arrive = (test) => new Promise((resolve, reject) => {
+  const client = createConnection(process.env.${TEST_GATE_ENV});
+  client.setEncoding('utf8');
+  client.on('connect', () => client.write(JSON.stringify({ binary: 'pkg::bin', test }) + '\\n'));
+  client.on('data', () => resolve(client));
+  client.on('error', reject);
+});
+(async () => {
+  const first = await arrive('a');
+  const second = await arrive('b');
+  second.destroy();
+  first.destroy();
+})();
+`,
+    );
+    await writeFile(join(bin, 'cargo'), `#!/bin/sh\nexec '${process.execPath}' '${cases}'\n`, { mode: 0o755 });
+    const saved = { PATH: process.env.PATH, [TEST_GATE_SERVED_ENV]: process.env[TEST_GATE_SERVED_ENV] };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env[TEST_GATE_SERVED_ENV] = '1';
+    const pool = await fakePool();
+    try {
+      const result = await runBoundedExec(
+        {
+          command: `cargo nextest run --binaries-metadata m.json --test-threads=${nextestWant}`,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: 0,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        pool.inherited,
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(pool.requests).toMatchObject([
+        { op: 'cpu-pool', want: nextestWant, gated: true },
+        { op: 'cpu-pool', want: 1, lend: true, left: 0, task: 'nextest:pkg::bin::b' },
+      ]);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await pool.close();
+    }
+  });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
   it.each([
     [
@@ -3606,6 +3660,9 @@ async function withPool<T>(
     tokens,
     new Promise<void>(() => {}),
     memory === null ? null : { bytes: memory, source: 'a test run' },
+    undefined,
+    // A test's pool lends at once: the settle time is the pool's own table (cpu-pool.test.ts).
+    { settleMs: 0, now: () => performance.now() },
   );
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
@@ -3640,12 +3697,12 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
  */
 async function fakePool(): Promise<{
   inherited: InheritedCpuPool;
-  requests: { alone?: boolean }[];
+  requests: Record<string, unknown>[];
   close: () => Promise<void>;
 }> {
   const directory = await ownedSocketDirectory('fake-pool-', 'p.sock');
   const socket = join(directory, 'p.sock');
-  const requests: { alone?: boolean }[] = [];
+  const requests: Record<string, unknown>[] = [];
   const connections = new Set<Socket>();
   const server = createServer((connection) => {
     connections.add(connection);

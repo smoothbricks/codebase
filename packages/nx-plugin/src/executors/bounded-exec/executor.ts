@@ -608,6 +608,7 @@ async function runCommand(
     parallelism: chargeParallelism,
     alone: attempt.alone,
     task: context.record?.task.id,
+    gated: demand.kind === 'nextest' && process.env[TEST_GATE_SERVED_ENV] === '1',
   });
   for (const said of parent.said) appendStderr(said);
   const { grant, refusal: parentRefusal, wait: parentWait } = parent;
@@ -843,9 +844,9 @@ async function runCommand(
       const gate = served.gate;
       gated = gateCases(
         lender.own,
-        (id) => lastWalls.get(id) ?? 0,
+        lastWalls,
         (id) => gate.start(id),
-        (id) => lendParentToken(lender.pool, `nextest:${id}`),
+        (id, left) => lendParentToken(lender.pool, `nextest:${id}`, left),
       );
     }
   }
@@ -1477,7 +1478,7 @@ async function runCommand(
             const gate = caseGate;
             gated = gateCases(
               granted.cpus,
-              (id) => lastWalls.get(id) ?? 0,
+              lastWalls,
               (id) => gate.start(id),
               (id) => {
                 const held = reserveCores(endpoint, 1, 'low', 1, `nextest:${id}`);
