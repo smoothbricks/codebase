@@ -7,10 +7,8 @@ on:
   pull_request:
 
 permissions:
-  # actions:write lets the drift step dispatch the managed-files workflow.
-  actions: write
+  actions: read
   contents: read
-  statuses: write
 
 concurrency:
   # One in-flight run per pull request, and per ref for pushes. Pushes to the first
@@ -27,6 +25,11 @@ defaults:
 jobs:
   main:
     name: Validate
+    permissions:
+      # Only Validate dispatches managed-file healing and creates PR deployments.
+      actions: write
+      contents: read
+      statuses: write
     runs-on:
       ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
