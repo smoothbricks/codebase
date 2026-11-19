@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from 'nx/src/devkit-exports.js';
 import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.js';
+import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import {
   closeRunReservations,
   endpointGatesTests,
@@ -148,21 +149,59 @@ describe("an Nx run's mbx reservation endpoint", () => {
     }
   });
 
-  it('is not started without mbx’s pool, or inside a reservation', async () => {
+  it('is not started without mbx’s pool', async () => {
     const mbx = await standInMbx('exit 97');
     try {
-      for (const env of [
-        { PATH: mbx.env.PATH },
-        { ...mbx.env, MBX_SCHED_DISABLE: '1' },
-      ] satisfies NodeJS.ProcessEnv[]) {
-        await serveRunReservations({ id: 'run-2' }, env);
-        expect(env).not.toHaveProperty(RESERVATIONS_ENV);
-      }
+      const env: NodeJS.ProcessEnv = { PATH: mbx.env.PATH };
+      await serveRunReservations({ id: 'run-2' }, env);
+      expect(env).not.toHaveProperty(RESERVATIONS_ENV);
       await expect(access(mbx.said)).rejects.toThrow();
     } finally {
       await rm(mbx.root, { recursive: true, force: true });
     }
   });
+
+  //#region smoo/cowshed!n/a-case-starts-on-a-core
+  it('is asked once whether its mbx gates test cases by a run under a hold, outside the hold, and serves that run nothing', async () => {
+    // What `mbx reservations` does with the one question: it listens, answers, and ends with its standard input.
+    const mbx = await standInMbx(
+      `printf '%s\\n' "\${MBX_SCHED_DISABLE-unset} \${MBX_SCHED_DIR-unset}" >> "$0.env"\nexec '${process.execPath}' -e '
+const server = require("node:net").createServer((client) => client.on("data", () => client.write(JSON.stringify({ type: "capabilities", test_gate: true }) + "\\n")));
+server.listen(process.argv.at(-1), () => console.log("listening"));
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+' "$2"`,
+    );
+    try {
+      const env: NodeJS.ProcessEnv = { ...mbx.env, MBX_SCHED_DISABLE: '1', MBX_SCHED_DIR: '' };
+      await serveRunReservations({ id: 'run-4' }, env);
+      expect(env[TEST_GATE_SERVED_ENV]).toBe('1');
+      expect(env).not.toHaveProperty(RESERVATIONS_ENV);
+      expect(env).not.toHaveProperty(RESERVATIONS_UNSERVED_ENV);
+      expect(env.MBX_SCHED_DISABLE).toBe('1');
+      expect(await readFile(join(mbx.root, 'mbx.env'), 'utf8')).toBe('unset unset\n');
+      const socket = (await readFile(mbx.said, 'utf8')).trim().replace(/^reservations /, '');
+      // The endpoint ended with the question, and its socket's directory went with it.
+      await expect(access(dirname(socket))).rejects.toThrow();
+    } finally {
+      await rm(mbx.root, { recursive: true, force: true });
+    }
+  });
+
+  it('sizes the leaves of a run under a hold to their grants where its mbx does not answer', async () => {
+    const mbx = await standInMbx("echo 'mbx: unknown command reservations' >&2\nexit 2");
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const env: NodeJS.ProcessEnv = { ...mbx.env, MBX_SCHED_DISABLE: '1', [TEST_GATE_SERVED_ENV]: '1' };
+      await serveRunReservations({ id: 'run-5' }, env);
+      expect(env).not.toHaveProperty(TEST_GATE_SERVED_ENV);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('did not say whether its test shim gates cases'));
+    } finally {
+      warn.mockRestore();
+      await rm(mbx.root, { recursive: true, force: true });
+    }
+  });
+  //#endregion smoo/cowshed!n/a-case-starts-on-a-core
 
   it('says why an endpoint did not start, and publishes none', async () => {
     const mbx = await standInMbx("echo 'mbx: reservations need scheduler.enabled' >&2\nexit 1");

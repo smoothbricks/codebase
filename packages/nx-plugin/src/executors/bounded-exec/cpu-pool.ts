@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
+import type { CaseCore } from './case-gate.js';
 import { holdLease, type Unleased } from './gateway-lease.js';
 import { type LiveUsageReading, type RunMemory, readLiveUsage } from './host-memory.js';
 import { type CpuLeaseProgress, type CpuLeaseQueued, CpuLeaseWait, HEARTBEAT_MS } from './lease-wait.js';
@@ -64,6 +65,8 @@ interface CpuPoolRequest {
   parallelism?: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
   task?: string & typia.tags.MaxLength<256>;
   alone?: boolean;
+  /** One token for one test case of a leaf that holds a grant: granted only while no other request waits. */
+  lend?: boolean;
 }
 
 /** A grant whose charge alone exceeds the run's memory, made while nothing else held memory: the run's memory. */
@@ -127,6 +130,7 @@ interface Waiter {
   readonly parallelism?: number | undefined;
   readonly task?: string | undefined;
   readonly alone?: boolean | undefined;
+  readonly lend?: boolean | undefined;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -239,6 +243,38 @@ export async function takeParentCpuTokens(
   };
 }
 
+/**
+ * One token of `parent` asked for one test case of a leaf that holds a grant of it, named `task` in the request
+ * (specs/cowshed/05_gateway.md, "A case starts on a core", Inside a hold). The pool grants it only while no other
+ * request waits. `release` gives the token back, or withdraws the request while it waits. A pool that refuses, falls
+ * silent or is gone grants nothing: the case waits for a token of its leaf's own grant.
+ */
+export function lendParentToken(parent: InheritedCpuPool, task: string): CaseCore {
+  const withdrawn = new AbortController();
+  const lease = holdLease(
+    parent.socket,
+    { op: 'cpu-pool', want: 1, lend: true, task: task.slice(0, MAX_TASK_LENGTH) },
+    'the parent CPU pool',
+    new CpuLeaseWait(),
+    undefined,
+    withdrawn.signal,
+  );
+  let released = false;
+  return {
+    granted: lease.then((held) => held.granted && !released),
+    release: () => {
+      if (released) return;
+      released = true;
+      withdrawn.abort();
+      void lease.then((held) => {
+        if (held.granted) held.release();
+      });
+    },
+  };
+}
+
+/** A request's `task` is at most this long (`CpuPoolRequest`). */
+const MAX_TASK_LENGTH = 256;
 /** A thrown value's message. */
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -542,7 +578,7 @@ export async function createCpuPool(
         ),
       );
 
-      if (memory !== null) {
+      if (memory !== null && request.lend !== true) {
         const live = liveUsage(memory.source);
         const held = live.ok
           ? `${live.usage.anon + live.usage.shmem} bytes (anon ${live.usage.anon}, shmem ${live.usage.shmem}, ${live.usage.source})`
@@ -646,6 +682,13 @@ export async function createCpuPool(
         );
         return;
       }
+      if (parsed.lend === true && (parsed.want !== 1 || parsed.memory !== undefined || parsed.alone === true)) {
+        refuse(
+          child,
+          'a lent request is one token for one test case: {"op":"cpu-pool","want":1,"lend":true,"task"?:<its case>}',
+        );
+        return;
+      }
       const request = parsed;
       child.phase = { kind: 'queued' };
       const waiter: Waiter = {
@@ -655,13 +698,18 @@ export async function createCpuPool(
         parallelism: request.parallelism,
         task: request.task,
         alone: request.alone,
+        lend: request.lend,
       };
       if (request.alone === true) {
         // A leaf the kernel killed has waited once already: it goes ahead of the leaves that have not run.
         const at = queue.findIndex((waiting) => waiting.alone !== true);
         queue.splice(at === -1 ? queue.length : at, 0, waiter);
-      } else {
+      } else if (request.lend === true) {
         queue.push(waiter);
+      } else {
+        // A leaf's request goes ahead of every lent one: a case is lent only a token no leaf waits for.
+        const at = queue.findIndex((waiting) => waiting.lend === true);
+        queue.splice(at === -1 ? queue.length : at, 0, waiter);
       }
       socket.write(frame({ ok: true, lease: 'queued', server: process.pid }));
       drain(0);

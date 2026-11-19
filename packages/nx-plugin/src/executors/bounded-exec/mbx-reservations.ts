@@ -9,7 +9,7 @@ import typia, { type tags } from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import { CONTROL_MS } from './lease-wait.js';
-import { type MbxPriority, mbxPool } from './mbx-pool.js';
+import { type MbxPriority, mbxHold, mbxPool } from './mbx-pool.js';
 
 /**
  * mbx's reservation endpoint of one Nx run (specs/cowshed/05_gateway.md, "Parallelism inside a job"). A reserved leaf
@@ -72,13 +72,15 @@ const endpoints = new Map<string, Endpoint>();
 /**
  * Serve `context`'s run an mbx reservation endpoint and publish it in `env`, which every task inherits, when the
  * environment names mbx's pool (`mbxPool`). An endpoint that does not start is said, and each reserved leaf of the run
- * then refuses to run, naming `RESERVATIONS_ENV`; a leaf in no pool, or one mbx admits itself, runs as before.
+ * then refuses to run, naming `RESERVATIONS_ENV`; a leaf in no pool, or one mbx admits itself, runs as before. A run
+ * under a hold on mbx's pool is served no endpoint, and learns whether its mbx gates test cases (`learnHeldGate`).
  */
 export async function serveRunReservations(
   context: Pick<PreTasksExecutionContext, 'id'>,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   if (mbxPool(env) === null) {
+    if (mbxHold(env)) await learnHeldGate(env);
     return;
   }
   const started = await startEndpoint(env);
@@ -97,6 +99,31 @@ export async function serveRunReservations(
   else delete env[TEST_GATE_SERVED_ENV];
 }
 
+/**
+ * A run under a hold on mbx's pool reserves nothing and serves its own token pool (run-cpu-pool.ts), and its nextest
+ * leaves still start every case through mbx's shim. Whether that shim gates is the endpoint's own answer, so the run
+ * starts the endpoint once, outside the hold's `MBX_SCHED_DISABLE` and `MBX_SCHED_DIR`, which it refuses to serve
+ * under, asks, and ends it; no request is made of it (specs/cowshed/05_gateway.md, "A case starts on a core", Inside a
+ * hold). An mbx that does not start it, or does not answer, gates nothing: the run's leaves are sized to their grants.
+ */
+async function learnHeldGate(env: NodeJS.ProcessEnv): Promise<void> {
+  const unheld = { ...env };
+  delete unheld.MBX_SCHED_DISABLE;
+  delete unheld.MBX_SCHED_DIR;
+  const started = await startEndpoint(unheld);
+  if (!started.ok) {
+    logger.warn(
+      `bounded-exec: the installed mbx did not say whether its test shim gates cases (${started.error}); this run's nextest leaves are sized to their grants`,
+    );
+    delete env[TEST_GATE_SERVED_ENV];
+    return;
+  }
+  const gates = await endpointGatesTests(started.socket);
+  await endEndpoint(started.endpoint);
+  if (gates) env[TEST_GATE_SERVED_ENV] = '1';
+  else delete env[TEST_GATE_SERVED_ENV];
+}
+
 /** Close the endpoint `context`'s run was served, if it was served one: its standard input's end ends it. */
 export async function closeRunReservations(context: Pick<PostTasksExecutionContext, 'id'>): Promise<void> {
   const endpoint = endpoints.get(context.id);
@@ -104,12 +131,18 @@ export async function closeRunReservations(context: Pick<PostTasksExecutionConte
     return;
   }
   endpoints.delete(context.id);
-  endpoint.server.stdin.end();
-  const ended = await endedWithin(endpoint, CONTROL_MS);
-  await rm(endpoint.directory, { recursive: true, force: true });
+  const ended = await endEndpoint(endpoint);
   if (ended !== 'mbx reservations ended with status 0') {
     logger.warn(`bounded-exec: this run's mbx reservation endpoint did not close cleanly: ${ended}`);
   }
+}
+
+/** End `endpoint` by its standard input's end and remove its socket's directory; how it ended. */
+async function endEndpoint(endpoint: Endpoint): Promise<string> {
+  endpoint.server.stdin.end();
+  const ended = await endedWithin(endpoint, CONTROL_MS);
+  await rm(endpoint.directory, { recursive: true, force: true });
+  return ended;
 }
 
 /** Start `mbx reservations` by its PATH name in an owned socket directory, and wait until it says it listens. */

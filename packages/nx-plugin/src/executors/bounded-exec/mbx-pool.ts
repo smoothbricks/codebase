@@ -46,6 +46,15 @@ export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | nul
 }
 
 /**
+ * Whether the environment names mbx's pool from inside a hold on it: what a held cowshed job, `mbx reserve`'s command
+ * and a reserved leaf's shell see (`MBX_SCHED_DISABLE=1` beside the canonical environment). mbx's test shim still
+ * starts every nextest case there, so a run under it may gate its cases (mbx-reservations.ts, `learnHeldGate`).
+ */
+export function mbxHold(environment: Readonly<NodeJS.ProcessEnv>): boolean {
+  return environment.MBX_SCHEDULER === '1' && !!environment.MBX_CACHE_DIR && environment.MBX_SCHED_DISABLE === '1';
+}
+
+/**
  * How a leaf enters the pool once. A Cargo leaf that builds runs through mbx, which admits its compilers and supported
  * test work itself, so wrapping it would charge it twice. Any other leaf reserves for its whole run, asking its Nx
  * run's mbx reservation endpoint (mbx-reservations.ts) for at most its runner's count: mbx grants as many of those

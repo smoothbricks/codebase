@@ -303,6 +303,8 @@ export function withInvocationFlag(
 /**
  * Size the runner to the lesser of its bounded demand and grant, keeping the test-thread ceilings. Rewrite named flags
  * so they cannot outrank that size. `CPU_TOKENS_ENV` still reports the actual held grant.
+ * A `gated` nextest runner starts every thread of its ask instead: each case takes its token at the leaf's gate
+ * (case-gate.ts; specs/cowshed/05_gateway.md, "A case starts on a core", Inside a hold).
  *
  * Cargo's rustc count is the pool's: the executor's sub-pool exports its jobserver fifo, so no `CARGO_BUILD_JOBS`
  * comes from the grant (specs/cowshed/05_gateway.md, "Cargo reads its holder's jobserver"). Test threads take no
@@ -313,6 +315,7 @@ export function sizeRunner(
   demand: Demand,
   command: string,
   tokens: number,
+  gated = false,
 ): { command: string; env: Record<string, string> } {
   const runnerCount = Math.min(tokens, demand.want);
   const count = String(runnerCount);
@@ -320,8 +323,8 @@ export function sizeRunner(
   switch (demand.kind) {
     case 'nextest':
       return {
-        command: command.replace(TEST_THREADS, `--test-threads=${count}`),
-        env: { [CPU_TOKENS_ENV]: held, NEXTEST_TEST_THREADS: count },
+        command: command.replace(TEST_THREADS, `--test-threads=${gated ? demand.want : count}`),
+        env: { [CPU_TOKENS_ENV]: held, NEXTEST_TEST_THREADS: gated ? String(demand.want) : count },
       };
     case 'bun-parallel':
       return { command: command.replace(BUN_PARALLEL, `--parallel=${count}`), env: { [CPU_TOKENS_ENV]: held } };

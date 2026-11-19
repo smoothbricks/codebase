@@ -162,6 +162,58 @@ export class CaseGate {
   }
 }
 
+/** One core asked of a pool for one case: whether the pool granted it, and how it is given back or withdrawn. */
+export interface CaseCore {
+  /** Settles once the pool grants the core (true), or refuses, loses or is withdrawn the request (false). */
+  readonly granted: Promise<boolean>;
+  /** Gives the core back, or withdraws the request while it waits. Later calls do nothing. */
+  release(): void;
+}
+
+/** A leaf's gate decisions and the cores its waiting cases asked their pool for. */
+export interface GatedCases {
+  readonly cases: CaseGate;
+  /** Gives back every core a case still holds and withdraws every request that waits. */
+  releaseAll(): void;
+}
+
+/**
+ * The gate of a leaf that holds `own` cores, over whichever pool `ask` asks: mbx's, through the run's reservation
+ * endpoint, or the run's own token pool (cpu-pool.ts, `lendParentToken`). `start` answers a case's connection.
+ */
+export function gateCases(
+  own: number,
+  wall: (id: string) => number,
+  start: (id: string) => void,
+  ask: (id: string) => CaseCore,
+): GatedCases {
+  const requests = new Map<string, CaseCore>();
+  const cases: CaseGate = new CaseGate(own, wall, {
+    start,
+    reserve: (id) => {
+      const held = ask(id);
+      requests.set(id, held);
+      void held.granted.then((granted) => {
+        // Released since: the case started on a core of the grant, or ended while it waited.
+        if (requests.get(id) !== held) return;
+        if (granted) cases.granted(id);
+        else requests.delete(id);
+      });
+    },
+    release: (id) => {
+      requests.get(id)?.release();
+      requests.delete(id);
+    },
+  });
+  return {
+    cases,
+    releaseAll: () => {
+      for (const held of requests.values()) held.release();
+      requests.clear();
+    },
+  };
+}
+
 /**
  * A case's wall as its result records it: nextest times a case from the shim's start, so its own duration includes the
  * wait at the gate, which is taken off. Never below zero.

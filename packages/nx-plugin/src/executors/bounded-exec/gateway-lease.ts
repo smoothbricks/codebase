@@ -61,6 +61,7 @@ export function holdLease(
   what: string,
   bounds: LeaseBounds | CpuLeaseWait,
   onQueued?: () => void,
+  withdrawn?: AbortSignal,
 ): Promise<HeldLease> {
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
   // es2022 from tsconfig.base.json.
@@ -231,5 +232,10 @@ export function holdLease(
     socketClosed = true;
     unleased(`the lease connection for ${what} at ${socket} closed`);
   });
+  if (withdrawn !== undefined) {
+    const withdraw = (): void => unleased(`the request for ${what} at ${socket} was withdrawn`);
+    if (withdrawn.aborted) withdraw();
+    else withdrawn.addEventListener('abort', withdraw, { once: true });
+  }
   return promise;
 }

@@ -16,15 +16,16 @@ import {
 import { AdmissionObservation, type QueueHost } from './admission-queue.js';
 import { type BoundEvent, type BoundKind, type Bounds, earliestBound, stepBounds, UNARMED } from './bounds.js';
 import {
-  CaseGate,
   type CaseGateServer,
+  type GatedCases,
+  gateCases,
   runWallMs,
   serveCaseGate,
   TEST_GATE_ENV,
   TEST_GATE_SERVED_ENV,
 } from './case-gate.js';
 import { DIAGNOSTIC_CONTEXT_ENV, DIAGNOSTIC_MODULE_ENV, grantMemoryEnvironment } from './child-exit-diagnostics.js';
-import { type CpuPool, createCpuPool } from './cpu-pool.js';
+import { type CpuPool, createCpuPool, lendParentToken } from './cpu-pool.js';
 import type { CpuRise } from './cpu-rise.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { declaredGoTests, goRunSummaryText } from './go-run-summary.js';
@@ -617,8 +618,19 @@ async function runCommand(
   // its runner's count, a maximum, and its runner runs on the cores it is granted, which only the command learns
   // (specs/cowshed/05_gateway.md, "Parallelism inside a job"). No grant and no sub-pool beside it.
   const leaf = mbx === null ? null : mbxLeaf(mbx, demand, requested, process.env[TEST_GATE_SERVED_ENV] === '1');
+  // A nextest leaf granted fewer of its parent pool's tokens than it asked takes the case gate where the run's mbx
+  // gates cases: its runner starts every thread of its ask, and a case that finds no token of the grant free asks the
+  // pool for one of its own (specs/cowshed/05_gateway.md, "A case starts on a core", Inside a hold).
+  const lender =
+    grant !== null &&
+    inherited !== null &&
+    demand.kind === 'nextest' &&
+    grant.tokens < demand.want &&
+    process.env[TEST_GATE_SERVED_ENV] === '1'
+      ? { own: grant.tokens, pool: inherited }
+      : null;
   if (grant !== null) {
-    sized = sizeRunner(demand, requested, grant.tokens);
+    sized = sizeRunner(demand, requested, grant.tokens, lender !== null);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs };
     for (const said of describeGrant(grant, { waitedMs, want: demand.want, runner: demand.kind, charge })) {
       appendStderr(said);
@@ -638,20 +650,18 @@ async function runCommand(
   // before the command starts, decided from the leaf's grant on, and closed once the command is gone, when every core a
   // case still holds goes back to the pool and the leaf says what its cases ran on.
   let caseGate: CaseGateServer | null = null;
-  let cases: CaseGate | null = null;
-  const caseRequests = new Map<string, Reservation>();
+  let gated: GatedCases | null = null;
   let caseGateClosed: Promise<void> | null = null;
   const closeCaseGate = (): Promise<void> => {
     caseGateClosed ??= (async () => {
       const left = (await caseGate?.close()) ?? null;
       if (left !== null) appendStderr(`bounded-exec: ${left}\n`);
-      for (const held of caseRequests.values()) held.release();
-      caseRequests.clear();
-      const decided = cases;
+      const decided = gated;
       if (decided === null) return;
-      const { own, lent, lentCoreMs, waitedCaseMs } = decided.summary();
+      decided.releaseAll();
+      const { own, lent, lentCoreMs, waitedCaseMs } = decided.cases.summary();
       tell(
-        `cowshed: mbx reserve cases own=${own} lent=${lent} lent_core_s=${Math.round(lentCoreMs / 1000)} waited_case_s=${Math.round(waitedCaseMs / 1000)}\n`,
+        `cowshed: ${grant !== null ? 'cpu-pool' : 'mbx reserve'} cases own=${own} lent=${lent} lent_core_s=${Math.round(lentCoreMs / 1000)} waited_case_s=${Math.round(waitedCaseMs / 1000)}\n`,
       );
     })();
     return caseGateClosed;
@@ -812,10 +822,10 @@ async function runCommand(
   }
   // A case that arrives before the leaf's grant has no core to take and no leaf to wait for: its connection is refused,
   // and its shim fails it by name.
-  if (reserved?.leaf.gated === true) {
+  if (reserved?.leaf.gated === true || lender !== null) {
     const served = await serveCaseGate({
-      arrived: (id) => cases?.arrived(id) ?? false,
-      ended: (id) => cases?.ended(id),
+      arrived: (id) => gated?.cases.arrived(id) ?? false,
+      ended: (id) => gated?.cases.ended(id),
       invalid: (detail) => {
         if (lifecycleFailure !== null || state.expiry !== null || state.settled) return;
         lifecycleFailure = { kind: 'executor', message: `case gate: ${detail}` };
@@ -829,6 +839,15 @@ async function runCommand(
       );
     }
     caseGate = served.gate;
+    if (lender !== null) {
+      const gate = served.gate;
+      gated = gateCases(
+        lender.own,
+        (id) => lastWalls.get(id) ?? 0,
+        (id) => gate.start(id),
+        (id) => lendParentToken(lender.pool, `nextest:${id}`),
+      );
+    }
   }
   const native = directory === null ? { command: sized.command, env: {} } : withTestResultReport(sized.command);
   const command =
@@ -976,7 +995,7 @@ async function runCommand(
       ? undefined
       : (closed) => {
           // nextest times a case from its shim's start: the wait at the gate is taken off its wall and named beside it.
-          const waitMs = cases?.waitedMs(closed.id) ?? 0;
+          const waitMs = gated?.cases.waitedMs(closed.id) ?? 0;
           const result =
             closed.durationMs === null || waitMs === 0
               ? closed
@@ -1456,23 +1475,15 @@ async function runCommand(
           tell(`cowshed: mbx reserve granted elapsed=${Date.now() - startedAt}ms priority=${reservedLeaf.priority}\n`);
           if (caseGate !== null) {
             const gate = caseGate;
-            cases = new CaseGate(granted.cpus, (id) => lastWalls.get(id) ?? 0, {
-              start: (id) => gate.start(id),
-              reserve: (id) => {
+            gated = gateCases(
+              granted.cpus,
+              (id) => lastWalls.get(id) ?? 0,
+              (id) => gate.start(id),
+              (id) => {
                 const held = reserveCores(endpoint, 1, 'low', 1, `nextest:${id}`);
-                caseRequests.set(id, held);
-                void held.granted.then((answer) => {
-                  // Released since: the case started on a core of the grant, or ended while it waited.
-                  if (caseRequests.get(id) !== held) return;
-                  if (answer.ok) cases?.granted(id);
-                  else caseRequests.delete(id);
-                });
+                return { granted: held.granted.then((answer) => answer.ok), release: () => held.release() };
               },
-              release: (id) => {
-                caseRequests.get(id)?.release();
-                caseRequests.delete(id);
-              },
-            });
+            );
           }
           channel.end(`${granted.cpus}\n`);
           stepTo({ kind: 'granted', at: Date.now(), testing: isTesting(), fixture: !fixtureDone });
