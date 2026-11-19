@@ -76,6 +76,9 @@ export type EndpointEffect =
   | { readonly do: 'refuse'; readonly why: string }
   | { readonly do: 'close-stdin' }
   | { readonly do: 'kill' }
+
+  /** Stop the child and its pipes from keeping the run alive, without signalling it again. */
+  | { readonly do: 'unref-child' }
   | { readonly do: 'arm'; readonly ms: number }
   | { readonly do: 'disarm' }
   /** Answer the run's end. */
@@ -265,9 +268,10 @@ function ending(life: EndpointLife & { phase: 'ending' }, event: EndpointEvent):
       // Neither did the kill: it is stuck in the kernel, or something it started holds its pipes. The wait ends and
       // says so; the child is left as it is (05_gateway.md, "A child's exit and its output are reap-class waits").
       const left = `${life.pid === undefined ? 'it' : `pid ${life.pid}`} had not ended ${REAP_MS}ms after it was killed and is left as it is`;
-      if (life.refusing !== null) return [ENDED, [{ do: 'refuse', why: `${life.refusing}; ${left}` }]];
+      if (life.refusing !== null)
+        return [ENDED, [{ do: 'unref-child' }, { do: 'refuse', why: `${life.refusing}; ${left}` }]];
       const how = `mbx reservations outlived its standard input by ${REAP_MS}ms; ${left}`;
-      return [ENDED, [{ do: 'conclude', ended: { how, clean: false } }]];
+      return [ENDED, [{ do: 'unref-child' }, { do: 'conclude', ended: { how, clean: false } }]];
     }
     default:
       return [life, []];

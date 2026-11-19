@@ -198,6 +198,15 @@ async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
       case 'kill':
         server.kill('SIGKILL');
         return;
+
+      case 'unref-child': {
+        server.unref();
+        // Node exposes its pipes as sockets; Bun's readable pipes also unref but are not sockets.
+        type Pipe = (typeof server.stdin | typeof server.stdout) & { unref?: () => void };
+        const pipes: readonly Pipe[] = [server.stdin, server.stdout, server.stderr];
+        for (const pipe of pipes) pipe.unref?.();
+        return;
+      }
       case 'close-stdin':
         server.stdin.end();
         return;

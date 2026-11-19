@@ -254,6 +254,7 @@ describe("the life of a run's reservation endpoint", () => {
           [{ do: 'close-stdin' }, reap],
           [{ do: 'kill' }, reap],
           [
+            { do: 'unref-child' },
             {
               do: 'conclude',
               ended: {
@@ -271,6 +272,7 @@ describe("the life of a run's reservation endpoint", () => {
         effects: [
           [{ do: 'kill' }, reap],
           [
+            { do: 'unref-child' },
             {
               do: 'refuse',
               why: `mbx reservations said "mbx 1.2.3", not that it was listening; pid ${PID} had not ended ${REAP_MS}ms after it was killed and is left as it is`,
@@ -430,4 +432,19 @@ describe("the life of a run's reservation endpoint", () => {
       });
     });
   });
+
+  //#region smoo/cowshed!n/an-nx-run-serves-its-leaves-one-reservation-endpoint
+  it('lets the run exit when the killed child or its pipes outlive the final reap bound', () => {
+    everyOrder((steps) => {
+      for (const { event, before, effects } of steps) {
+        const outputs = effects.map((effect) => effect.do);
+        if (event.type === 'expired' && before.phase === 'ending' && before.killed) {
+          expect(outputs).toEqual(['unref-child', before.refusing === null ? 'conclude' : 'refuse']);
+        } else {
+          expect(outputs).not.toContain('unref-child');
+        }
+      }
+    });
+  });
+  //#endregion smoo/cowshed!n/an-nx-run-serves-its-leaves-one-reservation-endpoint
 });
