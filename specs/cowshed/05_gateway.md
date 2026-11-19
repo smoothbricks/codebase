@@ -2824,9 +2824,10 @@ mount then waits for a verb or the next start.
 A RAM temp volume is no held workspace: its disk is its keeping caller's ("RAM disks"), and a lost mount of it is
 settled through its leases (`packages/nx-plugin/README.md`, RAM temp).
 
-The regression is `cowshed-cli`'s `real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount`: a real fixture
-adopts main and forks a shed, arms the watch on its own store, unmounts both with `diskutil unmount`, and hears both
-remounted at their mountpoints, `nobrowse` with owners honoured and their markers in place.
+The regression is `cowshed-cli`'s `real_apfs_a_removal_under_the_lost_mount_watch_leaves_a_held_build_detach_unpinned`.
+One real fixture proves that the watch remounts its independently unmounted shed at the recorded path, leaves the shed's
+build volume alone while removal holds the image lock across a raw-device dissent, and heals an independently unmounted
+main after the removal. Both remounts are `nobrowse` with owners honoured and their markers in place.
 
 ## Deleting released images
 

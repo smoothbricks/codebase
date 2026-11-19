@@ -5833,32 +5833,64 @@ mod tests {
         }
     }
 
-    /// Only a fresh `adopt --re-adopt` that names no repository asks the store for main's recorded
-    /// primary. A resumed one is named by its journal, `--repo-id` names its own, and a plain adopt
-    /// or any other verb derives nothing from the marker.
-    #[test]
-    fn only_a_fresh_re_adoption_without_a_repo_id_binds_the_recorded_primary() {
-        let binds = |argv: &[&str], resuming| {
-            let cli = crate::args::parse_args(argv.iter().copied()).expect("a valid command line");
-            binds_re_adoption_primary(&cli.command, resuming)
-        };
-        assert!(binds(&["adopt", "--re-adopt"], false));
-        assert!(binds(&["adopt", "checkout", "--re-adopt"], false));
-        for (argv, resuming) in [
-            (&["adopt", "--re-adopt"][..], true),
-            (&["adopt", "checkout", "--re-adopt"], true),
-            (&["adopt", "--re-adopt", "--repo-id", "acme/widget"], false),
-            (&["adopt", "--re-adopt", "--repo-id", "acme/widget"], true),
-            (&["adopt"], false),
-            (&["adopt", "--repo-id", "acme/widget"], false),
-            (&["mount", "main", "--repo-id", "acme/widget"], false),
-        ] {
-            assert!(
-                !binds(argv, resuming),
-                "{argv:?} (resuming: {resuming}) must not bind the recorded primary"
+    //#region smoo/cowshed!n/re-adoption-cli
+    proptest::proptest! {
+        // 02_workspaces.md, "Re-adoption", steps 1 and 5: only a fresh replacement
+        // without an explicit repo id binds the recorded primary, with or without a checkout.
+        #[test]
+        fn only_a_fresh_re_adoption_without_a_repo_id_binds_the_recorded_primary(
+            checkout in proptest::option::of("[a-z][a-z0-9-]{0,12}"),
+            repo in proptest::option::of("[a-z]+/[a-z]+"),
+            re_adopt in proptest::bool::ANY,
+            resuming in proptest::bool::ANY,
+        ) {
+            let mut argv = vec!["adopt"];
+            argv.extend(checkout.as_deref());
+            if re_adopt {
+                argv.push("--re-adopt");
+            }
+            if let Some(repo) = repo.as_deref() {
+                argv.extend(["--repo-id", repo]);
+            }
+            let cli = crate::args::parse_args(argv).expect("adopt parses");
+            proptest::prop_assert_eq!(
+                binds_re_adoption_primary(&cli.command, resuming),
+                re_adopt && !resuming && repo.is_none()
             );
         }
+
+        // The removal hint carries exactly the returned paths, in order, even in quiet mode.
+        #[test]
+        fn re_adoption_guidance_names_exactly_the_retained_paths(
+            retained in proptest::collection::vec("/store/[a-z]+/retained/[a-z0-9.-]+", 1..9),
+            replacement in "[a-f0-9]{32}",
+            quiet in proptest::bool::ANY,
+        ) {
+            let report = ReAdoption {
+                replacement: WorkspaceIncarnation::new(&replacement).expect("incarnation"),
+                retained: retained.iter().map(PathBuf::from).collect(),
+            };
+            let mut output = Output::new(Vec::new(), Vec::new(), quiet);
+            report_re_adoption(&mut output, &report).expect("write re-adoption guidance");
+            let (stdout, stderr) = output.into_inner();
+            proptest::prop_assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr).expect("guidance is UTF-8");
+            let mut account = stderr.lines();
+            let hint = account.next_back().expect("one removal hint");
+            let named: Vec<&str> = hint.strip_prefix("next: rm -R -- ")
+                .expect("explicit removal command").split_whitespace().collect();
+            let expected: Vec<&str> = retained.iter().map(String::as_str).collect();
+            proptest::prop_assert_eq!(named.as_slice(), expected.as_slice());
+            if quiet {
+                proptest::prop_assert!(account.next().is_none());
+            } else {
+                proptest::prop_assert!(account.next().is_some_and(|line| line.contains(&replacement)));
+                let lines: Vec<_> = account.filter_map(|line| line.strip_prefix("  ")).collect();
+                proptest::prop_assert_eq!(lines, expected);
+            }
+        }
     }
+    //#endregion smoo/cowshed!n/re-adoption-cli
 
     /// A manager that answers every call with the refusal a daemon of another build gives, and
     /// reports what it was asked.

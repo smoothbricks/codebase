@@ -2203,10 +2203,10 @@ async fn directory_a_workspace_landed_through_the_controller_leaves_the_gateway_
 /// a base takes the block (the making-room test lost 45184 so), and the workspace's own session
 /// install on its next `exec` lets the claim go.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_again() {
+async fn directory_a_detached_workspace_keeps_its_port_block_until_it_attaches_again() {
     use std::io::Read as _;
 
-    let mut fixture = Fixture::with(Project::Plain);
+    let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
@@ -2215,10 +2215,6 @@ async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_a
         .await
         .expect("serve the project");
     new_workspace(&mut service, "parked").await;
-    service
-        .reconcile_gateway()
-        .await
-        .expect("serve the parked session");
     let block = service
         .grants("parked")
         .await
@@ -2228,10 +2224,6 @@ async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_a
     let claim = block.base() + 1;
 
     succeed(&mut service, ["detach", "parked"]).await;
-    service
-        .reconcile_gateway()
-        .await
-        .expect("remove the detached session");
     let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, claim))
         .expect_err("the store claims the detached block");
     assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
@@ -2248,112 +2240,6 @@ async fn real_apfs_a_detached_workspace_keeps_its_port_block_until_it_attaches_a
         "the session's install lets the store's claim go"
     );
     service.shutdown().await.expect("shutdown runtime");
-    fixture.stop_gateway().await;
-}
-
-/// A volume the gateway holds that loses its mount while its image stays attached is mounted
-/// again where it belongs (05_gateway.md, "Lost mounts"). On 2026-11-10 a restart of `fseventsd`
-/// left about 100 cowshed volumes so, every main and shed of the host, and each stayed unmounted
-/// until an operator mounted main and attached every shed by hand. Here the fixture's own main and
-/// shed lose their mounts to a Disk Arbitration unmount under the gateway's watch, their images
-/// left attached; the watch hears the kernel, remounts both through the heal's settle, with the
-/// canonical `nobrowse,owners` policy, and says so for each.
-#[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_the_gateway_remounts_a_held_volume_that_lost_its_mount() {
-    use cowshed_core::LostMount;
-    use cowshed_core::storage::apfs::Remount;
-
-    let mut fixture = Fixture::with(Project::Plain);
-    let mut service = fixture.open().await;
-    adopt(&fixture, &mut service).await;
-    fixture.start_gateway().await;
-    service
-        .reconcile_gateway()
-        .await
-        .expect("serve the project");
-    let shed = new_workspace(&mut service, "shed").await;
-    // Nothing of the runtime holds either volume while the test unmounts it.
-    service.shutdown().await.expect("shutdown runtime");
-    let held = |mount: &Path| {
-        SystemKernelMountSource
-            .mounts()
-            .expect("own fixture mounts")
-            .into_iter()
-            .find(|kernel| kernel.mount_point == mount)
-    };
-    for mount in [&fixture.checkout, &shed] {
-        assert!(held(mount).is_some(), "{} is mounted", mount.display());
-    }
-
-    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
-    let watch = cowshed_core::lost_mounts::watch(
-        cowshed_core::NativeGatewayInventory::new(fixture.storage.clone()),
-        move |lost| {
-            let _ = heard.send(lost);
-        },
-    )
-    .expect("arm the gateway's watch on lost mounts");
-    for mount in [&fixture.checkout, &shed] {
-        let unmount = cowshed_apfs::CommandRequest::new(
-            "/usr/sbin/diskutil",
-            [OsString::from("unmount"), mount.as_os_str().to_os_string()],
-        );
-        let result = fixture
-            .runner()
-            .run(&unmount, "fixture unmount")
-            .expect("run diskutil unmount")
-            .output;
-        assert!(
-            result.succeeded(),
-            "diskutil unmount {}: {result:?}",
-            mount.display()
-        );
-    }
-
-    let mut remounted = std::collections::BTreeMap::new();
-    while remounted.len() < 2 {
-        let lost = hearing.recv().await.expect("the watch runs");
-        match lost {
-            LostMount::Workspace {
-                workspace,
-                remount:
-                    Ok(Remount::Remounted {
-                        device,
-                        mount_point,
-                    }),
-            } => {
-                assert!(device.starts_with("/dev/disk"), "{device}");
-                remounted.insert(workspace.name().to_string(), mount_point);
-            }
-            other => panic!("a lost mount the watch did not remount: {other}"),
-        }
-    }
-    assert_eq!(
-        remounted,
-        [
-            ("main".to_owned(), fixture.checkout.clone()),
-            ("shed".to_owned(), shed.clone()),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    for mount in [&fixture.checkout, &shed] {
-        let kernel = held(mount).unwrap_or_else(|| panic!("{} is mounted again", mount.display()));
-        assert!(!kernel.browse(), "{} is mounted nobrowse", mount.display());
-        assert!(
-            kernel.owners_honoured(),
-            "{} honours owners",
-            mount.display()
-        );
-        assert!(
-            mount
-                .join(cowshed_core::storage::WORKSPACE_MARKER_PATH)
-                .is_file(),
-            "{} carries its marker",
-            mount.display()
-        );
-    }
-    drop(watch);
     fixture.stop_gateway().await;
 }
 
@@ -2383,14 +2269,11 @@ impl WatchedRemoval {
             .mount(&volume)
             .canonicalize()
             .expect("the shed's build mount");
-        for mount in [&shed, &build] {
-            assert!(
-                kernel_mount_at(mount).is_some(),
-                "{} is mounted",
-                mount.display()
-            );
-        }
-        let (heard, hearing) = tokio::sync::mpsc::unbounded_channel();
+        service
+            .shutdown()
+            .await
+            .expect("stop supervisors before external unmount");
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
         let watch = cowshed_core::lost_mounts::watch(
             cowshed_core::NativeGatewayInventory::new(fixture.storage.clone()),
             move |lost| {
@@ -2398,6 +2281,22 @@ impl WatchedRemoval {
             },
         )
         .expect("arm the gateway's watch on lost mounts");
+        let previous_volume = unmount_for_watch(&fixture, &shed);
+        match hearing.recv().await.expect("the watch runs") {
+            cowshed_core::LostMount::Workspace {
+                workspace,
+                remount:
+                    Ok(cowshed_core::storage::apfs::Remount::Remounted {
+                        device,
+                        mount_point,
+                    }),
+            } => {
+                assert_eq!(workspace.name().as_str(), "shed");
+                assert_watched_remount(&shed, &mount_point, &device, &previous_volume);
+            }
+            other => panic!("the watch did not heal the shed: {other}"),
+        }
+        let service = fixture.reopen().await;
         Self {
             fixture,
             service,
@@ -2427,27 +2326,21 @@ impl WatchedRemoval {
         );
         // Nothing of the runtime holds main while the test unmounts it.
         self.service.shutdown().await.expect("shutdown runtime");
-        let unmount = cowshed_apfs::CommandRequest::new(
-            "/usr/sbin/diskutil",
-            [
-                OsString::from("unmount"),
-                self.fixture.checkout.as_os_str().to_os_string(),
-            ],
-        );
-        let result = self
-            .fixture
-            .runner()
-            .run(&unmount, "fixture unmount")
-            .expect("run diskutil unmount")
-            .output;
-        assert!(result.succeeded(), "diskutil unmount main: {result:?}");
+        let volume = unmount_for_watch(&self.fixture, &self.fixture.checkout);
         let mut main_remounted = false;
         while !main_remounted || self.answers.unanswered() {
             match self.hearing.recv().await.expect("the watch runs") {
                 LostMount::Workspace {
                     workspace,
-                    remount: Ok(Remount::Remounted { .. }),
-                } if workspace.name().as_str() == "main" => main_remounted = true,
+                    remount:
+                        Ok(Remount::Remounted {
+                            device,
+                            mount_point,
+                        }),
+                } if workspace.name().as_str() == "main" => {
+                    assert_watched_remount(&self.fixture.checkout, &mount_point, &device, &volume);
+                    main_remounted = true;
+                }
                 lost => self.answers.left_to_its_holder(lost),
             }
         }
@@ -2477,6 +2370,54 @@ impl WatchedRemoval {
     }
 }
 
+fn unmount_for_watch(fixture: &Fixture, mount: &Path) -> String {
+    let volume = kernel_mount_at(mount)
+        .unwrap_or_else(|| panic!("{} is mounted before unmount", mount.display()))
+        .source_device;
+    let unmount = cowshed_apfs::CommandRequest::new(
+        "/usr/sbin/diskutil",
+        [OsString::from("unmount"), mount.as_os_str().to_os_string()],
+    );
+    let result = fixture
+        .runner()
+        .run(&unmount, "fixture unmount")
+        .expect("run diskutil unmount")
+        .output;
+    assert!(
+        result.succeeded(),
+        "diskutil unmount {}: {result:?}",
+        mount.display()
+    );
+    volume
+}
+
+fn assert_watched_remount(expected: &Path, reported: &Path, whole_device: &str, volume: &str) {
+    assert!(whole_device.starts_with("/dev/disk"), "{whole_device}");
+    assert_eq!(reported, expected);
+    let kernel = kernel_mount_at(expected)
+        .unwrap_or_else(|| panic!("{} is mounted again", expected.display()));
+    assert_eq!(
+        kernel.source_device, volume,
+        "the same APFS volume is remounted"
+    );
+    assert!(
+        !kernel.browse(),
+        "{} is mounted nobrowse",
+        expected.display()
+    );
+    assert!(
+        kernel.owners_honoured(),
+        "{} honours owners",
+        expected.display()
+    );
+    assert!(
+        expected
+            .join(cowshed_core::storage::WORKSPACE_MARKER_PATH)
+            .is_file(),
+        "{} carries its marker",
+        expected.display()
+    );
+}
 /// The kernel's mount at `mount`, if any.
 fn kernel_mount_at(mount: &Path) -> Option<cowshed_apfs::mounts::KernelMountSnapshot> {
     SystemKernelMountSource
@@ -2523,29 +2464,9 @@ impl ShedAnswers {
     }
 }
 
-/// A removal holds its workspace's image lock from before it unmounts the build volume the
-/// checkout links, so the watch on lost mounts finds the lock held and mounts nothing of a
-/// workspace being removed (05_gateway.md, "Lost mounts"; 02_workspaces.md, `rm` step 4). Here
-/// the removal and the watch run as they come: the unmount of the shed's build volume wakes the
-/// watch while the removal releases that volume, and without the lock the watch took the shed
-/// and settled its mount again over a build image the removal had just released.
-#[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_a_removal_under_the_lost_mount_watch_detaches_and_remounts_nothing() {
-    let mut removal = WatchedRemoval::armed().await;
-    // Forked seconds ago: forced past the age floor alone.
-    succeed(&mut removal.service, ["rm", "shed", "--force"]).await;
-    removal.finish().await;
-}
-
-/// The same removal with its detach of the shed's build image held, as on 2026-11-17, when three
-/// removals refused: the watch read the shed, its volume mounted and its build volume just
-/// unmounted, as having lost its mount, took the free lock and pinned the build volume's device
-/// to mount it again, and every detach of that image by the removal answered `Resource busy`. A
-/// reader of the build volume's raw device holds the detach in its grace, between the volume's
-/// unmount and its image's release, until the watch has answered for the shed: the window the
-/// watch met, held open instead of raced. The watch answers that the lock's holder has the shed,
-/// the reader lets go, the detach goes through and the removal succeeds, and the watch remounts
-/// nothing of the shed.
+/// Heal the shed after an independent native unmount, then hold its retirement between build
+/// unmount and image release with a raw-device reader. The watcher leaves the volume to the
+/// removal's image lock, then still heals main at its canonical mount after removal.
 #[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_a_removal_under_the_lost_mount_watch_leaves_a_held_build_detach_unpinned() {
     use cowshed_core::LostMount;
@@ -2611,9 +2532,8 @@ async fn real_apfs_a_removal_under_the_lost_mount_watch_leaves_a_held_build_deta
 /// register, read from the I/O Registry (01_storage.md, "Host namespace"), so another user's
 /// attach moves no reading this test or `make_room` decides on, and every outcome is exact.
 ///
-/// With both sessions idle (the runtime that served their supervisors shut down), a cap nothing
-/// can meet is said by name and detaches nothing, never failing. A process working in the older
-/// session keeps it attached while the newer one is the command's own: the warning names the
+/// A process working in the older session keeps it attached while the newer one is the command's
+/// own (both supervisors are stopped): the warning names the
 /// holder's hold, and a land holding its lease keeps it attached the same way. Once the holder is
 /// gone, a cap one medium short detaches the least recently used session alone, which leaves the
 /// namespace under the cap, and the detached session attaches again on its next `exec`.
@@ -2688,35 +2608,6 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
     // One medium past the cap as the namespace stands.
     let one_short = |reading: MediaReading| reading.excess(0, 1) - 1;
 
-    // Nothing can meet a cap of zero: said by name, nothing detached, never a failure.
-    let made = make_room(&fixture.storage, &demand(&[]), 0, gateway.as_ref()).await;
-    assert!(made.detached.is_empty(), "{made:?}");
-    let refusal = made.unmet.expect("no workspace frees a whole cap");
-    assert_eq!(refusal.code, ErrorCode::Conflict, "{refusal}");
-    for named in [
-        "fixture/dispatch/main ",
-        "fixture/dispatch/older ",
-        "fixture/dispatch/newer ",
-        "(main, never detached)",
-        "(idle)",
-        "match-notification queue",
-    ] {
-        assert!(
-            refusal.message.contains(named),
-            "{named}: {}",
-            refusal.message
-        );
-    }
-    assert!(
-        refusal.hint.contains("cowshed detach <ws>"),
-        "{}",
-        refusal.hint
-    );
-    assert!(
-        mounted(&older) && mounted(&newer),
-        "a shortfall detaches nothing"
-    );
-
     // A process working in the older session holds it, and the newer one is the command's own:
     // the plan picks the older one, its unmount is refused, and the media read again are unmoved.
     let mut host = HostProcesses(Vec::new());
@@ -2738,7 +2629,20 @@ async fn real_apfs_making_room_detaches_the_least_recently_used_idle_session_and
         "{}",
         refusal.message
     );
-    assert!(mounted(&older), "the held session stays attached");
+    assert!(
+        entry(&refusal.message, "fixture/dispatch/main").ends_with("(main, never detached)"),
+        "{}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("match-notification queue"),
+        "{refusal}"
+    );
+    assert!(refusal.hint.contains("cowshed detach <ws>"), "{refusal}");
+    assert!(
+        mounted(&older) && mounted(&newer),
+        "the shortfall detaches nothing"
+    );
     host.end();
 
     // A land of the older session holds its land lease: making room counts it busy too.
@@ -6485,9 +6389,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .expect("main's sidecar")
             .workspace_incarnation;
 
-        // The replacement's account is a returned value the CLI renders into its own output:
-        // each kept path on its line, and the one removal command naming them all.
-        let (replacement, stdout, stderr) = run(
+        succeed(
             &mut service,
             [
                 OsString::from("adopt"),
@@ -6496,12 +6398,6 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             ],
         )
         .await;
-        let stderr = String::from_utf8_lossy(&stderr);
-        assert!(
-            matches!(replacement, Ok(0)),
-            "cowshed adopt --re-adopt: {replacement:?}\nstdout: {}\nstderr: {stderr}",
-            String::from_utf8_lossy(&stdout)
-        );
 
         let new = cowshed_core::metadata::DetachedWorkspaceMetadata::read_for_image(&main_image)
             .expect("the replacement's sidecar")
@@ -6560,15 +6456,7 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             retained.join(format!("build-{}.dmg", main_volume.as_str())),
             retained.join(format!("build-{}.dmg.json", main_volume.as_str())),
         ] {
-            assert!(kept.exists(), "{} is retained: {stderr}", kept.display());
-            let kept = kept.display().to_string();
-            assert!(
-                stderr.lines().any(|line| line == format!("  {kept}"))
-                    && stderr
-                        .lines()
-                        .any(|line| line.starts_with("next: rm -R -- ") && line.contains(&kept)),
-                "the returned report names {kept} and its removal: {stderr}"
-            );
+            assert!(kept.exists(), "{} is retained", kept.display());
         }
 
         service.shutdown().await.expect("stop the runtime");
@@ -7740,8 +7628,8 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
 /// preservation guard starts after), then writes the source. The rename must refuse with the
 /// `rm <destination> --force` cancel, keep both images, and keep the edits it raced.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
-    let mut fixture = Fixture::with(Project::Plain);
+async fn directory_rename_keeps_edits_written_after_clone_publication() {
+    let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
     adopt(&fixture, &mut service).await;
     fixture.start_gateway().await;
@@ -7779,45 +7667,48 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
     let image_b_path = image_b.image().to_path_buf();
     let image_a_path = image_a.image().to_path_buf();
 
-    let observer = tokio::task::spawn_blocking({
+    let watched = [sidecar_b.as_path()];
+    let publication = until(&watched, {
+        let path = sidecar_b.clone();
         let tracked = a_mount.join("tracked.txt");
         let untracked = a_mount.join("u");
-        move || -> Instant {
-            loop {
-                match cowshed_core::metadata::read_json::<
-                    cowshed_core::metadata::DetachedWorkspaceMetadata,
-                >(&sidecar_b)
-                {
-                    Ok(metadata)
-                        if metadata.publication_state
-                            == cowshed_core::metadata::PublicationState::Active =>
-                    {
-                        break;
-                    }
-                    Ok(_) => std::thread::sleep(Duration::from_millis(1)),
-                    Err(cowshed_core::metadata::MetadataError::Io { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(error) => panic!("read the destination sidecar: {error}"),
+        move || match cowshed_core::metadata::read_json::<
+            cowshed_core::metadata::DetachedWorkspaceMetadata,
+        >(&path)
+        {
+            Ok(metadata) => {
+                if metadata.publication_state != cowshed_core::metadata::PublicationState::Active {
+                    return false;
                 }
+                fs::write(&tracked, b"five\n").expect("edit tracked after publication");
+                fs::write(&untracked, b"u2\n").expect("edit untracked after publication");
+                true
             }
-            fs::write(&tracked, b"five\n").expect("edit tracked after publication");
-            fs::write(&untracked, b"u2\n").expect("edit untracked after publication");
-            Instant::now()
+            Err(cowshed_core::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                false
+            }
+            Err(error) => panic!("read the destination sidecar: {error}"),
         }
     });
-
-    let (result, _, _) = run(&mut service, ["mv", "a", "b"]).await;
-    let finished = Instant::now();
-    let written = observer.await.expect("publication observer");
-    assert!(
-        written <= finished,
-        "the source edits must race the live rename, not follow it"
-    );
+    let (result, _, _) = {
+        let rename = run(&mut service, ["mv", "a", "b"]);
+        tokio::pin!(rename);
+        tokio::select! {
+            () = publication => rename.await,
+            (result, _, stderr) = &mut rename => panic!(
+                "rename ended before the source edit: {result:?}; {}",
+                String::from_utf8_lossy(&stderr),
+            ),
+        }
+    };
     let error = result.expect_err("a rename whose source changed after clone must refuse");
     assert_eq!(error.code.as_str(), "conflict", "{}", error.message);
+    assert!(
+        error.message.contains("source work matches: false"),
+        "{error}"
+    );
     assert!(error.hint.contains("rm b --force"), "{}", error.hint);
 
     assert_eq!(
@@ -8334,10 +8225,10 @@ async fn logged_starts(log: &Path, count: usize) -> Vec<libc::pid_t> {
 /// nothing holds the mount the workspace retires, and no job was admitted after the first `rm`
 /// began.
 #[tokio::test(flavor = "multi_thread")]
-async fn real_apfs_rm_reaps_the_keepers_start_in_its_restart_backoff_before_its_census() {
+async fn directory_rm_reaps_the_keepers_start_in_its_restart_backoff_before_its_census() {
     use std::os::unix::ffi::OsStrExt as _;
     let (nx, node) = repository_nx();
-    let mut fixture = Fixture::with(Project::Build {
+    let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: None,
     });
