@@ -72,7 +72,7 @@ function readLockfile(context: CreateNodesContextV2): LockfileRead {
   if (!existsSync(path)) throw new Error(`builtOutputPackages names packages, but ${path} does not exist`);
   const contents = packageManager === 'bun' ? readBunLockFile(path) : readFileSync(path, 'utf-8');
   const hash = hashArray([nxVersion, contents]);
-  if (published?.hash === hash) return published;
+  if (packageManager !== 'bun' && published?.hash === hash) return published;
   const { nodes, keyMap } = getLockFileNodes(packageManager, lockFile, contents, hash, context);
   return { packageManager, lockFile, contents, hash, nodes, keyMap };
 }

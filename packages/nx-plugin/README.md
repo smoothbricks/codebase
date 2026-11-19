@@ -978,10 +978,13 @@ integrity. Nx merges its default plugin's lockfile nodes after every configured 
 on they would replace these: the plugin refuses the option then, and refuses a name the lockfile installs nowhere
 (`src/built-output-packages.ts`, `src/built-output-packages.test.ts`).
 
-The option covers the lockfile only. A member manifest that declares a named package's version is still an input
-wherever its project's files are; a workspace keeps the version out of member manifests by declaring it once, in the
-root manifest's `catalog`, and `catalog:` in each member. Inferred validation inputs omit the root's install-only pins
-as described below; targets producing shipped artifacts retain the raw manifests.
+For a Bun text lockfile the pinned parser also keys each installed node on the selected patch bytes. The plugin
+refreshes that projection even when the lock text is unchanged. A named built-output package still uses its
+`built-output:<name>` identity: its actual output bytes are the task's input. Its dependencies keep their own keys,
+including any patches they use. The option covers the lockfile only. A member manifest that declares a named package's
+version is still an input wherever its project's files are; a workspace keeps the version out of member manifests by
+declaring it once, in the root manifest's `catalog`, and `catalog:` in each member. Inferred validation inputs omit the
+root's install-only pins as described below; targets producing shipped artifacts retain the raw manifests.
 
 ### Manifest versions and validation inputs
 

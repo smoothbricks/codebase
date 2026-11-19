@@ -3893,19 +3893,83 @@ index 6fa8fdb04f096837631b21a25893a714848ea922..37f16e888262892b51392c76f5d0ecea
      }
      async hashTask(task, taskGraph, env) {
          return (await this.hashTasks([task], taskGraph, {
+diff --git a/dist/src/plugins/js/index.js b/dist/src/plugins/js/index.js
+index 8190f2152e5dd4beb64de47758e4b6a351511758..8cd064c681e4cde87579da4fe59c353d6439265b 100644
+--- a/dist/src/plugins/js/index.js
++++ b/dist/src/plugins/js/index.js
+@@ -47,21 +47,29 @@ function internalCreateNodes(lockFile, _, context) {
+         : (0, bun_parser_1.readBunLockFile)(lockFilePath);
+     const lockFileHash = getLockFileHash(lockFileContents);
+     cachedLockFile = { packageManager, lockFile, lockFileContents, lockFileHash };
++    const isBunTextLock = lockFile === bun_parser_1.BUN_TEXT_LOCK_FILE;
+     const cached = readCache(externalNodesCache, lockFileHash);
++    let nodes;
+     if (cached) {
+-        cachedKeyMap = deserializeKeyMap(cached.keyMap, cached.nodes);
+-        return {
+-            externalNodes: cached.nodes,
+-        };
++        nodes = cached.nodes;
++        cachedKeyMap = deserializeKeyMap(cached.keyMap, nodes);
++    }
++    else {
++        // The persistent cache is a function of lock text, never live patch bytes.
++        const parsed = isBunTextLock
++            ? (0, lock_file_1.getLockFileNodesForName)(lockFile, lockFileContents, lockFileHash)
++            : (0, lock_file_1.getLockFileNodes)(packageManager, lockFile, lockFileContents, lockFileHash, context);
++        nodes = parsed.nodes;
++        cachedKeyMap = parsed.keyMap;
++        writeCache(externalNodesCache, lockFileHash, {
++            nodes,
++            keyMap: serializeKeyMap(cachedKeyMap),
++        });
+     }
+-    const { nodes: externalNodes, keyMap } = (0, lock_file_1.getLockFileNodes)(packageManager, lockFile, lockFileContents, lockFileHash, context);
+-    cachedKeyMap = keyMap;
+-    writeCache(externalNodesCache, lockFileHash, {
+-        nodes: externalNodes,
+-        keyMap: serializeKeyMap(keyMap),
+-    });
+     return {
+-        externalNodes,
++        externalNodes: isBunTextLock
++            ? (0, bun_parser_1.applyBunPatchHashes)(nodes, lockFileContents, lockFileHash, context.workspaceRoot)
++            : nodes,
+     };
+ }
+ const createDependencies = (_, ctx) => {
 diff --git a/dist/src/plugins/js/lock-file/bun-parser.js b/dist/src/plugins/js/lock-file/bun-parser.js
-index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dcece8293b0 100644
+index 169563d598af64c8b74d00ab9815dd651650ec9d..20649f44c57701a6b7aa8e3a6a8438b9949e07f9 100644
 --- a/dist/src/plugins/js/lock-file/bun-parser.js
 +++ b/dist/src/plugins/js/lock-file/bun-parser.js
-@@ -7,6 +7,7 @@ exports.clearCache = clearCache;
+@@ -5,8 +5,10 @@ exports.readBunLockFile = readBunLockFile;
+ exports.getBunTextLockfileDependencies = getBunTextLockfileDependencies;
+ exports.clearCache = clearCache;
  exports.getBunTextLockfileNodes = getBunTextLockfileNodes;
++exports.applyBunPatchHashes = applyBunPatchHashes;
  const node_child_process_1 = require("node:child_process");
  const node_fs_1 = require("node:fs");
 +const node_path_1 = require("node:path");
  const semver_1 = require("semver");
  const project_graph_1 = require("../../../config/project-graph");
  const file_hasher_1 = require("../../../hasher/file-hasher");
-@@ -285,8 +286,7 @@ function buildPackageIndex(lockFile) {
+@@ -33,6 +35,7 @@ exports.BUN_TEXT_LOCK_FILE = 'bun.lock';
+ let currentLockFileHash;
+ let cachedParsedLockFile;
+ let cachedPackageIndex;
++let cachedExternalNodes;
+ const keyMap = new Map();
+ const packageVersions = new Map();
+ const specParseCache = new Map();
+@@ -83,6 +86,7 @@ function clearCache() {
+     currentLockFileHash = undefined;
+     cachedParsedLockFile = undefined;
+     cachedPackageIndex = undefined;
++    cachedExternalNodes = undefined;
+     keyMap.clear();
+     packageVersions.clear();
+     specParseCache.clear();
+@@ -285,8 +289,7 @@ function buildPackageIndex(lockFile) {
                  ...workspace.peerDependencies,
              };
              for (const [depName, depVersion] of Object.entries(allDeps)) {
@@ -3915,7 +3979,7 @@ index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dce
                      workspaceNames.add(depName);
                  }
              }
-@@ -306,8 +306,9 @@ function buildPackageIndex(lockFile) {
+@@ -306,8 +309,9 @@ function buildPackageIndex(lockFile) {
              if (!name || !version) {
                  continue;
              }
@@ -3927,6 +3991,110 @@ index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dce
                  workspaceNames.add(name);
              }
              // Check if this is a workspace-specific variant (e.g., "@quz/pkg1/lodash")
+@@ -384,6 +388,10 @@ function parseLockFile(lockFileContent, lockFileHash) {
+         if (result.patches && typeof result.patches !== 'object') {
+             throw new Error('Lockfile patches section must be an object');
+         }
++        if (result.patchedDependencies !== undefined &&
++            (!result.patchedDependencies || typeof result.patchedDependencies !== 'object' || Array.isArray(result.patchedDependencies))) {
++            throw new Error('Lockfile patchedDependencies must map package versions to patch paths');
++        }
+         if (result.manifests && typeof result.manifests !== 'object') {
+             throw new Error('Lockfile manifests section must be an object');
+         }
+@@ -440,10 +448,11 @@ function parseLockFile(lockFileContent, lockFileHash) {
+ function getBunTextLockfileNodes(lockFileContent, lockFileHash) {
+     try {
+         const { lockFile, index } = parseLockFile(lockFileContent, lockFileHash);
++        if (cachedExternalNodes) return cachedExternalNodes;
+         const nodes = {};
+         const localPackageVersions = new Map();
+         if (!lockFile.packages || Object.keys(lockFile.packages).length === 0) {
+-            return nodes;
++            return (cachedExternalNodes = nodes);
+         }
+         const packageEntries = Object.entries(lockFile.packages);
+         for (const [packageKey, packageData] of packageEntries) {
+@@ -453,7 +462,7 @@ function getBunTextLockfileNodes(lockFileContent, lockFileHash) {
+             }
+         }
+         createHoistedNodes(localPackageVersions, lockFile, index, keyMap, nodes);
+-        return nodes;
++        return (cachedExternalNodes = nodes);
+     }
+     catch (error) {
+         if (error instanceof Error) {
+@@ -462,6 +471,50 @@ function getBunTextLockfileNodes(lockFileContent, lockFileHash) {
+         throw new Error(`Failed to get Bun lockfile nodes: ${error.message}`);
+     }
+ }
++/** Apply live patch bytes after loading the lock-only nodes, including on a cache hit. */
++/** Apply live patch bytes after loading the lock-only nodes, including on a cache hit. */
++function applyBunPatchHashes(nodes, lockFileContent, lockFileHash, workspaceRoot) {
++    const { lockFile, index } = parseLockFile(lockFileContent, lockFileHash);
++    const patches = lockFile.patchedDependencies;
++    if (!patches) return nodes;
++    let result = nodes;
++    const byPath = new Map();
++    for (const [identity, path] of Object.entries(patches)) {
++        const versioned = nodes[`npm:${identity}`];
++        if (!versioned) continue;
++        const { packageName, version } = versioned.data;
++        if (typeof path !== 'string' || path.length === 0) {
++            throw new Error(`Invalid Bun patch path for ${identity}: expected a non-empty path`);
++        }
++        let patchHash = byPath.get(path);
++        if (patchHash === undefined) {
++            try {
++                patchHash = (0, file_hasher_1.hashFile)((0, node_path_1.resolve)(workspaceRoot, path));
++                if (patchHash == null) throw new Error('could not read its bytes');
++            }
++            catch (error) {
++                throw new Error(`Cannot hash Bun patch ${path} for ${identity}: ${error.message}`, { cause: error });
++            }
++            byPath.set(path, patchHash);
++        }
++        if (result === nodes) result = { ...nodes };
++        const withPatch = (node) => ({
++            ...node,
++            data: { ...node.data, hash: (0, file_hasher_1.hashArray)([node.data.hash, patchHash]) },
++        });
++        result[versioned.name] = withPatch(versioned);
++        const hoisted = nodes[`npm:${packageName}`];
++        if (hoisted?.data.version === version) {
++            result[hoisted.name] = { ...hoisted, data: { ...hoisted.data, hash: result[versioned.name].data.hash } };
++        }
++        for (const entry of index.byName.get(packageName) ?? []) {
++            if (entry.version !== version || entry.packageKey === packageName) continue;
++            const alias = nodes[`npm:${entry.packageKey}`];
++            if (alias?.data.version === `npm:${identity}`) result[alias.name] = withPatch(alias);
++        }
++    }
++    return result;
++}
+ function processPackageEntry(packageKey, packageData, lockFile, index, keyMap, nodes, packageVersions) {
+     try {
+         if (!Array.isArray(packageData) ||
+diff --git a/dist/src/plugins/js/lock-file/lock-file.js b/dist/src/plugins/js/lock-file/lock-file.js
+index e9bc3673ce7e3ecb71e74c26633d88a4e6d9aa67..7810678810f73a20b15333c1481c653b98178e40 100644
+--- a/dist/src/plugins/js/lock-file/lock-file.js
++++ b/dist/src/plugins/js/lock-file/lock-file.js
+@@ -58,7 +58,14 @@ const BUN_TEXT_LOCK_PATH = (0, node_path_1.join)(workspace_root_1.workspaceRoot,
+  */
+ function getLockFileNodes(packageManager, lockFile, contents, lockFileHash, context) {
+     try {
+-        const packageJson = packageManager === 'yarn' || packageManager === 'bun'
++        if (lockFile === bun_parser_1.BUN_TEXT_LOCK_FILE) {
++            const nodes = (0, bun_parser_1.getBunTextLockfileNodes)(contents, lockFileHash);
++            return {
++                nodes: (0, bun_parser_1.applyBunPatchHashes)(nodes, contents, lockFileHash, context.workspaceRoot),
++                keyMap: new Map(),
++            };
++        }
++        const packageJson = packageManager === 'yarn' || lockFile === bun_parser_1.BUN_LOCK_FILE
+             ? (0, fileutils_1.readJsonFile)((0, node_path_1.join)(context.workspaceRoot, 'package.json'))
+             : undefined;
+         return getLockFileNodesForName(lockFile, contents, lockFileHash, packageJson);
 diff --git a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js b/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
 index 5c2bcfaa11caef956fc906f2693586cb647b1382..1eeccd1ba61ce8391596f06aafeb0452cb49cf2a 100644
 --- a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js

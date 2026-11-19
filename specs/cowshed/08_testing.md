@@ -549,7 +549,11 @@ whole, each one target) while every other cowshed cargo test target keeps its ca
 `cargo-test-cowshed-*`'s `dependsOn`, as Nx applies one `targetDefaults` entry to a target, and the gateway's names its
 single unsharded target exactly: sharding that crate renames it and needs the key to follow. After an Nx bump that
 leaves a name in the list uninstalled, every run that hashes these targets fails with Nx's "The externalDependency
-'nx@24.0.3' … could not be found" until the list follows.
+'nx@24.0.3' … could not be found" until the list follows. <a id="smoo/cowshed!n/patch-bytes-in-keys"></a> An Nx task
+that reaches a registered Bun patch through the external package it keys also keys the patch's bytes, not its path. No
+package edge changes when its patch changes. A task that cannot reach that installed version keeps its key. A target
+that already keys the actual outputs in place of a package's version continues to key those outputs. The regression uses
+real Nx, including a patch-only edit served by the same daemon with the lockfile unchanged.
 
 Nx-backed host-controller probes share `tests/support/nx_reads.rs`: it walks the checkout's pinned Bun-installed Nx
 package and its reachable package-private namespaces, admitting only the required external Bun-store payloads and

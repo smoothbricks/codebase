@@ -378,6 +378,19 @@ the workspace stays out of the external-node set. Normal nx-plugin test shards e
 activate the carried patch through the owning flow above; do not repair graph coverage by weakening a scope check or
 deleting a runtime input.
 
+## Bun patch bytes in external package keys
+
+Bun's text lockfile records a patch path under the exact installed `package@version`, not its bytes. The live Bun node
+projection combines the selected patch bytes with the existing node integrity, including the unversioned and install
+aliases of that version. A path-only rename with identical bytes keeps the key. An unreadable selected patch refuses the
+graph, naming its path and package. Registrations for an uninstalled version read no file.
+
+The parser and default plugin's lock-text caches retain only lockfile facts. Live graph construction projects patch
+bytes on both cache hits and misses; historical lockfile parsing never reads the current checkout's patch files. The
+graph topology is unchanged. `builtOutputPackages` still replaces the hashes of packages keyed by their actual outputs.
+The nx-plugin regression `src/bun-patch-keys.test.ts` measures Nx's task and external-node keys in a live workspace on
+both publication routes. Drop the hunk when upstream keys the live patch bytes equivalently.
+
 ## Dependency-graph resolution cache identity
 
 The cached dependency edges of an unchanged file are reusable only while its resolution context is unchanged.
