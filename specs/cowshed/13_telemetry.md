@@ -440,8 +440,8 @@ audit records authorize nothing.
 
 Report the following independently, with unavailable measurements explicitly absent rather than zero:
 
-- ordinary WIP lookups: local and remote hit counts, misses, and bytes and time (a shed's read-only client sends no
-  `PUT` and builds no archive);
+- ordinary WIP lookups: local and remote hit counts, misses, and bytes and time, and separately the results a checkout's
+  own client stored under its bound (archive bytes and `PUT` time);
 - a land's publication: the `published`, `existing` and `skipped` counts of `build_volume::nx::Published`, and each
   failed entry's cause on stderr;
 - client archive construction, land publication transfer, target download/extraction, and — in a project without the mbx
@@ -452,10 +452,11 @@ Report the following independently, with unavailable measurements explicitly abs
 - the target's exact landed head and the same successful cacheable task/hash set before and after adoption, every
   hit/miss/exit status, the check timings, and its no-remote control.
 
-A shed's read-only client builds no archive and sends no `PUT` (05_gateway.md, "A shed never uploads"), so its lookups
-are its whole Nx cost; a land's publish pays archive construction and `PUT` per stored result, measured there. Task-hash
-archives are not a per-file content-addressed store, and transferred bytes are not filesystem allocation. A successful
-server-only HTTP smoke proves neither the gateway's route nor a two-workspace adoption.
+A shed's bounded client builds an archive and sends a `PUT` only for a result worth its bytes (05_gateway.md, "A shed
+uploads only what is worth its bytes"), so its lookups and those stores are its whole Nx cost; a land's publish pays
+archive construction and `PUT` per result it stores, measured there. Task-hash archives are not a per-file
+content-addressed store, and transferred bytes are not filesystem allocation. A successful server-only HTTP smoke proves
+neither the gateway's route nor a two-workspace adoption.
 
 ### Automated Nx proof surfaces
 
@@ -463,9 +464,9 @@ These are process and API fixtures. They are not protected authorized-land, inst
 or normal-client missing-artifact proofs, and they do not measure a stock client against a real land.
 
 - `cowshed-gateway` `tests/gateway/nx_land_publish.rs`, ignored host case
-  `host_controller_a_landed_gate_publishes_and_another_shed_restores_it`: shed A's read-only run stores nothing; the
-  land's gate publish stores the attributed result once, and a second publish finds it already stored; shed B restores
-  it with nothing executed.
+  `host_controller_a_landed_gate_publishes_and_another_shed_restores_it`: under the workspace's bound, shed A's cheap
+  result is not stored by its own run and its slow one is, once; the land's gate publish stores the cheap result once
+  and finds the slow one stored, and a second publish finds both; shed B restores the cheap task with nothing executed.
 - `cowshed-gateway` `tests/gateway/nx_process.rs`, ignored host case: a real `Gateway` is SIGKILLed, the kernel reports
   its server's exit, a fresh server on the same store acquires the lock, and two sessions read through the route.
 

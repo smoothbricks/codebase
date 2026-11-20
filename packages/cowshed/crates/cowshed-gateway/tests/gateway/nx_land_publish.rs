@@ -1,10 +1,11 @@
 //! A land's publish end to end (05_gateway.md "`/nx/v1/cache/{hash}`"; the owner's rulings,
-//! 2026-10-10 and 2026-10-25). Shed A's stock Nx reads the project's cache and never stores to it.
-//! The land of A then runs the publish `cowshed land` runs after its gate passed: the same script,
-//! `node - <root> <hashes>`, over the task hashes `attribute` gives the land for A's run. Shed B of
-//! the project, at the same inputs, then restores the task from the cache and executes nothing. One
-//! real `Gateway` with one real nx-cache-server, the stock Nx client in two fixture checkouts, and
-//! no credential anywhere.
+//! 2026-10-25 and 2026-11-10). Shed A's Nx runs under the environment every workspace carries: it
+//! reads the project's cache and stores only a result worth its bytes. The land of A then runs the
+//! publish `cowshed land` runs after its gate passed: the same script, `node - <root> <hashes>`,
+//! over the task hashes `attribute` gives the land for A's runs, which stores what the client left
+//! unstored. Shed B of the project, at the same inputs, then restores the task from the cache and
+//! executes nothing. One real `Gateway` with one real nx-cache-server, the repository's Nx client
+//! in two fixture checkouts, and no credential anywhere.
 use super::*;
 use cowshed_os::test_backstop::AsyncChildBackstop as _;
 
@@ -20,22 +21,80 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 const REPO: &str = "owner/nx-land-publish";
-/// The land check A's gate ran, as `cowshed land --check` would name it.
-const CHECK: &str = "nx run app:build --outputStyle=static";
+/// The land check A's gate ran for `project`, as `cowshed land --check` would name it.
+fn check(project: &str) -> String {
+    format!("nx run {project}:build --outputStyle=static")
+}
 
-/// One shed's `nx run app:build`, its cache at `origin` and read-only, as every workspace's
-/// environment sets it (03_caches.md, Wiring).
-async fn shed_build(root: &Path, origin: &str) -> Output {
+/// The endpoint and store bound every workspace's environment sets (03_caches.md, Wiring).
+fn workspace_nx(command: &mut Command, origin: &str) {
+    command
+        .env(
+            cowshed_core::workspace_environment::NX_REMOTE_SERVER_ENV,
+            origin,
+        )
+        .env(
+            cowshed_core::workspace_environment::NX_REMOTE_STORE_BOUND_ENV,
+            cowshed_core::workspace_environment::NX_REMOTE_STORE_SECONDS_PER_MIB,
+        );
+}
+
+/// One shed's `nx run <project>:build`, in the workspace's Nx environment.
+async fn shed_build(root: &Path, origin: &str, project: &str) -> Output {
     let mut command = Command::new("node");
     command
         .arg(root.join("node_modules/.bin/nx"))
-        .args(["run", "app:build", "--outputStyle=static"])
+        .args(["run", &format!("{project}:build"), "--outputStyle=static"])
         .current_dir(root);
     scrub(&mut command, root);
+    workspace_nx(&mut command, origin);
     command
-        .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin)
-        .env("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY", "true");
-    command.output_bounded().await.expect("run the stock Nx")
+        .output_bounded()
+        .await
+        .expect("run the repository's Nx")
+}
+
+/// A second project whose build takes longer than the workspace's bound asks of its few bytes,
+/// so the client's own store keeps it (the build nx-remote-cache-outage.test.ts calls slow).
+fn write_slow_project(root: &Path) {
+    std::fs::create_dir(root.join("slow")).expect("create the slow project");
+    std::fs::write(
+        root.join("slow/project.json"),
+        serde_json::json!({
+            "name": "slow",
+            "targets": {
+                "build": {
+                    "executor": "nx:run-commands",
+                    "cache": true,
+                    "inputs": ["{projectRoot}/source.txt"],
+                    "outputs": ["{projectRoot}/result.txt"],
+                    "options": {"cwd": "slow", "command": "sleep 1.5 && cp source.txt result.txt"}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write the slow project");
+    std::fs::write(root.join("slow/source.txt"), "slow").expect("write the slow source");
+}
+
+/// The one hash the land attributes to shed A's run of `project` between the two instants.
+fn attributed(
+    root: &Path,
+    project: &str,
+    spawned: std::time::SystemTime,
+    exited: std::time::SystemTime,
+) -> String {
+    let Attribution::Ours(run) =
+        attribute(&root.join(".nx/cache"), &check(project), spawned, exited)
+    else {
+        panic!("the land attributes shed A's run of {project} to its check");
+    };
+    let hashes: Vec<String> = run.tasks.into_iter().map(|task| task.hash).collect();
+    let [hash] = hashes.as_slice() else {
+        panic!("one cacheable task: {hashes:?}");
+    };
+    hash.clone()
 }
 
 /// The land's publish job for `hashes` of the checkout at `root`: the script on stdin, the
@@ -48,9 +107,8 @@ async fn land_publish(root: &Path, origin: &str, hashes: &[String]) -> Published
         .arg(serde_json::to_string(hashes).expect("hashes as JSON"))
         .current_dir(root);
     scrub(&mut command, root);
+    workspace_nx(&mut command, origin);
     command
-        .env("NX_SELF_HOSTED_REMOTE_CACHE_SERVER", origin)
-        .env("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY", "true")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -84,6 +142,7 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
     }
     write_workspace(&shed_a);
     write_workspace(&shed_b);
+    write_slow_project(&shed_a);
     let (mut config, _cache) = test_config();
     config.nx_cache = Some(NxCacheServiceConfig {
         script: server_script(),
@@ -108,20 +167,15 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
         origins.push(format!("http://{endpoint}/nx"));
     }
 
-    // Shed A builds: its lookup misses, the task executes, and its read-only Nx stores nothing.
+    // Shed A builds a cheap task: its lookup misses, the task executes, and the bound keeps the
+    // client from storing a result that took milliseconds.
     let spawned = std::time::SystemTime::now();
-    let built = shed_build(&shed_a, &origins[0]).await;
+    let built = shed_build(&shed_a, &origins[0], "app").await;
     let exited = std::time::SystemTime::now();
     assert!(built.status.success(), "{}", run_text(&built));
     assert_eq!(executions(&shed_a), 1, "shed A executes its task");
-    let Attribution::Ours(run) = attribute(&shed_a.join(".nx/cache"), CHECK, spawned, exited)
-    else {
-        panic!("the land attributes shed A's run to its check");
-    };
-    let hashes: Vec<String> = run.tasks.into_iter().map(|task| task.hash).collect();
-    let [hash] = hashes.as_slice() else {
-        panic!("one cacheable task: {hashes:?}");
-    };
+    let cheap = attributed(&shed_a, "app", spawned, exited);
+    let hash = &cheap;
     let lookups = nx_events(&audit, hash, "GET");
     assert!(
         !lookups.is_empty() && lookups.iter().all(|lookup| *lookup == (Some(404), None)),
@@ -129,33 +183,48 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
     );
     assert!(
         nx_events(&audit, hash, "PUT").is_empty(),
-        "a shed's own run never stores"
+        "a result not worth its bytes is not stored by the shed's own run"
     );
 
-    // The land publishes what its gate attributed: one PUT, stored.
+    // Shed A builds a task that took longer than the bound asks: its own client stores it, once.
+    let spawned = std::time::SystemTime::now();
+    let built = shed_build(&shed_a, &origins[0], "slow").await;
+    let exited = std::time::SystemTime::now();
+    assert!(built.status.success(), "{}", run_text(&built));
+    let worthwhile = attributed(&shed_a, "slow", spawned, exited);
+    assert_eq!(
+        nx_events(&audit, &worthwhile, "PUT"),
+        [(Some(200), None)],
+        "a result worth its bytes is stored by the shed's own run"
+    );
+
+    // The land publishes what its gate attributed: the cheap result is stored now, by one PUT,
+    // and the worthwhile one is found stored.
+    let hashes = [cheap.clone(), worthwhile.clone()];
     let published = land_publish(&shed_a, &origins[0], &hashes).await;
     assert_eq!(
         published,
         Published {
             published: 1,
-            existing: 0,
+            existing: 1,
             skipped: 0
         }
     );
     assert_eq!(nx_events(&audit, hash, "PUT"), [(Some(200), None)]);
-    // Publishing again finds the result stored and replaces nothing.
+    assert_eq!(nx_events(&audit, &worthwhile, "PUT"), [(Some(200), None)]);
+    // Publishing again finds both results stored and replaces nothing.
     let again = land_publish(&shed_a, &origins[0], &hashes).await;
     assert_eq!(
         again,
         Published {
             published: 0,
-            existing: 1,
+            existing: 2,
             skipped: 0
         }
     );
 
     // Shed B, at the same inputs, restores the task from the project's cache and executes nothing.
-    let restored = shed_build(&shed_b, &origins[1]).await;
+    let restored = shed_build(&shed_b, &origins[1], "app").await;
     assert!(restored.status.success(), "{}", run_text(&restored));
     assert_eq!(
         executions(&shed_b),

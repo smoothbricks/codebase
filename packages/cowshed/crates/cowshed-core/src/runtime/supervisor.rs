@@ -2561,13 +2561,13 @@ pub(super) async fn sandbox_environment(
             OsStr::new(&format!("http://127.0.0.1:{port_base}/nx")),
         );
         own(
-            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV,
-            OsStr::new("true"),
+            crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV,
+            OsStr::new(crate::workspace_environment::NX_REMOTE_STORE_SECONDS_PER_MIB),
         );
     } else {
         withheld.extend([
             crate::workspace_environment::NX_REMOTE_SERVER_ENV,
-            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV,
+            crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV,
         ]);
     }
     // The caller may have sourced a different checkout's mbx-enabled host environment.
@@ -11899,12 +11899,11 @@ mod workspace_toolchain_tests {
     }
 
     /// The real host-side environment builder creates its own global short runtime alias. The
-    /// caller's endpoint and read-only flag never reach the child; a non-Nx checkout withholds both.
+    /// caller's endpoint and store bound never reach the child; a non-Nx checkout withholds both.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    async fn host_controller_caller_supplied_nx_endpoint_and_read_only_flag_never_reach_the_child()
-    {
+    async fn host_controller_caller_supplied_nx_endpoint_and_store_bound_never_reach_the_child() {
         struct RuntimeAlias {
             path: PathBuf,
             target: PathBuf,
@@ -11956,8 +11955,8 @@ mod workspace_toolchain_tests {
                 "http://attacker.example:9/nx".to_owned(),
             ),
             (
-                crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV.to_owned(),
-                "false".to_owned(),
+                crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV.to_owned(),
+                "0".to_owned(),
             ),
             (
                 crate::capabilities::mbx::CARGO_ROUTE_ENV.to_owned(),
@@ -11977,7 +11976,7 @@ mod workspace_toolchain_tests {
         };
         std::fs::create_dir_all(&sandbox.home).expect("home");
 
-        // Without an Nx project, the caller's endpoint and read-only flag are withheld.
+        // Without an Nx project, the caller's endpoint and store bound are withheld.
         let mut plain = sandbox.clone();
         plain.configure_capabilities().expect("detect capabilities");
         let plain_environment = sandbox_environment(&plain, &caller)
@@ -11988,7 +11987,7 @@ mod workspace_toolchain_tests {
             crate::workspace_environment::NX_REMOTE_SERVER_ENV
         )));
         assert!(!without_nx.contains_key(OsStr::new(
-            crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
+            crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV
         )));
         assert!(!without_nx.contains_key(OsStr::new(crate::capabilities::mbx::CARGO_ROUTE_ENV)));
         assert!(
@@ -11998,7 +11997,7 @@ mod workspace_toolchain_tests {
             "a warm command cannot import another checkout's Cargo route"
         );
 
-        // With one, the endpoint is the workspace's own and the read-only flag is set.
+        // With one, the endpoint is the workspace's own and so is the store bound.
         std::fs::write(mount.join("nx.json"), "{}").expect("nx project");
         let mut configured = sandbox.clone();
         configured
@@ -12016,9 +12015,9 @@ mod workspace_toolchain_tests {
         );
         assert_eq!(
             child.get(OsStr::new(
-                crate::workspace_environment::NX_REMOTE_READ_ONLY_ENV
+                crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV
             )),
-            Some(&std::ffi::OsString::from("true"))
+            Some(&std::ffi::OsString::from("1"))
         );
         assert_eq!(
             std::fs::read_link(&runtime_link).expect("owned runtime alias"),
@@ -12657,12 +12656,12 @@ mod lifecycle_commitment_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// An existing shed's `.cowshed/env` from an older build exported the Nx cache bearer and no
-    /// read-only flag. The first supervisor start of this build republishes it, so a host shell
-    /// that re-sources it reads its project's Nx cache and never stores to it (05_gateway.md
-    /// "`/nx/v1/cache/{hash}`").
+    /// An existing shed's `.cowshed/env` from an older build exported the Nx cache bearer, or the
+    /// read-only flag the carried Nx patch no longer reads, and no store bound. The first
+    /// supervisor start of this build republishes it, so a host shell that re-sources it stores
+    /// only what is worth its bytes (05_gateway.md "`/nx/v1/cache/{hash}`").
     #[tokio::test]
-    async fn a_supervisor_start_rewrites_an_older_env_with_the_nx_read_only_flag() {
+    async fn a_supervisor_start_rewrites_an_older_env_with_the_nx_store_bound() {
         let root =
             std::env::temp_dir().join(format!("cowshed-env-republish-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).unwrap();
@@ -12696,7 +12695,7 @@ mod lifecycle_commitment_tests {
         let env = workspace_root.join(".cowshed/env");
         std::fs::write(
             &env,
-            "export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\nexport NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=older-bearer\n",
+            "export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\nexport NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\nexport NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=older-bearer\n",
         )
         .unwrap();
         let repo_id = RepoId::parse("acme/widget").unwrap();
@@ -12749,7 +12748,11 @@ mod lifecycle_commitment_tests {
             "{published}"
         );
         assert!(
-            published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\n"),
+            published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1\n"),
+            "{published}"
+        );
+        assert!(
+            !published.contains("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY"),
             "{published}"
         );
         assert!(

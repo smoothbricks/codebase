@@ -765,18 +765,20 @@ nothing, and no token, principal, transaction or receipt guards it. What it keep
 namespacing, the key charset, atomic first-writer-wins writes, and the eviction bound (03_caches.md, "Nx accepted-task
 artifact service").
 
-**Sheds read; a land writes** (the owner's rulings, 2026-10-10). Every checkout reads its project's results, during
-ordinary iteration as well as adoption. Nx keeps its local artifact cache and task database private to that checkout
-(16_build_volumes.md); this route shares neither path nor live database. The controller wires stock Nx's
-`NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`, without a trailing slash, beside
-`NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`, in `.cowshed/env` and in every job's environment (03_caches.md), and no
-access token. The read-only flag is configuration, not authority: the carried Nx 24.0.3 patch makes a read-only client
-answer every store `false` before it builds an archive (patches/README.md, "A shed reads the remote cache and never
-stores"), so work in progress is never stored and never costs an upload; a repository on another declared Nx version is
-read-only only if it carries the same change. The gateway itself would store a shed's `PUT`; nothing configured sends
-one. Every supervisor start rewrites `.cowshed/env` whole, so an existing shed's older file, which exported the retired
-bearer and no flag, carries the flag from the first supervisor start of a build that sets it, and direnv reloads it in
-the shed's host shells.
+**Every checkout reads and stores** (the owner's rulings, 2026-10-25 and 2026-11-10). Every checkout reads its project's
+results, during ordinary iteration as well as adoption, and stores each result it executed that is worth its bytes. Nx
+keeps its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares
+neither path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`,
+without a trailing slash, beside `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1`, in `.cowshed/env` and in every
+job's environment (03_caches.md), and no access token. The bound is configuration, not authority: the carried Nx 24.0.3
+patch makes the client answer a store `false`, before it builds an archive, unless the task took at least that many
+seconds per MiB of its outputs, counting at least one MiB (patches/README.md, "A shed stores what is worth its bytes";
+03_caches.md, "What a checkout stores"). A client without that change does not read the variable and stores every result
+it executes, as stock Nx does: a repository on another declared Nx version is bounded only if it carries the same
+change, and until it does its workspaces store without a bound. The gateway stores any `PUT` the route admits. Every
+supervisor start rewrites `.cowshed/env` whole, so an existing shed's older file, which exported the retired bearer or
+the retired `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY` flag and no bound, carries the bound from the first supervisor start
+of a build that sets it, and direnv reloads it in the shed's host shells.
 
 The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
 `/nx/v1/cache/{hash}` route reaches that project's backend, so a hash in one project never names another project's
@@ -794,22 +796,22 @@ job stores every attributed task result from that checkout's own Nx cache throug
 as well as executed tasks, since stock Nx stores only what it executed. It first asks for each key with a `GET` whose
 body it cancels at once; a key already stored is counted, never archived or replaced. A missing key's archive is built
 by the job itself, in the layout the stock native `HttpRemoteCache.store` writes but at gzip level 1 (03_caches.md, "Nx
-accepted-task artifact service"), and sent in one plain `PUT`; a `409` counts as already stored. Nx's own client, which
-the read-only flag the job also carries governs, stores nothing here. A task Nx does not cache, or one that failed, is
-skipped. The cache never blocks a land: a failed publish is said on stderr with its cause, and the land goes on. A
-declared land's gate (02_workspaces.md, "A declared land") uses `@smoothbricks/nx-plugin`'s emitted `smoo-nx-publish`
-executable, not a repository-local publisher. It captures each invocation's succeeded hashes before another can
-overwrite the summary, whatever the invocation's verdict, and publishes every list it captured before the gate states
-its verdict: a red gate publishes each task that succeeded in it as a green gate does, and never one that failed (the
-owner's ruling, 2026-11-10; 03_caches.md, "Nx accepted-task artifact service"). The plugin's cached asset producer
-packages unchanged bytes from the canonical `build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint
-runtime output. Sheds remain read-only. A failed publication is a distinct diagnostic with the cause, never a claim that
-results were stored. `cache_adapter.js` is the one boundary to the checkout's local Nx cache, whose `DbCache` and native
-cache are Nx internals: it declares each Nx version it was read against (23.2.1 and 24.0.3) with the layout it relies on
-— the checkout's `.nx/workspace-data` and `.nx/cache`, and the archive its native `HttpRemoteCache` stores and restores
-— opens the cache through the installed version's entry and checks Nx resolved that layout, and refuses any other
-version by name before it loads Nx. So a land publishes from a repository on either version, and an upgrade requalifies
-the adapter first.
+accepted-task artifact service"), and sent in one plain `PUT`; a `409` counts as already stored. Nx's own client, under
+the bound the job also carries, has stored the results worth their bytes by then, and the publish finds those stored. A
+task Nx does not cache, or one that failed, is skipped. The cache never blocks a land: a failed publish is said on
+stderr with its cause, and the land goes on. A declared land's gate (02_workspaces.md, "A declared land") uses
+`@smoothbricks/nx-plugin`'s emitted `smoo-nx-publish` executable, not a repository-local publisher. It captures each
+invocation's succeeded hashes before another can overwrite the summary, whatever the invocation's verdict, and publishes
+every list it captured before the gate states its verdict: a red gate publishes each task that succeeded in it as a
+green gate does, and never one that failed (the owner's ruling, 2026-11-10; 03_caches.md, "Nx accepted-task artifact
+service"). The plugin's cached asset producer packages unchanged bytes from the canonical
+`build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint runtime output. A failed publication is a
+distinct diagnostic with the cause, never a claim that results were stored. `cache_adapter.js` is the one boundary to
+the checkout's local Nx cache, whose `DbCache` and native cache are Nx internals: it declares each Nx version it was
+read against (23.2.1 and 24.0.3) with the layout it relies on — the checkout's `.nx/workspace-data` and `.nx/cache`, and
+the archive its native `HttpRemoteCache` stores and restores — opens the cache through the installed version's entry and
+checks Nx resolved that layout, and refuses any other version by name before it loads Nx. So a land publishes from a
+repository on either version, and an upgrade requalifies the adapter first.
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
@@ -875,10 +877,11 @@ commits a success head, the gateway keeps `200` and cannot change it. A body tha
 ends early, and its audit event is `failed` with classification `nx-transfer-failed`, never a hit or a completed read. A
 client must treat a short body as a failed read; the gateway stages and buffers nothing to hide the cut.
 
-**A shed never uploads.** Stock Nx 24.0.3's `native/cache/http_remote_cache.rs` has no read-only option: its `store`
-first builds an in-memory gzip tar archive, then attempts `PUT`, and `skipRemoteCache` disables reads too. The carried
-patch's read-only client (Sheds read; a land writes, above) answers every store before that archive exists, so a shed's
-run costs its project cache lookups only. Measure lookups and a land's publication separately (13_telemetry.md).
+**A shed uploads only what is worth its bytes.** Stock Nx 24.0.3's `native/cache/http_remote_cache.rs` has no store
+policy: its `store` first builds an in-memory gzip tar archive, then attempts `PUT`, and `skipRemoteCache` disables
+reads too. The carried patch's bounded client (Every checkout reads and stores, above) answers a store it refuses before
+that archive exists, so a shed's run costs its project cache lookups and one archive and `PUT` per result the bound
+keeps. Measure lookups, a checkout's own stores and a land's publication separately (13_telemetry.md).
 
 ### `/sim/` — personal-session simulator broker (posture B)
 

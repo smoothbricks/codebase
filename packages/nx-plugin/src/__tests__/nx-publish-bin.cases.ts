@@ -49,7 +49,7 @@ it('the emitted publisher stores a missing key, counts a stored one without arch
     const environment = {
       ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NX_'))),
       NX_SELF_HOSTED_REMOTE_CACHE_SERVER: new URL('nx', server.url).href,
-      NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY: 'true',
+      NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB: '1',
     };
     async function run(args: readonly string[], stdin?: string) {
       const child = Bun.spawn(['node', ...args], {
@@ -108,7 +108,7 @@ local.cache.cache.put("accepted-fixture", "passed", ["result.txt"], 0);
       expect(puts).toHaveLength(1);
       expect(puts[0]?.path).toBe('/nx/v1/cache/accepted-fixture');
       expect(puts[0]?.bytes).toBeGreaterThan(0);
-      expect(environment.NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY).toBe('true');
+      expect(environment.NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB).toBe('1');
 
       // A stored key is asked for first, counted, and never archived: no second PUT reaches the store.
       const again = await run([executable, 'publish', root, hashes]);
@@ -251,7 +251,7 @@ for (const [version, installed] of DECLARED_NX) {
         ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NX_') && key !== 'CI')),
         NX_DAEMON: 'false',
         NX_NO_CLOUD: 'true',
-        NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY: 'true',
+        NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB: '1',
       };
       const terminal = 'passed ✓\n\u001b[32mgreen\u001b[0m\n';
       const adapter = await readFile(join(packageRoot, 'runtime/nx-publish/cache_adapter.js'), 'utf8');
@@ -377,12 +377,13 @@ for (const [version, installed] of DECLARED_NX) {
       NX_TUI: 'false',
       NX_ISOLATE_PLUGINS: 'false',
     };
-    // The landed run reads no project cache: stock 23.2.1 ignores READ_ONLY and would store its own results, so the store
-    // holds only what the publisher sent. The publish and the other checkout read it, read-only, as every job does.
+    // The landed run reads no project cache: stock 23.2.1 does not read the store bound and would store every result of
+    // its own, so the store holds only what the publisher sent. The publish and the other checkout read it under the
+    // bound every job carries.
     const reading = {
       ...base,
       NX_SELF_HOSTED_REMOTE_CACHE_SERVER: origin,
-      NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY: 'true',
+      NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB: '1',
     };
     async function run(cwd: string, env: Record<string, string | undefined>, args: readonly string[]) {
       const child = Bun.spawn(['node', ...args], { cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });

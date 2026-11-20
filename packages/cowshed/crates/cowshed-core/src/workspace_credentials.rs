@@ -543,9 +543,9 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use crate::workspace_environment::{
-        NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV, NX_REMOTE_READ_ONLY_ENV,
-        NX_REMOTE_SERVER_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV, TEMP_DIR_ENV,
-        WORKSPACE_TOKEN_ENV,
+        NODE_COMPILE_CACHE_DIRECTORY, NODE_COMPILE_CACHE_ENV, NX_REMOTE_SERVER_ENV,
+        NX_REMOTE_STORE_BOUND_ENV, PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, RUNTIME_LINK_ENV,
+        TEMP_DIR_ENV, WORKSPACE_TOKEN_ENV,
     };
 
     use super::*;
@@ -690,7 +690,7 @@ mod tests {
                 WORKSPACE_TOKEN_ENV,
                 NODE_COMPILE_CACHE_ENV,
                 NX_REMOTE_SERVER_ENV,
-                NX_REMOTE_READ_ONLY_ENV,
+                NX_REMOTE_STORE_BOUND_ENV,
             ],
         )
         .try_into()

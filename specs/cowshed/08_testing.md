@@ -501,10 +501,10 @@ fill. The job-only host, volume and charged-memory boundary columns come from th
 same generator. Boundary round trips preserve signed deltas, absent build/charged memory and the exact `u16` core count;
 positive schema controls reject a widened core column or an added process-specific column. The admitted APFS-baseline
 reader control is macOS-only; the fixed-column encoding and schema controls remain in all-targets Linux cross-checks.
-The supervisor's `host_controller_caller_supplied_nx_endpoint_and_read_only_flag_never_reach_the_child` exercises the
-real host-side environment builder: a caller's Nx endpoint and `READ_ONLY=false` never reach the child, which gets the
-workspace's own endpoint and `READ_ONLY=true`. Creating its independent global short runtime alias requires this lane.
-The fixture keeps its directory guard under its selected granted parent, supplies the canonical owned workspace mount to
+The supervisor's `host_controller_caller_supplied_nx_endpoint_and_store_bound_never_reach_the_child` exercises the real
+host-side environment builder: a caller's Nx endpoint and store bound of `0` never reach the child, which gets the
+workspace's own endpoint and bound of `1`. Creating its independent global short runtime alias requires this lane. The
+fixture keeps its directory guard under its selected granted parent, supplies the canonical owned workspace mount to
 capability containment as the controller does, and removes its verified runtime alias on return or panic. Its success
 path asserts the alias is gone; it neither changes the production detector nor adds a sandbox grant.
 

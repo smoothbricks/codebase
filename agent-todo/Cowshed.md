@@ -380,14 +380,15 @@ Red first: the two runtimes give one hash for the same task of a package whose e
 push and at the after-steps. Decide first whether the spec's sentence or the fix is the rule; nothing on main supersedes
 the fix. Red first: a land with a blocked main `.envrc` pushes, and refuses an unapproved shell change before its gate.
 
-### A workspace stores each executed result worth its bytes
+### The cache server answers a stored key before staging
 
-`feat(cowshed): a shed's Nx stores each executed result worth its bytes`. The Nx half is on main (`patches/README.md` "A
-shed stores what is worth its bytes" says every workspace sets `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1`);
-the cowshed half is not: `workspace_environment.rs` still exports `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`,
-`specs/cowshed/05_gateway.md` still reads "Sheds read; a land writes", and the cache server's already-stored answer
-before staging is absent. Main's README and spec contradict each other until it lands. A consumer must take the
-Nx-plugin release that carries the Nx half first, or its workspaces store every result with no bound.
+`feat(nx-cache-server): a PUT of a stored key answers 409 before its body is staged`. A workspace's Nx now carries the
+store bound (`specs/cowshed/05_gateway.md`, "Every checkout reads and stores"), so a checkout's own client and a land's
+publish can both send one key; the second still stages its whole body before `link` answers `EEXIST`. A first attempt
+(an `lstat` of the key's path before reservation) left its process test waiting: a held upload on one connection and a
+stored-key `PUT` on another never drained at stop. Find that wait first. A repository on a declared Nx version without
+the carried patch (one adopted consumer is on Nx 23.2.1 with no patch, 2026-11-21) stores every result with no bound
+until it takes it.
 
 ### A declared land frees its turn at the fast-forward
 

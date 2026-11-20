@@ -22,9 +22,12 @@ pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 /// Capacity grants can grow it, so tools read the admitted size rather than assuming one.
 pub const PORT_BLOCK_SIZE_ENV: &str = "COWSHED_PORT_BLOCK_SIZE";
 pub const NX_REMOTE_SERVER_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_SERVER";
-/// A shed reads its project's Nx cache and never stores to it; only a land publishes
-/// (05_gateway.md "`/nx/v1/cache/{hash}`").
-pub const NX_REMOTE_READ_ONLY_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY";
+/// What a checkout's Nx stores to its project's cache: a result that took at least this many
+/// seconds per MiB of its outputs (05_gateway.md "`/nx/v1/cache/{hash}`", "Every checkout reads
+/// and stores"). The carried Nx patch reads it; a client without that patch stores every result.
+pub const NX_REMOTE_STORE_BOUND_ENV: &str = "NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB";
+/// The bound every workspace sets (03_caches.md, "What a checkout stores").
+pub const NX_REMOTE_STORE_SECONDS_PER_MIB: &str = "1";
 /// The sandbox's `TMPDIR` ([`crate::storage::StorageLayout::exec_temp_dir`]), exported to host
 /// shells too, so a host gate and a land gate of one workspace share one scratch directory and
 /// neither shares the machine's: Bun reads every ancestor directory of its working directory
@@ -240,7 +243,7 @@ pub(crate) fn write_workspace_environment(
         let port = port_block.map_or(7_644, |block| block.base());
         writeln!(
             &mut *contents,
-            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_READ_ONLY_ENV}=true"
+            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_STORE_BOUND_ENV}={NX_REMOTE_STORE_SECONDS_PER_MIB}"
         )
         .expect("writing to a String cannot fail");
     }
@@ -519,7 +522,7 @@ mod tests {
         .unwrap();
         let published = std::fs::read_to_string(root.join(WORKSPACE_ENVIRONMENT_PATH)).unwrap();
         assert!(!published.contains(NX_REMOTE_SERVER_ENV));
-        assert!(!published.contains(NX_REMOTE_READ_ONLY_ENV));
+        assert!(!published.contains(NX_REMOTE_STORE_BOUND_ENV));
         assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"));
         std::fs::write(root.join("nx.json"), "{}").unwrap();
         write_workspace_environment(
@@ -539,7 +542,8 @@ mod tests {
             published
                 .contains("export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\n")
         );
-        assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true\n"));
+        assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1\n"));
+        assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY"));
         assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"));
         assert!(!published.contains("--exit-on-stdin-eof"));
         for marker in [None, Some(""), Some("false"), Some("true")] {

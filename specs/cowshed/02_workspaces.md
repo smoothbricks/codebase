@@ -2014,7 +2014,7 @@ it, stay. A holder that finds the path naming another inode once granted refuses
 Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
 `.cowshed/env` exports, on macOS, `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` from detached metadata's exact
 `portBlock`; Linux has no port block and omits both lines. In an Nx checkout it also exports the project cache route's
-endpoint and read-only flag, `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY=true`
+endpoint and store bound, `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1`
 (03_caches.md); the route takes no credential. On a host with a provisioned build-cache volume it exports that volume's
 root as `COWSHED_BUILD_CACHE` (01a_apfs.md, "Dedicated build-cache volume"), the one spelling every consumer reads; a
 host without one omits the line. It never exports the bare token: a file every shell of the workspace sources hands its
