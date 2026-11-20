@@ -53,6 +53,8 @@ use std::time::{Duration, Instant, SystemTime};
 mod blank_image;
 #[path = "../../../cowshed-core/tests/support/nx_reads.rs"]
 mod nx_dependencies;
+#[path = "../../../cowshed-core/tests/support/progress.rs"]
+mod progress;
 #[path = "../../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
 #[path = "../../../cowshed-core/tests/support/scratch_directory.rs"]
@@ -387,6 +389,7 @@ fn clone_checkout(project: Project<'_>, destination: &Path) {
             "the fixture's Nx {file} must match the repository's patched product",
         );
     }
+    progress::completed_phase("fixture checkout");
 }
 
 impl Drop for Fixture {
@@ -449,6 +452,11 @@ async fn run(
         started.elapsed(),
         result.is_ok()
     );
+    // A verb that completed successfully is a phase of the lifecycle the run can see moved; a
+    // failed or refused one moved nothing (08_testing.md, "awake-idle-bound").
+    if matches!(result, Ok(0)) {
+        progress::completed_phase(&verb);
+    }
     let (stdout, stderr) = output.into_inner();
     (result, stdout, stderr)
 }
