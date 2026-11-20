@@ -3243,12 +3243,16 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
 }
 
 /// The value a rule binds from two-key row `row`, `field0 | field1 << 32`, or
-/// `None` unless both fields are set: the prior value the change feed names
-/// for a two-key row.
+/// `None` unless both fields are set lanes: the prior value the change feed
+/// names for a two-key row. A value-object or array field's cell is an arena
+/// reference, not a lane, so a row whose field 0 or 1 is one binds none, as a
+/// one-key struct map binds none; the watch log keeps its typed image.
 fn struct_map2_value<I: KeyIndex>(state: &[u8], smap: &StructMap2Slot<I>, row: u32) -> Option<u64> {
     if smap.num_fields < 2
         || !StructMapSlot::is_field_set(state, row, 0)
         || !StructMapSlot::is_field_set(state, row, 1)
+        || is_arena_field_type(smap.field_type(state, 0))
+        || is_arena_field_type(smap.field_type(state, 1))
     {
         return None;
     }

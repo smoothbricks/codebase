@@ -26,8 +26,9 @@ newest entry. Fields are private: an entry is built only by `ChangeFeed::record(
 value cannot exist. `key2` is 0 for a one-key source.
 
 The prior value is the lane a rule binds: a hash map's `u32` value and a two-key map's `field0 | field1 << 32` (present
-only when both fields are set). A one-key struct map, a set and a bitmap have none. A derived fact's is the image the
-RETE layer passes.
+only when both fields are set and neither is an arena field: a value-object or array cell is an arena reference, not a
+lane, and §7's row image carries its bytes). A one-key struct map, a set and a bitmap have none. A derived fact's is the
+image the RETE layer passes.
 
 ## 3. Recording sites
 
