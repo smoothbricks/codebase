@@ -51,7 +51,7 @@
     },
     "packages/bend-emit": {
       "name": "@smoothbricks/bend-emit",
-      "version": "0.0.1-next.0",
+      "version": "0.0.1",
       "bin": {
         "bend-emit": "./bin/bend-emit.ts",
       },
@@ -99,7 +99,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.21-next.0",
+      "version": "0.13.21",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -135,7 +135,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.5.4-next.0",
+      "version": "0.5.4",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -144,8 +144,8 @@
         "typia": "15.4.1",
       },
       "devDependencies": {
-        "@smoothbricks/bend-emit": "workspace:*",
         "@napi-rs/cli": "3.7.3",
+        "@smoothbricks/bend-emit": "workspace:*",
         "@smoothbricks/lmao": "workspace:*",
         "@smoothbricks/validation": "workspace:*",
         "@types/node": "catalog:",
@@ -329,7 +329,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.20-next.0",
+      "version": "0.7.20",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
@@ -1907,6 +1907,7 @@
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
 
     "@smoothbricks/bend-emit": ["@smoothbricks/bend-emit@workspace:packages/bend-emit"],
+
     "@smoothbricks/bitmosaic": ["@smoothbricks/bitmosaic@workspace:packages/bitmosaic"],
 
     "@smoothbricks/build-inputs": ["@smoothbricks/build-inputs@workspace:packages/build-inputs"],
