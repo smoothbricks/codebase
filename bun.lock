@@ -36,7 +36,7 @@
     },
     "packages/arrow-builder": {
       "name": "@smoothbricks/arrow-builder",
-      "version": "0.2.0",
+      "version": "0.2.1-next.0",
       "dependencies": {
         "@noble/hashes": "2.4.0",
         "@smoothbricks/duration": "workspace:*",
@@ -55,7 +55,7 @@
     },
     "packages/build-inputs": {
       "name": "@smoothbricks/build-inputs",
-      "version": "0.0.4",
+      "version": "0.0.5-next.0",
       "bin": {
         "smoo-nx-build-inputs": "./dist/ts/bin/smoo-nx-build-inputs.js",
       },
@@ -73,7 +73,7 @@
     },
     "packages/cargo-retain": {
       "name": "@smoothbricks/cargo-retain",
-      "version": "0.0.3",
+      "version": "0.0.4-next.0",
       "bin": {
         "smoo-nx-cargo-retain": "./dist/ts/node-cli.js",
       },
@@ -92,7 +92,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.20",
+      "version": "0.13.21-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -119,7 +119,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.4.0",
+      "version": "0.4.1-next.0",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.7.0",
@@ -128,7 +128,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.5.3",
+      "version": "0.5.4-next.0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -148,7 +148,7 @@
     },
     "packages/duration": {
       "name": "@smoothbricks/duration",
-      "version": "0.1.10",
+      "version": "0.1.11-next.0",
       "dependencies": {
         "@smoothbricks/time": "workspace:*",
         "tslib": "^2.8.1",
@@ -189,7 +189,7 @@
     },
     "packages/lmao": {
       "name": "@smoothbricks/lmao",
-      "version": "0.7.0",
+      "version": "0.7.1-next.0",
       "dependencies": {
         "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
@@ -235,7 +235,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.19",
+      "version": "0.1.20-next.0",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@smoothbricks/lmao": "workspace:*",
@@ -252,7 +252,7 @@
     },
     "packages/lmao-ttsc": {
       "name": "@smoothbricks/lmao-ttsc",
-      "version": "0.1.20",
+      "version": "0.1.21-next.0",
       "dependencies": {
         "@ttsc/unplugin": "0.37.1",
         "ttsc": "0.37.1",
@@ -266,7 +266,7 @@
     },
     "packages/money": {
       "name": "@smoothbricks/money",
-      "version": "0.2.0",
+      "version": "0.2.1-next.0",
       "dependencies": {
         "tslib": "^2.8.1",
       },
@@ -322,7 +322,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.19",
+      "version": "0.7.20-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
@@ -361,7 +361,7 @@
     },
     "packages/opencode-entangled": {
       "name": "@smoothbricks/opencode-entangled",
-      "version": "0.1.11",
+      "version": "0.1.12-next.0",
       "dependencies": {
         "@opencode-ai/plugin": "^1.3.5",
         "fenceparser": "^2.2.0",
@@ -374,7 +374,7 @@
     },
     "packages/statebus-core": {
       "name": "@smoothbricks/statebus-core",
-      "version": "0.1.8",
+      "version": "0.1.9-next.0",
       "dependencies": {
         "@tldraw/state": "^3.15.5",
         "tslib": "^2.8.1",
@@ -386,7 +386,7 @@
     },
     "packages/statebus-data-loader": {
       "name": "@smoothbricks/statebus-data-loader",
-      "version": "0.1.4",
+      "version": "0.1.5-next.0",
       "dependencies": {
         "@smoothbricks/statebus-core": "workspace:*",
         "tslib": "^2.8.1",
@@ -426,7 +426,7 @@
     },
     "packages/statebus-react": {
       "name": "@smoothbricks/statebus-react",
-      "version": "0.1.8",
+      "version": "0.1.9-next.0",
       "dependencies": {
         "@smoothbricks/statebus-core": "workspace:*",
         "@tldraw/state": "^3.15.5",
@@ -446,7 +446,7 @@
     },
     "packages/statebus-tanstack-query": {
       "name": "@smoothbricks/statebus-tanstack-query",
-      "version": "0.1.4",
+      "version": "0.1.5-next.0",
       "dependencies": {
         "@smoothbricks/statebus-core": "workspace:*",
         "@smoothbricks/statebus-data-loader": "workspace:*",
@@ -462,7 +462,7 @@
     },
     "packages/time": {
       "name": "@smoothbricks/time",
-      "version": "0.2.0",
+      "version": "0.2.1-next.0",
       "dependencies": {
         "tslib": "^2.8.1",
       },
@@ -472,7 +472,7 @@
     },
     "packages/validation": {
       "name": "@smoothbricks/validation",
-      "version": "0.1.15",
+      "version": "0.1.16-next.0",
       "dependencies": {
         "@ttsc/unplugin": "0.37.1",
         "tslib": "^2.8.1",
