@@ -18,18 +18,24 @@
 use std::collections::BTreeMap;
 
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{EMPTY_KEY, ErrorCode, SlotType, StructFieldType, TOMBSTONE};
+use columine_types::types::{
+    EMPTY_KEY, ErrorCode, SlotMetaOffset, SlotType, StructFieldType, TOMBSTONE,
+};
 use columine_vm::bytes;
+use columine_vm::change_feed::{Change, Source};
+use columine_vm::key_index::Key;
 use columine_vm::key_index::NoStrings;
 use columine_vm::logical_export::{
     InternLookup, Interner, LogicalValue, SlotEncoding, export_slot, import_slot,
 };
+use columine_vm::meta::slot_meta_base;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, DEFAULT_ACCEPTED_PROGRAM_MAGICS, GrowthRoom, calculate_grown_state_size,
     calculate_state_size, init_state, validate_state,
 };
 use columine_vm::struct_map::StructMap2Slot;
 use columine_vm::vm::{Vm, u32s_as_bytes};
+use columine_vm::watch_log::{NetAnswer, NetChanges};
 
 const HALT: u8 = 0x00;
 const FOR_EACH: u8 = 0xe0;
@@ -842,6 +848,116 @@ fn the_logical_form_carries_each_pairs_frames_and_imports_to_the_same_reads() {
     assert_eq!(logical, back, "export of import is the identity");
 }
 
+// =============================================================================
+// Change feed and watch log
+// =============================================================================
+
+/// The feed entries of slot 0 since the pass began, oldest first.
+fn feed_entries(vm: &Vm) -> Vec<(Key, Change)> {
+    vm.feed()
+        .entries()
+        .iter()
+        .filter(|entry| entry.source() == Source::Slot(0))
+        .map(|entry| (entry.key(), entry.change()))
+        .collect()
+}
+
+/// Track slot 0 in the change feed, watch it, and begin a pass.
+fn armed(state: &mut [u8]) -> Vm {
+    let mut vm = Vm::default();
+    // Change-plane bit `slot + 1` names slot 0.
+    vm.feed_bind(&[0b10, 0], 0, 64).expect("feed_bind");
+    state[at(slot_meta_base(SLOT) + SlotMetaOffset::CHANGE_FLAGS)] = 0;
+    vm.feed_begin_pass(state);
+    vm.watch(state, SLOT, 64, 4096).expect("watch");
+    vm
+}
+
+/// Columine 07 §2: the feed's prior is "the lane a rule binds: … a two-key
+/// map's `field0 | field1 << 32`". A value-object or array field's cell is an
+/// arena reference, not a lane, so a row whose field 0 or 1 is one binds no
+/// prior, as a one-key struct map binds none; §7's watch log keeps the typed
+/// row image, its frames included.
+#[test]
+fn a_value_object_lane_binds_no_feed_prior_and_the_watch_log_keeps_its_frame() {
+    let prog = upsert_program();
+    let mut state = init(&prog);
+    let mut vm = armed(&mut state);
+    let first = [row(7, 0, b"first frame of 7/0", &[1, 2])];
+    assert_eq!(
+        ErrorCode::Ok,
+        run(&mut vm, &mut state, &prog, &Batch::of(&first))
+    );
+    // The insert was the slot's first write: write sequence 1.
+    let inserted = 1;
+    let second = [row(7, 0, b"second frame of 7/0", &[3])];
+    assert_eq!(
+        ErrorCode::Ok,
+        run(&mut vm, &mut state, &prog, &Batch::of(&second))
+    );
+    let (k1, k2) = ([7u32], [0u32]);
+    let erase = [u32s_as_bytes(&k1), u32s_as_bytes(&k2)];
+    assert_eq!(
+        ErrorCode::Ok,
+        exec(&mut vm, &mut state, &exact_erase_program(), &erase, 1)
+    );
+    assert_eq!(
+        feed_entries(&vm),
+        [
+            (Key::two(7, 0), Change::Inserted),
+            (Key::two(7, 0), Change::Updated(None)),
+            (Key::two(7, 0), Change::Removed(None)),
+        ],
+        "an arena reference is never a prior value"
+    );
+
+    // Since the insert, the pair's net change is its removal, and the prior
+    // the log names is the inserted row's image, its frame bytes inline.
+    let mut out = NetChanges::default();
+    assert_eq!(
+        Ok(NetAnswer::Changes),
+        vm.net_changes(&state, SLOT, inserted, &NoStrings, &mut out)
+    );
+    assert!(
+        contains(out.bytes(), b"first frame of 7/0"),
+        "the watch log's prior is the typed row image"
+    );
+}
+
+/// The gate is per lane: a row whose fields 0 and 1 are u32 lanes binds its
+/// prior though another field is a value object.
+#[test]
+fn scalar_lanes_beside_a_value_object_field_keep_their_feed_prior() {
+    let init_code = pair_init(&[UINT32, UINT32, VO]);
+    let prog = program(
+        7,
+        &init_code,
+        &[UPSERT2_ARRAYS, 0, 0, 1, 2, 2, 0, 2, 1, 1, 5, 6, 2],
+    );
+    let mut state = init(&prog);
+    let mut vm = armed(&mut state);
+    let first = [row(4, 1, b"", &[9])];
+    assert_eq!(
+        ErrorCode::Ok,
+        run(&mut vm, &mut state, &prog, &Batch::of(&first))
+    );
+    let second = [row(4, 1, b"", &[8])];
+    assert_eq!(
+        ErrorCode::Ok,
+        run(&mut vm, &mut state, &prog, &Batch::of(&second))
+    );
+    let count = first[0].count;
+    assert_eq!(
+        feed_entries(&vm),
+        [
+            (Key::two(4, 1), Change::Inserted),
+            (
+                Key::two(4, 1),
+                Change::Updated(Some(u64::from(count) | (u64::from(count) << 32)))
+            ),
+        ]
+    );
+}
 // =============================================================================
 // The old scalar form and refusals
 // =============================================================================
