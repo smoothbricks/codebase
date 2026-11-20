@@ -1,3 +1,5 @@
+import type { MutationReportTool } from './mutation-report.js';
+
 /**
  * A command and the bounds that end it. At least one bound is required: a run with neither would block Nx forever.
  * A test target names only `idleTimeoutMs` (`bounded-test-policy.ts`); `timeoutMs` is for commands that report no
@@ -30,6 +32,12 @@ export type BoundedExecBounds =
 export interface BoundedExecCommand {
   command: string;
   cwd?: string;
+  /**
+   * The mutation tool whose report this run captures (`mutation-report.ts`): a private directory per spawn, named by
+   * `BOUNDED_EXEC_MUTATION_REPORT_DIR` inside the executor's scratch, and its report handed to Nx as the execution's
+   * `mutationReport` task-result artifact once the run's processes are retired. No declared output is written.
+   */
+  mutationReport?: MutationReportTool;
   env?: Record<string, string>;
   /** Absolute wall-clock ceiling: a backstop against an unbounded run, not a performance budget. */
   timeoutMs?: number;

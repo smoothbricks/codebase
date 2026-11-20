@@ -110,7 +110,7 @@ index 237830c6863aa8c5bdab8c4794c6fc9f1e4a48b5..857a97118d646f25f61696b2db672de5
          const pid = await daemonClient.startInBackground();
          output_1.output.log({
 diff --git a/dist/src/config/workspace-json-project-json.d.ts b/dist/src/config/workspace-json-project-json.d.ts
-index 19008ba3584074369ad6a965585eaac0aaf647be..7709710cb754cfd149d4384f3d70d2677d2a8a3e 100644
+index 19008ba3584074369ad6a965585eaac0aaf647be..1dbb9cf2101fc329108b32e434412b3f3acbb6b0 100644
 --- a/dist/src/config/workspace-json-project-json.d.ts
 +++ b/dist/src/config/workspace-json-project-json.d.ts
 @@ -256,6 +256,11 @@ export interface TargetDependencyConfig {
@@ -125,6 +125,20 @@ index 19008ba3584074369ad6a965585eaac0aaf647be..7709710cb754cfd149d4384f3d70d267
  }
  /**
   * `always`: the files the input resolves to stay in the hash even when the task
+@@ -341,6 +346,13 @@ export interface TargetConfiguration<T = any> {
+      * Determines if Nx is able to cache a given target.
+      */
+     cache?: boolean;
++    /**
++     * The task-result artifacts an execution of this target produces, distinct names matching
++     * `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. Only an execution of a target that declares some gets a private artifact
++     * directory (`NX_TASK_ARTIFACTS_DIR`); they ride its result and its cache entry, and an entry without one of them is
++     * no hit for this target (the SmoothBricks Nx patch, `tasks-runner/task-artifacts.js`).
++     */
++    artifacts?: string[];
+     /**
+      * Configures ultracache for tasks of this target. Nx Cloud only.
+      */
 diff --git a/dist/src/daemon/cache.d.ts b/dist/src/daemon/cache.d.ts
 index 65e58a019d7c1f7ba7c8243ad119aa444ec3a499..cb060c6d90352cbaf69d105652617d5a995385ea 100644
 --- a/dist/src/daemon/cache.d.ts
@@ -5528,18 +5542,77 @@ index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a6
                  // Deliberately not disabled: unlike the inotify limit above, a socket
                  // owned by someone else stops being there when it is removed or the
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce5770c8a3 100644
+index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..1b8c617c9e91129a48d7d59879b280584b560fa9 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
-@@ -28,6 +28,7 @@ const workspace_root_1 = require("../utils/workspace-root");
+@@ -28,6 +28,8 @@ const workspace_root_1 = require("../utils/workspace-root");
  const default_tasks_runner_1 = require("./default-tasks-runner");
  const task_io_service_1 = require("./task-io-service");
  const handle_import_1 = require("../utils/handle-import");
++const task_artifacts_1 = require("./task-artifacts");
 +const remote_cache_outage_1 = require("./remote-cache-outage");
  // This function is called once during tasks runner initialization. It checks if the db cache is enabled and logs a warning if it is not.
  function dbCacheEnabled() {
      // ...but if on wasm and the the db cache isnt supported we shouldn't warn
-@@ -175,7 +176,17 @@ class DbCache {
+@@ -97,11 +99,11 @@ class DbCache {
+     async get(task) {
+         const res = this.cache.get(task.hash);
+         if (res) {
+-            return {
++            return (0, task_artifacts_1.withTaskArtifacts)({
+                 ...res,
+                 terminalOutput: res.terminalOutput ?? '',
+                 remote: false,
+-            };
++            });
+         }
+         if (this.remoteCache) {
+             // didn't find it locally but we have a remote cache
+@@ -109,11 +111,11 @@ class DbCache {
+             const res = await this.remoteCache.retrieve(task.hash, this.cache.cacheDirectory);
+             if (res) {
+                 this.applyRemoteCacheResults(task.hash, res, task.outputs);
+-                return {
++                return (0, task_artifacts_1.withTaskArtifacts)({
+                     ...res,
+                     terminalOutput: res.terminalOutput ?? '',
+                     remote: true,
+-                };
++                });
+             }
+             else {
+                 return null;
+@@ -143,11 +145,13 @@ class DbCache {
+         for (const [i, task] of tasks.entries()) {
+             const res = batchResults[i];
+             if (res) {
+-                results.set(task.hash, {
++                const hit = (0, task_artifacts_1.withTaskArtifacts)({
+                     ...res,
+                     terminalOutput: res.terminalOutput ?? '',
+                     remote: false,
+                 });
++                if (hit !== null)
++                    results.set(task.hash, hit);
+             }
+             else if (this.remoteCache) {
+                 remoteMisses.push(task);
+@@ -161,11 +165,13 @@ class DbCache {
+                 const res = await this.remoteCache.retrieve(task.hash, this.cache.cacheDirectory);
+                 if (res) {
+                     this.applyRemoteCacheResults(task.hash, res, task.outputs);
+-                    results.set(task.hash, {
++                    const hit = (0, task_artifacts_1.withTaskArtifacts)({
+                         ...res,
+                         terminalOutput: res.terminalOutput ?? '',
+                         remote: true,
+                     });
++                    if (hit !== null)
++                        results.set(task.hash, hit);
+                 }
+             }));
+         }
+@@ -175,15 +181,29 @@ class DbCache {
          return this.cache.getCacheSize();
      }
      applyRemoteCacheResults(hash, res, outputs) {
@@ -5556,11 +5629,14 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce
 +            stampRestoredOutputs(workspace_root_1.workspaceRoot, res.outputsPath, (0, native_1.expandOutputs)(res.outputsPath, relativeOutputs));
 +        }
      }
-     async put(task, terminalOutput, outputs, code) {
+-    async put(task, terminalOutput, outputs, code) {
++    async put(task, terminalOutput, outputs, code, artifacts) {
          return tryAndRetry(async () => {
-@@ -183,7 +194,9 @@ class DbCache {
+             const { expandedOutputs, files } = this.cache.put(task.hash, terminalOutput, outputs, code);
              // Notify TaskIOService of actual output files
              (0, task_io_service_1.getTaskIOService)().notifyTaskOutputs(task.id, expandedOutputs);
++            // The task's artifacts enter the entry before any remote store archives it.
++            (0, task_artifacts_1.writeTaskArtifacts)((0, path_1.join)(this.cache.cacheDirectory, task.hash), artifacts);
              if (this.remoteCache) {
 -                await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code);
 +                // A store policy (NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB) decides on how long the task
@@ -5569,7 +5645,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce
              }
              return files;
          });
-@@ -198,7 +211,7 @@ class DbCache {
+@@ -198,7 +218,7 @@ class DbCache {
          this.cache.recordTerminalOutputs(records);
      }
      copyFilesFromCache(_, cachedResult, outputs) {
@@ -5578,7 +5654,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce
      }
      removeOldCacheRecords() {
          return this.cache.removeOldCacheRecords();
-@@ -293,7 +306,9 @@ class DbCache {
+@@ -293,7 +313,9 @@ class DbCache {
              if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
                  process.emitWarning("Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.");
              }
@@ -5589,7 +5665,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce
          }
          return null;
      }
-@@ -452,6 +467,7 @@ class Cache {
+@@ -452,6 +474,7 @@ class Cache {
                      await this.copy(cached, src);
                  }
              }));
@@ -5597,7 +5673,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..23c356d6c628374336b1919e95fa10ce
          });
      }
      temporaryOutputPath(task) {
-@@ -557,6 +573,213 @@ class Cache {
+@@ -557,6 +580,213 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -6562,6 +6638,266 @@ index 4c56ddede1856427cf936950e2771bf8f9322e92..9c3b57391a002f29a4f5a72c1d925050
                      }
                  });
              }),
+diff --git a/dist/src/tasks-runner/task-artifacts.d.ts b/dist/src/tasks-runner/task-artifacts.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cb6bf4a1ebadbcbd787954dd703cd6db954cfe6
+--- /dev/null
++++ b/dist/src/tasks-runner/task-artifacts.d.ts
+@@ -0,0 +1,16 @@
++export declare const TASK_ARTIFACTS_ENV = "NX_TASK_ARTIFACTS_DIR";
++export declare const SIDECAR = ".nx-task-artifacts";
++export declare const MAX_ARTIFACT_BYTES: number;
++export type TaskArtifacts = Record<string, Uint8Array>;
++export interface TaskArtifactsDirectory {
++    readonly path: string;
++    readonly declared: readonly string[];
++    readonly pinned: { readonly dev: number; readonly ino: number };
++}
++export declare function declaredArtifacts(task: unknown, projectGraph: unknown): readonly string[];
++export declare function createTaskArtifactsDirectory(task: unknown, projectGraph: unknown): TaskArtifactsDirectory | undefined;
++export declare function collectTaskArtifacts(directory: TaskArtifactsDirectory, taskId: string): TaskArtifacts | undefined;
++export declare function removeTaskArtifactsDirectory(directory: TaskArtifactsDirectory | undefined): void;
++export declare function writeTaskArtifacts(entry: string, artifacts: TaskArtifacts | undefined): void;
++export declare function withTaskArtifacts<T extends { outputsPath: string }>(result: T): (T & { artifacts?: TaskArtifacts }) | null;
++export declare function holdsRequiredArtifacts(task: unknown, projectGraph: unknown, artifacts: TaskArtifacts | undefined): boolean;
+diff --git a/dist/src/tasks-runner/task-artifacts.js b/dist/src/tasks-runner/task-artifacts.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..5735fec0b6da3a7b515c2cb5a98bd054bde06770
+--- /dev/null
++++ b/dist/src/tasks-runner/task-artifacts.js
+@@ -0,0 +1,232 @@
++"use strict";
++/**
++ * Task-result artifacts: small named byte strings a task's own execution produces beside its outputs, carried with its
++ * result to the lifecycle and into its cache entry, so a hit returns the producing run's artifacts.
++ *
++ * A target declares the artifacts it produces (`artifacts: [...]` in its configuration, distinct names matching
++ * {@link NAME}). Only an execution of such a target gets an artifact directory: a fresh private one (mode 0700), named
++ * only in that execution's spawn environment ({@link TASK_ARTIFACTS_ENV}), never an input and never part of the task
++ * hash, never shared by two executions. Any other execution's environment is as before. After the execution the
++ * orchestrator takes only the declared names, each a regular file with one link opened without following a link or
++ * waiting on a FIFO, all of them together at most {@link MAX_ARTIFACT_BYTES} and refused by size before a byte is
++ * read; the directory is pinned by its identity when made and must be the same directory before and after the reads.
++ * What it does not take is said with the task and the reason, never dropped in silence; then the directory is removed.
++ *
++ * In a cache entry the artifacts sit in {@link SIDECAR} with a manifest naming each one's size and SHA-256, inside the
++ * entry's directory, so every transport that moves the entry moves them (the self-hosted HTTP cache archives the
++ * entry; the v1 adapter moves it under outputs/). A reader bounds the manifest and every artifact by size before it
++ * reads them and verifies every digest; an entry whose artifacts do not verify is no hit. Restore copies declared
++ * outputs only, so the sidecar never lands in the workspace.
++ *
++ * An entry without one of its target's declared artifacts, one made before artifacts existed included, is no hit for
++ * that target, and the task runs. Artifact maps have no prototype, so only an artifact itself answers for its name.
++ */
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.MAX_ARTIFACT_BYTES = exports.SIDECAR = exports.TASK_ARTIFACTS_ENV = void 0;
++exports.declaredArtifacts = declaredArtifacts;
++exports.createTaskArtifactsDirectory = createTaskArtifactsDirectory;
++exports.collectTaskArtifacts = collectTaskArtifacts;
++exports.removeTaskArtifactsDirectory = removeTaskArtifactsDirectory;
++exports.writeTaskArtifacts = writeTaskArtifacts;
++exports.withTaskArtifacts = withTaskArtifacts;
++exports.holdsRequiredArtifacts = holdsRequiredArtifacts;
++const node_crypto_1 = require("node:crypto");
++const node_fs_1 = require("node:fs");
++const node_os_1 = require("node:os");
++const node_path_1 = require("node:path");
++const utils_1 = require("./utils");
++const output_1 = require("../utils/output");
++exports.TASK_ARTIFACTS_ENV = 'NX_TASK_ARTIFACTS_DIR';
++exports.SIDECAR = '.nx-task-artifacts';
++/** The bound on all of one execution's artifacts together. */
++exports.MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
++const MAX_MANIFEST_BYTES = 64 * 1024;
++const MANIFEST = 'manifest.json';
++const NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
++function digest(bytes) {
++    return (0, node_crypto_1.createHash)('sha256').update(bytes).digest('base64url');
++}
++/** The artifacts `task`'s target declares; a declaration that is not distinct artifact names is a configuration error. */
++function declaredArtifacts(task, projectGraph) {
++    const declared = (0, utils_1.getTargetConfigurationForTask)(task, projectGraph)?.artifacts;
++    if (declared === undefined)
++        return [];
++    if (!Array.isArray(declared) ||
++        !declared.every((name) => typeof name === 'string' && NAME.test(name)) ||
++        new Set(declared).size !== declared.length) {
++        throw new Error(`Task ${task.id}: its target's \`artifacts\` must list distinct artifact names (${NAME.source}), not ${JSON.stringify(declared)}`);
++    }
++    return declared;
++}
++/** A directory's identity as lstat sees it at `path`; null when `path` is not a directory (a link included). */
++function pin(path) {
++    const info = (0, node_fs_1.lstatSync)(path);
++    return info.isDirectory() ? { dev: info.dev, ino: info.ino } : null;
++}
++function stillPinned(path, pinned) {
++    try {
++        const now = pin(path);
++        return now !== null && now.dev === pinned.dev && now.ino === pinned.ino;
++    }
++    catch {
++        return false;
++    }
++}
++/** This execution's artifact directory when its target declares artifacts; undefined, and no directory, otherwise. */
++function createTaskArtifactsDirectory(task, projectGraph) {
++    const declared = declaredArtifacts(task, projectGraph);
++    if (declared.length === 0)
++        return undefined;
++    const path = (0, node_fs_1.mkdtempSync)((0, node_path_1.join)((0, node_os_1.tmpdir)(), 'nx-task-artifacts-'));
++    return { path, declared, pinned: pin(path) };
++}
++/**
++ * The bytes of the regular file with one link at `path`, opened without following a link or blocking, refused by its
++ * size before a byte is read when it holds more than `limit`; for anything else, why it is not taken.
++ */
++function readBounded(path, limit) {
++    let fd;
++    try {
++        fd = (0, node_fs_1.openSync)(path, node_fs_1.constants.O_RDONLY | node_fs_1.constants.O_NOFOLLOW | node_fs_1.constants.O_NONBLOCK);
++    }
++    catch (error) {
++        return `cannot be opened without following a link (${error?.code ?? error})`;
++    }
++    try {
++        const info = (0, node_fs_1.fstatSync)(fd);
++        if (!info.isFile())
++            return 'is not a regular file';
++        if (info.nlink !== 1)
++            return `has ${info.nlink} links`;
++        if (info.size > limit)
++            return `holds ${info.size} bytes, over the ${limit} bytes left of the bound`;
++        const bytes = Buffer.alloc(info.size);
++        let read = 0;
++        while (read < bytes.length) {
++            const got = (0, node_fs_1.readSync)(fd, bytes, read, bytes.length - read, read);
++            if (got === 0)
++                return `shrank while read (${read} of ${bytes.length} bytes)`;
++            read += got;
++        }
++        if ((0, node_fs_1.readSync)(fd, Buffer.alloc(1), 0, 1, read) !== 0)
++            return `grew while read (past ${read} bytes)`;
++        return bytes;
++    }
++    finally {
++        (0, node_fs_1.closeSync)(fd);
++    }
++}
++/**
++ * The declared artifacts `taskId`'s execution left in `directory`, by name; undefined when it left none. Everything it
++ * left that is not taken, an undeclared name included, is said.
++ */
++function collectTaskArtifacts(directory, taskId) {
++    const refused = [];
++    let artifacts = Object.create(null);
++    let names = [];
++    if (!stillPinned(directory.path, directory.pinned)) {
++        refused.push(`its artifact directory ${directory.path} is no longer the directory made for it`);
++    }
++    else {
++        try {
++            names = (0, node_fs_1.readdirSync)(directory.path);
++        }
++        catch (error) {
++            refused.push(`its artifact directory ${directory.path} cannot be read (${error?.code ?? error})`);
++        }
++    }
++    for (const name of names) {
++        if (!directory.declared.includes(name))
++            refused.push(`${JSON.stringify(name)} is not an artifact its target declares (${directory.declared.join(', ')})`);
++    }
++    let left = exports.MAX_ARTIFACT_BYTES;
++    for (const name of directory.declared) {
++        if (!names.includes(name))
++            continue;
++        const bytes = readBounded((0, node_path_1.join)(directory.path, name), left);
++        if (typeof bytes === 'string') {
++            refused.push(`${name} ${bytes}`);
++            continue;
++        }
++        artifacts[name] = bytes;
++        left -= bytes.length;
++    }
++    if (names.length > 0 && !stillPinned(directory.path, directory.pinned)) {
++        refused.push(`its artifact directory ${directory.path} was replaced while read`);
++        artifacts = Object.create(null);
++    }
++    if (refused.length > 0)
++        output_1.output.warn({ title: `Task ${taskId}: task-result artifacts not taken`, bodyLines: refused });
++    return Object.keys(artifacts).length === 0 ? undefined : artifacts;
++}
++function removeTaskArtifactsDirectory(directory) {
++    if (directory !== undefined)
++        (0, node_fs_1.rmSync)(directory.path, { recursive: true, force: true });
++}
++/** Write `artifacts` into the cache entry at `entry`, replacing any earlier sidecar; nothing when there are none. */
++function writeTaskArtifacts(entry, artifacts) {
++    const sidecar = (0, node_path_1.join)(entry, exports.SIDECAR);
++    (0, node_fs_1.rmSync)(sidecar, { recursive: true, force: true });
++    const names = artifacts === undefined ? [] : Object.keys(artifacts).filter((name) => NAME.test(name));
++    if (names.length === 0)
++        return;
++    (0, node_fs_1.mkdirSync)(sidecar);
++    const manifest = Object.create(null);
++    for (const name of names) {
++        const bytes = artifacts[name];
++        (0, node_fs_1.writeFileSync)((0, node_path_1.join)(sidecar, name), bytes, { flag: 'wx' });
++        manifest[name] = { bytes: bytes.byteLength, sha256: digest(bytes) };
++    }
++    (0, node_fs_1.writeFileSync)((0, node_path_1.join)(sidecar, MANIFEST), JSON.stringify(manifest), { flag: 'wx' });
++}
++/**
++ * `result` with its entry's artifacts, each bounded by size before it is read and verified against the manifest;
++ * `result` alone when its entry holds none; null when they do not verify, so the entry is no hit.
++ */
++function withTaskArtifacts(result) {
++    const sidecar = (0, node_path_1.join)(result.outputsPath, exports.SIDECAR);
++    let info;
++    try {
++        info = (0, node_fs_1.lstatSync)(sidecar);
++    }
++    catch (error) {
++        return error?.code === 'ENOENT' ? result : null;
++    }
++    if (!info.isDirectory())
++        return null;
++    const text = readBounded((0, node_path_1.join)(sidecar, MANIFEST), MAX_MANIFEST_BYTES);
++    if (typeof text === 'string')
++        return null;
++    let manifest;
++    try {
++        manifest = JSON.parse(text.toString('utf8'));
++    }
++    catch {
++        return null;
++    }
++    if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest))
++        return null;
++    const artifacts = Object.create(null);
++    let left = exports.MAX_ARTIFACT_BYTES;
++    for (const [name, expected] of Object.entries(manifest)) {
++        if (!NAME.test(name) ||
++            typeof expected !== 'object' ||
++            expected === null ||
++            !Number.isSafeInteger(expected.bytes) ||
++            expected.bytes < 0 ||
++            expected.bytes > left ||
++            typeof expected.sha256 !== 'string') {
++            return null;
++        }
++        const bytes = readBounded((0, node_path_1.join)(sidecar, name), expected.bytes);
++        if (typeof bytes === 'string' || bytes.length !== expected.bytes || digest(bytes) !== expected.sha256)
++            return null;
++        artifacts[name] = bytes;
++        left -= bytes.length;
++    }
++    return { ...result, artifacts };
++}
++/** Whether `artifacts` hold every artifact `task`'s target declares, each its own; a target that declares none needs nothing. */
++function holdsRequiredArtifacts(task, projectGraph, artifacts) {
++    return declaredArtifacts(task, projectGraph).every((name) => artifacts != null && Object.hasOwn(artifacts, name));
++}
 diff --git a/dist/src/tasks-runner/task-env.js b/dist/src/tasks-runner/task-env.js
 index bded0d604f20417f61fdf18bcf62b09966847d43..2aa4f9cde2f677b89032b439ef90c7c7ee68f977 100644
 --- a/dist/src/tasks-runner/task-env.js
@@ -6813,10 +7149,18 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..ff7cd099c7a2092bdba5d1232ee73570
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<NoopChildProcess | RunningTask | SharedRunningTask>;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d8882119b 100644
+index 9a17f88be6502a302c5f5eab71df646a2f87851c..7ce7672b1cb4e4e81232990c4a99facb1427e351 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
-@@ -32,6 +32,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
+@@ -20,6 +20,7 @@ const params_1 = require("../utils/params");
+ const workspace_root_1 = require("../utils/workspace-root");
+ const cache_1 = require("./cache");
+ const forked_process_task_runner_1 = require("./forked-process-task-runner");
++const task_artifacts_1 = require("./task-artifacts");
+ const is_tui_enabled_1 = require("./is-tui-enabled");
+ const pseudo_terminal_1 = require("./pseudo-terminal");
+ const probes_1 = require("./readiness/probes");
+@@ -32,6 +33,8 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
  const task_env_1 = require("./task-env");
  const tasks_schedule_1 = require("./tasks-schedule");
  const utils_1 = require("./utils");
@@ -6825,7 +7169,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
  /**
   * Resolve a batch executor's per-task result to a TaskStatus. Prefers an
   * explicit `status` from the executor; falls back to the `success` boolean
-@@ -150,11 +152,12 @@ class TaskOrchestrator {
+@@ -150,11 +153,12 @@ class TaskOrchestrator {
          // underlying real tasks become the anchors.
          this.initializingTaskIds = (0, utils_1.expandInitiatingTasksThroughNoop)(this.initiatingTasks, this.taskGraph, this.projectGraph);
          this.processedTasks = new Map();
@@ -6843,7 +7187,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          this.cacheMissedHashes = new Set();
          // The files the cache just wrote or restored, by task id, for postRunSteps
          // to hand the daemon instead of it walking the outputs again.
-@@ -164,6 +167,9 @@ class TaskOrchestrator {
+@@ -164,6 +168,9 @@ class TaskOrchestrator {
          this.pendingDiscreteWorkers = new Set();
          this.groups = [];
          this.continuousTasksStarted = 0;
@@ -6853,7 +7197,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          /**
           * How many folds each batch id has rendered. A batch that reports a strict
           * subset of its tasks is re-run under the same id, so one id can produce more
-@@ -173,6 +179,7 @@ class TaskOrchestrator {
+@@ -173,6 +180,7 @@ class TaskOrchestrator {
          this.bailed = false;
          this.resolveStopPromise = null;
          this.stopRequested = false;
@@ -6861,7 +7205,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          this.runningContinuousTasks = new Map();
          this.runningRunCommandsTasks = new Map();
          this.runningDiscreteTasks = new Map();
-@@ -195,6 +202,9 @@ class TaskOrchestrator {
+@@ -195,6 +203,9 @@ class TaskOrchestrator {
          // exit, and the paths that never spawn one write it inline. The backstop in
          // postRunSteps consults this so a task's output is written exactly once.
          this.tasksWithPersistedOutput = new Set();
@@ -6871,7 +7215,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
      }
      async init() {
          this.setupSignalHandlers();
-@@ -214,9 +224,24 @@ class TaskOrchestrator {
+@@ -214,9 +225,24 @@ class TaskOrchestrator {
          }
      }
      async run() {
@@ -6896,7 +7240,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          process.stdout.setMaxListeners(total + events_1.defaultMaxListeners);
          process.stderr.setMaxListeners(total + events_1.defaultMaxListeners);
          process.setMaxListeners(total + events_1.defaultMaxListeners);
-@@ -252,8 +277,6 @@ class TaskOrchestrator {
+@@ -252,8 +278,6 @@ class TaskOrchestrator {
              // the native half does not exist.
              (0, cache_1.sweepBatchOutputs)();
          }
@@ -6905,7 +7249,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -307,7 +330,7 @@ class TaskOrchestrator {
+@@ -307,7 +331,7 @@ class TaskOrchestrator {
                  if (unhashed.length > 0) {
                      const perTaskEnvs = {};
                      for (const task of unhashed) {
@@ -6914,7 +7258,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
                      }
                      await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, unhashed);
                  }
-@@ -345,6 +368,18 @@ class TaskOrchestrator {
+@@ -345,6 +369,18 @@ class TaskOrchestrator {
                  const groupId = this.closeGroup();
                  this.dispatchDiscreteWorker(doNotSkipCache, task, groupId);
              }
@@ -6933,7 +7277,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
              // 6. Nothing left to dispatch and nothing in flight — done.
              if (!this.tasksSchedule.hasTasks() &&
                  this.pendingDiscreteWorkers.size === 0) {
-@@ -410,9 +445,18 @@ class TaskOrchestrator {
+@@ -410,9 +446,18 @@ class TaskOrchestrator {
          }
      }
      // region Processing Scheduled Tasks
@@ -6953,7 +7297,26 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          if (!task.hash) {
              await (0, hash_task_1.hashTask)(this.hasher, this.projectGraph, this.fullTaskGraph, task, taskSpecificEnv, this.taskDetails);
          }
-@@ -581,12 +625,9 @@ class TaskOrchestrator {
+@@ -515,7 +560,9 @@ class TaskOrchestrator {
+             // under (shouldCacheTaskResult): successes always, failures only when
+             // NX_CACHE_FAILURES is enabled. Otherwise cached failures would be
+             // written but never read back.
+-            if (cachedResult && this.shouldCacheTaskResult(task, cachedResult.code)) {
++            if (cachedResult &&
++                this.shouldCacheTaskResult(task, cachedResult.code) &&
++                (0, task_artifacts_1.holdsRequiredArtifacts)(task, this.projectGraph, cachedResult.artifacts)) {
+                 cacheHits.push({ task, cachedResult });
+             }
+             else {
+@@ -570,6 +617,7 @@ class TaskOrchestrator {
+                 code: cachedResult.code,
+                 status,
+                 terminalOutput: cachedResult.terminalOutput,
++                ...(cachedResult.artifacts === undefined ? {} : { artifacts: cachedResult.artifacts }),
+             });
+         }
+         return results;
+@@ -581,12 +629,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -6969,7 +7332,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -701,7 +742,7 @@ class TaskOrchestrator {
+@@ -701,7 +746,7 @@ class TaskOrchestrator {
          // single-task path.
          const perTaskEnvs = {};
          for (const task of tasks) {
@@ -6978,7 +7341,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          }
          await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
      }
-@@ -709,6 +750,17 @@ class TaskOrchestrator {
+@@ -709,6 +754,17 @@ class TaskOrchestrator {
          if (this.bailed || this.stopRequested) {
              return [];
          }
@@ -6996,7 +7359,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskIds = Object.keys(batch.taskGraph.tasks);
          this.options.lifeCycle.registerRunningBatch?.(batch.id, {
-@@ -1062,6 +1114,20 @@ class TaskOrchestrator {
+@@ -1062,6 +1118,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -7017,7 +7380,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -1088,10 +1154,8 @@ class TaskOrchestrator {
+@@ -1088,10 +1158,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -7030,7 +7393,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -1125,9 +1189,11 @@ class TaskOrchestrator {
+@@ -1125,9 +1193,11 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -7045,7 +7408,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
       */
      async runTaskDirectly(doNotSkipCache, task, groupId) {
          // Wait for task to be processed
-@@ -1155,6 +1221,18 @@ class TaskOrchestrator {
+@@ -1155,6 +1225,18 @@ class TaskOrchestrator {
                  terminalOutput: waitError.message,
              };
          }
@@ -7064,7 +7427,37 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
          const temporaryOutputPath = this.cache.temporaryOutputPath(task);
-@@ -1382,8 +1460,22 @@ class TaskOrchestrator {
+@@ -1170,6 +1252,11 @@ class TaskOrchestrator {
+             ? (0, task_env_1.getEnvVariablesForTask)(task, taskSpecificEnv, (0, task_env_1.getForceColorForChild)(), this.options.skipNxCache, this.options.captureStderr, null, null)
+             : (0, task_env_1.getEnvVariablesForTask)(task, taskSpecificEnv, undefined, this.options.skipNxCache, this.options.captureStderr, temporaryOutputPath, streamOutput);
+         Object.assign(env, this.getReadyUrlEnv(task));
++        // An execution of a target that declares artifacts gets its own artifact directory, named only in its spawn
++        // environment: never a task input or hash. Any other execution's environment is as before.
++        const artifactsDirectory = (0, task_artifacts_1.createTaskArtifactsDirectory)(task, this.projectGraph);
++        if (artifactsDirectory !== undefined)
++            env[task_artifacts_1.TASK_ARTIFACTS_ENV] = artifactsDirectory.path;
+         let resolveDiscreteExit;
+         const discreteExitHandled = new Promise((r) => (resolveDiscreteExit = r));
+         this.discreteTaskExitHandled.set(task.id, discreteExitHandled);
+@@ -1197,6 +1284,9 @@ class TaskOrchestrator {
+                     code,
+                     status: isStopping ? 'stopped' : code === 0 ? 'success' : 'failure',
+                     terminalOutput,
++                    artifacts: artifactsDirectory === undefined
++                        ? undefined
++                        : (0, task_artifacts_1.collectTaskArtifacts)(artifactsDirectory, task.id),
+                 };
+             }
+             catch (e) {
+@@ -1216,6 +1306,7 @@ class TaskOrchestrator {
+             return result;
+         }
+         finally {
++            (0, task_artifacts_1.removeTaskArtifactsDirectory)(artifactsDirectory);
+             this.discreteTaskExitHandled.delete(task.id);
+             resolveDiscreteExit();
+         }
+@@ -1382,8 +1473,22 @@ class TaskOrchestrator {
          }
      }
      async startContinuousTask(task, groupId) {
@@ -7089,7 +7482,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
              // This branch never reads the hash, so a failure to compute it is dropped
              void this.processedTasks.get(task.id)?.catch(() => { });
              let readyWhen;
-@@ -1432,11 +1524,6 @@ class TaskOrchestrator {
+@@ -1432,11 +1537,6 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -7101,7 +7494,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          let pipeOutput;
          let temporaryOutputPath;
          let streamOutput;
-@@ -1485,7 +1572,11 @@ class TaskOrchestrator {
+@@ -1485,7 +1585,11 @@ class TaskOrchestrator {
              return new noop_child_process_1.NoopChildProcess({ code: 1, terminalOutput: '' });
          }
          let childProcess;
@@ -7113,7 +7506,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
              await this.preRunSteps([task], { groupId });
              this.detectTaskInvocationLoop(task);
              childProcess = await this.runTask(task, streamOutput, env, temporaryOutputPath, pipeOutput);
-@@ -1515,15 +1606,19 @@ class TaskOrchestrator {
+@@ -1515,15 +1619,19 @@ class TaskOrchestrator {
              // release paths (completeContinuousTask, the signal handler) both iterate
              // that map. Drop it here or siblings wait on a task no one is running.
              this.runningTasksService?.removeRunningTask(task.id);
@@ -7140,7 +7533,34 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -2114,22 +2209,32 @@ class TaskOrchestrator {
+@@ -1846,8 +1954,8 @@ class TaskOrchestrator {
+         if (resultsToCache.length > 0) {
+             // cache the results
+             perf_hooks_1.performance.mark('cache-results-start');
+-            await Promise.all(resultsToCache.map(async ({ task, code, terminalOutput, outputs }) => {
+-                const files = await this.cache.put(task, terminalOutput, outputs, code);
++            await Promise.all(resultsToCache.map(async ({ task, code, terminalOutput, outputs, artifacts }) => {
++                const files = await this.cache.put(task, terminalOutput, outputs, code, artifacts);
+                 if (files)
+                     this.copiedOutputFiles.set(task.id, files);
+             }));
+@@ -2004,13 +2112,14 @@ class TaskOrchestrator {
+         // 1. endTasks FIRST (non-skipped only)
+         const tasksToReport = [];
+         const taskIds = [];
+-        for (const { task, status, terminalOutput } of results) {
++        for (const { task, status, terminalOutput, artifacts } of results) {
+             taskIds.push(task.id);
+             if (!this.completedTasks.has(task.id) && status !== 'skipped') {
+                 tasksToReport.push({
+                     task,
+                     status,
+                     terminalOutput,
++                    ...(artifacts === undefined ? {} : { artifacts }),
+                     code: status === 'success' ||
+                         status === 'local-cache' ||
+                         status === 'local-cache-kept-existing' ||
+@@ -2114,22 +2223,32 @@ class TaskOrchestrator {
          if (tasks.length === 0)
              return resultMap;
          if (this.daemon?.enabled()) {
@@ -7179,7 +7599,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          }
      }
      // endregion utils
-@@ -2208,6 +2313,8 @@ class TaskOrchestrator {
+@@ -2208,6 +2327,8 @@ class TaskOrchestrator {
          // Waiters must not sit out a probe once the run is stopping
          this.abortAllReadiness();
          this.readySignal?.close();
@@ -7188,7 +7608,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..8fc11ce4af48b49d7055f8bdbb9d0d8d
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -2277,6 +2384,7 @@ class TaskOrchestrator {
+@@ -2277,6 +2398,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;
@@ -8131,7 +8551,7 @@ index 74f0682269ede01ee9ee4819e39f38c90a719894..03686ffeeff54286b99386fddeef77d0
      }
  }
 diff --git a/schemas/nx-schema.json b/schemas/nx-schema.json
-index 7cde7b48be009dac84b8155e4c4c2e3ae16a5ea5..bd672ab5d38664a559565b1c18cffd80c07e7dd3 100644
+index 7cde7b48be009dac84b8155e4c4c2e3ae16a5ea5..0f6fddcc2613a8a508a19e431680085aa0b769c2 100644
 --- a/schemas/nx-schema.json
 +++ b/schemas/nx-schema.json
 @@ -1138,6 +1138,10 @@
@@ -8145,8 +8565,21 @@ index 7cde7b48be009dac84b8155e4c4c2e3ae16a5ea5..bd672ab5d38664a559565b1c18cffd80
                    }
                  },
                  "oneOf": [
+@@ -1170,6 +1174,12 @@
+           "type": "boolean",
+           "description": "Specifies if the given target should be cacheable"
+         },
++        "artifacts": {
++          "type": "array",
++          "description": "The task-result artifacts an execution of this target produces: each gets a private directory named by NX_TASK_ARTIFACTS_DIR, and an entry without one of them is no cache hit",
++          "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
++          "uniqueItems": true
++        },
+         "ultracache": {
+           "type": "object",
+           "description": "Configures ultracache for tasks of this target. Nx Cloud only.",
 diff --git a/schemas/project-schema.json b/schemas/project-schema.json
-index fb73efc334c39c90a341c4098277021e19f75a0f..4ad470194f1c524491341e2599d3dc36f1b4dc37 100644
+index fb73efc334c39c90a341c4098277021e19f75a0f..28cb95cca2bcf75437e5f4caf8bf06ec12a23dea 100644
 --- a/schemas/project-schema.json
 +++ b/schemas/project-schema.json
 @@ -119,6 +119,10 @@
@@ -8160,6 +8593,19 @@ index fb73efc334c39c90a341c4098277021e19f75a0f..4ad470194f1c524491341e2599d3dc36
                      }
                    },
                    "oneOf": [
+@@ -155,6 +159,12 @@
+             "type": "boolean",
+             "description": "Specifies if the given target should be cacheable"
+           },
++          "artifacts": {
++            "type": "array",
++            "description": "The task-result artifacts an execution of this target produces: each gets a private directory named by NX_TASK_ARTIFACTS_DIR, and an entry without one of them is no cache hit",
++            "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
++            "uniqueItems": true
++          },
+           "ultracache": {
+             "type": "object",
+             "description": "Configures ultracache for tasks of this target. Nx Cloud only.",
 diff --git a/schemas/workspace-schema.json b/schemas/workspace-schema.json
 index 2cd72f6d94098f83a29b9100bcfffd749dbc5047..38499ef75993f26f70f0eeee2599d0745e4fb5d6 100644
 --- a/schemas/workspace-schema.json
