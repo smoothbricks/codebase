@@ -7215,10 +7215,10 @@ index 0000000000000000000000000000000000000000..258a765b1061f2e716b0453988c491de
 +}
 diff --git a/dist/src/tasks-runner/task-output-lease.js b/dist/src/tasks-runner/task-output-lease.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..d7d2cc31ff43f979270cfe3405b15f61ecfd1940
+index 0000000000000000000000000000000000000000..a48dab300226c9cdc46121fd417580e8d0735961
 --- /dev/null
 +++ b/dist/src/tasks-runner/task-output-lease.js
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,283 @@
 +"use strict";
 +const { channel } = require("node:diagnostics_channel");
 +const { readFileSync, writeFileSync } = require("node:fs");
@@ -7351,6 +7351,18 @@ index 0000000000000000000000000000000000000000..d7d2cc31ff43f979270cfe3405b15f61
 +                }
 +            }
 +            events.publish({ phase: "waiting", purpose: this.purpose, targets, paths, pid: process.pid });
++            // An idle helper whose IPC channel has already closed died, or lost its
++            // parent's channel, while idle, and its exit has not arrived yet (under
++            // Bun it can come after the process is reaped). Nothing of this acquire
++            // has reached it, and nothing can: retire it now, so its slot is this
++            // acquire's, instead of sending it the acquire and failing. An idle
++            // helper holds no lease, so retiring it frees none. A helper whose
++            // channel is open is used as before, and a send that then fails fails
++            // this acquire: whether that acquire was delivered is unknown, so it is
++            // never sent again.
++            for (const closed of this.idle.filter((idle) => !idle.worker.connected)) {
++                this.retire(closed, new Error(`Task output lease helper ${closed.worker.pid} closed its channel while idle`));
++            }
 +            let entry = this.idle.pop();
 +            if (!entry && this.workers.size + this.reserved >= this.parallelism) {
 +                // An entry from a release, or null: a retired helper's slot, reserved for this acquire.

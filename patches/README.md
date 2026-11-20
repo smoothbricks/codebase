@@ -276,9 +276,11 @@ waiter for a pool slot waits for exactly two events: a release hands it the rele
 and its slot is handed on to fork a successor. A helper leaves the pool on every way it can stop serving: its exit, a
 failed spawn, a failed send, or an error reply, after which the client kills it (its reply came after it unlocked what
 it held). A helper that dies holding a lease fails only that holder's release, with the exit named; a dead idle helper
-is never handed out. Without this, one failed acquire in a one-worker pool (`--parallel=1`) left a live, idle helper
-holding the only slot and every later acquire waiting forever, the client and its helper both idle with no lock wait. No
-deadline stands in for these events.
+is never handed out, even before its exit arrives: the next acquire retires an idle helper whose IPC channel already
+closed, so nothing is sent to it, while a send to an open channel that fails still fails its acquire, never resent.
+Without this, one failed acquire in a one-worker pool (`--parallel=1`) left a live, idle helper holding the only slot
+and every later acquire waiting forever, the client and its helper both idle with no lock wait. No deadline stands in
+for these events.
 
 A released lock does not imply a finished writer. A helper that dies holding a lease releases the kernel lock while the
 task may still be writing its outputs, so another client can take the target then; the task fails only at release time,

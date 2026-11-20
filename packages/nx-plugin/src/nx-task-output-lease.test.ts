@@ -375,6 +375,46 @@ it('does not hand an idle helper that died to the next acquire', async () => {
   }
 });
 
+/**
+ * Closes the parent's channel to the one idle helper of `leases` and returns that helper's pid. The state the next case
+ * needs is the parent's own view of its helper, which no public member exposes, so this reads the pool's `idle` list
+ * and checks each value it reads.
+ */
+function closeIdleHelperChannel(leases: TaskOutputLeases): number {
+  const idle: unknown = Reflect.get(leases, 'idle');
+  if (!Array.isArray(idle) || idle.length !== 1) throw new Error(`expected one idle helper, found ${String(idle)}`);
+  const worker: unknown = Reflect.get(idle[0], 'worker');
+  if (typeof worker !== 'object' || worker === null) throw new Error('the idle helper holds no worker');
+  const disconnect: unknown = Reflect.get(worker, 'disconnect');
+  const pid: unknown = Reflect.get(worker, 'pid');
+  if (typeof disconnect !== 'function' || typeof pid !== 'number')
+    throw new Error('the idle helper has no IPC channel');
+  Reflect.apply(disconnect, worker, []);
+  return pid;
+}
+
+it('replaces an idle helper whose channel closed before its exit arrived, never sending it the acquire', async () => {
+  const leases = new TaskOutputLeases(1, null, 'output');
+  try {
+    const release = await leases.acquire([leaseTask('idle')]);
+    await release();
+    // A helper that dies while idle closes its channel, and its exit reaches the pool later (under Bun, after the
+    // process is reaped). Closing the channel from the parent's side holds that order by construction: the next
+    // acquire chooses its helper before any event can deliver the exit.
+    const closed = closeIdleHelperChannel(leases);
+    const nextPath = nextLeasePath();
+    const releaseNext = await guardEvent(
+      leases.acquire([leaseTask('after-closed-channel')]),
+      "an acquire after the idle helper's channel closed",
+      () => 'the acquire was sent to the closed helper',
+    );
+    expect(await leaseHolder(await nextPath), 'the closed helper holds the next lease').not.toBe(closed);
+    await releaseNext();
+  } finally {
+    await leases.close();
+  }
+});
+
 /** The descriptors process `pid` holds open on `file`: /proc on Linux, lsof elsewhere, both naming its real path. */
 function openDescriptors(pid: number, file: string): number {
   const path = realpathSync(file);
