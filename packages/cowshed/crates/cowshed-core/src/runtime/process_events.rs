@@ -58,12 +58,14 @@ use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
 use crate::api::dto::{JobId, UtcTimestamp};
-use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
+use crate::api::process::{JobProcessEvent, ProcessCoverageGap};
 use crate::error::CowshedError;
 use crate::runtime::job_groups::{
     Birth, ProcessRecord, job_member_records, process_record, signal_life,
 };
-use crate::runtime::process_stream::{JobProcessFold, JobProcessFoldError, JobProcessObservation};
+use crate::runtime::process_stream::{
+    JobProcessFold, JobProcessFoldError, JobProcessObservation, PublishedTree,
+};
 use crate::runtime::process_tree::{
     BirthToken, ProcessIdentity, ProcessImage, ProcessObservation, ProcessTreeFold,
 };
@@ -414,9 +416,9 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.fold.attribution_summary()
     }
 
-    /// Job `job_id`'s tree, as last observed and read.
-    pub fn tree(&self, job_id: JobId, at: UtcTimestamp) -> JobProcessTree {
-        self.fold.tree(job_id, at)
+    /// Job `job_id`'s tree as published now, as last observed and read.
+    pub fn published(&mut self, job_id: JobId, at: UtcTimestamp) -> PublishedTree {
+        self.fold.published(job_id, at)
     }
 
     pub fn drain_events(&mut self) -> std::vec::Drain<'_, JobProcessEvent> {

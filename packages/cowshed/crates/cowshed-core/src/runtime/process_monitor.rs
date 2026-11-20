@@ -28,6 +28,7 @@ use super::job_groups::Birth;
 use super::job_spans::{JobSpanPublisher, job_span_thread};
 use super::process_events::{Darwin, KqueueObserver, ObserveError, ProcessReads};
 use super::process_spans::{ProcessSpanProjection, RetainedProcessEvent};
+use super::process_stream::PublishedTree;
 use super::process_tree::{ProcessIdentity, TreeOwner};
 use super::supervisor::{LeafCoverage, utc_now};
 use crate::api::dto::JobInfo;
@@ -153,11 +154,11 @@ impl TraceWriter {
 }
 
 enum SnapshotTree {
-    Job(Result<JobProcessTree>),
+    Job(Result<PublishedTree>),
     Spare,
 }
 impl SnapshotTree {
-    fn job(&self) -> Result<&JobProcessTree> {
+    fn job(&self) -> Result<&PublishedTree> {
         match self {
             Self::Job(tree) => tree.as_ref().map_err(Clone::clone),
             Self::Spare => Err(CowshedError::usage(
@@ -487,9 +488,15 @@ impl ProcessMonitor {
     pub(crate) fn ledger_changes(&self, changed: Arc<tokio::sync::Notify>) -> Result<()> {
         self.driver.send(Request::LedgerChanges(changed))
     }
-    /// One publication load. A read neither touches the writer's fold nor samples the kernel.
+    /// One publication load. A read neither touches the writer's fold nor samples the kernel: it
+    /// copies the records the publication holds, so a publication nobody reads copies none.
     pub fn tree(&self) -> Result<JobProcessTree> {
-        self.driver.snapshot.load().tree.job().cloned()
+        self.driver
+            .snapshot
+            .load()
+            .tree
+            .job()
+            .map(PublishedTree::tree)
     }
 
     /// One publication load, answered even while a retirement occupies the writer: every life
@@ -725,7 +732,7 @@ impl<P: ProcessReads> Writer<P> {
             TreeOwner::Job(job_id) => SnapshotTree::Job(
                 outcome
                     .clone()
-                    .and_then(|()| utc_now().map(|at| self.observer.tree(job_id, at))),
+                    .and_then(|()| utc_now().map(|at| self.observer.published(job_id, at))),
             ),
             TreeOwner::Spare => SnapshotTree::Spare,
         };

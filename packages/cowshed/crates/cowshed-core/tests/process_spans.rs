@@ -846,7 +846,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
     );
 
     // Rebuilt from its rows, each span ends at the fold's own final record.
-    let tree = job.fold.tree(running_job().job_id, utc(124));
+    let tree = job.fold.published(running_job().job_id, utc(124)).tree();
     assert_eq!(
         tree.coverage,
         ProcessCoverage::Gap {

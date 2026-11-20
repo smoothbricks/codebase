@@ -22,12 +22,13 @@
 //! a change since the last event, which the next heartbeat or the exit restates.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::process::{
-    BlockerChange, JobProcessDelta, JobProcessEvent, JobProcessTree, PROCESS_HEARTBEAT,
-    ProcessBlockedOn, ProcessCoverage, ProcessUsage,
+    BlockerChange, JobProcessDelta, JobProcessEvent, JobProcessSample, JobProcessTree,
+    PROCESS_HEARTBEAT, ProcessBlockedOn, ProcessCoverage, ProcessUsage,
 };
 use crate::api::resources::ResidentBytes;
 use crate::runtime::process_tree::{
@@ -130,6 +131,56 @@ pub struct JobProcessFold {
     /// The tick as of which a record last restated each retained life's usage, by its index:
     /// its heartbeat is due [`PROCESS_HEARTBEAT`] later.
     restated: Vec<Instant>,
+    /// Each chunk of [`PUBLISHED_CHUNK`] lives, by birth order, as publications share it.
+    published: Vec<PublishedChunk>,
+}
+
+/// Lives per chunk of a [`PublishedTree`].
+pub const PUBLISHED_CHUNK: usize = 256;
+
+/// One chunk of lives as the fold keeps it for publication: how many of its lives are not final
+/// yet, counted as lives are born and end so no publication rescans a final life to learn it, and
+/// once the chunk is full and none is left, its records.
+#[derive(Debug, Default)]
+struct PublishedChunk {
+    unfinal: usize,
+    records: Option<Arc<[JobProcessSample]>>,
+}
+
+/// A job's tree as one publication holds it: every record, in birth-observation order, in chunks
+/// of [`PUBLISHED_CHUNK`]. A full chunk whose lives were all final when it was built is the same
+/// allocation in every publication since; every other chunk is built for this publication. A
+/// record is final once its life's exit is folded with what was read after it: nothing about a
+/// process follows its exit (07_api.md, "Process-tree observations").
+#[derive(Clone, Debug)]
+pub struct PublishedTree {
+    pub job_id: JobId,
+    pub sampled_at: UtcTimestamp,
+    pub coverage: ProcessCoverage,
+    chunks: Arc<[Arc<[JobProcessSample]>]>,
+    built: usize,
+}
+
+impl PublishedTree {
+    /// The tree a reader is answered, every record copied in order. A publication nobody reads
+    /// copies none.
+    pub fn tree(&self) -> JobProcessTree {
+        let mut processes = Vec::with_capacity(self.chunks.iter().map(|chunk| chunk.len()).sum());
+        for chunk in self.chunks.iter() {
+            processes.extend(chunk.iter().cloned());
+        }
+        JobProcessTree {
+            job_id: self.job_id,
+            sampled_at: self.sampled_at.clone(),
+            processes,
+            coverage: self.coverage,
+        }
+    }
+
+    /// How many records this publication built; it shares every other one.
+    pub fn built(&self) -> usize {
+        self.built
+    }
 }
 
 impl JobProcessFold {
@@ -141,6 +192,7 @@ impl JobProcessFold {
             readings: Readings::default(),
             last_tick: started,
             restated: Vec::new(),
+            published: Vec::new(),
         }
     }
 
@@ -210,9 +262,45 @@ impl JobProcessFold {
         }))
     }
 
-    /// Every record, as last observed and read, as job `job_id`'s tree.
+    #[cfg(test)]
+    /// Every record, as last observed and read, as job `job_id`'s tree, each one built anew.
     pub fn tree(&self, job_id: JobId, sampled_at: UtcTimestamp) -> JobProcessTree {
         self.tree.tree(job_id, sampled_at, &self.readings)
+    }
+
+    /// Every record, as last observed and read, as job `job_id`'s published tree: the records of
+    /// each chunk that can still change are built, and every final chunk is shared. Its cost is
+    /// one reference per chunk and one record per life of a chunk that is not final.
+    pub fn published(&mut self, job_id: JobId, sampled_at: UtcTimestamp) -> PublishedTree {
+        let lives = self.restated.len();
+        let mut built = 0;
+        let chunks = self
+            .published
+            .iter_mut()
+            .enumerate()
+            .map(|(chunk, published)| {
+                if let Some(records) = &published.records {
+                    return Arc::clone(records);
+                }
+                let start = chunk * PUBLISHED_CHUNK;
+                let end = (start + PUBLISHED_CHUNK).min(lives);
+                let records: Arc<[JobProcessSample]> = (start..end)
+                    .map(|index| self.tree.sample(index, &self.readings))
+                    .collect();
+                built += end - start;
+                if end - start == PUBLISHED_CHUNK && published.unfinal == 0 {
+                    published.records = Some(Arc::clone(&records));
+                }
+                records
+            })
+            .collect();
+        PublishedTree {
+            job_id,
+            sampled_at,
+            coverage: *self.tree.coverage(),
+            chunks,
+            built,
+        }
     }
 
     fn observed(
@@ -236,7 +324,13 @@ impl JobProcessFold {
         };
         match observed {
             // The tree retained the newborn at the next index.
-            Observed::Born => self.restated.push(self.last_tick),
+            Observed::Born => {
+                if index.is_multiple_of(PUBLISHED_CHUNK) {
+                    self.published.push(PublishedChunk::default());
+                }
+                self.published[index / PUBLISHED_CHUNK].unfinal += 1;
+                self.restated.push(self.last_tick);
+            }
             Observed::Exec => self.restated[index] = self.last_tick,
             Observed::Exited => {
                 let unread_before = self.readings.usage.gap();
@@ -250,6 +344,8 @@ impl JobProcessFold {
                 }
                 // The exit carries what was read after it.
                 self.readings.awaiting_exit.remove(&process);
+                // Final: nothing about the life can follow its exit.
+                self.published[index / PUBLISHED_CHUNK].unfinal -= 1;
             }
         }
         let process = self.tree.sample(index, &self.readings);
@@ -1136,6 +1232,216 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<JobProcessEvent>(&json).expect("an event decodes"),
             usage
+        );
+    }
+
+    /// The fold's publication now, checked against the tree built anew from the same fold.
+    fn published(run: &mut Run, second: u32) -> PublishedTree {
+        let published = run.fold.published(job(), utc(second));
+        assert_eq!(
+            published.tree(),
+            run.fold.tree(job(), utc(second)),
+            "a publication answers the fold's own tree"
+        );
+        published
+    }
+
+    /// Births under a running shell, ended in birth order but for one long-lived life, so chunk 0
+    /// holds the shell, chunk 2 the long-lived one, and chunk 3 is a partial tail. Half of the
+    /// ended lives carry a final usage read after their exit; the rest end unread.
+    fn ended_lives(run: &mut Run, lives: usize, long_lived: usize) -> Vec<ProcessIdentity> {
+        let shell = id(100, 1);
+        run.root(shell).expect("a birth event");
+        let children: Vec<ProcessIdentity> = (1..lives)
+            .map(|index| id(1000 + index as u32, index as u64 + 1))
+            .collect();
+        for &child in &children {
+            run.fork(child, shell);
+        }
+        for (offset, &child) in children.iter().enumerate() {
+            if offset + 1 == long_lived {
+                continue;
+            }
+            if offset % 2 == 0 {
+                let after_exit = UsageReading {
+                    exited: true,
+                    ..reading(run.at(10), 5, 4096)
+                };
+                run.read(child, after_exit);
+            }
+            run.exit(child, 2).expect("an exit event");
+        }
+        children
+    }
+
+    /// A publication on every event batch rebuilt every record the job ever had: 48,920 per
+    /// publication late in a consumer's cold gate, where nearly all of them had long ended and none of
+    /// those could change again. A full chunk whose lives have all ended with what was read after
+    /// their exits is built once; a publication builds only the records of the other chunks.
+    #[test]
+    fn a_publication_builds_only_the_records_of_chunks_that_can_still_change() {
+        let mut run = Run::new();
+        let lives = 3 * PUBLISHED_CHUNK + 8;
+        let long_lived = 2 * PUBLISHED_CHUNK + 5;
+        let children = ended_lives(&mut run, lives, long_lived);
+        let shell = id(100, 1);
+
+        let first = published(&mut run, 3);
+        assert_eq!(
+            first.built(),
+            lives,
+            "the first publication builds every record"
+        );
+        let first_tree = first.tree();
+        let second = published(&mut run, 4);
+        assert_eq!(
+            second.built(),
+            2 * PUBLISHED_CHUNK + 8,
+            "only the chunks of the shell, of the long-lived life and the partial tail can change"
+        );
+        assert!(Arc::ptr_eq(&first.chunks[1], &second.chunks[1]));
+
+        // Nothing about an ended life follows its exit: every later observation of one in the
+        // kept chunk is refused, and the chunk stays the one shared allocation.
+        let ended = children[PUBLISHED_CHUNK];
+        run.refused(JobProcessObservation::Tree(ProcessObservation::Exec {
+            process: ended,
+            image: image("/usr/bin/cc"),
+        }));
+        run.refused(JobProcessObservation::Tree(
+            ProcessObservation::ImageUnread { process: ended },
+        ));
+        run.refused(JobProcessObservation::Tree(ProcessObservation::Exited {
+            process: ended,
+            status: Some(ExitStatus::Exited { code: 0 }),
+            at: utc(9),
+        }));
+        run.refused(JobProcessObservation::Usage {
+            process: ended,
+            reading: reading(run.at(50), 9, 4096),
+        });
+        run.refused(JobProcessObservation::Usage {
+            process: ended,
+            reading: UsageReading {
+                exited: true,
+                ..reading(run.at(51), 9, 4096)
+            },
+        });
+        run.refused(JobProcessObservation::Blocker {
+            process: ended,
+            blocked_on: Some(lock("/tmp/lease", 7)),
+        });
+        let after_refusals = published(&mut run, 5);
+        assert_eq!(after_refusals.built(), 2 * PUBLISHED_CHUNK + 8);
+        assert!(Arc::ptr_eq(&first.chunks[1], &after_refusals.chunks[1]));
+
+        // A later life takes the long-lived life's pid before its exit is seen: the earlier life
+        // stays unfinal until its own late exit, which ends its chunk, not the tail's.
+        let long = children[long_lived - 1];
+        run.fork(id(long.pid, 88_888), shell);
+        assert_eq!(published(&mut run, 6).built(), 2 * PUBLISHED_CHUNK + 9);
+        run.exit(long, 7).expect("an exit event");
+        assert_eq!(published(&mut run, 8).built(), 2 * PUBLISHED_CHUNK + 9);
+        assert_eq!(published(&mut run, 9).built(), PUBLISHED_CHUNK + 9);
+
+        // A later life of an ended life's pid joins the tail; the earlier life's record stays.
+        run.fork(id(children[0].pid, 9_999), shell);
+        assert_eq!(published(&mut run, 10).built(), PUBLISHED_CHUNK + 10);
+
+        // A publication a reader still holds answers what it held when it was published.
+        assert_eq!(first.tree(), first_tree);
+        assert_eq!(first.tree().processes[long_lived].exit, None);
+        assert_eq!(first.tree().processes.len(), lives);
+    }
+
+    /// Every kind of observation, each followed by a publication that must answer the tree built
+    /// anew: execs and usage reads of running lives in shared and unshared chunks, blockers set
+    /// and cleared, a read after an exit withheld until the exit, an exit with no such read.
+    #[test]
+    fn every_publication_answers_the_tree_built_anew() {
+        let mut run = Run::new();
+        let lives = 2 * PUBLISHED_CHUNK + 3;
+        let long_lived = PUBLISHED_CHUNK + 1;
+        let children = ended_lives(&mut run, lives, long_lived);
+        let shell = id(100, 1);
+        let survivor = children[long_lived - 1];
+        let mut second = 3;
+        let mut step = |run: &mut Run| {
+            second += 1;
+            published(run, second);
+        };
+        step(&mut run);
+        run.read(shell, reading(run.at(20), 7, 1 << 20));
+        step(&mut run);
+        run.read(survivor, reading(run.at(30), 9, 1 << 22));
+        step(&mut run);
+        run.blocked(survivor, Some(lock("/tmp/lease", 7)));
+        step(&mut run);
+        run.apply(JobProcessObservation::Tree(ProcessObservation::Exec {
+            process: survivor,
+            image: image("/usr/bin/cc"),
+        }))
+        .expect("an exec event");
+        step(&mut run);
+        run.blocked(survivor, None);
+        step(&mut run);
+        let after_exit = UsageReading {
+            exited: true,
+            ..reading(run.at(40), 11, 1 << 22)
+        };
+        run.read(survivor, after_exit);
+        step(&mut run);
+        run.exit(survivor, 9).expect("an exit event");
+        step(&mut run);
+        let late = id(5000, 77_777);
+        run.fork(late, shell);
+        step(&mut run);
+        run.exit(late, 10).expect("an exit event");
+        step(&mut run);
+    }
+
+    /// Readers load publications while the writer folds and publishes with kept chunks shared:
+    /// each loaded publication answers exactly the tree the writer built anew beside it.
+    #[test]
+    fn a_reader_sees_one_whole_publication_while_the_writer_publishes() {
+        let mut run = Run::new();
+        let lives = 3 * PUBLISHED_CHUNK + 4;
+        let children = ended_lives(&mut run, lives, 3 * PUBLISHED_CHUNK + 1);
+        let publish = |run: &mut Run, second: u32| {
+            let published = run.fold.published(job(), utc(second));
+            let anew = run.fold.tree(job(), utc(second));
+            Arc::new((published, anew))
+        };
+        let snapshot = arc_swap::ArcSwap::new(publish(&mut run, 3));
+        // The writer publishes once more before the readers start, so they read while it works.
+        let started = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    started.wait();
+                    for _ in 0..500 {
+                        let loaded = snapshot.load();
+                        assert_eq!(
+                            loaded.0.tree(),
+                            loaded.1,
+                            "a reader saw a publication other than the tree built anew with it"
+                        );
+                    }
+                });
+            }
+            for (step, &child) in children.iter().take(64).enumerate() {
+                run.fork(id(child.pid, 100_000 + step as u64), id(100, 1));
+                snapshot.store(publish(&mut run, 4));
+                if step == 0 {
+                    started.wait();
+                }
+            }
+        });
+        let last = snapshot.load();
+        assert_eq!(
+            last.0.built(),
+            PUBLISHED_CHUNK + 4 + 64,
+            "the two ended chunks were shared, not rebuilt"
         );
     }
 }

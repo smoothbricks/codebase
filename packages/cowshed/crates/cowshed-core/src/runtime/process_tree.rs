@@ -17,9 +17,11 @@ use std::sync::Arc;
 use crate::api::dto::{
     CommandArg, ExitStatus, JobId, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES, UtcTimestamp,
 };
+#[cfg(test)]
+use crate::api::process::JobProcessTree;
 use crate::api::process::{
-    JobProcessSample, JobProcessTree, ProcessBlockedOn, ProcessCoverage, ProcessCoverageGap,
-    ProcessExit, ProcessUsage,
+    JobProcessSample, ProcessBlockedOn, ProcessCoverage, ProcessCoverageGap, ProcessExit,
+    ProcessUsage,
 };
 
 /// A value the kernel never gives two lives of the same pid: macOS's `p_uniqueid`
@@ -431,6 +433,7 @@ impl ProcessTreeFold {
             .map(|&index| self.lives[index].identity)
     }
 
+    #[cfg(test)]
     pub fn tree(
         &self,
         job_id: JobId,
