@@ -9,7 +9,6 @@
 //! system calls from returning to the actor.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Instant;
 
 use super::super::child_fence::ChildFence;
@@ -110,7 +109,7 @@ impl<T: Send + 'static> Drop for OffActor<T> {
 /// from the actor; only adoption hands reaping to the ordinary process watcher.
 pub(super) struct Spawned {
     child: Option<std::process::Child>,
-    fence: Option<Arc<ChildFence>>,
+    fence: Option<ChildFence>,
     pub(super) at: Instant,
     pub(super) nice: Option<i32>,
 }
@@ -124,7 +123,7 @@ impl Spawned {
             at: Instant::now(),
             nice,
         };
-        spawned.fence = Some(Arc::new(ChildFence::new(spawned.child().id())?));
+        spawned.fence = Some(ChildFence::new(spawned.child().id())?);
         Ok(spawned)
     }
 
@@ -134,14 +133,14 @@ impl Spawned {
             .expect("an unadopted spawn owns its child")
     }
 
-    pub(super) fn fence(&self) -> &Arc<ChildFence> {
+    pub(super) fn fence(&self) -> &ChildFence {
         self.fence
             .as_ref()
             .expect("a returned spawn has observed its child's fence")
     }
 
     /// All fallible pipe setup is over. The watcher alone may now reap this leader.
-    pub(super) fn adopt(mut self) -> Arc<ChildFence> {
+    pub(super) fn adopt(mut self) -> ChildFence {
         self.child.take();
         self.fence.take().expect("an adopted spawn has its fence")
     }

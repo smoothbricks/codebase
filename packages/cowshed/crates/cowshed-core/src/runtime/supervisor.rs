@@ -3229,7 +3229,7 @@ async fn spawn_fenced(
         stderr,
         events.clone(),
     ));
-    let watcher = std::sync::Arc::clone(&fence);
+    let watcher = fence.clone();
     tokio::spawn(async move {
         let event = match watcher.exited().await {
             Ok(exit) => ProcessEvent::Exited { job_id, exit },
@@ -3443,7 +3443,7 @@ impl StdinLane {
 }
 
 struct SystemRunningProcess {
-    fence: std::sync::Arc<ChildFence>,
+    fence: ChildFence,
     /// The command as this process observed it right after spawning it.
     process: OwnedProcess,
     stdin: StdinLane,

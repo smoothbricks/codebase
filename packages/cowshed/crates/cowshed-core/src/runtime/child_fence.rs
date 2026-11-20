@@ -15,17 +15,23 @@
 use std::fmt;
 use std::io;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use cowshed_os::fork_lock::Spawn as _;
+use cowshed_os::{deadline, process::ExitWatch};
 
-use super::job_groups::{self, Birth};
+use super::job_groups::{self, Birth, ProcessExit};
 use crate::api::dto::ExitStatus;
 use crate::error::{CowshedError, Result};
 
 /// A child this process spawned and alone reaps, with the fence that makes signalling its group
 /// safe ([module docs](self)).
+#[derive(Clone)]
 pub struct ChildFence {
+    leader: Arc<Leader>,
+}
+
+struct Leader {
     pid: i32,
     birth: Birth,
     fenced: Mutex<Fenced>,
@@ -160,23 +166,25 @@ impl ChildFence {
                 CowshedError::internal("process id is not a signalable process group")
             })?;
         Ok(Self {
-            pid: leader,
-            birth: Birth::of(pid),
-            fenced: Mutex::new(Fenced {
-                hold: Hold::Held,
-                exit: None,
+            leader: Arc::new(Leader {
+                pid: leader,
+                birth: Birth::of(pid),
+                fenced: Mutex::new(Fenced {
+                    hold: Hold::Held,
+                    exit: None,
+                }),
             }),
         })
     }
 
     /// The child's pid, the id of the group it leads.
     pub fn pid(&self) -> i32 {
-        self.pid
+        self.leader.pid
     }
 
     /// The child's birth identity, observed before anything could reap it.
     pub fn birth(&self) -> &Birth {
-        &self.birth
+        &self.leader.birth
     }
 
     /// Where the child is now.
@@ -185,24 +193,29 @@ impl ChildFence {
     }
 
     fn fenced(&self) -> std::sync::MutexGuard<'_, Fenced> {
-        self.fenced.lock().unwrap_or_else(PoisonError::into_inner)
+        self.leader
+            .fenced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Signal the group the child leads, only while the child is unreaped.
     pub fn signal(&self, signal: libc::c_int) -> std::result::Result<(), NotSignalled> {
         let fenced = self.fenced();
         if !fenced.hold.admits_signal() {
-            return Err(NotSignalled::Reaped { pgid: self.pid });
+            return Err(NotSignalled::Reaped { pgid: self.pid() });
         }
-        if let Birth::Unobserved { reason, .. } = &self.birth {
+        if let Birth::Unobserved { reason, .. } = self.birth() {
             return Err(NotSignalled::Unidentified {
-                pgid: self.pid,
+                pgid: self.pid(),
                 reason: reason.clone(),
             });
         }
-        job_groups::signal_unreaped_group(self.pid, signal).map_err(|error| NotSignalled::Refused {
-            pgid: self.pid,
-            error,
+        job_groups::signal_unreaped_group(self.pid(), signal).map_err(|error| {
+            NotSignalled::Refused {
+                pgid: self.pid(),
+                error,
+            }
         })
     }
 
@@ -214,8 +227,8 @@ impl ChildFence {
             // SAFETY: `pid` is this process's own child and `status` a valid out-pointer.
             // WHY unbounded: `WNOHANG` returns at once.
             #[allow(clippy::disallowed_methods)]
-            let waited = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-            if waited == self.pid {
+            let waited = unsafe { libc::waitpid(self.pid(), &mut status, libc::WNOHANG) };
+            if waited == self.pid() {
                 let status = std::process::ExitStatus::from_raw(status);
                 fenced.hold = Hold::Reaped;
                 fenced.exit = exit_of(status);
@@ -245,7 +258,7 @@ impl ChildFence {
                 io::Error::other("the child was reaped by something other than its fence")
             });
         }
-        let exit = match job_groups::exit_unreaped(self.pid) {
+        let exit = match job_groups::exit_unreaped(self.pid()) {
             Ok(exit) => exit,
             Err(error) => {
                 if error.raw_os_error() == Some(libc::ECHILD) {
@@ -261,29 +274,48 @@ impl ChildFence {
         Ok(exit)
     }
 
+    /// Register an exact kernel watch while the fence still owns this pid. Reaping after this
+    /// returns cannot change what the already-registered descriptor names.
+    fn exit_watch(&self) -> io::Result<ProcessExit> {
+        let fenced = self.fenced();
+        if fenced.hold == Hold::Reaped {
+            return Ok(ProcessExit::Before);
+        }
+        ExitWatch::of(self.pid().unsigned_abs())
+            .map(|watch| watch.map_or(ProcessExit::Before, ProcessExit::Watching))
+    }
+
     /// Wait for the child to exit without reaping it: it stays held until [`Self::release`], or
     /// is reaped here when it was already released. A child the fence already reaped answers the
-    /// exit it recorded. The child-exit notifications are subscribed before the first look, so
-    /// none falls between a look and the wait for the next.
+    /// exit it recorded. The watch only wakes the parent; only its wait status answers how it ended.
     pub async fn exited(&self) -> Result<ExitStatus> {
         let unobserved = |error: io::Error| {
             CowshedError::integrity(
-                format!("cannot wait for process {}: {error}", self.pid),
+                format!("cannot wait for process {}: {error}", self.pid()),
                 "cowshed doctor --json",
             )
         };
-        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-            .map_err(unobserved)?;
-        loop {
-            if let Some(exit) = self.look().map_err(unobserved)? {
-                return Ok(exit);
-            }
-            if exits.recv().await.is_none() {
-                return Err(unobserved(io::Error::other(
-                    "child-exit notifications ended",
-                )));
-            }
+        let watch = self.exit_watch().map_err(unobserved)?;
+        if let Some(exit) = self.look().map_err(unobserved)? {
+            return Ok(exit);
         }
+        watch.observed().await.map_err(unobserved)?;
+        if let Some(exit) = self.look().map_err(unobserved)? {
+            return Ok(exit);
+        }
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            deadline::collect_exited(
+                "held child whose exit was observed",
+                owner.pid().unsigned_abs(),
+                &deadline::start("read fenced child exit", deadline::REAP),
+                deadline::Progress::Nothing,
+                || owner.look(),
+            )
+        })
+        .await
+        .map_err(|error| unobserved(io::Error::other(error)))?
+        .map_err(|error| unobserved(error.into()))
     }
 
     /// Nothing more is wanted of the child: reap it now if it has exited, or as soon as it is
@@ -682,7 +714,7 @@ mod tests {
         std::io::BufReader::new(job.0.stdout.as_mut().unwrap())
             .read_line(&mut ready)
             .unwrap();
-        let fence = Arc::new(ChildFence::new(job.0.id()).unwrap());
+        let fence = ChildFence::new(job.0.id()).unwrap();
         assert!(fence.birth().leader().is_some());
         fence
             .signal(0)
@@ -704,7 +736,7 @@ mod tests {
         let mut signaller = OwnedSignaller {
             done: Arc::clone(&done),
             thread: Some({
-                let (fence, done) = (Arc::clone(&fence), Arc::clone(&done));
+                let (fence, done) = (fence.clone(), Arc::clone(&done));
                 std::thread::spawn(move || {
                     let initial = fence.signal(0).is_ok();
                     let mut outcomes = vec![initial];

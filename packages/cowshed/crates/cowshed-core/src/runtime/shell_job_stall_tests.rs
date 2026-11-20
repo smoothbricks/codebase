@@ -110,7 +110,7 @@ impl Drop for Workspace {
 
 /// The test's side of a host: the process standing for it and its control socket's other end.
 struct FakeHost {
-    fence: Arc<ChildFence>,
+    fence: ChildFence,
     socket: StdUnixStream,
     /// The write end of the stand-in's stdin: it reads until this closes.
     _stdin: OwnedFd,
@@ -128,10 +128,10 @@ impl FakeHost {
             .stdin(Stdio::from(read))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let fence = Arc::new(ChildFence::spawn(command).unwrap());
+        let fence = ChildFence::spawn(command).unwrap();
         ours.set_nonblocking(true).unwrap();
         let host = ExecHost {
-            fence: Arc::clone(&fence),
+            fence: fence.clone(),
             process: OwnedProcess {
                 birth: fence.birth().clone(),
                 spawned: Instant::now(),

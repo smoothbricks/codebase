@@ -346,7 +346,7 @@ pub(super) struct JobControl {
 enum Target {
     #[default]
     Pending,
-    Host(Arc<ChildFence>),
+    Host(ChildFence),
     /// The command's host, through the run that forwards signals to it.
     Command(mpsc::UnboundedSender<i32>),
     /// The run ended: the command was released, or never started, or its host is gone.
@@ -642,7 +642,7 @@ async fn run_pooled(
             signal_failed(
                 events,
                 job_id,
-                control.publish(Target::Host(Arc::clone(&host.fence))),
+                control.publish(Target::Host(host.fence.clone())),
             )
             .await;
             let activation = match (io.stdout.try_clone(), io.stderr.try_clone()) {
@@ -760,7 +760,7 @@ async fn run_pooled(
 
 pub(super) struct ExecHost {
     /// This process is the host's parent and reaps it only inside this fence.
-    fence: Arc<ChildFence>,
+    fence: ChildFence,
     /// The host as this process observed it right after spawning it.
     process: OwnedProcess,
     control: tokio::net::UnixStream,
@@ -782,7 +782,7 @@ impl Drop for ExecHost {
             if self.fence.reaped() {
                 return;
             }
-            let fence = Arc::clone(&self.fence);
+            let fence = self.fence.clone();
             runtime.spawn(async move {
                 let pid = fence.birth().pid();
                 match fence.wait().await {
@@ -1314,7 +1314,7 @@ impl HostActivator {
             .map_err(super::supervisor::map_exec_error)?;
         drop(theirs);
         let spawned = Instant::now();
-        let fence = Arc::new(ChildFence::new(child.id())?);
+        let fence = ChildFence::new(child.id())?;
         let process = OwnedProcess {
             birth: fence.birth().clone(),
             spawned,

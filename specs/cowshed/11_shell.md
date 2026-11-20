@@ -233,14 +233,18 @@ actual parent's unreaped child remains its own. A stop is not an exit: Darwin re
 asked only for exits (measured on Darwin 25.6), so the exit read takes that report with a wait that cannot reap
 (`WSTOPPED | WCONTINUED`, never `WEXITED`) and reads again; a leader that stops its own group stays held and signalled.
 
-Linux can return `ECHILD` to that stop-only wait when the child has already exited but is still unreaped. It is accepted
-only after a separate `WEXITED | WNOWAIT | WNOHANG` read proves that child's pending exit; a non-child remains an error,
-and neither observation consumes the parent's exit status. A warm command's signals are framed `REQUEST_SIGNAL`s to its
-actual parent host. The host reports the observed birth with `REPLY_STARTED`, and its exact typed exit with
-`REPLY_EXITED`, while keeping the leader unreaped. It continues serving signals until the supervisor concludes the job
-and sends `REQUEST_RELEASE`; `REPLY_RELEASED` acknowledges actual reaping, and only then may that host serve another
-command. Failed signal delivery is `REPLY_SIGNAL_FAILED`, not silent success. Signal/release while no command is held,
-malformed frames, and unknown tags fail closed.
+The parent registers the unreaped leader's kernel exit watch under the fence before it reads the child status; the watch
+wakes the parent independently of a shared `SIGCHLD`, never determines the status. If the watch says the child has begun
+to exit but its status is not waitable yet (Darwin), the parent's non-reaping read may repeat within the existing reap
+bound off the actor's turn. A release racing delivery still returns that child's recorded status. Linux can return
+`ECHILD` to that stop-only wait when the child has already exited but is still unreaped. It is accepted only after a
+separate `WEXITED | WNOWAIT | WNOHANG` read proves that child's pending exit; a non-child remains an error, and neither
+observation consumes the parent's exit status. A warm command's signals are framed `REQUEST_SIGNAL`s to its actual
+parent host. The host reports the observed birth with `REPLY_STARTED`, and its exact typed exit with `REPLY_EXITED`,
+while keeping the leader unreaped. It continues serving signals until the supervisor concludes the job and sends
+`REQUEST_RELEASE`; `REPLY_RELEASED` acknowledges actual reaping, and only then may that host serve another command.
+Failed signal delivery is `REPLY_SIGNAL_FAILED`, not silent success. Signal/release while no command is held, malformed
+frames, and unknown tags fail closed.
 
 Parent-side output/diagnostic writers are dropped as soon as the command starts, not kept until release: otherwise EOF
 would wait for release while release waited for EOF. Every post-fork failure and controller EOF ends the host's own held

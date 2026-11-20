@@ -261,6 +261,92 @@ fn a_group_that_stops_itself_is_still_ended_through_its_holder() {
     assert_eq!(hold.wait().code(), Some(128 + libc::SIGKILL));
 }
 
+/// Child exit still belongs to its exact owner when no process-wide child notification arrives.
+#[test]
+fn a_held_child_publishes_its_exact_exit_without_shared_notification() {
+    let cases = [
+        ("already exiting", "exit 17", false),
+        ("held before exit", "read -r line; exit 17", false),
+        ("release racing exit", "read -r line; exit 17", true),
+    ];
+    for (case, script, early_release) in cases {
+        let mut hold = Hold::start(&[], &[os("/bin/sh"), os("-c"), os(script)], |command| {
+            // SAFETY: these signal-set and mask operations are async-signal-safe; only the
+            // forked holder inherits this mask. The test and its other children are unchanged.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut block = std::mem::zeroed();
+                    if libc::sigemptyset(&raw mut block) != 0
+                        || libc::sigaddset(&raw mut block, libc::SIGCHLD) != 0
+                        || libc::sigprocmask(
+                            libc::SIG_BLOCK,
+                            &raw const block,
+                            std::ptr::null_mut(),
+                        ) != 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        });
+        let (pid, _, _) = hold.started();
+        if script.starts_with("read") {
+            // The holder tries its biased exit branch before it acknowledges this command.
+            hold.request("signal CONT");
+            assert_eq!(
+                hold.event(),
+                HoldEvent::Signalled {
+                    signal: HoldSignal::Cont
+                }
+            );
+            if early_release {
+                hold.release();
+            }
+            writeln!(hold.stdin.take().expect("leader stdin"), "exit").expect("end the held child");
+        }
+        let ready = if hold.state.buffer().contains(&b'\n') {
+            1
+        } else {
+            let mut state = libc::pollfd {
+                fd: hold.state.get_ref().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd; the finite backstop only bounds the regression oracle.
+            unsafe { libc::poll(&raw mut state, 1, 2_000) }
+        };
+        if ready != 1 {
+            let shown = process_state(pid);
+            if !early_release {
+                hold.release();
+            }
+            // The test only ends its own holder; release first lets it reap the child.
+            let _ = hold.child.kill();
+            let _ = hold.wait();
+            panic!(
+                "{case}: forked leader {pid} in state {shown:?} owes exit 17; poll returned {ready}"
+            );
+        }
+        assert_eq!(
+            hold.event(),
+            HoldEvent::Exited {
+                status: ExitStatus::Exited { code: 17 }
+            },
+            "{case}"
+        );
+        if !early_release {
+            assert!(
+                process_state(pid).starts_with('Z'),
+                "{case}: leader remains held"
+            );
+            hold.release();
+        }
+        assert_eq!(hold.wait().code(), Some(17), "{case}");
+        assert_eq!(hold.rest(), "", "{case}: no second terminal");
+        assert_eq!(process_state(pid), "", "{case}: leader was reaped");
+    }
+}
 /// The leader exits while a descendant still holds its output. The exit is observed without
 /// reaping: the leader's pid stays taken (a zombie), so its group id still names its group, and
 /// `signal TERM` reaches the descendant, whose end ends the output: the holder kept no copy of
