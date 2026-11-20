@@ -1,4 +1,5 @@
 import typia from 'typia';
+import { sleepFor } from './live-version.js';
 import type { LiveKvNamespace } from './stage.js';
 
 export interface R2Bucket {
@@ -112,6 +113,11 @@ const PAGE_SIZE = 1000;
 const ZONE_PAGE_SIZE = 50;
 /** A listing that never reports its end is a broken listing; refuse rather than page forever. */
 const MAX_LIST_PAGES = 1000;
+/**
+ * The waits between tries of a transient Cloudflare failure: three tries in all, about 3 s added
+ * at worst. Shared by the REST client and the wrangler wrapper.
+ */
+export const TRANSIENT_RETRY_DELAYS_MS = [1_000, 2_000];
 const isKvNamespaces = typia.createIs<LiveKvNamespace[]>();
 const isR2Buckets = typia.createIs<R2Bucket[]>();
 const isWorkerScripts = typia.createIs<WorkerScript[]>();
@@ -180,6 +186,7 @@ export class CloudflareRestClient implements CloudflareClient {
     private readonly apiToken: string,
     private readonly fetcher: CloudflareFetcher = fetch,
     private readonly apiBaseUrl = 'https://api.cloudflare.com/client/v4',
+    private readonly sleep: (ms: number) => Promise<void> = sleepFor,
   ) {
     if (!accountId || !apiToken) {
       throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.');
@@ -458,15 +465,42 @@ export class CloudflareRestClient implements CloudflareClient {
   }
 
   private async send(path: string, init: RequestInit = {}): Promise<{ response: Response; text: string }> {
-    const response = await this.fetcher(`${this.apiBaseUrl}${path}`, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${this.apiToken}`,
-        'Content-Type': 'application/json',
-        ...init.headers,
-      },
-    });
-    return { response, text: await response.text() };
+    for (let attempt = 1; ; attempt += 1) {
+      const response = await this.fetcher(`${this.apiBaseUrl}${path}`, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${this.apiToken}`,
+          'Content-Type': 'application/json',
+          ...init.headers,
+        },
+      });
+      const text = await response.text();
+      const delay = TRANSIENT_RETRY_DELAYS_MS[attempt - 1];
+      // A create is never repeated: Cloudflare may have made it before failing to answer.
+      if (delay === undefined || init.method === 'POST' || !isTransientFailure(response.status, text)) {
+        return { response, text };
+      }
+      console.warn(
+        `Cloudflare API ${path} failed transiently (HTTP ${response.status}) on try ${attempt} of ${TRANSIENT_RETRY_DELAYS_MS.length + 1}; retrying in ${delay / 1_000}s.`,
+      );
+      await this.sleep(delay);
+    }
+  }
+}
+
+/**
+ * A 5xx, or Cloudflare's "internal error" envelope on a status that is not a 4xx. A 4xx never is:
+ * auth and validation failures do not heal by asking again.
+ */
+function isTransientFailure(status: number, text: string): boolean {
+  if (status >= 500) return true;
+  // The regex first keeps every healthy response from being parsed twice.
+  if (status >= 400 || !/internal error/i.test(text)) return false;
+  try {
+    const body = parseCloudflareEnvelope(text);
+    return body?.success === false && (body.errors ?? []).some((error) => /internal error/i.test(error.message ?? ''));
+  } catch {
+    return false;
   }
 }
 

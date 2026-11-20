@@ -115,7 +115,13 @@ describe('CloudflareRestClient responses without an envelope', () => {
   });
 
   it('still rejects a non-envelope body on a failed request', async () => {
-    const client = new CloudflareRestClient('account-1', 'token', rawFetcher('{"unexpected":true}', 500));
+    const client = new CloudflareRestClient(
+      'account-1',
+      'token',
+      rawFetcher('{"unexpected":true}', 500),
+      undefined,
+      async () => {},
+    );
     await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
   });
 
@@ -127,6 +133,87 @@ describe('CloudflareRestClient responses without an envelope', () => {
   it('still rejects a non-envelope object on a successful status', async () => {
     const client = new CloudflareRestClient('account-1', 'token', rawFetcher('{"unexpected":true}', 200));
     await expect(client.deleteWorkerDomain('domain-1')).rejects.toThrow(/malformed response/);
+  });
+});
+
+describe('CloudflareRestClient transient failures', () => {
+  const INTERNAL_ERROR = {
+    success: false,
+    errors: [{ code: 10001, message: 'We encountered an internal error. Please try again.' }],
+    result: null,
+  };
+  const LISTING = { success: true, errors: [], result: { buckets: [{ name: 'bucket-0' }] } };
+
+  /** Answers each call with the next queued response, repeating the last one; sleeps are recorded, not taken. */
+  function scripted(answers: Array<{ status: number; body: unknown }>) {
+    const calls: string[] = [];
+    const sleeps: number[] = [];
+    let index = 0;
+    const client = new CloudflareRestClient(
+      'account-1',
+      'token',
+      async (input, init) => {
+        calls.push(`${init?.method ?? 'GET'} ${input}`);
+        const answer = answers[Math.min(index, answers.length - 1)];
+        index += 1;
+        return Response.json(answer?.body, { status: answer?.status });
+      },
+      undefined,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+    );
+    return { client, calls, sleeps };
+  }
+
+  it('retries an internal error and returns what the next try answers', async () => {
+    const { client, calls, sleeps } = scripted([
+      { status: 500, body: INTERNAL_ERROR },
+      { status: 200, body: LISTING },
+    ]);
+    expect(await client.listR2Buckets()).toEqual([{ name: 'bucket-0' }]);
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toEqual([1_000]);
+  });
+
+  it('retries an internal error Cloudflare answers with a 2xx status', async () => {
+    const { client, calls } = scripted([
+      { status: 200, body: INTERNAL_ERROR },
+      { status: 200, body: LISTING },
+    ]);
+    expect(await client.listR2Buckets()).toEqual([{ name: 'bucket-0' }]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('fails with the original error after three tries of a failure that never clears', async () => {
+    const { client, calls, sleeps } = scripted([{ status: 502, body: INTERNAL_ERROR }]);
+    const failure = client.listR2Buckets();
+    await expect(failure).rejects.toBeInstanceOf(CloudflareApiError);
+    await expect(failure).rejects.toMatchObject({
+      message:
+        'Cloudflare API /accounts/account-1/r2/buckets?per_page=1000 failed: We encountered an internal error. Please try again.',
+      status: 502,
+      codes: [10001],
+    });
+    expect(calls).toHaveLength(3);
+    expect(sleeps).toEqual([1_000, 2_000]);
+  });
+
+  it('never retries a 4xx, even one that mentions an internal error', async () => {
+    const { client, calls, sleeps } = scripted([
+      { status: 403, body: { success: false, errors: [{ code: 10000, message: 'Authentication error' }] } },
+      { status: 400, body: INTERNAL_ERROR },
+    ]);
+    await expect(client.listR2Buckets()).rejects.toMatchObject({ status: 403, codes: [10000] });
+    await expect(client.listR2Buckets()).rejects.toMatchObject({ status: 400 });
+    expect(calls).toHaveLength(2);
+    expect(sleeps).toEqual([]);
+  });
+
+  it('never retries a create, which may have happened despite the error', async () => {
+    const { client, calls } = scripted([{ status: 500, body: INTERNAL_ERROR }]);
+    await expect(client.createR2Bucket('bucket-1')).rejects.toMatchObject({ status: 500 });
+    expect(calls).toEqual(['POST https://api.cloudflare.com/client/v4/accounts/account-1/r2/buckets']);
   });
 });
 
