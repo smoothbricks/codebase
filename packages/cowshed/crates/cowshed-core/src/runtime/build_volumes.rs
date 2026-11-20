@@ -5517,10 +5517,12 @@ mod tests {
             ))
         }
 
-        /// Data-only scenarios use the ordinary exec's granted filesystem parent.
+        /// Data-only checkouts need a physical path for the no-follow directory opener.
         fn data_directory(name: &str) -> Self {
             Self::directory_in(FixtureRoot::Files(crate::temp_root::TempRoot::new_in(
-                &std::env::temp_dir(),
+                &std::env::temp_dir()
+                    .canonicalize()
+                    .expect("resolve granted TMPDIR"),
                 name,
             )))
         }
