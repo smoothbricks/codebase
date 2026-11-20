@@ -44,9 +44,9 @@
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{ErrorCode, STATE_HEADER_SIZE};
 use columine_vm::bytes;
-use columine_vm::key_index::NoStrings;
+use columine_vm::key_index::{HashIndex, NoStrings};
 use columine_vm::state_init::{self, GrowthRoom, SIZING_RECORD_LEN, sizing_record};
-use columine_vm::struct_map::Validity;
+use columine_vm::struct_map::{StructRows, Validity};
 use columine_vm::vm::{CheckedMap, CheckedSet, CheckedStructMap2, Vm};
 
 // =============================================================================
@@ -826,6 +826,45 @@ pub unsafe extern "C" fn vm_struct_map_arena_field(
     field_idx: u32,
     out_ptr: *mut u8,
 ) -> u32 {
+    unsafe {
+        arena_field_record(state_base, state_len, field_idx, out_ptr, |state| {
+            let smap = state_init::bind_struct_map(state, slot)?;
+            Ok((smap.rows(), smap.find(state, key)))
+        })
+    }
+}
+
+/// The two-key form of [`vm_struct_map_arena_field`]: the field of the row the
+/// exact pair `(key1, key2)` names, in the same record.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vm_struct_map2_arena_field(
+    state_base: *const u8,
+    state_len: u32,
+    slot: u32,
+    key1: u32,
+    key2: u32,
+    field_idx: u32,
+    out_ptr: *mut u8,
+) -> u32 {
+    unsafe {
+        arena_field_record(state_base, state_len, field_idx, out_ptr, |state| {
+            let smap = state_init::bind_struct_map2_in::<HashIndex>(state, slot)?;
+            Ok((smap.rows(), smap.find(state, key1, key2)))
+        })
+    }
+}
+
+/// Write the eight-byte range record of field `field_idx` of the row `locate`
+/// names in the validated slot it binds: `[state-relative offset, length]`,
+/// `[u32::MAX, 0]` for an absent row and `[u32::MAX - 1, 0]` for an unset
+/// field. A field past the descriptor or of a scalar kind is `InvalidProgram`.
+unsafe fn arena_field_record(
+    state_base: *const u8,
+    state_len: u32,
+    field_idx: u32,
+    out_ptr: *mut u8,
+    locate: impl FnOnce(&[u8]) -> Result<(StructRows, Option<u32>), ErrorCode>,
+) -> u32 {
     if !range_is_bounded(out_ptr as usize, 8) || !disjoint(state_base, state_len, out_ptr, 8) {
         return ErrorCode::InvalidState as u32;
     }
@@ -833,19 +872,19 @@ pub unsafe extern "C" fn vm_struct_map_arena_field(
         Ok(state) => state,
         Err(_) => return ErrorCode::InvalidState as u32,
     };
-    let smap = match state_init::bind_struct_map(state, slot) {
-        Ok(slot) => slot,
+    let (rows, pos) = match locate(state) {
+        Ok(found) => found,
         Err(error) => return error as u32,
     };
     let Ok(field_idx) = u8::try_from(field_idx) else {
         return ErrorCode::InvalidProgram as u32;
     };
-    if field_idx >= smap.num_fields {
+    if field_idx >= rows.num_fields {
         return ErrorCode::InvalidProgram as u32;
     }
-    let (offset, len) = match smap.find(state, key) {
+    let (offset, len) = match pos {
         None => (u32::MAX, 0),
-        Some(pos) => match smap.arena_field(state, pos, field_idx) {
+        Some(pos) => match rows.arena_field(state, pos, field_idx) {
             Ok(None) => (u32::MAX - 1, 0),
             Ok(Some(payload)) => {
                 let offset = payload.as_ptr() as usize - state.as_ptr() as usize;

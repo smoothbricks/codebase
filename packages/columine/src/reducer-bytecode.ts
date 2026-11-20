@@ -90,11 +90,11 @@ function parseStructFieldType(value: number): StructFieldType {
   }
 }
 
-/** VO is a STRUCT_MAP-only field kind: the VM refuses it in every other container, and so does this mirror. */
-function parseNonStructMapFieldType(value: number, container: 'struct-map2' | 'ordered-list'): StructFieldType {
+/** VO is a struct-map field kind, one-key or two-key: the VM refuses it in an ordered list, and so does this mirror. */
+function parseOrderedListFieldType(value: number): StructFieldType {
   const fieldType = parseStructFieldType(value);
   if (fieldType === StructFieldType.VO) {
-    throw new Error(`Invalid program: ${container} VO field descriptors are not supported`);
+    throw new Error('Invalid program: ordered-list VO field descriptors are not supported');
   }
   return fieldType;
 }
@@ -285,12 +285,7 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
         const fieldTypes: StructFieldType[] = [];
         for (let i = 0; i < numFields; i++) {
-          const fieldTypeByte = initCode[pc++];
-          fieldTypes.push(
-            op === Opcode.SLOT_STRUCT_MAP2
-              ? parseNonStructMapFieldType(fieldTypeByte, 'struct-map2')
-              : parseStructFieldType(fieldTypeByte),
-          );
+          fieldTypes.push(parseStructFieldType(initCode[pc++]));
         }
 
         defineSlot(
@@ -336,14 +331,14 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           requireInitBytes(initCode, pc, numFields, 'ordered-list field metadata');
           const fieldTypes: StructFieldType[] = [];
           for (let i = 0; i < numFields; i++) {
-            fieldTypes.push(parseNonStructMapFieldType(initCode[pc++], 'ordered-list'));
+            fieldTypes.push(parseOrderedListFieldType(initCode[pc++]));
           }
           slotDef = { type: SlotType.ORDERED_LIST, capacity, fieldTypes };
         } else {
           slotDef = {
             type: SlotType.ORDERED_LIST,
             capacity,
-            elemType: parseNonStructMapFieldType(elemTypeByte, 'ordered-list'),
+            elemType: parseOrderedListFieldType(elemTypeByte),
           };
         }
         defineSlot(slotDefs, expectedSlots, slot, slotDef);

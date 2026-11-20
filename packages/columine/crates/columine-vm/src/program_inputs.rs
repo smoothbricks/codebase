@@ -32,6 +32,7 @@ use crate::counts_fold::CountsFoldOp;
 use crate::program_admission::ProgramAdmissionError;
 use crate::vm::{
     body_op_len, decode_struct_map_guarded_upsert_operands, decode_struct_map_upsert_operands,
+    decode_struct_map2_upsert_operands,
 };
 
 /// Container nesting a program may reach. Bounds compile recursion, and the
@@ -302,6 +303,15 @@ impl Builder<'_> {
                         .ok_or(invalid.clone())?;
                     for array in operands.row.array_fields() {
                         if let Some(link) = self.link(operands.row.slot, array.field_idx) {
+                            self.add(link, array.offsets_col, array.values_col, scope)?;
+                        }
+                    }
+                }
+                Opcode::BatchStructMap2UpsertLastArrays => {
+                    let operands = decode_struct_map2_upsert_operands(code, pc + 1, op)
+                        .ok_or(invalid.clone())?;
+                    for array in operands.array_fields() {
+                        if let Some(link) = self.link(operands.slot, array.field_idx) {
                             self.add(link, array.offsets_col, array.values_col, scope)?;
                         }
                     }

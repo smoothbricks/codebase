@@ -98,8 +98,9 @@ export enum StructFieldType {
    * slot arena. In-row geometry matches the arrays (8 bytes: arena-relative
    * offset:u32 LE + length:u32 LE), element size 1, bytes retained verbatim.
    * The VM verifies only arena geometry; frame and schema validation belong to
-   * the typed host above it. Admitted on STRUCT_MAP fields only and written by
-   * the CSR `(offsets_col, values_col, field_idx)` operands of 0x80–0x82.
+   * the typed host above it. Admitted on STRUCT_MAP and STRUCT_MAP2 fields and
+   * written by the CSR `(offsets_col, values_col, field_idx)` operands of 0x80–0x82,
+   * 0x8b, 0x8d, 0x8f and 0xa0.
    * No layout version bump: geometry is unchanged, and a VM without this kind
    * refuses the program at its closed field-kind admission.
    */
@@ -261,7 +262,7 @@ export type VmReadResult<T> =
   | { readonly ok: false; readonly error: ErrorCode };
 
 /**
- * One STRUCT_MAP arena-backed field (arrays, VO) read through the VM's checked
+ * One STRUCT_MAP or STRUCT_MAP2 arena-backed field (arrays, VO) read through the VM's checked
  * arena geometry: the row is `absent`, the field `unset`, or its exact `bytes`.
  * `bytes` is a fresh copy taken before any later state mutation or growth, so it
  * never aliases backend memory. `error` carries the VM's refusal: a non-arena
@@ -493,6 +494,7 @@ export enum Opcode {
   BATCH_STRUCT_MAP_UPSERT_FIRST_SINCE_RESET = 0x8b, // same row operands followed by reset field_idx (mapped BOOL); replaces when the key is absent, the stored reset is true, or the incoming reset is true
   SLOT_STRUCT_MAP2 = 0x1b, // same slot operands as SLOT_STRUCT_MAP; type flag low nibble = 10
   BATCH_STRUCT_MAP2_UPSERT_LAST = 0x83, // slot,key1_col,key2_col,num_vals,[val_col,field_idx] × N
+  BATCH_STRUCT_MAP2_UPSERT_LAST_ARRAYS = 0xa0, // 0x83 operands, then num_arrays,[(offsets_col, values_col, field_idx) × num_arrays] as 0x80; writes a two-key row's arena (VO) fields
   BATCH_STRUCT_MAP2_REMOVE = 0x86, // slot,key1_col,key2_col
   BATCH_STRUCT_MAP2_REMOVE_PREFIX = 0x8e, // slot,key1_col; removes every row whose key1 is the element's, in key-index order
   BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2 = 0x87, // 0x83 operands + cmp1_col,cmp1_field,cmp2_col,cmp2_field; strict signed lexicographic max
@@ -519,7 +521,7 @@ export enum Opcode {
   FLAT_MAP = 0xe1, // offsets_col, parent_ts_col, inner_body_len (u16 LE: 2 bytes)
 
   // Note: 0x50+ range reserved for RETE (superset binary)
-  // Nested container ops at 0x90+; struct map at 0x80+; blocks at 0xE0+
+  // Nested container ops at 0x90+; struct map at 0x80+ and 0xA0+; blocks at 0xE0+
 }
 
 // =============================================================================
@@ -642,6 +644,16 @@ export interface ColumineBackend {
     program: ReducerProgram,
     slot: number,
     key: number,
+    fieldIdx: number,
+  ): StructMapArenaField;
+
+  /** The two-key form of {@link structMapArenaField}: the field of the row the exact pair `(key1, key2)` names. */
+  structMap2ArenaField(
+    state: StateHandle,
+    program: ReducerProgram,
+    slot: number,
+    key1: number,
+    key2: number,
     fieldIdx: number,
   ): StructMapArenaField;
 

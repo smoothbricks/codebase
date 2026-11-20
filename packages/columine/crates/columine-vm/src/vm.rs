@@ -37,8 +37,8 @@ use crate::row_exprs::{LiveColumns, StoredBinding, StoredRow};
 use crate::scratch::ScratchDemand;
 use crate::state_init::{self, EVICTION_ENTRY_SIZE, GrowthRoom};
 use crate::struct_map::{
-    ArenaRegion, ColumnValidity, StructMap2Slot, StructMapSlot, Validity, scalar_cell_encoded,
-    scalar_cell_order_key, scalar_order_key,
+    ArenaRegion, ColumnValidity, StructMap2Slot, StructMapSlot, StructRows, Validity,
+    scalar_cell_encoded, scalar_cell_order_key, scalar_order_key,
 };
 use crate::temporal::{NO_COMPANION, Temporal};
 use crate::ttl_plan::{TtlBatchPlan, TtlBatchScratch, consume_ttl_batch, prepare_ttl_batch};
@@ -1251,12 +1251,17 @@ impl<I: KeyIndex> Vm<I> {
     }
 
     /// Map a capacity failure to `NEEDS_GROWTH` and record its slot.
+    /// Record `slot` and the room it lacks when a kernel answered
+    /// `CapacityExceeded` (its rows) or `ArenaOverflow` (its arena), either of
+    /// which becomes `NEEDS_GROWTH` here.
     fn signal_growth(&mut self, slot: u32, result: ErrorCode) -> u32 {
-        if result == ErrorCode::CapacityExceeded {
-            self.needs_growth = Some((slot, GrowthRoom::Rows));
-            return NEEDS_GROWTH;
-        }
-        result as u32
+        let room = match result {
+            ErrorCode::CapacityExceeded => GrowthRoom::Rows,
+            ErrorCode::ArenaOverflow => GrowthRoom::Arena,
+            _ => return result as u32,
+        };
+        self.needs_growth = Some((slot, room));
+        NEEDS_GROWTH
     }
 
     /// Record `slot` when a kernel answered `NEEDS_GROWTH` for it, or its
@@ -2361,21 +2366,9 @@ impl StructMapUpsertOperands {
         operands: &mut R,
         op: Opcode,
     ) -> Option<()> {
-        self.num_arrays = 0;
         let num_vals = usize::from(operands.byte()?);
         self.vals.decode_into(operands, num_vals, 0)?;
-        let num_arrays = usize::from(operands.byte()?);
-        if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
-            return None;
-        }
-        for array in &mut self.arrays[..num_arrays] {
-            *array = ArrayField {
-                offsets_col: operands.index()?,
-                values_col: operands.index()?,
-                field_idx: operands.byte()?,
-            };
-        }
-        self.num_arrays = num_arrays;
+        self.num_arrays = decode_array_tail(operands, &mut self.arrays)?;
         self.pick = match op {
             Opcode::BatchStructMapUpsertLast => StructMapPick::Last,
             Opcode::BatchStructMapUpsertFirst => StructMapPick::First,
@@ -2458,25 +2451,36 @@ pub(crate) fn decode_struct_map_guarded_upsert_operands(
     Some(operands)
 }
 
+/// `num_arrays:u8, (offsets_col:index, values_col:index, field_idx:u8) ×
+/// num_arrays` into `arrays`, answering `num_arrays`: the array tail 0x80
+/// and 0xa0 share. More than [`MAX_STRUCT_ARRAY_OPERANDS`] is no instruction.
+fn decode_array_tail<'a, R: OperandRead<'a>>(
+    operands: &mut R,
+    arrays: &mut [ArrayField; MAX_STRUCT_ARRAY_OPERANDS],
+) -> Option<usize> {
+    let num_arrays = usize::from(operands.byte()?);
+    if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
+        return None;
+    }
+    for array in &mut arrays[..num_arrays] {
+        *array = ArrayField {
+            offsets_col: operands.index()?,
+            values_col: operands.index()?,
+            field_idx: operands.byte()?,
+        };
+    }
+    Some(num_arrays)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StructMap2UpsertOperands {
     pub(crate) slot: u32,
     pub(crate) key1_col: u32,
     pub(crate) key2_col: u32,
     pub(crate) vals: ScalarOperands,
+    arrays: [ArrayField; MAX_STRUCT_ARRAY_OPERANDS],
+    num_arrays: usize,
     pub(crate) end: usize,
-}
-
-/// `slot:index, key1_col:index, key2_col:index, num_vals:u8,
-/// (val_col:index, field_idx:u8) × num_vals`; `reserve` pairs of room stay
-/// free for operands an extension appends.
-fn decode_struct_map2_row(
-    operands: &mut Operands<'_>,
-    reserve: usize,
-) -> Option<StructMap2UpsertOperands> {
-    let mut row = StructMap2UpsertOperands::EMPTY;
-    row.decode_from(operands, reserve)?;
-    Some(row)
 }
 
 impl StructMap2UpsertOperands {
@@ -2485,15 +2489,30 @@ impl StructMap2UpsertOperands {
         key1_col: 0,
         key2_col: 0,
         vals: ScalarOperands::EMPTY,
+        arrays: [ArrayField {
+            offsets_col: 0,
+            values_col: 0,
+            field_idx: 0,
+        }; MAX_STRUCT_ARRAY_OPERANDS],
+        num_arrays: 0,
         end: 0,
     };
 
-    /// Decode over this value, writing only what the instruction carries.
+    /// The array operands 0xa0 carries; empty for 0x83 and the tuple picks.
+    pub(crate) fn array_fields(&self) -> &[ArrayField] {
+        &self.arrays[..self.num_arrays]
+    }
+
+    /// Decode `slot:index, key1_col:index, key2_col:index, num_vals:u8,
+    /// (val_col:index, field_idx:u8) × num_vals` over this value, writing only
+    /// what the instruction carries; `reserve` pairs of room stay free for
+    /// operands an extension appends.
     fn decode_from<'a, R: OperandRead<'a>>(
         &mut self,
         operands: &mut R,
         reserve: usize,
     ) -> Option<()> {
+        self.num_arrays = 0;
         self.slot = operands.index()?;
         self.key1_col = operands.index()?;
         self.key2_col = operands.index()?;
@@ -2502,13 +2521,36 @@ impl StructMap2UpsertOperands {
         self.end = operands.pos();
         Some(())
     }
+
+    /// Decode the pair upsert `op` names: 0x83's row, or 0xa0's, which is
+    /// 0x83's row followed by 0x80's array tail. Any other opcode is `None`.
+    fn decode_op_from<'a, R: OperandRead<'a>>(
+        &mut self,
+        operands: &mut R,
+        op: Opcode,
+    ) -> Option<()> {
+        self.decode_from(operands, 0)?;
+        match op {
+            Opcode::BatchStructMap2UpsertLast => {}
+            Opcode::BatchStructMap2UpsertLastArrays => {
+                self.num_arrays = decode_array_tail(operands, &mut self.arrays)?;
+                self.end = operands.pos();
+            }
+            _ => return None,
+        }
+        Some(())
+    }
 }
 
+/// Decode a 0x83 or 0xa0 pair upsert without mutating state.
 pub(crate) fn decode_struct_map2_upsert_operands(
     code: &[u8],
     start: usize,
+    op: Opcode,
 ) -> Option<StructMap2UpsertOperands> {
-    decode_struct_map2_row(&mut Operands::at(code, start), 0)
+    let mut row = StructMap2UpsertOperands::EMPTY;
+    row.decode_op_from(&mut Operands::at(code, start), op)?;
+    Some(row)
 }
 
 /// Which row a 0x87/0x89 tuple pick keeps: the strictly greatest or the
@@ -2966,30 +3008,11 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
             element_idx,
         )?;
         let target = RowTarget::of(map.plan_upsert(state, key, cx)?);
-        let arena = if map.arena_header_off == 0 {
-            None
-        } else {
-            let arena = ArenaRegion::bind(state, map.arena_header_off)?;
-            if !target.is_new() {
-                let row = map.row_off(target.pos());
-                let mut offset = map.bitset_bytes;
-                for field_idx in 0..map.num_fields {
-                    let kind = map.field_type(state, field_idx);
-                    if is_arena_field_type(kind)
-                        && StructMapSlot::is_field_set(state, row, field_idx)
-                    {
-                        arena.bytes(
-                            state,
-                            bytes::read_u32(state, row + offset),
-                            bytes::read_u32(state, row + offset + 4),
-                            arena_elem_size(kind),
-                        )?;
-                    }
-                    offset += struct_field_size(kind);
-                }
-            }
-            Some(arena)
-        };
+        let arena = bind_row_arena(
+            state,
+            &map.rows(),
+            (!target.is_new()).then_some(target.pos()),
+        )?;
         Ok(Self {
             map,
             slot,
@@ -3050,15 +3073,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
         cx: &mut KeyCx<'_, I, S>,
     ) -> Result<(), ErrorCode> {
         let meta = slot_meta_base(self.slot);
-        let (header, append) = self.arena.map_or(((0, 0), (0, 0)), |arena| {
-            (
-                (arena.header + 4, if arrays.is_some() { 4 } else { 0 }),
-                (
-                    arena.data + arena.used,
-                    arrays.map_or(0, |plan| plan.used - arena.used),
-                ),
-            )
-        });
+        let [header, append] = arrays.map_or([(0, 0); 2], ArenaWrites::ranges);
         let pos = self.target.pos();
         let ranges = || {
             CaptureRanges::new()
@@ -3084,7 +3099,7 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
         if written.is_ok()
             && let Some(arrays) = arrays
         {
-            arrays.write(state, &self.map, pos, self.cols);
+            arrays.write(state, &self.map.rows(), pos, self.cols);
         }
         undo.finish_capture(delta_mode, state, capture);
         if written.is_ok() {
@@ -3103,8 +3118,9 @@ impl<'a, I: KeyIndex> PreparedRow<'a, I> {
 }
 
 /// One exact-pair upsert-last row on two-key map `smap` (slot `slot`): the
-/// pair is planned once, then its index writes, size, change flag and row are
-/// captured together before any byte moves.
+/// pair is planned once and its array operands' arena appends are planned
+/// before any byte moves, then its index writes, size, change flag, row, the
+/// arena's used word and the appended bytes are captured together.
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     undo: &mut UndoState,
@@ -3117,6 +3133,7 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     key2: u32,
     val_cols: &[u32],
     field_idxs: &[u8],
+    array_fields: &[ArrayField],
     cols: &[&[u8]],
     valid: &[ColumnValidity<'_>],
     element_idx: u32,
@@ -3143,6 +3160,21 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
     };
     let pos = target.pos();
     let row = smap.row_off(pos);
+    let arrays = if array_fields.is_empty() {
+        None
+    } else {
+        let rows = smap.rows();
+        let planned = bind_row_arena(state, &rows, (!target.is_new()).then_some(pos))
+            .and_then(|arena| arena.ok_or(ErrorCode::InvalidState))
+            .and_then(|arena| {
+                ArenaWrites::prepare(state, &rows, arena, cols, element_idx, array_fields)
+            });
+        match planned {
+            Ok(plan) => Some(plan),
+            Err(error) => return error,
+        }
+    };
+    let [header, append] = arrays.as_ref().map_or([(0, 0); 2], ArenaWrites::ranges);
     let meta = slot_meta_base(slot);
     let feeds = rec.feed.records(slot);
     let prior = if feeds && !target.is_new() {
@@ -3159,6 +3191,8 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
             .marks(meta)
             .writes(&target.writes())
             .push((row, smap.row_size))
+            .push(header)
+            .push(append)
     };
     let capture = match undo.begin_capture(state, ranges) {
         Ok(capture) => capture,
@@ -3181,6 +3215,9 @@ fn single_struct_map2_upsert_last<I: KeyIndex, S: InternBytes + ?Sized>(
             val_col,
             element_idx,
         );
+    }
+    if let Some(arrays) = &arrays {
+        arrays.write(state, &smap.rows(), pos, cols);
     }
     mark_meta(
         state,
@@ -3886,43 +3923,103 @@ struct ArenaWrite {
     arena_offset: u32,
 }
 
+/// An instruction's array operands, admitted once before any row: each names
+/// an arena field of the slot, and no field twice. Otherwise `InvalidProgram`.
+fn validate_array_operands(
+    state: &[u8],
+    rows: &StructRows,
+    fields: &[ArrayField],
+) -> Result<(), ErrorCode> {
+    for (index, field) in fields.iter().enumerate() {
+        if field.field_idx >= rows.num_fields
+            || !is_arena_field_type(rows.field_type(state, field.field_idx))
+            || fields[..index]
+                .iter()
+                .any(|prior| prior.field_idx == field.field_idx)
+        {
+            return Err(ErrorCode::InvalidProgram);
+        }
+    }
+    Ok(())
+}
+/// The arena of a struct-map slot, `None` when it has none. When the write
+/// replaces the existing row at `held`, each arena reference that row stores
+/// is checked against the arena first: a reference outside it is
+/// `InvalidState` before any byte moves.
+fn bind_row_arena(
+    state: &[u8],
+    rows: &StructRows,
+    held: Option<u32>,
+) -> Result<Option<ArenaRegion>, ErrorCode> {
+    if rows.arena_header_off == 0 {
+        return Ok(None);
+    }
+    let arena = ArenaRegion::bind(state, rows.arena_header_off)?;
+    if let Some(pos) = held {
+        let row = rows.row_off(pos);
+        let mut offset = rows.bitset_bytes;
+        for field_idx in 0..rows.num_fields {
+            let kind = rows.field_type(state, field_idx);
+            if is_arena_field_type(kind) && StructMapSlot::is_field_set(state, row, field_idx) {
+                arena.bytes(
+                    state,
+                    bytes::read_u32(state, row + offset),
+                    bytes::read_u32(state, row + offset + 4),
+                    arena_elem_size(kind),
+                )?;
+            }
+            offset += struct_field_size(kind);
+        }
+    }
+    Ok(Some(arena))
+}
+
+/// The arena appends of one row's array operands, planned against the arena
+/// before any byte moves. Both struct-map kinds write through it.
 struct ArenaWrites {
-    arena: Option<ArenaRegion>,
+    arena: ArenaRegion,
     fields: [ArenaWrite; MAX_STRUCT_ARRAY_OPERANDS],
     len: usize,
     used: u32,
 }
 
 impl ArenaWrites {
-    fn prepare<I: KeyIndex>(
+    /// Plan each array operand's CSR cell at `element_idx` into `arena`. A
+    /// field past the descriptor or of a scalar kind is
+    /// `InvalidProgram`; a malformed cell is `ColumnUnderrun` or
+    /// `InvalidCellValue`; appends past the arena's capacity are
+    /// `ArenaOverflow`.
+    fn prepare(
         state: &[u8],
-        row: &PreparedRow<'_, I>,
+        rows: &StructRows,
+        arena: ArenaRegion,
+        cols: &[&[u8]],
+        element_idx: u32,
         fields: &[ArrayField],
     ) -> Result<Self, ErrorCode> {
-        let arena = row.arena.ok_or(ErrorCode::InvalidProgram)?;
+        if fields.len() > MAX_STRUCT_ARRAY_OPERANDS {
+            return Err(ErrorCode::InvalidProgram);
+        }
         let mut plan = Self {
-            arena: Some(arena),
+            arena,
             fields: [ArenaWrite::default(); MAX_STRUCT_ARRAY_OPERANDS],
             len: fields.len(),
             used: arena.used,
         };
         for (write, field) in plan.fields.iter_mut().zip(fields) {
-            if field.field_idx >= row.map.num_fields {
+            if field.field_idx >= rows.num_fields {
                 return Err(ErrorCode::InvalidProgram);
             }
-            let field_type =
-                StructFieldType::from_u8(row.map.field_type_byte(state, field.field_idx))
-                    .ok_or(ErrorCode::InvalidState)?;
+            let field_type = StructFieldType::from_u8(rows.field_type_byte(state, field.field_idx))
+                .ok_or(ErrorCode::InvalidState)?;
             if !is_arena_field_type(field_type) {
                 return Err(ErrorCode::InvalidProgram);
             }
             let elem_size = arena_elem_size(field_type);
-            let offsets = row
-                .cols
+            let offsets = cols
                 .get(field.offsets_col as usize)
                 .ok_or(ErrorCode::ColumnUnderrun)?;
-            let offset_pos = row
-                .element_idx
+            let offset_pos = element_idx
                 .checked_mul(4)
                 .ok_or(ErrorCode::ColumnUnderrun)?;
             let offset_end = offset_pos.checked_add(8).ok_or(ErrorCode::ColumnUnderrun)?;
@@ -3939,8 +4036,7 @@ impl ArenaWrites {
                 .checked_mul(elem_size)
                 .ok_or(ErrorCode::InvalidCellValue)?;
             let byte_len = source_end - source_offset;
-            let values = row
-                .cols
+            let values = cols
                 .get(field.values_col as usize)
                 .ok_or(ErrorCode::ColumnUnderrun)?;
             if source_end as usize > values.len() {
@@ -3955,7 +4051,7 @@ impl ArenaWrites {
             }
             *write = ArenaWrite {
                 field_idx: field.field_idx,
-                field_offset: row.map.field_offset(state, field.field_idx),
+                field_offset: rows.field_offset(state, field.field_idx),
                 values_col: field.values_col,
                 source_offset,
                 byte_len,
@@ -3967,17 +4063,23 @@ impl ArenaWrites {
         Ok(plan)
     }
 
-    fn write<I: KeyIndex>(
-        &self,
-        state: &mut [u8],
-        smap: &StructMapSlot<I>,
-        pos: u32,
-        cols: &[&[u8]],
-    ) {
-        let Some(arena) = self.arena else {
-            return;
-        };
-        let row = smap.row_off(pos);
+    /// The bytes the appends change: the arena's used word and the appended
+    /// range, which a writer's capture holds beside the row.
+    fn ranges(&self) -> [(u32, u32); 2] {
+        [
+            (self.arena.header + 4, 4),
+            (
+                self.arena.data + self.arena.used,
+                self.used - self.arena.used,
+            ),
+        ]
+    }
+
+    /// Point each planned field of row `pos` at its append and copy the cell's
+    /// bytes there. Unjournaled: the caller captured [`Self::ranges`].
+    fn write(&self, state: &mut [u8], rows: &StructRows, pos: u32, cols: &[&[u8]]) {
+        let arena = self.arena;
+        let row = rows.row_off(pos);
         for field in &self.fields[..self.len] {
             StructMapSlot::set_field_bit(state, row, field.field_idx);
             bytes::write_u32(state, row + field.field_offset, field.arena_offset);
@@ -4035,9 +4137,21 @@ fn upsert_struct_map_row<I: KeyIndex, S: InternBytes + ?Sized>(
     let arrays = if array_fields.is_empty() {
         None
     } else {
-        match ArenaWrites::prepare(state, &row, array_fields) {
+        let planned = row
+            .arena
+            .ok_or(ErrorCode::InvalidProgram)
+            .and_then(|arena| {
+                ArenaWrites::prepare(
+                    state,
+                    &row.map.rows(),
+                    arena,
+                    row.cols,
+                    row.element_idx,
+                    array_fields,
+                )
+            });
+        match planned {
             Ok(plan) => Some(plan),
-            Err(ErrorCode::ArenaOverflow) => return ErrorCode::ArenaOverflow as u32,
             Err(error) => return error as u32,
         }
     };
@@ -6117,8 +6231,8 @@ impl<I: KeyIndex> Vm<I> {
                     }
                 }
 
-                Opcode::BatchStructMap2UpsertLast => {
-                    let Some(operands) = decode_struct_map2_upsert_operands(code, pc) else {
+                Opcode::BatchStructMap2UpsertLast | Opcode::BatchStructMap2UpsertLastArrays => {
+                    let Some(operands) = decode_struct_map2_upsert_operands(code, pc, op) else {
                         return INVALID_PROGRAM;
                     };
                     pc = operands.end;
@@ -6126,6 +6240,11 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
+                    if let Err(error) =
+                        validate_array_operands(state, &smap.rows(), operands.array_fields())
+                    {
+                        return error as u32;
+                    }
                     let keys1 = batch_col!(col_u32_exact(
                         col_at(cols, operands.key1_col as usize),
                         batch_len
@@ -6152,6 +6271,7 @@ impl<I: KeyIndex> Vm<I> {
                             keys2[index],
                             operands.vals.cols(),
                             operands.vals.fields(),
+                            operands.array_fields(),
                             cols,
                             valid.as_slice(),
                             i,
@@ -7487,9 +7607,9 @@ impl<I: KeyIndex> Vm<I> {
                 }
 
                 // Exact two-lane struct map upsert/remove.
-                Opcode::BatchStructMap2UpsertLast => {
+                Opcode::BatchStructMap2UpsertLast | Opcode::BatchStructMap2UpsertLastArrays => {
                     let operands = &mut self.element_struct_map2;
-                    if operands.decode_from(&mut r, 0).is_none() {
+                    if operands.decode_op_from(&mut r, op).is_none() {
                         return INVALID_PROGRAM;
                     }
                     bpc = operands.end;
@@ -7497,6 +7617,11 @@ impl<I: KeyIndex> Vm<I> {
                         Ok(map) => map,
                         Err(error) => return error as u32,
                     };
+                    if let Err(error) =
+                        validate_array_operands(state, &smap.rows(), operands.array_fields())
+                    {
+                        return error as u32;
+                    }
                     if self.removal_cuts.of(operands.slot).covers_pair(
                         cell_u32(cols, operands.key1_col, child_idx),
                         cell_u32(cols, operands.key2_col, child_idx),
@@ -7515,6 +7640,7 @@ impl<I: KeyIndex> Vm<I> {
                         cell_u32(cols, operands.key2_col, child_idx),
                         operands.vals.cols(),
                         operands.vals.fields(),
+                        operands.array_fields(),
                         cols,
                         operands.vals.validity(validity).as_slice(),
                         child_idx,

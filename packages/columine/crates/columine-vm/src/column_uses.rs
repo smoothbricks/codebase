@@ -654,8 +654,8 @@ fn walk_op(
                 cell(visit, mask.mask_col, ColumnUse::Read, U32);
             }
         }
-        Opcode::BatchStructMap2UpsertLast => {
-            struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1)?, visit);
+        Opcode::BatchStructMap2UpsertLast | Opcode::BatchStructMap2UpsertLastArrays => {
+            struct_map2_reads(&decode_struct_map2_upsert_operands(code, pc + 1, op)?, visit);
         }
         Opcode::BatchStructMapRemove | Opcode::BatchStructMap2RemovePrefix => {
             ops.index()?;
@@ -775,6 +775,14 @@ fn struct_map2_reads(
     cell(visit, operands.key1_col, ColumnUse::Read, U32);
     cell(visit, operands.key2_col, ColumnUse::Read, U32);
     field_reads(visit, operands.slot, &operands.vals);
+    for array in operands.array_fields() {
+        visit(ColumnOperand::Csr {
+            slot: operands.slot,
+            field_idx: array.field_idx,
+            offsets_col: array.offsets_col,
+            values_col: array.values_col,
+        });
+    }
 }
 
 /// One slot definition of an init section, as far as the walk reads it.

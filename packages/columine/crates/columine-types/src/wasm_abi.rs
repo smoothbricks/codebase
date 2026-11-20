@@ -43,6 +43,7 @@ pub const COLUMINE_VM_EXPORTS: &[&str] = &[
     "vm_map_get",
     "vm_reset_state",
     "vm_set_contains",
+    "vm_struct_map2_arena_field",
     "vm_struct_map2_get_row_ptr",
     "vm_struct_map2_iter_key1",
     "vm_struct_map2_iter_key2",

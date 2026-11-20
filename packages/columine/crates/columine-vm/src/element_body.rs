@@ -354,12 +354,24 @@ pub(crate) fn walk_operands<S: OperandSink>(
             raw(r, sink, usize::try_from(prefix_len).ok()?)?;
             &[]
         }
-        Opcode::BatchStructMap2UpsertLast => {
-            // slot, key1_col, key2_col, then the value pairs.
+        Opcode::BatchStructMap2UpsertLast | Opcode::BatchStructMap2UpsertLastArrays => {
+            // slot, key1_col, key2_col, then the value pairs, and 0xa0's
+            // num_arrays, (offsets_col, values_col, field_idx) × num_arrays.
             for _ in 0..3 {
                 index(r, sink)?;
             }
             pairs(r, sink, MAX_STRUCT_SCALAR_OPERANDS)?;
+            if op == Opcode::BatchStructMap2UpsertLastArrays {
+                let num_arrays = count(r, sink)?;
+                if num_arrays > MAX_STRUCT_ARRAY_OPERANDS {
+                    return None;
+                }
+                for _ in 0..num_arrays {
+                    index(r, sink)?;
+                    index(r, sink)?;
+                    byte(r, sink)?;
+                }
+            }
             &[]
         }
         Opcode::BatchStructMap2UpsertMaxI64x2 | Opcode::BatchStructMap2UpsertMinI64x2 => {

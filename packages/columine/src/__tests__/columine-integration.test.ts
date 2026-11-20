@@ -68,6 +68,7 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
     structMap2GetRow: () => ({ ok: true, value: undefined }),
     structMap2Entries: () => ({ ok: true, value: [] }),
     structMapArenaField: () => ({ kind: 'absent' }),
+    structMap2ArenaField: () => ({ kind: 'absent' }),
     evictExpired: () => ({ ok: true, count: 0, rows: [] }),
     serialize: () => new Uint8Array(0),
     deserialize: () => ({ _brand: 'ColumineStateHandle' }),

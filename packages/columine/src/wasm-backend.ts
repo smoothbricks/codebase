@@ -46,7 +46,7 @@ const SLOT_META_EVICTED_BUFFER_OFFSET = 36;
 const SLOT_META_EVICTED_COUNT_OFFSET = 40;
 const EVICTION_ENTRY_SIZE = 16;
 
-// `vm_struct_map_arena_field` writes [state-relative offset:u32 LE, length:u32 LE]
+// `vm_struct_map_arena_field` and `vm_struct_map2_arena_field` write [state-relative offset:u32 LE, length:u32 LE]
 // to an 8-byte scratch on OK. Only the two reserved offsets mean absent/unset;
 // length zero at an ordinary offset is a PRESENT empty payload.
 const ARENA_FIELD_RECORD_SIZE = 8;
@@ -54,6 +54,28 @@ const ARENA_FIELD_ABSENT = 0xffff_ffff;
 const ARENA_FIELD_UNSET = 0xffff_fffe;
 const ABSENT_ARENA_FIELD = Object.freeze<StructMapArenaField>({ kind: 'absent' });
 const UNSET_ARENA_FIELD = Object.freeze<StructMapArenaField>({ kind: 'unset' });
+
+/** Decode an arena-field read's status and its record at `outPtr` into a fresh copy of the field's bytes. */
+function arenaField(
+  memory: WebAssembly.Memory,
+  state: WasmStateHandle,
+  status: number,
+  outPtr: number,
+): StructMapArenaField {
+  if (status !== ErrorCode.OK) return { kind: 'error', error: vmErrorCode(status) };
+  const record = new DataView(memory.buffer, outPtr, ARENA_FIELD_RECORD_SIZE);
+  const offset = record.getUint32(0, true);
+  const length = record.getUint32(4, true);
+  if (length === 0 && offset === ARENA_FIELD_ABSENT) return ABSENT_ARENA_FIELD;
+  if (length === 0 && offset === ARENA_FIELD_UNSET) return UNSET_ARENA_FIELD;
+  if (offset + length > state.size) {
+    // invariant throw: the VM validated this reference against the arena it lives in
+    throw new Error(
+      `WASM VM returned arena field [${offset}, ${offset + length}) outside the ${state.size}-byte state`,
+    );
+  }
+  return { kind: 'bytes', bytes: new Uint8Array(state.buffer, offset, length).slice() };
+}
 
 export type VmProgramInvalidCause =
   | { readonly kind: 'MalformedProgram' }
@@ -199,6 +221,15 @@ interface VmExports {
     fieldIdx: number,
     outPtr: number,
   ): number;
+  vm_struct_map2_arena_field(
+    stateBase: number,
+    stateLen: number,
+    slot: number,
+    key1: number,
+    key2: number,
+    fieldIdx: number,
+    outPtr: number,
+  ): number;
   vm_undo_enable(stateBase: number, stateSize: number): number;
   vm_undo_checkpoint(stateBase: number): number;
   vm_undo_rollback(stateBase: number, stateLen: number, checkpointPos: number, outPtr: number): number;
@@ -273,6 +304,7 @@ const VM_EXPORT_NAMES = [
   'vm_struct_map2_iter_key1',
   'vm_struct_map2_iter_key2',
   'vm_struct_map2_iter_row_ptr',
+  'vm_struct_map2_arena_field',
   'vm_struct_map_arena_field',
   'vm_undo_enable',
   'vm_undo_checkpoint',
@@ -718,10 +750,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       // This module links no native value-object admission capability. Explicitly empty metadata on
       // a program that declares no VO field names nothing to admit, exactly as the native program
       // owner treats an ordinary program. Any other metadata is refused with a typed error; it is
-      // never accepted unchecked. Only STRUCT_MAP slots can declare a VO field: the parser refuses
-      // VO descriptors in every other slot kind.
+      // never accepted unchecked. STRUCT_MAP and STRUCT_MAP2 slots can declare a VO field: the
+      // parser refuses VO descriptors in every other slot kind.
       const declaresVo = program.slotDefs.some(
-        (slotDef) => slotDef.type === SlotType.STRUCT_MAP && slotDef.fieldTypes.includes(StructFieldType.VO),
+        (slotDef) =>
+          (slotDef.type === SlotType.STRUCT_MAP || slotDef.type === SlotType.STRUCT_MAP2) &&
+          slotDef.fieldTypes.includes(StructFieldType.VO),
       );
       if (voProgramMetadata.fields.length === 0 && voProgramMetadata.counts.length === 0 && !declaresVo) {
         return program;
@@ -887,19 +921,23 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource): Promis
       const statePtr = stageState(state, ARENA_FIELD_RECORD_SIZE);
       const outPtr = align8(statePtr + state.size);
       const status = wasmInstance.exports.vm_struct_map_arena_field(statePtr, state.size, slot, key, fieldIdx, outPtr);
-      if (status !== ErrorCode.OK) return { kind: 'error', error: vmErrorCode(status) };
-      const record = new DataView(wasmInstance.memory.buffer, outPtr, ARENA_FIELD_RECORD_SIZE);
-      const offset = record.getUint32(0, true);
-      const length = record.getUint32(4, true);
-      if (length === 0 && offset === ARENA_FIELD_ABSENT) return ABSENT_ARENA_FIELD;
-      if (length === 0 && offset === ARENA_FIELD_UNSET) return UNSET_ARENA_FIELD;
-      if (offset + length > state.size) {
-        // invariant throw: the VM validated this reference against the arena it lives in
-        throw new Error(
-          `WASM VM returned arena field [${offset}, ${offset + length}) outside the ${state.size}-byte state`,
-        );
-      }
-      return { kind: 'bytes', bytes: new Uint8Array(state.buffer, offset, length).slice() };
+      return arenaField(wasmInstance.memory, state, status, outPtr);
+    },
+
+    structMap2ArenaField(stateHandle, _program, slot, key1, key2, fieldIdx) {
+      const state = assertWasmStateHandle(stateHandle);
+      const statePtr = stageState(state, ARENA_FIELD_RECORD_SIZE);
+      const outPtr = align8(statePtr + state.size);
+      const status = wasmInstance.exports.vm_struct_map2_arena_field(
+        statePtr,
+        state.size,
+        slot,
+        key1,
+        key2,
+        fieldIdx,
+        outPtr,
+      );
+      return arenaField(wasmInstance.memory, state, status, outPtr);
     },
 
     evictExpired(stateHandle, program, now, delta) {

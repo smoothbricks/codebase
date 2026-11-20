@@ -162,6 +162,8 @@ enum Effect {
     Entry { slot: u32 },
     /// One struct-map row per execution plus its array bytes.
     Arena { slot: u32, col: u32 },
+    /// One new pair per execution plus its array bytes.
+    PairArena { slot: u32, col1: u32, col2: u32 },
     /// Slot-to-slot bitmap algebra: `source` is `None` for the scratch image.
     Algebra {
         target: u32,
@@ -200,6 +202,7 @@ impl Effect {
         match self {
             Effect::Key { slot, .. }
             | Effect::Pair { slot, .. }
+            | Effect::PairArena { slot, .. }
             | Effect::Remove { slot, .. }
             | Effect::Entry { slot }
             | Effect::Arena { slot, .. }
@@ -221,6 +224,7 @@ impl Effect {
             Effect::Cut { slot, .. } => Some(SlotWrite::Cut(slot)),
             Effect::Key { slot, .. }
             | Effect::Pair { slot, .. }
+            | Effect::PairArena { slot, .. }
             | Effect::Entry { slot }
             | Effect::Arena { slot, .. }
             | Effect::Routed { slot, .. }
@@ -361,6 +365,16 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
                 col1: at(1)?,
                 col2: at(2)?,
             });
+        }
+        Opcode::BatchStructMap2UpsertLastArrays => {
+            // slot, key1, key2, num_vals, (col, field) × num_vals, num_arrays, ...
+            let (slot, col1, col2) = (at(0)?, at(1)?, at(2)?);
+            let num_vals = usize::try_from(at(3)?).ok()?;
+            if at(4 + 2 * num_vals)? == 0 {
+                out(Effect::Pair { slot, col1, col2 });
+            } else {
+                out(Effect::PairArena { slot, col1, col2 });
+            }
         }
         // probe_slot, key, miss_mode, out_slot, num_fields, out_key.
         Opcode::BatchStructMapProbe => out(Effect::Key {
@@ -575,7 +589,7 @@ impl CapacityScratch {
                 | Effect::Arena { col, .. }
                 | Effect::Cut { col, .. }
                 | Effect::Routed { col, .. } => Some(col),
-                Effect::Pair { col1, .. } => Some(col1),
+                Effect::Pair { col1, .. } | Effect::PairArena { col1, .. } => Some(col1),
                 Effect::Opaque { .. } => None,
                 _ => continue,
             };
@@ -825,9 +839,28 @@ impl CapacityScratch {
                             Some(())
                         })
                     }
-                    Effect::Arena { slot, col } if slot == target => {
-                        arena_demand(state, &lookup, o, domain, cols, batch_len, col, &mut d, cx)
-                    }
+                    Effect::Arena { slot, col } if slot == target => arena_demand(
+                        state,
+                        &lookup,
+                        o,
+                        domain,
+                        cols,
+                        batch_len,
+                        ArenaKey::One(col),
+                        &mut d,
+                        cx,
+                    ),
+                    Effect::PairArena { slot, col1, col2 } if slot == target => arena_demand(
+                        state,
+                        &lookup,
+                        o,
+                        domain,
+                        cols,
+                        batch_len,
+                        ArenaKey::Pair(col1, col2),
+                        &mut d,
+                        cx,
+                    ),
                     Effect::Routed {
                         slot,
                         route_col,
@@ -982,7 +1015,14 @@ fn fits<I: KeyIndex>(state: &[u8], slot: u32, meta: &SlotMetaView, d: &Demand) -
         }
         SlotType::StructMap2 => {
             let map = state_init::bind_struct_map2_in::<I>(state, slot).ok()?;
-            u64::from(map.size(state)) + d.units <= u64::from(I::max_rows(map.capacity))
+            let rows = u64::from(map.size(state)) + d.units <= u64::from(I::max_rows(map.capacity));
+            let arena = if d.bytes == 0 {
+                true
+            } else {
+                let arena = ArenaRegion::bind(state, map.arena_header_off).ok()?;
+                u64::from(arena.used) + d.bytes <= u64::from(arena.capacity)
+            };
+            rows && arena
         }
         SlotType::Bitmap => {
             let storage = get_bitmap_storage(meta);
@@ -1057,6 +1097,7 @@ impl<'s, I: KeyIndex> Lookup<'s, I> {
 
 /// Rows and exact array bytes of one struct-map upsert. Bytes are charged on
 /// every execution with a non-sentinel key, update or insert, unaligned.
+/// A two-key row charges every execution: a sentinel key1 refuses there.
 #[allow(clippy::too_many_arguments)]
 fn arena_demand<I: KeyIndex, S: InternBytes + ?Sized>(
     state: &[u8],
@@ -1065,29 +1106,43 @@ fn arena_demand<I: KeyIndex, S: InternBytes + ?Sized>(
     domain: &Domain<'_>,
     cols: &[&[u8]],
     batch_len: u32,
-    key_col: u32,
+    key: ArenaKey,
     d: &mut Demand,
     cx: &mut KeyCx<'_, I, S>,
 ) -> Option<()> {
-    let Lookup::Rows(map) = lookup else {
-        return None;
+    // slot, the key column(s), num_vals, (col, field) × num_vals, num_arrays,
+    // (offsets, values, field) × num_arrays.
+    let (rows, vals_at) = match (lookup, key) {
+        (Lookup::Rows(map), ArenaKey::One(_)) => (map.rows(), 2),
+        (Lookup::Pairs(map), ArenaKey::Pair(..)) => (map.rows(), 3),
+        _ => return None,
     };
-    let num_vals = usize::try_from(*o.get(2)?).ok()?;
-    let arrays_at = 3 + 2 * num_vals;
+    let num_vals = usize::try_from(*o.get(vals_at)?).ok()?;
+    let arrays_at = vals_at + 1 + 2 * num_vals;
     let num_arrays = usize::try_from(*o.get(arrays_at)?).ok()?;
     for_rows(domain, cols, batch_len, &mut |row| {
-        let key = cell(cols, key_col, row)?;
-        if is_sentinel(key) {
-            return Some(());
-        }
-        if map.lookup(state, key, cx).ok()?.is_none() {
+        let is_new = match (lookup, key) {
+            (Lookup::Rows(map), ArenaKey::One(col)) => {
+                let key = cell(cols, col, row)?;
+                if is_sentinel(key) {
+                    return Some(());
+                }
+                map.lookup(state, key, cx).ok()?.is_none()
+            }
+            (Lookup::Pairs(map), ArenaKey::Pair(col1, col2)) => {
+                let (key1, key2) = (cell(cols, col1, row)?, cell(cols, col2, row)?);
+                map.lookup(state, key1, key2, cx).ok()?.is_none()
+            }
+            _ => return None,
+        };
+        if is_new {
             d.units += 1;
         }
         for array in 0..num_arrays {
             let base = arrays_at + 1 + 3 * array;
             let (offsets, field) = (*o.get(base)?, *o.get(base + 2)?);
             let kind =
-                StructFieldType::from_u8(map.field_type_byte(state, u8::try_from(field).ok()?))?;
+                StructFieldType::from_u8(rows.field_type_byte(state, u8::try_from(field).ok()?))?;
             let start = cell(cols, offsets, row)?;
             let end = cell(cols, offsets, row.checked_add(1)?)?;
             let len = end.checked_sub(start)?;
@@ -1097,6 +1152,14 @@ fn arena_demand<I: KeyIndex, S: InternBytes + ?Sized>(
         }
         Some(())
     })
+}
+
+/// The key columns of an arena-writing upsert: a one-key map's, or a
+/// two-key map's pair.
+#[derive(Clone, Copy)]
+enum ArenaKey {
+    One(u32),
+    Pair(u32, u32),
 }
 
 /// The inputs of the row-count bound.
@@ -1174,7 +1237,9 @@ impl Tier1<'_> {
             Effect::Key { col, .. } | Effect::Routed { col, .. } => {
                 self.executions(whole_batch, Some(col))
             }
-            Effect::Pair { col1, .. } => self.executions(whole_batch, Some(col1)),
+            Effect::Pair { col1, .. } | Effect::PairArena { col1, .. } => {
+                self.executions(whole_batch, Some(col1))
+            }
             _ => self.executions(whole_batch, None),
         };
         let d = &mut demand[usize::try_from(slot).ok()?];
@@ -1189,10 +1254,10 @@ impl Tier1<'_> {
             // because the bound's two bytes per member already cover every
             // shape tried, but the bound's soundness argument is per term.
             (Effect::Remove { .. }, Some(n)) => d.touches = d.touches.saturating_add(n),
-            (Effect::Arena { col, .. }, _) => {
+            (Effect::Arena { col: key, .. } | Effect::PairArena { col1: key, .. }, _) => {
                 // Rows are bounded like any key; the array bytes need rows.
                 d.rows = true;
-                if let Some(n) = self.executions(whole_batch, Some(col)) {
+                if let Some(n) = self.executions(whole_batch, Some(key)) {
                     d.units = d.units.saturating_add(n);
                 }
             }

@@ -469,11 +469,10 @@ fn check_init_code(
                 let Some(field_types) = code.get(pc..pc.saturating_add(num_fields)) else {
                     return Err(ProgramInvalidCause::MalformedProgram);
                 };
-                if field_types.iter().any(|field_type| {
-                    StructFieldType::from_u8(*field_type).is_none()
-                        || (op == Opcode::SlotStructMap2
-                            && *field_type == StructFieldType::Vo as u8)
-                }) {
+                if field_types
+                    .iter()
+                    .any(|field_type| StructFieldType::from_u8(*field_type).is_none())
+                {
                     return Err(ProgramInvalidCause::MalformedProgram);
                 }
                 pc += num_fields;
@@ -1434,7 +1433,7 @@ fn checked_struct_layout(
         .ok_or(ErrorCode::InvalidState)?;
     for &field in descriptor {
         StructFieldType::from_u8(field).ok_or(ErrorCode::InvalidState)?;
-        if kind != SlotType::StructMap && field == StructFieldType::Vo as u8 {
+        if kind == SlotType::OrderedList && field == StructFieldType::Vo as u8 {
             return Err(ErrorCode::InvalidState);
         }
     }
@@ -2733,10 +2732,10 @@ impl Declarations {
                     let Some(fields) = r.bytes(usize::from(nf)) else {
                         return Ok(false);
                     };
-                    if fields.iter().any(|&field| {
-                        StructFieldType::from_u8(field).is_none()
-                            || (pair && field == StructFieldType::Vo as u8)
-                    }) {
+                    if fields
+                        .iter()
+                        .any(|&field| StructFieldType::from_u8(field).is_none())
+                    {
                         return Ok(false);
                     }
                     DeclaredShape::Struct {

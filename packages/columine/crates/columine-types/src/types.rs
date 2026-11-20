@@ -1027,6 +1027,12 @@ pub enum Opcode {
     /// slot:index, key1_col:index, key2_col:index, num_vals:u8,
     /// [val_col:index, field_idx:u8] × num_vals
     BatchStructMap2UpsertLast = 0x83,
+    /// 0x83's operands followed by 0x80's array tail: num_arrays:u8 (at most
+    /// 16), \[offsets_col:index, values_col:index, field_idx:u8\] × num_arrays.
+    /// Writes the exact pair's row as 0x83 does, then each array operand's CSR
+    /// cell into its arena field: a two-key row holds value-object fields.
+    /// 0x83 keeps its scalar-only encoding.
+    BatchStructMap2UpsertLastArrays = 0xa0,
     /// slot:index, key1_col:index, key2_col:index
     BatchStructMap2Remove = 0x86,
     /// Conditional exact-pair row replacement with signed-i64 lexicographic
@@ -1182,6 +1188,7 @@ impl Opcode {
             0x90 => Self::NestedSetInsert,
             0x92 => Self::NestedMapUpsertLast,
             0x95 => Self::NestedAggUpdate,
+            0xa0 => Self::BatchStructMap2UpsertLastArrays,
             0xe0 => Self::ForEach,
             0xe1 => Self::FlatMap,
             _ => return None,

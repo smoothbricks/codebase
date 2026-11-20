@@ -119,3 +119,50 @@ its key1, at top level and per element, refuses sentinel keys and other slot kin
 redo reproduces the image byte for byte; that lane-kind bits decode, store in byte 19, are refused on a one-key record's
 lane 2 and in malformed images, and leave HashIndex execution unchanged; that permuted insertion histories seal to
 identical images; and that a header of another family is refused by every entry point.
+
+## 9. Two-key value-object fields
+
+A two-key record declares the field kinds a one-key record does, value objects (`StructFieldType::Vo`, kind 10) and
+arrays included. A slot that declares an arena field has a CSR arena after its rows, laid out, grown and sealed as a
+one-key map's (§2, §6); a two-key map has no timestamp lane. An ordered list still refuses a value-object field. A key
+family that confirms a key by bytes its row stores, such as a text key lane whose frame is the row's leading
+value-object field, reads that field as any other: the VM gives a value-object field no meaning.
+
+`BATCH_STRUCT_MAP2_UPSERT_LAST_ARRAYS` is opcode `0xa0` (`Opcode::BatchStructMap2UpsertLastArrays`; TypeScript
+`Opcode.BATCH_STRUCT_MAP2_UPSERT_LAST_ARRAYS`): `BATCH_STRUCT_MAP2_UPSERT_LAST`'s operands followed by
+`BATCH_STRUCT_MAP_UPSERT_LAST`'s array tail,
+
+```text
+slot:index, key1_col:index, key2_col:index, num_vals:u8, (val_col:index, field_idx:u8) × num_vals,
+num_arrays:u8, (offsets_col:index, values_col:index, field_idx:u8) × num_arrays
+```
+
+with at most 16 arrays. `0x83` keeps its scalar-only encoding, so a program written before `0xa0` decodes and folds as
+it did; `0xa0` with no arrays writes what `0x83` writes. `0xa0` runs at top level and in element bodies. Per element it
+writes the exact pair's row as `0x83` does (last write wins, the bitset cleared, then each scalar), then each array
+operand's CSR cell: the field's bit is set, its cell holds the append's arena offset and element count, and the cell's
+bytes are appended to the arena. The pair's plan, its scalar checks and its appends are decided before any byte moves,
+and one capture holds the slot's size, change flag, index writes, the row, the arena's used word and the appended range,
+so a rollback restores the image byte for byte and a delta segment replays it.
+
+An array operand that names a field past the descriptor, a scalar field, or a field another array operand names is
+`InvalidProgram`, checked once per instruction before any element; a scalar operand into an arena field is
+`InvalidProgram` as for `0x83`. A malformed CSR cell is `ColumnUnderrun` or `InvalidCellValue` as for `0x80`, and a
+sentinel key1 is `InvalidKey` as for `0x83`. Capacity admission charges each execution's new pair and its array bytes
+before the batch writes: a batch past the arena's free bytes is `NEEDS_GROWTH` naming `GrowthRoom::Arena`, past the rows
+`GrowthRoom::Rows`. A rewritten row's earlier payload and a removed row's payload (`0x86`, `0x8e`) stay dead in the
+arena until growth or seal compacts it; neither removal writes the arena.
+
+A program's value-object metadata links a two-key field as it links a one-key field: every declared value-object field
+needs its schema, and `0xa0`'s array operands that name a linked field are value-object inputs, admitted and projected
+before execution as `0x80`'s are. Readers take a field by its pair: `StructRows::arena_field` at the ordinal
+`StructMap2Slot::lookup` names, the WASM export `vm_struct_map2_arena_field(state, len, slot, key1, key2, field, out)`
+writing `vm_struct_map_arena_field`'s record, and the TypeScript backend's `structMap2ArenaField`. Logical export
+carries a two-key value-object field as `LogicalValue::Bytes`, and import writes it back through the arena.
+
+`columine-vm/tests/pair_vo_arena.rs` proves, through the real VM, that one key1 holds a frame per key2 and the last
+write of a pair wins; that frames survive rows and arena growth, seal, undo rollback and delta replay, and export and
+import; that prefix and exact removal drop a pair's frames and growth or seal leaves none of their bytes; that histories
+holding the same pairs seal to one image; that `0xa0` without arrays writes `0x83`'s image; and each refusal above,
+before any write. `src/__tests__/pair-vo-struct-map.test.ts` proves the same through the built WASM module, and
+`columine-vm/tests/program_admission.rs` that a two-key value-object field takes the one-key admission path.
