@@ -1398,7 +1398,8 @@ Concrete targets come from concrete files:
   executor supplies. This directory is private even to concurrent invocations of one target, retired with the task, and
   never an Nx output. Custom targets retain their normal `cwd`, `env`, declared producer edges, source/toolchain/config
   inputs and any runtime reports or outputs. An explicit `inputs` array uses `"..."` to retain inference. A binary that
-  is an input to another task remains a declared artifact of its own producer.
+  is an input to another task remains a declared artifact of its own producer. The Cargo version input runs in the same
+  directory as the fixture, after Nx resolves any `cwd` tokens.
 
   Cargo sources are keyed from each selected package's locked closure, including its test dev-dependencies but not the
   dependency crates' dev-dependencies, and the Cargo and nextest settings it uses. Cargo-derived filesets are anchored

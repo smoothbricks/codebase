@@ -2966,6 +2966,41 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.cleanup();
     }
   });
+
+  it('hashes a declared native test from its resolved options cwd', async () => {
+    const workspace = await createWorkspace();
+    const root = workspace.context.workspaceRoot;
+    const project = 'packages/ferris';
+    try {
+      await writeCargoIdentityFixture(workspace);
+      await workspace.write(
+        `${project}/package.json`,
+        JSON.stringify({
+          name: 'ferris',
+          nx: {
+            targets: {
+              'native-attachment': {
+                executor: '@smoothbricks/nx-plugin:bounded-exec',
+                options: { cwd: '{projectRoot}/src', nativeTest: { cargoArgs: ['-p', 'ferris-core'] } },
+              },
+            },
+          },
+        }),
+      );
+      await mkdir(join(root, project, 'src'));
+      const targets = await inferProjectTargets(workspace, `${project}/package.json`);
+      const versions = targets['native-attachment']?.inputs?.find(
+        (input) => typeof input === 'object' && 'runtime' in input && input.runtime.includes('cargo nextest --version'),
+      );
+      if (typeof versions !== 'object' || !('runtime' in versions))
+        throw new Error('missing native Cargo version input');
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(fileURLToPath(new URL('..', import.meta.url)), join(root, 'node_modules/@smoothbricks/nx-plugin'));
+      expect(await runtimeInputValue(versions.runtime, root)).toMatch(/cargo-nextest/);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   // Without an `externalDependencies` input Nx keys a task whose executor is
   // not an `@nx/` one on every package in the lockfile, so a lockfile-only
   // commit re-ran every cargo verdict (measured in a consumer: every cargo-test-*

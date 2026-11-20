@@ -16,6 +16,7 @@ import {
   type TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
+import { resolveNxTokensInOptions } from 'nx/src/project-graph/utils/project-configuration/target-merging.js';
 import { parse as parseToml } from 'smol-toml';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { refuseOverlappingOutputs } from './build-state-output-policy.js';
@@ -2230,12 +2231,16 @@ async function createProjectTargets(
       (input) => typeof input === 'object' && 'externalDependencies' in input && !isCargoLockInput(input),
     );
     const namesLock = inputs.some((input) => input === CARGO_CLOSURE_INPUT || isCargoLockInput(input));
-    const lockDirectory = typeof cwd === 'string' ? cwd : projectRoot;
+    // Nx expands tokens in options, not in a runtime input synthesized from an option.
+    const lockDirectory =
+      typeof cwd === 'string'
+        ? resolveNxTokensInOptions({ cwd }, { root: projectRoot, name: projectName }, name).cwd || '.'
+        : projectRoot;
     target.inputs = [
       ...inputs,
       ...cargoToolchainInputs(),
       ...(target.options?.nativeTest === undefined ? [] : [{ env: 'CARGO_BUILD_TARGET' }, { env: 'NEXTEST_PROFILE' }]),
-      cargoRuntimeInput(typeof cwd === 'string' ? cwd : projectRoot, `rustc -vV && cargo -V${versions}`),
+      cargoRuntimeInput(lockDirectory, `rustc -vV && cargo -V${versions}`),
       ...(namesPackages
         ? []
         : [{ externalDependencies: cargoCommandNpmPackages(target, text, pluginInstalledIn(workspaceRoot)) }]),
