@@ -410,7 +410,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
     }
 
     pub(crate) fn attribution_summary(
-        &self,
+        &mut self,
     ) -> Result<super::job_attribution::AttributionSummary, crate::api::resources::ResourceUnitError>
     {
         self.fold.attribution_summary()

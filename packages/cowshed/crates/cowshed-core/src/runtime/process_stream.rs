@@ -133,6 +133,9 @@ pub struct JobProcessFold {
     restated: Vec<Instant>,
     /// Each chunk of [`PUBLISHED_CHUNK`] lives, by birth order, as publications share it.
     published: Vec<PublishedChunk>,
+    /// How many lives the last attribution summary read, for the tests that count them.
+    #[cfg(all(test, target_os = "macos"))]
+    attribution_read: usize,
 }
 
 /// Lives per chunk of a [`PublishedTree`].
@@ -140,11 +143,13 @@ pub const PUBLISHED_CHUNK: usize = 256;
 
 /// One chunk of lives as the fold keeps it for publication: how many of its lives are not final
 /// yet, counted as lives are born and end so no publication rescans a final life to learn it, and
-/// once the chunk is full and none is left, its records.
+/// once the chunk is full and none is left, its records and its attribution part.
 #[derive(Debug, Default)]
 struct PublishedChunk {
     unfinal: usize,
     records: Option<Arc<[JobProcessSample]>>,
+    #[cfg(target_os = "macos")]
+    attribution: Option<super::job_attribution::ObservedPart<usize>>,
 }
 
 /// A job's tree as one publication holds it: every record, in birth-observation order, in chunks
@@ -193,6 +198,8 @@ impl JobProcessFold {
             last_tick: started,
             restated: Vec::new(),
             published: Vec::new(),
+            #[cfg(all(test, target_os = "macos"))]
+            attribution_read: 0,
         }
     }
 
@@ -247,18 +254,74 @@ impl JobProcessFold {
         self.readings.usage.start(process)
     }
 
-    /// Summarize the same identity-fenced readings that the tree and events expose.
+    /// Summarize the same identity-fenced readings that the tree and events expose. A full chunk
+    /// whose lives are all final keeps its part the first time it is read, and every later summary
+    /// merges that part instead of reading its lives: nothing about a life follows its exit
+    /// (07_api.md, "Process-tree observations"). Its cost is one merge per kept chunk and one read
+    /// per life of a chunk that can still change.
     #[cfg(target_os = "macos")]
     pub(crate) fn attribution_summary(
-        &self,
+        &mut self,
     ) -> Result<super::job_attribution::AttributionSummary, crate::api::resources::ResourceUnitError>
     {
-        super::job_attribution::AttributionSummary::from_observed(self.tree.nodes().map(|node| {
-            super::job_attribution::ObservedLife {
-                identity: node.identity,
-                image: node.image_known.then_some(node.image),
-                usage: self.readings.usage(node.identity),
+        use super::job_attribution::ObservedPart;
+        let lives = self.restated.len();
+        #[cfg(test)]
+        let mut read = 0;
+        let mut whole = ObservedPart::none()?;
+        let mut parts = || -> Result<(), crate::api::resources::ResourceUnitError> {
+            for (chunk, published) in self.published.iter_mut().enumerate() {
+                if let Some(part) = &published.attribution {
+                    whole.merge(part)?;
+                    continue;
+                }
+                let start = chunk * PUBLISHED_CHUNK;
+                let end = (start + PUBLISHED_CHUNK).min(lives);
+                let mut part = ObservedPart::none()?;
+                for index in start..end {
+                    let node = self
+                        .tree
+                        .node_at(index)
+                        .expect("a chunk covers lives the tree retains");
+                    part.add(
+                        node.identity,
+                        node.image_known.then_some(index),
+                        self.readings.usage(node.identity),
+                    )?;
+                }
+                #[cfg(test)]
+                {
+                    read += end - start;
+                }
+                if end - start == PUBLISHED_CHUNK && published.unfinal == 0 {
+                    published.attribution = Some(part);
+                }
+                whole.merge(&part)?;
             }
+            Ok(())
+        };
+        if parts().is_err() {
+            // The refusal a summary answers is the first one in birth order, which only reading
+            // every life in that order names; parts summed in another grouping may refuse elsewhere.
+            return super::job_attribution::AttributionSummary::from_observed(
+                self.tree
+                    .nodes()
+                    .map(|node| super::job_attribution::ObservedLife {
+                        identity: node.identity,
+                        image: node.image_known.then_some(node.image),
+                        usage: self.readings.usage(node.identity),
+                    }),
+            );
+        }
+        let tree = &self.tree;
+        #[cfg(test)]
+        {
+            self.attribution_read = read;
+        }
+        Ok(whole.summary(|index| {
+            tree.node_at(index)
+                .expect("the winner is a life the tree retains")
+                .image
         }))
     }
 
@@ -1235,7 +1298,8 @@ mod tests {
         );
     }
 
-    /// The fold's publication now, checked against the tree built anew from the same fold.
+    /// The fold's publication now, checked against the tree built anew from the same fold, and its
+    /// attribution against the one read anew from every life.
     fn published(run: &mut Run, second: u32) -> PublishedTree {
         let published = run.fold.published(job(), utc(second));
         assert_eq!(
@@ -1243,9 +1307,79 @@ mod tests {
             run.fold.tree(job(), utc(second)),
             "a publication answers the fold's own tree"
         );
+        #[cfg(target_os = "macos")]
+        attributed(run);
         published
     }
 
+    /// The fold's attribution summary now, checked against the summary read anew from every life
+    /// in birth order, and how many lives it read.
+    #[cfg(target_os = "macos")]
+    fn attributed(run: &mut Run) -> usize {
+        use crate::runtime::job_attribution::{AttributionSummary, ObservedLife};
+        let summary = run.fold.attribution_summary().expect("a summary");
+        let fold = &run.fold;
+        let anew = AttributionSummary::from_observed(fold.tree.nodes().map(|node| ObservedLife {
+            identity: node.identity,
+            image: node.image_known.then_some(node.image),
+            usage: fold.readings.usage(node.identity),
+        }))
+        .expect("a summary read anew");
+        assert_eq!(
+            summary.observed(),
+            anew.observed(),
+            "a summary from kept parts answers the summary of every life"
+        );
+        run.fold.attribution_read
+    }
+
+    /// A publication summarized the own CPU of every life the job ever had to name its leaf: on
+    /// live workspace supervisors, 67,132 lives read for each of 6 publications a second, and
+    /// 43,440 for each of 88, nearly all long ended and none of those able to change again. A
+    /// full chunk whose lives are all final is read once; a summary reads only the lives of the
+    /// other chunks and answers the summary of every life read anew, its leaf included when the
+    /// leaf is in a kept chunk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_attribution_reads_only_the_lives_of_chunks_that_can_still_change() {
+        let mut run = Run::new();
+        let lives = 3 * PUBLISHED_CHUNK + 8;
+        let long_lived = 2 * PUBLISHED_CHUNK + 5;
+        let children = ended_lives(&mut run, lives, long_lived);
+        assert_eq!(
+            attributed(&mut run),
+            lives,
+            "the first summary reads every life"
+        );
+        assert_eq!(
+            attributed(&mut run),
+            2 * PUBLISHED_CHUNK + 8,
+            "chunk 1 ended whole: its part is merged, not read"
+        );
+
+        // The long-lived life spends the most CPU, then ends: its chunk is read once more and kept,
+        // and the leaf it is stays the leaf from the kept part.
+        let long = children[long_lived - 1];
+        run.read(long, reading(run.at(60), 1_000, 4096));
+        assert_eq!(attributed(&mut run), 2 * PUBLISHED_CHUNK + 8);
+        run.exit(long, 7).expect("an exit event");
+        assert_eq!(attributed(&mut run), 2 * PUBLISHED_CHUNK + 8);
+        assert_eq!(
+            attributed(&mut run),
+            PUBLISHED_CHUNK + 8,
+            "only the shell's chunk and the partial tail are read"
+        );
+        let summary = run.fold.attribution_summary().expect("a summary");
+        assert_eq!(
+            summary.observed().1.map(|leaf| leaf.pid),
+            Some(long.pid),
+            "the leaf is the life that spent the most CPU, in a kept chunk"
+        );
+
+        // A later life of an ended life's pid joins the tail; the kept parts stay merged.
+        run.fork(id(children[PUBLISHED_CHUNK].pid, 9_999), id(100, 1));
+        assert_eq!(attributed(&mut run), PUBLISHED_CHUNK + 9);
+    }
     /// Births under a running shell, ended in birth order but for one long-lived life, so chunk 0
     /// holds the shell, chunk 2 the long-lived one, and chunk 3 is a partial tail. Half of the
     /// ended lives carry a final usage read after their exit; the rest end unread.

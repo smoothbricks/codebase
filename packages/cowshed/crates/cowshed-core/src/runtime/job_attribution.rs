@@ -82,6 +82,84 @@ pub struct AttributionSummary {
     winner: Option<JobProcessLeaf>,
 }
 
+/// The observed CPU of some lives and the one among them that ranks first, `W` naming its image:
+/// a part of an [`AttributionSummary`]. Parts merge in any order into the part of all their lives,
+/// since sums commute and no two lives rank equal, so a fold keeps the part of lives that can no
+/// longer change instead of reading them again.
+#[derive(Clone, Copy, Debug)]
+pub struct ObservedPart<W> {
+    observed: CpuMicros,
+    first: Option<(CpuMicros, ProcessIdentity, W)>,
+}
+
+impl<W: Copy> ObservedPart<W> {
+    /// The part of no lives.
+    pub fn none() -> Result<Self, ResourceUnitError> {
+        Ok(Self {
+            observed: CpuMicros::new(0)?,
+            first: None,
+        })
+    }
+
+    /// Count one life: its own CPU and its rank. An unread image or unread usage counts nothing
+    /// and cannot rank.
+    pub fn add(
+        &mut self,
+        identity: ProcessIdentity,
+        image: Option<W>,
+        usage: Option<ProcessUsage>,
+    ) -> Result<(), ResourceUnitError> {
+        let (Some(image), Some(usage)) = (image, usage) else {
+            return Ok(());
+        };
+        let own = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
+        self.observed = self.observed.checked_add(own)?;
+        self.rank(own, identity, image);
+        Ok(())
+    }
+
+    /// Count the lives of `other` too.
+    pub fn merge(&mut self, other: &Self) -> Result<(), ResourceUnitError> {
+        self.observed = self.observed.checked_add(other.observed)?;
+        if let Some((own, identity, image)) = other.first {
+            self.rank(own, identity, image);
+        }
+        Ok(())
+    }
+
+    fn rank(&mut self, own: CpuMicros, identity: ProcessIdentity, image: W) {
+        let rank = |own: CpuMicros, identity: ProcessIdentity| {
+            (
+                own,
+                std::cmp::Reverse(identity.birth.0),
+                std::cmp::Reverse(identity.pid),
+            )
+        };
+        if self
+            .first
+            .is_none_or(|(most, best, _)| rank(own, identity) > rank(most, best))
+        {
+            self.first = Some((own, identity, image));
+        }
+    }
+
+    /// The summary of these lives, the winner's image named by `image`.
+    pub fn summary<'i>(&self, image: impl FnOnce(W) -> &'i ProcessImage) -> AttributionSummary {
+        AttributionSummary {
+            observed_cpu: self.observed,
+            winner: self.first.map(|(_, identity, named)| {
+                let image = image(named);
+                JobProcessLeaf {
+                    pid: identity.pid,
+                    program: image.program.to_string(),
+                    argv: image.argv.to_vec(),
+                    truncated: image.truncated,
+                }
+            }),
+        }
+    }
+}
+
 impl AttributionSummary {
     /// Sums identified own CPU and keeps only the winning leaf. An unread image
     /// or unread usage covers nothing and cannot win. A checked add that fails
@@ -89,34 +167,17 @@ impl AttributionSummary {
     pub fn from_observed<'a>(
         lives: impl IntoIterator<Item = ObservedLife<'a>>,
     ) -> Result<Self, ResourceUnitError> {
-        let mut observed = CpuMicros::new(0)?;
-        let mut winner: Option<(CpuMicros, ProcessIdentity, &ProcessImage)> = None;
+        let mut part = ObservedPart::none()?;
         for life in lives {
-            let (Some(image), Some(usage)) = (life.image, life.usage) else {
-                continue;
-            };
-            let own = usage.cpu_user_us.checked_add(usage.cpu_sys_us)?;
-            observed = observed.checked_add(own)?;
-            let rank = |own: CpuMicros, identity: ProcessIdentity| {
-                (
-                    own,
-                    std::cmp::Reverse(identity.birth.0),
-                    std::cmp::Reverse(identity.pid),
-                )
-            };
-            if winner.is_none_or(|(most, best, _)| rank(own, life.identity) > rank(most, best)) {
-                winner = Some((own, life.identity, image));
-            }
+            part.add(life.identity, life.image, life.usage)?;
         }
-        Ok(Self {
-            observed_cpu: observed,
-            winner: winner.map(|(_, identity, image)| JobProcessLeaf {
-                pid: identity.pid,
-                program: image.program.to_string(),
-                argv: image.argv.to_vec(),
-                truncated: image.truncated,
-            }),
-        })
+        Ok(part.summary(|image| image))
+    }
+
+    /// The observed CPU and the winning leaf, which a summary from parts must equal.
+    #[cfg(test)]
+    pub(crate) fn observed(&self) -> (CpuMicros, Option<&JobProcessLeaf>) {
+        (self.observed_cpu, self.winner.as_ref())
     }
 
     /// Applies the independent total and the configured threshold. Clones the
