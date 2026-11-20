@@ -117,7 +117,7 @@ impl Fixture {
     }
 
     /// A fixture whose checkout holds `project`, committed: an APFS clone of this run's checkout
-    /// template for it ([`checkout_template`]).
+    /// template for it, with its installed Nx when it runs Nx ([`clone_checkout`]).
     fn with(project: Project<'_>) -> Self {
         Self::with_root(
             project,
@@ -139,8 +139,7 @@ impl Fixture {
                 &blank_template_path(&store, blank_image::CAPACITY),
             );
         }
-        test_template::clone_tree(&checkout_template(project), &checkout)
-            .expect("clone the checkout template");
+        clone_checkout(project, &checkout);
         // The fixture's workspaces run the host's own tools (bash, Bun, Nx's node), resolved
         // where production resolves them: the real host's program directories, named
         // explicitly (08_testing.md, "Fixtures").
@@ -288,7 +287,18 @@ enum Project<'a> {
     Declared,
 }
 
-impl Project<'_> {
+impl<'a> Project<'a> {
+    /// The repository's installed Nx a checkout of this project runs, if it runs Nx.
+    fn nx(self) -> Option<&'a Path> {
+        match self {
+            Self::Nx { nx, .. }
+            | Self::Build {
+                nx: Some((nx, _)), ..
+            } => Some(nx),
+            Self::Plain | Self::Build { nx: None, .. } | Self::Declared => None,
+        }
+    }
+
     /// The template's name: everything that varies between checkouts of one run. The toolchain
     /// paths are the run's own and the same in every test.
     fn key(self) -> &'static str {
@@ -329,8 +339,8 @@ impl Project<'_> {
         git(checkout, &["commit", "-q", "-m", "initial"]);
         match self {
             Self::Plain => {}
-            Self::Nx { nx, node, declared } => {
-                write_nx_project(checkout, nx, node, declared);
+            Self::Nx { node, declared, .. } => {
+                write_nx_project(checkout, node, declared);
                 git(checkout, &["add", "-A"]);
                 git(checkout, &["commit", "-q", "-m", "nx project"]);
             }
@@ -350,6 +360,33 @@ fn checkout_template(project: Project<'_>) -> PathBuf {
         |aside| project.write(aside),
     )
     .expect("the checkout template")
+}
+
+/// A fixture checkout holding `project` at `destination`: a clone of this run's committed checkout
+/// template and, when the project runs Nx, a clone of the run's installed Nx namespace as its
+/// ignored `node_modules` (08_testing.md, "one installed Nx per run"). The template holds no
+/// namespace, so the five-thousand-entry clone is this checkout's own and goes with its root.
+fn clone_checkout(project: Project<'_>, destination: &Path) {
+    test_template::clone_tree(&checkout_template(project), destination)
+        .expect("clone the checkout template");
+    let Some(nx) = project.nx() else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    clone_repository_nx_install(destination, nx);
+    cowshed_os::eprintln!(
+        "cloned the repository's Bun-installed Nx namespace in {}: {:?}",
+        destination.display(),
+        started.elapsed()
+    );
+    for file in ["package.json", "dist/bin/nx.js"] {
+        assert_eq!(
+            fs::read(destination.join("node_modules/nx").join(file))
+                .expect("the fixture's installed Nx"),
+            fs::read(nx.join(file)).expect("the repository's installed Nx"),
+            "the fixture's Nx {file} must match the repository's patched product",
+        );
+    }
 }
 
 impl Drop for Fixture {
@@ -3081,6 +3118,28 @@ fn directory_nx_install_is_materialized_once_across_checkout_templates() {
     }
 }
 
+//#region smoo/cowshed!n/one-installed-nx-per-run
+#[test]
+fn an_nx_checkout_template_holds_no_installed_namespace_and_its_fixture_does() {
+    let (nx, node) = repository_nx();
+    let project = Project::Nx {
+        nx: &nx,
+        node: &node,
+        declared: true,
+    };
+    let template = checkout_template(project);
+    assert!(
+        !template.join("node_modules").exists(),
+        "the checkout template {} must not retain an installed Nx namespace",
+        template.display()
+    );
+    let scratch = scratch_directory::ScratchRoot::new("nx-checkout").expect("scratch root");
+    let checkout = scratch.path().join("checkout");
+    clone_checkout(project, &checkout);
+    assert_nx_executable(&checkout);
+}
+//#endregion smoo/cowshed!n/one-installed-nx-per-run
+
 fn write_repository_nx_install(installed: &Path, nx: &Path) {
     clone_nx_store_entries(nx, &installed.join(".bun"));
     // The links Bun's install leaves at the namespace root, recreated relative so they
@@ -3287,7 +3346,7 @@ fn clone_or_copy_tree(source: &Path, destination: &Path) {
 /// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
 /// default inputs include it). `declared` says whether `a:build` declares that output. Written,
 /// not committed: the caller commits once it has written all it adds.
-fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
+fn write_nx_project(checkout: &Path, node: &Path, declared: bool) {
     // A command a workspace runs by name, as a land's publish job runs `node`,
     // resolves through its shim directory, which travels with every clone (03_caches.md).
     fs::create_dir_all(checkout.join(".cowshed/bin")).unwrap();
@@ -3327,21 +3386,6 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
         ),
     )
     .unwrap();
-    let started = std::time::Instant::now();
-    clone_repository_nx_install(checkout, nx);
-    cowshed_os::eprintln!(
-        "cloned the repository's Bun-installed Nx namespace in {}: {:?}",
-        checkout.display(),
-        started.elapsed()
-    );
-    for file in ["package.json", "dist/bin/nx.js"] {
-        assert_eq!(
-            fs::read(checkout.join("node_modules/nx").join(file))
-                .expect("the fixture's installed Nx"),
-            fs::read(nx.join(file)).expect("the repository's installed Nx"),
-            "the fixture's Nx {file} must match the repository's patched product",
-        );
-    }
 }
 
 /// A cloned Nx project must retain the real package-manager executable entry the keeper runs.
@@ -3858,8 +3902,8 @@ fn write_cargo_workspace(checkout: &Path, rust: &RustToolchain) {
 /// with its outputs declared and/or the Cargo workspace, with every build output and the tests'
 /// own control files ignored, so a retiring land finds the landing tree clean.
 fn write_build_project(checkout: &Path, nx: Option<(&Path, &Path)>, rust: Option<&RustToolchain>) {
-    if let Some((nx, node)) = nx {
-        write_nx_project(checkout, nx, node, true);
+    if let Some((_, node)) = nx {
+        write_nx_project(checkout, node, true);
     }
     if let Some(rust) = rust {
         declare_rust(checkout, rust);
@@ -7871,14 +7915,13 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     // A real foreign stock daemon owns a standalone root that retirement must not remove.
     // Its produced record nominates it in the landing checkout; it grants no ledger ownership.
     let foreign = fixture._scratch.path().join("foreign-daemon-checkout");
-    test_template::clone_tree(
-        &checkout_template(Project::Build {
+    clone_checkout(
+        Project::Build {
             nx: Some((&nx, &node)),
             rust: None,
-        }),
+        },
         &foreign,
-    )
-    .expect("clone the checkout template");
+    );
     let state = fixture._scratch.path().join("foreign-daemon-state");
     let data = state.join("workspace-data");
     let socket = cowshed_core::sandbox::workspace_runtime_link(&foreign).join("nx");

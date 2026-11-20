@@ -565,13 +565,18 @@ renames the allowed source change into place, drains pending events and stops th
 and notification assertions. It carries no deadline of its own: a callback or line that never comes is a hang the
 target's no-progress bound names, and the walk never retries or enables diagnostic flags to make the test pass.
 
-The CLI's committed checkout templates share one immutable copy of the repository's installed Nx namespace per run,
-regardless of whether a checkout declares outputs or also declares a Rust build volume. The first writer materializes
-the real Bun dependency closure under the existing template lock and publishes it by rename; later checkout writers
-clone that published tree on the scratch volume, without rediscovering or recopying the repository installation.
-Crossing from the repository's volume can require a byte copy, but changing fixture shape cannot repeat it. A
-deterministic regression removes the source after the first materialization and requires the second checkout to preserve
-the installed bytes and relative links with exactly one writer invocation.
+<a id="smoo/cowshed!n/one-installed-nx-per-run"></a>A run holds one immutable copy of the repository's installed Nx
+namespace, whatever checkout shapes it builds. The first writer materializes the real Bun dependency closure under the
+existing template lock and publishes it by rename; later writers find that published tree, without rediscovering or
+recopying the repository installation. Crossing from the repository's volume can require a byte copy, but changing
+fixture shape cannot repeat it. A deterministic regression removes the source after the first materialization and
+requires the second clone to preserve the installed bytes and relative links with exactly one writer invocation. The
+CLI's committed checkout templates hold the committed tree alone: the namespace is ignored, so no commit reads it, and
+the fixture's tests only read it. Each fixture whose project runs Nx clones the run's namespace into its own checkout as
+its `node_modules`, so that five-thousand-entry clone belongs to the fixture's root and goes with it, removed by the
+test that made it while its metadata is warm. A run's template directory therefore retains one namespace for the lane
+setup's sweep, not one more per Nx checkout shape; a regression requires an Nx checkout template to hold no
+`node_modules` and its fixture's Nx to resolve inside the fixture's checkout.
 
 The run's templates live in `/private/tmp/cowshed-dtest-<pid>-templates`, named for the run's process: under nextest,
 which names the run (`NEXTEST_RUN_ID`) and starts each test in a process group of its own led by its target runner
