@@ -4,7 +4,7 @@
 //! 2026-10-21: a sibling test's `tail -f` kept a copied workspace's `.git/logs/refs/heads` open
 //! and land kept that workspace as in use. So every copy here names descriptors this process
 //! opened, which `std` opens close-on-exec, through `fcopyfile(3)`. Only a clone names paths:
-//! `COPYFILE_CLONE_FORCE` is one `clonefileat(2)` on the two paths and opens no descriptor.
+//! one `clonefileat(2)` on the two paths, which opens no descriptor.
 
 use super::LeafMaterialization;
 use std::ffi::CString;
@@ -27,21 +27,25 @@ fn c_path(path: &Path) -> io::Result<CString> {
     })
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "COPYFILE_CLONE_FORCE is one clonefileat(2) on the two paths and opens no descriptor"
-)]
+/// `<sys/clonefile.h>`: clone a symlink itself rather than its target.
+const CLONE_NOFOLLOW: u32 = 0x0001;
+/// `<sys/clonefile.h>`: carry the source's access control list.
+const CLONE_ACL: u32 = 0x0004;
+
+/// One metadata clone of the leaf `source` to the absent `destination`: `clonefileat(2)` with the
+/// flags `copyfile(3)`'s `COPYFILE_CLONE_FORCE | COPYFILE_NOFOLLOW` passes it (measured), without
+/// the source `lstat` and destination `stat` copyfile spends first.
 fn clone(source: &Path, destination: &Path) -> io::Result<()> {
     let source = c_path(source)?;
     let destination = c_path(destination)?;
-    // SAFETY: both C strings outlive the call, and a null state requests the
-    // default one-shot copy rather than a caller-managed one.
+    // SAFETY: both C strings outlive the call; AT_FDCWD names no descriptor.
     let status = unsafe {
-        libc::copyfile(
+        libc::clonefileat(
+            libc::AT_FDCWD,
             source.as_ptr(),
+            libc::AT_FDCWD,
             destination.as_ptr(),
-            std::ptr::null_mut(),
-            COPYFILE_ALL | libc::COPYFILE_CLONE_FORCE | libc::COPYFILE_NOFOLLOW,
+            CLONE_NOFOLLOW | CLONE_ACL,
         )
     };
     if status == 0 {

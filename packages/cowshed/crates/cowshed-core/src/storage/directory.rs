@@ -1398,8 +1398,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(destination)?;
-        crate::copy::copy_until_quiescent_blocking(source, destination)
-            .and_then(|_| crate::copy::verify_tree_blocking(source, destination))
+        crate::copy::copy_and_verify_blocking(source, destination)
             .map(|report| {
                 cowshed_os::eprintln!("cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}",
                 source.display(),

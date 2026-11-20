@@ -15,7 +15,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
     DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, MARKER_VERSION, MetadataError, Platform,
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
@@ -3975,8 +3974,7 @@ where
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(destination)?;
-        copy_until_quiescent_blocking(source, destination)
-            .and_then(|_| crate::copy::verify_tree_blocking(source, destination))
+        crate::copy::copy_and_verify_blocking(source, destination)
             .map(|report| { cowshed_os::eprintln!("cowshed: verified copy {} -> {}; regular-file allocated bytes: source {}, copied {}; content {}", source.display(), destination.display(), report.source_allocated_bytes, report.copied_allocated_bytes, report.digest.to_hex()); })
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }

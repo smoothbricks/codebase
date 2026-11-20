@@ -203,6 +203,19 @@ pub fn copy_with_budget_blocking(
     let (source, destination) = validate_copy_roots(source, destination)?;
     converge(&source, &destination, pass_budget, &mut snapshot)
 }
+/// Copy `source` onto `destination` until quiescent, then verify the copy (`verify_tree_blocking`)
+/// against the source snapshot the last copy pass observed unchanged rather than a fresh walk of
+/// the same quiescent tree. Verification still re-observes both trees once it has read them, so a
+/// source that moves after that pass is refused as before.
+pub(crate) fn copy_and_verify_blocking(
+    source: &Path,
+    destination: &Path,
+) -> Result<CopyVerification> {
+    let (source, destination) = validate_copy_roots(source, destination)?;
+    let (_, quiescent) =
+        converge_observed(&source, &destination, DEFAULT_PASS_BUDGET, &mut snapshot)?;
+    verify_observed(&source, &destination, quiescent, snapshot)
+}
 
 /// Copy a live repository into an attached image until a pass observes no changes.
 pub async fn copy_until_quiescent(source: &Path, destination: &Path) -> Result<CopyReport> {
@@ -581,11 +594,20 @@ fn verify_with_snapshot(
     destination: &Path,
     observe: impl Fn(&Path) -> Result<Snapshot>,
 ) -> Result<CopyVerification> {
+    verify_observed(source, destination, observe(source)?, observe)
+}
+
+/// [`verify_with_snapshot`] from a source snapshot `before` already observed.
+fn verify_observed(
+    source: &Path,
+    destination: &Path,
+    before: Snapshot,
+    observe: impl Fn(&Path) -> Result<Snapshot>,
+) -> Result<CopyVerification> {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let before = observe(source)?;
     let copied = observe(destination)?;
     let mismatch = |relative: &Path, reason: &str| {
         CowshedError::integrity(
@@ -728,6 +750,16 @@ fn converge(
     pass_budget: usize,
     observe: &mut dyn FnMut(&Path) -> Result<Snapshot>,
 ) -> Result<CopyReport> {
+    converge_observed(source, destination, pass_budget, observe).map(|(report, _)| report)
+}
+
+/// [`converge`], answering also the source snapshot its last pass observed unchanged.
+fn converge_observed(
+    source: &Path,
+    destination: &Path,
+    pass_budget: usize,
+    observe: &mut dyn FnMut(&Path) -> Result<Snapshot>,
+) -> Result<(CopyReport, Snapshot)> {
     let mut mirrored: MirrorState = snapshot(destination)?
         .iter()
         .map(|(path, entry)| (path.clone(), Mirrored::from_destination(entry)))
@@ -748,12 +780,15 @@ fn converge(
         let current = observe(source)?;
         let changes = describe_churn(&observed, &current);
         if changes.is_empty() {
-            return Ok(CopyReport {
-                passes: pass,
-                changed_entries,
-                cloned_files: materialized.cloned_files,
-                copied_files: materialized.copied_files,
-            });
+            return Ok((
+                CopyReport {
+                    passes: pass,
+                    changed_entries,
+                    cloned_files: materialized.cloned_files,
+                    copied_files: materialized.copied_files,
+                },
+                current,
+            ));
         }
         changed_entries = changed_entries.saturating_add(changes.len());
         observed = current;
@@ -819,6 +854,7 @@ fn reconcile(
                         primary: primary.clone(),
                         relative: relative.clone(),
                         state: Mirrored::from(entry),
+                        occupied: mirrored.contains_key(relative),
                     });
                 }
                 continue;
@@ -829,6 +865,7 @@ fn reconcile(
             leaf_copies.push(LeafCopy {
                 relative: relative.clone(),
                 state: Mirrored::from(entry),
+                occupied: mirrored.contains_key(relative),
             });
         }
     }
@@ -854,8 +891,11 @@ fn reconcile(
             continue;
         }
         let path = destination.join(relative);
-        let materialized =
-            relative.as_os_str().is_empty() || path.is_dir() || create_directory(&path)?;
+        // Obsolete entries are gone from the mirror by now, so an entry it still holds here is
+        // this directory, already present: only a path it never held needs creating.
+        let materialized = relative.as_os_str().is_empty()
+            || mirrored.contains_key(relative)
+            || create_directory(&path)?;
         if materialized {
             mirrored.insert(
                 relative.clone(),
@@ -886,6 +926,7 @@ fn reconcile(
         if link_leaf(
             &destination.join(&alias.primary),
             &destination.join(&alias.relative),
+            alias.occupied,
         )? {
             let identity = match mirrored
                 .get(&alias.primary)
@@ -931,6 +972,8 @@ fn reconcile(
 struct LeafCopy {
     relative: PathBuf,
     state: Mirrored,
+    /// The mirror holds this path: the destination has something there to replace.
+    occupied: bool,
 }
 
 struct LeafCopyOutcome {
@@ -943,6 +986,8 @@ struct HardLinkAlias {
     primary: PathBuf,
     relative: PathBuf,
     state: Mirrored,
+    /// The mirror holds this path: the destination has something there to replace.
+    occupied: bool,
 }
 
 fn copy_worker_count(job_count: usize) -> usize {
@@ -981,6 +1026,7 @@ fn copy_leaves_parallel(
                         materialization: copy_leaf(
                             &source.join(&leaf.relative),
                             &destination.join(&leaf.relative),
+                            leaf.occupied,
                         )?,
                     });
                 }
@@ -1260,23 +1306,40 @@ fn create_directory(path: &Path) -> Result<bool> {
     }
 }
 
-/// Replace `destination` with a hard link to `primary`. Reports `false` if the
-/// link target vanished.
-fn link_leaf(primary: &Path, destination: &Path) -> Result<bool> {
-    remove(destination, EntryKind::File)?;
+/// Replace `destination` with a hard link to `primary`, removing what is there first only when
+/// the mirror says something is (`occupied`). Reports `false` if the link target vanished.
+fn link_leaf(primary: &Path, destination: &Path, occupied: bool) -> Result<bool> {
+    if occupied {
+        remove(destination, EntryKind::File)?;
+    }
     match fs::hard_link(primary, destination) {
         Ok(()) => Ok(true),
+        // Something the mirror did not record holds the path: replace it, as an occupied one is.
+        Err(error) if !occupied && error.kind() == io::ErrorKind::AlreadyExists => {
+            link_leaf(primary, destination, true)
+        }
         Err(error) if vanished(&error) => Ok(false),
         Err(error) => Err(write_error(destination, &error)),
     }
 }
 
-/// Copy one file or symlink with every attribute it carries. `None` means the source vanished
-/// mid-pass.
-fn copy_leaf(source: &Path, destination: &Path) -> Result<Option<native::LeafMaterialization>> {
-    remove(destination, EntryKind::File)?;
+/// Copy one file or symlink with every attribute it carries, removing what is at `destination`
+/// first only when the mirror says something is (`occupied`): a fresh destination path costs the
+/// clone alone. `None` means the source vanished mid-pass.
+fn copy_leaf(
+    source: &Path,
+    destination: &Path,
+    occupied: bool,
+) -> Result<Option<native::LeafMaterialization>> {
+    if occupied {
+        remove(destination, EntryKind::File)?;
+    }
     match copy_leaf_native(source, destination) {
         Ok(materialization) => Ok(Some(materialization)),
+        // Something the mirror did not record holds the path: replace it, as an occupied one is.
+        Err(error) if !occupied && error.kind() == io::ErrorKind::AlreadyExists => {
+            copy_leaf(source, destination, true)
+        }
         Err(error) if vanished(&error) => Ok(None),
         Err(error) => Err(copy_error(source, destination, &error)),
     }
@@ -1336,10 +1399,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_with_budget,
-        describe_churn, render_path, snapshot, validate_copy_roots,
+        CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_leaf,
+        copy_with_budget, describe_churn, link_leaf, render_path, snapshot, validate_copy_roots,
     };
 
+    #[test]
+    fn a_leaf_the_mirror_thought_vacant_replaces_an_unrecorded_occupant() {
+        let root = temp_root("unrecorded-occupant");
+        let (source, destination) = (root.join("source"), root.join("destination"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("leaf"), b"source bytes").unwrap();
+        fs::write(destination.join("leaf"), b"unrecorded occupant").unwrap();
+        copy_leaf(&source.join("leaf"), &destination.join("leaf"), false)
+            .expect("copy over an unrecorded occupant")
+            .expect("the source is still there");
+        assert_eq!(fs::read(destination.join("leaf")).unwrap(), b"source bytes");
+
+        fs::write(destination.join("alias"), b"unrecorded occupant").unwrap();
+        assert!(
+            link_leaf(&destination.join("leaf"), &destination.join("alias"), false)
+                .expect("link over an unrecorded occupant")
+        );
+        assert_eq!(
+            fs::metadata(destination.join("alias")).unwrap().ino(),
+            fs::metadata(destination.join("leaf")).unwrap().ino()
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn region_probes_follow_regions_not_extents() {
         use std::cell::Cell;
