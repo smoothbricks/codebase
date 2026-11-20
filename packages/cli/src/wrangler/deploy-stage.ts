@@ -10,6 +10,7 @@ import {
   CloudflareRestClient,
   type D1DatabaseRecord,
   type DnsRecord,
+  TRANSIENT_RETRY_DELAYS_MS,
   type WorkerDomain,
   type WorkerRoute,
 } from './cloudflare.js';
@@ -21,6 +22,7 @@ import {
   findVersionIdByTag,
   type LiveVersionProbe,
   liveVersionCacheDirectory,
+  sleepFor,
   type VersionEndpointWaitOptions,
   writeCachedLiveVersion,
 } from './live-version.js';
@@ -244,7 +246,11 @@ export async function deployStage(
       await writeFile(temporarySecretsPath, `${JSON.stringify(secretValues)}\n`, { mode: 0o600 });
       deployArgs.push('--secrets-file', temporarySecretsPath);
     }
-    await wrangler(runner, deployArgs, run);
+    // Creating a pull-request Worker, wrangler's next call after the upload can find it missing
+    // (10007) for a moment. Anywhere else 10007 means the Worker really is gone.
+    const bootstrapSleep =
+      isPullRequestStage(stage) && !workerExists ? (dependencies.wait?.sleep ?? sleepFor) : undefined;
+    await wrangler(runner, deployArgs, run, bootstrapSleep);
     if (versionTag) {
       await confirmVersionIsLive(probe, versionTag, { stage, workerName, accountId }, options, dependencies, cwd);
     }
@@ -1208,18 +1214,33 @@ export async function wranglerJson(runner: ProcessRunner, args: string[], run: P
   }
 }
 
-async function wrangler(runner: ProcessRunner, args: string[], run: ProcessRunOptions): Promise<ProcessResult> {
-  const result = await runner.run('wrangler', args, run);
-  if (result.exitCode !== 0) {
+/** `bootstrapSleep` is given only for the deploy that creates a pull-request Worker; it retries a 10007. */
+async function wrangler(
+  runner: ProcessRunner,
+  args: string[],
+  run: ProcessRunOptions,
+  bootstrapSleep?: (ms: number) => Promise<void>,
+): Promise<ProcessResult> {
+  for (let attempt = 1; ; attempt += 1) {
+    const result = await runner.run('wrangler', args, run);
+    if (result.exitCode === 0) return result;
     printCommandOutput(result.stdout, result.stderr);
     const failure = `wrangler ${args.join(' ')} failed with exit code ${result.exitCode}`;
+    const output = `${result.stdout}\n${result.stderr}`;
+    const delay = TRANSIENT_RETRY_DELAYS_MS[attempt - 1];
+    if (bootstrapSleep && delay !== undefined && /\[code: 10007\]/.test(output)) {
+      console.warn(
+        `${failure}: the Worker it just created is not visible yet (10007) on try ${attempt} of ${TRANSIENT_RETRY_DELAYS_MS.length + 1}; retrying in ${delay / 1_000}s.`,
+      );
+      await bootstrapSleep(delay);
+      continue;
+    }
     // Cloudflare's code for the account's 500th Durable Object namespace; wrangler prints it as `[code: 10067]`.
-    if (/\[code: 10067\]/.test(`${result.stdout}\n${result.stderr}`)) {
+    if (/\[code: 10067\]/.test(output)) {
       throw new Error(`${failure}. ${DURABLE_OBJECT_LIMIT_HINT}`);
     }
     throw new Error(failure);
   }
-  return result;
 }
 
 /** What to do when a deploy hits Cloudflare 10067: the managed PR Stage Sweep frees closed pull requests' namespaces. */
