@@ -54,10 +54,49 @@
     "targets": {
       "lint": {},
       "test": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "test-unit",
+          "test-host"
+        ]
+      },
+      "test-unit": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "...",
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "env": "NODE_ENV"
+          }
+        ],
         "//": "Its typia plugin warmth is the fixture segment below: each TypeScript project the test loads through the compiler preload compiles its own native plugin key, minutes on a cold Go cache, which blew the 180s progress bound before any test finished (canonical 39038263857: build still active at idle expiry, compiler at 116.8% CPU, no test named). The plugin cache lives outside Nx outputs, so the warming cannot be an Nx cache entry of its own; as this task's build interval under a 600s budget it runs exactly when the test executes, and a cache hit warms nothing. Uses the same compiler preload specifier as bunfig.toml; the trace preload is absent on purpose (its setup calls afterAll(), which throws outside bun test).",
         "options": {
-          "command": "bun test --timeout=0",
+          "command": "bun test --timeout=0 --path-ignore-patterns='**/*-host.test.ts'",
+          "cwd": "{projectRoot}",
+          "fixtureCommand": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
+          "fixtureTimeoutMs": 600000,
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
+      "test-host": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "...",
+          "default",
+          "^dependencyDefault",
+          "bunToolchain",
+          {
+            "env": "NODE_ENV"
+          }
+        ],
+        "//": "The publication contract: every case here publishes through link(2), which a cowshed job's sandbox denies (specs/cowshed/04_sandbox.md, `file-link`), so it runs at the host boundary. The fixture segment is test-unit's.",
+        "options": {
+          "command": "bun test --timeout=0 ./src/__tests__/cache-server-host.test.ts ./src/__tests__/process-host.test.ts ./src/__tests__/store-host.test.ts",
           "cwd": "{projectRoot}",
           "fixtureCommand": "bun --preload @smoothbricks/lmao/bun/preload scripts/warm-ttsc-plugins.mjs",
           "fixtureTimeoutMs": 600000,

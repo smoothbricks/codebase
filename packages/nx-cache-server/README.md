@@ -68,17 +68,19 @@ lifecycle only.
 ## Library API and retention
 
 The root export provides `cacheServerConfigFromEnv`, `CacheServerConfig`, `startCacheServer`, `RunningCacheServer`,
-`openCacheStore`, `stageEntry`, `publishEntry`, `readEntry`, `directoryStore`, `sweep`, and `sweepDirectory`.
-`startCacheServer(config)` returns `{ ok: true, server }` or `{ ok: false, stage, directory, reason }`; a `store-locked`
-failure also carries `path`. A running server provides `origin`, `port`, `reclaimedStagingFiles`, and asynchronous
-`stop()`. `stageEntry` returns `ready` (a verified `CompleteUpload`), `incomplete` (received bytes), or `failed`
-(reason). `publishEntry(store, upload)` atomically publishes that complete value and returns `stored`, `exists`, or
-`failed`. Terminal outcomes carry `stagingRetained`: admission accounting may be released only after cleanup removed the
-file. `readEntry` returns a pinned inode stream and byte count, `missing`, or `failed`; unlinking an archive cannot
-truncate an already-opened GET. `sweepDirectory(store, capBytes, protectedKey?)` takes an owned `CacheStore`, not a bare
-path, and returns `{ ok: true, outcome }` or `{ ok: false, reason }`. The standalone
-`bun src/gc.ts <entries-dir> <positive-cap-bytes>` CLI acquires the store lease and passes its store; callers must not
-run it beside a live server.
+`openCacheStore`, `stageEntry`, `publishEntry`, `readEntry`, `directoryStore`, `sweep`, `sweepRing`, and
+`openRetention`. `startCacheServer(config)` returns `{ ok: true, server }` or `{ ok: false, stage, directory, reason }`;
+a `store-locked` failure also carries `path`. A running server provides `origin`, `port`, `reclaimedStagingFiles`, and
+asynchronous `stop()`. `stageEntry` returns `ready` (a verified `CompleteUpload`), `incomplete` (received bytes), or
+`failed` (reason). `publishEntry(store, upload)` atomically publishes that complete value and returns `stored`,
+`exists`, or `failed`. Terminal outcomes carry `stagingRetained`: admission accounting may be released only after
+cleanup removed the file. `readEntry` returns a pinned inode stream and byte count, `missing`, or `failed`; unlinking an
+archive cannot truncate an already-opened GET. `openRetention(store, capBytes)` takes an owned `CacheStore`, not a bare
+path: it lists the store once, sweeps it to its cap and returns `{ ok: true, retention, opened }` or
+`{ ok: false, reason }`. `retention.admit(key)` accounts the archive just published at `key` and returns
+`{ ok: true, outcome, listed }` or `{ ok: false, reason }`; `outcome` counts the archives it `examined`, `cleared`,
+`deleted` and found `missing`. The standalone `bun src/gc.ts <entries-dir> <positive-cap-bytes>` CLI acquires the store
+lease and sweeps once; callers must not run it beside a live server.
 
 `openCacheStore(directory)` returns `{ ok: true, store }` or `{ ok: false, kind: 'store-locked', path }`. A successful
 store has an async `close()`, and callers must close it after all use. Other low-level IO or errno errors propagate to
@@ -87,9 +89,13 @@ already-held lease, and nothing sweeps the store concurrently.
 
 Parallel streams produce complete staged values. One serialized publication section hard-links each value without
 replacement and sweeps SIEVE before successful completion; no publication interleaves another commit's sweep. Startup
-also sweeps. Each completed successful commit enforces the published archive-length cap before replying 200. SIEVE
-orders by mtime, reads `atime > mtime` as the visited bit, and clears it by restoring atime to mtime. A real APFS GET
-left atime unchanged, so GET explicitly marks the pinned inode when clear, retaining the modification-time cursor.
+lists the store once and sweeps; the ring that listing built (each archive's path, mtime and length, in insertion order,
+with their sum and the hand) is held for the life of the lease. A publication adds its one archive to it and, only when
+the sum exceeds the cap, walks from the hand reading the visited bit of each archive it examines, until enough is freed.
+A sweep that fails discards the ring, and the next publication lists again. Each completed successful commit enforces
+the published archive-length cap before replying 200. SIEVE orders by mtime, reads `atime > mtime` as the visited bit,
+and clears it by restoring atime to mtime. A real APFS GET left atime unchanged, so GET explicitly marks the pinned
+inode when clear, retaining the modification-time cursor.
 
 Uploads reserve their declared lengths before streaming from an independent staging budget, also `capBytes`. Full
 staging admission returns 403; there is no admission queue or retry service. Reservations cover streaming and completed

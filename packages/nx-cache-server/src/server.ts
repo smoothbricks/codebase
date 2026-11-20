@@ -16,7 +16,7 @@
  */
 
 import { type CacheServerConfig, HOST } from './config.js';
-import { sweepDirectory } from './gc.js';
+import { openRetention } from './gc.js';
 import { logLine, logValue } from './log.js';
 import {
   type CacheStore,
@@ -109,23 +109,24 @@ export async function startCacheServer(config: CacheServerConfig): Promise<Cache
     };
   }
   const store = opened.store;
-  const initial = await sweepDirectory(store, config.capBytes);
-  if (!initial.ok) {
+  const retained = await openRetention(store, config.capBytes);
+  if (!retained.ok) {
     await store.close();
-    return { ok: false, stage: 'gc', directory: config.directory, reason: initial.reason };
+    return { ok: false, stage: 'gc', directory: config.directory, reason: retained.reason };
   }
+  const { retention } = retained;
   const admission: UploadAdmission = { reservedBytes: 0 };
   let publishing = Promise.resolve();
   function publish(upload: CompleteUpload): Promise<StoreOutcome> {
     const next = publishing.then(async () => {
       const outcome = await publishEntry(store, upload);
       if (outcome.kind !== 'stored') return outcome;
-      const retained = await sweepDirectory(store, config.capBytes, upload.key);
-      return retained.ok
+      const swept = await retention.admit(upload.key);
+      return swept.ok
         ? outcome
         : ({
             kind: 'failed',
-            reason: retained.reason,
+            reason: swept.reason,
             stagingRetained: outcome.stagingRetained,
           } satisfies StoreOutcome);
     });
@@ -138,7 +139,7 @@ export async function startCacheServer(config: CacheServerConfig): Promise<Cache
       port: config.port,
       maxRequestBodySize: FRAMING_CEILING,
       // A paused upload keeps its connection. Bun's default closes a request idle for 10 s: an Nx upload
-      // stalled on a loaded host lost its bytes with a 500, and process.test.ts's drain case, whose
+      // stalled on a loaded host lost its bytes with a 500, and process-host.test.ts's drain case, whose
       // upload waits on purpose, hung on the staged file that close removed. The listener is
       // loopback-only, so a client that dies closes its socket in the kernel and frees its reservation.
       idleTimeout: 0,

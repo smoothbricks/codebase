@@ -625,9 +625,15 @@ explicitly marks the opened inode's visited bit when clear so SIEVE does not deg
 modification-time cursor through `utimes`; it never retimes a path that could name a replacement inode. No shared live
 cache database is introduced. Streaming stages proceed in parallel. Complete staged values enter one serialized
 publication section: never-replace hard link, then SIEVE sweep, then successful completion. No publication interleaves a
-sweep's listing and cap enforcement. A sweep also runs before listening. Each successful commit restores the configured
-`capBytes` sum of published archive lengths before replying 200. `maxBytes` independently bounds one upload and cannot
-exceed `capBytes`.
+sweep's cap enforcement. A sweep also runs before listening, and it is the one that lists the store: the ring it reads
+(each archive's path, mtime and length in insertion order, their sum, and the hand) is held in the backend's memory
+under the store lease, which excludes every other writer of the directory. A publication adds its one archive to the
+ring and lists nothing. Only when the sum exceeds `capBytes` does its sweep walk from the hand, and it reads the visited
+bit from the inode of each archive it examines, so the filesystem stays the only record of a read and the work of a
+commit is bounded by the archives it evicts or spares. A sweep that fails discards the ring; the next commit lists the
+store again. The ring is derived state, never persisted: a restart rebuilds it from the directory and `sieve.hand`. Each
+successful commit restores the configured `capBytes` sum of published archive lengths before replying 200. `maxBytes`
+independently bounds one upload and cannot exceed `capBytes`.
 
 The sweep never evicts the archive its own commit just published. The protected just-linked key remains in used-byte
 accounting, while other keys undergo SIEVE. Each PUT 200 still has its own archive immediately retrievable. There is no

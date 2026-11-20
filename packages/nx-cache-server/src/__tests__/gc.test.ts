@@ -8,6 +8,10 @@ function memoryStore(initial: readonly Entry[]): Store & { readonly entries: Ent
     async list() {
       return [...entries];
     },
+    async visited(archive) {
+      const held = entries.find((e) => e.path === archive.path);
+      return held === undefined ? undefined : held.atimeMs > held.mtimeMs;
+    },
     async clearVisited(entry) {
       const i = entries.findIndex((e) => e.path === entry.path);
       entries[i] = { ...entry, atimeMs: entry.mtimeMs };
