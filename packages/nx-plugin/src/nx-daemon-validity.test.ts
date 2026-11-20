@@ -25,7 +25,8 @@ import { awaitExit, isRunning, type ProcessEntry, processesOf, processTree, term
  *
  * Each test runs a real daemon in a fixture workspace and asserts only what a client, a watcher, or the filesystem can
  * observe. Restarts are awaited on the record directory, and readiness on an actual PING answer, not a filesystem event.
- * The one real-clock observation window is the idle walk in the last test.
+ * The real-clock observation windows are the idle walk in the last test and the unchanged linked plugin's safety
+ * interval.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
@@ -43,6 +44,8 @@ const FIXTURE_WORKSPACE = 'workspace';
 const OBSERVATION_MS = 6_000;
 /** How long a client waits for its daemon's successor: `WAIT_FOR_SERVER_CONFIG` in `daemon/client/client.js`. */
 const RECONNECT_WINDOW_MS = 60_000;
+/** What the daemon logs once it has judged a full census of a linked plugin's published files. */
+const LINKED_CENSUS = '[Server] linked plugin census';
 
 interface DaemonRecord {
   readonly processId: number;
@@ -1143,6 +1146,120 @@ it('restarts a daemon once a file a linked plugin publishes changes its bytes, i
       // The checkout's lockfile selects the plugin's dependencies, so its change restarts the daemon as well.
       await writeFile(first.lock, 'checkout lock two\n');
       await replaced(daemon, "the linked plugin checkout's lockfile changing");
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
+
+/** The number of lines of `log` that hold `needle`, once it exceeds `taken`: each write to the log is judged. */
+async function logLinesAfter(log: string, needle: string, taken: number, what: string): Promise<number> {
+  const stop = new AbortController();
+  const lines = async () => (await readFile(log, 'utf8')).split('\n').filter((line) => line.includes(needle)).length;
+  const found = whenFound(
+    log,
+    async () => {
+      const count = await lines();
+      return count > taken ? count : null;
+    },
+    stop.signal,
+  );
+  try {
+    return await guardEvent(found, what, () => `${log} holds no more than ${taken} lines naming ${needle}`);
+  } finally {
+    stop.abort();
+    await found.catch((error: unknown) => {
+      if (error !== stop.signal.reason) throw error;
+    });
+  }
+}
+
+/**
+ * A linked plugin's full census (npm-packlist's walk of the package, then the stat of every file it publishes) is what
+ * finds a published file added beside the known ones; a request judges the known ones by their stats. Taken on the
+ * safety interval, it walked an unchanged package every 5 s for each kept daemon's whole life: a consumer's daemon spent
+ * 31.6% of its CPU in that walk (1,468 scandir and 6,136 lstat calls in 45 s) while nothing in the package changed. A
+ * file added or removed changes the entries of its directory, so the census runs once a directory of the package, or
+ * the checkout holding its lockfiles, has moved, and every published change still restarts the daemon.
+ */
+it('takes a linked plugin census only once its package directories move, and restarts for every published change', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-census-',
+    async ({ root, socketDirectory, workspace }) => {
+      const checkout = await linkedPluginCheckout(root, 'checkout');
+      await fixtureWorkspace(workspace, join(repositoryRoot, 'node_modules', 'nx'));
+      await symlink(checkout.plugin, join(workspace, 'node_modules', 'linked-plugin'), 'dir');
+      await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['linked-plugin'] }));
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      const log = join(dirname(recordPath(workspace)), 'daemon.log');
+      const censuses = async () =>
+        (await readFile(log, 'utf8')).split('\n').filter((line) => line.includes(LINKED_CENSUS)).length;
+      const serves = async (daemon: Daemon, what: string) => {
+        expect(
+          await requestOnce(daemon.record.socketPath, ping(workspace), `a PING after ${what}`),
+          `${what} was refused`,
+        ).toEqual({ answered: true, message: true });
+        expect(await recordedPid(workspace), `${what} replaced the daemon`).toBe(daemon.record.processId);
+      };
+      // The census that finds an added file runs beside the request that saw its directory move, so the daemon's
+      // replacement is awaited, not that request's refusal.
+      const replaced = async (daemon: Daemon, what: string, change: () => Promise<void>) => {
+        const record = await replacementAfter({
+          workspace,
+          previous: daemon.record.processId,
+          what: `a successor after ${what}`,
+          action: async () => {
+            await change();
+            await requestOnce(daemon.record.socketPath, ping(workspace), `a PING after ${what}`);
+          },
+        });
+        await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after ${what}`);
+        return readyDaemon(workspace, record);
+      };
+      let daemon = await startDaemon(workspace, env);
+      const baseline = await censuses();
+      expect(baseline, 'the daemon judged no baseline census of its linked plugin').toBe(1);
+      // npm leaves version-control metadata out: a .git directory appearing moves the package root once, and the
+      // writes inside it move nothing.
+      await mkdir(join(checkout.plugin, '.git'));
+      await serves(daemon, 'a .git directory appearing in the linked plugin');
+      expect(
+        await logLinesAfter(log, LINKED_CENSUS, baseline, 'the census of the package that gained a .git directory'),
+      ).toBe(baseline + 1);
+      await writeFile(join(checkout.plugin, '.git', 'index'), 'one\n');
+      await writeFile(join(checkout.plugin, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+      // A census logs only once its walk ends, so absence is judged a safety interval later: the requests on either
+      // side of it judge the known files alone, and any census they or the interval started has logged by then.
+      await serves(daemon, "writes inside the linked plugin checkout's .git");
+      await sleep(OBSERVATION_MS);
+      await serves(daemon, 'an unchanged linked plugin, a safety interval later');
+      expect(await censuses(), 'the unchanged linked plugin was walked again').toBe(baseline + 1);
+      // A file the package does not publish moves its directory: one census, which finds nothing of the plugin's.
+      await writeFile(join(checkout.plugin, 'dist', 'added.test.js'), '// another test, never published\n');
+      await serves(daemon, 'a file the linked plugin does not publish appearing');
+      expect(
+        await logLinesAfter(
+          log,
+          LINKED_CENSUS,
+          baseline + 1,
+          'the census of a directory that gained an unpublished file',
+        ),
+      ).toBe(baseline + 2);
+      await serves(daemon, 'the census of a file the linked plugin does not publish');
+      // Every file the package publishes is the plugin's: added, added under a new directory, or removed.
+      daemon = await replaced(daemon, 'a published file added to the linked plugin', () =>
+        writeFile(join(checkout.plugin, 'dist', 'added.js'), '// added\n'),
+      );
+      // One census at a time: a census the request after the unpublished file's census had started would have logged
+      // before the one that found added.js, so the total holds exactly the baseline, .git, the unpublished file,
+      // added.js and the successor's baseline.
+      expect(await censuses(), 'a census ran for a change no published file made').toBe(baseline + 4);
+      daemon = await replaced(daemon, 'a published file added under a new directory', async () => {
+        await mkdir(join(checkout.plugin, 'dist', 'nested'));
+        await writeFile(join(checkout.plugin, 'dist', 'nested', 'deep.js'), '// nested\n');
+      });
+      await replaced(daemon, 'a published file removed from the linked plugin', () =>
+        unlink(join(checkout.plugin, 'dist', 'added.js')),
+      );
     },
     FIXTURE_WORKSPACE,
   );

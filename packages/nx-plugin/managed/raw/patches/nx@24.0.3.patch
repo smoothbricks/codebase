@@ -1933,7 +1933,7 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..66d6e21694a0a8607e7841167dd8d31c
 +/** Stops the daemon, naming `reason` in its log: its file watcher stopped delivering. */
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
-index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc0805f8e936 100644
+index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c09017664d71cf3b 100644
 --- a/dist/src/daemon/server/restart-checks.js
 +++ b/dist/src/daemon/server/restart-checks.js
 @@ -1,22 +1,47 @@
@@ -1999,7 +1999,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc08
      for (const path of paths) {
          const basename = path.slice(path.lastIndexOf('/') + 1);
          if (IGNORE_FILE_NAMES.includes(basename)) {
-@@ -54,24 +81,451 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
+@@ -54,24 +81,544 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
      }
      return false;
  }
@@ -2106,8 +2106,9 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc08
 +    lockFileHash = hashLockFiles();
 +    const roots = linkedPluginRoots() ?? [];
 +    linkedPluginRootKey = JSON.stringify(roots);
++    linkedPluginTree = linkedPluginTreeOf(roots);
 +    linkedPluginFiles = hashCensus(await linkedPluginCensus(roots), new Map());
-+    linkedPluginCensusAt = Date.now();
++    logger_1.serverLogger.log(`[Server] linked plugin census (baseline): ${linkedPluginFiles.size} files`);
 +}
 +function lockFileHashChanged() {
 +    const newHash = hashLockFiles();
@@ -2130,14 +2131,20 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc08
 +// bytes restart the daemon. Files are keyed by plugin and package-relative
 +// path, so a link moved to a copy with the same bytes keeps the daemon. A
 +// request resolves each link and stats the files already known at the link's
-+// current target; a moved link, and at most once per safety interval anyway,
-+// starts the full census in the background, which finds a file added beside
-+// them and restarts the daemon when one changed. A package inside the
-+// workspace changes only with its lockfile.
++// current target, and the directories of its package and its checkout (the
++// census tree, below). A moved link, or a directory whose entries moved, starts
++// the full census in the background, which finds a file added beside the known
++// ones and restarts the daemon when one changed. No timer starts it: a file
++// added, removed or renamed moves the entries of its directory, so an unmoved
++// tree is an unchanged published set. A package inside the workspace changes
++// only with its lockfile.
 +let linkedPluginRootKey;
 +let linkedPluginFiles;
-+let linkedPluginCensusAt = 0;
++let linkedPluginTree;
 +let linkedPluginCensusRunning = false;
++// When the last census failed: the next one waits a safety interval, so a
++// census that keeps failing is retried on that bound, not on every request.
++let linkedPluginCensusFailedAt = -Infinity;
 +const linkedPluginCheckouts = new Map();
 +const linkedPluginsWithoutPacklist = new Set();
 +function pluginSpecifiers() {
@@ -2198,6 +2205,103 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc08
 +    else if (stat.isFile()) {
 +        census.set(`${prefix}${(0, path_1.relative)(base, path)}`, { path, stat: statKey(stat) });
 +    }
++}
++// The files whose bytes, beside the ones a package publishes, decide what npm
++// publishes of it: npm-packlist reads each directory's rules from them.
++const PUBLISH_RULE_FILES = ['package.json', '.npmignore', '.gitignore'];
++// The directories the census never enters: npm-packlist always leaves out
++// version-control metadata (the `defaults` of npm-packlist's lib/index.js), and
++// the census leaves out `node_modules`. A `.git` that moves on every commit
++// never moves the tree.
++const UNPUBLISHED_DIRECTORIES = ['node_modules', '.git', '.svn', '.hg', 'CVS'];
++// A path's stat as the census tree records it: its statKey, or the code of the
++// error that stopped the read. An entry that stays unreadable stays unmoved; one
++// that turns readable or unreadable has moved.
++function treeStat(path) {
++    try {
++        const stat = (0, fs_1.statSync)(path, { bigint: true });
++        return { stat, key: statKey(stat) };
++    }
++    catch (error) {
++        if (typeof error?.code !== 'string') throw error;
++        return { stat: null, key: `error:${error.code}` };
++    }
++}
++// Adds every directory under `path` (following links, each directory once,
++// UNPUBLISHED_DIRECTORIES left out) and each publish-rule file in them to
++// `tree`, keyed by `prefix` and its path relative to `base`, with its tree stat.
++// A directory that cannot be listed keeps its stat alone: its removal, or a
++// change of its mode, moves that stat.
++function addTree(tree, prefix, base, path, seen) {
++    const { stat, key } = treeStat(path);
++    if (stat !== null && !stat.isDirectory()) return;
++    tree.set(`${prefix}${(0, path_1.relative)(base, path)}/`, { path, stat: key });
++    if (stat === null) return;
++    const directory = `${stat.dev}:${stat.ino}`;
++    if (seen.has(directory)) return;
++    seen.add(directory);
++    let entries;
++    try {
++        entries = (0, fs_1.readdirSync)(path, { withFileTypes: true });
++    }
++    catch (error) {
++        if (typeof error?.code !== 'string') throw error;
++        return;
++    }
++    for (const entry of entries) {
++        if (UNPUBLISHED_DIRECTORIES.includes(entry.name)) continue;
++        const child = (0, path_1.join)(path, entry.name);
++        if (entry.isDirectory() || entry.isSymbolicLink()) {
++            addTree(tree, prefix, base, child, seen);
++        }
++        else if (PUBLISH_RULE_FILES.includes(entry.name)) {
++            tree.set(`${prefix}${(0, path_1.relative)(base, child)}`, { path: child, stat: treeStat(child).key });
++        }
++    }
++}
++// The census tree of each linked plugin: what decides which files it publishes
++// and which lockfiles its checkout holds. Every directory of the package and
++// its publish-rule files, and the checkout's own directory, whose entries move
++// when a lockfile appears or goes.
++function linkedPluginTreeOf(roots) {
++    const tree = new Map();
++    for (const [name, root] of roots) {
++        addTree(tree, `${name}\0`, root, root, new Set());
++        const checkout = checkoutOf(root);
++        tree.set(`${name}\0checkout\0`, { path: checkout, stat: treeStat(checkout).key });
++    }
++    return tree;
++}
++// The first entry of the census tree whose tree stat moved, described; null
++// when none did.
++function linkedPluginTreeMoved() {
++    for (const { path, stat } of linkedPluginTree.values()) {
++        const now = treeStat(path).key;
++        if (now !== stat) return `${path} moved (${stat} -> ${now})`;
++    }
++    return null;
++}
++// Takes the full census in the background, for `reason`. The tree is read
++// before npm-packlist walks the package, so a directory that moves during the
++// walk differs from it and the next request takes another census. Only a
++// census that completes adopts its tree and its links: one that fails leaves
++// both as they were, so the move that asked for it asks again once a safety
++// interval has passed.
++function takeLinkedPluginCensus(roots, rootKey, reason) {
++    const tree = linkedPluginTreeOf(roots);
++    linkedPluginCensusRunning = true;
++    linkedPluginCensus(roots).then((census) => {
++        linkedPluginCensusRunning = false;
++        linkedPluginRootKey = rootKey;
++        linkedPluginTree = tree;
++        const change = judgeLinkedPlugins(census);
++        logger_1.serverLogger.log(`[Server] linked plugin census (${reason}): ${census.size} files, ${change ?? 'unchanged'}`);
++        if (change !== null) restartForLinkedPlugin(change);
++    }, (error) => {
++        linkedPluginCensusRunning = false;
++        linkedPluginCensusFailedAt = performance.now();
++        logger_1.serverLogger.log(`[Server] the linked plugin census (${reason}) failed and is taken again after ${exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS}ms; until then a file added beside the known ones is not seen: ${error.message}`);
++    });
 +}
 +// The checkout a linked package lives in: the nearest directory above it that
 +// holds a lockfile, or the file system's root.
@@ -2317,27 +2421,16 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..aca2e9b4948f89ef074e1b0ac609bc08
 +    return change;
 +}
 +// The first linked plugin file whose bytes moved since the baseline among the
-+// files already known, described; null when none did. A moved link, or the
-+// safety interval, starts the full census in the background.
++// files already known, described; null when none did. A moved link, or a moved
++// directory of the census tree, starts the full census in the background.
 +function linkedPluginsChanged() {
 +    if (linkedPluginFiles === undefined) return null;
 +    const roots = linkedPluginRoots();
 +    if (roots === null) return null;
 +    const rootKey = JSON.stringify(roots);
-+    const now = Date.now();
-+    if (!linkedPluginCensusRunning &&
-+        (rootKey !== linkedPluginRootKey || now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS)) {
-+        linkedPluginRootKey = rootKey;
-+        linkedPluginCensusAt = now;
-+        linkedPluginCensusRunning = true;
-+        linkedPluginCensus(roots).then((census) => {
-+            linkedPluginCensusRunning = false;
-+            const change = judgeLinkedPlugins(census);
-+            if (change !== null) restartForLinkedPlugin(change);
-+        }, (error) => {
-+            linkedPluginCensusRunning = false;
-+            logger_1.serverLogger.log(`[Server] the linked plugin census failed, so a file added beside the known ones is not seen before the next census: ${error.message}`);
-+        });
++    if (!linkedPluginCensusRunning && performance.now() - linkedPluginCensusFailedAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS) {
++        const reason = rootKey !== linkedPluginRootKey ? 'a link moved' : linkedPluginTreeMoved();
++        if (reason !== null) takeLinkedPluginCensus(roots, rootKey, reason);
 +    }
 +    return judgeLinkedPlugins(knownFileStats(roots));
 +}

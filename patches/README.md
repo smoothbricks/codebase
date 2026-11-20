@@ -480,14 +480,23 @@ decides what is published: npm-packlist, resolved from that checkout, reads `fil
 `npm pack` does, so a test the package keeps beside its sources but does not publish never restarts a consumer's daemon.
 A package whose manifest does not parse, or whose checkout installs no npm-packlist, is judged whole, and the daemon log
 says so once. A request resolves each plugin's link, stats the files already known at the link's current target and
-re-hashes only one whose stat moved; a moved link, and at most once per safety interval anyway, starts the full census
-in the background, which finds a file added beside them and restarts the daemon when a file changed. Only changed bytes
-restart the daemon (`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files, or a link moved to a copy with
-the same bytes, keeps it. A plugin package installed inside the workspace changes only with its lockfile and is not
-watched this way. A local plugin is one whose entry resolves to source inside the checkout, outside `node_modules`. A
-module loaded into a process cannot be evicted: purging `require.cache` does not unload an ESM module, so a local plugin
-would keep serving the code it first loaded after its source changed. Where it loads decides what a change to it
-replaces:
+re-hashes only one whose stat moved. It also stats the census tree: every directory of the package (`node_modules` and
+the version-control directories npm-packlist leaves out by default, `.git`, `.svn`, `.hg` and `CVS`, left out), each
+`package.json`, `.npmignore` and `.gitignore` in them, and the checkout's own directory. A file added, removed or
+renamed moves the entries of its directory, so an unmoved tree is an unchanged published set. A path the daemon cannot
+read is recorded by its error, so it moves only when it turns readable or its error changes. A moved link or a moved
+tree entry starts the full census in the background, which finds a file added beside the known ones and restarts the
+daemon when a file changed; nothing else starts it, so its cost follows the package's directory changes (a rebuild that
+creates or removes files, once per request that sees them), not a clock. Only a census that completes adopts its tree
+and link; one that fails is taken again once a safety interval has passed. Taken on the safety interval instead, it
+walked an unchanged package every 5 s for each kept daemon's life: a consumer's kept daemon spent 31.6% of its CPU in
+that walk (1,468 `scandir` and 6,136 `lstat` calls in 45 s). The daemon log names each census and its reason. Only
+changed bytes restart the daemon (`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files, or a link moved
+to a copy with the same bytes, keeps it. A plugin package installed inside the workspace changes only with its lockfile
+and is not watched this way. A local plugin is one whose entry resolves to source inside the checkout, outside
+`node_modules`. A module loaded into a process cannot be evicted: purging `require.cache` does not unload an ESM module,
+so a local plugin would keep serving the code it first loaded after its source changed. Where it loads decides what a
+change to it replaces:
 
 - **A Node daemon with isolation off (`NX_ISOLATE_PLUGINS=false`) holds every local plugin in its own process**, as it
   holds the installed ones, and starts no worker (`holdLocalPlugin`). The daemon registers the Node load hook once and
