@@ -4,6 +4,11 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
+[[package.metadata.wiring.external]]
+item = "merge_tree_paths"
+consumer = "private"
+why = "a trusted controller probes an uncommitted checkout tree against a newer target without publishing a ref"
+
 # Earlier hosted-CI sizing measured a 3-core macOS runner ~1.85x slower, with three Nx tasks
 # competing for its cores and ~13s of archive extraction per batch. Three shards ran out
 # 101.9s in with 35 tests left; five were chosen for that workload.
