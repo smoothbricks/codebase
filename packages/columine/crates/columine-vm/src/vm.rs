@@ -3305,6 +3305,7 @@ fn single_struct_map2_upsert_tuple<I: KeyIndex, S: InternBytes + ?Sized>(
         key2,
         vals.cols(),
         vals.fields(),
+        &[],
         cols,
         valid,
         element_idx,
