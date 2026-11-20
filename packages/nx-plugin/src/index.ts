@@ -2151,7 +2151,8 @@ async function createProjectTargets(
     if (!isRecord(declaration) || declaration.executor !== '@smoothbricks/nx-plugin:bounded-exec') continue;
     const options = declaration.options;
     if (!isRecord(options) || !isRecord(options.nativeTest)) continue;
-    const target = (targets[name] ??= {});
+    targets[name] ??= {};
+    const target = targets[name];
     target.executor = '@smoothbricks/nx-plugin:bounded-exec';
     target.cache ??= true;
     target.metadata = { ...target.metadata, ...CARGO_PRODUCER_METADATA, smooTaskKind: 'test' };

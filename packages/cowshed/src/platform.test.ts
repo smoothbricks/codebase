@@ -82,7 +82,7 @@ function cliBuildOf(target: Target, configuration: string | undefined): { triple
     return { triple, tree };
   }
   const command = options.command;
-  if (command === undefined || !command.includes('--bin cowshed')) {
+  if (command === undefined || !/(?:^|\s)--bin(?:\s+|=)(?:cowshed|'cowshed'|"cowshed")(?=\s|$)/.test(command)) {
     return null;
   }
   const triple = /--target (\S+)/.exec(command)?.[1];
@@ -132,6 +132,13 @@ describe('platform target table', () => {
       expect(development[target.cli.triple]).toBe(`.cache/bin/${target.cli.directory}`);
       expect(production[target.cli.triple]).toBe(`dist/bin/${target.cli.directory}`);
     }
+  });
+
+  it('does not count the APFS sweep executable as a platform CLI build', () => {
+    const sweep = manifest.nx.targets['apfs-test-sweep-bin'];
+    if (sweep === undefined) throw new Error('the APFS sweep artifact has no producer');
+    expect(cliBuildOf(sweep, undefined)).toBeNull();
+    expect(cliBuildOf(sweep, 'production')).toBeNull();
   });
 
   it('refuses a host it does not ship for', () => {
