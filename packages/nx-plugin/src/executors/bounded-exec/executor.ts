@@ -46,6 +46,14 @@ import {
 } from './mbx-pool.js';
 import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
 import { killedFromOutside, type RunOutcome, runUntilNotKilledForMemory } from './memory-retry.js';
+import {
+  type Capture,
+  closeCapture,
+  handOffMutationReport,
+  MUTATION_REPORT_ENV,
+  openCapture,
+  TASK_ARTIFACTS_ENV,
+} from './mutation-report.js';
 import { FIXTURE_DIRECTORY_ENV, nativeTestPhases } from './native-test.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
@@ -474,6 +482,7 @@ async function runCommand(
   let lease: RamTempLease | null = null;
   let ordinaryTemp: string | null = null;
   let fixtureDirectory: string | undefined;
+  let mutationCapture: Capture | undefined;
   // Before spawn there is nothing to retire. Once started, only the owner's terminal retirement permits deletion.
   let subtreeRetired = true;
   // A lease is removed when its command ends, so it is taken only where whatever the command leaves
@@ -571,6 +580,31 @@ async function runCommand(
   const releaseLease = (keep: boolean): Promise<void> => {
     tempReleased ??= (async () => {
       await retireSubtree();
+      if (mutationCapture !== undefined) {
+        const capture = mutationCapture;
+        mutationCapture = undefined;
+        const tool = options.mutationReport;
+        if (owner !== null && !subtreeRetired) {
+          lifecycleFailure ??= {
+            kind: 'executor',
+            message: `the mutation report was not handed off: the command subtree was not retired; its capture is retained at ${capture.path}`,
+          };
+          tell(`bounded-exec: ${lifecycleFailure.message}\n`);
+        } else if (tool !== undefined) {
+          const handed = await handOffMutationReport(tool, capture, process.env);
+          if (handed.kind === 'refused') {
+            lifecycleFailure ??= {
+              kind: 'executor',
+              message: `the ${tool} report was not handed off: ${handed.reason}`,
+            };
+            tell(`bounded-exec: ${lifecycleFailure.message}\n`);
+          }
+          await rm(capture.path, { recursive: true, force: true }).catch((error: unknown) =>
+            tell(`bounded-exec: could not remove the mutation report capture at ${capture.path}: ${String(error)}\n`),
+          );
+        }
+        closeCapture(capture);
+      }
       if (fixtureDirectory !== undefined) {
         const path = fixtureDirectory;
         fixtureDirectory = undefined;
@@ -959,6 +993,14 @@ async function runCommand(
       env[FIXTURE_DIRECTORY_ENV] = fixtureDirectory;
     } catch (error) {
       return refuse(`bounded-exec: could not create fixture scratch: ${String(error)}\n`);
+    }
+  }
+  if (options.mutationReport !== undefined) {
+    try {
+      mutationCapture = await openCapture(lease?.directory ?? ordinaryTemp ?? tmpdir());
+      env[MUTATION_REPORT_ENV] = mutationCapture.path;
+    } catch (error) {
+      return refuse(`bounded-exec: could not create the mutation report capture: ${String(error)}\n`);
     }
   }
   const results = directory === null ? null : await createTestResultWriter(directory, { cwd, root: context.root });
@@ -1704,12 +1746,16 @@ function mergeEnv(directory: string | null, env: Record<string, string>): NodeJS
   return directory === null ? { ...inherited, ...env } : { ...inherited, TMPDIR: directory, ...env };
 }
 
-/** The process's environment without the CPU pool's descriptor: a pool and its count only a grant may give. */
+/**
+ * The process's environment without the CPU pool's descriptor, a pool and its count only a grant may give, and without
+ * Nx's task-artifact directory, which is this executor's to write and never the command's.
+ */
 function withoutPoolEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const kept = { ...env };
   for (const name of POOL_ENV) {
     delete kept[name];
   }
+  delete kept[TASK_ARTIFACTS_ENV];
   return kept;
 }
 

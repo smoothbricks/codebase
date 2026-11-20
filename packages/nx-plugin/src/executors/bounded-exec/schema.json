@@ -63,6 +63,11 @@
       "minimum": 1,
       "description": "The fixture segment's own wall-clock ceiling in milliseconds: a build budget bounding only the fixture interval, never the command it prepares. Required with fixtureCommand."
     },
+    "mutationReport": {
+      "type": "string",
+      "enum": ["stryker", "cargo-mutants"],
+      "description": "The mutation tool whose report this run captures in a run-private directory inside the executor's scratch (BOUNDED_EXEC_MUTATION_REPORT_DIR, in the spawn's environment only) and hands to Nx as the execution's mutationReport task-result artifact (NX_TASK_ARTIFACTS_DIR) once its processes are retired; no declared output is written."
+    },
     "unitsCommand": {
       "type": "string",
       "description": "A shell command that prints one line per unit command runs (a test, a file), run at the end of the fixture segment, under its ceiling; refused without fixtureCommand. A leaf mbx's pool reserves for asks for no more cores than it prints lines, at least one. Its failure fails the run before anything is reserved."

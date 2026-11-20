@@ -31,6 +31,7 @@ import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
 import { MBX_QUEUE_POLL_MS } from './mbx-queue.js';
 import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.js';
+import { MUTATION_REPORT_ARTIFACT, MUTATION_REPORT_ENV, TASK_ARTIFACTS_ENV } from './mutation-report.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import { CPU_POOL_ENV, type InheritedCpuPool, readInheritedCpuPool } from './pool-environment.js';
@@ -182,6 +183,29 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain(join(workspace.root, 'package'));
     expect(result.terminalOutput).toContain('from-env');
+  });
+
+  it("hands a mutation run's report to Nx's artifact directory, which its command never sees", async () => {
+    const workspace = await createWorkspace();
+    const artifacts = await mkdtemp(join(tmpdir(), 'bounded-exec-artifacts-'));
+    // Nx makes the declared artifact's file; the executor writes into it.
+    await writeFile(join(artifacts, MUTATION_REPORT_ARTIFACT), '');
+    process.env[TASK_ARTIFACTS_ENV] = artifacts;
+    try {
+      // The report the command writes is what it saw of Nx's artifact directory.
+      const write = `require('node:fs').writeFileSync(process.env.${MUTATION_REPORT_ENV} + '/mutation.json', JSON.stringify({ saw: process.env.${TASK_ARTIFACTS_ENV} ?? null }))`;
+      const result = await runBoundedExec(
+        { command: `node -e "${write}"`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, mutationReport: 'stryker' },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+      );
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(await readFile(join(artifacts, MUTATION_REPORT_ARTIFACT), 'utf8')).toBe('{"saw":null}');
+    } finally {
+      delete process.env[TASK_ARTIFACTS_ENV];
+      await rm(artifacts, { recursive: true, force: true });
+    }
   });
 
   it.each([

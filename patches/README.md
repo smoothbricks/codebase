@@ -346,6 +346,60 @@ deadline and then answered with a real native artifact leaves the task's own ent
 given the cache directory overwrites it. Drop the hunk, and keep the test, once the pinned upstream version treats an
 unreachable cache as a miss ([nrwl/nx#36651](https://github.com/nrwl/nx/pull/36651) proposes it, unmerged).
 
+## A task's execution hands back its own artifacts
+
+A task's result is its exit code, terminal output and declared outputs. A tool's report about the run itself (a mutation
+report, say) has no custody of its own: a declared output is a file in the workspace that another clone, an earlier run
+or a restore can have written, and reading it back names no execution. Stock Nx has no channel from one execution to its
+result besides those.
+
+A target declares the artifacts its executions produce: `artifacts: ["<name>", ...]`, distinct names matching
+`^[A-Za-z][A-Za-z0-9_-]{0,63}$` (`TargetConfiguration.artifacts`, both JSON schemas). A declaration of anything else
+fails the task's run with its target named. Only an execution of a declaring target gets a fresh private directory
+(`mkdtemp`, mode 0700), named by `NX_TASK_ARTIFACTS_DIR` in that execution's spawn environment only: never an input,
+never in the hash, never shared, and any other execution's environment is unchanged. The orchestrator
+(`tasks-runner/task-artifacts.js`) makes each declared artifact's file in it itself (`O_CREAT | O_EXCL | O_NOFOLLOW`,
+mode 0600) and holds its descriptor; the execution writes into that file. After the execution each artifact is read back
+through the descriptor held since the file was made, never by a path: an entry or the directory swapped under its name,
+even swapped back, cannot turn the read to another file. An empty file is an artifact not produced; a file the execution
+removed or linked elsewhere is refused; all of them together are at most `MAX_ARTIFACT_BYTES` (64 MiB), refused by size
+before a byte is read. Everything not taken (an undeclared entry, a removed file, a file over the bound) is said in one
+warning naming the task and each reason; then the directory is removed. The artifacts ride the task's result to
+`postRunSteps` and `lifeCycle.endTasks` in a map with no prototype.
+
+`DbCache.put` writes a task's artifacts, when it has any, into the entry's `.nx-task-artifacts` sidecar with a manifest
+of sizes and SHA-256 digests, after the native put (which makes the entry's directory afresh, so no earlier sidecar
+survives) and before any remote store, so every transport that moves the entry moves them: the self-hosted HTTP cache
+archives the entry directory and a remote lookup moves its staged entry into place whole; the v1 adapter moves it under
+`outputs/`. The declaration is not part of the task hash (measured: adding `artifacts` keeps the hash), so an entry from
+before it carries the same hash. Only a declaring target's cache hit reads the sidecar (`cachedTaskArtifacts`, from the
+orchestrator's hit check): it bounds the manifest (64 KiB) and every artifact by its stated size before reading,
+verifies each digest and refuses a sidecar that is a link, and the hit stands only when the entry holds every declared
+artifact as its own property; otherwise the task runs. The manifest is written last, so a reader that races the put sees
+no sidecar or one without a manifest, a miss either way. A cached replay hands the entry's artifacts to `endTasks`.
+Restore copies declared outputs only, so the sidecar never reaches the workspace. A target that declares none hits,
+misses, stores and restores as before, without one sidecar call.
+
+Executions of one target in one clone are already serialized by the output lease ("Cross-client task output ownership"),
+held across the execution and its cache write, with the key looked up again under the lease.
+`@smoothbricks/nx-plugin:bounded-exec`'s `mutationReport` is the producer. It strips `NX_TASK_ARTIFACTS_DIR` from its
+command's environment, makes the run's capture directory and holds it open from that moment, and tells the command only
+its path. Once the run's processes are retired its capture reader (`capture-reader.ts`, on the executor's Bun) inherits
+that descriptor and reads the tool's fixed leaf beneath it with openat(2) (`open-beneath.ts`, `bun:ffi`; Node has none):
+each directory `O_DIRECTORY | O_NOFOLLOW` relative to the one before, the leaf `O_NOFOLLOW | O_NONBLOCK`, a regular file
+with one link refused by size before a byte is read. The tool is a closed selector (`stryker`, `cargo-mutants`) and its
+leaf fixed (`capture.ts`); the reader takes no path. Its bytes go into the `mutationReport` file Nx made, and a target
+that does not declare it is refused.
+
+`packages/nx-plugin/src/nx-task-artifacts.test.ts` guards the declaration, collection through held descriptors
+(undeclared entries, a replaced file, a directory swapped under its name holding a forged artifact, the aggregate
+bound), the sidecar (tampered bytes, malformed and oversized manifests, a linked sidecar, inherited names) and real Nx
+runs: a declaring target's artifact enters its cache entry and a self-hosted remote cache carries it to a clone with no
+local cache, a forged or missing artifact executes again, and a target that declares none sees no directory and gets no
+sidecar. `src/executors/bounded-exec/mutation-report.test.ts` guards the capture read: a capture swapped under its name
+holding a forged report is not read, and a linked leaf or directory, a FIFO and an oversized report are refused. Keep
+the hunk while Nx has no task-result channel of its own.
+
 ## A shed stores what is worth its bytes
 
 Stock Nx (23.2.1 through 24.0.3) has no policy on what its self-hosted client stores: after every executed task its

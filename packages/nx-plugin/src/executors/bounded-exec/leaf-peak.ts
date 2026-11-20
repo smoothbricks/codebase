@@ -44,14 +44,18 @@ export type PeakWaiter =
 
 /**
  * The Bun that runs this executor, else the first `bun` on the executor's own PATH, never one a target's environment
- * names: the waiter is the executor's, not the command's.
+ * names: the programs it runs (the peak waiter, the capture reader) are the executor's, not the command's.
  */
+export function executorBun(): string | null {
+  return process.versions.bun === undefined ? resolveOnPath('bun', process.env.PATH, process.cwd()) : process.execPath;
+}
+
+/** The waiter on {@link executorBun}, or why a leaf's peak goes unmeasured. */
 export function peakWaiter(): PeakWaiter {
   if (HOST_MEMORY === null) {
     return { kind: 'unmeasured', reason: `${process.platform} has no reader of a leaf's peak` };
   }
-  const runtime =
-    process.versions.bun === undefined ? resolveOnPath('bun', process.env.PATH, process.cwd()) : process.execPath;
+  const runtime = executorBun();
   return runtime === null
     ? { kind: 'unmeasured', reason: 'no bun is on PATH to wait on the command and read its rusage' }
     : { kind: 'waiter', runtime };
