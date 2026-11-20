@@ -1153,7 +1153,8 @@ attach cycles that prove its behavior. A run that killed a test leaves nothing a
 mounted RAW image and one read-only retained RAW input: panic drops the child's root, while a killed child's root is
 reclaimed by its keeper, whose exit the parent awaits on the kernel's exit event, never reclaiming it itself. The keeper
 is the declared native `cowshed-test-sweep` artifact in the checkout, or the instance next to a direct Cargo build's or
-archive's test binaries. A root is handed out only once its keeper has said on its stdout, within the handshake bound
+archive's test binaries. The standalone sweep uses its own executable for its scratch root's keeper, without a Cargo
+test process's environment. A root is handed out only once its keeper has said on its stdout, within the handshake bound
 (05_gateway.md, "Deadlines"), that it keeps that root; a root whose keeper cannot start, cannot keep, refuses the path
 or says nothing in time is torn down at construction, so no root a kill would leak is handed out. A keeper keeps and
 reclaims only a test namespace's own directory in the per-user root. Both its pipes are made under the exclusive fork

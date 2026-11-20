@@ -28,13 +28,13 @@ const TYPESCRIPT_EMIT = '@smoothbricks/nx-plugin:typescript-emit';
 const CARGO_ZIGBUILD = '@smoothbricks/nx-plugin:cargo-zigbuild';
 
 /**
- * A producer a Rust runner's run reads at run time and whose bytes reach its verdict (the model's `reads`): the target
- * that writes it, the files of it the run reads, the crates whose tests read them, and the file that reads them. A
- * producer the runner keys through the sources it is built from, not through its output (the test archive
- * `cargo-test-build` writes, which the runner keys by the Cargo closure that built it), is not listed: the key names it.
+ * A producer a Rust runner reads and whose bytes reach its verdict (the model's `reads`): the target
+ * that writes it, the files read, the crates or suite targets that read them, and the evidence of the read.
+ * The native test binaries and their invocation-local metadata are not outputs of another task.
  */
 interface RuntimeRead {
   readonly crates: readonly string[];
+  readonly targets?: readonly string[];
   readonly producer: { readonly project: string; readonly target: string };
   readonly glob: string;
   readonly evidence: string;
@@ -62,6 +62,19 @@ const RUNTIME_READS: readonly RuntimeRead[] = [
     glob: '**/capability-probe/diagnostics.json',
     evidence: 'cowshed-core/tests/public_api_contracts.rs:1501 CAPABILITY_VERDICT_FILE',
   },
+  {
+    crates: ['cowshed-apfs', 'cowshed-apfs-tests', 'cowshed-core', 'cowshed-cli'],
+    targets: ['cargo-test-group-real-apfs', 'cargo-test-group-real-apfs-host', 'integration-apfs'],
+    producer: { project: 'cowshed', target: 'apfs-test-sweep-bin' },
+    glob: 'packages/cowshed/.cache/apfs-test-sweep/cowshed-test-sweep',
+    evidence: 'cowshed-apfs/tests/support/scratch_apfs.rs keeper_executable and scripts/apfs-test-sweep.ts',
+  },
+  {
+    crates: ['cowshed-napi'],
+    producer: { project: 'cowshed', target: 'wire-fixtures' },
+    glob: 'packages/cowshed/src/wire-fixtures.json',
+    evidence: 'cowshed-napi/src/wire_contract.rs compiles the generated corpus into its test',
+  },
 ];
 
 /** The text a target runs: its `command`, or its `commands` in order. */
@@ -78,7 +91,12 @@ function commandOf(target: TargetConfiguration): string {
 function languageOf(target: TargetConfiguration): model.Lang {
   const command = commandOf(target);
   if (target.executor === TYPESCRIPT_EMIT || /^(tsc|bun build)\b/.test(command)) return { $: 'Ts' };
-  if (target.executor === CARGO_ZIGBUILD || /\b(cargo|napi build|just wasm)\b/.test(command)) return { $: 'Rust' };
+  if (
+    target.executor === CARGO_ZIGBUILD ||
+    target.options?.nativeTest !== undefined ||
+    /\b(cargo|napi build|just wasm)\b/.test(command)
+  )
+    return { $: 'Rust' };
   return { $: 'Other' };
 }
 
@@ -94,11 +112,16 @@ function writtenFiles(task: Task, target: TargetConfiguration): string[] {
     return [target.options.output.replaceAll('{projectRoot}', task.projectRoot ?? '')];
   }
   const command = commandOf(target);
+  const installedBin = /\bcargo\b.*--artifact-dir\b/.test(command)
+    ? /(?:^|\s)--bin\s+([\w-]+)/.exec(command)?.[1]
+    : undefined;
   let emitted = ['output'];
   if (target.executor === TYPESCRIPT_EMIT || /^tsc\b/.test(command)) emitted = ['index.js', 'index.d.ts'];
   else if (/\bnapi build\b/.test(command) && !/--bin\b/.test(command)) emitted = ['addon.node'];
   return task.outputs.flatMap((output) =>
-    /\.[A-Za-z0-9]+$/.test(posix.basename(output)) ? [output] : emitted.map((file) => `${output}/${file}`),
+    posix.basename(output) === installedBin || /\.[A-Za-z0-9]+$/.test(posix.basename(output))
+      ? [output]
+      : emitted.map((file) => `${output}/${file}`),
   );
 }
 
@@ -172,7 +195,9 @@ interface Judged {
 function rustRunners(graph: ProjectGraph): Runner[] {
   return Object.values(graph.nodes).flatMap((node) =>
     Object.entries(node.data.targets ?? {}).flatMap(([target, configuration]) =>
-      configuration.executor === BOUNDED_EXEC && /^cargo\b/.test(commandOf(configuration))
+      configuration.executor === BOUNDED_EXEC &&
+      (/^cargo\b/.test(commandOf(configuration)) ||
+        (isRecord(configuration.options?.nativeTest) && configuration.options?.command === undefined))
         ? [{ project: node.name, target, id: `${node.name}:${target}`, crate: packageNameFromCargoTestTarget(target) }]
         : [],
     ),
@@ -310,7 +335,10 @@ function judgedRunners(): Promise<readonly Judged[]> {
         graph,
         runner,
         named,
-        RUNTIME_READS.filter(({ crates }) => runner.crate !== null && crates.includes(runner.crate)),
+        RUNTIME_READS.filter(
+          ({ crates, targets }) =>
+            targets?.includes(runner.target) === true || (runner.crate !== null && crates.includes(runner.crate)),
+        ),
       ),
     );
   })();

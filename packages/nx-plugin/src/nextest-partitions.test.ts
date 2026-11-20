@@ -152,12 +152,16 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
         'oneline',
         '--user-config-file',
         'none',
+        '--color',
+        'never',
       ]);
       expect(result.code, result.output).toBe(0);
-      return result.output.split('\n').filter((line) => line.startsWith('partition-probe '));
+      return result.stdout.split('\n').filter((line) => line.startsWith('partition-probe '));
     };
     const before = await list(['--workspace']);
-    expect(before).toEqual(['partition-probe tests::workspace_feature_and_ignored_inventory']);
+    expect(before, 'nextest stdout must contain the ignored test in the workspace inventory').toEqual([
+      'partition-probe tests::workspace_feature_and_ignored_inventory',
+    ]);
     expect(await list(['-p', 'partition-probe'])).toEqual(before);
     await mkdir(await publishFixtureSocketDirectory(root), { recursive: true });
     shared = { root, targets };
@@ -491,6 +495,7 @@ function killProcessGroup(child: ChildProcess): void {
 interface Tracked {
   readonly code: number | null;
   readonly output: string;
+  readonly stdout: string;
 }
 
 async function runTracked(
@@ -508,9 +513,11 @@ async function runTracked(
   });
   child.stdin?.end();
   const output: Buffer[] = [];
+  const stdout: Buffer[] = [];
   const tee = options.tee ?? false;
   child.stdout?.on('data', (chunk: Buffer) => {
     output.push(chunk);
+    stdout.push(chunk);
     if (tee) process.stdout.write(chunk);
   });
   child.stderr?.on('data', (chunk: Buffer) => {
@@ -536,7 +543,7 @@ async function runTracked(
       `teardown began while ${args.join(' ')} ran; its output is printed above and its result is discarded`,
     );
   }
-  return { code, output: Buffer.concat(output).toString() };
+  return { code, stdout: Buffer.concat(stdout).toString(), output: Buffer.concat(output).toString() };
 }
 
 async function run(root: string, args: string[], overlay: Record<string, string> = {}): Promise<void> {

@@ -294,6 +294,11 @@ fn hear(
 /// alongside its test binaries. Both paths are in the checkout or build that actually runs the tests.
 fn keeper_executable() -> std::io::Result<PathBuf> {
     const NAME: &str = "cowshed-test-sweep";
+    let current = std::env::current_exe()?;
+    // The sweep keeps its own scratch root too; nextest setup is not a Cargo test process.
+    if current.file_name().is_some_and(|name| name == NAME) {
+        return Ok(current);
+    }
     if std::env::var_os("BOUNDED_EXEC_FIXTURE_DIR").is_some() {
         let manifest = std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
             std::io::Error::other("native test fixture has no Cargo manifest directory")
@@ -302,7 +307,6 @@ fn keeper_executable() -> std::io::Result<PathBuf> {
             .join("../../.cache/apfs-test-sweep")
             .join(NAME));
     }
-    let current = std::env::current_exe()?;
     current
         .ancestors()
         .skip(1)
