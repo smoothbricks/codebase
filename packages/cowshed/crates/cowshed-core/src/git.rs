@@ -44,6 +44,15 @@ pub const MAIN_REMOTE: &str = "main";
 /// it. Cowshed adds and lets the user remove; it never retargets a remote it did not create.
 pub const FALLBACK_MAIN_REMOTE: &str = "cowshed-main";
 
+/// Result of a confined `merge-tree --name-only -z` probe. A conflict is a Git verdict,
+/// not an inferred property of its path list.
+#[derive(Debug)]
+pub struct MergeTreePaths {
+    pub conflicted: bool,
+    /// NUL-terminated tree OID followed by NUL-terminated, unquoted conflicting path bytes.
+    pub stdout: Vec<u8>,
+}
+
 /// The config key that records "cowshed created this remote and may retarget it".
 ///
 /// Ownership has to be a written-down fact rather than one inferred from the URL. Inferring it
@@ -2304,16 +2313,9 @@ impl GitRepository {
         head: &str,
     ) -> Result<crate::landing::MergedTree> {
         self.require_commits([target, head]).await?;
-        let merge = self.merge_scratch().await?;
         let output = self
-            .run_merging(
-                &merge,
-                ["merge-tree", "--write-tree", "--no-messages", target, head],
-            )
-            .await;
-        let cleanup = merge.scratch.cleanup().await;
-        let output = output?;
-        cleanup?;
+            .scratch_merge(["merge-tree", "--write-tree", "--no-messages", target, head])
+            .await?;
         match output.status.code() {
             Some(0) => Ok(crate::landing::MergedTree::Clean(parse_oid(
                 parse_one_string(&output.stdout, "merge into the target")?,
@@ -2323,6 +2325,46 @@ impl GitRepository {
             Some(1) => Ok(crate::landing::MergedTree::Conflicted),
             _ => Err(git_internal("merge into the target", &output)),
         }
+    }
+
+    /// Merge an exact snapshot tree against `target` with an explicit common `base`. Like
+    /// [`Self::merged_tree`], this uses scratch objects and never runs a repository merge driver.
+    /// `treeish` need not be a commit: the caller may have snapshotted dirty and untracked files.
+    pub async fn merge_tree_paths(
+        &self,
+        base: &GitOid,
+        target: &GitOid,
+        treeish: &GitOid,
+    ) -> Result<MergeTreePaths> {
+        let base = format!("--merge-base={}", base.as_str());
+        let output = self
+            .scratch_merge([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                &base,
+                target.as_str(),
+                treeish.as_str(),
+            ])
+            .await?;
+        match output.status.code() {
+            Some(code @ (0 | 1)) => Ok(MergeTreePaths {
+                conflicted: code == 1,
+                stdout: output.stdout,
+            }),
+            _ => Err(git_internal("probe a snapshot merge", &output)),
+        }
+    }
+
+    async fn scratch_merge<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        let merge = self.merge_scratch().await?;
+        let output = self.run_merging(&merge, args).await;
+        let cleanup = merge.scratch.cleanup().await;
+        let output = output?;
+        cleanup?;
+        Ok(output)
     }
 
     /// The scratch object store a read-only merge writes into, in this repository's git directory,
@@ -2912,8 +2954,9 @@ impl GitRepository {
         Ok(output.stdout)
     }
 
-    async fn merge_base(&self, revision: &str, head: &str) -> Result<String> {
-        let output = self.run(["merge-base", revision, head]).await?;
+    /// Common ancestor of two revisions visible to this repository, including its read-only alternate.
+    pub async fn merge_base(&self, revision: &str, head: &str) -> Result<String> {
+        let output = self.run(["merge-base", "--", revision, head]).await?;
         match output.status.code() {
             Some(0) => parse_one_string(&output.stdout, "merge base"),
             Some(1) => Err(CowshedError::conflict(
@@ -7193,12 +7236,43 @@ mod tests {
         };
         let before = objects();
 
-        for branch in ["by-ours", "by-union"] {
+        let target = repo.head_oid().await.expect("target commit");
+        let unchanged = repo.tree_of(base.as_str()).await.expect("base tree");
+        let clean = repo
+            .merge_tree_paths(&base, &target, &unchanged)
+            .await
+            .expect("clean probe");
+        assert!(!clean.conflicted);
+        let target_tree = repo.tree_of(target.as_str()).await.expect("target tree");
+        assert_eq!(
+            clean.stdout.strip_suffix(b"\0"),
+            Some(target_tree.as_str().as_bytes())
+        );
+        for (branch, path) in [("by-ours", "ours"), ("by-union", "union")] {
+            assert_eq!(
+                repo.merge_base(target.as_str(), branch)
+                    .await
+                    .expect("common base"),
+                base.as_str()
+            );
             assert_eq!(
                 repo.merged_tree("main", branch).await.expect("merge"),
                 crate::landing::MergedTree::Conflicted,
                 "{branch}"
             );
+            let snapshot = repo.tree_of(branch).await.expect("snapshot tree");
+            let walked = repo
+                .merge_tree_paths(&base, &target, &snapshot)
+                .await
+                .expect("probe");
+            assert!(walked.conflicted);
+            let paths: Vec<_> = walked
+                .stdout
+                .split(|byte| *byte == 0)
+                .skip(1)
+                .filter(|field| !field.is_empty())
+                .collect();
+            assert_eq!(paths, [path.as_bytes()]);
         }
         assert_eq!(
             String::from_utf8_lossy(&objects()),
