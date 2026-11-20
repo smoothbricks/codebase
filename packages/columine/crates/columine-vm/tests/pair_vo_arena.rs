@@ -151,7 +151,7 @@ struct Row {
 fn row(key1: u32, key2: u32, frame: &[u8], payload: &[u8]) -> Row {
     Row {
         pair: (key1, key2),
-        count: key1 * 1000 + key2,
+        count: key1.wrapping_mul(1000).wrapping_add(key2),
         frame: frame.to_vec(),
         payload: payload.to_vec(),
     }
@@ -374,6 +374,14 @@ fn arena(state: &[u8]) -> (u32, u32, &[u8]) {
     (capacity, used, &state[at(data)..at(data + capacity)])
 }
 
+/// The slot's own bytes, descriptor through arena end: what a seal makes a
+/// function of its pairs. The image header and slot metadata also count the
+/// batches a history ran.
+fn slot_bytes(state: &[u8]) -> &[u8] {
+    let (capacity, _, _) = arena(state);
+    let end = map(state).arena_header_off + ARENA_HEADER_SIZE + capacity;
+    &state[at(map(state).slot_offset)..at(end)]
+}
 fn live_bytes(model: &Model) -> u32 {
     model
         .values()
@@ -650,11 +658,20 @@ fn histories_holding_the_same_pairs_seal_to_the_same_image() {
     );
     erase_pair(&mut winding, 9, 9);
     run_ok(&mut winding, &prog, &[final_rows[3].clone()]);
-    assert_ne!(direct, winding, "the live images differ by history");
+    assert_ne!(
+        slot_bytes(&direct),
+        slot_bytes(&winding),
+        "the live slots differ by history"
+    );
 
     seal(&mut direct);
     seal(&mut winding);
-    assert_eq!(direct, winding, "a sealed image is a function of its pairs");
+    assert_eq!(
+        slot_bytes(&direct),
+        slot_bytes(&winding),
+        "a sealed slot is a function of its pairs"
+    );
+    assert_eq!(map(&direct).size(&direct), map(&winding).size(&winding));
     assert_holds(&direct, &model(&final_rows));
     assert!(!contains(&winding, b"superseded"));
     assert!(!contains(&winding, b"erased"));
