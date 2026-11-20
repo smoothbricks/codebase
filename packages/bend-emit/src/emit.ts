@@ -1,4 +1,4 @@
-// bend-emit: emits Rust, Goose and TypeScript from a CHECKED Bend book.
+// bend-emit: emits Rust, Go, Goose and TypeScript from a CHECKED Bend book.
 //
 // Input is Bend's own elaborated core (bend2/bend.ts `Book`, `HTerm`: the terms
 // the checker accepted), never the surface text: a def is a lambda spine whose
@@ -1290,11 +1290,272 @@ function emitTs(p: Program, module: string | null = null): string {
   return `${o}  return failed;\n}\n${m}`;
 }
 
+// ---------- Go
+
+// Leave ordinary model names readable; encode qualified names in a disjoint namespace.
+function goName(role: string, name: string): string {
+  return /^[A-Za-z0-9_]+$/.test(name)
+    ? `${role}_${name}`
+    : `${role}Q_${name.replace(/[^a-zA-Z0-9]/gu, (c) => `_${c.codePointAt(0)?.toString(16)}_`)}`;
+}
+
+function goTy(t: Ty): string {
+  switch (t.k) {
+    case 'nat':
+      return 'uint64';
+    case 'bool':
+      return 'bool';
+    case 'list':
+      return `*List[${goTy(t.el)}]`;
+    case 'adt':
+      return goName('Type', t.name);
+  }
+}
+
+function goHelper(op: string, t: Ty): string {
+  switch (t.k) {
+    case 'nat':
+      return `${op}Nat`;
+    case 'bool':
+      return `${op}Bool`;
+    case 'list':
+      return goHelper(`${op}List`, t.el);
+    case 'adt':
+      return goName(`${op}Type`, t.name);
+  }
+}
+
+function goExpr(e: Expr): string {
+  switch (e.k) {
+    case 'var':
+      return e.n;
+    case 'nat':
+      return `uint64(${e.v})`;
+    case 'bool':
+      return String(e.v);
+    case 'add':
+      return `natAdd(${goExpr(e.a)}, ${goExpr(e.b)})`;
+    case 'cmp':
+      return `(${goExpr(e.a)} ${e.op} ${goExpr(e.b)})`;
+    case 'nil':
+      return `(*List[${goTy(e.el)}])(nil)`;
+    case 'cons':
+      return `&List[${goTy(e.el)}]{${goExpr(e.h)}, ${goExpr(e.t)}}`;
+    case 'append':
+      return `listAppend(${goExpr(e.a)}, ${goExpr(e.b)})`;
+    case 'ctor':
+      return `${goName('Ctor', e.ctor)}{${e.args.map(goExpr).join(', ')}}`;
+    case 'call':
+      return `${goName('Fn', e.f)}(${e.args.map(goExpr).join(', ')})`;
+  }
+}
+
+// Only live pattern variables are legal Go locals. IR binders are already unique within a function.
+function goReads(s: Stmt, used: Set<string>): void {
+  const expr = (e: Expr): void => {
+    if (e.k === 'var') used.add(e.n);
+    else for (const child of children(e)) expr(child);
+  };
+  switch (s.k) {
+    case 'ret':
+      expr(s.e);
+      break;
+    case 'unreachable':
+      break;
+    case 'let':
+      expr(s.e);
+      goReads(s.body, used);
+      break;
+    case 'match':
+      used.add(s.scrut);
+      for (const a of s.arms) goReads(a.body, used);
+      if (s.dflt !== null) goReads(s.dflt, used);
+  }
+}
+
+function goStmt(s: Stmt, used: ReadonlySet<string>, ind: string): string {
+  switch (s.k) {
+    case 'ret':
+      return `${ind}return ${goExpr(s.e)}\n`;
+    case 'unreachable':
+      return `${ind}panic("unreachable Bend pattern")\n`;
+    case 'let':
+      return `${ind}${s.n} := ${goExpr(s.e)}\n${goStmt(s.body, used, ind)}`;
+    case 'match': {
+      const x = s.scrut;
+      const bindVariant = s.arms.some((a) => a.binds.some((b) => used.has(b.n)));
+      const on =
+        s.ty.k === 'nat'
+          ? `${x} == 0`
+          : s.ty.k === 'list'
+            ? `${x} == nil`
+            : s.ty.k === 'bool'
+              ? x
+              : `${bindVariant ? 'variant := ' : ''}${x}.(type)`;
+      let out = `${ind}switch ${on} {\n`;
+      for (const a of s.arms) {
+        const pattern = s.ty.k === 'adt' ? goName('Ctor', a.ctor) : String(['Zero', 'True', 'Nil'].includes(a.ctor));
+        out += `${ind}case ${pattern}:\n`;
+        a.binds.forEach((b, i) => {
+          if (!used.has(b.n)) return;
+          const field =
+            s.ty.k === 'nat' ? `${x} - 1` : s.ty.k === 'list' ? `${x}.${i === 0 ? 'Head' : 'Tail'}` : `variant.F${i}`;
+          out += `${ind}\t${b.n} := ${field}\n`;
+        });
+        out += goStmt(a.body, used, `${ind}\t`);
+      }
+      return `${out}${ind}default:\n${goStmt(s.dflt ?? { k: 'unreachable' }, used, `${ind}\t`)}${ind}}\n`;
+    }
+  }
+}
+
+function goData(p: Program): string {
+  let out = `type List[T any] struct { Head T; Tail *List[T] }
+
+func listAppend[T any](a, b *List[T]) *List[T] {
+  var head *List[T]
+  end := &head
+  for ; a != nil; a = a.Tail { *end = &List[T]{Head: a.Head}; end = &(*end).Tail }
+  *end = b
+  return head
+}
+
+func natAdd(a, b uint64) uint64 {
+  if a >= 1 << 48 || b >= (1 << 48) - a { panic("Nat past 2^48") }
+  return a + b
+}
+`;
+  for (const adt of p.adts) {
+    const marker = goName('is', adt);
+    out += `\ntype ${goName('Type', adt)} interface { ${marker}() }\n`;
+    for (const c of adtCtors(adt)) {
+      const name = goName('Ctor', c.name);
+      out += `type ${name} struct { ${c.fields.map((f, i) => `F${i} ${goTy(fieldTy(f, { k: 'adt', name: adt }))}`).join('; ')} }\nfunc (${name}) ${marker}() {}\n`;
+    }
+  }
+  for (const f of p.fns) {
+    const used = new Set<string>();
+    goReads(f.body, used);
+    out += `\nfunc ${goName('Fn', f.name)}(${f.params.map((x) => `${x.name} ${goTy(x.ty)}`).join(', ')}) ${goTy(f.ret)} {\n${goStmt(f.body, used, '\t')}}\n`;
+  }
+  return out;
+}
+function goValues(p: Program): string {
+  let out = `
+func writeNat(s *strings.Builder, x uint64) { s.WriteString(strconv.FormatUint(x, 10)) }
+func writeBool(s *strings.Builder, x bool) { s.WriteString(strconv.FormatBool(x)) }
+func display[T any](x T, write func(*strings.Builder, T)) string {
+  var s strings.Builder
+  write(&s, x)
+  return s.String()
+}
+
+type rng uint64
+func (r *rng) next() uint64 {
+  *r += ${MIX.inc}
+  z := uint64(*r)
+  z = (z ^ (z >> 30)) * ${MIX.m1}
+  z = (z ^ (z >> 27)) * ${MIX.m2}
+  return z ^ (z >> 31)
+}
+func genNat(r *rng, _ uint64) uint64 { return r.next() % 3 }
+func genBool(r *rng, _ uint64) bool { return r.next() % 2 == 0 }
+`;
+  for (const t of genTys(p)) {
+    if (t.k !== 'list' && t.k !== 'adt') continue;
+    const ty = goTy(t);
+    const writer = `func ${goHelper('write', t)}(s *strings.Builder, x ${ty})`;
+    const gen = `func ${goHelper('gen', t)}(r *rng, m uint64) ${ty}`;
+    if (t.k === 'list') {
+      out += `\n${writer} {\n  s.WriteByte('[')\n  for ; x != nil; x = x.Tail { ${goHelper('write', t.el)}(s, x.Head); if x.Tail != nil { s.WriteByte(',') } }\n  s.WriteByte(']')\n}\n`;
+      out += `${gen} {\n  var head ${ty}\n  end := &head\n  for n := r.next() % (m + 1); n != 0; n-- { *end = &List[${goTy(t.el)}]{Head: ${goHelper('gen', t.el)}(r, 3)}; end = &(*end).Tail }\n  return head\n}\n`;
+    } else {
+      const cs = adtCtors(t.name);
+      const binding = cs.some((c) => c.fields.length > 0) ? 'v := ' : '';
+      out += `\n${writer} {\n  switch ${binding}x.(type) {\n`;
+      for (const c of cs) {
+        out += `  case ${goName('Ctor', c.name)}:\n    s.WriteString(${JSON.stringify(c.name + (c.fields.length ? '(' : ''))})\n`;
+        c.fields.forEach((f, i) => {
+          if (i > 0) out += `    s.WriteByte(',')\n`;
+          out += `    ${goHelper('write', fieldTy(f, t))}(s, v.F${i})\n`;
+        });
+        if (c.fields.length) out += `    s.WriteByte(')')\n`;
+      }
+      out += `  default: panic("invalid Bend value")\n  }\n}\n${gen} {\n  switch r.next() % ${cs.length} {\n`;
+      cs.forEach((c, i) => {
+        out += `  ${i === cs.length - 1 ? 'default' : `case ${i}`}: return ${goName('Ctor', c.name)}{${c.fields.map((f) => `${goHelper('gen', fieldTy(f, t))}(r, 3)`).join(', ')}}\n`;
+      });
+      out += '  }\n}\n';
+    }
+  }
+  return out;
+}
+
+function goShow(t: Ty, x: string): string {
+  switch (t.k) {
+    case 'nat':
+      return `strconv.FormatUint(${x}, 10)`;
+    case 'bool':
+      return `strconv.FormatBool(${x})`;
+    default:
+      return `display[${goTy(t)}](${x}, ${goHelper('write', t)})`;
+  }
+}
+
+function goLaw(p: Program, law: Law, index: number): string {
+  const params = law.params.map((x) => `${x.name} ${goTy(x.ty)}`);
+  const args = law.params.map((x) => x.name);
+  const name = goName('Law', law.name);
+  let out = `\nfunc ${name}(${params.join(', ')}) (bool, string) {\n`;
+  for (const h of law.hyps) {
+    const atom = h.ty.k === 'nat' || h.ty.k === 'bool';
+    const a = goExpr(h.a),
+      b = goExpr(h.b);
+    out += `  if ${atom ? a : goShow(h.ty, a)} != ${atom ? b : goShow(h.ty, b)} { return true, "vacuous" }\n`;
+  }
+  const atom = law.ty.k === 'nat' || law.ty.k === 'bool';
+  if (atom) out += `  a := ${goExpr(law.a)}\n  return a == ${goExpr(law.b)}, ${goShow(law.ty, 'a')}\n}\n`;
+  else out += `  lhs := ${goShow(law.ty, goExpr(law.a))}\n  return lhs == ${goShow(law.ty, goExpr(law.b))}, lhs\n}\n`;
+  const visit = ['kind string', 'index int', 'ok bool', 'lhs string', ...params].join(', ');
+  out += `\nfunc ${goName('Drive', law.name)}(visit func(${visit})) {\n`;
+  out += `  run := func(${['kind string', 'index int', ...params].join(', ')}) {\n    ok, lhs := ${name}(${args.join(', ')})\n    visit(${['kind', 'index', 'ok', 'lhs', ...args].join(', ')})\n  }\n`;
+  (p.cases.get(law.name) ?? []).forEach((row, i) => {
+    out += `  run(${['"law"', i, ...row.map((v) => goExpr(valExpr(v)))].join(', ')})\n`;
+  });
+  if (args.length > 0) out += `  r := rng(${seedOf(index)})\n`;
+  const draws = law.params.map((x) => `${goHelper('gen', x.ty)}(&r, ${p.propLen})`);
+  return `${out}  for i := 0; i < ${p.props}; i++ { run(${['"prop"', 'i', ...draws].join(', ')}) }\n}\n`;
+}
+
+function emitGo(p: Program, module: string | null = null): string {
+  let out = `// Code generated by bend-emit from a checked Bend book. DO NOT EDIT.\n${module ?? ''}package ${module === null ? 'main' : 'bendmodel'}\n`;
+  if (p.laws.length > 0) {
+    out += `\nimport (\n  "strconv"\n  "strings"\n${module === null ? '  "fmt"\n  "os"\n' : ''})\n`;
+  }
+  out += `\n${goData(p)}`;
+  if (p.laws.length > 0) out += goValues(p);
+  p.laws.forEach((l, i) => {
+    out += goLaw(p, l, i);
+  });
+  if (module !== null) return out;
+  if (p.laws.length === 0) return `${out}\nfunc main() {}\n`;
+  out += '\nfunc main() {\n  failed := false\n';
+  for (const l of p.laws) {
+    const params = l.params.map((x) => `${x.name} ${goTy(x.ty)}`);
+    const show = l.params.map((x) => goShow(x.ty, x.name)).join(', ');
+    out += `  ${goName('Drive', l.name)}(func(${['kind string', 'index int', 'ok bool', 'lhs string', ...params].join(', ')}) {\n    fmt.Printf("%s %s %d %t %s", kind, ${JSON.stringify(l.name)}, index, ok, lhs)\n    if !ok { failed = true; fmt.Print(" | args ", strings.Join([]string{${show}}, " ; ")) }\n    fmt.Println()\n  })\n`;
+  }
+  return `${out}  if failed { os.Exit(1) }\n}\n`;
+}
 // ---- package entry ------------------------------------------------------------
 
 type Target =
   | { readonly kind: 'all'; readonly stem: string }
-  | { readonly kind: 'rust-module' | 'ts-module'; readonly modelName: string; readonly flags: readonly string[] };
+  | {
+      readonly kind: 'rust-module' | 'ts-module' | 'go-module';
+      readonly modelName: string;
+      readonly flags: readonly string[];
+    };
 
 export interface EmitOptions {
   readonly target: Target;
@@ -1316,6 +1577,7 @@ export type Emission = {
       readonly kind: 'all';
       readonly rust: string;
       readonly goose: string;
+      readonly go: string;
       readonly typescript: string;
       readonly runner: string;
       readonly cases: number;
@@ -1370,14 +1632,18 @@ function emitBook({
       ...counts,
       rust: emitRust(prog),
       goose: emitGoose(prog),
+      go: emitGo(prog),
       typescript: emitTs(prog),
-      runner: emitRunner(target.stem),
+      runner: emitRunner(target.stem, prog),
       cases: [...cases.values()].reduce((n, c) => n + c.length, 0),
       properties,
     };
   }
   const emittedBy = `Emitted by: bend-emit ${target.flags.join(' ')}\n`;
   const model = `Model: ${target.modelName}, checked by bend2 before emission.\n`;
+  if (target.kind === 'go-module') {
+    return { kind: 'module', ...counts, source: emitGo(prog, `// ${model}// ${emittedBy}`) };
+  }
   const source =
     target.kind === 'rust-module'
       ? emitRust(prog, `//! ${model}//! ${emittedBy}`)
@@ -1389,16 +1655,17 @@ function emitBook({
 }
 
 // The generated runner: builds each target (its own step; a check never builds),
-// runs the three drivers, and reports by law: pass counts per target, and the
+// runs the drivers, and reports by law: pass counts per target, and the
 // first case where the targets disagree or a law fails, with its counterexample.
-function emitRunner(stem: string): string {
-  return `// GENERATED by bend-emit. Runs the ${stem} laws on Rust, Goose and TypeScript and compares them.
+function emitRunner(stem: string, p: Program): string {
+  const laws = p.laws.map((l) => ({ name: l.name, cases: p.cases.get(l.name)?.length ?? 0, proven: l.proven }));
+  return `// GENERATED by bend-emit. Compare the checked laws on Rust, Goose, Go and TypeScript.
 import { spawnSync } from "node:child_process";
 const here = import.meta.dir;
 const sh = (cmd: string, args: string[]) => {
   const t0 = performance.now();
   const r = spawnSync(cmd, args, { cwd: here, encoding: "utf8", maxBuffer: 1 << 28 });
-  return { code: r.status ?? -1, out: r.stdout ?? "", err: r.stderr ?? "", ms: performance.now() - t0 };
+  return { code: r.status ?? -1, out: r.stdout ?? "", err: r.error?.message ?? r.stderr ?? "", ms: performance.now() - t0 };
 };
 const build = process.argv.includes("--build");
 if (build) {
@@ -1406,10 +1673,13 @@ if (build) {
   if (rs.code !== 0) { console.error(rs.err); process.exit(2); }
   const gs = sh(process.env.GOOSE ?? "goose", ["build", "${stem}.goose"]);
   if (gs.code !== 0) { console.error(gs.err + gs.out); process.exit(2); }
+  const go = sh("go", ["build", "-o", "${stem}_go", "${stem}.go"]);
+  if (go.code !== 0) { console.error(go.err); process.exit(2); }
 }
 const runs = {
   rust: sh("./${stem}_rs", []),
   goose: sh("./${stem}", []),
+  go: sh("./${stem}_go", []),
   ts: sh("bun", ["${stem}.ts"]),
 };
 type Row = { law: string; i: string; ok: string; v: string; args: string; kind: string };
@@ -1418,30 +1688,40 @@ const parse = (out: string): Row[] => out.split("\\n").filter((l) => l.startsWit
   const [v = "", args = ""] = rest.join(" ").split(" | args ");
   return { kind, law, i, ok, v, args };
 });
-const status = new Map(runs.rust.out.split("\\n").filter((l) => l.startsWith("summary ")).map((l) => {
-  const [, law = "", , st = "proven"] = l.split(" ");
-  return [law, st] as const;
-}));
-const rows = { rust: parse(runs.rust.out), goose: parse(runs.goose.out), ts: parse(runs.ts.out) };
-const laws = [...new Set(rows.ts.map((r) => r.law))];
+const targets = ["rust", "goose", "go", "ts"] as const;
+const rows = { rust: parse(runs.rust.out), goose: parse(runs.goose.out), go: parse(runs.go.out), ts: parse(runs.ts.out) };
+const laws: { name: string; cases: number; proven: boolean }[] = ${JSON.stringify(laws)};
 let bad = 0;
-for (const law of laws) {
-  const per = (t: keyof typeof rows) => rows[t].filter((r) => r.law === law);
-  const [a, b, c] = [per("rust"), per("goose"), per("ts")];
-  const pass = (xs: Row[]) => xs.filter((r) => r.ok === "true").length;
-  let disagree = -1;
-  for (let k = 0; k < Math.max(a.length, b.length, c.length); k++) {
-    const [x, y, z] = [a[k], b[k], c[k]];
-    if (x === undefined || y === undefined || z === undefined || x.ok + x.v !== y.ok + y.v || y.ok + y.v !== z.ok + z.v) { disagree = k; break; }
+for (const t of targets) {
+  const code = rows[t].some((r) => r.ok === "false") ? 1 : 0;
+  if (runs[t].code !== code || rows[t].length !== ${laws.reduce((n, l) => n + l.cases + p.props, 0)}) {
+    console.error(t + ": unexpected exit or row count", runs[t].code, rows[t].length, runs[t].err);
+    process.exit(2);
   }
-  const fail = c.find((r) => r.ok !== "true");
-  const verdict = disagree < 0 && fail === undefined ? "PASS" : "FAIL";
-  if (verdict === "FAIL") bad++;
-  console.log(\`\${verdict} \${law} [\${status.get(law) ?? "?"}]: rust \${pass(a)}/\${a.length}  goose \${pass(b)}/\${b.length}  ts \${pass(c)}/\${c.length}  targets \${disagree < 0 ? "agree" : "DISAGREE at " + c[disagree]?.kind + " " + c[disagree]?.i}\`);
-  if (fail !== undefined) console.log(\`  counterexample (\${fail.kind} \${fail.i}): args \${fail.args}  lhs = \${fail.v}\`);
-  if (disagree >= 0) console.log(\`  rust: \${a[disagree]?.ok} \${a[disagree]?.v}\\n  goose: \${b[disagree]?.ok} \${b[disagree]?.v}\\n  ts: \${c[disagree]?.ok} \${c[disagree]?.v}\`);
 }
-console.log(\`runtime ms: rust \${runs.rust.ms.toFixed(0)}  goose \${runs.goose.ms.toFixed(0)}  ts \${runs.ts.ms.toFixed(0)}\`);
+for (const { name: law, cases, proven } of laws) {
+  const per = targets.map((t) => rows[t].filter((r) => r.law === law));
+  const ts = rows.ts.filter((r) => r.law === law);
+  let disagree = -1;
+  for (let k = 0; k < Math.max(cases + ${p.props}, ...per.map((xs) => xs.length)); k++) {
+    const ref = ts[k];
+    const kind = k < cases ? "law" : "prop";
+    const i = String(k < cases ? k : k - cases);
+    if (!ref || (ref.ok !== "true" && ref.ok !== "false") || per.some((xs, t) => {
+      const r = xs[k];
+      return !r || r.kind !== kind || r.i !== i || r.ok !== ref.ok || r.v !== ref.v
+        || (targets[t] === "go" && r.args !== ref.args);
+    })) { disagree = k; break; }
+  }
+  const fail = ts.find((r) => r.ok !== "true");
+  const counts = per.map((xs, i) => targets[i] + " " + xs.filter((r) => r.ok === "true").length + "/" + xs.length);
+  const verdict = disagree < 0 && !fail ? "PASS" : "FAIL";
+  if (verdict === "FAIL") bad++;
+  console.log(verdict + " " + law + " [" + (proven ? "proven" : "open") + "]: " + counts.join("  ") + "  targets " + (disagree < 0 ? "agree" : "DISAGREE at row " + disagree));
+  if (fail !== undefined) console.log(\`  counterexample (\${fail.kind} \${fail.i}): args \${fail.args}  lhs = \${fail.v}\`);
+  if (disagree >= 0) for (const [i, xs] of per.entries()) console.log("  " + targets[i] + ": " + JSON.stringify(xs[disagree] ?? "missing"));
+}
+console.log("runtime ms: " + targets.map((t) => t + " " + runs[t].ms.toFixed(0)).join("  "));
 process.exit(bad === 0 ? 0 : 1);
 `;
 }

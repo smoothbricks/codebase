@@ -1,6 +1,6 @@
 # Bend emitter
 
-`bend-emit` checks a Bend 2 book and emits its first-order kernel and law drivers as Rust, Goose, and TypeScript. It
+`bend-emit` checks a Bend 2 book and emits its first-order kernel and law drivers as Rust, Goose, Go, and TypeScript. It
 lowers the checked terms, not the source syntax. Proof terms are erased; emitted drivers exercise the claims over
 enumerated and seeded inputs. A law binding supplies the production comparison separately.
 
@@ -14,13 +14,13 @@ bend-emit <model.bend> <outdir> --fns a,b --laws x,y
 - `--cap N` bounds enumerated cases per law (default 400). `--len N` bounds enumerated list length (default 3).
   `--no-corpus x,y` leaves those laws' enumerated cases to their binding.
 - `--props N` sets seeded draws per law (default 200). `--prop-len N` sets their list length bound (default 12).
-- `--rust-module path` or `--ts-module path` writes a single binding module to that path instead of standalone drivers.
-  `--model-name name` supplies the model's name in its provenance header (the default is the input basename).
+- `--rust-module path`, `--ts-module path` or `--go-module path` writes one binding module instead of standalone
+  drivers. `--model-name name` supplies the model's name in its provenance header (the default is the input basename).
 
 The command always takes both positionals; module mode does not use the output directory. Without module mode, it writes
-`<stem>.rs`, `<stem>.goose`, `<stem>.ts` and `run_<stem>.ts`. It refuses outside the first-order fragment over Nat,
-Bool, lists and non-generic user ADTs, including closures, templates and unsupported term/type forms. A checker or
-emitter refusal exits nonzero without writing an output.
+`<stem>.rs`, `<stem>.goose`, `<stem>.go`, `<stem>.ts` and `run_<stem>.ts`. It refuses outside the first-order fragment
+over Nat, Bool, lists and non-generic user ADTs, including closures, templates and unsupported term/type forms. A
+checker or emitter refusal exits nonzero without writing an output.
 
 ## Package API and local link
 
@@ -46,6 +46,41 @@ from one checked book are independent. The package runs on Bun. To test a local 
 
 The linked command needs no build or checker environment variable. The regular package build emits the public TypeScript
 declarations for publication.
+
+## Go binding
+
+`--go-module model.go` emits `package bendmodel`. Select `{ kind: 'go-module', modelName, flags }` through the library
+for the same source. Nat is `uint64` with the same checked addition bound as the other targets. Bool is `bool`. A list
+is `*List[T]` (`nil` is empty; fields `Head` and `Tail`). A datatype `Packet` is the sealed interface `Type_Packet`;
+`Ctor_Packed{F0: n, F1: live, F2: items}` constructs its `Packed` variant.
+
+`Fn_number(x)` runs the model. `Law_all_packets_are_zero(x)` returns `(ok, lhs)`; a false hypothesis returns
+`(true, "vacuous")`. `Drive_all_packets_are_zero(visit)` calls `visit(kind, index, ok, lhs, x)` on the shared corpus
+(`kind == "law"`) and then on the shared seeded draws (`"prop"`). Indices in each start at zero. A binding uses these
+typed inputs to run production in the same process. No Go command is invoked during emission.
+
+To exercise the package's conformance fixture from this directory:
+
+```sh
+out=$(mktemp -d)
+laws=packets_agree,guarded_lists_agree,all_packets_are_zero
+bun bin/bend-emit.ts test/conformance.bend "$out" --laws "$laws" --cap 40 --len 2 --props 16
+bun "$out/run_conformance.ts" --build
+```
+
+The last command needs `rustc`, `go`, Bun, and the Goose language compiler (`GOOSE` can name it). It builds each native
+driver once, then compares row identities, verdicts and canonical results. Run without `--build` to reuse the binaries.
+The first two laws must pass on all four targets. The open law must fail with status **1**, not a tool failure **2**;
+the four targets must agree on `Packed(0,false,[])` as the first counterexample, with lhs `1`.
+
+To build and then execute the callable-package witness separately:
+
+```sh
+bun bin/bend-emit.ts test/conformance.bend . --go-module "$out/model.go" --laws "$laws" --cap 40 --len 2 --props 16
+cp test/testdata/binding_test.go "$out/"
+go test -c -o "$out/binding.test" "$out/model.go" "$out/binding_test.go"
+"$out/binding.test" -test.v
+```
 
 ## Checker custody
 

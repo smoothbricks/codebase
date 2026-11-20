@@ -12,13 +12,13 @@ export async function run(argv: readonly string[]): Promise<void> {
     return i >= 0 ? (rest[i + 1] ?? '') : '';
   };
   const book = await checkBendFile(file);
-  const rustModule = opt('--rust-module');
-  const modulePath = rustModule || opt('--ts-module');
+  const moduleKind = opt('--rust-module') ? 'rust-module' : opt('--ts-module') ? 'ts-module' : 'go-module';
+  const modulePath = opt(`--${moduleKind}`);
   const stem = basename(file, '.bend');
   const emission = book.emit({
     target: modulePath
       ? {
-          kind: rustModule ? 'rust-module' : 'ts-module',
+          kind: moduleKind,
           modelName: opt('--model-name') || basename(file),
           flags: rest.filter((arg) => arg !== modulePath),
         }
@@ -40,9 +40,10 @@ export async function run(argv: readonly string[]): Promise<void> {
   mkdirSync(outdir, { recursive: true });
   writeFileSync(join(outdir, `${stem}.rs`), emission.rust);
   writeFileSync(join(outdir, `${stem}.goose`), emission.goose);
+  writeFileSync(join(outdir, `${stem}.go`), emission.go);
   writeFileSync(join(outdir, `${stem}.ts`), emission.typescript);
   writeFileSync(join(outdir, `run_${stem}.ts`), emission.runner);
   console.log(
-    `bend-emit: ${stem}: ${counts}, ${emission.cases} corpus cases + ${emission.properties} seeded properties per law -> ${outdir}/${stem}.{rs,goose,ts} + run_${stem}.ts`,
+    `bend-emit: ${stem}: ${counts}, ${emission.cases} corpus cases + ${emission.properties} seeded properties per law -> ${outdir}/${stem}.{rs,goose,go,ts} + run_${stem}.ts`,
   );
 }
