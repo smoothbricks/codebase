@@ -14,11 +14,8 @@ interface CowshedManifest {
 
 const parseCowshedManifest = typia.json.createAssertParse<CowshedManifest>();
 
-/** The root edge that builds the test binaries the Rust worker proofs run in place. */
-const BUILD_EDGE = { target: 'cargo-test-build', projects: ['@smoothbricks/codebase'] };
-
 describe('cowshed host-controller-test wiring', () => {
-  it('depends on the host CLI, addon, JavaScript and root test build it actually reads', async () => {
+  it('depends on the host CLI, addon, JavaScript and APFS helper it actually reads', async () => {
     const manifest = parseCowshedManifest(
       await readFile(new URL('../../cowshed/package.json', import.meta.url), 'utf8'),
     );
@@ -26,6 +23,6 @@ describe('cowshed host-controller-test wiring', () => {
     // The worker proof loads the compiled package without NAPI_DEBUG_ADDON, and starts the checkout's host CLI.
     for (const producer of ['cli-native', 'napi-native', 'tsc-js']) expect(dependsOn).toContain(producer);
     expect(dependsOn).not.toContain('build');
-    expect(dependsOn).toContainEqual(BUILD_EDGE);
+    expect(dependsOn).toContain('apfs-test-sweep-bin');
   });
 });

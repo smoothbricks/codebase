@@ -236,10 +236,9 @@ last 60 lines before fixture retirement removes them. The record-change and rest
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
 
-- **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-test-build`,
-  `cargo-lint`, cross-check, mutation and bench target. Its `cargo-lint` and `cargo-test` aggregates reach all workspace
-  crates, including a root `[package]`; `cargo-test` is the ordinary suite, and the project's `test` also reaches the
-  serial test groups (below).
+- **Workspace owner:** the project beside a workspace `Cargo.toml` owns one `cargo-fetch`, `cargo-lint`, cross-check,
+  mutation and bench target. Its `cargo-lint` and `cargo-test` aggregates reach all workspace crates, including a root
+  `[package]`; `cargo-test` is the ordinary suite, and the project's `test` also reaches the serial test groups (below).
 - **Crate owner:** the deepest Nx project directory containing a crate owns `cargo-test-<crate>` targets. Its
   `cargo-lint` delegates to the workspace owner's one verdict, and `lint` never depends on the workspace test suite.
   Projects can own multiple crates. A nested independent workspace has its own prerequisites and does not inherit those
@@ -259,7 +258,7 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   lock serializes the invocations that share a directory.
 - **Retention:** Cargo never deletes a unit generation a later build superseded, so a busy checkout's target directory
   only grows. After each Nx run that executed a Cargo producer (an inferred target that builds, checks or tests into the
-  target directory, marked by its `cargoProducer` metadata: `cargo-test-build`, `cargo-test`, `cargo-lint`,
+  target directory, marked by its `cargoProducer` metadata: native `cargo-test-<package>` leaves, `cargo-lint`,
   `cargo-lint-cross`, mutation, bench, and the napi and wasm builds), the plugin's `postTasksExecution` runs its Cargo
   retention hook, which starts a pass of `@smoothbricks/cargo-retain` for each Cargo workspace that is due for
   maintenance, in a process of its own (below). In an mbx project, whose canonical environment names `MBX_CACHE_DIR`
@@ -394,14 +393,12 @@ Every inferred cargo target that runs work is cached, `cargo-fetch` included. It
 outside Nx outputs, so its key names the registry's state instead: the manifests, the lock and the Cargo configuration
 it reads, and a runtime input that is `fetched` when an offline `cargo fetch --locked` of each manifest succeeds. A
 registry missing a locked crate gives a value of its own run, which no cached run matches, so the fetch runs; a complete
-one makes an unchanged lock a cache hit. `cargo-test-build` is the one cached cargo build, and it is the step that
-compiles the test binaries ahead of the bounded runners; there is no separate `cargo test --no-run` warm-up, since it
-compiled the same units the test build does. Cargo's own incremental cache avoids recompiling unchanged code. Nx never
-restores or collects shared Cargo build directories; lint and test **results**, and dedicated Wasm/N-API **outputs**,
-remain cacheable. `mutation` and `bench` key on the workspace's crates and toolchain like `cargo-lint`, `mutation` also
-on `.cargo/mutants.toml` and `cargo mutants --version` with `mutants.out` as its output: an unchanged tree measures
-nothing new. A cross-triple test runner keys on its archive's own bytes, the binaries it runs, since the machine that
-runs it did not build them.
+one makes an unchanged lock a cache hit. Native tests compile selected packages in their separately bounded fixture only
+when their test result misses Nx. Cargo and mbx reuse unchanged units. Nx never restores or collects shared Cargo build
+directories; lint and test **results**, and dedicated Wasm/N-API **outputs**, remain cacheable. `mutation` and `bench`
+key on the workspace's crates and toolchain like `cargo-lint`, `mutation` also on `.cargo/mutants.toml` and
+`cargo mutants --version` with `mutants.out` as its output: an unchanged tree measures nothing new. A cross-triple test
+runner keys on its archive's own bytes, the binaries it runs, since the machine that runs it did not build them.
 
 Validation inputs include the crate's files, every file its sources compile in through a literal `include_str!` or
 `include_bytes!` path outside the crate's directory (a shipped skill or a shared corpus beside the crates), the crates
@@ -1382,57 +1379,39 @@ Concrete targets come from concrete files:
 - `test-watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`. Build targets
-  compile build outputs only: compiling every test binary makes every build a test build. Test runners depend on their
-  workspace's `cargo-test-build` themselves, and a test that executes a CLI or loads an addon names its producer.
-  `cargo-test-build` runs one `cargo --frozen nextest list --workspace --list-type binaries-only --message-format json`
-  into `.cache/nextest/binaries-metadata.json` and `cargo --frozen metadata --format-version 1 --all-features` into
-  `.cache/nextest/cargo-metadata.json`, and is the only cached Cargo compilation of test binaries: mbx caches the build,
-  and its Nx outputs are nextest's reuse-build metadata and the build's key (`.cache/nextest/build.key`, the task's
-  hash), files outside the build-volume links, never the mutable build tree the binaries stay in. Its last step records
-  that key in the target directory it built. Nx cache restoration must never replace Cargo's `target` link. Its inputs,
-  like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx resolves a `{projectRoot}` glob against only
-  the files its project owns, and a nested package owns the crates under it, so a root workspace's test build spelled
-  that way hashes none of its members and replays stale binaries against edited crates. The test build, `cargo-lint`,
-  the cross check and archives, mutation and bench also hash the outputs of the producers a repository adds to their
-  `dependsOn` that a compile can read: one `{dependentTasksOutputFiles: "<fileset>", transitive: false}` per positive
-  file set of that union, its `{workspaceRoot}/` anchor dropped because Nx matches the glob against each output's
-  workspace-relative path. A generated crate source, a compiled-in file or a manifest a producer writes keys them; a
-  producer's output anywhere else, such as a TypeScript package's `dist`, keys none of them. The test build (`record`)
-  and every runner, each crate's pieces and the serial groups (`target-dir` in the command, `ensure` in the fixture),
-  key the local nextest helper they run (`**/dist/bin/<platform>/smoo-nx-nextest-binaries`) where the workspace builds
-  it. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill) whose inputs
-  include the crates Cargo builds for that crate's tests (from Cargo's locked resolve: its dependencies and its own
-  dev-dependencies, never the dev-dependencies of the crates below it), and whose command runs
-  `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
-  in place, against the binaries the build left in Cargo's target directory. Runners therefore execute rather than
-  build: they compile nothing in cargo's build tree, copy nothing, and fan out instead of chaining. A test archive
-  exists only for a cross build, whose binaries are built on one platform and run on another (`cross-targets`, below); a
-  same-platform run reuses the build in place, where an archive made every run pay for a copy of the workspace's
-  binaries before its first test (measured: 290 binaries, 678 MB, 4.6s on a quiet host and 21s in a gate, per archive).
-  `--target-dir-remap` names this checkout's target directory, which the host's native `smoo-nx-nextest-binaries`
-  (`@smoothbricks/nextest-extract`) reads from `cargo metadata`, so a `build.target-dir` setting is honoured. The
-  binaries are not Nx outputs, and a binary's path is cargo's `-C metadata` hash, which ignores source content: a
-  checkout whose build was a cache hit holds the metadata without the binaries, or with an older tree's at the very
-  paths it names. Each runner's `bounded-exec` fixture (`smoo-nx-nextest-binaries ensure`) therefore compares the key
-  the target directory records with the build's and stats every binary the metadata names; on any difference it rebuilds
-  with the build's own command through mbx, once for the checkout's runners under a lock of its own, and records the
-  key, inside the fixture's build interval and never the progress-bounded test window. The key output is also what lets
-  a dependent that hashes the build's outputs see a source change the metadata alone would hide. The fixture reports its
-  own duration and mbx's hits and misses apart from the run's, and says `CACHE MISS` naming the crates when mbx
-  compiled. A repository's own target that runs the workspace's test binaries itself ensures them the same way
-  (`ensureInPlace`) and passes the same reuse flags. A cross lane's runner, `nextest run --archive-file`, unpacks the
-  whole archive into a fresh directory under its `TMPDIR`, which for a `bounded-exec` task on macOS is a lease on the
-  shared RAM volume (measured: a 548 MB archive unpacks to 1.97 GiB, and four such tasks filled the 8 GiB volume).
-  `--workspace-remap` is required — the metadata records the producing tree's absolute paths, and without it metadata
-  restored from another checkout hands tests that checkout's `CARGO_MANIFEST_DIR`. With it the metadata is relocatable,
-  so one cache entry serves every checkout of the same commit; nextest re-points
-  `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the remapped binaries at runtime, but a test that reads them
-  through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an empty nextest
-  selection because a valid workspace member may have no tests and a hash partition may legitimately be empty. No Rust
+  compile build outputs only. Each crate's inferred `cargo-test-<package>` caches its verdict and any declared report
+  outputs. A hit does not start Cargo's test build or nextest's run, even when the checkout has no test binaries. On a
+  miss, bounded-exec first uses the Cargo shim to build the crate's test binaries with
+  `nextest list -p <package> --list-type binaries-only`. The fixture has its own ceiling, before the reservation and
+  180-second test idle bound. Cargo and mbx reuse unchanged units among shards and crates in the workspace's target
+  directory; nothing copies it or scans it for binaries. Repositories that need the same feature resolution as
+  `--workspace` use their existing Cargo workspace feature unification policy. The run feeds the invocation's Cargo and
+  nextest metadata back to nextest without relocation, under the same filter, partition and nextest configuration. Valid
+  inferred empty suites and partitions can pass. Cross archives remain separate: the archive runner receives its
+  binaries from another platform.
+
+  An explicit `@smoothbricks/nx-plugin:bounded-exec` target supplies `options.nativeTest` with literal argv arrays:
+  `cargoArgs` selects packages, binary targets, Cargo profile, target triple and features; `selectionArgs` supplies
+  nextest profile, filter, partition or ignored-test selection to both run and count; `runArgs` supplies run-only flags.
+  By default the generated run refuses an empty selection. A target that supplies `options.command` runs that launcher
+  instead: it reads `binaries-metadata.json` and `cargo-metadata.json` from the absolute `BOUNDED_EXEC_FIXTURE_DIR` the
+  executor supplies. This directory is private even to concurrent invocations of one target, retired with the task, and
+  never an Nx output. Custom targets retain their normal `cwd`, `env`, declared producer edges, source/toolchain/config
+  inputs and any runtime reports or outputs. An explicit `inputs` array uses `"..."` to retain inference. A binary that
+  is an input to another task remains a declared artifact of its own producer.
+
+  Cargo sources are keyed from each selected package's locked closure, including its test dev-dependencies but not the
+  dependency crates' dev-dependencies, and the Cargo and nextest settings it uses. Cargo-derived filesets are anchored
+  at `{workspaceRoot}` because a member's source can belong to a different Nx project. Generated source prerequisites
+  must be ordered ahead of the leaf; inferred runners hash producer outputs under the closure's input globs. A workspace
+  whose native tests read generated files can name its existing aggregate as the plugin option
+  `cargoTestGeneratedBy: "<project>:<target>"`. Only the aggregate's declared artifact producers whose outputs match the
+  selected crate's Cargo closure are added. A workspace that reads no generated source needs no such option. No Rust
   test runner waits on `napi-debug`: a test binary loads no debug addon, and a test that runs the package's JavaScript
   loads the host addon `napi-native` writes, which the runner names itself; only a target that sets `NAPI_DEBUG_ADDON=1`
   reads `napi-debug`'s (below). A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the
   cacheable `cargo-wasm` output target in its owning project.
+
 - The plugin's own `nextest.toml` is passed as
   `--tool-config-file "smoo:$PWD/<to workspace root>/node_modules/@smoothbricks/nx-plugin/nextest.toml"`, so it is a
   layer BENEATH the repository's `<cargo-workspace>/.config/nextest.toml` rather than a replacement for it: a repository
@@ -1485,8 +1464,8 @@ Concrete targets come from concrete files:
   may time only a member that declares `shards`, by test paths a `test(=…)` filter matches literally; anything else
   fails graph construction.
 - A repository's serial test groups each run in one runner, `cargo-test-group-<group>`, owned by the cargo workspace
-  root beside `cargo-test-build`. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a
-  `[test-groups.<group>]` table with `max-threads = 1`, and default-profile overrides that name it with `test-group` and
+  root. A group is declared once, in `<cargo-workspace>/.config/nextest.toml`: a `[test-groups.<group>]` table with
+  `max-threads = 1`, and default-profile overrides that name it with `test-group` and
   `platform = 'cfg(target_os="macos")'`. The runner's filter is the union of those overrides, so the runner and the
   per-crate exclusions cannot drift; every crate piece excludes it with `not (…)`, so each test is selected by exactly
   one target. The runner is not inferred off macOS, where nextest applies the group nowhere and no piece excludes its
@@ -1823,8 +1802,8 @@ an unbounded runtime source closure. `ensure-built-receipt.test.ts` judges this 
 graph.
 
 A tracked public output stays in the source basis while it holds HEAD's bytes, so a later task can read it as a FILE
-input: the root `cargo-test-build` reads the corpus `cowshed:wire-fixtures` regenerates, a tracked file that is both.
-Only its stamp is the run's to move (a cache restore or a regeneration moves it). A run that leaves it other bytes
+input: the `cowshed-napi` test fixture reads the corpus `cowshed:wire-fixtures` regenerates, a tracked file that is
+both. Only its stamp is the run's to move (a cache restore or a regeneration moves it). A run that leaves it other bytes
 refuses the receipt, and one that differs from HEAD when the run starts binds no input, so a task that reads it is
 unbound.
 
@@ -2212,15 +2191,14 @@ are not polling input. The activity projection omits those walks and encodings i
 or control-plane limits.
 
 The decision to use zero-hold pausing is made before spawn, from the canonical scheduling switch and the supported
-command, never from silence on the pipe. The inferred in-place
-`cargo --frozen nextest run --binaries-metadata … --target-dir-remap "$(…/smoo-nx-nextest-binaries target-dir)" …`,
-whose one substitution prints this checkout's target directory, is hold-gated, including chains joined by `&&`, `||`, or
-`;` when every leg is a supported scheduled Cargo test execution. Each leg is checked separately; a later unscheduled
-command, pipeline or background command retains conservative idle protection. Plain `cargo test` can also run
-unscheduled doctests, so it retains its lifecycle idle clock, as do unknown runners, direct binaries, test listings,
-configuration/toolchain/directory overrides, and `--archive-file` whose target is not known at spawn. Explicit non-doc
-Cargo target selections can be hold-gated. These conservative cases remain bounded even when they never hold an mbx
-permit (specs/cowshed/11_shell.md, "Cargo test-runner boundaries").
+command, never from silence on the pipe. Native nextest uses the invocation's binaries metadata and reserves cores only
+after the fixture succeeds. For a chain of Cargo test invocations joined by `&&`, `||`, or `;`, each leg must be a
+supported scheduled Cargo test execution. A later unscheduled command, pipeline or background command retains
+conservative idle protection. Plain `cargo test` can also run unscheduled doctests, so it retains its lifecycle idle
+clock, as do unknown runners, direct binaries, test listings, configuration/toolchain/directory overrides, and
+`--archive-file` whose target is not known at spawn. Explicit non-doc Cargo target selections can be hold-gated. These
+conservative cases remain bounded even when they never hold an mbx permit (specs/cowshed/11_shell.md, "Cargo test-runner
+boundaries").
 
 On POSIX hosts, direct Go and Cargo test commands (including chains joined by `&&`, `||`, or `;`) share one private
 runner lifecycle: `build`, `active`, and `terminal`. A per-command Node supervisor reports phases over an acknowledged

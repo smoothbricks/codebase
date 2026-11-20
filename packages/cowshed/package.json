@@ -350,10 +350,7 @@
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           {
-            "json": "{projectRoot}/package.json",
-            "excludeFields": [
-              "devDependencies.@smoothbricks/nextest-extract"
-            ]
+            "json": "{projectRoot}/package.json"
           },
           {
             "externalDependencies": [
@@ -719,18 +716,13 @@
           "!{workspaceRoot}/patches/**/*.md",
           "{workspaceRoot}/.config/nextest.toml",
           "{workspaceRoot}/packages/nx-plugin/nextest.toml",
-          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts"
+          "cargoClosure",
+          "cargoToolchain"
         ],
         "dependsOn": [
           "...",
           "napi-debug",
           "tsc-js",
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-build"
-          },
           "^build"
         ],
         "options": {
@@ -739,10 +731,14 @@
           "env": {
             "NAPI_DEBUG_ADDON": "1"
           },
-          "fixtureCommand": "bun ../scripts/host-controller-test.ts --ensure-binaries",
-          "fixtureTimeoutMs": 3600000,
-          "idleTimeoutMs": 180000,
-          "killAfterMs": 10000
+          "nativeTest": {
+            "cargoArgs": [
+              "-p",
+              "cowshed-core",
+              "--test",
+              "project_runtime"
+            ]
+          }
         }
       },
       "launcher-test": {
@@ -776,7 +772,7 @@
       "wire-fixtures": {
         "executor": "nx:run-commands",
         "cache": true,
-        "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of cargo-test-build because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
+        "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of the cowshed-napi test fixture because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
         "dependsOn": [
           "api-check",
           {
@@ -1034,8 +1030,6 @@
         "inputs": [
           "...",
           "{projectRoot}/scripts/apfs-test-root.ts",
-          "{projectRoot}/scripts/apfs-test-sweep.ts",
-          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts",
           "{projectRoot}/scripts/apfs-test-root.test.ts",
           "{projectRoot}/crates/cowshed-core/src/storage/host_config.rs",
           "{projectRoot}/crates/cowshed-core/src/storage/bootstrap/native/macos.rs",
@@ -1063,12 +1057,7 @@
           "napi-native",
           "tsc-js",
           "apfs-test-root",
-          {
-            "target": "cargo-test-build",
-            "projects": [
-              "@smoothbricks/codebase"
-            ]
-          },
+          "apfs-test-sweep-bin",
           {
             "projects": [
               "nx-cache-server"
@@ -1080,7 +1069,9 @@
           "...",
           "default",
           "{workspaceRoot}/packages/nx-plugin/nextest.toml",
-          "{workspaceRoot}/packages/nextest-extract/src/nextest-binaries.ts",
+          "{workspaceRoot}/.config/nextest.toml",
+          "cargoClosure",
+          "cargoToolchain",
           {
             "dependentTasksOutputFiles": "**/*",
             "transitive": true
@@ -1091,23 +1082,37 @@
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
           }
         ],
-        "//": "Run from an unsandboxed host-controller shell, never cowshed exec: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. Runs ignored host_controller_ tests in place from the owning workspace's test build, whose reuse-build metadata is a hashed input. Compilation is cached and paid by cargo-test-build before this run, or by the script's ensure step when that build was a cache hit that restored only the metadata; the private runtime TMPDIR cannot change the compiled environment. The fixtures run the development CLI (cli-native), the compiled TypeScript package (tsc-js) and the host's default Node-API addon (napi-native), which build first.",
+        "//": "Run from an unsandboxed host-controller shell: controller fixtures require file-link, deliberately denied to every workspace supervisor and child. The launcher sets private TMPDIR and uses the native fixture's local binaries.",
         "options": {
           "command": "bun packages/cowshed/scripts/host-controller-test.ts",
-          "fixtureCommand": "bun packages/cowshed/scripts/host-controller-test.ts --ensure-binaries",
-          "fixtureTimeoutMs": 3600000,
           "cwd": ".",
-          "idleTimeoutMs": 180000,
-          "killAfterMs": 10000
+          "nativeTest": {
+            "cargoArgs": [
+              "-p",
+              "cowshed-core",
+              "-p",
+              "cowshed-cli",
+              "-p",
+              "cowshed-shell",
+              "-p",
+              "cowshed-gateway"
+            ]
+          }
         }
       },
       "integration-apfs": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
-        "//": "Cached on the crate closure, the toolchain and the host kernel it exercises. It runs from the workspace root so its first step can sweep dead runs (scripts/apfs-test-sweep.ts, from the root's test build, in place) before its fixtures start; replayed from cache it starts none and sweeps nothing.",
+        "//": "Cache the native integration verdict on the crate closure, the toolchain and the host kernel it exercises.",
         "inputs": [
           "cargoClosure",
           "cargoToolchain",
+          "{workspaceRoot}/.config/nextest.toml",
+          "{workspaceRoot}/packages/nx-plugin/nextest.toml",
+          {
+            "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep",
+            "transitive": false
+          },
           "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh uname -sr"
@@ -1118,17 +1123,56 @@
         ],
         "outputs": [],
         "dependsOn": [
+          "...",
           "apfs-test-root",
+          "apfs-test-sweep-bin"
+        ],
+        "options": {
+          "cwd": ".",
+          "nativeTest": {
+            "cargoArgs": [
+              "-p",
+              "cowshed-core",
+              "--test",
+              "apfs_integration"
+            ],
+            "selectionArgs": [
+              "--profile",
+              "integration-apfs"
+            ],
+            "runArgs": [
+              "--no-capture"
+            ]
+          }
+        }
+      },
+      "apfs-test-sweep-bin": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/apfs-test-sweep/cowshed-test-sweep"
+        ],
+        "dependsOn": [
           {
             "projects": [
               "@smoothbricks/codebase"
             ],
-            "target": "cargo-test-build"
+            "target": "cargo-fetch"
           }
         ],
         "options": {
           "cwd": ".",
-          "command": "bun packages/cowshed/scripts/apfs-test-sweep.ts && cargo test -p cowshed-core --test apfs_integration -- --nocapture"
+          "command": "cargo --frozen build -p cowshed-apfs --bin cowshed-test-sweep -Z unstable-options --artifact-dir packages/cowshed/.cache/apfs-test-sweep"
         }
       },
       "benchmark-apfs": {
@@ -1165,7 +1209,6 @@
     "@napi-rs/cli": "3.7.3",
     "@smoothbricks/bend-emit": "workspace:*",
     "@smoothbricks/lmao": "workspace:*",
-    "@smoothbricks/nextest-extract": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "catalog:",
     "nx": "24.0.3",

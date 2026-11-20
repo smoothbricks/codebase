@@ -72,16 +72,22 @@
     "cargo-test-cowshed-*": {
       "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }]
     },
+    "cargo-test-cowshed-apfs*": {
+      "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }, "apfs-test-sweep-bin"],
+      "inputs": ["...", { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false }]
+    },
     "cargo-test-cowshed-core-*": {
       "dependsOn": [
         "...",
         { "projects": ["cowshed"], "target": "apfs-test-root" },
+        "apfs-test-sweep-bin",
         { "projects": ["cowshed"], "target": "capability-probe" },
         { "projects": ["cowshed"], "target": "tsc-js" },
         { "projects": ["cowshed"], "target": "napi-native" }
       ],
       "inputs": [
         "...",
+        { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
         { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false },
         { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
@@ -93,11 +99,13 @@
       "dependsOn": [
         "...",
         { "projects": ["cowshed"], "target": "apfs-test-root" },
+        "apfs-test-sweep-bin",
         { "projects": ["cowshed"], "target": "tsc-js" },
         { "projects": ["cowshed"], "target": "napi-native" }
       ],
       "inputs": [
         "...",
+        { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
         { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
         { "externalDependencies": ["nx@24.0.3", "bun-lock:packages/cowshed"] },
@@ -108,11 +116,20 @@
       "dependsOn": ["...", { "projects": ["cowshed"], "target": "apfs-test-root" }],
       "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"]
     },
+    "cargo-test-cowshed-napi": {
+      "dependsOn": ["...", "wire-fixtures"]
+    },
     "cargo-test-group-real-apfs": {
       "dependsOn": [
         "...",
         { "projects": ["cowshed"], "target": "cli-native" },
+        { "projects": ["cowshed"], "target": "apfs-test-sweep-bin" },
         { "projects": ["cowshed"], "target": "apfs-test-root" }
+      ],
+      "inputs": [
+        "...",
+        { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
+        "{workspaceRoot}/packages/cowshed/scripts/apfs-test-sweep.ts"
       ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     },
@@ -121,9 +138,16 @@
         "...",
         { "projects": ["cowshed"], "target": "cli-native" },
         { "projects": ["cowshed"], "target": "apfs-test-root" },
+        { "projects": ["cowshed"], "target": "apfs-test-sweep-bin" },
         "cargo-test-group-real-apfs"
       ],
-      "inputs": ["...", { "externalDependencies": ["nx@24.0.3"] }, "{workspaceRoot}/patches/nx@*.patch"],
+      "inputs": [
+        "...",
+        { "externalDependencies": ["nx@24.0.3"] },
+        "{workspaceRoot}/patches/nx@*.patch",
+        { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
+        "{workspaceRoot}/packages/cowshed/scripts/apfs-test-sweep.ts"
+      ],
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     }
   },

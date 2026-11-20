@@ -95,8 +95,14 @@ describe('the real-APFS serial groups of this repository', () => {
   it('run the host group after the device group, so two real-image runners never overlap', async () => {
     const nx = await readRecord('nx.json', JSON.parse);
     const host = child(child(nx, 'targetDefaults'), HOST_GROUP);
-    // `...` keeps the inferred archive and fetch edges ahead of the explicit ones.
-    expect(host.dependsOn).toEqual(['...', CHECKOUT_COWSHED_BUILD, APFS_TEST_ROOT, DEVICE_GROUP]);
+    // `...` keeps the inferred fetch edge ahead of the explicit ones.
+    expect(host.dependsOn).toEqual([
+      '...',
+      CHECKOUT_COWSHED_BUILD,
+      APFS_TEST_ROOT,
+      { projects: ['cowshed'], target: 'apfs-test-sweep-bin' },
+      DEVICE_GROUP,
+    ]);
   });
 
   it("run this checkout's cowshed, built first, for every disk command the code under test makes", async () => {
@@ -135,7 +141,7 @@ describe('the real-APFS serial groups of this repository', () => {
       expect(target, name).toBeDefined();
       if (process.platform === 'darwin') {
         expect(target?.executor, name).toBe('@smoothbricks/nx-plugin:bounded-exec');
-        expect(target?.options?.command, name).toContain('nextest run');
+        expect(target?.options?.nativeTest, name).toBeDefined();
       } else {
         // Nx normalizes the package-declared placeholder to a no-op, never an APFS runner.
         expect(target?.executor, name).toBe('nx:noop');
@@ -281,13 +287,11 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         filter: [...grouped.map((override) => `(${String(override.filter)})`), 'test(/host_controller_/)'].join(' or '),
       },
     ]);
-    // integration-apfs runs under cargo test, so the sweep is its own first step, from the workspace root.
     const integration = graph.nodes.cowshed?.data.targets?.['integration-apfs'];
-    expect(integration?.options?.cwd).toBe('.');
-    expect(String(integration?.options?.command)).toStartWith('bun packages/cowshed/scripts/apfs-test-sweep.ts && ');
-    // Every lane runs the root's test build in place: the inferred groups through the native helper, which builds before
-    // them, and cowshed's lanes through the helper's source their scripts import. Linux CI infers its own graph, so this
-    // run checks that one too, not only the host's.
+    expect(integration?.options).toMatchObject({
+      cwd: '.',
+      nativeTest: { cargoArgs: ['-p', 'cowshed-core', '--test', 'apfs_integration'] },
+    });
     for (const { platform, arch } of GRAPH_PLATFORMS) {
       const inferred = await projectGraph({ platform, arch });
       const tasks = createTaskGraph(
@@ -298,12 +302,6 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         undefined,
         {},
       );
-      const producer = `scriptc-${arch}-${platform === 'darwin' ? 'macos' : 'linux'}`;
-      if (platform === 'darwin') {
-        expect(inferred.nodes['nextest-extract']?.data.targets?.[producer]?.options?.outputDirectory, platform).toBe(
-          `dist/bin/${platform}-${arch}`,
-        );
-      }
       for (const [project, target] of [
         [ROOT_PROJECT, DEVICE_GROUP],
         [ROOT_PROJECT, HOST_GROUP],
@@ -311,41 +309,16 @@ describe('the per-user mount root the real-image fixtures keep their scratch tre
         ['cowshed', 'integration-apfs'],
       ] as const) {
         const lane = `${project}:${target}`;
-        expect(
-          tasks.dependencies[lane]?.map((edge) => edge.id),
-          `${platform} ${lane}`,
-        ).toContain(`${ROOT_PROJECT}:cargo-test-build`);
-        // A serial group is inferred only where its declared cfg holds, macOS: there it runs bounded by progress, and
-        // elsewhere its root entry only orders its dependencies and runs no command, so it sweeps nothing.
         const runner = inferred.nodes[project]?.data.targets?.[target];
         const group = target === DEVICE_GROUP || target === HOST_GROUP;
-        if (group && platform === 'darwin') expect(runner?.options?.idleTimeoutMs, lane).toBe(180000);
         if (group && platform !== 'darwin') {
-          expect(runner?.options?.command, `${platform} ${lane}`).toBeUndefined();
+          expect(runner?.options?.nativeTest, lane).toBeUndefined();
           continue;
         }
-        expect(runner?.options?.command, `${platform} ${lane}`).toBeString();
-        if (!group) continue;
-        const reached = (tasks.dependencies[lane] ?? []).flatMap(({ id }) => [
-          id,
-          ...(tasks.dependencies[id] ?? []).map((edge) => edge.id),
-        ]);
-        expect(reached, `${platform} ${lane}`).toContain(`nextest-extract:${producer}`);
-      }
-      // The runner's command (`target-dir`) and fixture (`ensure`) run the helper that producer builds, so its bytes key
-      // every runner, each crate's pieces as well as the groups.
-      const helper = `packages/nextest-extract/dist/bin/${platform}-${arch}/smoo-nx-nextest-binaries`;
-      for (const [project, target] of [
-        [ROOT_PROJECT, DEVICE_GROUP],
-        ['cowshed', 'cargo-test-cowshed-core-shard1'],
-        ['lmao', 'cargo-test-lmao-core'],
-      ] as const) {
-        const runner = inferred.nodes[project]?.data.targets?.[target];
-        if (typeof runner?.options?.command !== 'string') continue;
-        const globs = (runner.inputs ?? []).flatMap((input) =>
-          typeof input === 'object' && 'dependentTasksOutputFiles' in input ? [input.dependentTasksOutputFiles] : [],
-        );
-        expect(matchGlobPaths(globs, [helper])[0], `${platform} ${project}:${target}`).toBe(true);
+        expect(runner?.options?.nativeTest, lane).toBeDefined();
+        const dependencies = tasks.dependencies[lane]?.map((edge) => edge.id);
+        expect(dependencies, lane).toContain('cowshed:apfs-test-sweep-bin');
+        expect(dependencies, lane).not.toContain(`${ROOT_PROJECT}:cargo-test-build`);
       }
       // A macOS addon build runs the record writer after its build, so the writer's bytes key it: a change to what a
       // record states leaves no cache hit restoring an addon beside a record in the old form.

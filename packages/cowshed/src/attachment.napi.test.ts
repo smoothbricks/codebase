@@ -2,11 +2,11 @@
 
 import { expect, it } from 'bun:test';
 import { join } from 'node:path';
-import { cargoTargetDirectory, NEXTEST_BINARIES_METADATA, NEXTEST_CARGO_METADATA } from '@smoothbricks/nextest-extract';
 
 it('projects the public attachment through the built addon and controller', async () => {
   const checkout = join(import.meta.dir, '../../..');
-  const target = await cargoTargetDirectory(checkout);
+  const fixture = process.env.BOUNDED_EXEC_FIXTURE_DIR;
+  if (fixture === undefined) throw new Error('attachment test requires the native test fixture');
   const run = Bun.spawn(
     [
       'cargo',
@@ -14,13 +14,9 @@ it('projects the public attachment through the built addon and controller', asyn
       'nextest',
       'run',
       '--binaries-metadata',
-      NEXTEST_BINARIES_METADATA,
+      join(fixture, 'binaries-metadata.json'),
       '--cargo-metadata',
-      NEXTEST_CARGO_METADATA,
-      '--target-dir-remap',
-      target,
-      '--workspace-remap',
-      checkout,
+      join(fixture, 'cargo-metadata.json'),
       '--filterset',
       'binary_id(cowshed-core::project_runtime) and test(=napi_attachment_projects_the_input_view)',
       '--run-ignored',

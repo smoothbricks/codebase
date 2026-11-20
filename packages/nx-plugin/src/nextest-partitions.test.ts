@@ -1,16 +1,15 @@
 import { afterAll, afterEach, beforeAll, expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { fixtureNxEnv, nxFixtureRoot } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
-import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import { SERIAL_TEST_GROUP_PLATFORM } from './cargo-workspace.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
-import type { BoundedExecOptions } from './executors/bounded-exec/schema.js';
+import { type BoundedExecOptions, type NativeBoundedExecOptions } from './executors/bounded-exec/schema.js';
 import {
   type BoundedExecRecord,
   JUNIT_FILE,
@@ -19,15 +18,18 @@ import {
   writeRecord,
 } from './executors/bounded-exec/verdict.js';
 import { createNodesV2 } from './index.js';
-import { descendantsDiagnostic } from './testing.js';
+import {
+  descendantsDiagnostic,
+  fixtureSocketDirectory,
+  publishFixtureSocketDirectory,
+  retireFixtureSocketDirectory,
+} from './testing.js';
 
 useFixtureCargoHome();
 
 const GROUP_TARGET = 'cargo-test-group-serial-probe';
 const GROUP_ID = `partition-fixture:${GROUP_TARGET}`;
 const GROUP_HASH = 'serial-probe-hash';
-// The filter the plugin's group runner carries; the empty-selection case replaces exactly this text.
-const SERIAL_FILTER_ARG = "-E '(test(/serial_probe_/))'";
 
 const ordinary = Array.from({ length: 13 }, (_, index) => `ordinary_${index}`);
 // The class the plugin's nextest.toml singles out with an override: the
@@ -44,7 +46,6 @@ const expected = [...ordinary, ...exceptional, ...serial];
 interface SharedFixture {
   readonly root: string;
   readonly targets: Readonly<Record<string, TargetConfiguration>>;
-  readonly passingSeed: BoundedExecRecord | undefined;
 }
 
 /** A child this test started and has not yet seen close, with the command line that names it. */
@@ -70,14 +71,30 @@ const installation = testFileInstallation();
 
 beforeAll(
   caseBody(async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-nextest-partitions-')));
+    const root = await nxFixtureRoot('smoo-nextest-partitions-');
     fixtureRoot = root;
     await writeFile(join(root, 'package.json'), '{"name":"partition-fixture","private":true}\n');
     await writeFile(join(root, '.gitignore'), 'node_modules/\ntarget/\n.nx/\n*.log\n');
     await writeFile(
       join(root, 'Cargo.toml'),
-      '[workspace]\nresolver = "2"\n\n[package]\nname = "partition-probe"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+      '[workspace]\nresolver = "2"\nmembers = ["feature-enabler", "shared"]\n\n[dependencies]\nshared = { path = "shared" }\n\n[package]\nname = "partition-probe"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
     );
+    await mkdir(join(root, '.cargo'));
+    await writeFile(
+      join(root, '.cargo/config.toml'),
+      '[unstable]\nfeature-unification = true\n[resolver]\nfeature-unification = "workspace"\n',
+    );
+    for (const name of ['feature-enabler', 'shared']) await mkdir(join(root, name, 'src'), { recursive: true });
+    await writeFile(
+      join(root, 'shared/Cargo.toml'),
+      '[package]\nname="shared"\nversion="0.1.0"\nedition="2021"\n[features]\nextra=[]\n',
+    );
+    await writeFile(join(root, 'shared/src/lib.rs'), '#[cfg(feature="extra")] pub const ENABLED: bool = true;\n');
+    await writeFile(
+      join(root, 'feature-enabler/Cargo.toml'),
+      '[package]\nname="feature-enabler"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nshared={path="../shared",features=["extra"]}\n',
+    );
+    await writeFile(join(root, 'feature-enabler/src/lib.rs'), '');
     await mkdir(join(root, '.config'));
     await writeFile(
       join(root, '.config/nextest.toml'),
@@ -108,6 +125,7 @@ beforeAll(
         }
     }
 ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.includes(name) ? ' fail_when_forced();' : ''} }`).join('\n')}
+    #[test] #[ignore] fn workspace_feature_and_ignored_inventory() { assert!(shared::ENABLED); }
 }
 `,
     );
@@ -118,12 +136,31 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     const result = await infer(['package.json'], undefined, { workspaceRoot: root, nxJsonConfiguration: {} });
     const targets = result[0]?.[1].projects?.['.']?.targets;
     if (targets === undefined) throw new Error('Cargo fixture inferred no targets');
-    // The test build is the one real prerequisite: every runner executes its binaries where it left them. Nx gives
-    // every task its hash; the build declares it as its key and records it in the target directory it built.
-    await run(root, ['sh', '-c', command(targets, 'cargo-test-build')], { NX_TASK_HASH: '424242' });
-    const source = { root, targets };
-    const passingSeed = targets[GROUP_TARGET] === undefined ? undefined : await groupSucceeds(source);
-    shared = { ...source, passingSeed };
+    expect(targets['cargo-test-build']).toBeUndefined();
+    const list = async (selection: string[]) => {
+      const result = await runTracked(root, [
+        'cargo',
+        '--frozen',
+        'nextest',
+        'list',
+        ...selection,
+        '-E',
+        'package(partition-probe)',
+        '--run-ignored',
+        'only',
+        '-T',
+        'oneline',
+        '--user-config-file',
+        'none',
+      ]);
+      expect(result.code, result.output).toBe(0);
+      return result.output.split('\n').filter((line) => line.startsWith('partition-probe '));
+    };
+    const before = await list(['--workspace']);
+    expect(before).toEqual(['partition-probe tests::workspace_feature_and_ignored_inventory']);
+    expect(await list(['-p', 'partition-probe'])).toEqual(before);
+    await mkdir(await publishFixtureSocketDirectory(root), { recursive: true });
+    shared = { root, targets };
   }),
 );
 
@@ -202,6 +239,7 @@ afterAll(async () => {
   if (barrierFailure !== undefined) throw new Error(`kept fixture ${root}:\n${barrierFailure}`);
   fixtureRoot = undefined;
   shared = undefined;
+  await retireFixtureSocketDirectory(root);
   await rm(root, { recursive: true, force: true });
 });
 
@@ -239,21 +277,14 @@ function groupDirectory(root: string): string {
 function groupOptions(
   targets: Readonly<Record<string, TargetConfiguration>>,
   root: string,
-  run = command(targets, GROUP_TARGET),
-): BoundedExecOptions {
-  // The group runner is bounded by progress like every test target: no ceiling, one runnable test at a time.
-  expect(targets[GROUP_TARGET]?.options).toMatchObject({
-    idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-    killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-    parallelism: 1,
-  });
-  expect(targets[GROUP_TARGET]?.options).not.toHaveProperty('timeoutMs');
+  selectionArgs?: string[],
+): NativeBoundedExecOptions {
+  const options = nativeOptions(targets, GROUP_TARGET);
+  expect(options.parallelism).toBe(1);
   return {
-    command: run,
+    ...options,
     cwd: root,
-    idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-    killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-    parallelism: 1,
+    nativeTest: { ...options.nativeTest, ...(selectionArgs === undefined ? {} : { selectionArgs }) },
   };
 }
 
@@ -273,41 +304,39 @@ async function executesEveryTestOnce(): Promise<void> {
   ];
   await Promise.all([
     ...partitions.flatMap(({ kind, log }) =>
-      [1, 2, 3].map((index) =>
-        run(root, ['sh', '-c', command(targets, `cargo-test-partition-probe-${kind}${index}`)], {
-          PARTITION_EXECUTIONS: log,
-        }),
-      ),
+      [1, 2, 3].map(async (index) => {
+        const name = `cargo-test-partition-probe-${kind}${index}`;
+        const result = await runGroupExecutor(
+          root,
+          nativeOptions(targets, name),
+          { root },
+          { PARTITION_EXECUTIONS: log },
+        );
+        expect(result.code, result.output).toBe(0);
+      }),
     ),
-    ...(hasGroup ? [run(root, ['sh', '-c', command(targets, GROUP_TARGET)], { PARTITION_EXECUTIONS: serialLog })] : []),
+    ...(hasGroup ? [groupSucceeds()] : []),
   ]);
+  if (hasGroup) {
+    await writeFile(serialLog, await readFile(join(root, 'group-success.log')));
+  }
   for (const { log, tests } of [...partitions, ...(hasGroup ? [{ log: serialLog, tests: serial }] : [])]) {
     const observed = (await readFile(log, 'utf8')).trim().split('\n').sort();
     expect(observed).toEqual([...tests].sort());
   }
-  // The runners ran the build's binaries in place: the build's directory holds only its reuse-build metadata, the
-  // declared Nx outputs, and Cargo's build tree holds no extraction.
-  expect((await readdir(join(root, '.cache/nextest'))).sort()).toEqual([
-    'binaries-metadata.json',
-    'build.key',
-    'cargo-metadata.json',
-  ]);
+  await expect(readdir(join(root, '.cache/nextest'))).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await readdir(join(root, 'target'))).not.toContain('nextest-extracted');
-  // The serial group is one unpartitioned runner.
-  if (hasGroup) expect(command(targets, GROUP_TARGET)).not.toContain('--partition');
+  if (hasGroup) expect(groupOptions(targets, root).nativeTest.selectionArgs).not.toContain('--partition');
 }
 
 /**
  * The real default executor, run for real on this fixture's group in a driver process. Its verdict is typed
- * passed and returned to its caller: fixture setup retains one real seed before any case runs.
+ * passed and returned to its caller, which can replay it before a failing case.
  */
 async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = fixture()): Promise<BoundedExecRecord> {
   const { root, targets } = source;
+  expect(groupOptions(targets, root).nativeTest.runArgs).toContain('--no-fail-fast');
   const directory = groupDirectory(root);
-  const realCommand = command(targets, GROUP_TARGET);
-  // Group policy requires --no-fail-fast: ordinary failures must not stop the remaining tests. Checked before any run.
-  expect(realCommand).toContain('--no-fail-fast');
-  expect(realCommand).not.toContain('max-fail');
   // The probes read PARTITION_EXECUTIONS and PARTITION_FAIL_SERIAL from the environment. Each run sets them on the
   // driver's spawn; the runner inherits them, since bounded-exec merges process.env into every runner. The command
   // stays the byte-identical one the plan generates.
@@ -333,17 +362,14 @@ async function groupSucceeds(source: Pick<SharedFixture, 'root' | 'targets'> = f
  * run seeds the stale verdict and report the run must replace; the marker log proves no probe ran.
  */
 async function emptySelectionFails(): Promise<void> {
-  const { root, targets, passingSeed } = fixture();
-  if (passingSeed === undefined) throw new Error('the inferred serial group has no passing seed');
+  const { root, targets } = fixture();
+  const passingSeed = await groupSucceeds();
   const directory = groupDirectory(root);
   await writeRecord(directory, passingSeed);
   await writeFile(join(directory, JUNIT_FILE), 'stale report\n');
-  const realCommand = command(targets, GROUP_TARGET);
-  const emptied = realCommand.replace(SERIAL_FILTER_ARG, "-E 'none()'");
-  if (emptied === realCommand) throw new Error(`the group runner carries no ${SERIAL_FILTER_ARG} to empty`);
   const emptyLog = join(root, 'group-empty.log');
   await rm(emptyLog, { force: true });
-  const empty = await runGroupExecutor(root, groupOptions(targets, root, emptied), groupContext(root), {
+  const empty = await runGroupExecutor(root, groupOptions(targets, root, ['-E', 'none()']), groupContext(root), {
     PARTITION_EXECUTIONS: emptyLog,
   });
   expect(empty.code, empty.output).toBe(2);
@@ -384,6 +410,38 @@ async function continuesPastFailures(): Promise<void> {
 
 it('executes every built test once across the actual host runners', caseBody(executesEveryTestOnce));
 
+//#region smoo/cowshed!n/native-test-verdicts
+it(
+  'keeps metadata private to concurrent invocations of the same suite',
+  caseBody(async () => {
+    const { root, targets } = fixture();
+    const options = nativeOptions(targets, 'cargo-test-partition-probe-shard1');
+    const runs = await Promise.all(
+      [1, 2].map(() =>
+        runGroupExecutor(
+          root,
+          {
+            ...options,
+            command:
+              'test -s "$BOUNDED_EXEC_FIXTURE_DIR/binaries-metadata.json" && test -s "$BOUNDED_EXEC_FIXTURE_DIR/cargo-metadata.json" && printf "fixture path: %s\n" "$BOUNDED_EXEC_FIXTURE_DIR"',
+          },
+          { root },
+        ),
+      ),
+    );
+    const paths = new Set<string>();
+    for (const result of runs) {
+      expect(result.code, result.output).toBe(0);
+      const path = /^fixture path: (.+)$/m.exec(result.output)?.[1];
+      if (path === undefined) throw new Error('the custom native command did not receive its fixture directory');
+      paths.add(path);
+      await expect(readdir(path)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(paths.size).toBe(2);
+  }),
+);
+//#endregion smoo/cowshed!n/native-test-verdicts
+
 // Serial groups are a macOS capability, not a simulated Darwin plan to execute on another host.
 // Every host still executes all fixture tests above through its real inferred partition.
 if (process.platform === 'darwin') {
@@ -400,10 +458,24 @@ if (process.platform === 'darwin') {
   it('runs the serial group past failing probes and reports all four', caseBody(continuesPastFailures));
 }
 
-function command(targets: Readonly<Record<string, TargetConfiguration>>, name: string): string {
-  const single: unknown = targets[name]?.options?.command;
-  if (typeof single !== 'string') throw new Error(`${name} inferred no executable command`);
-  return single;
+function nativeOptions(targets: Readonly<Record<string, TargetConfiguration>>, name: string): NativeBoundedExecOptions {
+  const options = targets[name]?.options;
+  const recipe: unknown = options?.nativeTest;
+  if (typeof recipe !== 'object' || recipe === null || !('cargoArgs' in recipe) || !Array.isArray(recipe.cargoArgs)) {
+    throw new Error(`${name} inferred no native test recipe`);
+  }
+  return {
+    ...options,
+    nativeTest: {
+      cargoArgs: recipe.cargoArgs.filter((word): word is string => typeof word === 'string'),
+      ...('selectionArgs' in recipe && Array.isArray(recipe.selectionArgs)
+        ? { selectionArgs: recipe.selectionArgs.filter((word): word is string => typeof word === 'string') }
+        : {}),
+      ...('runArgs' in recipe && Array.isArray(recipe.runArgs)
+        ? { runArgs: recipe.runArgs.filter((word): word is string => typeof word === 'string') }
+        : {}),
+    },
+  };
 }
 
 function killProcessGroup(child: ChildProcess): void {
@@ -424,14 +496,14 @@ interface Tracked {
 async function runTracked(
   root: string,
   args: string[],
-  options: { overlay?: Record<string, string>; graceful?: boolean; tee?: boolean } = {},
+  options: { overlay?: Record<string, string>; env?: NodeJS.ProcessEnv; graceful?: boolean; tee?: boolean } = {},
 ): Promise<Tracked> {
   if (ending) throw new Error(`teardown has begun; not starting ${args.join(' ')}`);
   const [program, ...rest] = args;
   if (program === undefined) throw new Error('run needs a program');
   const child = spawn(program, rest, {
     cwd: root,
-    env: { ...process.env, ...options.overlay },
+    env: { ...(options.env ?? process.env), ...options.overlay },
     detached: process.platform !== 'win32',
   });
   child.stdin?.end();
@@ -499,6 +571,7 @@ process.exitCode = result.success ? 0 : 2;`;
   const result = await runTracked(root, ['node', '--input-type=module', '-e', script], {
     graceful: true,
     tee: true,
+    env: { ...fixtureNxEnv(root, fixtureSocketDirectory(root)), TMPDIR: fixtureSocketDirectory(root) },
     overlay: { ...environment, NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data') },
   });
   return result;

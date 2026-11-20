@@ -3,7 +3,25 @@
  * A test target names only `idleTimeoutMs` (`bounded-test-policy.ts`); `timeoutMs` is for commands that report no
  * tests, whose only progress is exiting.
  */
-export type BoundedExecOptions = BoundedExecCommand & BoundedExecBounds;
+export type BoundedExecOptions = ShellBoundedExecOptions | NativeBoundedExecOptions;
+export type ShellBoundedExecOptions = BoundedExecCommand & BoundedExecBounds & { nativeTest?: undefined };
+export type NativeBoundedExecOptions = Omit<
+  BoundedExecCommand,
+  'command' | 'fixtureCommand' | 'fixtureTimeoutMs' | 'unitsCommand'
+> & {
+  /** Omit to run nextest directly, or name a launcher that reads this invocation's fixture metadata. */
+  command?: string;
+  nativeTest: NativeTestOptions;
+};
+
+export interface NativeTestOptions {
+  /** Cargo package/target/feature/profile selection, passed to nextest's binaries-only build. */
+  cargoArgs: readonly string[];
+  /** Shared nextest run/list selection, e.g. filterset, partition, profile or ignored mode. */
+  selectionArgs?: readonly string[];
+  /** Nextest run-only arguments, e.g. fail-fast policy or output options. */
+  runArgs?: readonly string[];
+}
 
 export type BoundedExecBounds =
   | { timeoutMs: number; idleTimeoutMs?: number }

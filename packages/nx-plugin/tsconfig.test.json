@@ -29,7 +29,6 @@
     },
     { "path": "../cargo-retain/tsconfig.lib.json" },
     { "path": "../build-inputs/tsconfig.lib.json" },
-    { "path": "../nextest-extract/tsconfig.lib.json" },
     { "path": "../cowshed/tsconfig.lib.json" }
   ]
 }

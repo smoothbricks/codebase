@@ -2139,13 +2139,13 @@ one package per core), each held 17 or 18 of an 18-core pool, and mbx's ordered 
 behind it waiting while the pool drained: a downstream gate on 2026-10-31 ran 4.9 of 18 cores busy while 25 of its tasks
 queued a minute or more, and a gate's Go test leaf waited 401 s for all 18 cores. Every other leaf keeps the rule above.
 
-**A nextest run of prebuilt test binaries is a reserved leaf.** The inferred extracted-archive run
-(`--binaries-metadata`), or one from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf does:
-its run's endpoint admits it once for its whole grant, and its test processes run inside that grant or on a core each
-takes for itself ("A case starts on a core"), mbx scheduling none of them beneath the reservation. Admitted one test
-process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for a ticket of its own: a downstream gate on 2026-10-30
-measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121 tests run in 1.18 s unqueued (owner's ruling,
-2026-10-30).
+**A nextest run of prebuilt test binaries is a reserved leaf.** A native run using its invocation's binaries metadata
+(`--binaries-metadata`), or a cross run from `--archive-file`, builds nothing, so it enters the pool as a non-Cargo leaf
+does: its run's endpoint admits it once for its whole grant, and its test processes run inside that grant or on a core
+each takes for itself ("A case starts on a core"), mbx scheduling none of them beneath the reservation. Admitted one
+test process at a time under `MBX_SCHEDULER_TESTS=1`, each queued for a ticket of its own: a downstream gate on
+2026-10-30 measured 73.5 s apiece for codec tests of at most 0.25 s, whose 121 tests run in 1.18 s unqueued (owner's
+ruling, 2026-10-30).
 
 <a id="smoo/cowshed!n/a-case-starts-on-a-core"></a>**A case starts on a core.** A grant never grows, and a runner's
 thread count is fixed when it starts, so a suite granted one core beside its run's short leaves ran its cases in turn
@@ -2213,27 +2213,32 @@ core before it runs:
   answer), `mbx-reservations.test.ts` (a run under a hold asks it), the replay above, and mbx's own suite for the shim.
 
 <a id="smoo/cowshed!n/build-precedes-reservation"></a>**A leaf's build precedes its reservation.** A reservation holds
-cores only while its command can use them. A reserved leaf's fixture (`fixtureCommand`; for the plugin's nextest runners
-the workspace's test binaries build, the command of `cargo-test-build`) therefore runs first and outside any
-reservation, as pooled work like any other build: mbx's scheduler is on for it and admits its compilers one by one, and
-while it waits on Cargo's build-directory lock it holds no core. Only once the fixture has exited 0 does the leaf ask
-its run's endpoint for cores, and what runs under the grant is the command alone. A fixture that fails, or that outlives
-its own ceiling, which starts at spawn, fails the leaf before anything is reserved. Run inside the reservation, a
-fixture locks the pool up: the leaf holds its grant while its Cargo call waits on the build-directory lock, the lock's
-holder is a pooled build whose compiler waits for one core, and reserved leaves hold every core. A downstream land gate
-stood so for 14 minutes at load 1.5, with 864 of its 1,030 tasks done, until it was ended by hand. Enforced by
-`mbx-pool.test.ts` (the leaf's shell runs its fixture with the scheduler on before it asks) and `executor.test.ts` (the
-endpoint hears no request before the fixture has run, and none from a leaf whose fixture never ends). **A reserved leaf
-asks for no more than its units.** A leaf whose target names a `unitsCommand` (the plugin's nextest pieces: the same
-`nextest list` of the piece's selection and partition, one line per test) runs that command at the end of its fixture
-segment, under the fixture's ceiling, before any reservation as every fixture runs ("A leaf's build precedes its
-reservation"), then asks for `min(units, g)` cores, at least one. A piece of two slow tests reserves two cores, not
-every core its runner could use, so a grant mbx makes from the free cores is not held idle for the piece's whole run.
-Units count tests, not nextest's per-test thread slots, so a test with `threads-required` above one runs on fewer cores
-than it could use. A count that fails fails the leaf before anything is reserved. A leaf with no units command, such as
-a cross-target archive run, asks for its runner's own count `g`, after its fixture all the same.
+cores only while its command can use them. A reserved leaf's fixture (for a native nextest runner, the selected
+packages' test build) therefore runs first and outside any reservation, as pooled work like any other build: mbx's
+scheduler is on for it and admits its compilers one by one, and while it waits on Cargo's build-directory lock it holds
+no core. Only once the fixture has exited 0 does the leaf ask its run's endpoint for cores, and what runs under the
+grant is the command alone. A fixture that fails, or that outlives its own ceiling, which starts at spawn, fails the
+leaf before anything is reserved. Run inside the reservation, a fixture locks the pool up: the leaf holds its grant
+while its Cargo call waits on the build-directory lock, the lock's holder is a pooled build whose compiler waits for one
+core, and reserved leaves hold every core. A downstream land gate stood so for 14 minutes at load 1.5, with 864 of its
+1,030 tasks done, until it was ended by hand. Enforced by `mbx-pool.test.ts` (the leaf's shell runs its fixture with the
+scheduler on before it asks) and `executor.test.ts` (the endpoint hears no request before the fixture has run, and none
+from a leaf whose fixture never ends). **A reserved leaf asks for no more than its units.** A leaf whose target names a
+`unitsCommand` (the plugin's nextest pieces: the same `nextest list` of the piece's selection and partition, one line
+per test) runs that command at the end of its fixture segment, under the fixture's ceiling, before any reservation as
+every fixture runs ("A leaf's build precedes its reservation"), then asks for `min(units, g)` cores, at least one. A
+piece of two slow tests reserves two cores, not every core its runner could use, so a grant mbx makes from the free
+cores is not held idle for the piece's whole run. Units count tests, not nextest's per-test thread slots, so a test with
+`threads-required` above one runs on fewer cores than it could use. A count that fails fails the leaf before anything is
+reserved. A leaf with no units command, such as a cross-target archive run, asks for its runner's own count `g`, after
+its fixture all the same.
 
-The boundary of an unheld job is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing
+<a id="smoo/cowshed!n/native-test-verdicts"></a>**Cache native test verdicts, not test binaries.** The native test leaf
+owns the build and run phases. A result hit starts neither phase. On a miss the fixture materializes the selected
+packages, Cargo targets and features through mbx in the shared Cargo target directory. Its reuse-build metadata is
+private to the invocation and never an Nx output. The nextest phase consumes that metadata and runs the selected cases,
+without building or changing the test idle bound. A cross archive remains a separate artifact for another platform. The
+boundary of an unheld job is the actual leaf runner (`bounded-exec` and equivalent direct runners), not an enclosing
 orchestration command; a held job's boundary is the job itself ("Held jobs"). An Nx run mixing Cargo and non-Cargo
 leaves outside a hold holds no reservation of its own: Cargo leaves use mbx, non-Cargo leaves reserve, and local fan-out
 consumes only the admitted leaf's grant. A reservation does not discover Cargo children. Reserving around an

@@ -6,12 +6,26 @@
   "cli": "nx",
   "outputCapture": "pipe",
   "additionalProperties": true,
-  "required": ["command"],
-  "anyOf": [{ "required": ["timeoutMs"] }, { "required": ["idleTimeoutMs"] }],
+  "anyOf": [
+    { "required": ["nativeTest"] },
+    { "required": ["command", "timeoutMs"] },
+    { "required": ["command", "idleTimeoutMs"] }
+  ],
   "properties": {
     "command": {
       "type": "string",
       "description": "Shell command to run."
+    },
+    "nativeTest": {
+      "type": "object",
+      "description": "Materialize selected Cargo test binaries in the bounded fixture, then run nextest or the named custom command. The 180s test idle bound is the default.",
+      "required": ["cargoArgs"],
+      "additionalProperties": false,
+      "properties": {
+        "cargoArgs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "selectionArgs": { "type": "array", "items": { "type": "string" } },
+        "runArgs": { "type": "array", "items": { "type": "string" } }
+      }
     },
     "cwd": {
       "type": "string",

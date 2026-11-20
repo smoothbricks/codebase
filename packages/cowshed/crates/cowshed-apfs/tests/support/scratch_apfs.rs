@@ -290,14 +290,18 @@ fn hear(
     Ok(length)
 }
 
-/// The lane's `cowshed-test-sweep`, which keeps roots: the nearest one among the directories
-/// holding this executable, itself included when it is that program. Cargo puts it in the target
-/// profile directory (`target/<profile>/`), an ancestor of every test and example binary of that
-/// build whatever its layout (`deps/`, `examples/`, `build/<package>/<hash>/out/`), and the
-/// lane's nextest archive keeps that tree. None is an error that names where it looked and the
-/// remedy.
+/// A native Nx lane has the declared keeper artifact; a direct Cargo run or archive uses the keeper
+/// alongside its test binaries. Both paths are in the checkout or build that actually runs the tests.
 fn keeper_executable() -> std::io::Result<PathBuf> {
     const NAME: &str = "cowshed-test-sweep";
+    if std::env::var_os("BOUNDED_EXEC_FIXTURE_DIR").is_some() {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+            std::io::Error::other("native test fixture has no Cargo manifest directory")
+        })?;
+        return Ok(PathBuf::from(manifest)
+            .join("../../.cache/apfs-test-sweep")
+            .join(NAME));
+    }
     let current = std::env::current_exe()?;
     current
         .ancestors()

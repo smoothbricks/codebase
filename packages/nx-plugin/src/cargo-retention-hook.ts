@@ -1,4 +1,4 @@
-import { join, relative } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import {
   describeRetentionError,
   describeRetentionStart,
@@ -77,8 +77,14 @@ export async function postTasksExecution(_options: unknown, context: PostTasksEx
   const roots = new Set<string>();
   for (const { task } of executed) {
     const project = graph.nodes[task.target.project];
-    if (project?.data.targets?.[task.target.target]?.metadata?.cargoProducer !== true) continue;
-    roots.add(join(context.workspaceRoot, task.projectRoot ?? project.data.root));
+    const target = project?.data.targets?.[task.target.target];
+    if (project === undefined || target?.metadata?.cargoProducer !== true) continue;
+    const cwd: unknown = target.options?.nativeTest === undefined ? undefined : target.options.cwd;
+    roots.add(
+      typeof cwd === 'string'
+        ? resolve(context.workspaceRoot, cwd)
+        : join(context.workspaceRoot, task.projectRoot ?? project.data.root),
+    );
   }
   const done: string[] = [];
   for (const root of [...roots].sort()) {

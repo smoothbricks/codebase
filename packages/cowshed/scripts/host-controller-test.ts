@@ -3,27 +3,9 @@
 import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  cargoTargetDirectory,
-  ensureInPlace,
-  NEXTEST_BINARIES_METADATA,
-  NEXTEST_CARGO_METADATA,
-} from '../../nextest-extract/src/nextest-binaries.js';
 
 const checkout = realpathSync(fileURLToPath(new URL('../../../', import.meta.url)));
 const toolConfig = `smoo:${join(checkout, 'packages/nx-plugin/nextest.toml')}`;
-const say = (line: string) => console.error(`host-controller-test: ${line}`);
-if (process.argv[2] === '--ensure-binaries') {
-  // The target's fixture: the binaries run where cargo-test-build left them, and a checkout whose build was a cache hit
-  // builds them here, in the fixture's build interval, never under the test guard.
-  try {
-    await ensureInPlace(checkout, toolConfig, say);
-    process.exit(0);
-  } catch (error) {
-    say(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  }
-}
 const temporaryRoot = join(checkout, '.cowshed/tmp');
 let temporary: string | undefined;
 let status = 1;
@@ -35,7 +17,8 @@ try {
   // Test the actual operation, not an environment flag: a nested profile cannot
   // regain file-link authority denied by an enclosing workspace sandbox.
   linkSync(source, join(temporary, 'authority-alias'));
-  const target = await cargoTargetDirectory(checkout);
+  const fixture = process.env.BOUNDED_EXEC_FIXTURE_DIR;
+  if (fixture === undefined) throw new Error('host-controller tests require the native test fixture');
   const child = Bun.spawn(
     [
       'cargo',
@@ -43,13 +26,9 @@ try {
       'nextest',
       'run',
       '--binaries-metadata',
-      join(checkout, NEXTEST_BINARIES_METADATA),
+      join(fixture, 'binaries-metadata.json'),
       '--cargo-metadata',
-      join(checkout, NEXTEST_CARGO_METADATA),
-      '--target-dir-remap',
-      target,
-      '--workspace-remap',
-      checkout,
+      join(fixture, 'cargo-metadata.json'),
       '-E',
       'test(/host_controller_/) and (package(cowshed-core) or package(cowshed-cli) or package(cowshed-shell) or package(cowshed-gateway))',
       '--run-ignored',

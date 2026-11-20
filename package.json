@@ -303,46 +303,8 @@
           }
         ]
       },
-      "cargo-test-build": {
-        "dependsOn": [
-          "...",
-          {
-            "target": "wire-fixtures",
-            "projects": [
-              "cowshed"
-            ]
-          }
-        ],
-        "inputs": [
-          "...",
-          "{workspaceRoot}/packages/cowshed/src/wire-fixtures.json",
-          {
-            "env": "LMAO_GIT_REVISION"
-          }
-        ]
-      },
-      "cargo-test-group-real-apfs": {
-        "dependsOn": [
-          "...",
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-build"
-          }
-        ]
-      },
-      "cargo-test-group-real-apfs-host": {
-        "dependsOn": [
-          "...",
-          {
-            "projects": [
-              "@smoothbricks/codebase"
-            ],
-            "target": "cargo-test-build"
-          }
-        ]
-      }
+      "cargo-test-group-real-apfs": {},
+      "cargo-test-group-real-apfs-host": {}
     },
     "name": "@smoothbricks/codebase"
   },

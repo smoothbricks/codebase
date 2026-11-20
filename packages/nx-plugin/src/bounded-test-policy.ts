@@ -322,7 +322,8 @@ function commandOf(project: ResolvedProjectTargets, targetName: string): string 
     return undefined;
   }
   const command = options.command;
-  return typeof command === 'string' ? command : undefined;
+  if (typeof command === 'string') return command;
+  return isRecord(options.nativeTest) ? 'cargo --frozen nextest run' : undefined;
 }
 
 function resolvedTargetReaches(project: ResolvedProjectTargets, from: string, goal: string): boolean {
@@ -418,14 +419,15 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
   if (executor !== BOUNDED_TEST_EXECUTOR || !isRecord(rawOptions)) {
     return false;
   }
-  const command = rawOptions.command;
+  const native = isRecord(rawOptions.nativeTest);
+  const command = rawOptions.command ?? (native ? 'cargo --frozen nextest run' : undefined);
   return (
     typeof command === 'string' &&
     command.length > 0 &&
     isPackageTestScriptRunnerCommand(command) === false &&
     // A test leg is bounded by progress alone: a wall-clock ceiling fails a suite that is only slow.
     rawOptions.timeoutMs === undefined &&
-    isPositiveSafeInteger(rawOptions.idleTimeoutMs) &&
+    (isPositiveSafeInteger(rawOptions.idleTimeoutMs) || (native && rawOptions.idleTimeoutMs === undefined)) &&
     bunTestHasNoDeadline(command) &&
     typeof rawOptions.cwd === 'string' &&
     // `bun test` walks its working directory looking for test files, so it must start where that walk is cheap: the
@@ -433,7 +435,7 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     // per-crate nextest legs run from the workspace root, which no member project owns, and a gate may run a script
     // that lives in another project; both are bounded by their progress bound alone.
     (!BUN_TEST_PREFIX.test(command) || allowedCwds.has(rawOptions.cwd)) &&
-    isPositiveSafeInteger(rawOptions.killAfterMs)
+    (isPositiveSafeInteger(rawOptions.killAfterMs) || (native && rawOptions.killAfterMs === undefined))
   );
 }
 

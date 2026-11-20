@@ -27,10 +27,6 @@
     {
       "path": "../lmao/tsconfig.lib.json"
     },
-
-    {
-      "path": "../nextest-extract/tsconfig.lib.json"
-    },
     {
       "path": "../nx-cache-server/tsconfig.lib.json"
     },

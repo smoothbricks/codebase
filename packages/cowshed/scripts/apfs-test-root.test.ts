@@ -17,30 +17,6 @@ import {
   requirements,
   systemHost,
 } from './apfs-test-root.js';
-import { sweepExecutable } from './apfs-test-sweep.js';
-
-describe('the lane sweep executable in the test build', () => {
-  const entry = { name: 'cowshed-test-sweep', kind: 'bin-exe', path: 'debug/cowshed-test-sweep' };
-  const metadata = (entries: unknown[]) => ({
-    'rust-build-meta': { 'non-test-binaries': { 'cowshed-apfs-package': entries } },
-  });
-  it("uses exactly the build's executable under this checkout's target directory", () => {
-    expect(sweepExecutable('/target', metadata([entry]))).toBe('/target/debug/cowshed-test-sweep');
-    expect(sweepExecutable('/relocated', metadata([{ ...entry, path: 'debug/build/sweep/out/helper' }]))).toBe(
-      '/relocated/debug/build/sweep/out/helper',
-    );
-  });
-  it('refuses missing or ambiguous cleanup executables instead of starting fixtures', () => {
-    for (const value of [null, {}, metadata([]), metadata([entry, entry]), metadata([{ ...entry, kind: 'dylib' }])]) {
-      expect(() => sweepExecutable('/target', value)).toThrow();
-    }
-  });
-  it('cannot execute a path outside the target directory', () => {
-    for (const path of ['/foreign/helper', '../foreign/helper', 'debug/../../foreign/helper', '.']) {
-      expect(() => sweepExecutable('/target', metadata([{ ...entry, path }]))).toThrow();
-    }
-  });
-});
 
 const SUDO = '/usr/bin/sudo';
 const INSTALL = '/usr/bin/install';

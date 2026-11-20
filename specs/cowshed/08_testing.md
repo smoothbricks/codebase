@@ -1152,48 +1152,44 @@ attach cycles that prove its behavior. A run that killed a test leaves nothing a
 `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and SIGKILL cleanup with one
 mounted RAW image and one read-only retained RAW input: panic drops the child's root, while a killed child's root is
 reclaimed by its keeper, whose exit the parent awaits on the kernel's exit event, never reclaiming it itself. The keeper
-is the nearest `cowshed-test-sweep` among the directories holding the test binary: the target profile directory, where a
-workspace build and the lane's nextest archive put it, whatever the binary's own layout below it. A root is handed out
-only once its keeper has said on its stdout, within the handshake bound (05_gateway.md, "Deadlines"), that it keeps that
-root; a root whose keeper cannot start, cannot keep, refuses the path or says nothing in time is torn down at
-construction, so no root a kill would leak is handed out. A keeper keeps and reclaims only a test namespace's own
-directory in the per-user root. Both its pipes are made under the exclusive fork lock (01c_macos.md, "Darwin has no
-`pipe2` and no `SOCK_CLOEXEC`"), so no concurrent spawn carries the owner's end past its `exec`, and its input is
-written only by its owner: a release line says the owner tears the root down itself; end of input without one says the
-owner died, which the owner's pid cannot yet say while the exited owner awaits its reaping. What a keeper says goes to
-`keeper.log` in the shared scratch directory, never to the test's streams a runner waits on. This uses the same
-process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated dead runs.
-Owned-attachment release selects the exact backing path the kernel holds, not the runtime image extension: a retained
-input must be released too. Ordinary runtime enumeration and attachment remain RAW-only (02_workspaces.md,
+is the declared native `cowshed-test-sweep` artifact in the checkout, or the instance next to a direct Cargo build's or
+archive's test binaries. A root is handed out only once its keeper has said on its stdout, within the handshake bound
+(05_gateway.md, "Deadlines"), that it keeps that root; a root whose keeper cannot start, cannot keep, refuses the path
+or says nothing in time is torn down at construction, so no root a kill would leak is handed out. A keeper keeps and
+reclaims only a test namespace's own directory in the per-user root. Both its pipes are made under the exclusive fork
+lock (01c_macos.md, "Darwin has no `pipe2` and no `SOCK_CLOEXEC`"), so no concurrent spawn carries the owner's end past
+its `exec`, and its input is written only by its owner: a release line says the owner tears the root down itself; end of
+input without one says the owner died, which the owner's pid cannot yet say while the exited owner awaits its reaping.
+What a keeper says goes to `keeper.log` in the shared scratch directory, never to the test's streams a runner waits on.
+This uses the same process/image/tree cleanup as root drop, without starting a host-wide sweep or waiting on unrelated
+dead runs. Owned-attachment release selects the exact backing path the kernel holds, not the runtime image extension: a
+retained input must be released too. Ordinary runtime enumeration and attachment remain RAW-only (02_workspaces.md,
 "Re-adoption"); cleanup neither attaches nor converts an image. A scratch root's teardown and the sweep release a root's
 images concurrently, one holder per image: each release is an unmount under the host's namespace lease and then a detach
 under its storage lease, and those classes exclude each other (05_gateway.md, "Disk-lifecycle lease"), so releasing a
 CLI fixture's main, build and workspace images one after another waited for a phase change at every step on a loaded
 host. Each real-substrate lane that runs sweeps its dead predecessors first, before any of its fixtures starts:
-`packages/cowshed/scripts/apfs-test-sweep.ts` extracts the root's archive with the native extractor (both built first,
-through the lane's own dependencies) and runs the existing sweep from it synchronously under `t/sweep.lock`, writing
-`sweep.run` only after the full pass completes. The lanes nextest runs (both serial groups and `host-controller-test`)
-run it as nextest's `apfs-sweep` setup script, scoped by the groups' filters and the host-controller filter
-(`.config/nextest.toml`); `integration-apfs`, which runs under `cargo test`, runs it as its own first step. A lane
-replayed from Nx's cache runs nothing, starts no fixture and so sweeps nothing; that is why no separate sweep target
-exists to run, or be cached, for it. A second lane of the same run takes the lock after the first and finds nothing
-left. The setup owns cleanup through completion; a failed or killed setup starts no tests and leaves uncompleted work
-for the next setup. A fixture owns and tears down only its own root: no constructor starts a predecessor sweep and no
-Drop retains or joins one. A real-substrate regression holds the actual `t/sweep.lock` while both the first and later
-fixtures construct and finish Drop; it never forges a completed run record or starts a backlog sweep inside the test.
-Separate pure controls require all N selected roots to be attempted before recording completion, no record after
-failure, and no second sweep of a completed run. An individual image-release refusal retains only the dead root
-containing that image; the sweep reports every refusal and still removes other dead roots after releasing their images.
-An inventory failure retains every root, since no root's image-release safety can then be proved. Root-local refusal and
-continued reclamation have a pure, platform-independent regression; one unreleased image must not leave another run's
-already-detached files behind. No sweep selects a live pid's root. Child fixtures create only their own roots and never
-force a host-wide scan. The test lanes retain their unchanged 180-second no-finish guard, and setup emits no synthetic
-test completions or progress: what it says is diagnosis, never a heartbeat. It says on stderr each step of its pass as
-it starts and how long it took, and each dead root and directory fixture by path as it removes it, so a setup the guard
-ends names the work it was in. It keeps a holder record on `t/sweep.lock` (its pid, its run and the step it is in), so a
-setup that finds the lock taken says so on stderr naming that holder, and names it again once per holder-report interval
-while it keeps its place in the kernel's queue (`cowshed_os::flock::queued`). Ordinary sandboxed shards keep their
-existing root provisioning and do not acquire host-wide cleanup authority.
+`packages/cowshed/scripts/apfs-test-sweep.ts` runs the declared sweep synchronously under `t/sweep.lock`, writing
+`sweep.run` only after the full pass completes. The lanes run it as nextest's `apfs-sweep` setup script, scoped by
+filters in `.config/nextest.toml`. A lane replayed from Nx's cache runs no tests or setup and so sweeps nothing; no
+standalone sweep action exists to run, or be cached, for it. A second lane of the same run takes the lock after the
+first and finds nothing left. The setup owns cleanup through completion; a failed or killed setup starts no tests and
+leaves uncompleted work for the next setup. A fixture owns and tears down only its own root: no constructor starts a
+predecessor sweep and no Drop retains or joins one. A real-substrate regression holds the actual `t/sweep.lock` while
+both the first and later fixtures construct and finish Drop; it never forges a completed run record or starts a backlog
+sweep inside the test. Separate pure controls require all N selected roots to be attempted before recording completion,
+no record after failure, and no second sweep of a completed run. An individual image-release refusal retains only the
+dead root containing that image; the sweep reports every refusal and still removes other dead roots after releasing
+their images. An inventory failure retains every root, since no root's image-release safety can then be proved.
+Root-local refusal and continued reclamation have a pure, platform-independent regression; one unreleased image must not
+leave another run's already-detached files behind. No sweep selects a live pid's root. Child fixtures create only their
+own roots and never force a host-wide scan. The test lanes retain their unchanged 180-second no-finish guard, and setup
+emits no synthetic test completions or progress: what it says is diagnosis, never a heartbeat. It says on stderr each
+step of its pass as it starts and how long it took, and each dead root and directory fixture by path as it removes it,
+so a setup the guard ends names the work it was in. It keeps a holder record on `t/sweep.lock` (its pid, its run and the
+step it is in), so a setup that finds the lock taken says so on stderr naming that holder, and names it again once per
+holder-report interval while it keeps its place in the kernel's queue (`cowshed_os::flock::queued`). Ordinary sandboxed
+shards keep their existing root provisioning and do not acquire host-wide cleanup authority.
 
 Pure regressions recycle a device to a RAM image during the storage-lease wait, recycle it between dissent attempts and
 before force, and repeat an image's whole-device view. They prove the guard runs after the grant, no child detaches a

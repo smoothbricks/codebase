@@ -1,7 +1,7 @@
 import { type ChildProcess, type IOType, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { availableParallelism, constants as osConstants, userInfo } from 'node:os';
+import { availableParallelism, constants as osConstants, tmpdir, userInfo } from 'node:os';
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Duplex, Readable } from 'node:stream';
@@ -46,6 +46,7 @@ import {
 } from './mbx-pool.js';
 import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
 import { killedFromOutside, type RunOutcome, runUntilNotKilledForMemory } from './memory-retry.js';
+import { FIXTURE_DIRECTORY_ENV, nativeTestPhases } from './native-test.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -76,7 +77,7 @@ import {
 import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
-import { type BoundedExecOptions, boundedCommand } from './schema.js';
+import { type BoundedExecOptions, boundedCommand, type ShellBoundedExecOptions } from './schema.js';
 import { readLastWalls, suiteMinimum } from './suite-minimum.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
@@ -326,9 +327,10 @@ export async function runBoundedExec(
   // The walls its last run recorded size the minimum its reservation names (suite-minimum.ts), read before the same
   // clear removes them.
   const lastWalls = directory !== null ? await readLastWalls(directory) : new Map<string, number>();
+  const phases = options.nativeTest === undefined ? options : nativeTestPhases(options);
   return runUntilNotKilledForMemory(
     (alone) =>
-      runCommand(options, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
+      runCommand(phases, context, killer, tempVolume, inherited, captureDiagnostics, owner, queueHost, {
         lastPeak,
         lastWalls,
         alone,
@@ -350,7 +352,7 @@ interface Attempt {
 
 /** One run of the command, from the pool's grant to its record. */
 async function runCommand(
-  options: BoundedExecOptions,
+  options: ShellBoundedExecOptions,
   context: BoundedExecContext,
   killer: ProcessTreeKiller,
   tempVolume: TempVolume | null,
@@ -471,6 +473,7 @@ async function runCommand(
 
   let lease: RamTempLease | null = null;
   let ordinaryTemp: string | null = null;
+  let fixtureDirectory: string | undefined;
   // Before spawn there is nothing to retire. Once started, only the owner's terminal retirement permits deletion.
   let subtreeRetired = true;
   // A lease is removed when its command ends, so it is taken only where whatever the command leaves
@@ -568,6 +571,19 @@ async function runCommand(
   const releaseLease = (keep: boolean): Promise<void> => {
     tempReleased ??= (async () => {
       await retireSubtree();
+      if (fixtureDirectory !== undefined) {
+        const path = fixtureDirectory;
+        fixtureDirectory = undefined;
+        if (owner !== null && !subtreeRetired) {
+          tell(`bounded-exec: fixture scratch retained at ${path}: the command subtree was not retired\n`);
+        } else {
+          try {
+            await rm(path, { recursive: true, force: true });
+          } catch (error) {
+            tell(`bounded-exec: could not remove fixture scratch at ${path}: ${String(error)}\n`);
+          }
+        }
+      }
       if (ordinaryTemp !== null) {
         const held = ordinaryTemp;
         ordinaryTemp = null;
@@ -937,6 +953,14 @@ async function runCommand(
       ? underWaiter(waiter.runtime, root?.file ?? '/bin/sh', root?.args ?? ['-c', shellCommand], descriptors)
       : null;
   let child: ChildProcess;
+  if (fixture !== null) {
+    try {
+      fixtureDirectory = await mkdtemp(resolvePath(lease?.directory ?? ordinaryTemp ?? tmpdir(), 'smoo-fixture-'));
+      env[FIXTURE_DIRECTORY_ENV] = fixtureDirectory;
+    } catch (error) {
+      return refuse(`bounded-exec: could not create fixture scratch: ${String(error)}\n`);
+    }
+  }
   const results = directory === null ? null : await createTestResultWriter(directory, { cwd, root: context.root });
   if (results !== null && !results.ok) return refuse(`bounded-exec: ${results.error}\n`);
   resultWriter = results?.ok ? results.writer : null;

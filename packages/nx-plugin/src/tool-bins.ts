@@ -24,7 +24,7 @@ function toolCommand(cwd: string, tool: string, file: string): string {
 }
 
 /** The tool packages whose native artifacts inferred commands consume. */
-const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'nextest-extract', 'cowshed'] as const;
+const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'cowshed'] as const;
 
 export type NativeToolPackage = (typeof NATIVE_TOOL_PACKAGES)[number];
 

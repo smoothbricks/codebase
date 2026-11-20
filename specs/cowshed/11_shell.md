@@ -613,15 +613,14 @@ together (14_nix.md, "mbx").
 
 Plain `cargo test` may include doctests and keeps its lifecycle clock. Commands with unsupported overrides, direct
 binaries, other runners and archives whose target is unknown at spawn keep that same conservative hang protection, not
-an unbounded wait for a grant they never take. The plugin's inferred in-place nextest command uses `--binaries-metadata`
-under the canonical Cargo shim, with one known substitution, this checkout's target directory from
-`smoo-nx-nextest-binaries` as the value of `--target-dir-remap`, and is hold-gated, including a chain of supported Cargo
-test executions joined by `&&`, `||`, or `;`. Every leg must satisfy the boundary; a later unscheduled command, pipeline
-or background command keeps conservative idle protection for the whole command. The plugin's `mbx-pool.test.ts` table
-owns this spawn-time mapping; `bounds.test.ts` owns the grant/release/progress sequences without real clocks.
-`mbx-queue.test.ts` owns versioned activity-only reads and scoped PID membership; `verdict.test.ts` owns persistence of
-never-admitted queue failures. The executor's mbx leaf and in-place nextest chain checks prove these observers remain
-wired alongside live closed-test result publication.
+an unbounded wait for a grant they never take. An inferred native nextest run uses `--binaries-metadata` and
+`--cargo-metadata` from its own fixture, and is a reserved leaf: the fixture compiles with mbx before the command asks
+for a grant. Direct Cargo test chains joined by `&&`, `||`, or `;` are hold-gated only when every leg satisfies the
+scheduling boundary. A later unscheduled command, pipeline or background command keeps conservative idle protection for
+the whole command. The plugin's `mbx-pool.test.ts` table owns this spawn-time mapping; `bounds.test.ts` owns the
+grant/release/progress sequences without real clocks. `mbx-queue.test.ts` owns versioned activity-only reads and scoped
+PID membership; `verdict.test.ts` owns persistence of never-admitted queue failures. The executor's mbx leaf and
+in-place nextest chain checks prove these observers remain wired alongside live closed-test result publication.
 
 **Enforced by:** for Phase 2, `canonical_mbx_environment_matches_host_warm_and_host_gate_paths` must compare the
 contribution's host-file and child projections, including adoption, caller overrides, non-Rust environment isolation

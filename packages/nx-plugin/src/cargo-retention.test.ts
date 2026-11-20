@@ -30,7 +30,6 @@ import {
   writeMid,
 } from '@smoothbricks/cargo-retain/testing/cargo-fixture';
 import { useFixtureCargoHome } from '@smoothbricks/cargo-retain/testing/fixture-cargo-home';
-import { NEXTEST_BINARIES_BUILD_ARGS } from '@smoothbricks/nextest-extract';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 
@@ -224,12 +223,27 @@ describe('cargo retention after real Nx runs', () => {
       const fx = await churnFixture(root, false);
       await scopedTo(fx.target, async () => {
         const gen = await churnGenerations(fx);
-        // cargo-test-build: the binaries stay in the target directory, the reuse-build metadata is its Nx output.
-        const listed = spawnSync('cargo', ['--frozen', ...NEXTEST_BINARIES_BUILD_ARGS], {
-          cwd: fx.ws,
-          env: cargoEnv(),
-          encoding: 'utf8',
-        });
+        // The fixture's binaries stay in Cargo's target directory and the runner consumes the local metadata.
+        const listed = spawnSync(
+          'cargo',
+          [
+            '--frozen',
+            'nextest',
+            'list',
+            '--workspace',
+            '--list-type',
+            'binaries-only',
+            '--message-format',
+            'json',
+            '--user-config-file',
+            'none',
+          ],
+          {
+            cwd: fx.ws,
+            env: cargoEnv(),
+            encoding: 'utf8',
+          },
+        );
         expect({ status: listed.status, stderr: listed.status === 0 ? '' : listed.stderr }).toEqual({
           status: 0,
           stderr: '',
