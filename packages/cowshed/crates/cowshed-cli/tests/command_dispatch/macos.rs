@@ -2851,7 +2851,7 @@ fn developer_nx(fixture: &Fixture) -> (PathBuf, PathBuf) {
     let installed = fixture_nx(&fixture.checkout);
     test_template::clone_tree(&installed, &nx).expect("clone the installed Nx");
     let modules = nx.join("node_modules");
-    clone_nx_store_entries(&installed, &modules.join(".bun"));
+    clone_nx_store_entries(&installed, &modules.join(".bun"), FIXTURE_OPTIONAL_PEERS);
     // Nx's bindings are the links Bun left beside it in its store entry. A relative one names a
     // store entry, now cloned under this package's `.bun`; one into Bun's global store stays.
     let bun_root = bun_namespace(&installed);
@@ -2989,11 +2989,42 @@ fn install_in_fixture_profile(fixture: &Fixture, name: &str, program: &Path) {
     std::os::unix::fs::symlink(program, profile.join(name)).unwrap();
 }
 
+/// The optional peers a fixture's Nx install selects: none. The fixture projects run
+/// `nx:run-commands` from `project.json` and load no TypeScript plugin, so nothing reaches Nx's
+/// optional `@swc-node/register` and `@swc/core` peers (08_testing.md, "one installed Nx per run").
+const FIXTURE_OPTIONAL_PEERS: &[&str] = &[];
+
+/// The peers `manifest` marks optional (`peerDependenciesMeta.<name>.optional`) and does not also
+/// name as a dependency or optional dependency, less those `requested`: what an install omits.
+fn omitted_peers(
+    manifest: &serde_json::Value,
+    requested: &[&str],
+) -> std::collections::BTreeSet<String> {
+    let Some(peers) = manifest["peerDependencies"].as_object() else {
+        return std::collections::BTreeSet::new();
+    };
+    peers
+        .keys()
+        .filter(|name| {
+            manifest["peerDependenciesMeta"][name.as_str()]["optional"].as_bool() == Some(true)
+                && !["dependencies", "optionalDependencies"]
+                    .iter()
+                    .any(|field| manifest[*field].get(name.as_str()).is_some())
+                && !requested.contains(&name.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 /// The installed dependency closure of `nx`, walked through the repository's own Bun store:
 /// each package's dependencies resolve to the sibling Bun linked beside it in the same store
 /// entry, so the walk yields the exact instances the repository runs, platform binaries for
-/// this host included and other platforms' absent, as Bun's linker left them.
-fn nx_install_closure(nx: &Path) -> std::collections::BTreeMap<String, PathBuf> {
+/// this host included and other platforms' absent, as Bun's linker left them. An optional peer
+/// is followed only where `requested` selects it ([`omitted_peers`]).
+fn nx_install_closure(
+    nx: &Path,
+    requested: &[&str],
+) -> std::collections::BTreeMap<String, PathBuf> {
     let mut members = std::collections::BTreeMap::new();
     let mut queue = vec![nx.to_path_buf()];
     while let Some(directory) = queue.pop() {
@@ -3021,11 +3052,15 @@ fn nx_install_closure(nx: &Path) -> std::collections::BTreeMap<String, PathBuf> 
                 .parent()
                 .expect("a package sits in its store neighbourhood")
         };
+        let omitted = omitted_peers(&manifest, requested);
         for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
             let Some(dependencies) = manifest[field].as_object() else {
                 continue;
             };
             for dependency in dependencies.keys() {
+                if field == "peerDependencies" && omitted.contains(dependency) {
+                    continue;
+                }
                 let sibling = neighbourhood.join(dependency);
                 if sibling.exists() {
                     queue.push(
@@ -3079,6 +3114,67 @@ fn clone_nx_namespace(templates: &Path, destination: &Path, write: impl FnOnce(&
     test_template::clone_tree(&installed, destination).expect("clone the installed Nx template");
 }
 
+//#region smoo/cowshed!n/one-installed-nx-per-run
+#[test]
+fn an_nx_install_keeps_required_and_selected_peers_and_omits_unselected_optional_ones() {
+    let scratch = scratch_directory::ScratchRoot::new("nx-peers").expect("scratch root");
+    let bun = scratch.path().join("node_modules/.bun");
+    let package = |entry: &str, name: &str, manifest: serde_json::Value| {
+        let directory = bun.join(entry).join("node_modules").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("package.json"), manifest.to_string()).unwrap();
+        directory
+    };
+    let host = package(
+        "host@1.0.0",
+        "host",
+        serde_json::json!({
+            "name": "host",
+            "peerDependencies": { "required-peer": "*", "optional-peer": "*", "selected-peer": "*" },
+            "peerDependenciesMeta": { "optional-peer": { "optional": true }, "selected-peer": { "optional": true } },
+        }),
+    );
+    for name in ["required-peer", "optional-peer", "selected-peer"] {
+        package(
+            &format!("{name}@1.0.0"),
+            name,
+            serde_json::json!({ "name": name }),
+        );
+        std::os::unix::fs::symlink(
+            Path::new("../..").join(format!("{name}@1.0.0/node_modules/{name}")),
+            bun.join("host@1.0.0/node_modules").join(name),
+        )
+        .unwrap();
+    }
+
+    let members: Vec<String> = nx_install_closure(&host, &["selected-peer"])
+        .into_keys()
+        .collect();
+    assert_eq!(members, ["host", "required-peer", "selected-peer"]);
+
+    let cloned = scratch.path().join("cloned/.bun");
+    clone_nx_store_entries(&host, &cloned, &["selected-peer"]);
+    let mut entries: Vec<String> = fs::read_dir(&cloned)
+        .unwrap()
+        .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        ["host@1.0.0", "required-peer@1.0.0", "selected-peer@1.0.0"]
+    );
+    let omitted = cloned.join("host@1.0.0/node_modules/optional-peer");
+    assert!(
+        fs::symlink_metadata(&omitted).is_err(),
+        "the unselected optional peer's link is gone from the cloned entry"
+    );
+    assert!(
+        cloned
+            .join("host@1.0.0/node_modules/selected-peer")
+            .exists()
+    );
+}
+//#endregion smoo/cowshed!n/one-installed-nx-per-run
 #[test]
 fn directory_nx_install_is_materialized_once_across_checkout_templates() {
     let scratch = scratch_directory::ScratchRoot::new("nx-install-template").expect("scratch root");
@@ -3141,7 +3237,7 @@ fn an_nx_checkout_template_holds_no_installed_namespace_and_its_fixture_does() {
 //#endregion smoo/cowshed!n/one-installed-nx-per-run
 
 fn write_repository_nx_install(installed: &Path, nx: &Path) {
-    clone_nx_store_entries(nx, &installed.join(".bun"));
+    clone_nx_store_entries(nx, &installed.join(".bun"), FIXTURE_OPTIONAL_PEERS);
     // The links Bun's install leaves at the namespace root, recreated relative so they
     // survive the cloning every fixture performs: `node_modules/nx` and its `.bin` entries.
     let bun_root = bun_namespace(nx);
@@ -3188,14 +3284,18 @@ fn lexical_target(link: &Path, target: &Path) -> PathBuf {
 /// Clone into `bun_destination` every store entry of `nx`'s Bun namespace that its installed
 /// closure reaches, by entry directory name: cloning an entry clones the package and the
 /// dependency links Bun left beside it in one move. The set is closed along the entries' own
-/// relative links, so a cloned entry never points at a sibling that was not cloned with it.
-/// Packages Bun shares through its global store are already installed on the host and stay
-/// there — the read-grant traversal expects them in the store, not in the checkout.
-fn clone_nx_store_entries(nx: &Path, bun_destination: &Path) {
+/// relative links, so a cloned entry never points at a sibling that was not cloned with it,
+/// except the peers its package marks optional and `requested` does not select
+/// ([`omitted_peers`]): their links are removed from the clone, with a scope directory left
+/// empty, as Bun installs no link for a peer it does not install. Packages Bun shares through its
+/// global store are already installed on
+/// the host and stay there — the read-grant traversal expects them in the store, not in the
+/// checkout.
+fn clone_nx_store_entries(nx: &Path, bun_destination: &Path, requested: &[&str]) {
     let bun_root = bun_namespace(nx);
     fs::create_dir_all(bun_destination).unwrap();
     let mut entries = std::collections::BTreeMap::new();
-    for directory in nx_install_closure(nx).values() {
+    for directory in nx_install_closure(nx, requested).values() {
         let Some(entry) = directory
             .ancestors()
             .find(|ancestor| ancestor.parent() == Some(bun_root))
@@ -3213,6 +3313,8 @@ fn clone_nx_store_entries(nx: &Path, bun_destination: &Path) {
     }
     let mut pending: Vec<PathBuf> = entries.values().cloned().collect();
     while let Some(entry) = pending.pop() {
+        let links = entry.join("node_modules");
+        let omitted = entry_omitted_peers(&links, requested);
         let mut stack = vec![entry];
         while let Some(directory) = stack.pop() {
             // A store entry another process is pruning mid-walk simply contributes no
@@ -3227,6 +3329,14 @@ fn clone_nx_store_entries(nx: &Path, bun_destination: &Path) {
                     continue;
                 };
                 if file_type.is_symlink() {
+                    if path
+                        .strip_prefix(&links)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .is_some_and(|name| omitted.contains(name))
+                    {
+                        continue;
+                    }
                     let Ok(target) = fs::read_link(&path) else {
                         continue;
                     };
@@ -3262,9 +3372,66 @@ fn clone_nx_store_entries(nx: &Path, bun_destination: &Path) {
         // does not exist; there is nothing to clone for it, and the traversal
         // asserts on whatever a consumer actually reaches.
         if entry.exists() {
-            clone_or_copy_tree(entry, &bun_destination.join(name));
+            let cloned = bun_destination.join(name);
+            clone_or_copy_tree(entry, &cloned);
+            let links = cloned.join("node_modules");
+            for peer in entry_omitted_peers(&links, requested) {
+                let link = links.join(&peer);
+                match fs::remove_file(&link) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        panic!("remove the omitted peer link {}: {error}", link.display())
+                    }
+                }
+                if peer.starts_with('@') {
+                    // An emptied scope goes too; one still holding a binding refuses and stays.
+                    let scope = link.parent().expect("a scoped peer sits in its scope");
+                    match fs::remove_dir(scope) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            panic!("remove the emptied scope {}: {error}", scope.display())
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// The peers omitted ([`omitted_peers`]) by the packages a Bun store entry holds itself: the
+/// directories (scoped ones one level down) beside the entry's links in its `node_modules`.
+fn entry_omitted_peers(links: &Path, requested: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut omitted = std::collections::BTreeSet::new();
+    let mut packages = Vec::new();
+    for item in fs::read_dir(links).into_iter().flatten().flatten() {
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if item.file_name().to_string_lossy().starts_with('@') {
+            for scoped in fs::read_dir(item.path()).into_iter().flatten().flatten() {
+                if scoped.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    packages.push(scoped.path());
+                }
+            }
+        } else {
+            packages.push(item.path());
+        }
+    }
+    for package in packages {
+        let Ok(bytes) = fs::read(package.join("package.json")) else {
+            continue;
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("an installed package manifest parses");
+        omitted.extend(omitted_peers(&manifest, requested));
+    }
+    omitted
 }
 
 /// `nx`'s `bin` entries as Bun links them in `namespace`, whose `nx` binding names it:

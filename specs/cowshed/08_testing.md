@@ -576,7 +576,15 @@ the fixture's tests only read it. Each fixture whose project runs Nx clones the 
 its `node_modules`, so that five-thousand-entry clone belongs to the fixture's root and goes with it, removed by the
 test that made it while its metadata is warm. A run's template directory therefore retains one namespace for the lane
 setup's sweep, not one more per Nx checkout shape; a regression requires an Nx checkout template to hold no
-`node_modules` and its fixture's Nx to resolve inside the fixture's checkout.
+`node_modules` and its fixture's Nx to resolve inside the fixture's checkout. The namespace is Nx's installed closure as
+Bun left it: its dependencies, optional dependencies and required peers, and a peer Nx marks optional
+(`peerDependenciesMeta`) only where a fixture selects it. The CLI fixtures select none: their projects run
+`nx:run-commands` from `project.json` and load no TypeScript plugin, so Nx's optional `@swc-node/register` and
+`@swc/core` subtrees stay out of every fixture checkout, while a package another member requires is installed whichever
+peer edge it also sits on. Bun's link for an omitted peer is removed from the cloned entry, and a scope directory it
+leaves empty with it, as Bun installs no link for a peer it does not install; the read-grant traversal resolves every
+binding a namespace holds. A regression installs a synthetic store and requires a required peer and a selected optional
+peer to be cloned and an unselected optional peer, and its link, not to be.
 
 The run's templates live in `/private/tmp/cowshed-dtest-<pid>-templates`, named for the run's process: under nextest,
 which names the run (`NEXTEST_RUN_ID`) and starts each test in a process group of its own led by its target runner
