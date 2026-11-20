@@ -347,6 +347,11 @@ export const assertDoctorReportList = typia.createAssertEquals<readonly Api.Doct
 export const parseDoctorReportList = (json: string): readonly Api.DoctorReport[] =>
   assertDoctorReportList(JSON.parse(json));
 
+export const assertDrainWaits = typia.createAssertEquals<Api.DrainWaits>();
+export const parseDrainWaits = (json: string): Api.DrainWaits => assertDrainWaits(JSON.parse(json));
+export const assertDrainWaitsList = typia.createAssertEquals<readonly Api.DrainWaits[]>();
+export const parseDrainWaitsList = (json: string): readonly Api.DrainWaits[] => assertDrainWaitsList(JSON.parse(json));
+
 export const assertEgressMode = typia.createAssertEquals<Api.EgressMode>();
 export const parseEgressMode = (json: string): Api.EgressMode => assertEgressMode(JSON.parse(json));
 export const assertEgressModeList = typia.createAssertEquals<readonly Api.EgressMode[]>();
@@ -1671,6 +1676,12 @@ export const parseStreamLines = (json: string): Api.StreamLines => assertStreamL
 export const assertStreamLinesList = typia.createAssertEquals<readonly Api.StreamLines[]>();
 export const parseStreamLinesList = (json: string): readonly Api.StreamLines[] =>
   assertStreamLinesList(JSON.parse(json));
+
+export const assertSupervisorDrain = typia.createAssertEquals<Api.SupervisorDrain>();
+export const parseSupervisorDrain = (json: string): Api.SupervisorDrain => assertSupervisorDrain(JSON.parse(json));
+export const assertSupervisorDrainList = typia.createAssertEquals<readonly Api.SupervisorDrain[]>();
+export const parseSupervisorDrainList = (json: string): readonly Api.SupervisorDrain[] =>
+  assertSupervisorDrainList(JSON.parse(json));
 
 export const assertSupervisorRecovery = typia.createAssertEquals<Api.SupervisorRecovery>();
 export const parseSupervisorRecovery = (json: string): Api.SupervisorRecovery =>

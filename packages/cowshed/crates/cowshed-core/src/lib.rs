@@ -87,8 +87,8 @@ mod temp_parent;
 mod temp_root;
 
 pub use error::{
-    AdmissionRefusal, CowshedError, ErrorCode, FenceRefusal, MAX_FENCE_PATHS, OtherBuild,
-    RemovalRefusal, Result, Retry, StdinRefusal,
+    AdmissionRefusal, CowshedError, DrainWaits, ErrorCode, FenceRefusal, MAX_FENCE_PATHS,
+    OtherBuild, RemovalRefusal, Result, Retry, StdinRefusal, SupervisorDrain,
 };
 pub use gateway_inventory::{
     AdoptedProject, AttachedInventory, GatewayInventoryError, GatewaySessionFact,

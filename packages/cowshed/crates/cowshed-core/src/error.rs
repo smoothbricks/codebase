@@ -160,8 +160,39 @@ enum ColdRefusal {
     Removal {
         removal: RemovalRefusal,
     },
+    /// Present only on the refusal of a workspace whose supervisor is another build's and
+    /// drains, naming what its drain report says it waits for.
+    Drain {
+        drain: SupervisorDrain,
+    },
 }
 
+/// What a draining supervisor of another build waits for before it retires, as the drain report
+/// it publishes beside its socket says (11_shell.md "Supervisor"): a client that holds those jobs
+/// decides from it whether its own work keeps that supervisor, without reading the sentence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorDrain {
+    /// The supervisor serving the socket, which wrote the report.
+    pub pid: u32,
+    pub waits: DrainWaits,
+}
+
+/// One step of a draining supervisor's retirement, as its drain report names it. Wire:
+/// `"waits": { "for": "<camelCase variant>", ...camelCase fields }`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "for", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum DrainWaits {
+    /// The jobs that ran when it was asked to drain, to end.
+    Jobs {
+        running: Vec<crate::api::dto::JobId>,
+    },
+    /// Its jobs ended; it waits until a client reads these jobs' ends, or every process they
+    /// are owed to has exited.
+    Reads { unread: Vec<crate::api::dto::JobId> },
+    /// A step of its retirement failed: it serves on until it is killed.
+    Stuck { step: String },
+}
 /// The daemon serves only its own build, and refused a request from another (11_shell.md
 /// "hello"). A controller of the refused build can start nothing in a workspace from then on; a
 /// controller of the daemon's build — the host's current `cowshed` once an install has started
@@ -505,13 +536,23 @@ impl CowshedError {
     pub fn cpu_admission_source(&self) -> Option<&CpuAdmissionRefusal> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Admission { cpu_admission }) => Some(cpu_admission),
-            Some(ColdRefusal::Priority { .. } | ColdRefusal::Removal { .. }) | None => None,
+            Some(
+                ColdRefusal::Priority { .. }
+                | ColdRefusal::Removal { .. }
+                | ColdRefusal::Drain { .. },
+            )
+            | None => None,
         }
     }
     pub fn priority_source(&self) -> Option<&PriorityFailure> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Priority { priority }) => Some(priority),
-            Some(ColdRefusal::Admission { .. } | ColdRefusal::Removal { .. }) | None => None,
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Removal { .. }
+                | ColdRefusal::Drain { .. },
+            )
+            | None => None,
         }
     }
 
@@ -774,6 +815,18 @@ impl CowshedError {
         }
     }
 
+    /// A workspace's supervisor is another build's and drains: always a `Conflict`, carrying what
+    /// its drain report says it waits for as [`SupervisorDrain`].
+    pub fn draining_supervisor(
+        drain: SupervisorDrain,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            cold: Some(Box::new(ColdRefusal::Drain { drain })),
+            ..Self::conflict(message, hint)
+        }
+    }
     pub fn environment_missing(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(ErrorCode::EnvironmentMissing, message, hint)
     }
@@ -974,7 +1027,26 @@ impl CowshedError {
     pub fn removal_source(&self) -> Option<&RemovalRefusal> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Removal { removal }) => Some(removal),
-            Some(ColdRefusal::Admission { .. } | ColdRefusal::Priority { .. }) | None => None,
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Priority { .. }
+                | ColdRefusal::Drain { .. },
+            )
+            | None => None,
+        }
+    }
+
+    /// What the workspace's draining supervisor of another build waits for, when this is the
+    /// refusal of that supervisor.
+    pub fn drain_source(&self) -> Option<&SupervisorDrain> {
+        match self.cold.as_deref() {
+            Some(ColdRefusal::Drain { drain }) => Some(drain),
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Priority { .. }
+                | ColdRefusal::Removal { .. },
+            )
+            | None => None,
         }
     }
 

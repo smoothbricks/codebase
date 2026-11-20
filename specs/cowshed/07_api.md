@@ -1718,7 +1718,7 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission, stdin, retry: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin, retry, drain: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
@@ -1726,6 +1726,7 @@ impl CowshedError {
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
     pub fn stdin_source(&self) -> Option<StdinRefusal>;
     pub fn retry_source(&self) -> Option<Retry>;
+    pub fn drain_source(&self) -> Option<&SupervisorDrain>;
 }
 
 pub enum ErrorCode {
@@ -1756,6 +1757,18 @@ pub enum Retry {
     GcPlanStale,        // gc found the store changed between its plan and its execution and collected nothing
     SupervisorRetiring, // the workspace's supervisor closed admission on its way to retirement and admitted nothing
                         // (11_shell.md "Supervisor"): the work belongs to the supervisor that replaces it
+}
+
+/// What a workspace's supervisor of another build waits for while it drains, read from the drain report it publishes
+/// beside its socket (11_shell.md "Supervisor"): on the `Conflict` a client of this build meets opening that workspace.
+/// A client that holds those jobs decides from it whether only its own work keeps that supervisor. Wire:
+/// `"drain": { "pid": u32, "waits": { "for": "<camelCase variant>", ...camelCase fields } }`, absent on every other
+/// error; a variant this build does not know decodes as no drain.
+pub struct SupervisorDrain { pub pid: u32, pub waits: DrainWaits }
+pub enum DrainWaits {
+    Jobs { running: Vec<JobId> },   // the jobs that ran when it was asked to drain, to end
+    Reads { unread: Vec<JobId> },   // its jobs ended; it waits until a client reads these ends, or their owners exit
+    Stuck { step: String },         // a step of its retirement failed: it serves until it is killed
 }
 ```
 

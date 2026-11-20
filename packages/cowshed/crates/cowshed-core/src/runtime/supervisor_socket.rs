@@ -1632,6 +1632,19 @@ enum DrainWait {
     Stuck { step: String, error: String },
 }
 
+impl From<&DrainWait> for crate::error::DrainWaits {
+    fn from(waits: &DrainWait) -> Self {
+        match waits {
+            DrainWait::Jobs { running, .. } => Self::Jobs {
+                running: running.clone(),
+            },
+            DrainWait::Reads { unread, .. } => Self::Reads {
+                unread: unread.clone(),
+            },
+            DrainWait::Stuck { step, .. } => Self::Stuck { step: step.clone() },
+        }
+    }
+}
 impl DrainWait {
     fn describe(&self) -> String {
         let jobs = |ids: &[JobId]| {
@@ -1762,25 +1775,32 @@ impl DrainReport {
 
     /// What the supervisor `pid` serving `socket` reported it waits for: `None` when it published
     /// nothing, or the report is another (killed) process's.
+    #[cfg(test)]
     fn read(socket: &Path, pid: u64) -> Option<String> {
+        Self::read_waits(socket, pid)
+            .map(|read| read.map_or_else(|why| why, |waits| waits.describe()))
+    }
+
+    /// [`Self::read`], typed: the waits the report names, or why it could not be read.
+    fn read_waits(socket: &Path, pid: u64) -> Option<std::result::Result<DrainWait, String>> {
         let path = socket.with_extension("drain");
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
             Err(error) => {
-                return Some(format!(
+                return Some(Err(format!(
                     "its drain report {} is unreadable: {error}",
                     path.display()
-                ));
+                )));
             }
         };
         match serde_json::from_slice::<DrainReportWire>(&bytes) {
-            Ok(wire) if u64::from(wire.pid) == pid => Some(wire.waits.describe()),
+            Ok(wire) if u64::from(wire.pid) == pid => Some(Ok(wire.waits)),
             Ok(_) => None,
-            Err(error) => Some(format!(
+            Err(error) => Some(Err(format!(
                 "its drain report {} does not decode: {error}",
                 path.display()
-            )),
+            ))),
         }
     }
 }
@@ -3433,10 +3453,21 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
     let theirs = value.get("build").and_then(serde_json::Value::as_str);
     if theirs != Some(ours.as_str()) {
         let pid = value.get("pid").and_then(serde_json::Value::as_u64);
+        let mut drain = None;
         let (serving, hint) = match pid {
             Some(pid) => (
-                match DrainReport::read(path, pid) {
-                    Some(waits) => format!(" (pid {pid}; {waits})"),
+                match DrainReport::read_waits(path, pid) {
+                    Some(Ok(waits)) => {
+                        let described = format!(" (pid {pid}; {})", waits.describe());
+                        drain = u32::try_from(pid)
+                            .ok()
+                            .map(|pid| crate::error::SupervisorDrain {
+                                pid,
+                                waits: (&waits).into(),
+                            });
+                        described
+                    }
+                    Some(Err(why)) => format!(" (pid {pid}; {why})"),
                     None => format!(" (pid {pid})"),
                 },
                 format!(
@@ -3452,14 +3483,15 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
                     .to_owned(),
             ),
         };
-        return Err(CowshedError::conflict(
-            format!(
-                "the workspace supervisor at {}{serving} is cowshed build {}; this cowshed is build {ours}",
-                path.display(),
-                theirs.unwrap_or("(unnamed)")
-            ),
-            hint,
-        ));
+        let message = format!(
+            "the workspace supervisor at {}{serving} is cowshed build {}; this cowshed is build {ours}",
+            path.display(),
+            theirs.unwrap_or("(unnamed)")
+        );
+        return Err(match drain {
+            Some(drain) => CowshedError::draining_supervisor(drain, message, hint),
+            None => CowshedError::conflict(message, hint),
+        });
     }
     let hello: HelloWire = decode(value)?;
     Ok(Hello {
@@ -5455,6 +5487,20 @@ mod drain_read_tests {
         );
     }
 
+    /// What a client of this build meets at `socket`, served by `pid` of another build: whether
+    /// the refusal is the other-build `Conflict`, and the drain it types.
+    fn other_build_drain(socket: &Path, pid: u64) -> (bool, Option<crate::DrainWaits>) {
+        match decode_hello(
+            socket,
+            serde_json::json!({ "build": "an-earlier-build", "pid": pid }),
+        ) {
+            Ok(_) => (false, None),
+            Err(refusal) => (
+                refusal.code == crate::ErrorCode::Conflict,
+                refusal.drain_source().map(|drain| drain.waits.clone()),
+            ),
+        }
+    }
     /// A draining supervisor's report says what it waits for at each step, read back by the
     /// pid serving the socket. A report another pid wrote is a killed supervisor's and says
     /// nothing, and one that does not decode says so rather than vanishing.
@@ -5497,6 +5543,31 @@ mod drain_read_tests {
             None,
             "another process's report"
         );
+        // A client of this build that meets that supervisor reads what it waits for as data.
+        let refusal = match decode_hello(
+            &socket,
+            serde_json::json!({ "build": "an-earlier-build", "pid": ours }),
+        ) {
+            Ok(_) => panic!("another build's hello must refuse"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict);
+        assert_eq!(
+            refusal.drain_source(),
+            Some(&crate::SupervisorDrain {
+                pid: u32::try_from(ours).unwrap(),
+                waits: crate::DrainWaits::Jobs {
+                    running: vec![job(12), job(13)],
+                },
+            })
+        );
+        let wire = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(
+            wire["drain"],
+            serde_json::json!({ "pid": ours, "waits": { "for": "jobs", "running": [12, 13] } })
+        );
+        let read: CowshedError = serde_json::from_value(wire).unwrap();
+        assert_eq!(read.drain_source(), refusal.drain_source());
 
         let owed = DrainReads::default();
         unseen(&owed, 7024);
@@ -5512,6 +5583,15 @@ mod drain_read_tests {
                  read of them"
             )
         );
+        assert_eq!(
+            other_build_drain(&socket, ours),
+            (
+                true,
+                Some(crate::DrainWaits::Reads {
+                    unread: vec![job(7024)]
+                })
+            )
+        );
 
         report.stuck(
             "retire",
@@ -5523,6 +5603,15 @@ mod drain_read_tests {
                 && stuck.ends_with("so it serves until it is killed"),
             "{stuck}"
         );
+        assert_eq!(
+            other_build_drain(&socket, ours),
+            (
+                true,
+                Some(crate::DrainWaits::Stuck {
+                    step: "retire".to_owned()
+                })
+            )
+        );
 
         report.withdraw();
         assert_eq!(
@@ -5530,10 +5619,33 @@ mod drain_read_tests {
             None,
             "withdrawn on retirement"
         );
+        assert_eq!(
+            other_build_drain(&socket, ours),
+            (true, None),
+            "no report: the other-build refusal stands, untyped, as before"
+        );
         std::fs::write(socket.with_extension("drain"), b"{\"pid\":").unwrap();
         assert!(
             DrainReport::read(&socket, ours).is_some_and(|said| said.contains("does not decode")),
             "a torn report says so"
+        );
+        assert_eq!(
+            other_build_drain(&socket, ours),
+            (true, None),
+            "a torn report types nothing"
+        );
+        std::fs::write(
+            socket.with_extension("drain"),
+            serde_json::to_vec(
+                &serde_json::json!({ "pid": ours + 1, "waits": { "for": "jobs", "running": [9] } }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            other_build_drain(&socket, ours),
+            (true, None),
+            "a killed supervisor's report types nothing"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

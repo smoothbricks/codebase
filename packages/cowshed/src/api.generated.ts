@@ -474,6 +474,8 @@ export type CowshedError = {
   readonly priority?: PriorityFailure;
 } & {
   readonly removal?: RemovalRefusal;
+} & {
+  readonly drain?: SupervisorDrain;
 };
 
 /**
@@ -683,6 +685,21 @@ export type DoctorReport = {
   readonly healthy: boolean;
   readonly findings: ReadonlyArray<Finding>;
 };
+
+/**
+ * One step of a draining supervisor's retirement, as its drain report names it. Wire:
+ * `"waits": { "for": "<camelCase variant>", ...camelCase fields }`.
+ */
+export type DrainWaits =
+  | ({ readonly for: 'jobs' } & {
+      readonly running: ReadonlyArray<JobId>;
+    })
+  | ({ readonly for: 'reads' } & {
+      readonly unread: ReadonlyArray<JobId>;
+    })
+  | ({ readonly for: 'stuck' } & {
+      readonly step: string;
+    });
 
 export type EgressMode = 'intercept' | 'opaque';
 
@@ -3372,6 +3389,19 @@ export type StreamInfoRef = {
  * no `\n` ended.
  */
 export type StreamLines = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * What a draining supervisor of another build waits for before it retires, as the drain report
+ * it publishes beside its socket says (11_shell.md "Supervisor"): a client that holds those jobs
+ * decides from it whether its own work keeps that supervisor, without reading the sentence.
+ */
+export type SupervisorDrain = {
+  /**
+   * The supervisor serving the socket, which wrote the report.
+   */
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly waits: DrainWaits;
+};
 
 /**
  * The workspace supervisors that served before the daemon started and that it has not finished

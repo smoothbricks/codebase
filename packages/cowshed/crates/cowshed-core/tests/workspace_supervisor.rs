@@ -5933,6 +5933,66 @@ async fn a_supervisor_of_another_build_is_refused_by_name() {
     }
 }
 
+/// A draining supervisor of another build is refused with what its drain report beside the socket
+/// says it waits for, typed (07_api "Errors", `drain_source`), so a client tells whether only its
+/// own jobs keep it; one that published no report, or whose report another pid wrote, is refused
+/// as before, untyped.
+#[tokio::test]
+async fn a_draining_supervisor_of_another_build_types_what_it_waits_for() {
+    let path = SocketPath::new();
+    let pid = 4242_u32;
+    let other = other_build_supervisor::OtherBuild::serve(
+        &path,
+        br#"{"ok":{"value":{"build":"another build","pid":4242},"bytes":0}}"#,
+    );
+    let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(refused.drain_source(), None, "no report: refused as before");
+
+    for (report, waits) in [
+        (
+            format!(r#"{{"pid":{pid},"waits":{{"for":"jobs","running":[14961,14978]}}}}"#),
+            Some(cowshed_core::DrainWaits::Jobs {
+                running: vec![JobId::new(14961).unwrap(), JobId::new(14978).unwrap()],
+            }),
+        ),
+        (
+            format!(r#"{{"pid":{pid},"waits":{{"for":"reads","unread":[7024]}}}}"#),
+            Some(cowshed_core::DrainWaits::Reads {
+                unread: vec![JobId::new(7024).unwrap()],
+            }),
+        ),
+        (
+            format!(r#"{{"pid":{pid},"waits":{{"for":"stuck","step":"retire","error":"x"}}}}"#),
+            Some(cowshed_core::DrainWaits::Stuck {
+                step: "retire".to_owned(),
+            }),
+        ),
+        (
+            format!(
+                r#"{{"pid":{},"waits":{{"for":"jobs","running":[9]}}}}"#,
+                pid + 1
+            ),
+            None,
+        ),
+    ] {
+        std::fs::write(path.with_extension("drain"), report).unwrap();
+        let refused = cowshed_core::runtime::supervisor_socket::hello(&path)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert_eq!(
+            refused.drain_source().map(|drain| drain.waits.clone()),
+            waits
+        );
+        if waits.is_some() {
+            assert_eq!(refused.drain_source().map(|drain| drain.pid), Some(pid));
+        }
+    }
+    drop(other);
+}
 /// Starts `supervisor` on the workspace socket in-process, standing in for the supervisor
 /// process, and hands the manager a real child to watch.
 struct InProcessSpawner {
