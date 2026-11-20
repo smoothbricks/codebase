@@ -112,9 +112,12 @@ describe('the release record beside a binary', () => {
 
   it(
     'refuses a checkout git cannot answer for instead of writing a record without a commit',
-    checkout(async (root, binary) => {
-      rmSync(join(root, '.git'), { recursive: true, force: true });
-      await expect(releaseRecord(binary, gitWithin(root))).rejects.toThrow('git rev-parse HEAD');
+    checkout(async (root) => {
+      // A plain directory beside the checkout, inside the enclosing repository: no `.git` of its own ever existed.
+      const plain = mkdtempSync(join(dirname(root), 'plain-'));
+      const binary = join(plain, 'cowshed');
+      writeFileSync(binary, 'a release binary');
+      await expect(releaseRecord(binary, gitWithin(plain))).rejects.toThrow('git rev-parse HEAD');
     }, true),
   );
 
