@@ -902,10 +902,10 @@ fn reconcile(
             continue;
         }
         let path = destination.join(relative);
-        // Obsolete entries are gone from the mirror by now, so an entry it still holds here is
-        // this directory, already present: only a path it never held needs creating.
+        // A directory the mirror never held is created directly; one it holds is checked on disk
+        // first, since something outside the copier may have removed it after the snapshot.
         let materialized = relative.as_os_str().is_empty()
-            || mirrored.contains_key(relative)
+            || (mirrored.contains_key(relative) && path.is_dir())
             || create_directory(&path)?;
         if materialized {
             mirrored.insert(
@@ -1414,13 +1414,14 @@ mod tests {
         copy_and_verify_blocking, copy_and_verify_observing, copy_leaf, copy_with_budget,
         describe_churn, link_leaf, render_path, snapshot, validate_copy_roots,
     };
+    use cowshed_os::test_backstop::CommandBackstop as _;
     /// A file's extended ACL as `ls -le` prints it: the lines after the first, `N: <entry>`.
     #[cfg(target_os = "macos")]
     fn acl_entries(path: &Path) -> Vec<String> {
         let output = std::process::Command::new("/bin/ls")
             .arg("-led")
             .arg(path)
-            .output()
+            .output_bounded()
             .expect("run ls -le");
         assert!(output.status.success(), "ls -le {}", path.display());
         String::from_utf8(output.stdout)
@@ -1444,7 +1445,7 @@ mod tests {
             .arg("+a")
             .arg(format!("user:{user} allow read"))
             .arg(source.join("guarded"))
-            .status()
+            .status_bounded()
             .expect("run chmod +a");
         assert!(granted.success(), "chmod +a on the source leaf");
         std::os::unix::fs::symlink("directory", source.join("to-directory")).unwrap();
@@ -1469,6 +1470,76 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn a_destination_entry_of_another_kind_is_replaced_by_the_source_kind() {
+        let root = temp_root("kind-replacement");
+        let (source, destination) = (root.join("source"), root.join("destination"));
+        fs::create_dir_all(source.join("was-file")).unwrap();
+        fs::write(source.join("was-file/leaf"), b"under a directory").unwrap();
+        fs::write(source.join("was-directory"), b"now a file").unwrap();
+        fs::create_dir_all(destination.join("was-directory/inner")).unwrap();
+        fs::write(destination.join("was-directory/inner/stale"), b"stale").unwrap();
+        fs::write(destination.join("was-file"), b"stale file").unwrap();
+
+        copy_and_verify_blocking(&source, &destination).expect("copy and verify");
+
+        assert!(
+            fs::symlink_metadata(destination.join("was-file"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read(destination.join("was-file/leaf")).unwrap(),
+            b"under a directory"
+        );
+        assert!(
+            fs::symlink_metadata(destination.join("was-directory"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(destination.join("was-directory")).unwrap(),
+            b"now a file"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_occupied_directory_removed_after_the_destination_snapshot_is_created_again() {
+        use std::cell::Cell;
+
+        let root = temp_root("occupied-directory-removed");
+        let (source, destination) = (root.join("source"), root.join("destination"));
+        fs::create_dir_all(source.join("directory")).unwrap();
+        fs::set_permissions(source.join("directory"), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::write(source.join("directory/leaf"), b"leaf bytes").unwrap();
+        // The destination holds the directory, out of date by its mode, when the copy snapshots it.
+        fs::create_dir_all(destination.join("directory")).unwrap();
+        fs::set_permissions(
+            destination.join("directory"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        // Something outside the copier removes it on the copy's first look at the source, after
+        // the destination snapshot recorded it.
+        let looks = Cell::new(0_usize);
+        let mut observe = |path: &Path| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 {
+                fs::remove_dir(destination.join("directory")).unwrap();
+            }
+            snapshot(path)
+        };
+        let (source, destination) = validate_copy_roots(&source, &destination).unwrap();
+        converge(&source, &destination, 6, &mut observe).expect("the copy converges");
+
+        assert_eq!(
+            fs::read(destination.join("directory/leaf")).unwrap(),
+            b"leaf bytes"
+        );
+        assert_eq!(mode_of(&destination.join("directory")), 0o750);
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn a_source_moving_after_the_quiescent_pass_fails_verification() {
         use std::cell::Cell;
