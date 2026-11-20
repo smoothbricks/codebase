@@ -475,6 +475,64 @@ fn declares_vo_finds_a_value_object_field_at_any_position() {
     }
 }
 
+/// One two-key struct map holding one VO field, written by 0xa0: key1 and
+/// key2 from column 0, the frame's CSR pair from columns 1 (offsets) and 2
+/// (values).
+fn pair_program(key2_col: u8) -> Box<[u8]> {
+    let init = [0x1b, 0, 10, 4, 0, 1, 10, 0];
+    assemble(&init, &[0xa0, 0, 0, key2_col, 0, 1, 1, 2, 0])
+}
+
+#[test]
+fn a_two_key_value_object_field_takes_the_unary_admission_path() {
+    assert_eq!(declares_vo(&pair_program(0)), Ok(true));
+    assert_eq!(
+        AdmittedProgram::load(
+            pair_program(0),
+            VoProgramMetadata::default(),
+            UnavailableVoAdmission,
+            DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .err(),
+        Some(ProgramAdmissionError::MissingSchema {
+            slot: 0,
+            field_idx: 0
+        })
+    );
+    let refusal = AdmittedProgram::load(
+        pair_program(0),
+        metadata(),
+        UnavailableVoAdmission,
+        DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .err();
+    assert!(
+        matches!(
+            &refusal,
+            Some(ProgramAdmissionError::Preparation(error))
+                if error.error == VoAdmissionError::Unavailable
+        ),
+        "{refusal:?}"
+    );
+    // The frame's CSR columns cannot also be a key source: the admission's
+    // projection would change the key before execution.
+    for key2_col in [1u8, 2] {
+        assert_eq!(
+            AdmittedProgram::load(
+                pair_program(key2_col),
+                metadata(),
+                UnavailableVoAdmission,
+                DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            )
+            .err(),
+            Some(ProgramAdmissionError::InvalidProgram(
+                ProgramInvalidCause::MalformedProgram
+            )),
+            "key2 from column {key2_col}"
+        );
+    }
+}
+
 #[test]
 fn declares_vo_refuses_unknown_kinds_and_malformed_programs() {
     let invalid: Result<bool, ProgramAdmissionError> = Err(ProgramAdmissionError::InvalidProgram(

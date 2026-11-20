@@ -174,11 +174,14 @@ describe('parseReducerProgram', () => {
     expect(() => parseReducerProgram(bytecode)).toThrow('Invalid program: unknown struct field type 11');
   });
 
-  it('refuses VO descriptors outside STRUCT_MAP', () => {
+  it('admits VO descriptors in two-key maps and refuses them in ordered lists', () => {
+    // Columine 04 §9: a two-key record holds value-object fields.
     const structMap2 = [Opcode.SLOT_STRUCT_MAP2, 0, SlotType.STRUCT_MAP2, 4, 0, 1, StructFieldType.VO, Opcode.HALT];
-    expect(() => parseReducerProgram(buildProgram(structMap2, 1))).toThrow(
-      'Invalid program: struct-map2 VO field descriptors are not supported',
-    );
+    expect(parseReducerProgram(buildProgram(structMap2, 1)).slotDefs[0]).toEqual({
+      type: SlotType.STRUCT_MAP2,
+      capacity: 4,
+      fieldTypes: [StructFieldType.VO],
+    });
 
     const orderedList = (...descriptor: number[]) =>
       buildProgram([Opcode.SLOT_ORDERED_LIST, 0, SlotType.ORDERED_LIST, 4, 0, ...descriptor, Opcode.HALT], 1);

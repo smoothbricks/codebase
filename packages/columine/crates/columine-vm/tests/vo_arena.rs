@@ -2376,7 +2376,6 @@ fn unsupported_vo_descriptors_refuse_initialization() {
             "struct list with a VO field",
             list(&[STRUCT_LIST_ELEM, 2, UINT32, VO]),
         ),
-        ("two-key struct map with a VO field", map2(&[UINT32, VO])),
         ("unknown kind 11", struct_map_init(&[UINT32, 11])),
     ];
     for (name, init_code) in refused {
@@ -2393,11 +2392,14 @@ fn unsupported_vo_descriptors_refuse_initialization() {
         let status = init_state(&mut state, &prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
         assert_eq!(Err(ErrorCode::InvalidProgram), status, "{name}");
     }
-    // The refusals are about kind 10, not the containers.
+
+    // The refusals are about kind 10 in a list, not the containers; a two-key
+    // map holds value-object fields (columine 04 §9).
     let accepted = [
         list(&[BOOL]),
         list(&[STRUCT_LIST_ELEM, 2, UINT32, BOOL]),
         map2(&[UINT32, BOOL]),
+        map2(&[UINT32, VO]),
         struct_map_init(&[UINT32, VO]),
     ];
     for init_code in accepted {
