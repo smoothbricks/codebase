@@ -137,10 +137,7 @@ it('replays native NX results without binaries and builds only the missed select
     expect(miss.log).toMatch(/nx run native-probe:cargo-test-beta +\[(?:local cache|existing outputs match the cache)/);
 
     await cleanMarks();
-    const record = taskDirectory(
-      env.NX_WORKSPACE_DATA_DIRECTORY ?? join(workspace, '.nx/workspace-data'),
-      'native-probe:cargo-test-alpha',
-    );
+    const record = taskDirectory(join(workspace, '.nx/workspace-data'), 'native-probe:cargo-test-alpha');
     await writeFile(alpha, 'compile_error!("native fixture did not build");\n');
     const buildFailure = await nx();
     expect(buildFailure.code, buildFailure.log).not.toBe(0);
