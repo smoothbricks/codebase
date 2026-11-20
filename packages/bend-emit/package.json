@@ -1,0 +1,45 @@
+{
+  "name": "@smoothbricks/bend-emit",
+  "version": "0.0.1-next.0",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "bun": ">=1.4.4"
+  },
+  "main": "./src/emit.ts",
+  "types": "./dist/ts/src/emit.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/ts/src/emit.d.ts",
+      "default": "./src/emit.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "bend-emit": "./bin/bend-emit.ts"
+  },
+  "files": [
+    "bin",
+    "src",
+    "vendor/bend2",
+    "dist/ts/src/*.d.ts"
+  ],
+  "nx": {
+    "name": "bend-emit",
+    "tags": [
+      "npm:public"
+    ],
+    "targets": {
+      "lint": {}
+    }
+  },
+  "license": "MIT AND Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/bend-emit"
+  }
+}

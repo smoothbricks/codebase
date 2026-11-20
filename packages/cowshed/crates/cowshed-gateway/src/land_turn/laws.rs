@@ -13,7 +13,7 @@ use super::{BindRefusal, Parked, Turns};
 use cowshed_core::api::dto::LandTurnName;
 use cowshed_core::land_turn::TurnAsk;
 
-// Emitted by bend-emit from the checked model; never edited or formatted by hand.
+// Regenerate with bun run --filter @smoothbricks/cowshed emit-land-turn-law.
 #[rustfmt::skip]
 mod model;
 

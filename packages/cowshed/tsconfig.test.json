@@ -33,6 +33,9 @@
     },
     {
       "path": "../nx-cache-server/tsconfig.lib.json"
+    },
+    {
+      "path": "../bend-emit/tsconfig.lib.json"
     }
   ]
 }

@@ -49,6 +49,13 @@
         "mitata": "^1.0.34",
       },
     },
+    "packages/bend-emit": {
+      "name": "@smoothbricks/bend-emit",
+      "version": "0.0.1-next.0",
+      "bin": {
+        "bend-emit": "./bin/bend-emit.ts",
+      },
+    },
     "packages/bitmosaic": {
       "name": "@smoothbricks/bitmosaic",
       "version": "0.0.0",
@@ -137,6 +144,7 @@
         "typia": "15.4.1",
       },
       "devDependencies": {
+        "@smoothbricks/bend-emit": "workspace:*",
         "@napi-rs/cli": "3.7.3",
         "@smoothbricks/lmao": "workspace:*",
         "@smoothbricks/nextest-extract": "workspace:*",
@@ -1900,6 +1908,7 @@
 
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
 
+    "@smoothbricks/bend-emit": ["@smoothbricks/bend-emit@workspace:packages/bend-emit"],
     "@smoothbricks/bitmosaic": ["@smoothbricks/bitmosaic@workspace:packages/bitmosaic"],
 
     "@smoothbricks/build-inputs": ["@smoothbricks/build-inputs@workspace:packages/build-inputs"],
