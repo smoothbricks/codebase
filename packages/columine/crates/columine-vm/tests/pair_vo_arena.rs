@@ -78,7 +78,7 @@ fn program(num_inputs: u32, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     prog
 }
 
-/// `SLOT_STRUCT_MAP2` slot 0, capacity hint 4 (8 rows, 512 arena bytes).
+/// `SLOT_STRUCT_MAP2` slot 0, capacity hint 4 (64 arena bytes per row of its capacity).
 fn pair_init(kinds: &[u8]) -> Vec<u8> {
     let mut init = vec![
         SLOT_STRUCT_MAP2,
@@ -409,7 +409,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn a_two_key_map_declares_value_object_fields_and_starts_with_an_arena() {
     let state = init(&upsert_program());
     let (capacity, used, data) = arena(&state);
-    assert_eq!(512, capacity, "64 arena bytes per row of the 8-row slot");
+    assert_eq!(
+        64 * map(&state).capacity,
+        capacity,
+        "64 arena bytes per row of the slot"
+    );
     assert_eq!(0, used);
     assert!(data.iter().all(|byte| *byte == 0));
     assert_eq!(0, map(&state).size(&state));
@@ -478,13 +482,13 @@ fn frames_past_the_arena_grow_its_room_and_compaction_keeps_every_frame() {
     let prog = upsert_program();
     let mut state = init(&prog);
     let first = [
-        row(1, 0, &[0x11; 200], &[0x12; 100]),
+        row(1, 0, &[0x11; 500], &[0x12; 300]),
         row(1, 1, &[0x13; 100], &[]),
     ];
     run_ok(&mut state, &prog, &first);
     let mut expected = model(&first);
 
-    // 400 + 300 bytes: past the 512-byte arena, refused whole before any write.
+    // 900 + 300 bytes: past the 1024-byte arena, refused whole before any write.
     let over = [row(1, 0, &[0x21; 150], &[0x22; 150])];
     let before = state.clone();
     let mut vm = Vm::default();
@@ -511,9 +515,9 @@ fn frames_past_the_arena_grow_its_room_and_compaction_keeps_every_frame() {
 
     let (_, used, _) = arena(&state);
     assert_eq!(
-        400 + 300,
+        900 + 300,
         used,
-        "growth compacted the 400 live bytes, then the rewrite appended its 300"
+        "growth compacted the 900 live bytes, then the rewrite appended its 300"
     );
     let mut sealed = state.clone();
     seal(&mut sealed);
