@@ -406,11 +406,27 @@ fn state_events(dir: &Dir) -> Vec<LockWaiterEvent> {
 fn a_missing_executable_reports_failed_without_acquired() {
     let dir = Dir::new("missing-command");
     let missing = dir.path.join("no-such-executable");
-    let child = TestProcess::spawn(state_command(&dir).arg("--").arg(&missing));
-    assert_eq!(
-        child.wait().expect("observe failed spawn"),
-        ExitStatus::Exited { code: 104 }
-    );
+    let mut child = TestProcess::spawn(state_command(&dir).arg("--").arg(&missing));
+    let status = child.wait().expect("observe failed spawn");
+    if status != (ExitStatus::Exited { code: 104 }) {
+        // `sh` execs the cowshed under test, which spawns `missing`: say which program each exec named, whether it
+        // was there, and what the child wrote, since a status does not say which exec failed.
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr)
+            .expect("read the child's stderr");
+        let cowshed = cowshed();
+        panic!(
+            "expected Exited {{ code: 104 }}, got {status:?}; sh exec'd {} (exists: {}), which was to spawn {} (exists: {}); stderr: {stderr:?}",
+            cowshed.display(),
+            cowshed.exists(),
+            missing.display(),
+            missing.exists(),
+        );
+    }
     let events = state_events(&dir);
     let [LockWaiterEvent::Failed { reason }] = events.as_slice() else {
         panic!("a failed spawn must report only failed: {events:?}");
