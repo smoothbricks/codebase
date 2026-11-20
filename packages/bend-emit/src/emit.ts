@@ -1509,8 +1509,8 @@ function goLaw(p: Program, law: Law, index: number): string {
   let out = `\nfunc ${name}(${params.join(', ')}) (bool, string) {\n`;
   for (const h of law.hyps) {
     const atom = h.ty.k === 'nat' || h.ty.k === 'bool';
-    const a = goExpr(h.a),
-      b = goExpr(h.b);
+    const a = goExpr(h.a);
+    const b = goExpr(h.b);
     out += `  if ${atom ? a : goShow(h.ty, a)} != ${atom ? b : goShow(h.ty, b)} { return true, "vacuous" }\n`;
   }
   const atom = law.ty.k === 'nat' || law.ty.k === 'bool';

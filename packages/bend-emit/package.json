@@ -22,15 +22,28 @@
     "bin",
     "src",
     "vendor/bend2",
-    "dist/ts/src/*.d.ts"
+    "dist/ts/src/*.d.ts",
+    "!src/**/*.test.ts"
   ],
+  "scripts": {
+    "test": "nx run bend-emit:test --outputStyle=stream"
+  },
   "nx": {
     "name": "bend-emit",
     "tags": [
       "npm:public"
     ],
     "targets": {
-      "lint": {}
+      "lint": {},
+      "test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "options": {
+          "command": "bun test --timeout=0",
+          "cwd": "{projectRoot}/src",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      }
     }
   },
   "license": "MIT AND Apache-2.0",

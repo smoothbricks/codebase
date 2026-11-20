@@ -7,5 +7,6 @@
     "declarationMap": false,
     "types": ["bun"]
   },
-  "include": ["src/**/*.ts", "bin/*.ts", "vendor/bend2/bend.ts"]
+  "include": ["src/**/*.ts", "bin/*.ts", "vendor/bend2/bend.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

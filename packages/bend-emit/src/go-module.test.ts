@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { checkBendFile } from '../src/emit.js';
+import { checkBendFile } from './emit.js';
 
-const model = `${import.meta.dir}/conformance.bend`;
+const model = `${import.meta.dir}/../test/conformance.bend`;
 
 test('Go module mode emits a callable package deterministically from the same checked book', async () => {
   const book = await checkBendFile(model);
