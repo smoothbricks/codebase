@@ -515,6 +515,7 @@ struct VerifiedAlias {
 /// Verify the copied namespace, metadata, symlink targets and every regular-file byte before
 /// adoption stamps its own marker and credentials. Reuse the copier's volume-metadata and
 /// runtime-artifact exclusions; never follow a copied symlink while reading file content.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify_tree_blocking(source: &Path, destination: &Path) -> Result<CopyVerification> {
     verify_with_snapshot(source, destination, snapshot)
 }
@@ -600,6 +601,7 @@ fn selected_snapshot(root: &Path, paths: &[PathBuf]) -> Result<Snapshot> {
     Ok(entries)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn verify_with_snapshot(
     source: &Path,
     destination: &Path,
@@ -1414,6 +1416,7 @@ mod tests {
         copy_and_verify_blocking, copy_and_verify_observing, copy_leaf, copy_with_budget,
         describe_churn, link_leaf, render_path, snapshot, validate_copy_roots,
     };
+    #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::CommandBackstop as _;
     /// A file's extended ACL as `ls -le` prints it: the lines after the first, `N: <entry>`.
     #[cfg(target_os = "macos")]
