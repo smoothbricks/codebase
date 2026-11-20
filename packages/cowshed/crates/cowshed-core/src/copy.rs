@@ -211,10 +211,21 @@ pub(crate) fn copy_and_verify_blocking(
     source: &Path,
     destination: &Path,
 ) -> Result<CopyVerification> {
+    copy_and_verify_observing(source, destination, snapshot)
+}
+
+/// [`copy_and_verify_blocking`] over an injected tree observation.
+fn copy_and_verify_observing(
+    source: &Path,
+    destination: &Path,
+    observe: impl Fn(&Path) -> Result<Snapshot>,
+) -> Result<CopyVerification> {
     let (source, destination) = validate_copy_roots(source, destination)?;
     let (_, quiescent) =
-        converge_observed(&source, &destination, DEFAULT_PASS_BUDGET, &mut snapshot)?;
-    verify_observed(&source, &destination, quiescent, snapshot)
+        converge_observed(&source, &destination, DEFAULT_PASS_BUDGET, &mut |root| {
+            observe(root)
+        })?;
+    verify_observed(&source, &destination, quiescent, &observe)
 }
 
 /// Copy a live repository into an attached image until a pass observes no changes.
@@ -1399,10 +1410,94 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_leaf,
-        copy_with_budget, describe_churn, link_leaf, render_path, snapshot, validate_copy_roots,
+        CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge,
+        copy_and_verify_blocking, copy_and_verify_observing, copy_leaf, copy_with_budget,
+        describe_churn, link_leaf, render_path, snapshot, validate_copy_roots,
     };
+    /// A file's extended ACL as `ls -le` prints it: the lines after the first, `N: <entry>`.
+    #[cfg(target_os = "macos")]
+    fn acl_entries(path: &Path) -> Vec<String> {
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-led")
+            .arg(path)
+            .output()
+            .expect("run ls -le");
+        assert!(output.status.success(), "ls -le {}", path.display());
+        String::from_utf8(output.stdout)
+            .expect("ls prints UTF-8")
+            .lines()
+            .skip(1)
+            .map(|line| line.trim().to_owned())
+            .collect()
+    }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_leaf_keeps_its_acl_and_symlinks_stay_links() {
+        let root = temp_root("clone-acl-links");
+        let (source, destination) = (root.join("source"), root.join("destination"));
+        fs::create_dir_all(source.join("directory")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("guarded"), b"guarded bytes").unwrap();
+        let user = std::env::var("USER").expect("USER names the test's user");
+        let granted = std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(format!("user:{user} allow read"))
+            .arg(source.join("guarded"))
+            .status()
+            .expect("run chmod +a");
+        assert!(granted.success(), "chmod +a on the source leaf");
+        std::os::unix::fs::symlink("directory", source.join("to-directory")).unwrap();
+        std::os::unix::fs::symlink("nowhere", source.join("dangling")).unwrap();
+
+        copy_and_verify_blocking(&source, &destination).expect("copy and verify");
+
+        let acl = acl_entries(&source.join("guarded"));
+        assert!(!acl.is_empty(), "the fixture's ACL is in place: {acl:?}");
+        assert_eq!(acl_entries(&destination.join("guarded")), acl);
+        for (link, target) in [("to-directory", "directory"), ("dangling", "nowhere")] {
+            let copied = destination.join(link);
+            assert!(
+                fs::symlink_metadata(&copied)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{link} is copied as a link, not followed"
+            );
+            assert_eq!(fs::read_link(&copied).unwrap(), Path::new(target));
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_source_moving_after_the_quiescent_pass_fails_verification() {
+        use std::cell::Cell;
+
+        let root = temp_root("moves-after-pass");
+        let (source, destination) = (root.join("source"), root.join("destination"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("file"), b"settled").unwrap();
+        // Two source observations end the copy (its first look and the pass that found it
+        // unchanged); the writer moves the source on the next look, the verification's first.
+        let looks = Cell::new(0_usize);
+        let observe = |path: &Path| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 3 {
+                fs::write(source.join("file"), b"moved on").unwrap();
+            }
+            snapshot(path)
+        };
+        let refused = copy_and_verify_observing(&source, &destination, observe)
+            .expect_err("a source that moved after the copy is never verified");
+        assert!(
+            refused.message.contains("changed during verification")
+                || refused.message.contains("copied tree differs"),
+            "{}",
+            refused.message
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
     #[test]
     fn a_leaf_the_mirror_thought_vacant_replaces_an_unrecorded_occupant() {
         let root = temp_root("unrecorded-occupant");
