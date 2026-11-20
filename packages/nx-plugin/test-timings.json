@@ -10,6 +10,8 @@
     "src/executors/bounded-exec/case-gate.test.ts": 60,
     "src/cargo-resolve-cache.test.ts": 26366,
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 23230,
+    "src/native-test-cache.test.ts": 25489,
+    "src/cargo-test-generated-inputs.test.ts": 20736,
     "src/index.test.ts": 20426,
     "src/linked-snapshots.nx.test.ts": 17062,
     "src/ensure-built-receipt.test.ts": 13062,
