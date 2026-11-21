@@ -1503,7 +1503,10 @@ async fn a_peer_whose_work_this_land_brought_in_is_a_fold() {
         "peer",
     )
     .await;
-    assert!(facts.landed && !facts.held_before_land, "{facts:?}");
+    assert!(
+        facts.landed && facts.held_before_land == Ok(false),
+        "{facts:?}"
+    );
     assert_eq!(
         fold_step(&facts),
         Some(cowshed_core::landing::FoldStep::Retire)
@@ -1571,7 +1574,7 @@ async fn a_peer_main_already_held_is_not_a_lane_lands_fold() {
         "main's commit reads as its own: {facts:?}"
     );
     assert!(
-        facts.landed && !facts.held_before_land && facts.held_by_main,
+        facts.landed && facts.held_before_land == Ok(false) && facts.held_by_main == Ok(true),
         "{facts:?}"
     );
     assert_eq!(
@@ -1579,6 +1582,74 @@ async fn a_peer_main_already_held_is_not_a_lane_lands_fold() {
         None,
         "main carried its work, so the lane's land neither retires nor names it"
     );
+}
+
+/// The control for the rule above: main's branch is there, but whether main holds the peer
+/// cannot be established (here its tip names no object the peer's repository can read). An
+/// unknown comparison is no permission: the peer is kept, saying why, never retired.
+#[tokio::test]
+async fn a_peer_whose_main_containment_cannot_be_read_is_kept() {
+    let fixture = Fixture::new("fold-main-unread");
+    git(fixture.parent(), ["branch", "batch"]);
+    let mount = fixture.clone_workspace("land-install");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    fixture.parent_commit("story.txt", "main's story\n", "main's change");
+    git(
+        &mount,
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            fixture.parent().as_os_str(),
+            OsStr::new(TARGET),
+        ],
+    );
+    git(&mount, ["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("re-pointed head");
+    git(fixture.parent(), ["checkout", "-q", "batch"]);
+    git(fixture.parent(), ["merge", "-q", "--ff-only", TARGET]);
+    fixture.parent_commit("unit.txt", "the unit\n", "the unit's change");
+    git(fixture.parent(), ["checkout", "-q", TARGET]);
+    let target = resolve_target(fixture.store(), &fixture.parent(), "batch")
+        .await
+        .expect("the landed batch");
+    // Main's branch resolves, but its tip is an object no repository here holds.
+    let main = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main's branch")
+        .at(GitOid::new("1111111111111111111111111111111111111111".to_owned()).expect("an oid"));
+    let facts = fold_facts(
+        fixture.store(),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &base,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec(), b"unit.txt".to_vec()]),
+            main: Some(&main),
+        },
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "land-install",
+    )
+    .await;
+    assert!(
+        facts.landed && facts.held_before_land == Ok(false) && facts.held_by_main.is_err(),
+        "{facts:?}"
+    );
+    match fold_step(&facts) {
+        Some(cowshed_core::landing::FoldStep::Keep(cowshed_core::api::FoldKept::Refused {
+            message,
+            ..
+        })) => assert!(
+            message.contains("whether main held it could not be read"),
+            "{message}"
+        ),
+        other => panic!("an unreadable main comparison keeps the peer, saying why: {other:?}"),
+    }
 }
 
 /// The other side of the rule above: a peer whose own work main lacks and a lane land carries
@@ -1630,7 +1701,7 @@ async fn a_peer_whose_work_a_lane_land_brought_in_is_a_fold() {
     )
     .await;
     assert!(
-        facts.landed && !facts.held_before_land && !facts.held_by_main,
+        facts.landed && facts.held_before_land == Ok(false) && facts.held_by_main == Ok(false),
         "{facts:?}"
     );
     assert_eq!(

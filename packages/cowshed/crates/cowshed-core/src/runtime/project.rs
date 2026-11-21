@@ -8876,8 +8876,8 @@ self.finish_retire_intent(&workspace).await?;
                 let unreadable = |reason| crate::landing::FoldFacts {
                     touched: Err(reason),
                     landed: false,
-                    held_before_land: false,
-                    held_by_main: false,
+                    held_before_land: Ok(false),
+                    held_by_main: Ok(false),
                     dirty_files: Ok(0),
                 };
                 let facts = match head.as_ref() {

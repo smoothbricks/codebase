@@ -548,16 +548,18 @@ pub struct FoldFacts {
     /// (02_workspaces.md, `land` step 5, "Folds"), so a session whose work is merely preserved is
     /// neither retired nor named by the land.
     pub landed: bool,
-    /// Whether the target held its head before this land, as `rm` measures it. Then the land
-    /// carried none of its work, so it is no fold of this land, however much of the landed range
-    /// its own commits touch: a batch rebased onto an integration shed holds that shed's commits
-    /// before any unit lands into it, and landing a unit there must never retire the shed.
-    pub held_before_land: bool,
+    /// Whether the target held its head before this land, as `rm` measures its commits, or why
+    /// that could not be read. Held, the land carried none of its work, so it is no fold of this
+    /// land, however much of the landed range its own commits touch: a batch rebased onto an
+    /// integration shed holds that shed's commits before any unit lands into it, and landing a
+    /// unit there must never retire the shed.
+    pub held_before_land: std::result::Result<bool, String>,
     /// Whether main's head held its head at this land, for a land into a lane, as `rm` measures
-    /// it. Then main's own earlier land carried its work, not this one: a shed re-pointed onto
-    /// main keeps its recorded fork base, so main's commits since then read as its own, and a lane
-    /// land that replays them onto an older batch base must not retire it.
-    pub held_by_main: bool,
+    /// its commits, or why that could not be read. Held, main's own earlier land carried its work,
+    /// not this one: a shed re-pointed onto main keeps its recorded fork base, so main's commits
+    /// since then read as its own, and a lane land that replays them onto an older batch base must
+    /// not retire it. `Ok(false)` for a land into main, which `held_before_land` answers.
+    pub held_by_main: std::result::Result<bool, String>,
     /// Its uncommitted changes (tracked, and untracked no ignore rule covers), or why they could
     /// not be counted.
     pub dirty_files: std::result::Result<u64, String>,
@@ -586,8 +588,24 @@ pub fn fold_step(facts: &FoldFacts) -> Option<FoldStep> {
             }));
         }
         Ok(false) => return None,
-        Ok(true) if !facts.landed || facts.held_before_land || facts.held_by_main => return None,
+        Ok(true) if !facts.landed => return None,
         Ok(true) => {}
+    }
+    // A comparison that could not be read is no permission to retire: the peer is kept, saying why.
+    for (held, against) in [
+        (&facts.held_before_land, "the target before the land"),
+        (&facts.held_by_main, "main"),
+    ] {
+        match held {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(reason) => {
+                return Some(FoldStep::Keep(FoldKept::Refused {
+                    code: ErrorCode::EnvironmentMissing,
+                    message: format!("whether {against} held it could not be read: {reason}"),
+                }));
+            }
+        }
     }
     Some(match &facts.dirty_files {
         Ok(0) => FoldStep::Retire,
@@ -669,8 +687,8 @@ pub async fn fold_facts(
         return FoldFacts {
             touched,
             landed: false,
-            held_before_land: false,
-            held_by_main: false,
+            held_before_land: Ok(false),
+            held_by_main: Ok(false),
             dirty_files: Ok(0),
         };
     }
@@ -684,34 +702,33 @@ pub async fn fold_facts(
     )
     .await;
     let landed = landing.commits.held_by_target() && landing.branches.fully_landed();
-    let held_before_land = landed
-        && measure(
+    let held_before_land = if landed {
+        holds(
             store_root,
-            &Ok(target.clone().at(previous.clone())),
+            &target.clone().at(previous.clone()),
             workspace_mount,
             push_repository,
             workspace,
             head,
         )
         .await
-        .commits
-        .held_by_target();
-    let held_by_main = landed
-        && !held_before_land
-        && match main {
-            Some(main) => measure(
+    } else {
+        Ok(false)
+    };
+    let held_by_main = match (landed, &held_before_land, main) {
+        (true, Ok(false), Some(main)) => {
+            holds(
                 store_root,
-                &Ok(main.clone()),
+                main,
                 workspace_mount,
                 push_repository,
                 workspace,
                 head,
             )
             .await
-            .commits
-            .held_by_target(),
-            None => false,
-        };
+        }
+        _ => Ok(false),
+    };
     FoldFacts {
         touched,
         landed,
@@ -720,6 +737,31 @@ pub async fn fold_facts(
         dirty_files: landing
             .dirty_files
             .ok_or_else(|| String::from("git status could not be read")),
+    }
+}
+
+/// Whether `target` holds `head` as `rm` step 1 measures its commits ([`measure_commits`]), or
+/// why that could not be read: an indeterminate measure is never "not held".
+async fn holds(
+    store_root: &std::sync::Arc<Path>,
+    target: &LandingTarget,
+    workspace_mount: &Path,
+    push_repository: &Path,
+    workspace: &str,
+    head: &str,
+) -> std::result::Result<bool, String> {
+    match measure_commits(
+        store_root,
+        &Ok(target.clone()),
+        workspace_mount,
+        push_repository,
+        workspace,
+        head,
+    )
+    .await
+    {
+        LandingCommits::Indeterminate { reason } => Err(reason),
+        measured @ LandingCommits::Measured { .. } => Ok(measured.held_by_target()),
     }
 }
 /// The three questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is
@@ -987,8 +1029,8 @@ mod tests {
         let facts = |touched, landed, dirty_files| FoldFacts {
             touched,
             landed,
-            held_before_land: false,
-            held_by_main: false,
+            held_before_land: Ok(false),
+            held_by_main: Ok(false),
             dirty_files,
         };
         for (facts, step) in [
@@ -998,17 +1040,39 @@ mod tests {
             (facts(Ok(true), true, Ok(0)), Some(FoldStep::Retire)),
             (
                 FoldFacts {
-                    held_before_land: true,
+                    held_before_land: Ok(true),
                     ..facts(Ok(true), true, Ok(0))
                 },
                 None,
             ),
             (
                 FoldFacts {
-                    held_by_main: true,
+                    held_by_main: Ok(true),
                     ..facts(Ok(true), true, Ok(0))
                 },
                 None,
+            ),
+            (
+                FoldFacts {
+                    held_by_main: Err(String::from("unreadable")),
+                    ..facts(Ok(true), true, Ok(0))
+                },
+                Some(FoldStep::Keep(FoldKept::Refused {
+                    code: ErrorCode::EnvironmentMissing,
+                    message: String::from("whether main held it could not be read: unreadable"),
+                })),
+            ),
+            (
+                FoldFacts {
+                    held_before_land: Err(String::from("unreadable")),
+                    ..facts(Ok(true), true, Ok(0))
+                },
+                Some(FoldStep::Keep(FoldKept::Refused {
+                    code: ErrorCode::EnvironmentMissing,
+                    message: String::from(
+                        "whether the target before the land held it could not be read: unreadable",
+                    ),
+                })),
             ),
             (
                 facts(Ok(true), true, Ok(2)),
