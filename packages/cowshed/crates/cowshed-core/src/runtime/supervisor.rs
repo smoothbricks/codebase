@@ -2711,7 +2711,7 @@ impl SystemSpawnSink {
     ) -> Self {
         Self {
             shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
-            memberships: platform::MembershipAdmissions::default(),
+            ..Self::default()
         }
     }
 }

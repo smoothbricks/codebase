@@ -159,7 +159,7 @@ impl Source {
     pub(super) fn survey(
         &mut self,
         _purpose: ObservationPurpose,
-        _registered: &HashMap<ProcessIdentity, Watch>,
+        _registered: &mut HashMap<ProcessIdentity, Watch>,
         _reports: &mut Vec<Result<Report, ObserveError>>,
     ) {
     }
@@ -170,7 +170,7 @@ impl Source {
     pub(super) fn collect(
         &mut self,
         within: Option<Duration>,
-        registered: &HashMap<ProcessIdentity, Watch>,
+        registered: &mut HashMap<ProcessIdentity, Watch>,
         reports: &mut Vec<Result<Report, ObserveError>>,
     ) -> Result<usize, ObserveError> {
         let timeout = within.map(|within| libc::timespec {
