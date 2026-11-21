@@ -8819,6 +8819,25 @@ self.finish_retire_intent(&workspace).await?;
             .await
             .map_err(unreadable)?
             .at(landed_head.clone());
+        // A land into a lane folds no work main already held: main's own land carried it.
+        let main_tip = if into.name.is_main() {
+            None
+        } else {
+            let main = self.main_containment().await?;
+            Some(
+                crate::landing::resolve_target(&store_root, &main.mount, &main.branch)
+                    .await
+                    .map_err(|reason| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "main's {} cannot be read for the land's folds: {reason}",
+                                main.branch
+                            ),
+                            "cowshed doctor --json",
+                        )
+                    })?,
+            )
+        };
         let paths = crate::landing::landed_paths(&store_root, &target, previous, landed_head)
             .await
             .map_err(unreadable)?;
@@ -8843,9 +8862,10 @@ self.finish_retire_intent(&workspace).await?;
             let main = self.descriptor.git_root.to_path_buf();
             let incarnation = candidate.derived.workspace.incarnation().clone();
             let fork_base = candidate.metadata.info_snapshot.base_commit;
-            let (store_root, target, paths) = (
+            let (store_root, target, main_tip, paths) = (
                 std::sync::Arc::clone(&store_root),
                 target.clone(),
+                main_tip.clone(),
                 std::sync::Arc::clone(&paths),
             );
             let previous = previous.clone();
@@ -8857,6 +8877,7 @@ self.finish_retire_intent(&workspace).await?;
                     touched: Err(reason),
                     landed: false,
                     held_before_land: false,
+                    held_by_main: false,
                     dirty_files: Ok(0),
                 };
                 let facts = match head.as_ref() {
@@ -8868,6 +8889,7 @@ self.finish_retire_intent(&workspace).await?;
                                     target: &target,
                                     previous: &previous,
                                     paths: &paths,
+                                    main: main_tip.as_ref(),
                                 },
                                 crate::landing::FoldProvenance { base: &base, head },
                                 &mount,

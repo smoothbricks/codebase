@@ -1179,12 +1179,15 @@ step. An ungated land validates no head, so it rebases on its own (`--ungated`, 
    only a `push` ref keeps is work the tip lacks, so it is no fold. Nor is a peer whose work the target's previous head
    already held by the same measure: that land carried none of it. A batch rebased onto an integration workspace holds
    that workspace's commits before any unit lands into it, and landing a unit there touches the same paths, yet never
-   retires the integration workspace. The others are neither touched nor named. A folded peer is measured again under
-   its own land lease. The age floor is bypassed only for an idle peer: any live supervisor, running or queued job, or
-   attached shell keeps it, without quiescing, draining or stopping its owner. The supervisor socket's exclusive lease
-   fences new admission through retirement. A process cowshed does not run that holds its mount refuses as for `rm`
-   ("Holders cowshed does not run"). A dirty peer is kept too. The named source workspace still retires by the ordinary
-   land path, however young.
+   retires the integration workspace. For a land into a lane, nor is a peer whose head main's head already holds by the
+   same measure: main's own earlier land carried that work, and a lane land that replays it onto an older batch base
+   does not. A shed re-pointed onto main (`cowshed rebase --onto`) keeps its recorded fork base, so main's commits since
+   then read as its own, and such a shed, the install's build shed among them, is no fold of a lane land. The others are
+   neither touched nor named. A folded peer is measured again under its own land lease. The age floor is bypassed only
+   for an idle peer: any live supervisor, running or queued job, or attached shell keeps it, without quiescing, draining
+   or stopping its owner. The supervisor socket's exclusive lease fences new admission through retirement. A process
+   cowshed does not run that holds its mount refuses as for `rm` ("Holders cowshed does not run"). A dirty peer is kept
+   too. The named source workspace still retires by the ordinary land path, however young.
 
    Each folded peer is reported in `LandedReport.folded` with its head and outcome, `retired`, or `kept` with why
    (`dirty` with its file count, or `refused` with the refusal's code and message), and said on stderr. A kept peer

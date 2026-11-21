@@ -553,6 +553,11 @@ pub struct FoldFacts {
     /// its own commits touch: a batch rebased onto an integration shed holds that shed's commits
     /// before any unit lands into it, and landing a unit there must never retire the shed.
     pub held_before_land: bool,
+    /// Whether main's head held its head at this land, for a land into a lane, as `rm` measures
+    /// it. Then main's own earlier land carried its work, not this one: a shed re-pointed onto
+    /// main keeps its recorded fork base, so main's commits since then read as its own, and a lane
+    /// land that replays them onto an older batch base must not retire it.
+    pub held_by_main: bool,
     /// Its uncommitted changes (tracked, and untracked no ignore rule covers), or why they could
     /// not be counted.
     pub dirty_files: std::result::Result<u64, String>,
@@ -581,7 +586,7 @@ pub fn fold_step(facts: &FoldFacts) -> Option<FoldStep> {
             }));
         }
         Ok(false) => return None,
-        Ok(true) if !facts.landed || facts.held_before_land => return None,
+        Ok(true) if !facts.landed || facts.held_before_land || facts.held_by_main => return None,
         Ok(true) => {}
     }
     Some(match &facts.dirty_files {
@@ -622,6 +627,9 @@ pub struct LandedRange<'a> {
     pub target: &'a LandingTarget,
     pub previous: &'a GitOid,
     pub paths: &'a std::collections::BTreeSet<Vec<u8>>,
+    /// Main's branch at its head, for a land into a lane; `None` for a land into main, whose
+    /// previous head already answers whether main held a peer.
+    pub main: Option<&'a LandingTarget>,
 }
 
 /// Read the fold decision facts: non-empty own commits in the captured provenance touching the
@@ -639,6 +647,7 @@ pub async fn fold_facts(
         target,
         previous,
         paths: landed_paths,
+        main,
     } = landed_range;
     let fork_base = provenance.base.as_str();
     let head = provenance.head.as_str();
@@ -661,6 +670,7 @@ pub async fn fold_facts(
             touched,
             landed: false,
             held_before_land: false,
+            held_by_main: false,
             dirty_files: Ok(0),
         };
     }
@@ -686,10 +696,27 @@ pub async fn fold_facts(
         .await
         .commits
         .held_by_target();
+    let held_by_main = landed
+        && !held_before_land
+        && match main {
+            Some(main) => measure(
+                store_root,
+                &Ok(main.clone()),
+                workspace_mount,
+                push_repository,
+                workspace,
+                head,
+            )
+            .await
+            .commits
+            .held_by_target(),
+            None => false,
+        };
     FoldFacts {
         touched,
         landed,
         held_before_land,
+        held_by_main,
         dirty_files: landing
             .dirty_files
             .ok_or_else(|| String::from("git status could not be read")),
@@ -961,6 +988,7 @@ mod tests {
             touched,
             landed,
             held_before_land: false,
+            held_by_main: false,
             dirty_files,
         };
         for (facts, step) in [
@@ -971,6 +999,13 @@ mod tests {
             (
                 FoldFacts {
                     held_before_land: true,
+                    ..facts(Ok(true), true, Ok(0))
+                },
+                None,
+            ),
+            (
+                FoldFacts {
+                    held_by_main: true,
                     ..facts(Ok(true), true, Ok(0))
                 },
                 None,

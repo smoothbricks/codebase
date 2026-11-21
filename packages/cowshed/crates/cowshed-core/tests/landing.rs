@@ -1322,6 +1322,7 @@ async fn a_head_only_the_push_ref_keeps_is_retirable_and_not_a_fold() {
             target: &target,
             previous: &previous,
             paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: None,
         },
         cowshed_core::landing::FoldProvenance {
             base: &previous,
@@ -1369,6 +1370,7 @@ async fn a_fold_uses_the_captured_peer_head_and_landed_result_not_later_refs() {
             target: &target,
             previous: &base,
             paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: None,
         },
         cowshed_core::landing::FoldProvenance {
             base: &base,
@@ -1435,6 +1437,7 @@ async fn a_peer_the_target_held_before_the_land_is_not_a_fold() {
             target: &target,
             previous: &previous,
             paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: None,
         },
         cowshed_core::landing::FoldProvenance {
             base: &base,
@@ -1489,6 +1492,7 @@ async fn a_peer_whose_work_this_land_brought_in_is_a_fold() {
             target: &target,
             previous: &previous,
             paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: None,
         },
         cowshed_core::landing::FoldProvenance {
             base: &base,
@@ -1500,6 +1504,135 @@ async fn a_peer_whose_work_this_land_brought_in_is_a_fold() {
     )
     .await;
     assert!(facts.landed && !facts.held_before_land, "{facts:?}");
+    assert_eq!(
+        fold_step(&facts),
+        Some(cowshed_core::landing::FoldStep::Retire)
+    );
+}
+
+/// A land into a lane folds only work that land carried (02_workspaces.md, land step 5, "Folds").
+/// A shed re-pointed onto main (`cowshed rebase --onto`) keeps its recorded fork base, so main's
+/// commits since then read as its own; a lane land that replays those commits onto an older batch
+/// base carries them into the lane, yet main carried them first. Such a peer is no fold of the
+/// lane's land: the land-install shed was retired so, losing its warm build volume.
+#[tokio::test]
+async fn a_peer_main_already_held_is_not_a_lane_lands_fold() {
+    let fixture = Fixture::new("fold-main-held");
+    git(fixture.parent(), ["branch", "batch"]);
+    let mount = fixture.clone_workspace("land-install");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    // Main moves; the shed is re-pointed onto it, with nothing of its own.
+    fixture.parent_commit("story.txt", "main's story\n", "main's change");
+    git(
+        &mount,
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            fixture.parent().as_os_str(),
+            OsStr::new(TARGET),
+        ],
+    );
+    git(&mount, ["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("re-pointed head");
+    // A unit based on main folds into the batch, which stood at the older base: the land carries
+    // main's commit into the batch with the unit's own.
+    git(fixture.parent(), ["checkout", "-q", "batch"]);
+    git(fixture.parent(), ["merge", "-q", "--ff-only", TARGET]);
+    fixture.parent_commit("unit.txt", "the unit\n", "the unit's change");
+    git(fixture.parent(), ["checkout", "-q", TARGET]);
+    let target = resolve_target(fixture.store(), &fixture.parent(), "batch")
+        .await
+        .expect("the landed batch");
+    let main = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main at its head");
+    let facts = fold_facts(
+        fixture.store(),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &base,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec(), b"unit.txt".to_vec()]),
+            main: Some(&main),
+        },
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "land-install",
+    )
+    .await;
+    assert_eq!(
+        facts.touched,
+        Ok(true),
+        "main's commit reads as its own: {facts:?}"
+    );
+    assert!(
+        facts.landed && !facts.held_before_land && facts.held_by_main,
+        "{facts:?}"
+    );
+    assert_eq!(
+        fold_step(&facts),
+        None,
+        "main carried its work, so the lane's land neither retires nor names it"
+    );
+}
+
+/// The other side of the rule above: a peer whose own work main lacks and a lane land carries
+/// into the batch is that land's fold, retired when its tree is clean.
+#[tokio::test]
+async fn a_peer_whose_work_a_lane_land_brought_in_is_a_fold() {
+    let fixture = Fixture::new("fold-lane-brought-in");
+    git(fixture.parent(), ["branch", "batch"]);
+    let mount = fixture.clone_workspace("unit");
+    let base =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("fork base");
+    workspace_commit(&mount, "story.txt", "the unit's story\n", "unit work");
+    let head =
+        GitOid::new(git(&mount, ["rev-parse", "HEAD"]).trim().to_owned()).expect("unit head");
+    // The lane land carries the unit's commit into the batch; main never took it.
+    git(fixture.parent(), ["checkout", "-q", "batch"]);
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("unit"),
+        ],
+    );
+    git(fixture.parent(), ["merge", "-q", "--ff-only", "FETCH_HEAD"]);
+    git(fixture.parent(), ["checkout", "-q", TARGET]);
+    let target = resolve_target(fixture.store(), &fixture.parent(), "batch")
+        .await
+        .expect("the landed batch");
+    let main = resolve_target(fixture.store(), &fixture.parent(), TARGET)
+        .await
+        .expect("main at its head");
+    let facts = fold_facts(
+        fixture.store(),
+        cowshed_core::landing::LandedRange {
+            target: &target,
+            previous: &base,
+            paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: Some(&main),
+        },
+        cowshed_core::landing::FoldProvenance {
+            base: &base,
+            head: &head,
+        },
+        &mount,
+        &fixture.parent(),
+        "unit",
+    )
+    .await;
+    assert!(
+        facts.landed && !facts.held_before_land && !facts.held_by_main,
+        "{facts:?}"
+    );
     assert_eq!(
         fold_step(&facts),
         Some(cowshed_core::landing::FoldStep::Retire)
@@ -1523,6 +1656,7 @@ async fn a_session_without_commits_after_its_fork_base_is_not_a_fold() {
             target: &target,
             previous: &fork_base,
             paths: &std::collections::BTreeSet::from([b"story.txt".to_vec()]),
+            main: None,
         },
         cowshed_core::landing::FoldProvenance {
             base: &fork_base,
