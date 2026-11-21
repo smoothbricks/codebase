@@ -6088,10 +6088,11 @@ mod tests {
 
     /// A held cache whose package the checkout no longer tracks is the one held path a refresh
     /// does not link (16_build_volumes.md, "Declared build state"). Its exact link goes, with the
-    /// package's directories it leaves empty and none above them, while the volume keeps its bytes
-    /// and the state keeps its row, so the package tracked again is linked to them warm. A package
-    /// still tracked is linked as before, though uninstalled and though its links are missing, as
-    /// after a land; a kept path follows its own rule; and whatever else holds a removed package's
+    /// directories cowshed made for it that it leaves empty, never one that stood before it, while
+    /// the volume keeps its bytes and the state keeps its row, so the package tracked again is
+    /// linked to them warm. A package still tracked is linked as before, though uninstalled and
+    /// though its links are missing, as after a land; a kept path follows its own rule; and
+    /// whatever else holds a removed package's
     /// path, a real directory or a link aimed elsewhere, is left as it is and refuses nothing.
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -6188,6 +6189,18 @@ mod tests {
             );
             assert_eq!(fs::read(at.join("warm")).unwrap(), b"volume bytes");
         };
+        // The checkout made the package's directory, before any link: the refresh takes the links
+        // and the directories cowshed made for them, and leaves that directory, emptied.
+        assert_eq!(refresh().await.volume, Some(live.clone()));
+        assert_eq!(
+            fs::read_dir(checkout.join("packages/gone"))
+                .unwrap()
+                .count(),
+            0,
+            "only the package's own directory stays"
+        );
+        // Removed by hand, it is never made again.
+        fs::remove_dir(checkout.join("packages/gone")).unwrap();
         for _ in 0..2 {
             assert_eq!(refresh().await.volume, Some(live.clone()));
             assert!(

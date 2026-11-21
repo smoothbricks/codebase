@@ -449,15 +449,19 @@ package's `node_modules/.cache` whose `package.json` the index no longer lists, 
 row stays in the volume's state and the volume keeps what it holds, so the package tracked again is linked to it warm. A
 refresh makes nothing at its path: no link, no volume directory, no parent. Where the path holds exactly the fixed link
 its row names, the refresh removes that link, then each directory between it and the package's directory, that one
-included, while it is empty: never a directory above the package's. Anything else at the path, a real directory, a file
-or a link aimed elsewhere, it leaves as it is and refuses nothing. The evidence is the index listings the fingerprint
-already takes. A package only uninstalled (its manifest tracked, no `node_modules`), a kept declared path (above), a
-literal entry, the checkout root's cache, a capability's own path and a row whose pattern the declaration dropped
-therefore keep their link, and a checkout without a Git directory keeps every link. A resident `exec` and
-`cowshed doctor` judge only the links a refresh makes, and count a removed package's link still in place as one the
-refresh changes. **Why**: relinking a removed package's cache made the package's directory again at every refresh, an
-empty workspace member a `packages/*` glob reads as a package without a manifest. After a downstream repository removed
-a package, every `cowshed exec` remade its directory and the workspace lint refused the next commit (2026-11-21).
+included, while it is empty and carries the extended attribute cowshed gives every directory it makes for a link
+(`user.cowshed.made-for-link`): never a directory above the package's, and never one that stood before the link, made by
+Git, a tool or the user, nor any above that one, though it is empty. The mark is the directory's own, so a clone carries
+it and a directory made again in its place lacks it; a directory made before the mark existed, or on a file system
+without extended attributes, is never cowshed's to remove. Anything else at the path, a real directory, a file or a link
+aimed elsewhere, it leaves as it is and refuses nothing. The evidence is the index listings the fingerprint already
+takes. A package only uninstalled (its manifest tracked, no `node_modules`), a kept declared path (above), a literal
+entry, the checkout root's cache, a capability's own path and a row whose pattern the declaration dropped therefore keep
+their link, and a checkout without a Git directory keeps every link. A resident `exec` and `cowshed doctor` judge only
+the links a refresh makes, and count a removed package's link still in place as one the refresh changes. **Why**:
+relinking a removed package's cache made the package's directory again at every refresh, an empty workspace member a
+`packages/*` glob reads as a package without a manifest. After a downstream repository removed a package, every
+`cowshed exec` remade its directory and the workspace lint refused the next commit (2026-11-21).
 
 A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
 resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
@@ -492,10 +496,11 @@ instead. The swap would therefore be an unmount and a mount, which must skip ado
   `[build] keep` marking the entries it names and refusing one that names no `[build] state` entry; a discovery test
   telling a removed package's caches apart from an uninstalled package's, a kept path, a literal, the root's cache, a
   dropped pattern's and every row of a checkout without Git, and rejoining a package tracked again; `link.rs`'s test
-  taking only a removed package's exact links and the directories they emptied, never one above the package, a foreign
-  link or a real directory; and a refresh test in which a removed package's caches stay unlinked across refreshes with
-  their rows and volume bytes kept, a still-tracked package's missing links are made, a kept path follows its own rule,
-  the resident judgement holds, and the package tracked again is linked warm.
+  taking only a removed package's exact links and the emptied directories cowshed marked as made for them, never one
+  that stood before its link (the package's own included) or above the package, a foreign link or a real directory; and
+  a refresh test in which a removed package's caches stay unlinked across refreshes with their rows and volume bytes
+  kept, a still-tracked package's missing links are made, a kept path follows its own rule, the resident judgement
+  holds, and the package tracked again is linked warm.
 
 ### Targets and seeds
 

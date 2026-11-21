@@ -214,9 +214,12 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
 
 /// Take each removed package's cache off the checkout (`removed_package_caches`): its link, only
 /// where the path holds exactly the fixed link its row names ([`is_fixed_link`]), then each
-/// directory from the link's up to the package's own, that one included, while it is empty. It
-/// never removes a directory above the package's, anything the volume holds behind the link, or
-/// whatever else holds the path. Returns the paths whose link it removed.
+/// directory from the link's up to the package's own, that one included, while it is empty and
+/// carries the mark [`contained_parent`] gives a directory it made ([`made_by_cowshed`]). A
+/// directory that stood before the link, made by Git, a tool or the user, stays though empty, and
+/// so does every directory above it. It never removes a directory above the package's, anything
+/// the volume holds behind the link, or whatever else holds the path. Returns the paths whose link
+/// it removed.
 pub(crate) fn unlink_removed(
     checkout: &Path,
     removed: &[RemovedPackageCache],
@@ -242,7 +245,7 @@ pub(crate) fn unlink_removed(
         unlinked.push(path.to_owned());
         let package = checkout.join(&cache.package);
         for directory in at.ancestors().skip(1) {
-            if !directory.starts_with(&package) {
+            if !directory.starts_with(&package) || !made_by_cowshed(directory) {
                 break;
             }
             match fs::remove_dir(directory) {
@@ -482,9 +485,87 @@ pub fn relative_target(checkout_path: &Path, volume_path: &Path) -> PathBuf {
     target
 }
 
+/// The extended attribute a directory [`contained_parent`] made carries: cowshed's proof that it,
+/// not Git, a tool or the user, made the directory, which [`unlink_removed`] requires before it
+/// removes one. It is the directory's own, so it goes with the directory and travels with it in a
+/// clone; a directory something else made in its place carries none.
+const MADE_BY_COWSHED: &std::ffi::CStr = c"user.cowshed.made-for-link";
+
+/// Give the directory `directory` cowshed just made the mark [`made_by_cowshed`] reads. A file
+/// system holding no extended attributes leaves it unmarked, so never removed by cowshed.
+fn mark_made(directory: &Path) -> io::Result<()> {
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
+    let value = [1u8];
+    // SAFETY: the path and name are NUL-terminated and the one-byte value is live across the call,
+    // which only reads them.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            MADE_BY_COWSHED.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "macos"))]
+    let result = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            MADE_BY_COWSHED.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOTSUP) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// Whether `directory` carries the mark [`contained_parent`] gives each directory it makes. Reads
+/// only; a directory it cannot read the mark of is not proven cowshed's.
+fn made_by_cowshed(directory: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(directory.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: the path and name are NUL-terminated and live across the call; a null buffer of
+    // size zero asks only for the value's length.
+    #[cfg(target_os = "macos")]
+    let length = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            MADE_BY_COWSHED.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "macos"))]
+    let length = unsafe {
+        libc::lgetxattr(
+            path.as_ptr(),
+            MADE_BY_COWSHED.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    length >= 0
+}
+
 /// The real parent directory of `relative` inside `checkout`, created where missing, and its
 /// file name. No component between the checkout and the parent may be a symlink: a link planted
-/// there would aim the rename and the removal at a directory outside the checkout.
+/// there would aim the rename and the removal at a directory outside the checkout. Each directory
+/// it creates carries the mark [`made_by_cowshed`] reads, set before anything else can enter it.
 pub(crate) fn contained_parent<'a>(
     checkout: &Path,
     relative: &'a Path,
@@ -513,7 +594,10 @@ pub(crate) fn contained_parent<'a>(
                     format!("{} is not a real directory", parent.display()),
                 ));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&parent)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&parent)?;
+                mark_made(&parent)?;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -838,10 +922,11 @@ mod tests {
         assert!(point(&checkout, &scratch.volume("volume-a")).is_err());
     }
 
-    /// A removed package's cache leaves the checkout by its exact link alone: the package's
-    /// directories that link leaves empty go with it, the package's own included and none above
-    /// it, and the volume keeps what it held. A package directory holding anything else stays, and
-    /// a link aimed elsewhere or a real directory at the path is left as it is.
+    /// A removed package's cache leaves the checkout by its exact link alone, with only the
+    /// directories cowshed made for that link that it leaves empty: up to the package's own and
+    /// none above it, while a directory that stood before the link, the package's own included,
+    /// stays though empty. The volume keeps what it held. A directory holding anything else stays,
+    /// and a link aimed elsewhere or a real directory at the path is left as it is.
     #[test]
     fn unlinking_a_removed_package_s_cache_takes_only_its_exact_link_and_what_it_emptied() {
         let scratch = Scratch::new("removed-package");
@@ -863,9 +948,18 @@ mod tests {
         let partial = removed("packages/partial/.cache/lmao", "packages/partial");
         let foreign = removed("packages/foreign/.cache/lmao", "packages/foreign");
         let real = removed("packages/real/node_modules/.cache", "packages/real");
-        let mut linked: Vec<BuildStatePath> =
-            gone.iter().map(|cache| cache.state.clone()).collect();
+        let own = [
+            removed("packages/own/node_modules/.cache", "packages/own"),
+            removed("packages/own/.cache/lmao", "packages/own"),
+        ];
+        let mut linked: Vec<BuildStatePath> = gone
+            .iter()
+            .chain(&own)
+            .map(|cache| cache.state.clone())
+            .collect();
         linked.push(partial.state.clone());
+        // The package and its install tree stand before any link: a checkout and an install made them.
+        fs::create_dir_all(checkout.join("packages/own/node_modules")).unwrap();
         link_paths(&checkout, &volume, &linked).unwrap();
         for state in &linked {
             fs::write(
@@ -886,16 +980,32 @@ mod tests {
         )
         .unwrap();
         let mut caches = gone.to_vec();
+        caches.extend(own.iter().cloned());
         caches.extend([partial, foreign, real]);
         assert_eq!(
             unlink_removed(&checkout, &caches).unwrap(),
             [
                 PathBuf::from("packages/gone/node_modules/.cache"),
                 PathBuf::from("packages/gone/.cache/lmao"),
+                PathBuf::from("packages/own/node_modules/.cache"),
+                PathBuf::from("packages/own/.cache/lmao"),
                 PathBuf::from("packages/partial/.cache/lmao"),
             ]
         );
-        assert!(!checkout.join("packages/gone").exists());
+        assert!(
+            !checkout.join("packages/gone").exists(),
+            "cowshed made all of it"
+        );
+        assert!(
+            !checkout.join("packages/own/.cache").exists(),
+            "cowshed made it"
+        );
+        for stood in ["packages/own", "packages/own/node_modules"] {
+            assert!(
+                checkout.join(stood).is_dir(),
+                "{stood} stood before its link"
+            );
+        }
         assert!(
             checkout.join("packages/empty").is_dir(),
             "above the package's directory"
