@@ -3277,6 +3277,7 @@ mod tests {
         let root = scratch("lifecycle-lease");
         let sessions = root.join("store/acme/widget/sessions");
         fs::create_dir_all(&sessions).unwrap();
+        crate::storage::bootstrap::write_owner_marker(&root.join("store/acme")).unwrap();
         let database = root.join("T-v3.db");
         fs::write(&database, b"").unwrap();
         let hold = || {
@@ -3367,6 +3368,7 @@ mod tests {
                 .join(project)
                 .join(crate::repository::SESSIONS_DIRECTORY);
             fs::create_dir_all(&sessions).unwrap();
+            crate::storage::bootstrap::write_owner_marker(&store.join("acme")).unwrap();
             let path = sessions.join(name);
             let holder = crate::lease_holder::Process::this().unwrap();
             fs::write(&path, serde_json::to_vec(&holder).unwrap()).unwrap();
