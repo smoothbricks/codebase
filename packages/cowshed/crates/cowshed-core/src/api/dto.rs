@@ -3493,6 +3493,12 @@ pub struct AdoptOptions {
     /// that only grew, so only an APFS store has it: a ZFS or plain-directory store, which frees
     /// space as files are deleted, refuses it as [`SubstrateOperation::ReAdopt`].
     pub re_adopt: bool,
+    /// What the adopted project is kept on. Omitted, it is the host's default: APFS images on
+    /// macOS, and on Linux the one substrate the store is. A value the host does not keep a
+    /// project on, or another than an already adopted project has, is refused as a usage error
+    /// before anything changes; an adoption never moves a project between substrates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<StoreSubstrate>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -3532,8 +3538,9 @@ pub struct AttachOptions {
     pub aggregate: bool,
 }
 
-/// What a store keeps each workspace and build volume as (09_substrates.md). One store has one
-/// substrate, chosen when `cowshed setup` made it.
+/// What a project's workspaces and build volumes are kept as (09_substrates.md). A Linux store
+/// is one substrate and keeps every project on it; a macOS store keeps each project on APFS
+/// images or on ZFS datasets, as its adoption chose (`AdoptOptions::filesystem`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StoreSubstrate {

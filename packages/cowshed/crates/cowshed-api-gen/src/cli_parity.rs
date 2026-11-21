@@ -153,6 +153,7 @@ pub const PARITY: &[Row] = &[
     row("adopt", "", field(&[("coordinator.adopt", "")], &[member("Coordinator.adopt")])),
     row("adopt", "path", field(&[("coordinator.adopt", "options.path")], &[argument("Coordinator.adopt", 0, "path")])),
     row("adopt", "capacity", field(&[("coordinator.adopt", "options.capacity")], &[argument("Coordinator.adopt", 0, "capacity")])),
+    row("adopt", "filesystem", field(&[("coordinator.adopt", "options.filesystem")], &[argument("Coordinator.adopt", 0, "filesystem")])),
     row("adopt", "repo-id", field(&[("coordinator.adopt", "options.repoId")], &[argument("Coordinator.adopt", 0, "repoId")])),
     row("adopt", "quarantine", field(&[("coordinator.adopt", "options.quarantine")], &[argument("Coordinator.adopt", 0, "quarantine")])),
     row("adopt", "re-adopt", field(&[("coordinator.adopt", "options.reAdopt")], &[argument("Coordinator.adopt", 0, "reAdopt")])),

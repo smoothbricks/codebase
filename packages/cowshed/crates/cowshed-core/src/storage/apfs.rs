@@ -467,11 +467,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// Whether this host's workspaces are image files attached as kernel devices: a label, a
     /// device and an extent map. A directory host has none of them, whatever its store, so the
     /// executor and the runtime skip the steps that exist for images (volume labels, extent
-    /// proofs, seed compaction). What a host's payloads can do beyond that is its
-    /// [`Self::substrate`]'s to say (`StoreSubstrate::supports`, `has_volumes`), and an
-    /// operation a host is asked for without having it is refused with
-    /// [`ApfsStorageError::Unsupported`].
-    const HAS_PHYSICAL_VOLUMES: bool = true;
+    /// proofs, seed compaction). Asked of the host, never of its type: a platform whose native
+    /// host serves images for one project and datasets for another answers per project. What a
+    /// host's payloads can do beyond that is its [`Self::substrate`]'s to say
+    /// (`StoreSubstrate::supports`, `has_volumes`), and an operation a host is asked for without
+    /// having it is refused with [`ApfsStorageError::Unsupported`].
+    fn has_physical_volumes(&self) -> bool {
+        true
+    }
     /// What this host keeps a payload as. The image host answers APFS; a directory host answers
     /// from the store it was built over, where a ZFS dataset is a volume with a capacity and
     /// block statistics and a plain directory is not.
@@ -3148,7 +3151,7 @@ fn stage_captured_clone<H: ApfsExecutionHost>(
     // here: its first mutation, whatever and wherever it is, makes APFS copy the whole extent list
     // it shares with its source, and that copy lands where the clone is first written, never under
     // its source's image lock.
-    if H::HAS_PHYSICAL_VOLUMES && !resuming {
+    if host.has_physical_volumes() && !resuming {
         let proven = timed_apfs_step("canonical", "extent-proof", || {
             host.require_forkable_image(canonical_image, None)
                 .map_err(|error| {
@@ -3166,7 +3169,7 @@ fn stage_captured_clone<H: ApfsExecutionHost>(
             );
         }
     }
-    if resuming && H::HAS_PHYSICAL_VOLUMES {
+    if resuming && host.has_physical_volumes() {
         // A crash-left payload is not a retained proof of its current write generation.
         host.require_forkable_image(canonical_image, None)
             .map_err(|error| {
@@ -3355,7 +3358,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
             )
         })
     })?;
-    if H::HAS_PHYSICAL_VOLUMES {
+    if host.has_physical_volumes() {
         timed_apfs_step("canonical", "publication-extent-proof", || {
             host.require_forkable_image(&image, Some(&stage.mount_point)).map_err(|error| {
                 ApfsStorageError::Host(format!(

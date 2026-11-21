@@ -176,6 +176,7 @@ On the receiving side, `cowshed ls` sees the dataset immediately (there is no da
 
 ## ZFS on macOS?
 
-If you run OpenZFS on OS X, the zfs substrate works there too — cowshed only cares that `zfs` answers. But it is never
-the default on macOS: o3x is a kernel extension, which on Apple Silicon means reduced-security boot policy, and cowshed
+If you run OpenZFS on OS X, the zfs substrate works there too, one project at a time: `cowshed adopt --filesystem zfs`
+keeps that project on datasets of your cowshed root, beside the APFS projects in the same store. But it is never the
+default on macOS: o3x is a kernel extension, which on Apple Silicon means reduced-security boot policy, and cowshed
 won't steer your daily driver there. APFS images remain the blessed macOS substrate; ZFS is the blessed Linux one.

@@ -14,5 +14,10 @@ pub(super) fn project_facts(
     layout: &StorageLayout,
     repo: &RepoId,
 ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
-    recorded_facts(&native_host(config.clone())?, config, layout, repo)
+    recorded_facts(
+        &native_host(config.clone(), repo, None)?,
+        config,
+        layout,
+        repo,
+    )
 }

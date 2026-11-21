@@ -333,7 +333,9 @@ mod native {
     use crate::runtime::supervisor_socket;
     use crate::runtime::{NativeHost, native_host};
     use crate::storage::StorageLayout;
-    use crate::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
+    use crate::storage::apfs::{
+        ApfsExecutionHost as _, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+    };
     use crate::storage::bootstrap::ValidatedHostStorage;
     use crate::storage::lifecycle::{
         LifecycleWorkspace, MountState, Substrate as _, dispatch_blocking,
@@ -533,7 +535,8 @@ mod native {
         Ok((projects, candidates, attached))
     }
 
-    /// One project's attached workspaces.
+    /// One project's attached workspaces. A project whose workspaces are not images (a ZFS
+    /// dataset project) offers none: they register no IOMedia, so detaching one frees no room.
     async fn list_project(
         storage: &ValidatedHostStorage,
         repo: &AdoptedProject,
@@ -544,10 +547,20 @@ mod native {
         let config = ApfsSubstrateConfig::for_storage(storage, &repo.project_root);
         let substrate = ApfsSubstrate::new(
             config.clone(),
-            native_host(config.clone()).map_err(|error| text(&error))?,
+            native_host(config.clone(), &repo.repo_id, None).map_err(|error| text(&error))?,
         );
         let layout =
             StorageLayout::new(storage.store(), &repo.repo_id).map_err(|error| text(&error))?;
+        if !substrate.host().has_physical_volumes() {
+            return Ok((
+                Project {
+                    repo: repo.clone(),
+                    sessions: layout.project().sessions.clone(),
+                    substrate,
+                },
+                Vec::new(),
+            ));
+        }
         let builds = BuildVolumeLayout::new(layout.project()).map_err(|error| text(&error))?;
         let derived = substrate
             .list(&repo.repo_id)

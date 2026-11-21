@@ -151,6 +151,13 @@ export type AdoptOptions = {
    * space as files are deleted, refuses it as [`SubstrateOperation::ReAdopt`].
    */
   readonly reAdopt?: boolean;
+  /**
+   * What the adopted project is kept on. Omitted, it is the host's default: APFS images on
+   * macOS, and on Linux the one substrate the store is. A value the host does not keep a
+   * project on, or another than an already adopted project has, is refused as a usage error
+   * before anything changes; an adoption never moves a project between substrates.
+   */
+  readonly filesystem?: StoreSubstrate;
 };
 
 export type AdoptRequest = {
@@ -3389,8 +3396,9 @@ export type StorageIoTotals = {
 };
 
 /**
- * What a store keeps each workspace and build volume as (09_substrates.md). One store has one
- * substrate, chosen when `cowshed setup` made it.
+ * What a project's workspaces and build volumes are kept as (09_substrates.md). A Linux store
+ * is one substrate and keeps every project on it; a macOS store keeps each project on APFS
+ * images or on ZFS datasets, as its adoption chose (`AdoptOptions::filesystem`).
  */
 export type StoreSubstrate = 'apfs' | 'zfs' | 'directory';
 

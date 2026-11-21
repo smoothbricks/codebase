@@ -54,7 +54,7 @@ pub use project::{
     ProjectRuntime, ProjectRuntimeHost, ProjectSnapshots, RecoveryScope, RuntimeLogChunk,
     SEED_COMPACTION_VERB, WorkspaceSnapshot,
 };
-pub use storage_host::{NativeHost, native_host};
+pub use storage_host::{NativeHost, native_host, require_platform_filesystem};
 pub use supervisor::{
     CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk, SessionSnapshot,
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,

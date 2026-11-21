@@ -1,6 +1,9 @@
-//! macOS's reading of one project's native store: APFS volumes, whose mounts the kernel mount
-//! table reports. One reading of that table serves the whole pass, so the ambiguity check and
-//! the mount facts it guards judge the same mounts.
+//! macOS's reading of one project's native store. An image project's workspaces are APFS
+//! volumes, whose mounts the kernel mount table reports: one reading of that table serves the
+//! whole pass, so the ambiguity check and the mount facts it guards judge the same mounts. A
+//! dataset project's are read as Linux reads them (`linux.rs`): the dataset host's own records,
+//! where a mounted payload's mount fact is the mount record at its image path, proven by the
+//! marker in the tree the record names. No image attachment is asked of the kernel for it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -8,13 +11,14 @@ use std::path::PathBuf;
 use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::mounts::KernelMountSnapshot;
 
-use super::{GatewayInventoryError, ProjectInventoryFacts, expected_mount_paths};
+use super::{GatewayInventoryError, ProjectInventoryFacts, expected_mount_paths, recorded_facts};
 use crate::repository::RepoId;
 use crate::storage::StorageLayout;
 use crate::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig};
+use crate::storage::directory::DirectoryExecutionHost;
 
 #[derive(Clone)]
 struct CapturedKernelMountSource {
@@ -27,13 +31,18 @@ impl KernelMountSource for CapturedKernelMountSource {
     }
 }
 
-/// The storage and mount facts of `repo`, whose checkout `config` names, from one reading of the
-/// kernel mount table.
+/// The storage and mount facts of `repo`, whose checkout `config` names: a dataset project's
+/// from its host's records, an image project's from one reading of the kernel mount table.
+/// Which the project is, is asked as [`crate::runtime::native_host`] asks it, before any image
+/// host is built.
 pub(super) fn project_facts(
     config: &ApfsSubstrateConfig,
     layout: &StorageLayout,
     repo: &RepoId,
 ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
+    if let Some(datasets) = DirectoryExecutionHost::for_datasets(config.clone(), repo, None)? {
+        return recorded_facts(&datasets, config, layout, repo);
+    }
     let captured = SystemKernelMountSource.mounts()?;
     let host = MacOsApfsExecutionHost::with_mount_source(
         SystemCommandRunner::new(config.namespace),

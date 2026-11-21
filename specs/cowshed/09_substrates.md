@@ -164,18 +164,32 @@ never derives that container from the project root because an adopted root is it
 an unadopted source may live on another filesystem. The project path is still validated lexically and supplies
 repository identity/copy input, not host-volume authority.
 
-On Linux a host has one store, and a store that is published decides the substrate by what answers at
-`/private/cowshed/store`: a dataset named `<parent>/cowshed/store` mounted there selects ZFS with that root, and a
-directory there carrying a directory-store marker selects the directory store. Only a host with no store yet selects
-from an anchor: the project root for an opening, the home for `cowshed setup`. An explicit `.cowshed.toml`
-`[substrate] kind = "zfs"` and `parent = "<parent>"` names the root's parent, the pool or any dataset in it, and wins;
-an opening reads its project's file, and setup reads the nearest one at or above the directory it runs in. Without a
-declaration, an anchor on ZFS selects the nearest of its dataset and that dataset's ancestors whose `cowshed` child
-carries the caller's `cowshed:owner` set locally, read by exact name; every other anchor selects the directory store.
-cowshed never scans pools or silently picks one. A declaration that names another parent than the published store's, or
-any declaration on a host whose store is a directory store, is refused naming both. The root `<parent>/cowshed` exists
-before setup runs: whoever administers `<parent>` creates it and sets its owner ("Privileged helper"), and setup refuses
-a root that is absent with that command. `cowshed doctor` prints the selected substrate, root, and evidence.
+The macOS store is always that APFS volume, and a macOS host serves two substrates side by side, one per project: APFS
+images and ZFS datasets. A project's substrate is chosen once, by its adoption: `cowshed adopt` keeps the project on
+APFS images, and `cowshed adopt --filesystem zfs` keeps it on datasets below the one cowshed root whose `cowshed:owner`
+names the caller, refused when no root or more than one does. Nothing records the choice. The project's entry for main
+in the store, `<store>/<owner>/<repo>/main.dmg`, is the fact every later opening reads: a regular file is a disk image
+and the project is an APFS project; any other entry is a dataset project's mount record or home directory, and the
+dataset mounted where it says, or the one whose `mountpoint` names that place when nothing is mounted there, names the
+root. Each execution host is built from that fact for its one project, so the gateway's inventory and heal,
+`mount main`, store-wide attach and detach, and a project controller all serve an APFS project through the image host
+and a dataset project through the directory host, as Linux serves one. A dataset project attaches no image: it registers
+no IOMedia, takes no part in making room for an attach (02_workspaces.md), and is refused the image-only operations by
+the substrate table (07_api.md, "Substrates"). `directory` is not a project substrate on macOS.
+
+On Linux a host has one store, every project in it is kept on the store's substrate, and `adopt --filesystem` accepts
+only that substrate. A store that is published decides the substrate by what answers at `/private/cowshed/store`: a
+dataset named `<parent>/cowshed/store` mounted there selects ZFS with that root, and a directory there carrying a
+directory-store marker selects the directory store. Only a host with no store yet selects from an anchor: the project
+root for an opening, the home for `cowshed setup`. An explicit `.cowshed.toml` `[substrate] kind = "zfs"` and
+`parent = "<parent>"` names the root's parent, the pool or any dataset in it, and wins; an opening reads its project's
+file, and setup reads the nearest one at or above the directory it runs in. Without a declaration, an anchor on ZFS
+selects the nearest of its dataset and that dataset's ancestors whose `cowshed` child carries the caller's
+`cowshed:owner` set locally, read by exact name; every other anchor selects the directory store. cowshed never scans
+pools or silently picks one. A declaration that names another parent than the published store's, or any declaration on a
+host whose store is a directory store, is refused naming both. The root `<parent>/cowshed` exists before setup runs:
+whoever administers `<parent>` creates it and sets its owner ("Privileged helper"), and setup refuses a root that is
+absent with that command. `cowshed doctor` prints the selected substrate, root, and evidence.
 
 ## APFS image substrate (reference)
 
@@ -445,10 +459,10 @@ mounted, never creating one, until its retirement destroys it (03_caches.md, "Wi
 ### macOS ZFS, btrfs
 
 OpenZFS on macOS (o3x) is a kext requiring reduced-security boot on Apple silicon; cowshed supports the ZFS substrate
-there when the pool already exists but never selects it by default — APFS images remain the macOS path. btrfs occupies
-the third implementation slot when needed: subvolume snapshot + clone maps one-to-one onto the trait, its clones are
-independent (no origin rule), and reflink crosses subvolumes natively; it is listed only to show the trait is not
-ZFS-shaped.
+there when the pool and its cowshed root already exist but never selects it by default — APFS images remain the macOS
+path, and a project is kept on datasets only when its adoption names them (selection, above). btrfs occupies the third
+implementation slot when needed: subvolume snapshot + clone maps one-to-one onto the trait, its clones are independent
+(no origin rule), and reflink crosses subvolumes natively; it is listed only to show the trait is not ZFS-shaped.
 
 ## Tradeoffs
 

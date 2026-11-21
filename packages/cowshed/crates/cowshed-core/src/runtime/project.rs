@@ -867,14 +867,19 @@ struct RuntimeServices {
 }
 
 impl ProjectRuntime {
-    /// Opens the production runtime with foreground provisioning authority.
+    /// Opens the production runtime with foreground provisioning authority. `filesystem` is what
+    /// the adoption asks its project be kept on (`AdoptOptions::filesystem`): the host of a
+    /// project with no main yet is built for it, and the adoption itself refuses a value the
+    /// host does not serve or the project does not have.
     ///
     /// Only the parsed `cowshed adopt` command may call this entrypoint.
     pub async fn open_for_adopt(
         project_root: impl AsRef<Path>,
         requested_repo_id: Option<RepoId>,
+        filesystem: Option<crate::api::dto::StoreSubstrate>,
         gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
+        super::storage_host::require_platform_filesystem(filesystem)?;
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
@@ -887,6 +892,7 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
+            filesystem,
         )
         .await
     }
@@ -914,6 +920,7 @@ impl ProjectRuntime {
             },
             BindingRemoteValidation::Strict,
             scope,
+            None,
             None,
         )
         .await
@@ -956,6 +963,7 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
+            None,
         )
         .await
     }
@@ -981,6 +989,7 @@ impl ProjectRuntime {
             },
             BindingRemoteValidation::ForIdentityChange,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+            None,
             None,
         )
         .await
@@ -1008,6 +1017,7 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
+            None,
         )
         .await
     }
@@ -1032,6 +1042,7 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             Some(storage),
+            None,
         )
         .await
     }
@@ -1055,6 +1066,7 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             scope,
             Some(storage),
+            None,
         )
         .await
     }
@@ -1118,12 +1130,21 @@ impl ProjectRuntime {
             BindingRemoteValidation::Strict,
             scope,
             Some(storage),
-            crate::storage::directory::DirectoryExecutionHost::new,
+            crate::gateway_inventory::GatewayStoreBackend::Directory,
+            None,
+            |config, _repo, _adopting| {
+                crate::storage::directory::DirectoryExecutionHost::new(config)
+            },
         )
         .await?;
         Self::start(host).await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one native project open: root, bootstrap mode, repository, runtime services, \
+                  validation, recovery scope, supplied storage and the filesystem an adoption names"
+    )]
     async fn open_native(
         project_root: &Path,
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
@@ -1132,6 +1153,7 @@ impl ProjectRuntime {
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+        adopting: Option<crate::api::dto::StoreSubstrate>,
     ) -> Result<Self> {
         let host = NativeProjectRuntimeHost::open(
             project_root,
@@ -1141,6 +1163,8 @@ impl ProjectRuntime {
             validation,
             recovery_scope,
             storage,
+            crate::gateway_inventory::GatewayStoreBackend::Native,
+            adopting,
             super::storage_host::native_host,
         )
         .await?;
@@ -3014,12 +3038,16 @@ fn exec_request(
 #[path = "project_re_adopt.rs"]
 mod re_adopt;
 
-/// The runtime host over this host's native storage: the APFS image host on macOS, the
-/// directory host on Linux.
+/// The runtime host over this host's native storage: on macOS the APFS image host or the
+/// dataset host, whichever the project keeps its workspaces on; the directory host on Linux.
 type NativeProjectRuntimeHost = StorageProjectRuntimeHost<super::storage_host::NativeHost>;
 
+/// Builds the execution host of the project a repository id names in the store a config names,
+/// for the filesystem an adoption of it names: `None` from every opening but an adoption's.
 type StorageHostFactory<H> = fn(
     crate::storage::apfs::ApfsSubstrateConfig,
+    &RepoId,
+    Option<crate::api::dto::StoreSubstrate>,
 ) -> std::result::Result<H, crate::storage::apfs::ApfsStorageError>;
 
 struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
@@ -4098,7 +4126,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     #[allow(
         clippy::too_many_arguments,
         reason = "one project open: root, bootstrap mode, repository, runtime services, validation, \
-                  recovery scope, supplied storage and the backend constructor"
+                  recovery scope, supplied storage, the store's gateway inventory backend and the \
+                  backend constructor"
     )]
     async fn open(
         project_root: &Path,
@@ -4108,6 +4137,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
         supplied_storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
+        gateway_backend: crate::gateway_inventory::GatewayStoreBackend,
+        adopting: Option<crate::api::dto::StoreSubstrate>,
         host_factory: StorageHostFactory<H>,
     ) -> Result<Self> {
         use cowshed_os::timing::spanned;
@@ -4153,13 +4184,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         };
         let storage = host_storage(&git_root, bootstrap_mode, supplied_storage).await?;
         let gateway_control = gateway_factory(&storage)?;
+        // The store's backend is the opener's to name, never this project's host's: a native
+        // store's inventory asks each project's host what that project is kept on.
         let gateway_inventory = crate::gateway_sessions::NativeSessionInventory::with_backend(
             storage.clone(),
-            if H::HAS_PHYSICAL_VOLUMES {
-                crate::gateway_inventory::GatewayStoreBackend::Native
-            } else {
-                crate::gateway_inventory::GatewayStoreBackend::Directory
-            },
+            gateway_backend,
         );
         let home = storage.home().to_path_buf();
         let program_directories = storage.program_directories().to_vec();
@@ -4335,7 +4364,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             })?;
         }
         let config = crate::storage::apfs::ApfsSubstrateConfig::for_storage(&storage, &git_root);
-        let host = host_factory(config.clone()).map_err(native_storage_error)?;
+        let host =
+            host_factory(config.clone(), &repo_id, adopting).map_err(native_storage_error)?;
         let lifecycle_intents_path = layout
             .project()
             .project_root
@@ -4451,11 +4481,17 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         drop(recovery_span);
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
+        let retired_images = host.has_physical_volumes();
         let retired = spanned(
             "open",
             "retired",
             crate::storage::lifecycle::dispatch_blocking(move || {
-                retired_refs::<H>(&retired_project_root, &retired_repo, retired_names.as_ref())
+                retired_refs(
+                    &retired_project_root,
+                    &retired_repo,
+                    retired_names.as_ref(),
+                    retired_images,
+                )
             }),
         )
         .await
@@ -6621,7 +6657,7 @@ self.finish_retire_intent(&workspace).await?;
         let started = std::time::Instant::now();
         self.validate_binding().await?;
         let volumes = self.build_volumes()?;
-        if !H::HAS_PHYSICAL_VOLUMES {
+        if !self.substrate.host().has_physical_volumes() {
             return Ok(SeedCompactionReport::NoSeed);
         }
         let Some(turn) = volumes.try_compaction_turn()? else {
@@ -7491,7 +7527,8 @@ self.finish_retire_intent(&workspace).await?;
     /// path.
     fn rebind_checkout(&mut self, checkout_path: &Path) -> Result<()> {
         let config = self.substrate_config.rebind_checkout(checkout_path);
-        self.rebind_substrate(config)?;
+        let repo = self.descriptor.repo_id.clone();
+        self.rebind_substrate(config, &repo)?;
         self.descriptor.git_root = std::sync::Arc::from(checkout_path);
         self.git = crate::git::GitRepository::from_root(self.git.store_root(), checkout_path);
         Ok(())
@@ -7515,7 +7552,7 @@ self.finish_retire_intent(&workspace).await?;
         // directory, which the namespace move has already put in place. Rebuilding the triple is
         // still required, because the layout the host derives paths from has changed.
         let config = self.substrate_config.clone();
-        self.rebind_substrate(config)?;
+        self.rebind_substrate(config, &repo_id)?;
         self.layout = layout;
         self.descriptor.repo_id = repo_id;
         self.descriptor.binding = std::sync::Arc::new(binding);
@@ -7529,12 +7566,15 @@ self.finish_retire_intent(&workspace).await?;
     }
 
     /// The one place the config, the execution host and the substrate are swapped together. Every
-    /// rebind goes through here so no caller can leave the three disagreeing.
+    /// rebind goes through here so no caller can leave the three disagreeing. `repo` is the
+    /// identity the project answers to once the rebind is done.
     fn rebind_substrate(
         &mut self,
         config: crate::storage::apfs::ApfsSubstrateConfig,
+        repo: &RepoId,
     ) -> Result<()> {
-        let host = (self.host_factory)(config.clone()).map_err(native_storage_error)?;
+        // A rebound project has its main: the store says what it is kept on.
+        let host = (self.host_factory)(config.clone(), repo, None).map_err(native_storage_error)?;
         self.substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         self.substrate_config = config;
         Ok(())
@@ -10553,7 +10593,7 @@ self.finish_retire_intent(&workspace).await?;
             telemetry_root: Some(self.telemetry_root.clone()),
             // Filled from the lost predecessor's ledger once this process holds the socket.
             inherited_groups: Vec::new(),
-            volume_labels: if H::HAS_PHYSICAL_VOLUMES {
+            volume_labels: if self.substrate.host().has_physical_volumes() {
                 Some(super::supervisor::VolumeLabels {
                     workspace_image: self
                         .layout
@@ -10859,6 +10899,44 @@ self.finish_retire_intent(&workspace).await?;
                 operation,
             },
         ))
+    }
+
+    /// Refuse an adoption naming a filesystem the host does not keep a project on, or another
+    /// than this project has, before the adoption changes anything (06_cli.md, `adopt`). A
+    /// project is kept on what its main is in the store, which this controller's host was built
+    /// from; one with no main yet is kept on what its opening asked the host for, so an adoption
+    /// naming another filesystem than its opening did is refused too.
+    fn require_adopt_filesystem(
+        &self,
+        requested: Option<crate::api::dto::StoreSubstrate>,
+    ) -> Result<()> {
+        if requested.is_none() {
+            return Ok(());
+        }
+        let host = self.substrate.host();
+        let keeps = host.substrate();
+        let main = self.layout.main_image().map_err(native_integrity_error)?;
+        let existing = match std::fs::symlink_metadata(main.image()) {
+            Ok(_) => Some(keeps),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!("cannot inspect main at {}: {error}", main.image().display()),
+                    "cowshed doctor --json",
+                ));
+            }
+        };
+        let adopts = host
+            .adopt_filesystems()
+            .adopt(existing, requested)
+            .map_err(super::storage_host::AdoptFilesystemRefusal::into_error)?;
+        if adopts != keeps {
+            return Err(CowshedError::usage(
+                format!("this project was opened to be adopted onto {keeps}, not {adopts}"),
+                format!("cowshed adopt --filesystem {adopts}"),
+            ));
+        }
+        Ok(())
     }
 
     /// The ledger of the process groups `workspace`'s supervisor runs, and of the groups a lost
@@ -14722,13 +14800,23 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.snapshot(&current)
     }
 
-    async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)> {
+    async fn re_adopt(
+        &mut self,
+        mut options: AdoptOptions,
+    ) -> Result<(WorkspaceSnapshot, ReAdoption)> {
+        // The store, never a journal, says what a project is kept on: the named filesystem is
+        // checked here and recorded nowhere.
+        self.require_adopt_filesystem(options.filesystem.take())?;
         self.require_substrate_operation(crate::api::dto::SubstrateOperation::ReAdopt)?;
         self.re_adopt_main(options).await
     }
 
-    async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
+    async fn adopt(&mut self, mut options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::LifecyclePlanner;
+        // The store, never a journal, says what a project is kept on: the named filesystem is
+        // checked here and recorded nowhere, so an adoption repeated with or without it finds
+        // the intent it journaled.
+        self.require_adopt_filesystem(options.filesystem.take())?;
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         if options.re_adopt {
             return Err(CowshedError::internal(
@@ -16109,7 +16197,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .map_err(native_integrity_error)?
             .image()
             .to_owned();
-        if H::HAS_PHYSICAL_VOLUMES {
+        if self.substrate.host().has_physical_volumes() {
             let named = self
                 .substrate
                 .host()
@@ -16131,7 +16219,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     async fn make_media_room(&mut self, demand: crate::media_room::AttachDemand) {
         use crate::media_room::{Demand, Keep, make_room};
-        if !H::HAS_PHYSICAL_VOLUMES || (demand.fresh == 0 && demand.workspaces.is_empty()) {
+        if !self.substrate.host().has_physical_volumes()
+            || (demand.fresh == 0 && demand.workspaces.is_empty())
+        {
             return;
         }
         // A named workspace mounted at its path attaches nothing. The mount table is one
@@ -18071,7 +18161,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         match crate::doctor::probe("pending-publication", self.pending_metadata()).await {
             Ok(pending) => {
                 for (image, metadata) in pending {
-                    if H::HAS_PHYSICAL_VOLUMES && !metadata.workspace.is_main() {
+                    if self.substrate.host().has_physical_volumes() && !metadata.workspace.is_main()
+                    {
                         pending_extent_images.push((metadata.workspace.clone(), image.clone()));
                     }
                     let (message, hint) = if abandoned.contains(&image) {
@@ -18634,7 +18725,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .collect::<Vec<_>>();
         // Explicit diagnostics count every physical source and build seed; the fork admission
         // walk is separately capped at 7141 and never substitutes a source-only estimate.
-        if H::HAS_PHYSICAL_VOLUMES {
+        if self.substrate.host().has_physical_volumes() {
             let mut images = companion_images
                 .iter()
                 .map(|(name, image)| {
@@ -24362,10 +24453,14 @@ struct RetiredTrash {
     recorded: Vec<crate::storage::lifecycle::RetiredRef>,
 }
 
-fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
+/// The retired workspaces recorded in `project_root`'s trash. `image_files` is whether the
+/// project's host keeps a payload as an image file (`ApfsExecutionHost::has_physical_volumes`)
+/// or as a directory: an entry of the other kind is not this host's and is refused.
+fn retired_refs(
     project_root: &Path,
     repo_id: &RepoId,
     workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
+    image_files: bool,
 ) -> Result<RetiredTrash> {
     use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
@@ -24420,12 +24515,12 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
                 "cowshed doctor --json",
             )
         })?;
-        let expected_type = if H::HAS_PHYSICAL_VOLUMES {
+        let expected_type = if image_files {
             "regular file"
         } else {
             "directory"
         };
-        let matches_backend = if H::HAS_PHYSICAL_VOLUMES {
+        let matches_backend = if image_files {
             file_type.is_file()
         } else {
             file_type.is_dir()
@@ -24555,11 +24650,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = retired_refs::<
-            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id, None)
-        .unwrap()
-        .recorded;
+        let retired = retired_refs(&project_root, &repo_id, None, true)
+            .unwrap()
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -24612,11 +24705,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .expect("retired sidecar");
 
-        let retired = retired_refs::<
-            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id, None)
-        .expect("retired pending image is recoverable from its exact trash identity")
-        .recorded;
+        let retired = retired_refs(&project_root, &repo_id, None, true)
+            .expect("retired pending image is recoverable from its exact trash identity")
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(
@@ -24631,10 +24722,8 @@ mod retired_recovery_tests {
         mismatched
             .write_for_image(&image)
             .expect("change metadata identity");
-        retired_refs::<
-            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id, None)
-        .expect_err("a mismatched workspace identity cannot authorize reclamation");
+        retired_refs(&project_root, &repo_id, None, true)
+            .expect_err("a mismatched workspace identity cannot authorize reclamation");
         mismatched.workspace = name.clone();
         mismatched
             .write_for_image(&image)
@@ -24648,11 +24737,9 @@ mod retired_recovery_tests {
         mismatched
             .write_for_image(&live)
             .expect("new canonical metadata");
-        let retired = retired_refs::<
-            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id, None)
-        .expect("new use of the name cannot invalidate old retired trash")
-        .recorded;
+        let retired = retired_refs(&project_root, &repo_id, None, true)
+            .expect("new use of the name cannot invalidate old retired trash")
+            .recorded;
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert!(live.exists(), "discovery cannot touch the new workspace");
         assert!(image.exists(), "discovery cannot delete old retired bytes");
@@ -24701,11 +24788,9 @@ mod retired_recovery_tests {
         .write_for_image(&image)
         .unwrap();
 
-        let retired = retired_refs::<
-            crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id, None)
-        .unwrap()
-        .recorded;
+        let retired = retired_refs(&project_root, &repo_id, None, true)
+            .unwrap()
+            .recorded;
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
         assert_eq!(

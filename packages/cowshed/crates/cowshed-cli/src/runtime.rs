@@ -376,6 +376,15 @@ fn runtime_open_repo_id(command: &Command) -> Result<Option<RepoId>> {
     }
 }
 
+/// The filesystem a parsed `cowshed adopt` names for its project: what the host of a project
+/// with no main yet is opened for.
+fn runtime_open_filesystem(command: &Command) -> Option<cowshed_core::api::StoreSubstrate> {
+    match command {
+        Command::Adopt(args) => args.filesystem,
+        _ => None,
+    }
+}
+
 /// The primary identity of the project an explicit `adopt --re-adopt` with no `--repo-id` replaces.
 ///
 /// The checkout's in-image marker, the controller's Active main sidecar and the owning binding must
@@ -495,10 +504,12 @@ impl ActorBridge {
     pub async fn open_for_adopt(
         project_root: &Path,
         requested_repo_id: Option<RepoId>,
+        filesystem: Option<cowshed_core::api::StoreSubstrate>,
     ) -> Result<Self> {
         let runtime = ProjectRuntime::open_for_adopt(
             project_root,
             requested_repo_id,
+            filesystem,
             gateway_service::runtime_control,
         )
         .await?;
@@ -1490,7 +1501,11 @@ pub struct DispatchExit {
 }
 
 enum AdoptionOutcome<'a> {
-    Created { capacity: &'a str },
+    Created {
+        capacity: &'a str,
+        /// What the adoption named for its project to be kept on, when it named one.
+        filesystem: Option<cowshed_core::api::StoreSubstrate>,
+    },
     Recovered,
     Replaced(&'a ReAdoption),
 }
@@ -1512,9 +1527,10 @@ where
     let gateway = service.reconcile_gateway().await;
     emit_mount(output, json, info)?;
     match outcome {
-        AdoptionOutcome::Created { capacity } => {
-            output.guidance(&platform::created_main(info, capacity))
-        }
+        AdoptionOutcome::Created {
+            capacity,
+            filesystem,
+        } => output.guidance(&platform::created_main(info, capacity, filesystem)),
         AdoptionOutcome::Recovered => output.guidance(&format!(
             "resumed recorded replacement for {} at {}",
             info.workspace,
@@ -1655,6 +1671,7 @@ where
                 .capacity
                 .clone()
                 .unwrap_or_else(|| DEFAULT_IMAGE_CAPACITY.to_string());
+            let filesystem = options.filesystem;
             let (info, re_adoption) = service.adopt(options).await?;
             // The adopted main's managed target is kept, and its sheds' go first (03_caches.md,
             // "mbx"). The adoption is done either way: a list this could not write is said, and
@@ -1683,6 +1700,7 @@ where
                 Some(re_adoption) => AdoptionOutcome::Replaced(re_adoption),
                 None => AdoptionOutcome::Created {
                     capacity: &capacity,
+                    filesystem,
                 },
             };
             report_adoption(service, &info, outcome, json, output).await
@@ -2412,6 +2430,7 @@ fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
         capacity: args.capacity.map(os_capacity).transpose()?,
         quarantine: args.quarantine,
         re_adopt: args.re_adopt,
+        filesystem: args.filesystem,
     })
 }
 
@@ -3283,7 +3302,8 @@ async fn attach_project_sessions_from_store(
     let layout = StorageLayout::new(storage.store(), &project.repo_id)
         .map_err(attach_store_storage_error)?;
     let config = ApfsSubstrateConfig::for_storage(storage, &project.project_root);
-    let host = native_host(config.clone()).map_err(attach_store_storage_error)?;
+    let host =
+        native_host(config.clone(), &project.repo_id, None).map_err(attach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
     let derived = substrate
         .list(&project.repo_id)
@@ -3473,7 +3493,8 @@ async fn detach_project_sessions_from_store(
     project: &AdoptedProject,
 ) -> Result<usize> {
     let config = ApfsSubstrateConfig::for_storage(storage, &project.project_root);
-    let host = native_host(config.clone()).map_err(detach_store_storage_error)?;
+    let host =
+        native_host(config.clone(), &project.repo_id, None).map_err(detach_store_storage_error)?;
     let substrate = ApfsSubstrate::new(config, host);
     let derived = substrate
         .list(&project.repo_id)
@@ -5412,6 +5433,9 @@ where
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
     if mode == RuntimeOpenMode::Provision {
+        // A filesystem no store of this platform serves is the caller's mistake: refused before
+        // host setup can prompt for or create anything.
+        cowshed_core::runtime::require_platform_filesystem(runtime_open_filesystem(&cli.command))?;
         let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
         let _ = prepare_adopt_host_storage(&mut setup, output).await?;
     }
@@ -5423,7 +5447,14 @@ where
         };
     let open_span = cowshed_os::timing::span("cli", "open");
     let bridge = match mode {
-        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(root, requested_repo_id).await,
+        RuntimeOpenMode::Provision => {
+            ActorBridge::open_for_adopt(
+                root,
+                requested_repo_id,
+                runtime_open_filesystem(&cli.command),
+            )
+            .await
+        }
         RuntimeOpenMode::ExistingOnly => {
             ActorBridge::open_existing(root, runtime_recovery_scope(&cli.command)?).await
         }

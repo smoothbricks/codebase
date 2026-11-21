@@ -391,9 +391,11 @@ fn recorded_facts<H: ApfsExecutionHost>(
 }
 
 /// Inventory over the host's native store, read through the platform's native execution host
-/// ([`native_host`]): APFS images on macOS, ZFS datasets or directories on Linux. How one
-/// project's mount facts are read is the platform's (`macos.rs`: one reading of the kernel
-/// mount table; `linux.rs`: the directory host's own records), selected above and nowhere else.
+/// ([`native_host`]), built per project: APFS images or ZFS datasets on macOS, whichever the
+/// project is kept on; ZFS datasets or directories on Linux. How one project's mount facts are
+/// read is the platform's (`macos.rs`: one reading of the kernel mount table for an image
+/// project, the dataset host's own records for a dataset project; `linux.rs`: the directory
+/// host's own records), selected above and nowhere else.
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeInventorySource;
 
@@ -403,15 +405,9 @@ impl InventorySource for NativeInventorySource {
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError> {
-        let config = project_substrate_config(
-            storage,
-            storage
-                .store()
-                .join("gateway")
-                .join(UNRESOLVED_CHECKOUT_PATH),
-        );
+        let config = unresolved_project_config(storage);
         // One host for the complete pass, not a mount-registry thread per captured image.
-        let host = native_host(config)?;
+        let host = native_host(config, repo, None)?;
         let published = host.list(repo)?;
         let mut records = Vec::with_capacity(published.len());
         for fact in published {
@@ -460,7 +456,7 @@ impl InventorySource for NativeInventorySource {
                 .join(UNRESOLVED_CHECKOUT_PATH)
         });
         let mount = workspace_mountpoint(&layout, &checkout, workspace)?;
-        let host = native_host(project_substrate_config(storage, checkout))?;
+        let host = native_host(project_substrate_config(storage, checkout), repo, None)?;
         Ok(host
             .workspace_snapshot(repo, workspace)?
             .map(|(derived, metadata)| (derived, metadata, mount)))
@@ -480,13 +476,7 @@ impl InventorySource for DirectoryInventorySource {
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError> {
-        let config = project_substrate_config(
-            storage,
-            storage
-                .store()
-                .join("gateway")
-                .join(UNRESOLVED_CHECKOUT_PATH),
-        );
+        let config = unresolved_project_config(storage);
         let host = DirectoryExecutionHost::new(config)?;
         let published = host.list(repo)?;
         let mut records = Vec::with_capacity(published.len());
@@ -573,6 +563,19 @@ fn project_substrate_config(
     ApfsSubstrateConfig::for_storage(storage, checkout_path)
 }
 
+/// The substrate configuration of a project read from its store records alone, with no checkout
+/// resolved: its checkout path is a placeholder below the store that nothing mounts at. What the
+/// project's records and its main in the store say needs no checkout.
+pub(crate) fn unresolved_project_config(storage: &ValidatedHostStorage) -> ApfsSubstrateConfig {
+    project_substrate_config(
+        storage,
+        storage
+            .store()
+            .join("gateway")
+            .join(UNRESOLVED_CHECKOUT_PATH),
+    )
+}
+
 /// One project's mount side, opened once and mounting nothing on its own.
 ///
 /// Separate from [`InventorySource`] because the two answer different questions — what the store
@@ -619,7 +622,9 @@ impl HealSource for NativeHealSource {
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
-        open_project_mounts(storage, repo, |config| Ok(native_host(config.clone())?))
+        open_project_mounts(storage, repo, |config| {
+            Ok(native_host(config.clone(), repo, None)?)
+        })
     }
 }
 

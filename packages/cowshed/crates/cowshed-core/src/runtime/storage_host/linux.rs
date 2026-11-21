@@ -3,7 +3,9 @@
 //! (`DirectoryExecutionHost::new` decides which from the store root itself). Its
 //! [`super::RuntimeStorageHost`] is the directory store's own (`storage/directory/runtime_host.rs`).
 
+use crate::api::dto::StoreSubstrate;
 use crate::error::{CowshedError, Result};
+use crate::repository::RepoId;
 use crate::storage::apfs::{ApfsStorageError, ApfsSubstrateConfig};
 use crate::storage::bootstrap::SelectedSubstrate;
 use crate::storage::directory::DirectoryExecutionHost;
@@ -11,9 +13,23 @@ use crate::storage::directory::DirectoryExecutionHost;
 /// The execution host a native opening runs its lifecycle on.
 pub type NativeHost = DirectoryExecutionHost;
 
-/// The directory host over the store `config` names.
+/// What a Linux store can be, and so all an adoption can be told before its host's store is
+/// read: ZFS datasets or plain directories, never APFS images. Which of the two this host
+/// serves, and so its default, is its store's to say
+/// ([`super::RuntimeStorageHost::adopt_filesystems`]).
+pub(super) const PLATFORM_FILESYSTEMS: super::AdoptFilesystems = super::AdoptFilesystems {
+    default: StoreSubstrate::Zfs,
+    others: &[StoreSubstrate::Directory],
+};
+
+/// The directory host over the store `config` names. The store root alone says what its
+/// payloads are, so neither the project `_repo` it is built for nor the filesystem an adoption
+/// names (`_adopting`) changes the host: an adoption naming another is refused by what the
+/// host serves ([`super::AdoptFilesystems`]).
 pub fn native_host(
     config: ApfsSubstrateConfig,
+    _repo: &RepoId,
+    _adopting: Option<StoreSubstrate>,
 ) -> std::result::Result<NativeHost, ApfsStorageError> {
     DirectoryExecutionHost::new(config)
 }

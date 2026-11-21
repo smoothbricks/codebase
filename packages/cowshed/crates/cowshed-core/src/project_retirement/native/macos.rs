@@ -1,5 +1,6 @@
 //! Record-driven retirement on the macOS image substrate: drain each workspace, detach and hold
-//! its image, archive the project directory.
+//! its image, archive the project directory. A project kept on ZFS datasets has no image to
+//! detach and hold, and is refused before anything is recorded.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -198,10 +199,42 @@ fn hold_detached(image: &Image) -> Result<Fenced<File>> {
     Ok(Fenced::new(file))
 }
 
+/// Refuse a project kept on ZFS datasets, before its retirement is authorized: this retirement
+/// drains and archives disk images, and archiving a dataset project's directory would rename
+/// its mount records away from datasets that stay mounted.
+async fn require_image_project(storage: &ValidatedHostStorage, repo_id: &RepoId) -> Result<()> {
+    let config = crate::gateway_inventory::unresolved_project_config(storage);
+    let asked = repo_id.clone();
+    let datasets = dispatch_blocking(move || {
+        crate::storage::directory::DirectoryExecutionHost::for_datasets(config, &asked, None)
+            .map(|host| host.is_some())
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("reading what {repo_id} is kept on: {error}")))?
+    .map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot tell what {repo_id} is kept on: {error}"),
+            "cowshed doctor --json",
+        )
+    })?;
+    if datasets {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "record-driven project retirement drains and archives disk images, and \
+                 {repo_id} is kept on ZFS datasets"
+            ),
+            "retain the project registration; cowshed unadopt, from its checkout, retires a \
+             project kept on datasets",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn forget_project(
     storage: ValidatedHostStorage,
     repo_id: RepoId,
 ) -> Result<ProjectRetirementReport> {
+    require_image_project(&storage, &repo_id).await?;
     let store = storage.store().to_owned();
     let authorize_store = store.clone();
     let authorize_repo = repo_id.clone();

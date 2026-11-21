@@ -4,12 +4,14 @@
 //! own a kernel volume: its controller never configures physical volume labels or counters.
 //!
 //! Which execution host is this host's native one is the platform's (`macos.rs`: the APFS image
-//! host; `linux.rs`: the directory host, over ZFS datasets or plain directories), selected here
-//! and nowhere else.
+//! host or the dataset host, whichever a project is kept on; `linux.rs`: the directory host,
+//! over ZFS datasets or plain directories), selected here and nowhere else. What an adoption may
+//! keep a project on is [`AdoptFilesystems`], which each host answers for itself.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::api::dto::StoreSubstrate;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
@@ -40,6 +42,114 @@ pub(crate) use platform::require_native_substrate;
 /// host a project controller runs on.
 pub use platform::{NativeHost, native_host};
 
+/// Refuse a filesystem no store of this platform keeps a project on (`directory` on macOS,
+/// `apfs` on Linux), as the usage error the adoption itself would answer. It reads nothing, so
+/// an adoption asks it before the host's storage is set up or opened; what this host's own
+/// store serves, and what an adopted project has, the adoption decides once the store stands
+/// ([`AdoptFilesystems::adopt`]).
+pub fn require_platform_filesystem(requested: Option<StoreSubstrate>) -> crate::Result<()> {
+    platform::PLATFORM_FILESYSTEMS
+        .adopt(None, requested)
+        .map(drop)
+        .map_err(AdoptFilesystemRefusal::into_error)
+}
+
+/// What a host keeps a project it adopts on (09_substrates.md, where selection is described):
+/// the filesystem an adoption naming none gets, and what else an adoption may name there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdoptFilesystems {
+    /// The platform's default, or the one filesystem the store is.
+    pub(crate) default: StoreSubstrate,
+    pub(crate) others: &'static [StoreSubstrate],
+}
+
+/// Why an adoption that names a filesystem is refused, decided before the adoption changes
+/// anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdoptFilesystemRefusal {
+    /// The host keeps no project on `requested`.
+    Unserved {
+        requested: StoreSubstrate,
+        serves: AdoptFilesystems,
+    },
+    /// The project is adopted already, on `has`: an adoption never moves it.
+    Kept {
+        requested: StoreSubstrate,
+        has: StoreSubstrate,
+    },
+}
+
+impl AdoptFilesystems {
+    /// A host whose store is one filesystem and keeps every project on it.
+    pub(crate) const fn only(substrate: StoreSubstrate) -> Self {
+        Self {
+            default: substrate,
+            others: &[],
+        }
+    }
+
+    fn serves(self, substrate: StoreSubstrate) -> bool {
+        self.default == substrate || self.others.contains(&substrate)
+    }
+
+    /// What an adoption naming `requested` keeps the project on, where `existing` is what the
+    /// project's main is kept on already and `None` for a project with no main yet. Naming none
+    /// keeps what the project has, or the default; naming what the project has changes nothing.
+    pub(crate) fn adopt(
+        self,
+        existing: Option<StoreSubstrate>,
+        requested: Option<StoreSubstrate>,
+    ) -> Result<StoreSubstrate, AdoptFilesystemRefusal> {
+        let Some(requested) = requested else {
+            return Ok(existing.unwrap_or(self.default));
+        };
+        if !self.serves(requested) {
+            return Err(AdoptFilesystemRefusal::Unserved {
+                requested,
+                serves: self,
+            });
+        }
+        match existing {
+            Some(has) if has != requested => Err(AdoptFilesystemRefusal::Kept { requested, has }),
+            Some(_) | None => Ok(requested),
+        }
+    }
+}
+
+impl AdoptFilesystemRefusal {
+    /// The usage error an adoption answers this refusal as: the value it named and what stands
+    /// against it. A named conversion, not `From`: the crate's error keeps `?` inferable by
+    /// converting from itself alone.
+    pub(crate) fn into_error(self) -> crate::CowshedError {
+        match self {
+            Self::Unserved { requested, serves } => {
+                let mut named = serves.default.to_string();
+                for other in serves.others {
+                    named.push_str(" or ");
+                    named.push_str(other.as_str());
+                }
+                crate::CowshedError::usage(
+                    format!(
+                        "this host does not keep a project on {requested}: it adopts one onto \
+                         {named}"
+                    ),
+                    "omit --filesystem, or name one this host adopts onto",
+                )
+            }
+            Self::Kept { requested, has } => crate::CowshedError::usage(
+                format!(
+                    "this project is already adopted on {has}; adopting it again does not move \
+                     it to {requested}"
+                ),
+                format!(
+                    "omit --filesystem; to keep the project on {requested}, cowshed unadopt it \
+                     and adopt it with --filesystem {requested}"
+                ),
+            ),
+        }
+    }
+}
+
 /// The controller's storage boundary, shared by native images and real directory stores.
 ///
 /// These operations preserve the lifecycle host's lock and publication authority. Physical
@@ -47,6 +157,11 @@ pub use platform::{NativeHost, native_host};
 /// never a successful disk result. The capability flag keeps optional cosmetic labels and job
 /// volume sampling out of those backends; their resource samples report unconfigured volumes.
 pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
+    /// What an adoption through this host may keep its project on. A host over one kind of
+    /// store keeps every project on that kind.
+    fn adopt_filesystems(&self) -> AdoptFilesystems {
+        AdoptFilesystems::only(self.substrate())
+    }
     /// The platform this host records in the sidecar of every workspace it publishes
     /// ([`DetachedWorkspaceMetadata::platform`]): what decides, before a workspace exists,
     /// whether its grants start with a port block (macOS) or with none (Linux).
@@ -266,4 +381,145 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         next: CompactionSource,
         keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<SeedCatchUp, ApfsStorageError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdoptFilesystemRefusal, AdoptFilesystems};
+    use crate::api::dto::StoreSubstrate::{self, Apfs, Directory, Zfs};
+
+    /// macOS: an APFS store whose projects are images unless adopted onto ZFS.
+    const MACOS: AdoptFilesystems = AdoptFilesystems {
+        default: Apfs,
+        others: &[Zfs],
+    };
+    /// Linux: the store is one filesystem.
+    const ZFS_STORE: AdoptFilesystems = AdoptFilesystems::only(Zfs);
+    const DIRECTORY_STORE: AdoptFilesystems = AdoptFilesystems::only(Directory);
+    /// Linux before its store is read: either of the two a store can be.
+    const LINUX: AdoptFilesystems = AdoptFilesystems {
+        default: Zfs,
+        others: &[Directory],
+    };
+
+    fn unserved(
+        requested: StoreSubstrate,
+        serves: AdoptFilesystems,
+    ) -> Result<StoreSubstrate, AdoptFilesystemRefusal> {
+        Err(AdoptFilesystemRefusal::Unserved { requested, serves })
+    }
+
+    fn kept(
+        requested: StoreSubstrate,
+        has: StoreSubstrate,
+    ) -> Result<StoreSubstrate, AdoptFilesystemRefusal> {
+        Err(AdoptFilesystemRefusal::Kept { requested, has })
+    }
+
+    #[test]
+    fn an_adoption_keeps_a_project_on_what_the_host_serves_and_never_moves_it() {
+        let table = [
+            // An omitted filesystem is the default, or what the project already has.
+            (MACOS, None, None, Ok(Apfs)),
+            (MACOS, Some(Apfs), None, Ok(Apfs)),
+            (MACOS, Some(Zfs), None, Ok(Zfs)),
+            (ZFS_STORE, None, None, Ok(Zfs)),
+            (ZFS_STORE, Some(Zfs), None, Ok(Zfs)),
+            (DIRECTORY_STORE, None, None, Ok(Directory)),
+            (DIRECTORY_STORE, Some(Directory), None, Ok(Directory)),
+            // A project with no main yet is kept on any filesystem the host serves.
+            (MACOS, None, Some(Apfs), Ok(Apfs)),
+            (MACOS, None, Some(Zfs), Ok(Zfs)),
+            (ZFS_STORE, None, Some(Zfs), Ok(Zfs)),
+            (DIRECTORY_STORE, None, Some(Directory), Ok(Directory)),
+            // Naming what an adopted project has changes nothing.
+            (MACOS, Some(Apfs), Some(Apfs), Ok(Apfs)),
+            (MACOS, Some(Zfs), Some(Zfs), Ok(Zfs)),
+            (ZFS_STORE, Some(Zfs), Some(Zfs), Ok(Zfs)),
+            (
+                DIRECTORY_STORE,
+                Some(Directory),
+                Some(Directory),
+                Ok(Directory),
+            ),
+            // An adopted project is never moved to another filesystem the host serves.
+            (MACOS, Some(Apfs), Some(Zfs), kept(Zfs, Apfs)),
+            (MACOS, Some(Zfs), Some(Apfs), kept(Apfs, Zfs)),
+            // A filesystem the host does not serve is refused, adopted or not.
+            (MACOS, None, Some(Directory), unserved(Directory, MACOS)),
+            (LINUX, None, Some(Apfs), unserved(Apfs, LINUX)),
+            (LINUX, None, Some(Zfs), Ok(Zfs)),
+            (LINUX, None, Some(Directory), Ok(Directory)),
+            (
+                MACOS,
+                Some(Apfs),
+                Some(Directory),
+                unserved(Directory, MACOS),
+            ),
+            (
+                MACOS,
+                Some(Zfs),
+                Some(Directory),
+                unserved(Directory, MACOS),
+            ),
+            (ZFS_STORE, None, Some(Apfs), unserved(Apfs, ZFS_STORE)),
+            (
+                ZFS_STORE,
+                None,
+                Some(Directory),
+                unserved(Directory, ZFS_STORE),
+            ),
+            (
+                ZFS_STORE,
+                Some(Zfs),
+                Some(Directory),
+                unserved(Directory, ZFS_STORE),
+            ),
+            (
+                DIRECTORY_STORE,
+                None,
+                Some(Apfs),
+                unserved(Apfs, DIRECTORY_STORE),
+            ),
+            (
+                DIRECTORY_STORE,
+                None,
+                Some(Zfs),
+                unserved(Zfs, DIRECTORY_STORE),
+            ),
+            (
+                DIRECTORY_STORE,
+                Some(Directory),
+                Some(Zfs),
+                unserved(Zfs, DIRECTORY_STORE),
+            ),
+        ];
+        for (serves, existing, requested, expected) in table {
+            assert_eq!(
+                serves.adopt(existing, requested),
+                expected,
+                "{serves:?} adopting a project on {existing:?} as {requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_a_usage_error_naming_the_value_and_what_stands() {
+        let unserved = AdoptFilesystemRefusal::Unserved {
+            requested: Directory,
+            serves: MACOS,
+        }
+        .into_error();
+        assert_eq!(unserved.code, crate::ErrorCode::Usage);
+        assert!(unserved.message.contains("on directory"), "{unserved}");
+        assert!(unserved.message.contains("apfs or zfs"), "{unserved}");
+        let kept = AdoptFilesystemRefusal::Kept {
+            requested: Apfs,
+            has: Zfs,
+        }
+        .into_error();
+        assert_eq!(kept.code, crate::ErrorCode::Usage);
+        assert!(kept.message.contains("already adopted on zfs"), "{kept}");
+        assert!(kept.message.contains("to apfs"), "{kept}");
+    }
 }

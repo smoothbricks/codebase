@@ -5,7 +5,9 @@ use cowshed_core::api::held_lock::DecimalU64;
 use cowshed_core::api::hold::KernelAddress;
 use cowshed_core::api::operations::FdHoldersRequest;
 use cowshed_core::api::server::HostRole;
-use cowshed_core::api::{ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName, RebaseResume};
+use cowshed_core::api::{
+    ExecClass, ExecScope, GrantDelta, LandMode, LandTurnName, RebaseResume, StoreSubstrate,
+};
 use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
@@ -400,6 +402,8 @@ pub struct SetupArgs {
 pub struct AdoptArgs {
     pub path: Option<PathBuf>,
     pub capacity: Option<OsString>,
+    /// What the project is kept on; `None` is the host's default.
+    pub filesystem: Option<StoreSubstrate>,
     pub repo_id: Option<OsString>,
     pub quarantine: bool,
     pub re_adopt: bool,
@@ -920,6 +924,7 @@ pub fn cli_command() -> ClapCommand {
         .args(global_args())
         .subcommand(leaf("adopt").arg(positional("path", 0..=1)).args([
             value("capacity"),
+            value("filesystem"),
             value("repo-id"),
             flag("quarantine"),
             flag("re-adopt"),
@@ -2573,9 +2578,27 @@ fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
 }
 
 fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
+    let filesystem = match os(matches, "filesystem") {
+        None => None,
+        Some(value) => Some(match value.to_str() {
+            Some("apfs") => StoreSubstrate::Apfs,
+            Some("zfs") => StoreSubstrate::Zfs,
+            Some("directory") => StoreSubstrate::Directory,
+            _ => {
+                return Err(UsageError::new(
+                    format!(
+                        "--filesystem must be apfs, zfs or directory, got `{}`",
+                        value.to_string_lossy()
+                    ),
+                    &ADOPT,
+                ));
+            }
+        }),
+    };
     Ok(Command::Adopt(AdoptArgs {
         path: os(matches, "path").map(PathBuf::from),
         capacity: os(matches, "capacity"),
+        filesystem,
         repo_id: os(matches, "repo-id"),
         quarantine: flagged(matches, "quarantine"),
         re_adopt: flagged(matches, "re-adopt"),
@@ -2599,6 +2622,10 @@ const ADOPT: CommandSpec = CommandSpec {
         Opt {
             spelling: "--capacity <size>",
             meaning: "capacity of the images this project creates (100g, 1t); `cowshed resize` grows them later",
+        },
+        Opt {
+            spelling: "--filesystem <apfs|zfs|directory>",
+            meaning: "what the project's workspaces are kept on: APFS images or ZFS datasets on macOS (default apfs), and on Linux only what the store is. A value this host does not serve, or another than an adopted project has, is refused before anything changes",
         },
         Opt {
             spelling: "--repo-id <owner/repo>",
@@ -5232,6 +5259,29 @@ mod tests {
         assert!(args.quarantine);
         assert!(cli.global.json);
         assert!(parse_args(["adopt", "--repo-id"]).is_err());
+    }
+
+    #[test]
+    fn adopt_parses_the_filesystem_it_names_and_refuses_an_unknown_one() {
+        for (spelling, filesystem) in [
+            ("apfs", StoreSubstrate::Apfs),
+            ("zfs", StoreSubstrate::Zfs),
+            ("directory", StoreSubstrate::Directory),
+        ] {
+            let cli = parse_args(["adopt", "--filesystem", spelling]).unwrap();
+            let Command::Adopt(args) = cli.command else {
+                panic!("expected adopt")
+            };
+            assert_eq!(args.filesystem, Some(filesystem));
+        }
+        let Command::Adopt(args) = parse_args(["adopt"]).unwrap().command else {
+            panic!("expected adopt")
+        };
+        assert_eq!(args.filesystem, None);
+        let error = parse_args(["adopt", "--filesystem", "btrfs"]).unwrap_err();
+        assert!(error.message.contains("apfs, zfs or directory"));
+        assert_eq!(error.exit_code(), 2);
+        assert!(parse_args(["adopt", "--filesystem"]).is_err());
     }
 
     #[test]

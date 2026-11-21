@@ -416,6 +416,12 @@ next: cowshed fork <ws>
 <project-root>
 ```
 
+`--filesystem <apfs|zfs|directory>` names what the project's workspaces are kept on. On macOS the default is `apfs`
+(disk images) and `zfs` keeps the project on datasets of your cowshed ZFS root, beside your APFS projects in the same
+store; on Linux the only value accepted is what the store already is. A value the host does not serve, or one that
+differs from what an already adopted project has, is refused before anything changes (exit 2). Adoption never moves a
+project between filesystems: `cowshed unadopt` it and adopt it again.
+
 Re-adoption is an APFS store's verb: a sparse image keeps the space its files once used, and replacing main returns it.
 A ZFS or plain-directory store frees space as files are deleted, so `--re-adopt` is refused there (exit 2, and `--json`
 carries `unsupported: { substrate, operation: "reAdopt" }`).

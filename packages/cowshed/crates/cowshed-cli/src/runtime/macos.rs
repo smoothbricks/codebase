@@ -1,12 +1,12 @@
 //! What the CLI says and reads of a macOS host: the APFS volumes, the FileVault step and the
-//! LaunchDaemon of host setup, the `.dmg` an adoption creates, and the disk-image and IOKit
-//! device classes doctor reports.
+//! LaunchDaemon of host setup, the `.dmg` or the dataset an adoption creates, and the disk-image
+//! and IOKit device classes doctor reports.
 
 use std::path::{Path, PathBuf};
 
 use cowshed_apfs::image::IMAGE_EXTENSION;
 use cowshed_core::Result;
-use cowshed_core::api::{Finding, FindingSeverity, WorkspaceInfo};
+use cowshed_core::api::{Finding, FindingSeverity, StoreSubstrate, WorkspaceInfo};
 use cowshed_core::doctor::probe_sync;
 use cowshed_core::storage::bootstrap::MOUNT_SERVICE_PLIST;
 
@@ -19,12 +19,23 @@ pub(super) fn disk_tools() -> Result<()> {
     Ok(())
 }
 
-/// What an adoption created: main's image, at the capacity it was minted at.
-pub(super) fn created_main(info: &WorkspaceInfo, capacity: &str) -> String {
-    format!(
-        "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
-        info.workspace, info.repo_id,
-    )
+/// What an adoption created: main's image, at the capacity it was minted at, or, for an adoption
+/// that named ZFS, main's dataset, capped at it. An adoption that named nothing made an image.
+pub(super) fn created_main(
+    info: &WorkspaceInfo,
+    capacity: &str,
+    filesystem: Option<StoreSubstrate>,
+) -> String {
+    match filesystem {
+        Some(StoreSubstrate::Zfs) => format!(
+            "created {} for {} as a ZFS dataset (capped at {capacity})",
+            info.workspace, info.repo_id,
+        ),
+        Some(StoreSubstrate::Apfs | StoreSubstrate::Directory) | None => format!(
+            "created {}.{IMAGE_EXTENSION} for {} (capacity {capacity})",
+            info.workspace, info.repo_id,
+        ),
+    }
 }
 
 /// What creating one APFS volume will do.

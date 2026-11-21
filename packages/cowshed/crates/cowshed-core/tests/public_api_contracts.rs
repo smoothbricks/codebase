@@ -968,9 +968,16 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             capacity: Some("100g".into()),
             quarantine: true,
             re_adopt: true,
+            filesystem: Some(cowshed_core::api::StoreSubstrate::Zfs),
         })
         .unwrap(),
-        json!({"repoId":"acme/widget","capacity":"100g","quarantine":true,"reAdopt":true})
+        json!({
+            "repoId":"acme/widget",
+            "capacity":"100g",
+            "quarantine":true,
+            "reAdopt":true,
+            "filesystem":"zfs"
+        })
     );
     assert_eq!(
         serde_json::to_value(AdoptOptions::default()).unwrap(),

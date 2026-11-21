@@ -3602,7 +3602,7 @@ fn mint_seed_image<H: RuntimeStorageHost>(
         state.discard_clone_invalid(&mount)?;
         host.detach_claimed_build_volume(layout, &claim)
             .map_err(storage)?;
-        let proof = if H::HAS_PHYSICAL_VOLUMES {
+        let proof = if host.has_physical_volumes() {
             let image = layout.image(&id);
             Some((
                 crate::storage::apfs::extents::prove_forkable(&image).map_err(storage)?,
@@ -5518,8 +5518,11 @@ mod tests {
         mint: fn(&H, &BuildVolumeLayout, &BuildVolumeId, u64, &Registration) -> PathBuf,
     }
 
+    /// The APFS image host the image scenarios run on, whatever a project's native host is.
     #[cfg(target_os = "macos")]
-    impl Scratch {
+    type ImageHost = MacOsApfsExecutionHost<SystemCommandRunner>;
+    #[cfg(target_os = "macos")]
+    impl Scratch<ImageHost> {
         fn new(name: &str) -> Self {
             Self::with_root(
                 FixtureRoot::Apfs(
@@ -8901,7 +8904,7 @@ fn main() {
     /// attach and a detach.
     #[cfg(target_os = "macos")]
     fn test_volume(
-        host: &Host,
+        host: &ImageHost,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
         gib: u64,

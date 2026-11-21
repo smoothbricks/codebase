@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use cowshed_core::api::{Finding, FindingSeverity, WorkspaceInfo};
+use cowshed_core::api::{Finding, FindingSeverity, StoreSubstrate, WorkspaceInfo};
 use cowshed_core::{CowshedError, Result};
 
 /// The parties doctor's host-storage probe waits on: planning host setup reads the kernel's
@@ -29,8 +29,13 @@ pub(super) fn disk_tools() -> Result<()> {
 
 /// What an adoption created: main's payload in the store, a ZFS dataset whose refquota is the
 /// capacity, or a plain directory, which grows within its filesystem and takes no cap. Which of
-/// the two the store is, is not read here, so the line says what the capacity means for each.
-pub(super) fn created_main(info: &WorkspaceInfo, capacity: &str) -> String {
+/// the two the store is, is not read here, so the line says what the capacity means for each;
+/// the filesystem an adoption names is only ever the store's own and adds nothing to it.
+pub(super) fn created_main(
+    info: &WorkspaceInfo,
+    capacity: &str,
+    _filesystem: Option<StoreSubstrate>,
+) -> String {
     format!(
         "created {} for {} (a ZFS store caps it at {capacity}; a directory store sets no cap)",
         info.workspace, info.repo_id,

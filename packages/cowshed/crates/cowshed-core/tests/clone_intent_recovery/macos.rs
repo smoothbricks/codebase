@@ -817,6 +817,7 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
                 capacity: None,
                 quarantine: false,
                 re_adopt: false,
+                filesystem: None,
             },
         });
         Ok(())
@@ -996,6 +997,7 @@ impl Fixture {
                     capacity: Some("1g".to_owned()),
                     quarantine: false,
                     re_adopt: false,
+                    filesystem: None,
                 },
             }),
         )

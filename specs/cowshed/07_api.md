@@ -901,14 +901,16 @@ corpus covers the same operation table; CLI/N-API option parity is its own gate 
 
 ### Substrates
 
-A store keeps each workspace and build volume as one of three payloads, chosen when `cowshed setup` made the store
-(09_substrates.md): `StoreSubstrate = "apfs" | "zfs" | "directory"`. macOS serves `apfs` (one sparse image per payload,
-attached and mounted); Linux serves `zfs` (one dataset per payload, mounted where the store has the payload's directory)
-and `directory` (one real directory per payload on whatever filesystem holds the store). The execution host answers
-which it is from the store itself, and `project.open` reports it:
-`ProjectOpened = { repoId, binding, gitRoot, storeRoot, substrate? }`. `substrate` is absent only from a controller of a
-build that predates the field; the Rust `Project::substrate()` and the TypeScript `Project.substrate` read it, the
-latter `undefined` when it is absent.
+A project's workspaces and build volumes are each kept as one of three payloads (09_substrates.md):
+`StoreSubstrate = "apfs" | "zfs" | "directory"`. macOS serves `apfs` (one sparse image per payload, attached and
+mounted) and, for a project adopted onto it, `zfs`; Linux serves `zfs` (one dataset per payload, mounted where the store
+has the payload's directory) or `directory` (one real directory per payload on whatever filesystem holds the store),
+whichever its store is. `AdoptOptions.filesystem` names the substrate an adoption keeps its project on; omitted, it is
+`apfs` on macOS and the store's own on Linux, and a value the host does not serve or another than an adopted project has
+is a `usage` refusal decided before anything changes. The execution host answers which a project is kept on from the
+store itself, and `project.open` reports it: `ProjectOpened = { repoId, binding, gitRoot, storeRoot, substrate? }`.
+`substrate` is absent only from a controller of a build that predates the field; the Rust `Project::substrate()` and the
+TypeScript `Project.substrate` read it, the latter `undefined` when it is absent.
 
 No caller branches on the platform. A verb means what its substrate can do, and a verb that needs a physical-volume
 operation the substrate lacks is refused by one table, `StoreSubstrate::supports(SubstrateOperation)`, before a
@@ -1638,10 +1640,10 @@ supervisor that ran the job retires.
   validated `GitRef`, and otherwise as a validated `BranchName`. Invalid values return `DtoError`; git rev expressions
   such as `HEAD~1` never fall back to another resolver. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids
   are validated lowercase 40- or 64-hex strings.
-- `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `capacity` and `reAdopt` mean what the store's
-  substrate gives them ("Substrates"); `reAdopt: false` keeps default adoption idempotent, while `true` selects the
-  verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when main's image is missing, the
-  plain-checkout recovery in §Missing main image. `coordinator.adopt` answers
+- `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt, filesystem? }`; `capacity`, `reAdopt` and
+  `filesystem` mean what the store's substrate gives them ("Substrates"); `reAdopt: false` keeps default adoption
+  idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
+  main's image is missing, the plain-checkout recovery in §Missing main image. `coordinator.adopt` answers
   `AdoptView = { workspace: WorkspaceView, reAdoption: ReAdoption | null }`, with
   `ReAdoption = { replacement, retained }` and `reAdoption` non-null exactly when the call re-adopted main; the
   TypeScript `Coordinator.adopt` resolves `Adopted = { workspace: WorkspaceRef, reAdoption: ReAdoption | null }`. The

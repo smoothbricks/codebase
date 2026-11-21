@@ -7185,7 +7185,8 @@ async fn controller_startup_names_exhausted_lifecycle_fact() {
 #[tokio::test]
 async fn production_open_modes_return_typed_environment_error_off_macos() {
     let adopt_error =
-        match ProjectRuntime::open_for_adopt("/tmp/project", None, refusing_gateway::connect).await
+        match ProjectRuntime::open_for_adopt("/tmp/project", None, None, refusing_gateway::connect)
+            .await
         {
             Ok(_) => panic!("non-macOS adopt open must fail"),
             Err(error) => error,

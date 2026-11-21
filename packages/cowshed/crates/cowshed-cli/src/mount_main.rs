@@ -23,7 +23,9 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::{RepoId, RepositoryBinding};
 use cowshed_core::runtime::native_host;
 use cowshed_core::storage::StorageLayout;
-use cowshed_core::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
+use cowshed_core::storage::apfs::{
+    ApfsExecutionHost as _, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+};
 use cowshed_core::storage::lifecycle::{MountIntent, MountState, Substrate};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
 use std::io::Write;
@@ -212,7 +214,7 @@ impl MainMountBackend for NativeMainMountBackend {
             runtime.shutdown().await?;
         }
         let config = ApfsSubstrateConfig::for_storage(&self.storage, &resolved.checkout_path);
-        let host = native_host(config.clone()).map_err(storage_error)?;
+        let host = native_host(config.clone(), &resolved.repo_id, None).map_err(storage_error)?;
         let substrate = ApfsSubstrate::new(config, host);
         let workspaces = substrate
             .list(&resolved.repo_id)
@@ -231,7 +233,9 @@ impl MainMountBackend for NativeMainMountBackend {
                     "cowshed doctor --json",
                 )
             })?;
-        if main.mount_state == MountState::Detached {
+        // Only an image registers IOMedia: a main kept as a dataset attaches none, so its mount
+        // has no room to make.
+        if main.mount_state == MountState::Detached && substrate.host().has_physical_volumes() {
             let gateway = crate::gateway_service::runtime_control(&self.storage)?;
             cowshed_core::media_room::make_room(
                 &self.storage,

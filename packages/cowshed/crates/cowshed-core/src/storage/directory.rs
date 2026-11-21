@@ -639,6 +639,48 @@ impl DirectoryExecutionHost {
     /// A host over the directory store `config` names. The store root must be an absolute
     /// directory reached through no symlink; it is created when it does not exist yet.
     pub fn new(config: ApfsSubstrateConfig) -> Result<Self, ApfsStorageError> {
+        Self::validate(&config)?;
+        // A store that is the `store` dataset of a cowshed root keeps its payloads as datasets
+        // of that root (09_substrates.md, "Fixed dataset hierarchy"); any other directory keeps
+        // them as directories. The kernel's mount table says which, so nothing configures it.
+        let payloads = match zfs::ZfsPayloads::of_store(&config.store_root)? {
+            Some(datasets) => Payloads::Datasets(datasets),
+            None => Payloads::Directories,
+        };
+        Ok(Self::over(config, payloads))
+    }
+
+    /// A host over project `repo`'s payloads when they are ZFS datasets, whatever filesystem
+    /// holds the store; `None` for a project that keeps disk images. The project's main entry in
+    /// the store says which ([`zfs::ZfsPayloads::of_project`]); a project with none yet is being
+    /// adopted, and keeps datasets when `adopting` asks for ZFS. Nothing else records it.
+    pub fn for_datasets(
+        config: ApfsSubstrateConfig,
+        repo: &crate::repository::RepoId,
+        adopting: Option<crate::api::dto::StoreSubstrate>,
+    ) -> Result<Option<Self>, ApfsStorageError> {
+        Self::validate(&config)?;
+        let main = super::StorageLayout::new(&config.store_root, repo)?.main_image()?;
+        let datasets = adopting == Some(crate::api::dto::StoreSubstrate::Zfs);
+        Ok(
+            zfs::ZfsPayloads::of_project(&config.store_root, main.image(), datasets)?
+                .map(|payloads| Self::over(config, Payloads::Datasets(payloads))),
+        )
+    }
+
+    fn over(config: ApfsSubstrateConfig, payloads: Payloads) -> Self {
+        Self {
+            census: crate::census::CensusScope::new(
+                config.namespace,
+                std::sync::Arc::from(config.store_root.as_path()),
+            ),
+            config,
+            payloads,
+        }
+    }
+
+    /// The store root is an absolute directory reached through no symlink, made when missing.
+    fn validate(config: &ApfsSubstrateConfig) -> Result<(), ApfsStorageError> {
         let root = &config.store_root;
         if !root.is_absolute() || !crate::repository::is_lexically_canonical(root) {
             return Err(ApfsStorageError::Layout(
@@ -669,21 +711,7 @@ impl DirectoryExecutionHost {
             }
             Err(error) => return Err(io_error("inspect directory store root", root, error)),
         }
-        // A store that is the `store` dataset of a cowshed root keeps its payloads as datasets
-        // of that root (09_substrates.md, "Fixed dataset hierarchy"); any other directory keeps
-        // them as directories. The kernel's mount table says which, so nothing configures it.
-        let payloads = match zfs::ZfsPayloads::of_store(root)? {
-            Some(datasets) => Payloads::Datasets(datasets),
-            None => Payloads::Directories,
-        };
-        Ok(Self {
-            census: crate::census::CensusScope::new(
-                config.namespace,
-                std::sync::Arc::from(config.store_root.as_path()),
-            ),
-            config,
-            payloads,
-        })
+        Ok(())
     }
 
     pub fn config(&self) -> &ApfsSubstrateConfig {
@@ -1222,7 +1250,9 @@ impl DirectoryExecutionHost {
 }
 
 impl ApfsExecutionHost for DirectoryExecutionHost {
-    const HAS_PHYSICAL_VOLUMES: bool = false;
+    fn has_physical_volumes(&self) -> bool {
+        false
+    }
 
     fn substrate(&self) -> StoreSubstrate {
         match &self.payloads {

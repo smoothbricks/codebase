@@ -142,6 +142,90 @@ pub struct ZfsPayloads {
     helper: PathBuf,
 }
 
+/// The directory of this executable, through the links that name it: the helper is installed
+/// beside the executable itself.
+fn beside_this_executable() -> Option<PathBuf> {
+    std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .ok()
+        .and_then(|executable| Some(executable.parent()?.to_owned()))
+}
+
+fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageError> {
+    let described = format!("{command:?}");
+    let output = deadline::output_within(role, &mut command, &deadline::start(role, ZFS))
+        .map_err(|error| host(&described, error))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(host(
+            format_args!("{described} ended {}", output.status),
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        ))
+    }
+}
+
+/// An unprivileged `zfs` read.
+fn read_zfs(arguments: &[&str]) -> Result<String, ApfsStorageError> {
+    let mut command = Command::new("zfs");
+    command.args(arguments);
+    run("zfs read", command)
+}
+
+/// What `ask` answers of the directory at `place`; a place that does not exist holds nothing.
+fn dataset_at(
+    place: &Path,
+    ask: impl FnOnce(&File) -> io::Result<Option<String>>,
+) -> Result<Option<String>, ApfsStorageError> {
+    let opened = match File::open(place) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("open payload directory", place, error)),
+    };
+    ask(&opened).map_err(|error| io_error("read the mount at", place, error))
+}
+
+/// The dataset ZFS is to mount at `place`: the one whose `mountpoint` property names it, asked
+/// of ZFS when nothing is mounted there (a reboot or an import that did not mount).
+fn assigned_to(place: &Path) -> Result<Option<String>, ApfsStorageError> {
+    let listed = read_zfs(&["list", "-H", "-o", "name,mountpoint", "-t", "filesystem"])?;
+    Ok(assigned_in(&listed, path_text(place)?).map(str::to_owned))
+}
+
+/// The name in `listed` (`zfs list -H -o name,mountpoint`) whose mountpoint is `place`.
+fn assigned_in<'a>(listed: &'a str, place: &str) -> Option<&'a str> {
+    listed
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find_map(|(name, mountpoint)| (mountpoint == place).then_some(name))
+}
+
+/// The cowshed roots in `listed` (`zfs list -H -o name,cowshed:owner`) that name `uid`.
+fn serving_roots(listed: &str, uid: u32) -> Vec<&str> {
+    let uid = uid.to_string();
+    listed
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(name, owner)| *owner == uid && Root::parse(name).is_ok())
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The cowshed root a main workspace's dataset, `<root>/projects/<owner>/<repo>/main`, lies in.
+fn root_of_main(dataset: &str) -> Option<Root> {
+    let mut parts = dataset.rsplitn(5, '/');
+    match (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    ) {
+        ("main", _repo, _owner, "projects", root) => Root::parse(root).ok(),
+        _ => None,
+    }
+}
+
 impl ZfsPayloads {
     /// The payloads of the store at `store_root`, when that directory is the mounted root of the
     /// `store` dataset of a cowshed root (`<parent>/cowshed/store`; 09_substrates.md, "Fixed
@@ -149,12 +233,77 @@ impl ZfsPayloads {
     /// helper is the one beside this executable or on `PATH` ([`choose_helper`]), resolved here
     /// because `sudo` does not search the caller's `PATH`.
     pub(super) fn of_store(store_root: &Path) -> Result<Option<Self>, ApfsStorageError> {
-        // Through the links that name it: the helper is installed beside the executable itself.
-        let beside = std::env::current_exe()
-            .and_then(fs::canonicalize)
-            .ok()
-            .and_then(|executable| Some(executable.parent()?.to_owned()));
-        Self::of_store_beside(store_root, beside)
+        Self::of_store_beside(store_root, beside_this_executable())
+    }
+
+    /// The payloads of one project, whatever filesystem holds the store. `main` is the store's
+    /// entry for its main workspace, and that entry says what the project keeps:
+    ///
+    /// - A regular file is a disk image: no datasets.
+    /// - Any other entry is a mount record or a home payload: the dataset mounted where it
+    ///   says, or, with nothing mounted there, the one whose `mountpoint` names the place, is
+    ///   `<root>/projects/<owner>/<repo>/main`, which names the root.
+    /// - With no entry the project is not adopted yet and keeps what its adoption asks for:
+    ///   datasets only when `adopt_datasets`, below the one cowshed root that names this user.
+    pub(super) fn of_project(
+        store_root: &Path,
+        main: &Path,
+        adopt_datasets: bool,
+    ) -> Result<Option<Self>, ApfsStorageError> {
+        let root = match fs::symlink_metadata(main) {
+            Ok(metadata) if metadata.is_file() => return Ok(None),
+            Ok(metadata) => {
+                let place = if metadata.file_type().is_symlink() {
+                    fs::read_link(main)
+                        .map_err(|error| io_error("read mount record", main, error))?
+                } else {
+                    main.to_owned()
+                };
+                let dataset = match dataset_at(&place, cowshed_helper::host::mounted_dataset)? {
+                    Some(mounted) => Some(mounted),
+                    None => assigned_to(&place)?,
+                };
+                dataset.as_deref().and_then(root_of_main)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !adopt_datasets {
+                    return Ok(None);
+                }
+                // SAFETY: reads this process's real uid.
+                let uid = unsafe { libc::getuid() };
+                let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
+                let listed = read_zfs(&[
+                    "list",
+                    "-H",
+                    "-o",
+                    &format!("name,{property}"),
+                    "-t",
+                    "filesystem",
+                ])?;
+                match serving_roots(&listed, uid).as_slice() {
+                    [root] => Root::parse(root).ok(),
+                    [] => {
+                        return Err(host(
+                            format_args!("no cowshed ZFS root names uid {uid} as its owner"),
+                            format_args!(
+                                "whoever administers a pool creates one: zfs create -o mountpoint=none -o {property}={uid} <pool>/cowshed"
+                            ),
+                        ));
+                    }
+                    several => {
+                        return Err(host(
+                            format_args!("several cowshed ZFS roots name uid {uid} as their owner"),
+                            several.join(", "),
+                        ));
+                    }
+                }
+            }
+            Err(error) => return Err(io_error("inspect main payload", main, error)),
+        };
+        match root {
+            Some(root) => Self::with_root(root, store_root, beside_this_executable()).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// [`Self::of_store`] for the cowshed whose executable lies in `beside`: the payloads as that
@@ -174,21 +323,29 @@ impl ZfsPayloads {
         else {
             return Ok(None);
         };
+        Self::with_root(root, store_root, beside).map(Some)
+    }
+
+    fn with_root(
+        root: Root,
+        store_root: &Path,
+        beside: Option<PathBuf>,
+    ) -> Result<Self, ApfsStorageError> {
         let searched = std::env::var_os("PATH")
             .into_iter()
             .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>());
         let helper =
             choose_helper(helpers_in(beside.into_iter().chain(searched))).ok_or_else(|| {
                 host(
-                    format_args!("the store at {} is a ZFS dataset", store_root.display()),
+                    format_args!("{} is a cowshed ZFS root", root.dataset().as_str()),
                     "cowshed-helper is installed neither beside cowshed nor on PATH",
                 )
             })?;
-        Ok(Some(Self {
+        Ok(Self {
             root,
             store_root: store_root.to_owned(),
             helper,
-        }))
+        })
     }
 
     /// The cowshed root these payloads lie below.
@@ -201,25 +358,13 @@ impl ZfsPayloads {
         &self.helper
     }
 
-    fn run(&self, role: &'static str, mut command: Command) -> Result<String, ApfsStorageError> {
-        let described = format!("{command:?}");
-        let output = deadline::output_within(role, &mut command, &deadline::start(role, ZFS))
-            .map_err(|error| host(&described, error))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(host(
-                format_args!("{described} ended {}", output.status),
-                String::from_utf8_lossy(&output.stderr).trim_end(),
-            ))
-        }
+    fn run(&self, role: &'static str, command: Command) -> Result<String, ApfsStorageError> {
+        run(role, command)
     }
 
     /// An unprivileged `zfs` read.
     fn zfs(&self, arguments: &[&str]) -> Result<String, ApfsStorageError> {
-        let mut command = Command::new("zfs");
-        command.args(arguments);
-        self.run("zfs read", command)
+        read_zfs(arguments)
     }
 
     /// The helper's command line up to its verb, elevated as the helper is installed. `sudo`
@@ -734,6 +879,46 @@ impl ZfsPayloads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A project's main dataset names its cowshed root, and only a main dataset does; a lost
+    /// mount is found by the exact mountpoint ZFS holds for it.
+    #[test]
+    fn a_projects_main_dataset_names_its_root() {
+        for (dataset, root) in [
+            (
+                "tank/cowshed/projects/acme/widget/main",
+                Some("tank/cowshed"),
+            ),
+            (
+                "tank/a/b/cowshed/projects/acme/widget/main",
+                Some("tank/a/b/cowshed"),
+            ),
+            ("tank/cowshed/projects/acme/widget/ws/raven", None),
+            ("tank/cowshed/projects/acme/widget", None),
+            ("tank/other/projects/acme/widget/main", None),
+            ("tank/cowshed/store", None),
+            ("main", None),
+        ] {
+            assert_eq!(
+                root_of_main(dataset).map(|root| root.dataset().as_str().to_owned()),
+                root.map(str::to_owned),
+                "{dataset}"
+            );
+        }
+        let listed = "tank/cowshed\tnone\n\
+                      tank/cowshed/projects/acme/widget/main\t/Users/u/widget\n\
+                      tank/cowshed/projects/acme/widget/ws/raven\t/Users/u/widget-raven\n";
+        assert_eq!(
+            assigned_in(listed, "/Users/u/widget"),
+            Some("tank/cowshed/projects/acme/widget/main")
+        );
+        assert_eq!(assigned_in(listed, "/Users/u"), None);
+        assert_eq!(assigned_in(listed, "none"), Some("tank/cowshed"));
+        let owners = "tank/cowshed\t501\ntank/x/cowshed\t502\ntank/y/cowshed\t-\n\
+                      tank/cowshed/store\t501\ntank/z\t501\n";
+        assert_eq!(serving_roots(owners, 501), ["tank/cowshed"]);
+        assert_eq!(serving_roots(owners, 500), [""; 0]);
+    }
 
     #[test]
     fn the_helper_elevates_itself_only_when_it_is_setuid_root() {

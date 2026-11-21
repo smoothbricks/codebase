@@ -132,6 +132,7 @@ async fn a_probe_that_waits_for_an_answer_is_the_doctor_step_its_call_is_in() {
                 capacity: Some("1g".to_owned()),
                 quarantine: false,
                 re_adopt: false,
+                filesystem: None,
             },
         }),
         None,
