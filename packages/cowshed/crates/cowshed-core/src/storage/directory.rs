@@ -26,7 +26,6 @@
 
 mod build_volumes;
 mod recovery;
-#[cfg(target_os = "macos")]
 mod runtime_host;
 mod zfs;
 
@@ -39,6 +38,7 @@ use std::sync::{Mutex, PoisonError};
 
 use cowshed_apfs::{DetachIntent, MountAccess};
 
+use crate::api::dto::{StoreSubstrate, SubstrateOperation};
 use crate::metadata::{
     DetachedWorkspaceMetadata, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,
     WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
@@ -73,16 +73,6 @@ use super::lifecycle::{
 };
 use super::{WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks};
 
-/// The name every refusal of a physical-volume request gives this backend.
-const BACKEND: &str = "directory";
-
-fn unsupported(operation: &'static str) -> ApfsStorageError {
-    ApfsStorageError::Unsupported {
-        backend: BACKEND,
-        operation,
-    }
-}
-
 fn host_error(error: impl std::fmt::Display) -> ApfsStorageError {
     ApfsStorageError::Host(error.to_string())
 }
@@ -94,6 +84,46 @@ pub(crate) enum Payloads {
     Directories,
     /// A ZFS dataset, mounted wherever its directory is and cloned from a snapshot.
     Datasets(zfs::ZfsPayloads),
+}
+
+/// What `cowshed setup` learns of the root helper every mutation of a ZFS store goes through
+/// (09_substrates.md, "Privileged helper").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HelperProof {
+    /// The store keeps its payloads as directories: nothing of it reaches a helper.
+    NoDatasets,
+    /// `helper` answered `check` as root for the cowshed root `root`.
+    Proven { root: String, helper: PathBuf },
+    /// `helper` did not: `cause` is the command that was run and what it said.
+    Refused {
+        root: String,
+        helper: PathBuf,
+        cause: String,
+    },
+}
+
+/// Prove that the cowshed whose executable lies in `installed` can change the store at
+/// `store_root`: when the store is a cowshed ZFS dataset, run the `check` verb of the helper
+/// that cowshed reaches, as it reaches it, with no credentials a terminal cached. Nothing is
+/// changed. An error is a store that could not be read or a helper that is not installed.
+pub fn prove_store_helper(
+    store_root: &Path,
+    installed: &Path,
+) -> Result<HelperProof, ApfsStorageError> {
+    let Some(datasets) = zfs::ZfsPayloads::of_store_beside(store_root, Some(installed.to_owned()))?
+    else {
+        return Ok(HelperProof::NoDatasets);
+    };
+    let root = datasets.root().dataset().to_string();
+    let helper = datasets.helper_path().to_owned();
+    Ok(match datasets.prove_helper() {
+        Ok(()) => HelperProof::Proven { root, helper },
+        Err(error) => HelperProof::Refused {
+            root,
+            helper,
+            cause: error.to_string(),
+        },
+    })
 }
 
 /// The lifecycle host of a directory store. It holds no state but its configuration: the
@@ -294,6 +324,20 @@ fn observed_mount(image: &Path) -> Result<Option<PathBuf>, ApfsStorageError> {
     let mount_point =
         fs::read_link(image).map_err(|error| io_error("read mount record", image, error))?;
     Ok(is_real_directory(&mount_point)?.then_some(mount_point))
+}
+
+/// The mountpoint `image`'s mount record names, read without changing anything; `None` while the
+/// payload is home or absent. Unlike [`observed_mount`] it says nothing of what is at the
+/// mountpoint: a dataset's record stands while its mount is lost.
+fn recorded_mount(image: &Path) -> Result<Option<PathBuf>, ApfsStorageError> {
+    match fs::symlink_metadata(image) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(image)
+            .map(Some)
+            .map_err(|error| io_error("read mount record", image, error)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error("inspect payload", image, error)),
+    }
 }
 
 /// Where `image`'s payload directory is now, read without changing anything: its image path,
@@ -752,6 +796,15 @@ impl DirectoryExecutionHost {
         }
     }
 
+    /// Whether the payload a mount record places at `mount_point` is there. A directory payload
+    /// is the directory the record names; a dataset is there while the kernel has it mounted.
+    fn mount_stands(&self, mount_point: &Path) -> Result<bool, ApfsStorageError> {
+        match &self.payloads {
+            Payloads::Directories => Ok(true),
+            Payloads::Datasets(datasets) => datasets.is_mounted(mount_point),
+        }
+    }
+
     fn marker_names(
         &self,
         tree: &Path,
@@ -1058,10 +1111,15 @@ impl DirectoryExecutionHost {
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
                 release_mount(&self.payloads, &self.census, image, DetachIntent::Release)?;
-                if let Payloads::Datasets(datasets) = &self.payloads
-                    && datasets.destroy(image)?.is_some()
-                {
-                    return Ok(true);
+                if let Payloads::Datasets(datasets) = &self.payloads {
+                    // A dataset is destroyed, never parked: one a fork still depends on refuses.
+                    return match datasets.destroy(image)? {
+                        Some(_) => Ok(true),
+                        None => Err(ApfsStorageError::DependentForks {
+                            payload: image.to_owned(),
+                            forks: datasets.dependents(image)?,
+                        }),
+                    };
                 }
                 let entry = self.deleting_entry(image)?;
                 let deleting = entry
@@ -1165,6 +1223,13 @@ impl DirectoryExecutionHost {
 
 impl ApfsExecutionHost for DirectoryExecutionHost {
     const HAS_PHYSICAL_VOLUMES: bool = false;
+
+    fn substrate(&self) -> StoreSubstrate {
+        match &self.payloads {
+            Payloads::Directories => StoreSubstrate::Directory,
+            Payloads::Datasets(_) => StoreSubstrate::Zfs,
+        }
+    }
 
     type LockGuard = ImageLockGuard;
 
@@ -1306,7 +1371,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         _image: &Path,
         _mount: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
-        Err(unsupported("proving a physical image's extent budget"))
+        Err(self.unsupported(SubstrateOperation::ExtentBudget))
     }
 
     fn validate_pending_clone(
@@ -1520,7 +1585,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         _browse: bool,
     ) -> Result<(), ApfsStorageError> {
         if access == MountAccess::ReadOnly {
-            return Err(unsupported("read-only mounts"));
+            return Err(self.unsupported(SubstrateOperation::ReadOnlyMount));
         }
         self.verify_controller_path(mount_point)?;
         if let Some(bound) = attachment.bound()
@@ -1567,7 +1632,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         _mount_point: &Path,
         _volume_name: &str,
     ) -> Result<(), ApfsStorageError> {
-        Err(unsupported("volume labels"))
+        Err(self.unsupported(SubstrateOperation::VolumeLabel))
     }
 
     fn mint_workspace_credentials(
@@ -1726,7 +1791,9 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     }
 
     /// A mounted workspace must be mounted at its own mountpoint and carry its own marker;
-    /// there are no mount flags to heal.
+    /// there are no mount flags to heal. A dataset whose record stands while its mount is lost
+    /// ([`Self::lost_mount`]) is first mounted again from its own `mountpoint`, so the tree that
+    /// is judged is the workspace's and never the empty directory an unmounted mountpoint is.
     fn heal_mount(
         &self,
         workspace: &LifecycleWorkspace,
@@ -1736,6 +1803,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .canonical_image(workspace.name())?
             .image()
             .to_owned();
+        if let Payloads::Datasets(datasets) = &self.payloads
+            && recorded_mount(&canonical)?.is_some()
+        {
+            datasets.settle(&canonical)?;
+        }
         let Some(current) = observed_mount(&canonical)? else {
             return Ok(());
         };
@@ -1797,16 +1869,48 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                 .resolve_link(workspace.name(), &id)
                 .map_err(host_error)?,
             crate::build_volume::LinkResolution::Keep
-        ) && observed_mount(&build.image(&id))?.as_deref() == Some(build.mount(&id).as_path()))
+        ) && observed_mount(&build.image(&id))?.as_deref() == Some(build.mount(&id).as_path())
+            && self.mount_stands(&build.mount(&id))?)
     }
 
-    /// A directory payload is no kernel attachment, so nothing it holds can lose a mount.
+    /// A directory payload is no kernel mount, so nothing it holds can lose one. A dataset is
+    /// one: the answer is the dataset that the workspace's mount record, or the record of the
+    /// build volume its checkout links, places at a mountpoint where the kernel has nothing of
+    /// the store's root mounted, as a pool import that mounted nothing or a `zfs unmount`
+    /// cowshed did not make leaves it. Read from the records, the kernel and `zfs list` alone;
+    /// [`Self::heal_mount`] and the build link's settle are what mount it again.
     fn lost_mount(
         &self,
-        _workspace: &LifecycleWorkspace,
-        _mount_point: &Path,
+        workspace: &LifecycleWorkspace,
+        mount_point: &Path,
     ) -> Result<Option<String>, ApfsStorageError> {
-        Ok(None)
+        let Payloads::Datasets(datasets) = &self.payloads else {
+            return Ok(None);
+        };
+        let storage = layout(&self.config, workspace.repo())?;
+        let canonical = storage
+            .canonical_image(workspace.name())?
+            .image()
+            .to_owned();
+        // A workspace at home is detached: it holds no mount to lose.
+        let Some(recorded) = recorded_mount(&canonical)? else {
+            return Ok(None);
+        };
+        if let Some(dataset) = datasets.lost_at(&recorded)? {
+            return Ok(Some(dataset));
+        }
+        let Some(target) = crate::build_volume::link::linked(mount_point).map_err(host_error)?
+        else {
+            return Ok(None);
+        };
+        let build = crate::build_volume::BuildVolumeLayout::new(storage.project())?;
+        let Some(id) = build.volume_at(&target) else {
+            return Ok(None);
+        };
+        match recorded_mount(&build.image(&id))? {
+            Some(recorded) => datasets.lost_at(&recorded),
+            None => Ok(None),
+        }
     }
 
     /// The workspace's mount, kept: the canonical payload must be mounted, through this handle,
@@ -1889,14 +1993,16 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Ok(())
     }
 
+    /// Raise the workspace's cap, its dataset's `refquota`, in place: nothing is unmounted. A
+    /// plain directory has no cap to raise.
     fn resize(
         &self,
         _workspace: &LifecycleWorkspace,
-        _image: &Path,
+        image: &Path,
         _mount_point: &Path,
-        _capacity: ImageCapacity,
+        capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, ApfsStorageError> {
-        Err(unsupported("resizing a workspace"))
+        self.grow_payload(image, capacity, SubstrateOperation::ResizeWorkspace)
     }
 
     fn defragment(
@@ -1905,7 +2011,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         _image: &Path,
         _mount_point: &Path,
     ) -> Result<DefragmentOutcome, ApfsStorageError> {
-        Err(unsupported("defragmenting a workspace"))
+        Err(self.unsupported(SubstrateOperation::DefragmentWorkspace))
     }
 
     fn restore_adopted_checkout(
@@ -2094,6 +2200,16 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         self.require_store_image(trash)?;
         // Retirement moves the payload, never its mounted binding record.
         require_home(&self.payloads, canonical)?;
+        if let Payloads::Datasets(datasets) = &self.payloads {
+            // Refused before anything moves: a retired workspace must be destroyable.
+            let forks = datasets.dependents(canonical)?;
+            if !forks.is_empty() {
+                return Err(ApfsStorageError::DependentForks {
+                    payload: canonical.to_owned(),
+                    forks,
+                });
+            }
+        }
         ensure_parent(trash)?;
         self.validate_staged_companion(&companion_path(canonical))?;
         retire_payload(canonical, trash, |from, to| self.rename_payload(from, to))
@@ -2241,6 +2357,80 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
 }
 
 impl DirectoryExecutionHost {
+    /// The refusal of a physical-volume operation this store's substrate does not have.
+    pub(super) fn unsupported(&self, operation: SubstrateOperation) -> ApfsStorageError {
+        ApfsStorageError::Unsupported {
+            substrate: self.substrate(),
+            operation,
+        }
+    }
+
+    /// The payload `image` as a capped dataset: its datasets, the directory it is mounted at now
+    /// and its `refquota`. A plain directory has no cap, so `operation` is refused there; a
+    /// dataset an operator left uncapped has none to read or raise.
+    fn capped_payload(
+        &self,
+        image: &Path,
+        operation: SubstrateOperation,
+    ) -> Result<(&zfs::ZfsPayloads, PathBuf, ImageCapacity), ApfsStorageError> {
+        let Payloads::Datasets(datasets) = &self.payloads else {
+            return Err(self.unsupported(operation));
+        };
+        let directory = match settle(&self.payloads, image)? {
+            Payload::Home => image.to_owned(),
+            Payload::Mounted(mount_point) => mount_point,
+        };
+        let capacity = datasets.capacity(&directory)?.ok_or_else(|| {
+            host_error(format_args!(
+                "the dataset of {} has no refquota: it is uncapped, so it has no capacity",
+                image.display()
+            ))
+        })?;
+        Ok((datasets, directory, ImageCapacity::from_bytes(capacity)))
+    }
+
+    /// The cap of the payload `image`.
+    pub(super) fn payload_capacity(
+        &self,
+        image: &Path,
+        operation: SubstrateOperation,
+    ) -> Result<ImageCapacity, ApfsStorageError> {
+        self.capped_payload(image, operation)
+            .map(|(_, _, capacity)| capacity)
+    }
+
+    /// Raise the cap of the payload `image` to `capacity`, read back from the dataset. Like an
+    /// image's resize it only ever grows: a request that does not exceed the cap is refused
+    /// before anything is set.
+    pub(super) fn grow_payload(
+        &self,
+        image: &Path,
+        capacity: ImageCapacity,
+        operation: SubstrateOperation,
+    ) -> Result<ResizeOutcome, ApfsStorageError> {
+        let (datasets, directory, previous) = self.capped_payload(image, operation)?;
+        if capacity <= previous {
+            return Err(ApfsStorageError::CapacityNotGrowing {
+                current: previous,
+                requested: capacity,
+            });
+        }
+        datasets.set_capacity(&directory, capacity.bytes())?;
+        let observed = datasets
+            .capacity(&directory)?
+            .map_or(ImageCapacity::from_bytes(0), ImageCapacity::from_bytes);
+        if observed < capacity {
+            return Err(ApfsStorageError::ResizeNotObserved {
+                requested: capacity,
+                observed,
+            });
+        }
+        Ok(ResizeOutcome {
+            previous,
+            capacity: observed,
+        })
+    }
+
     /// The CA companion beside `image`, which recovery requires to be a private regular file.
     fn recovery_companion(
         &self,

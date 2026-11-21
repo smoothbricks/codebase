@@ -30,9 +30,9 @@ pub(super) enum Sampling {
     /// job's end looked like its middle.
     ///
     /// Both payloads are boxed, each allocated once per job (at its first owned process and at
-    /// its end, never per sample): which one is larger differs by platform -- the macOS sampler
-    /// carries its rusage source and census, a terminal sample its leaf and accounting -- so no
-    /// job's state is the size of the larger of the two.
+    /// its end, never per sample): the sampler carries its leader-usage fold and, when sampled
+    /// through it, a census; a terminal sample carries its leaf and accounting. No job's state
+    /// is the size of the larger of the two.
     Frozen {
         leader: Birth,
         outcome: Box<Result<JobResourceSample>>,
@@ -113,7 +113,6 @@ impl Sampling {
     }
 
     /// The sampler of a job that owns processes and has not ended.
-    #[cfg(target_os = "macos")]
     pub(super) fn live(&mut self) -> Option<&mut JobSampler> {
         match self {
             Self::Live(sampler) => Some(sampler.as_mut()),
@@ -141,7 +140,6 @@ impl Sampling {
 
     /// When the job's clock started, the instant its first owned process spawned, while the job
     /// owns processes: the origin of `wallUs`, and of its processes' usage windows.
-    #[cfg(target_os = "macos")]
     pub(super) fn origin(&self) -> Option<Instant> {
         match self {
             Self::Live(sampler) => Some(sampler.spawned),
@@ -254,11 +252,10 @@ pub(super) struct JobSampler {
     window: Option<CpuWindow>,
     /// The share of the job's accounted CPU its observed processes must cover for a leaf.
     coverage: LeafCoverage,
-    /// The job's CPU source: each leader's own and reaped-children rusage, the activation's once.
-    #[cfg(target_os = "macos")]
+    /// The job's leader-interval CPU source: each leader's own and reaped-children usage, the
+    /// activation's once.
     rusage: super::job_accounting::RusageChildren,
     /// A census exists only for an explicitly supplied spawn sink without native observations.
-    #[cfg(target_os = "macos")]
     census: Option<super::job_attribution::Census>,
 }
 
@@ -267,9 +264,7 @@ impl JobSampler {
         Self {
             job_id,
             spawned: first.spawned,
-            #[cfg(target_os = "macos")]
             rusage: super::job_accounting::RusageChildren::charging(first.birth.clone()),
-            #[cfg(target_os = "macos")]
             census: None,
             leader: first.birth,
             host_start: first.host,
@@ -280,25 +275,20 @@ impl JobSampler {
     }
 
     fn lead(&mut self, leader: Birth) {
-        #[cfg(target_os = "macos")]
-        {
-            self.rusage.lead(leader.clone());
-            if let Some(census) = &mut self.census {
-                census.lead(leader.pid());
-            }
+        self.rusage.lead(leader.clone());
+        if let Some(census) = &mut self.census {
+            census.lead(leader.pid());
         }
         self.leader = leader;
     }
 
     /// The job's CPU source, which the supervisor reads at each boundary and closes at the end
     /// of an activation.
-    #[cfg(target_os = "macos")]
     pub(super) fn rusage(&mut self) -> &mut super::job_accounting::RusageChildren {
         &mut self.rusage
     }
 
     /// The legacy spawn sink's census, allocated only when that path is actually sampled.
-    #[cfg(target_os = "macos")]
     pub(super) fn census(&mut self) -> &mut super::job_attribution::Census {
         self.census.get_or_insert_with(|| {
             super::job_attribution::Census::led_by(self.leader.pid(), self.spawned)
@@ -306,7 +296,6 @@ impl JobSampler {
     }
 
     /// The share of the job's accounted CPU its observed processes must cover for a leaf.
-    #[cfg(target_os = "macos")]
     pub(super) fn coverage(&self) -> LeafCoverage {
         self.coverage
     }

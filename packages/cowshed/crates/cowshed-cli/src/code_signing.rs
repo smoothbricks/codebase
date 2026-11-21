@@ -19,6 +19,10 @@
 //! The certificate is never trusted for code signing: trusting it needs an authorization, and
 //! nothing here needs trust. `codesign` signs with an untrusted identity, and a requirement of
 //! the form `certificate leaf = H"…"` is satisfied by the certificate's hash alone.
+//!
+//! Only macOS signs. Which identity an install signs the gateway host with comes from the
+//! platform file ([`gateway_host_identity`]): `macos.rs` answers this user's, `linux.rs` none,
+//! and an install given none signs and verifies nothing.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -37,6 +41,18 @@ use rcgen::{
 use zeroize::Zeroizing;
 
 use crate::launchd::CommandStatus;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The identity an install signs the gateway host with, when this platform signs it.
+pub use platform::gateway_host_identity;
 
 pub const SECURITY: &str = "/usr/bin/security";
 pub const CODESIGN: &str = "/usr/bin/codesign";

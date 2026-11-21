@@ -134,7 +134,7 @@ pub struct JobProcessFold {
     /// Each chunk of [`PUBLISHED_CHUNK`] lives, by birth order, as publications share it.
     published: Vec<PublishedChunk>,
     /// How many lives the last attribution summary read, for the tests that count them.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     attribution_read: usize,
 }
 
@@ -148,7 +148,6 @@ pub const PUBLISHED_CHUNK: usize = 256;
 struct PublishedChunk {
     unfinal: usize,
     records: Option<Arc<[JobProcessSample]>>,
-    #[cfg(target_os = "macos")]
     attribution: Option<super::job_attribution::ObservedPart<usize>>,
 }
 
@@ -198,7 +197,7 @@ impl JobProcessFold {
             last_tick: started,
             restated: Vec::new(),
             published: Vec::new(),
-            #[cfg(all(test, target_os = "macos"))]
+            #[cfg(test)]
             attribution_read: 0,
         }
     }
@@ -241,7 +240,6 @@ impl JobProcessFold {
     }
 
     /// Native control metadata is mutated only by the observer's sole writer.
-    #[cfg(target_os = "macos")]
     pub(crate) fn lives_mut(&mut self) -> &mut ProcessTreeFold {
         &mut self.tree
     }
@@ -259,7 +257,6 @@ impl JobProcessFold {
     /// merges that part instead of reading its lives: nothing about a life follows its exit
     /// (07_api.md, "Process-tree observations"). Its cost is one merge per kept chunk and one read
     /// per life of a chunk that can still change.
-    #[cfg(target_os = "macos")]
     pub(crate) fn attribution_summary(
         &mut self,
     ) -> Result<super::job_attribution::AttributionSummary, crate::api::resources::ResourceUnitError>
@@ -1307,14 +1304,12 @@ mod tests {
             run.fold.tree(job(), utc(second)),
             "a publication answers the fold's own tree"
         );
-        #[cfg(target_os = "macos")]
         attributed(run);
         published
     }
 
     /// The fold's attribution summary now, checked against the summary read anew from every life
     /// in birth order, and how many lives it read.
-    #[cfg(target_os = "macos")]
     fn attributed(run: &mut Run) -> usize {
         use crate::runtime::job_attribution::{AttributionSummary, ObservedLife};
         let summary = run.fold.attribution_summary().expect("a summary");
@@ -1339,7 +1334,6 @@ mod tests {
     /// full chunk whose lives are all final is read once; a summary reads only the lives of the
     /// other chunks and answers the summary of every life read anew, its leaf included when the
     /// leaf is in a kept chunk.
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_attribution_reads_only_the_lives_of_chunks_that_can_still_change() {
         let mut run = Run::new();

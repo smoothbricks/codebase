@@ -1,8 +1,10 @@
-//! The decisions of stopping and reloading a LaunchAgent, and of whether an install may restart
-//! the gateway now, pure over what the shell observed (05_gateway.md "Install order and
-//! rollback", "An install refuses while a land runs"). `gateway_service` is the shell: it runs
-//! `launchctl`, watches the old process's exit in the kernel, and reads the land-turn tickets.
-//! Nothing here does I/O or reads a clock.
+//! The decisions of stopping and reloading a service the host's service manager runs (a
+//! LaunchAgent, a systemd user unit), and of whether an install may restart the gateway now,
+//! pure over what the shell observed (05_gateway.md "Install order and rollback", "An install
+//! refuses while a land runs"). `gateway_service` is the shell: it runs the manager's control
+//! tool, watches the old process's exit in the kernel, and reads the land-turn tickets. Nothing
+//! here does I/O or reads a clock. Only the reading of the manager's status answer differs by
+//! platform (`macos.rs`: `launchctl print`; `linux.rs`: `systemctl show`).
 
 use std::fmt;
 use std::time::Duration;
@@ -11,83 +13,34 @@ use cowshed_core::CowshedError;
 use cowshed_core::api::dto::{LandTurnName, LandTurnQueue};
 use cowshed_core::land_turn::Ticket;
 
-/// A loaded agent as `launchctl print` reports it.
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The reading of the manager's status answer for a loaded agent, and why it could not be read.
+pub use platform::{PrintError, parse_print};
+
+/// A loaded agent as the service manager's status reports it (`launchctl print`,
+/// `systemctl show`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadedAgent {
-    /// The process launchd runs for the agent; `None` between two runs (exited, or throttled
-    /// before a `KeepAlive` respawn).
+    /// The process the manager runs for the agent; `None` between two runs (exited, or waiting
+    /// out the manager's delay before a `KeepAlive` respawn).
     pub pid: Option<u32>,
-    /// How long launchd lets that process exit after a bootout's SIGTERM before it SIGKILLs it.
-    /// It is the definition launchd *loaded*: a plist an install just rewrote changes it only at
-    /// the bootstrap that follows the bootout.
+    /// How long the manager lets that process exit after a bootout's SIGTERM before it SIGKILLs
+    /// it. It is the definition the manager *loaded*: a definition an install just rewrote
+    /// changes it only at the bootstrap that follows the bootout.
     pub exit_timeout: Duration,
 }
 
-/// Why `launchctl print`'s answer for a loaded agent could not be read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PrintError {
-    /// No property line `exit timeout = <seconds>`: the bound launchd kills the process at is
-    /// unknown, so no wait for its exit can be bounded by it.
-    NoExitTimeout,
-    /// A `pid` or `exit timeout` property whose value is not a number.
-    Unreadable { line: String },
-}
-
-impl fmt::Display for PrintError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoExitTimeout => {
-                formatter.write_str("launchctl print reports no `exit timeout` for the agent")
-            }
-            Self::Unreadable { line } => {
-                write!(
-                    formatter,
-                    "launchctl print reports an unreadable `{}`",
-                    line.trim()
-                )
-            }
-        }
-    }
-}
-
-/// Read a loaded agent from the stdout of `launchctl print gui/<uid>/<label>`. Only the service's
-/// own properties count, the lines one tab deep: a nested block (`resource coalition = {`, …)
-/// carries keys of its own two tabs deep.
-pub fn parse_print(stdout: &str) -> Result<LoadedAgent, PrintError> {
-    let mut pid = None;
-    let mut exit_timeout = None;
-    for line in stdout.lines() {
-        let Some(property) = line.strip_prefix('\t') else {
-            continue;
-        };
-        if property.starts_with('\t') {
-            continue;
-        }
-        let Some((key, value)) = property.split_once(" = ") else {
-            continue;
-        };
-        let unreadable = || PrintError::Unreadable {
-            line: line.to_owned(),
-        };
-        match key {
-            "pid" => pid = Some(value.parse::<u32>().map_err(|_| unreadable())?),
-            "exit timeout" => {
-                exit_timeout = Some(Duration::from_secs(
-                    value.parse::<u64>().map_err(|_| unreadable())?,
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(LoadedAgent {
-        pid,
-        exit_timeout: exit_timeout.ok_or(PrintError::NoExitTimeout)?,
-    })
-}
-
-/// How long launchd's unload of a job may trail its own SIGKILL at the exit timeout: launchd
+/// How long the manager's unload of a job may trail its own SIGKILL at the exit timeout: launchd
 /// reaps the killed process and drops the job in one pass (measured 2026-10-22 on a test label:
-/// unloaded 0.03 s after the kill).
+/// unloaded 0.03 s after the kill), and systemd's stop job ends as it reaps it.
 pub const UNLOAD_GRACE: Duration = Duration::from_secs(1);
 
 /// What still holds a bootout open.
@@ -96,7 +49,7 @@ pub enum Remains {
     /// The agent's process has not exited, and holds every descriptor it had, its listeners
     /// included.
     Process { pid: u32 },
-    /// The process is gone, and launchd still reports the job loaded.
+    /// The process is gone, and the manager still reports the job loaded.
     Job,
 }
 
@@ -104,7 +57,11 @@ impl fmt::Display for Remains {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Process { pid } => write!(formatter, "its process {pid} has not exited"),
-            Self::Job => formatter.write_str("its process exited and launchd still holds the job"),
+            Self::Job => write!(
+                formatter,
+                "its process exited and {} still holds the job",
+                crate::launchd::MANAGER
+            ),
         }
     }
 }
@@ -259,6 +216,7 @@ mod tests {
 
     /// A `launchctl print` answer as launchd writes it: the service's properties one tab deep,
     /// and nested blocks whose own `pid`/`exit timeout` keys sit two tabs deep.
+    #[cfg(target_os = "macos")]
     fn print_text(agent: Option<LoadedAgent>, decoy_pid: u32, decoy_timeout: u64) -> String {
         let mut text = String::from("gui/501/dev.cowshed.test = {\n\tactive count = 1\n");
         text.push_str("\tstate = running\n\n\tresource coalition = {\n");
@@ -322,6 +280,7 @@ mod tests {
 
     proptest! {
         /// The agent's own pid and exit timeout are read, never a nested block's.
+        #[cfg(target_os = "macos")]
         #[test]
         fn print_reads_the_service_properties_only(
             agent in agent(),

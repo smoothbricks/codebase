@@ -1884,7 +1884,9 @@ pub enum ExitStatus {
     Signaled { signal: i32, core_dumped: bool },
 }
 
-/// The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path.
+/// The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path. Both are
+/// macOS's own tools. A Linux host has neither, so the call is refused there as
+/// `environment-missing`: its store's datasets and directories are managed by cowshed itself.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskCommandTool {
@@ -3480,11 +3482,16 @@ pub struct AdoptOptions {
     pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<RepoId>,
+    /// The capacity main is created with, as `resize` spells one (`20g`). An APFS store makes
+    /// the sparse image that size, a ZFS store sets it as the dataset's `refquota`, and a
+    /// plain-directory store has no capacity to set: it reads the value and caps nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     pub quarantine: bool,
     /// Explicitly replace an adopted main through verified, retained-source re-adoption.
-    /// False keeps ordinary adoption idempotent.
+    /// False keeps ordinary adoption idempotent. Re-adoption returns the space of a sparse image
+    /// that only grew, so only an APFS store has it: a ZFS or plain-directory store, which frees
+    /// space as files are deleted, refuses it as [`SubstrateOperation::ReAdopt`].
     pub re_adopt: bool,
 }
 
@@ -3494,6 +3501,8 @@ pub struct ForkOptions {
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub revision: Option<RevisionTarget>,
     pub clean: bool,
+    /// Show the workspace's volume in Finder. A presentation flag of an APFS mount: a ZFS or
+    /// plain-directory store accepts it and has nothing to show it in.
     pub browse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
@@ -3512,16 +3521,123 @@ pub struct ForkOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttachOptions {
+    /// As [`ForkOptions::browse`]: Finder presentation, with no effect off an APFS store.
     pub browse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_path: Option<PathBuf>,
     /// One attach of an aggregate (`attach` with no name, `attach --all`): it makes no room under
     /// IOKit's IOMedia ceiling, since detaching some sessions to attach others frees nothing
-    /// (02_workspaces.md, "Making room for an attach").
+    /// (02_workspaces.md, "Making room for an attach"). The ceiling is macOS's; a Linux host has
+    /// none, and no attach there makes room.
     pub aggregate: bool,
 }
 
-/// Which of a workspace's volumes `cowshed resize` grows: its image, or its build volume and the
+/// What a store keeps each workspace and build volume as (09_substrates.md). One store has one
+/// substrate, chosen when `cowshed setup` made it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StoreSubstrate {
+    /// One APFS sparse image per payload, attached and mounted as a volume (macOS).
+    Apfs,
+    /// One ZFS dataset per payload, mounted where the store has the payload's directory and
+    /// capped by its `refquota`.
+    Zfs,
+    /// One real directory per payload on whatever filesystem holds the store: no volume, no
+    /// capacity and no block statistics of its own.
+    Directory,
+}
+
+impl StoreSubstrate {
+    /// Whether a store on this substrate has `operation`: the one table a verb is refused by.
+    /// An APFS image has every one; a ZFS dataset has a capacity, its `refquota`, and nothing
+    /// else an image file has; a plain directory has none.
+    pub const fn supports(self, operation: SubstrateOperation) -> bool {
+        match self {
+            Self::Apfs => true,
+            Self::Zfs => matches!(
+                operation,
+                SubstrateOperation::ResizeWorkspace | SubstrateOperation::ResizeBuildVolume
+            ),
+            Self::Directory => false,
+        }
+    }
+
+    /// Whether a payload is a volume of its own, mounted at its root with used-byte statistics
+    /// a job's volume samples read (`JobVolumeUsage`). A plain directory shares its filesystem
+    /// with everything else on it.
+    pub const fn has_volumes(self) -> bool {
+        match self {
+            Self::Apfs | Self::Zfs => true,
+            Self::Directory => false,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apfs => "apfs",
+            Self::Zfs => "zfs",
+            Self::Directory => "directory",
+        }
+    }
+}
+
+impl fmt::Display for StoreSubstrate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A physical-volume operation some substrate does not have. A verb that needs one on a store
+/// without it is refused before anything is changed, as `unsupported` on the error
+/// ([`crate::error::SubstrateRefusal`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstrateOperation {
+    /// `resize` of a workspace. A plain directory has no capacity; a ZFS dataset's is its
+    /// `refquota`, which `resize` raises.
+    ResizeWorkspace,
+    /// `resize --build`, and reading a build volume's capacity. A plain directory has none.
+    ResizeBuildVolume,
+    /// `defrag` of a workspace: only an image file has extents to rewrite contiguously.
+    DefragmentWorkspace,
+    /// `defrag` of the build volumes a workspace owns.
+    DefragmentBuildVolume,
+    /// `adopt --re-adopt`: only a sparse image keeps space its files no longer use.
+    ReAdopt,
+    /// Compacting a seed image by copying it.
+    CompactSeed,
+    /// Proving an image's extent count within the fork budget.
+    ExtentBudget,
+    /// Naming a volume in the file system's own label.
+    VolumeLabel,
+    /// Mounting a payload read-only.
+    ReadOnlyMount,
+}
+
+impl SubstrateOperation {
+    /// The operation as a sentence names it, after "does not support".
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::ResizeWorkspace => "resizing a workspace",
+            Self::ResizeBuildVolume => "build volume capacities",
+            Self::DefragmentWorkspace => "defragmenting a workspace",
+            Self::DefragmentBuildVolume => "defragmenting a build volume",
+            Self::ReAdopt => "re-adoption",
+            Self::CompactSeed => "compacting a seed",
+            Self::ExtentBudget => "proving a physical image's extent budget",
+            Self::VolumeLabel => "volume labels",
+            Self::ReadOnlyMount => "read-only mounts",
+        }
+    }
+}
+
+impl fmt::Display for SubstrateOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.describe())
+    }
+}
+
+/// Which of a workspace's volumes `cowshed resize` grows: its own, or its build volume and the
 /// workspace's seed with it (16_build_volumes.md, "Substrate").
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3530,7 +3646,10 @@ pub enum ResizeVolume {
     Build,
 }
 
-/// What `cowshed resize` changed, with both capacities as the image itself reports them.
+/// What `cowshed resize` changed, with both capacities as the volume itself reports them: an
+/// APFS image's size, or a ZFS dataset's `refquota`. A plain-directory store has no capacity and
+/// refuses the verb ([`SubstrateOperation::ResizeWorkspace`],
+/// [`SubstrateOperation::ResizeBuildVolume`]).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResizeResult {
@@ -3541,7 +3660,9 @@ pub struct ResizeResult {
 }
 
 /// What `cowshed defrag` changed: the image's extents before and after its data was rewritten
-/// contiguously, and the data bytes the rewrite copied.
+/// contiguously, and the data bytes the rewrite copied. Only an APFS store has an image to
+/// rewrite: a ZFS or plain-directory store refuses the verb
+/// ([`SubstrateOperation::DefragmentWorkspace`]).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefragmentResult {
@@ -4565,7 +4686,8 @@ pub struct MirrorInfo {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayStatus {
-    /// Whether launchd has the gateway agent loaded.
+    /// Whether the user's service manager (launchd on macOS, systemd on Linux) has the gateway
+    /// service loaded.
     pub installed: bool,
     /// Whether the control socket answered a status request.
     pub running: bool,

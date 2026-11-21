@@ -1,7 +1,8 @@
 //! `cowshed-helper <root> <verb> …`: the root binary through which cowshed mutates ZFS datasets
 //! (specs/cowshed/09_substrates.md, "Privileged helper").
 //!
-//! It runs one `zfs` command per invocation, from a fixed verb set ([`verb::plan`]), and only
+//! It runs at most one `zfs` command per invocation, from a fixed verb set ([`verb::plan`]), and
+//! only
 //! - for a root dataset that names the caller: `<root>` is `<parent>/cowshed` and carries the
 //!   local user property `cowshed:owner=<caller uid>`, which only the administrator of its parent
 //!   can set;
@@ -9,7 +10,9 @@
 //! - with properties from an allow-list, and mountpoints in a tree the caller owns
 //!   ([`mountpoint::permit`]).
 //!
-//! Reads (`zfs list`, `zfs get`) need no privilege and never come here.
+//! Reads (`zfs list`, `zfs get`) need no privilege and never come here. `check` runs no command:
+//! it answers 0 once the helper runs as root and the root names the caller, which is how an
+//! install is proven before anything depends on it.
 
 mod mountpoint;
 mod verb;
@@ -169,7 +172,9 @@ fn run(arguments: &[String]) -> Result<(), Failure> {
     for mountpoint in &mountpoints {
         mountpoint::permit(mountpoint, uid).map_err(refused)?;
     }
-    zfs(&command)?;
+    if let Some(command) = &command {
+        zfs(command)?;
+    }
     match created {
         Some(dataset) => own(&dataset, uid, gid),
         None => Ok(()),

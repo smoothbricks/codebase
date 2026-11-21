@@ -323,7 +323,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // A disk tool for a caller that is not cowshed: no project and no daemon, so it is answered
     // before anything asks the daemon and works on a host whose daemon runs another build or
     // none at all. It writes the tool's bytes itself; only the runner's own failures are
-    // cowshed's to report.
+    // cowshed's to report, a host that has no disk tool among them.
     if let args::Command::DiskCommand(disk) = &parsed.command {
         return Ok(crate::disk_command::dispatch(disk, &mut output).await);
     }

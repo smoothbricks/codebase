@@ -29,8 +29,6 @@ use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, DetachIntent, MacOsApfsBackend,
     MountAccess, RecoveredImageAttachment,
 };
-#[cfg(target_os = "macos")]
-use cowshed_os::fsio::AnchoredDirectory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -55,14 +53,28 @@ use image_telemetry::{Image, ImageTelemetry};
 mod blank_template;
 mod build_volumes;
 mod image_telemetry;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+use platform::carries_label;
+// The macOS volume stat `runtime::volume_usage`'s macOS arm reads job volumes with.
+#[cfg(target_os = "macos")]
+pub use macos::{ApfsVolume, ApfsVolumeStat};
 #[cfg(target_os = "macos")]
 mod re_adopt;
+mod root_held;
 pub use build_volumes::{
     CatchUp as SeedCatchUp, Claim as BuildVolumeClaim, CompactedSeed, Compaction as SeedCompaction,
     CompactionSource, Refusal as BuildVolumeRefusal, Release as BuildVolumeRelease,
 };
 use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
 use cowshed_apfs::store_lock::{ImageLockGuard, acquire_existing_image_locks, acquire_image_locks};
+use root_held::{RootHeldDirectory, root_held_event_log};
 
 /// One payload move commits retirement for both physical images and directory payloads: `moved`
 /// is the host's rename of a payload. Callers prove store authority, unmounted payload state and
@@ -286,6 +298,7 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         | ApfsStorageError::BuildVolumeHeld { .. }
         | ApfsStorageError::ImageLocksHeld { .. }
         | ApfsStorageError::WorkspaceGone(_)
+        | ApfsStorageError::DependentForks { .. }
         | ApfsStorageError::Host(_)
         | ApfsStorageError::MountIdentity(_)
         | ApfsStorageError::Quarantined { .. } => false,
@@ -847,21 +860,8 @@ struct RetiredCleanupArtifacts {
 }
 
 enum RetiredMountpoint {
-    Removable {
-        path: PathBuf,
-        junk: StrayJunk,
-    },
-    #[cfg(target_os = "macos")]
+    Removable { path: PathBuf, junk: StrayJunk },
     RootHeld(RootHeldDirectory),
-}
-
-#[cfg(target_os = "macos")]
-struct RootHeldDirectory {
-    path: PathBuf,
-    parent: AnchoredDirectory,
-    directory: AnchoredDirectory,
-    name: CString,
-    identity: (libc::dev_t, libc::ino_t),
 }
 
 #[derive(Default)]
@@ -909,11 +909,9 @@ impl StrayJunk {
 enum StrayCleanup {
     Empty,
     Work(Vec<PathBuf>),
-    #[cfg(target_os = "macos")]
     RootHeld,
 }
 
-#[cfg(target_os = "macos")]
 enum RootHeldInspection {
     OnlyLog,
     RetainedLog,
@@ -1057,6 +1055,10 @@ impl MountedRegistry {
         })
     }
 }
+
+/// The platform an APFS image host records in every sidecar it publishes: its workspaces are
+/// macOS workspaces, each granted a loopback port block.
+pub(crate) const SIDECAR_PLATFORM: Platform = Platform::Macos;
 
 /// Real filesystem adapter for [`super::ApfsSubstrate`]. Native image commands are never
 /// reconstructed here: every create/clone/attach/fsck/mount/detach/delete operation is
@@ -1831,7 +1833,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         junk: planned,
                         outcome: StrayCleanup::Empty,
                     } => junk = planned,
-                    #[cfg(target_os = "macos")]
                     StrayCleanupPlan {
                         outcome: StrayCleanup::RootHeld,
                         ..
@@ -1870,7 +1871,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         })
     }
 
-    #[cfg(target_os = "macos")]
     /// Hold the actual bare directory and its parent, without following a mutable path component.
     /// The kernel mount table, fd-relative metadata and sole-entry check are the retention proof.
     fn hold_root_held_mountpoint(
@@ -1879,156 +1879,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     ) -> Result<RootHeldDirectory, ApfsStorageError> {
         self.inspect_root_held_mountpoint(path, RootHeldInspection::OnlyLog)?
             .ok_or(ApfsStorageError::GcPlanStale)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn inspect_root_held_mountpoint(
-        &self,
-        path: &Path,
-        inspection: RootHeldInspection,
-    ) -> Result<Option<RootHeldDirectory>, ApfsStorageError> {
-        let parent_path = path.parent().ok_or(ApfsStorageError::InvalidPlan(
-            "root-held mountpoint has no parent",
-        ))?;
-        let name = CString::new(
-            path.file_name()
-                .ok_or(ApfsStorageError::InvalidPlan(
-                    "root-held mountpoint has no name",
-                ))?
-                .as_bytes(),
-        )
-        .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let parent = match AnchoredDirectory::open(parent_path) {
-            Ok(parent) => parent,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(io_error(
-                    "hold root-held mountpoint parent",
-                    parent_path,
-                    error,
-                ));
-            }
-        };
-        let directory = match parent.existing_child(&name) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io_error("hold root-held mountpoint", path, error)),
-        };
-        if !directory
-            .stat_child(c".fseventsd")
-            .map_err(|error| io_error("inspect held event-log metadata", path, error))?
-            .as_ref()
-            .is_some_and(root_owned_event_log)
-            || (matches!(inspection, RootHeldInspection::OnlyLog)
-                && !directory
-                    .contains_only(c".fseventsd")
-                    .map_err(|error| io_error("inspect held mountpoint entries", path, error))?)
-        {
-            return Ok(None);
-        }
-        let metadata = directory
-            .metadata()
-            .map_err(|error| io_error("inspect held mountpoint", path, error))?;
-        let parent_metadata = parent
-            .metadata()
-            .map_err(|error| io_error("inspect held mountpoint parent", parent_path, error))?;
-        if metadata.dev() != parent_metadata.dev()
-            || self
-                .mount_source
-                .mounts()?
-                .iter()
-                .any(|mount| mount.mount_point.starts_with(path))
-        {
-            return Err(ApfsStorageError::Host(format!(
-                "root-held mountpoint still carries a mounted filesystem: {}",
-                path.display()
-            )));
-        }
-        let entry = parent
-            .stat_child(&name)
-            .map_err(|error| io_error("inspect held mountpoint name", path, error))?
-            .ok_or(ApfsStorageError::GcPlanStale)?;
-        if entry.st_ino != metadata.ino() || entry.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(ApfsStorageError::GcPlanStale);
-        }
-        Ok(Some(RootHeldDirectory {
-            path: path.to_owned(),
-            parent,
-            directory,
-            name,
-            identity: (entry.st_dev, entry.st_ino),
-        }))
-    }
-
-    #[cfg(target_os = "macos")]
-    fn retain_root_held_mountpoint(
-        &self,
-        held: RootHeldDirectory,
-    ) -> Result<RootHeldMountpoint, ApfsStorageError> {
-        // Cleanup may have removed other artifacts since the directory was first held. Look at
-        // this directory, and the name that still refers to it, before changing the namespace.
-        let current = held.parent.stat_child(&held.name).map_err(|error| {
-            io_error("inspect root-held name before retention", &held.path, error)
-        })?;
-        if current.as_ref().map(|entry| (entry.st_dev, entry.st_ino)) != Some(held.identity)
-            || !held
-                .directory
-                .contains_only(c".fseventsd")
-                .map_err(|error| {
-                    io_error(
-                        "inspect root-held entries before retention",
-                        &held.path,
-                        error,
-                    )
-                })?
-            || !held
-                .directory
-                .stat_child(c".fseventsd")
-                .map_err(|error| {
-                    io_error("inspect root-held log before retention", &held.path, error)
-                })?
-                .as_ref()
-                .is_some_and(root_owned_event_log)
-        {
-            return Err(ApfsStorageError::GcPlanStale);
-        }
-        if self
-            .mount_source
-            .mounts()?
-            .iter()
-            .any(|mount| mount.mount_point.starts_with(&held.path))
-        {
-            return Err(ApfsStorageError::Host(format!(
-                "root-held mountpoint became mounted before retention: {}",
-                held.path.display()
-            )));
-        }
-        let destination_name = format!(
-            "{}{}",
-            crate::storage::recovery::ROOT_HELD_MOUNT_PREFIX,
-            uuid::Uuid::new_v4().simple()
-        );
-        let destination = CString::new(destination_name.as_bytes())
-            .expect("a fixed prefix and UUID contain no NUL");
-        held.parent
-            .rename_child_noreplace(&held.name, &destination)
-            .map_err(|error| {
-                io_error(
-                    "retain root-held mountpoint without replacement",
-                    &held.path,
-                    error,
-                )
-            })?;
-        let path = held.path.with_file_name(destination_name);
-        let retained = RootHeldMountpoint::Retained(path);
-        let (_, cleanup) = retained.cleanup_guidance();
-        cowshed_os::eprintln!(
-            "cowshed: retained root-owned event-log debris from {} at {}; privileged cleanup: {}",
-            held.path.display(),
-            retained.mount_point().display(),
-            cleanup
-        );
-        Ok(retained)
     }
 
     fn reclaim_retired_authority(
@@ -2150,7 +2000,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             self.reclaim_exec_temp(project, authority, trash_image)?;
         }
         let retained = match cleanup.mount_point {
-            #[cfg(target_os = "macos")]
             Some(RetiredMountpoint::RootHeld(held)) => {
                 Some(self.retain_root_held_mountpoint(held)?)
             }
@@ -2536,9 +2385,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 name_owners.get(retired.workspace().name()),
             )?;
             let cleanup = self.retired_cleanup_artifacts(&retired, &path, scope)?;
-            #[cfg(target_os = "macos")]
             if let Some(RetiredMountpoint::RootHeld(held)) = &cleanup.mount_point {
-                root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path.clone()));
+                root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path().to_owned()));
             }
             let artifacts = cleanup.paths;
             examined = examined
@@ -2820,12 +2668,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                     continue;
                 };
-                #[cfg(target_os = "macos")]
                 if name.starts_with(crate::storage::recovery::ROOT_HELD_MOUNT_PREFIX) {
                     if let Some(held) =
                         self.inspect_root_held_mountpoint(&path, RootHeldInspection::RetainedLog)?
                     {
-                        root_held_mountpoints.push(RootHeldMountpoint::Retained(held.path));
+                        root_held_mountpoints.push(RootHeldMountpoint::Retained(held.into_path()));
                     }
                     continue;
                 }
@@ -2838,11 +2685,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 if !metadata.file_type().is_dir() || metadata.dev() != root_metadata.dev() {
                     continue;
                 }
-                #[cfg(target_os = "macos")]
                 if let Some(held) =
                     self.inspect_root_held_mountpoint(&path, RootHeldInspection::OnlyLog)?
                 {
-                    root_held_mountpoints.push(RootHeldMountpoint::Pending(held.path));
+                    root_held_mountpoints.push(RootHeldMountpoint::Pending(held.into_path()));
                 }
                 examined = examined
                     .checked_add(1)
@@ -3188,7 +3034,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         }
                         match remove_stray_junk(candidate.path(), &self.config.checkout_path)? {
                             StrayCleanup::Empty => {}
-                            #[cfg(target_os = "macos")]
                             StrayCleanup::RootHeld => {
                                 let held = self.hold_root_held_mountpoint(candidate.path())?;
                                 report
@@ -3492,56 +3337,6 @@ where
             .clone_image()
             .map_err(ApfsError::from)
             .map_err(ApfsStorageError::from)
-    }
-
-    /// The unmount refused: name the processes that hold the volume, if it was mounted.
-    #[cfg(target_os = "macos")]
-    fn capture_unmount_refusal(
-        &self,
-        source: &Path,
-        mount_point: Option<&Path>,
-        refusal: ApfsError,
-    ) -> ApfsStorageError {
-        if !cowshed_apfs::detach_was_dissented(&refusal) {
-            return refusal.into();
-        }
-        let Some(mount_point) = mount_point else {
-            return refusal.into();
-        };
-        let holders = match self.mounted_at(mount_point) {
-            Ok(Some(_)) => match crate::build_volume::nx::volume_holders(&self.census, mount_point)
-            {
-                Ok(holders) => holders,
-                Err(error) => {
-                    return ApfsStorageError::Cleanup {
-                        operation: "name capture source holders",
-                        primary: Box::new(refusal.into()),
-                        cleanup: Box::new(io_error(
-                            "list capture source holders",
-                            mount_point,
-                            error,
-                        )),
-                    };
-                }
-            },
-            Ok(None) => Vec::new(),
-            Err(error) => {
-                return ApfsStorageError::Cleanup {
-                    operation: "inspect refused capture source",
-                    primary: Box::new(refusal.into()),
-                    cleanup: Box::new(error),
-                };
-            }
-        };
-        ApfsError::CaptureSourceBusy {
-            image: source.to_owned(),
-            held: cowshed_apfs::CaptureHold::Volume {
-                mount_point: mount_point.to_owned(),
-                holders,
-            },
-            refusal: Box::new(refusal),
-        }
-        .into()
     }
 
     /// The one atomic swap behind every handoff of a checkout to main's mountpoint: the checkout
@@ -4834,7 +4629,7 @@ where
             repo_id: workspace.repo().clone(),
             workspace: workspace.name().clone(),
             workspace_incarnation: workspace.incarnation().clone(),
-            platform: Platform::Macos,
+            platform: SIDECAR_PLATFORM,
             publication_state: match policy {
                 MetadataPolicy::FreshPendingFence | MetadataPolicy::PendingFence => {
                     PublicationState::PendingFence
@@ -5348,13 +5143,6 @@ pub(crate) fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
-#[cfg(target_os = "macos")]
-fn root_owned_event_log(metadata: &libc::stat) -> bool {
-    metadata.st_uid == 0
-        && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
-        && metadata.st_mode & 0o777 == 0o700
-}
-
 /// Classify strays without changing the mountpoint: hidden paths, project-ignored paths and
 /// regular files whose exact bytes the repository holds are junk. One walk, one check-ignore
 /// and one hash-object/cat-file pair supply both preview and execution with the same decision.
@@ -5367,7 +5155,6 @@ fn plan_stray_cleanup(
     let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
-    #[cfg(target_os = "macos")]
     let mut root_held = false;
     while let Some(dir) = stack.pop() {
         if dir != mount_point {
@@ -5383,15 +5170,9 @@ fn plan_stray_cleanup(
             let file_type = entry
                 .file_type()
                 .map_err(|error| io_error("inspect stray", &path, error))?;
-            #[cfg(target_os = "macos")]
-            if relative == Path::new(".fseventsd") && file_type.is_dir() {
-                let metadata = fs::symlink_metadata(&path).map_err(|error| {
-                    io_error("inspect root-held event-log candidate", &path, error)
-                })?;
-                if metadata.uid() == 0 && metadata.mode() & 0o777 == 0o700 {
-                    root_held = true;
-                    continue;
-                }
+            if root_held_event_log(&path, relative, file_type)? {
+                root_held = true;
+                continue;
             }
             if crate::git::is_hidden_path(relative.as_os_str().as_bytes()) {
                 hidden.push((path, file_type.is_dir()));
@@ -5405,7 +5186,6 @@ fn plan_stray_cleanup(
             }
             strays.push((path, judged, file_type.is_dir(), file_type.is_file()));
         }
-        #[cfg(target_os = "macos")]
         if root_held {
             if strays.is_empty() && hidden.is_empty() {
                 return Ok(StrayCleanupPlan {
@@ -5502,168 +5282,6 @@ fn remove_stray_junk(
     Ok(plan.outcome)
 }
 
-/// One mounted volume a job owns: the mountpoint it was found at and the filesystem id the
-/// kernel gave that mount. The id, not the volume UUID, is its identity: every image cloned from
-/// one template or seed carries the same volume UUID, and a mountpoint with nothing mounted on it
-/// answers for its parent's volume.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApfsVolume {
-    mount: PathBuf,
-    fsid: [i32; 2],
-}
-
-#[cfg(target_os = "macos")]
-impl ApfsVolume {
-    /// The volume mounted exactly at `mount` and the bytes it uses now, both from one read. A
-    /// directory on its parent's volume is refused.
-    pub fn capture(
-        mount: &Path,
-    ) -> Result<(Self, u64), crate::runtime::volume_usage::VolumeStatError> {
-        let own = volume_space(mount).map_err(usage_error)?;
-        let parent = mount.parent().ok_or_else(|| {
-            usage_error(ApfsStorageError::Host(format!(
-                "{} has no parent to be mounted on",
-                mount.display()
-            )))
-        })?;
-        if volume_space(parent).map_err(usage_error)?.fsid == own.fsid {
-            return Err(usage_error(ApfsStorageError::Host(format!(
-                "no volume is mounted at {}",
-                mount.display()
-            ))));
-        }
-        let volume = Self {
-            mount: mount.to_path_buf(),
-            fsid: own.fsid,
-        };
-        Ok((volume, own.used))
-    }
-
-    pub fn mount(&self) -> &Path {
-        &self.mount
-    }
-}
-
-/// The APFS volume stat: the bytes an owned volume itself uses, never its container's or a walk
-/// of its tree.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ApfsVolumeStat;
-
-#[cfg(target_os = "macos")]
-impl crate::runtime::volume_usage::VolumeStat for ApfsVolumeStat {
-    type Volume = ApfsVolume;
-
-    /// A mount that is no longer the one found at spawn is an error, never its successor's usage.
-    fn used_bytes(
-        &self,
-        volume: &ApfsVolume,
-    ) -> Result<u64, crate::runtime::volume_usage::VolumeStatError> {
-        let space = volume_space(&volume.mount).map_err(usage_error)?;
-        if space.fsid != volume.fsid {
-            return Err(usage_error(ApfsStorageError::Host(format!(
-                "{} no longer holds the volume mounted there when the job spawned",
-                volume.mount.display()
-            ))));
-        }
-        Ok(space.used)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn usage_error(error: ApfsStorageError) -> crate::runtime::volume_usage::VolumeStatError {
-    crate::CowshedError::environment_missing(
-        format!("volume usage read failed: {error}"),
-        "cowshed doctor --json",
-    )
-    .into()
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, PartialEq)]
-struct VolumeSpace {
-    fsid: [i32; 2],
-    used: u64,
-}
-
-/// The `getattrlist` answer [`volume_space`] asks for: its length (u32), the attributes it holds
-/// (attribute_set_t: five u32), the filesystem id (fsid_t: two i32), then the used bytes
-/// (off_t), packed on 4-byte boundaries in attribute-group order.
-#[cfg(target_os = "macos")]
-const VOLUME_SPACE_LENGTH: usize = 4 + 20 + 8 + 8;
-
-/// The filesystem id of the mount holding `path` and the bytes its volume uses, from one
-/// `getattrlist`. `statfs` is no substitute: on APFS its block counts are the container's, which
-/// every sibling volume moves.
-#[cfg(target_os = "macos")]
-fn volume_space(path: &Path) -> Result<VolumeSpace, ApfsStorageError> {
-    const OPERATION: &str = "read the volume attributes of";
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| ApfsStorageError::Host(format!("{} contains NUL", path.display())))?;
-    let mut request = libc::attrlist {
-        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FSID,
-        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_SPACEUSED,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
-    };
-    #[repr(C, align(4))]
-    struct Answer([u8; VOLUME_SPACE_LENGTH]);
-    let mut answer = Answer([0; VOLUME_SPACE_LENGTH]);
-    // SAFETY: `c_path` is NUL-terminated, `request` names only the attributes laid out in
-    // `VOLUME_SPACE_LENGTH`, and `answer` is writable for its full length, which is what the
-    // kernel is told.
-    let status = unsafe {
-        libc::getattrlist(
-            c_path.as_ptr(),
-            (&raw mut request).cast(),
-            answer.0.as_mut_ptr().cast(),
-            VOLUME_SPACE_LENGTH,
-            libc::FSOPT_NOFOLLOW,
-        )
-    };
-    if status != 0 {
-        return Err(io_error(OPERATION, path, io::Error::last_os_error()));
-    }
-    decode_volume_space(&answer.0).map_err(|error| io_error(OPERATION, path, error))
-}
-
-/// A file system that does not report a requested attribute omits it from the answer; a negative
-/// `off_t` is no byte count. Both are errors, never a zero.
-#[cfg(target_os = "macos")]
-fn decode_volume_space(bytes: &[u8; VOLUME_SPACE_LENGTH]) -> io::Result<VolumeSpace> {
-    let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
-    if u32::from_ne_bytes(word(4)) & libc::ATTR_CMN_FSID == 0
-        || u32::from_ne_bytes(word(8)) & libc::ATTR_VOL_SPACEUSED == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the file system reports no filesystem id or used bytes",
-        ));
-    }
-    if usize::try_from(u32::from_ne_bytes(word(0))).ok() != Some(VOLUME_SPACE_LENGTH) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the volume attributes answer has an unexpected length",
-        ));
-    }
-    let used = i64::from_ne_bytes([
-        bytes[32], bytes[33], bytes[34], bytes[35], bytes[36], bytes[37], bytes[38], bytes[39],
-    ]);
-    Ok(VolumeSpace {
-        fsid: [i32::from_ne_bytes(word(24)), i32::from_ne_bytes(word(28))],
-        used: u64::try_from(used).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the volume reports {used} used bytes"),
-            )
-        })?,
-    })
-}
-
 pub(in crate::storage) fn io_error(
     operation: &'static str,
     path: &Path,
@@ -5683,25 +5301,6 @@ pub(crate) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageErr
         .map_err(|_| ApfsStorageError::Host("staged image path contains NUL".to_owned()))?;
     cowshed_os::fsio::rename_exchange(libc::AT_FDCWD, &left_name, &right_name)
         .map_err(|error| io_error("atomically swap images", left, error))
-}
-
-/// Whether the volume mounted at `mount_point` already carries `label`, read straight from the
-/// kernel (`getattrlist`). A read that raced an unmount costs only a rename that the held root's
-/// proof then refuses.
-fn carries_label(mount_point: &Path, label: &str) -> Result<bool, ApfsStorageError> {
-    #[cfg(target_os = "macos")]
-    {
-        cowshed_apfs::volume_name(mount_point)
-            .map(|name| name == label)
-            .map_err(|error| io_error("read volume name", mount_point, error))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (mount_point, label);
-        Err(ApfsStorageError::Host(
-            "reading an APFS volume's name requires macOS getattrlist".to_owned(),
-        ))
-    }
 }
 
 /// The lineage a newly minted incarnation inherits from the marker already present at
@@ -6538,6 +6137,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn volume_space_answers_decode_exactly_and_refuse_missing_or_negative_usage() {
+        use super::macos::{VOLUME_SPACE_LENGTH, VolumeSpace, decode_volume_space};
         let answer = |volattr: u32, used: i64| {
             let mut bytes = [0_u8; VOLUME_SPACE_LENGTH];
             bytes[..4].copy_from_slice(&40_u32.to_ne_bytes());

@@ -169,7 +169,6 @@ fn refused(workspace: &str, wanted: Holding, holder: Option<&Holder>) -> Cowshed
 mod tests {
     use super::*;
     use crate::temp_root::TempRoot;
-    #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::ChildBackstop as _;
     use std::fs;
 
@@ -202,36 +201,35 @@ mod tests {
             .expect("the lease is free once its holder drops it");
     }
 
-    /// BSD `lockf(1)` takes the same `flock(2)`; Linux ships no such command.
-    #[cfg(target_os = "macos")]
+    /// The host's lock program takes the same `flock(2)` a taker does.
     #[test]
     fn a_killed_holder_releases_the_lease() {
         use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         use std::thread;
         use std::time::Duration;
         let (_root, sessions) = sessions();
         let lease = lease_path(&sessions, "topic");
-        // `lockf -k` takes flock(2) on the lease and runs `cat` as its child; the child inherits
-        // the locked descriptor and reads lockf's stdin, a pipe `holder` holds, so it runs until
-        // the kill. Killing the whole process group ends both, as a killed land's tree.
-        let mut holder = Command::new("/usr/bin/lockf")
-            .arg("-k")
-            .arg(&lease)
-            .arg("/bin/cat")
+        // The lock program takes flock(2) on the lease and runs `cat` as its child; the child
+        // inherits the locked descriptor and reads the program's stdin, a pipe `holder` holds, so
+        // it runs until the kill. Killing the whole process group ends both, as a killed land's
+        // tree.
+        let mut holder = crate::lock_program::holding(&lease)
+            .arg("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0)
             .spawn_locked()
-            .expect("spawn lockf");
+            .expect("spawn the lock program");
 
-        // Until lockf locks, a taker can win; a win writes its own record, so empty the file again
-        // and release, and retry. Once the child holds the lock, a taker is refused with no record.
+        // Until the program locks, a taker can win; a win writes its own record, so empty the file
+        // again and release, and retry. Once the child holds the lock, a taker is refused with no
+        // record.
         loop {
-            if let Some(status) = holder.try_wait().expect("poll lockf") {
-                panic!("lockf exited ({status}) before it held the lease");
+            if let Some(status) = holder.try_wait().expect("poll the lock program") {
+                panic!("the lock program exited ({status}) before it held the lease");
             }
             match take(&sessions, "topic", Holding::Remove) {
                 Ok(won) => {
@@ -251,12 +249,13 @@ mod tests {
 
         let group = libc::pid_t::try_from(holder.id()).expect("a pid fits pid_t");
         // SAFETY: `holder` leads its own process group (`process_group(0)`), so its pid names the
-        // group; SIGKILL to that group ends lockf and the `cat` child that holds the descriptor.
+        // group; SIGKILL to that group ends the lock program and the `cat` child that holds the
+        // descriptor.
         let killed = unsafe { libc::killpg(group, libc::SIGKILL) };
-        assert_eq!(killed, 0, "kill the lockf process group");
-        // `cat` reads this pipe: reaping lockf must not end it, only the kill may.
+        assert_eq!(killed, 0, "kill the lock program's process group");
+        // `cat` reads this pipe: reaping the lock program must not end it, only the kill may.
         let held = holder.stdin.take();
-        holder.wait_bounded().expect("reap lockf");
+        holder.wait_bounded().expect("reap the lock program");
 
         // The lock drops when the `cat` child's descriptor closes, a moment after the kill.
         loop {

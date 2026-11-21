@@ -33,16 +33,14 @@ use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 #[cfg(test)]
 use crate::storage::apfs::ApfsExecutionHost;
 use crate::storage::apfs::ApfsStorageError;
-use crate::storage::apfs::native::{
-    BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, MacOsApfsExecutionHost,
-};
+use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::{CowshedError, Result};
-use cowshed_apfs::SystemCommandRunner;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::store_lock::LockMode;
 
-type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
+/// The host a caller names no other for: this host's native storage.
+type Host = super::storage_host::NativeHost;
 
 mod compaction;
 mod nx_clear;
@@ -1568,7 +1566,11 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             {
                 return Ok(Err(skip(busy, Side::Landing)));
             }
-            if H::HAS_PHYSICAL_VOLUMES
+            // Where a build volume has a capacity (an image's size, a dataset's `refquota`), the
+            // landing volume is grown to its target's before it becomes the target's seed.
+            if host
+                .substrate()
+                .supports(crate::api::dto::SubstrateOperation::ResizeBuildVolume)
                 && let Some(target) = target
             {
                 let capacity = host
@@ -3449,7 +3451,10 @@ pub(crate) fn mint_retained_seed<H: RuntimeStorageHost>(
             )));
         }
     };
-    let capacity = if H::HAS_PHYSICAL_VOLUMES {
+    let capacity = if host
+        .substrate()
+        .supports(crate::api::dto::SubstrateOperation::ResizeBuildVolume)
+    {
         host.build_volume_capacity(layout, source.id())
             .map_err(storage)?
     } else {
@@ -4079,10 +4084,19 @@ fn resize_error(
 }
 
 fn storage(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
-    CowshedError::environment_missing(
-        format!("build volume storage failed: {error}"),
-        "cowshed doctor --json",
-    )
+    match error {
+        ApfsStorageError::Unsupported {
+            substrate,
+            operation,
+        } => CowshedError::unsupported_on_substrate(crate::error::SubstrateRefusal {
+            substrate,
+            operation,
+        }),
+        error => CowshedError::environment_missing(
+            format!("build volume storage failed: {error}"),
+            "cowshed doctor --json",
+        ),
+    }
 }
 
 pub(super) fn io(operation: &str, path: &Path, error: &std::io::Error) -> CowshedError {
@@ -4096,6 +4110,10 @@ pub(super) fn io(operation: &str, path: &Path, error: &std::io::Error) -> Cowshe
 mod tests {
     use super::*;
     use crate::repository::{ProjectPaths, RepoId};
+    #[cfg(target_os = "macos")]
+    use crate::storage::apfs::native::MacOsApfsExecutionHost;
+    #[cfg(target_os = "macos")]
+    use cowshed_apfs::SystemCommandRunner;
     use cowshed_os::test_backstop::{
         AsyncChildBackstop as _, AsyncCommandBackstop as _, ChildBackstop as _,
         CommandBackstop as _,
@@ -4916,7 +4934,6 @@ mod tests {
     /// A record that cannot be read never lets its volume go: the release a job's end owes and a
     /// retirement's own release both refuse with the error, and the image and the unreadable
     /// record are left byte for byte, for an operator to repair.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_an_unreadable_record_refuses_release_and_keeps_its_volume() {
         let scratch = Scratch::directory("build-corrupt-record");
@@ -4977,7 +4994,6 @@ mod tests {
 
     /// A seed an earlier land or fork claimed for its retirement is that retirement's to
     /// release: a retiring workspace's own release leaves it and releases the rest.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_retirement_leaves_a_seed_another_retirement_claims() {
         let scratch = Scratch::directory("build-claimed-seed");
@@ -5083,7 +5099,6 @@ mod tests {
     /// Told the workspace is forming, collection keeps its live volume and its seed, and the
     /// fork owns what its link names. Without that, the same collection deletes both, and the
     /// fork's mount refuses its link exactly as the broken `cowshed fork` did.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_collection_keeps_a_forming_forks_volume_and_seed() {
         let scratch = Scratch::directory("build-forming-fork");
@@ -5476,28 +5491,25 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     enum FixtureRoot {
+        #[cfg(target_os = "macos")]
         Apfs(crate::scratch_apfs::ScratchRoot),
         Directory(crate::scratch_directory::ScratchRoot),
-
         Files(crate::temp_root::TempRoot),
     }
 
-    #[cfg(target_os = "macos")]
     impl FixtureRoot {
         fn path(&self) -> &Path {
             match self {
+                #[cfg(target_os = "macos")]
                 Self::Apfs(root) => root.path(),
                 Self::Directory(root) => root.path(),
-
                 Self::Files(root) => root,
             }
         }
     }
 
     /// A real store with one project's build volumes, using the scenario's storage backend.
-    #[cfg(target_os = "macos")]
     struct Scratch<H: RuntimeStorageHost = Host> {
         root: FixtureRoot,
         host: Arc<H>,
@@ -5521,7 +5533,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl Scratch<crate::storage::directory::DirectoryExecutionHost> {
         fn directory(name: &str) -> Self {
             Self::directory_in(FixtureRoot::Directory(
@@ -5557,7 +5568,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl<H: RuntimeStorageHost> Scratch<H> {
         fn with_root(
             root: FixtureRoot,
@@ -5570,11 +5580,10 @@ mod tests {
             use cowshed_os::namespace::{HostNamespace, TestNamespace};
             let store = root.path().join("store");
             let namespace = match &root {
+                #[cfg(target_os = "macos")]
                 FixtureRoot::Apfs(apfs) => HostNamespace::Test(apfs.namespace()),
                 // These live directory roots name no namespace directory of their own.
-                FixtureRoot::Directory(_) | FixtureRoot::Files(_) => {
-                    HostNamespace::Test(TestNamespace::mint().expect("a test namespace"))
-                }
+                _ => HostNamespace::Test(TestNamespace::mint().expect("a test namespace")),
             };
             fs::create_dir_all(&store).unwrap();
             let project = ProjectPaths::with_mount_root(
@@ -5691,7 +5700,6 @@ mod tests {
     /// Before an exec pays for build-state discovery, the volume its job must hold is probed:
     /// an exclusively claimed volume refuses at once, with the refusal admission itself gives,
     /// so no discovery runs only to be discarded.
-    #[cfg(target_os = "macos")]
     #[test]
     fn probe_admissible_refuses_an_exclusively_claimed_linked_volume() {
         let scratch = Scratch::directory("probe-admissible");
@@ -5734,7 +5742,6 @@ mod tests {
         );
         scratch.release_all();
     }
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_cancelled_build_work_keeps_project_retirement_fenced_until_it_ends() {
         use crate::project_retirement::{RetirementIntent, acquire_collector};
@@ -5783,7 +5790,6 @@ mod tests {
         assert!(acquire_collector(&store, &repo).is_ok());
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_nx_state_clear_refuses_running_work_then_empties_cache_and_task_data() {
         let scratch = Scratch::directory("nx-state-clear");
@@ -5865,7 +5871,6 @@ mod tests {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     fn seed_move_workspace<H: RuntimeStorageHost>(
         scratch: &Scratch<H>,
         owner: Owner,
@@ -5891,7 +5896,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_owned_index_refresh_relinks_legacy_directories_without_copying() {
         for changed in [false, true] {
@@ -6005,7 +6009,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_owned_index_refresh_keeps_exact_links_and_volume_bytes_untouched() {
         use std::os::unix::fs::MetadataExt as _;
@@ -6094,7 +6097,6 @@ mod tests {
     /// though its links are missing, as after a land; a kept path follows its own rule; and
     /// whatever else holds a removed package's
     /// path, a real directory or a link aimed elsewhere, is left as it is and refuses nothing.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_refresh_leaves_a_removed_package_s_caches_unlinked_until_it_is_tracked_again()
      {
@@ -6525,7 +6527,6 @@ mod tests {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     struct CargoWitness {
         /// The build script's independently reported parent, checked against the kernel.
         pid: libc::pid_t,
@@ -6533,7 +6534,6 @@ mod tests {
 
     /// A real Cargo build stopped inside its build script, after Cargo has taken the profile's
     /// shared `.cargo-lock`. Socket readiness, not a delay, is the proof that it is building.
-    #[cfg(target_os = "macos")]
     async fn running_cargo(
         source: &Path,
         mount: &Path,
@@ -6653,7 +6653,7 @@ fn main() {
             arguments.argv
         );
         let started_pid = child.id().expect("the entry Cargo process is still live");
-        let parent = tokio::process::Command::new("/bin/ps")
+        let parent = tokio::process::Command::new("ps")
             .args(["-o", "ppid=,pgid=", "-p", &pid.to_string()])
             .output_bounded()
             .await
@@ -6697,7 +6697,6 @@ fn main() {
         (child, stream.into_inner(), CargoWitness { pid })
     }
 
-    #[cfg(target_os = "macos")]
     async fn freeze_with_running_cargo(profile: &str, enumerate_before_start: bool) {
         use tokio::io::AsyncWriteExt as _;
 
@@ -6797,19 +6796,16 @@ fn main() {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_skips_a_real_cargo_build_after_quiesce() {
         freeze_with_running_cargo("dev", false).await;
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_skips_a_new_cargo_profile_created_after_enumeration() {
         freeze_with_running_cargo("guard", true).await;
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_admits_an_open_contributed_cache_after_quiesce() {
         let scratch = Scratch::directory("seed-open-cache");
@@ -6860,7 +6856,6 @@ fn main() {
         assert_eq!(contents, b"warm after capture");
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_capture_names_nx_open_lock_contention_for_land_and_reseed() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -6909,9 +6904,7 @@ fn main() {
         let lock = database.with_extension("lock");
         // Stock Nx holds this flock while opening the database. The ready line proves the
         // real open lock is held, without pretending the database itself is already open.
-        let mut opening = std::process::Command::new("/usr/bin/lockf")
-            .arg("-k")
-            .arg(&lock)
+        let mut opening = crate::lock_program::holding(&lock)
             .args(["/bin/sh", "-c", "echo held; read _"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -6957,7 +6950,7 @@ fn main() {
             assert_eq!(named, database);
             assert!(
                 holders.iter().any(|holder| {
-                    holder.pid == pid && holder.command.starts_with("/usr/bin/lockf")
+                    holder.pid == pid && holder.command.starts_with(crate::lock_program::NAME)
                 }),
                 "the refusal names the actual opener: {holders:?}"
             );
@@ -7023,7 +7016,6 @@ fn main() {
     /// An Nx client that opens the landing volume's task database after quiesce is named by
     /// capture admission as `landingHeld`, never treated as an exempt contributed cache
     /// (16_build_volumes.md, Land step 5.4).
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -7050,7 +7042,7 @@ fn main() {
             .await
             .unwrap()
             .expect("the landing volume's task database had no holder at quiesce");
-        let mut holder = std::process::Command::new("/usr/bin/tail")
+        let mut holder = std::process::Command::new("tail")
             .arg("-f")
             .arg(&database)
             .stdout(std::process::Stdio::null())
@@ -7103,7 +7095,7 @@ fn main() {
             holders,
             [DatabaseHolder {
                 pid,
-                command: format!("/usr/bin/tail -f {}", database.display()),
+                command: format!("tail -f {}", database.display()),
             }]
         );
     }
@@ -7111,7 +7103,6 @@ fn main() {
     /// The landing checkout's own Nx daemon, recorded in the landing volume and started by a
     /// client after quiesce, is stopped again by capture admission before the mounted snapshot
     /// (16_build_volumes.md, Land step 5.4).
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_stops_a_late_landing_daemon_before_capture() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -7143,7 +7134,7 @@ fn main() {
             crate::temp_root::TempRoot::new_in(&crate::temp_parent::scratch_parent(), "cs-seal");
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let mut daemon = std::process::Command::new("/bin/cat")
+        let mut daemon = std::process::Command::new("cat")
             .current_dir(&data)
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
@@ -7190,7 +7181,6 @@ fn main() {
         assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_reseed_replaces_the_seed_with_an_open_contributed_cache() {
         let scratch = Scratch::directory("reseed-open-cache");
@@ -7259,7 +7249,6 @@ fn main() {
         assert_eq!(contents, b"warm after capture");
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_retained_seed_keeps_absent_declarations_absent() {
         for retention in [SeedRetention::Retain, SeedRetention::Rebuild] {
@@ -7302,7 +7291,6 @@ fn main() {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_retained_seed_refuses_a_symlink_ancestor_outside_the_snapshot() {
         let scratch = Scratch::directory("mbx-retained-escape");
@@ -7337,7 +7325,6 @@ fn main() {
         assert_eq!(outside_bytes, b"outside the atomic snapshot");
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_seeds_retain_only_marked_paths_without_changing_live_state() {
         let scratch = Scratch::directory("mbx-retained-seeds");
@@ -7477,7 +7464,6 @@ fn main() {
     /// for either fork, and copy nothing into one. Each holds the retained state as the target held
     /// it at its capture, and none of its rebuildable state or clone-invalid files, while the
     /// target's own job keeps its shared hold and writes on.
-    #[cfg(target_os = "macos")]
     async fn mbx_fork_clones_the_live_volume<H: RuntimeStorageHost>(scratch: Scratch<H>) {
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         let target = owner("main", '0');
@@ -7616,7 +7602,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_fork_clones_the_live_volume_and_mints_no_seed() {
         mbx_fork_clones_the_live_volume(Scratch::data_directory("mbx-fork-live")).await;
@@ -7681,7 +7666,6 @@ fn main() {
     /// a seed's capture takes, so a hash the target cached replays in the fork without a remote
     /// read or a rerun. A process holding the database leaves the fork's Nx state empty, as every
     /// other unguarded rebuildable path, and the target keeps what it had.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_fork_inherits_quiet_nx_state() {
         let scratch = Scratch::data_directory("mbx-fork-nx");
@@ -7777,7 +7761,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_fork_refuses_an_exclusive_lifecycle_source_claim_without_fallback() {
         let scratch = Scratch::directory("mbx-retention-exclusive");
@@ -7855,7 +7838,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_retained_seed_refuses_unrecorded_retention_before_snapshotting() {
         let scratch = Scratch::directory("mbx-retention-legacy");
@@ -7890,7 +7872,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_landing_retains_marked_state_under_its_existing_quiet_hold() {
         let scratch = Scratch::directory("mbx-retention-quiet");
@@ -7969,7 +7950,6 @@ fn main() {
     /// A retiring land of an mbx target mints no seed: no fork reads an mbx seed and no kept
     /// workspace reforks from it (16_build_volumes.md, "Targets and seeds"). A `--no-retire`
     /// land's refork reads the target's new seed, so its freeze still mints one.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_land_mints_a_seed_only_for_a_refork() {
         let scratch = Scratch::directory("mbx-seed-reader");
@@ -8041,7 +8021,6 @@ fn main() {
         scratch.release_all();
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_mbx_seed_with_no_retained_paths_creates_no_temporary_snapshot() {
         let scratch = Scratch::directory("mbx-retention-blank");
@@ -8096,7 +8075,6 @@ fn main() {
     /// deletion of it from running; the refresh still publishes the new seed and answers, the
     /// old one committed to `build/.deleting` with its owner record retired and none of its bytes
     /// deleted. The store's deleter leaves it while it is held and deletes it once it is not.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_refresh_journals_a_held_superseded_seed_that_recovery_finishes() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -8121,7 +8099,7 @@ fn main() {
             .unwrap();
         let old = scratch.layout.image(&previous);
         fs::write(old.join("old-seed"), b"superseded").unwrap();
-        let mut holder = std::process::Command::new("/bin/cat")
+        let mut holder = std::process::Command::new("cat")
             .current_dir(&old)
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
@@ -8187,7 +8165,6 @@ fn main() {
 
     /// Fork `destination` from `main`'s seed refreshed for `aim`, as `fork` does, and read the
     /// marker output in the fork's live volume, if any.
-    #[cfg(target_os = "macos")]
     async fn fork_marker<H: RuntimeStorageHost>(
         scratch: &Scratch<H>,
         main: &Owner,
@@ -8231,7 +8208,6 @@ fn main() {
     /// seed was built at the tree it has checked out, and main has that tree checked out too.
     /// Nothing moved `topic`'s branch, so that is no external land: the fork of `topic`
     /// reseeds from `topic`'s own volume and inherits what `topic` built, never main's volume.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
         let scratch = Scratch::data_directory("build-unmoved-fork");
@@ -8400,7 +8376,6 @@ fn main() {
     /// as it is (16_build_volumes.md, "A non-mbx reseed excludes the named non-transactional
     /// writers", step 1): the reseed is skipped at the build hold before the job's volume is
     /// touched, the seed stays, and the skip names the hold.
-    #[cfg(target_os = "macos")]
     async fn a_fork_of_a_source_a_job_writes_keeps_the_seed<H: RuntimeStorageHost>(
         scratch: Scratch<H>,
     ) {
@@ -8471,7 +8446,6 @@ fn main() {
         assert!(reason.contains(&hold.display().to_string()), "{reason}");
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_fork_of_a_source_a_job_writes_keeps_the_seed() {
         a_fork_of_a_source_a_job_writes_keeps_the_seed(Scratch::directory("build-busy-fork")).await;
@@ -8489,7 +8463,6 @@ fn main() {
     /// without building, and keeps inheriting it after main's own volume is written again. The
     /// control (no candidate), the plant (a candidate whose volume holds a marker at another
     /// tree) and a candidate whose image lock is held all leave main's seed where it was.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_fork_after_an_external_land_inherits_the_landed_volume() {
         let scratch = Scratch::data_directory("build-external-land");
@@ -8624,7 +8597,6 @@ fn main() {
     /// adopted the landing volume, that volume holds neither the entry's files nor its row. What
     /// other lands ran reaches a fork through the project's Nx cache (05_gateway.md,
     /// "Publication"), never through the adopted volume.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_adoption_copies_nothing_from_the_target() {
         let scratch = Scratch::directory("adopt-copies-nothing");
@@ -8639,11 +8611,11 @@ fn main() {
             mbx: None,
         };
         let sqlite = |mount: &Path, statement: &str| {
-            let output = std::process::Command::new("/usr/bin/sqlite3")
+            let output = std::process::Command::new("sqlite3")
                 .arg(mount.join("nx/workspace-data/task-v3.db"))
                 .arg(statement)
                 .output_bounded()
-                .unwrap();
+                .expect("run the sqlite3 command-line shell, which this test needs on PATH");
             assert!(output.status.success(), "{output:?}");
             output.stdout
         };
@@ -8716,7 +8688,6 @@ fn main() {
     /// shared, non-waiting flock), hands any hold it gets to a child that keeps it, and only then
     /// exits, so the attempt happens before the stop returns. The reseed's claim, taken before the
     /// stop, refuses that admission, and the reseed captures.
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_reseed_claims_its_source_before_the_keeper_can_restart_the_daemon() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -8754,7 +8725,7 @@ fn main() {
         let socket = sockets.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let admission = sockets.join("admission");
-        let mut daemon = std::process::Command::new("/usr/bin/perl")
+        let mut daemon = std::process::Command::new("perl")
             .args([
                 "-e",
                 r#"use Fcntl qw(:flock);
@@ -8845,7 +8816,6 @@ fn main() {
 
     /// A job admitted on the source before the reseed skips it, and the skip names the process
     /// holding the build hold rather than an empty list of open files.
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_reseed_skipped_by_an_admitted_job_names_the_holds_holder() {
         let scratch = Scratch::directory("reseed-admitted");
@@ -8958,7 +8928,6 @@ fn main() {
             .0
     }
 
-    #[cfg(target_os = "macos")]
     /// What a freeze did, once its superseded seeds are retired as a land retires them after it
     /// lets the target's image lock go.
     #[derive(Debug, Eq, PartialEq)]
@@ -9122,7 +9091,6 @@ fn main() {
 
     /// A git checkout under `root` with `tracked` files (each `{}`) and a `.cowshed.toml`
     /// asking `toml`, everything added to the index.
-    #[cfg(target_os = "macos")]
     fn tracked_checkout(root: &Path, name: &str, toml: &str, tracked: &[&str]) -> PathBuf {
         let checkout = root.join(name);
         fs::create_dir_all(checkout.join(".cowshed")).unwrap();
@@ -9143,10 +9111,8 @@ fn main() {
     }
 
     /// At the test cap, so a mint clones the run's template rather than making one.
-    #[cfg(target_os = "macos")]
     const AT_THE_CAP: &str = "[build]\ncapacity = \"1g\"\n";
 
-    #[cfg(target_os = "macos")]
     fn minted<H: RuntimeStorageHost>(first: &FirstMint<H>) -> MintedVolume {
         match first {
             FirstMint::Minted(owned) => lock(&owned.slot)
@@ -9158,7 +9124,6 @@ fn main() {
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn discovered(paths: Vec<BuildStatePath>) -> Discovered {
         Discovered::Changed {
             paths,
@@ -9176,7 +9141,6 @@ fn main() {
     /// from collection. A checkout in which nothing can name build state gets none minted at all:
     /// no tracked manifest, or only tracked build inputs whose state is the host's.
     /// Once linked, that volume wins over another mint, which settling releases unused.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_main_links_the_volume_minted_beside_its_image_or_releases_it() {
         let scratch = Scratch::directory("build-minted-first");
@@ -9288,7 +9252,6 @@ fn main() {
     /// A tracked-source refusal leaves the volume minted beside main's image to settling,
     /// which releases it. An interrupted first touch's link protects its volume even before
     /// the record is published.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_main_releases_the_volume_minted_beside_its_image_its_first_touch_left() {
         let scratch = Scratch::directory("build-minted-left");
@@ -9344,7 +9307,6 @@ fn main() {
     /// A first touch rejects a volume minted for an earlier capacity request, mints its own,
     /// and settling releases the unused first mint. This checks request selection, not physical
     /// growth, which the resize and adoption scenarios prove on APFS.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_main_mints_its_own_when_the_volume_minted_beside_it_is_another_capacity() {
         let scratch = Scratch::directory("build-minted-resized");
@@ -9390,7 +9352,6 @@ fn main() {
     /// that let the creation's hold go and then claimed the volume anew found it held through the
     /// copy, and once the copy had closed no census could name a holder: "in use, but no process
     /// of this user holds" it.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_main_seeds_its_first_volume_though_a_spawn_copied_its_creation_descriptor() {
         let scratch = Scratch::directory("build-minted-copied");
@@ -9430,7 +9391,6 @@ fn main() {
     /// the claim it was created under, though a spawn's child copied that claim's descriptor
     /// (cowshed-os `fork_lock`): a release that let the creation go and claimed the volume anew
     /// found it held through the copy, and the volume stayed.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_main_releases_its_unlinked_first_volume_though_a_spawn_copied_its_creation_descriptor()
      {
@@ -9533,7 +9493,6 @@ fn main() {
     /// answer releases it on the blocking lane, which dropping the runtime runs or cancels -- and
     /// a cancelled release runs as its task is dropped; under a runtime already shut down, which
     /// refuses the task, it runs at once.
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_a_dropped_adopt_releases_the_volume_minted_beside_main() {
         use std::task::Poll;
@@ -9601,7 +9560,6 @@ fn main() {
     /// holds its volume quiet and after main adopts it. Neither may take the adopted volume.
     /// If main's link later names a lost volume, opening settles it by reforking its seed.
     /// This is a publication/GC race; physical growth is covered by the adoption scenario.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_collection_planned_before_a_land_adopted_never_takes_the_adopted_volume() {
         let scratch = Scratch::directory("build-adopt-rm");
@@ -9755,7 +9713,6 @@ fn main() {
     /// the seed it read ('sync source image …: No such file or directory'). The land waits for
     /// main's image lock before it freezes main's seed, so the new always succeeds, and the land
     /// goes on once the new has linked its fork.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_new_of_the_target_succeeds_whatever_a_concurrent_land_does() {
         let scratch = Scratch::directory("build-land-new");
@@ -9960,7 +9917,6 @@ fn main() {
     /// GC over a record whose image is gone terminates: the record is released, journaled as
     /// `release-imageless-build-volume` naming the record and the missing image, and the next
     /// pass finds nothing left to decide.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_gc_releases_a_record_whose_image_is_gone_and_journals_it() {
         use crate::storage::deletion_log::{
@@ -10033,7 +9989,6 @@ fn main() {
     /// volume was a seed and whose its sidecar said it was: a land's release of main's previous
     /// volume once left no trace at all, and then named nobody; superseded, it names main. A held
     /// volume is not released, and leaves no line.
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_every_build_volume_release_is_journaled() {
         use crate::storage::deletion_log::{
@@ -10113,7 +10068,6 @@ fn main() {
     /// nothing, no collection takes it while the job runs, and the release a job's end owes it
     /// deletes it the moment the hold is gone. A volume recorded anything else is not that
     /// release's to decide.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_held_previous_volume_keeps_its_owner_until_the_jobs_end_releases_it() {
         let scratch = Scratch::directory("build-superseded-held");
@@ -10209,7 +10163,6 @@ fn main() {
     /// it, a first touch it registered and never finished — and nothing another incarnation of
     /// the same name, or another workspace, owns. A volume a job holds refuses the retirement
     /// and keeps its owner record.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_retirement_releases_every_volume_it_owns_and_refuses_while_one_is_held() {
         let scratch = Scratch::directory("build-retire-owned");
@@ -10303,7 +10256,6 @@ fn main() {
     /// bytes, a fork whose intent no longer forms, a registration with no bytes at all — and
     /// leaves one a forming intent or a held creation still owns, and an unregistered image,
     /// which nothing proves anyone's.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_next_open_releases_interrupted_registrations_by_their_ids() {
         let scratch = Scratch::directory("build-registered-recovery");
@@ -10441,7 +10393,6 @@ fn main() {
 
     /// A clone that fails after its registration releases what it registered: no image and no
     /// record of it are left behind, and its source keeps its own.
-    #[cfg(target_os = "macos")]
     #[test]
     fn directory_a_clone_refused_after_registration_leaves_nothing_registered() {
         let scratch = Scratch::directory("build-clone-refused");
@@ -10817,7 +10768,6 @@ fn main() {
     /// after the seed's mark; a later write, made before the move or while its replacement is
     /// cloned, before the seal, refuses the
     /// move as a conflict, keeps the volume and the write, and releases the replacement.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_compaction_moves_main_onto_its_seed_only_without_a_newer_write() {
         let scratch = Scratch::data_directory("compaction-lineage");
@@ -10942,7 +10892,6 @@ fn main() {
 
     /// Main with a seed whose volume holds `seed-marker`, and `topic`, a workspace of its, whose live
     /// volume holds `old-marker` and whose own seed is a clone of that volume.
-    #[cfg(target_os = "macos")]
     struct ReseedFixture {
         scratch: Scratch<crate::storage::directory::DirectoryExecutionHost>,
         main: Owner,
@@ -10957,7 +10906,6 @@ fn main() {
         topic_seed: BuildVolumeId,
     }
 
-    #[cfg(target_os = "macos")]
     fn seed_of_owner(
         scratch: &Scratch<crate::storage::directory::DirectoryExecutionHost>,
         live: &BuildVolumeId,
@@ -10980,7 +10928,6 @@ fn main() {
         Ok(seed)
     }
 
-    #[cfg(target_os = "macos")]
     fn reseed_fixture(
         name: &str,
     ) -> std::result::Result<ReseedFixture, Box<dyn std::error::Error>> {
@@ -11012,7 +10959,6 @@ fn main() {
         })
     }
 
-    #[cfg(target_os = "macos")]
     fn reseed_plan(
         fixture: &ReseedFixture,
         workspace: &Owner,
@@ -11063,7 +11009,6 @@ fn main() {
     /// the seed's tree and placed at the checkout's; HEAD, branch, status and the bytes of a
     /// committed, an edited and an untracked file are as they were; the old volume and the
     /// workspace's old seed are released, and the workspace has one new seed of its own.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_reseed_replaces_only_the_build_volume_with_a_clone_of_the_targets_seed()
     -> Tested {
@@ -11140,7 +11085,6 @@ fn main() {
     /// A reseed refuses, naming the holder and changing nothing, while a job holds the workspace's
     /// build volume or another lifecycle operation holds its image lock; main is refused by name,
     /// with what to run instead. Once nothing holds it, the same reseed replaces the volume.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_reseed_refuses_a_held_volume_and_main_by_name_and_changes_nothing()
     -> Tested {
@@ -11250,7 +11194,6 @@ fn main() {
     /// the target's unit. After a reseed every workspace input whose bytes differ is newer than every
     /// unit of the new volume, an input with the target's bytes takes the target's newer mtime, and
     /// no byte of the source changes.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_a_reseed_leaves_no_unit_newer_than_a_workspace_input_of_other_bytes()
     -> Tested {

@@ -5,8 +5,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use async_trait::async_trait;
-#[cfg(target_os = "macos")]
-use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml::Spanned;
@@ -18,20 +16,18 @@ use cowshed_os::process::fmt_command_failure;
 use super::fstab::FstabPin;
 
 pub mod native;
-#[cfg(target_os = "macos")]
-pub use native::execute_mount_root_provisioning;
 pub use native::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
     UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
-    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    execute_host_uninstall, execute_mount_root_provisioning, plan_host_setup, plan_host_uninstall,
 };
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
 use cowshed_gateway_types::STORE_ROOT;
-/// Where the retired `cowshed.caches` volume (or `<pool>/cowshed/caches` dataset) is mounted on a
+/// Where the retired `cowshed.caches` volume (or `<root>/caches` dataset) is mounted on a
 /// host that still has one. Nothing is provisioned there any more: setup moves what it holds into
 /// the host HOME and `setup --retire-caches-volume` deletes it (03_caches.md).
 pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
@@ -39,7 +35,6 @@ pub const RETIRED_CACHES_MOUNTPOINT: &str = "/private/cowshed/caches";
 /// `cowshed setup` and `doctor` plan it: a command that does not touch Cargo through mbx never
 /// consults the volume.
 pub const APFS_BUILD_CACHE_VOLUME: &str = "cowshed.build-cache";
-#[cfg(target_os = "macos")]
 pub use crate::storage::host_config::BUILD_CACHE_MOUNTPOINT;
 /// The hidden verb setup runs the invoking cowshed as, as root inside its one authorization
 /// session, to name an adopted volume through its held mount root:
@@ -50,10 +45,24 @@ pub const VOLUME_NAME_VERB: &str = "__name-volume";
 /// Where launchd reads the storage mount service from; owned here so the CLI's doctor names the
 /// same file the macOS planner installs.
 pub const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
-pub const ZFS_COWSHED_ROOT: &str = "cowshed";
+/// The last component of every cowshed root dataset, `<parent>/cowshed` (09_substrates.md,
+/// "Fixed dataset hierarchy"): the helper's own definition, so the two cannot disagree.
+pub const ZFS_COWSHED_ROOT: &str = cowshed_helper::name::ROOT_COMPONENT;
 pub const ZFS_STORE_CHILD: &str = "store";
-pub const ZFS_CACHES_CHILD: &str = "caches";
+/// The dataset that holds the one shared mbx cache directory (01b_zfs.md, "The mbx store on a ZFS
+/// host"). Only `cowshed setup` and `doctor` plan it, as they do the APFS build-cache volume.
+pub const ZFS_BUILD_CACHE_CHILD: &str = "build-cache";
+/// The retired caches dataset of an earlier release: kept mounted where it exists, never created.
+pub const ZFS_RETIRED_CACHES_CHILD: &str = "caches";
 pub const ZFS_PROJECTS_CHILD: &str = "projects";
+/// The user property on a root dataset that names the uid cowshed serves there; whoever
+/// administers the root's parent sets it, and it is the whole authorization of the helper
+/// (09_substrates.md, "Privileged helper").
+pub const ZFS_OWNER_PROPERTY: &str = "cowshed:owner";
+/// The user properties that mark a cowshed dataset: the marker of a dataset that is never
+/// mounted, and the attestation beside the marker file of one that is.
+pub const ZFS_ROLE_PROPERTY: &str = "cowshed:role";
+pub const ZFS_VERSION_PROPERTY: &str = "cowshed:version";
 
 /// The store-root names cowshed owns, so no walker mistakes one for a repository owner.
 ///
@@ -309,7 +318,11 @@ pub fn mark_project_owners(store_root: &Path) -> Result<Vec<PathBuf>, OwnerScanE
 }
 
 pub(crate) use cowshed_apfs::device::DISKUTIL;
-const ZFS: &str = "/usr/sbin/zfs";
+/// `zfs`, by its `PATH` name: reads only (`zfs list`, `zfs get`), which need no privilege. Every
+/// mutation goes through [`ZFS_HELPER`] (09_substrates.md, "Privileged helper").
+pub const ZFS: &str = "zfs";
+/// The root helper's program name: found beside the running executable, then on `PATH`.
+pub const ZFS_HELPER: &str = "cowshed-helper";
 const MARKER_VERSION: u32 = 1;
 
 /// Repository-owned settings accepted from `.cowshed.toml`.
@@ -398,14 +411,16 @@ impl CowshedConfig {
     }
 }
 
+/// `[substrate] kind = "zfs"`: the dataset whose `cowshed` child is the host's root dataset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubstrateConfig {
-    pool: String,
+    parent: String,
 }
 
 impl SubstrateConfig {
-    pub fn pool(&self) -> &str {
-        &self.pool
+    /// The root's parent: the pool, or any dataset in it (`<parent>/cowshed` is the root).
+    pub fn parent(&self) -> &str {
+        &self.parent
     }
 }
 
@@ -454,10 +469,10 @@ struct NxSection {
 #[serde(deny_unknown_fields)]
 struct SubstrateSection {
     kind: ExplicitSubstrate,
-    pool: Spanned<String>,
+    parent: Spanned<String>,
 }
 
-/// `[substrate] kind`: only an explicit ZFS pool overrides the filesystem evidence.
+/// `[substrate] kind`: only an explicit ZFS root overrides the filesystem evidence.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ExplicitSubstrate {
@@ -505,11 +520,11 @@ pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
     let substrate = match file.substrate {
         Some(SubstrateSection {
             kind: ExplicitSubstrate::Zfs,
-            pool,
+            parent,
         }) => {
-            let pool = pool.into_inner();
-            validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
-            Some(SubstrateConfig { pool })
+            let parent = parent.into_inner();
+            validate_dataset_name(&parent).map_err(ConfigError::InvalidParent)?;
+            Some(SubstrateConfig { parent })
         }
         None => None,
     };
@@ -917,34 +932,40 @@ pub enum ConfigError {
     },
     #[error("[doc] needs [land]: a doc commit holds the ref turn of the land turn [land] names")]
     DocWithoutLand,
-    #[error("invalid ZFS pool: {0}")]
-    InvalidPool(PoolNameError),
+    #[error("invalid ZFS parent dataset: {0}")]
+    InvalidParent(DatasetNameError),
 }
 
+/// The ZFS dataset a path lies in, and the cowshed root that serves the caller from it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegatedZfsDataset {
     dataset: String,
-    pool: String,
-    cowshed_root_available: bool,
+    root_parent: Option<String>,
 }
 
 impl DelegatedZfsDataset {
+    /// `dataset` contains the path. `root_parent` is the nearest of `dataset` and its ancestors
+    /// whose `cowshed` child carries the caller's `cowshed:owner`, when one does: the gatherer
+    /// asks for those exact names and never lists a pool.
     pub fn new(
         dataset: impl Into<String>,
-        cowshed_root_available: bool,
-    ) -> Result<Self, PoolNameError> {
+        root_parent: Option<String>,
+    ) -> Result<Self, DatasetNameError> {
         let dataset = dataset.into();
-        let mut components = dataset.split('/');
-        let pool = components.next().unwrap_or_default().to_owned();
-        validate_pool_name(&pool)?;
-        if components.any(|component| component.is_empty() || component == "." || component == "..")
-        {
-            return Err(PoolNameError::InvalidDataset(dataset));
+        validate_dataset_name(&dataset)?;
+        if let Some(parent) = &root_parent {
+            validate_dataset_name(parent)?;
+            let contains = dataset == *parent
+                || dataset
+                    .strip_prefix(parent.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'));
+            if !contains {
+                return Err(DatasetNameError::InvalidDataset(parent.clone()));
+            }
         }
         Ok(Self {
             dataset,
-            pool,
-            cowshed_root_available,
+            root_parent,
         })
     }
 
@@ -952,16 +973,13 @@ impl DelegatedZfsDataset {
         &self.dataset
     }
 
-    pub fn pool(&self) -> &str {
-        &self.pool
-    }
-
-    pub fn cowshed_root_available(&self) -> bool {
-        self.cowshed_root_available
+    /// The parent of the cowshed root that serves the caller here, if any.
+    pub fn root_parent(&self) -> Option<&str> {
+        self.root_parent.as_deref()
     }
 }
 
-/// Filesystem evidence gathered for the project root. Gathering it is a platform concern;
+/// Filesystem evidence gathered for the selection anchor. Gathering it is a platform concern;
 /// selection itself remains pure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatFsEvidence {
@@ -985,10 +1003,15 @@ pub enum SelectionEvidence {
     },
     DelegatedContainingDataset {
         dataset: String,
-        pool: String,
+        parent: String,
     },
     ExplicitConfig {
-        pool: String,
+        parent: String,
+    },
+    /// Neither an APFS container nor a ZFS root that names the caller: the store is a directory
+    /// tree of the filesystem that holds it.
+    DirectoryStatFs {
+        fs_type: String,
     },
 }
 
@@ -999,8 +1022,12 @@ pub enum SelectedSubstrate {
         evidence: SelectionEvidence,
     },
     Zfs {
-        pool: String,
+        /// The parent of the root dataset, `<parent>/cowshed`.
+        parent: String,
         evidence: Vec<SelectionEvidence>,
+    },
+    Directory {
+        evidence: SelectionEvidence,
     },
 }
 
@@ -1009,12 +1036,15 @@ impl SelectedSubstrate {
         match self {
             Self::Apfs { .. } => SubstrateKind::Apfs,
             Self::Zfs { .. } => SubstrateKind::Zfs,
+            Self::Directory { .. } => SubstrateKind::Directory,
         }
     }
 
     pub fn evidence(&self) -> &[SelectionEvidence] {
         match self {
-            Self::Apfs { evidence, .. } => std::slice::from_ref(evidence),
+            Self::Apfs { evidence, .. } | Self::Directory { evidence } => {
+                std::slice::from_ref(evidence)
+            }
             Self::Zfs { evidence, .. } => evidence,
         }
     }
@@ -1022,33 +1052,40 @@ impl SelectedSubstrate {
 
 /// Deterministically select from supplied evidence. This function performs no discovery and has no
 /// API through which it could scan APFS containers or ZFS pools.
+///
+/// An explicit `[substrate]` names the ZFS root's parent and wins, unless the anchor already lies
+/// under another root that serves the caller. Without one, an APFS anchor selects its container,
+/// a ZFS anchor selects the root that serves the caller from its dataset chain, and every other
+/// anchor selects the directory store, which any filesystem can hold.
 pub fn select_substrate(
     statfs: StatFsEvidence,
     configured: Option<&SubstrateConfig>,
 ) -> Result<SelectedSubstrate, SelectionError> {
     if let Some(configured) = configured {
-        let pool = configured.pool().to_owned();
-        let mut evidence = vec![SelectionEvidence::ExplicitConfig { pool: pool.clone() }];
+        let parent = configured.parent().to_owned();
+        let mut evidence = vec![SelectionEvidence::ExplicitConfig {
+            parent: parent.clone(),
+        }];
         if let StatFsEvidence::Zfs {
             containing_dataset: Some(dataset),
         } = &statfs
-            && dataset.cowshed_root_available()
+            && let Some(containing) = dataset.root_parent()
         {
-            if dataset.pool() != pool {
-                return Err(SelectionError::AmbiguousPools {
-                    configured: pool,
-                    containing: dataset.pool().to_owned(),
+            if containing != parent {
+                return Err(SelectionError::AmbiguousParents {
+                    configured: parent,
+                    containing: containing.to_owned(),
                 });
             }
             evidence.insert(
                 0,
                 SelectionEvidence::DelegatedContainingDataset {
                     dataset: dataset.dataset().to_owned(),
-                    pool: dataset.pool().to_owned(),
+                    parent: containing.to_owned(),
                 },
             );
         }
-        return Ok(SelectedSubstrate::Zfs { pool, evidence });
+        return Ok(SelectedSubstrate::Zfs { parent, evidence });
     }
 
     match statfs {
@@ -1063,21 +1100,28 @@ pub fn select_substrate(
             container,
         }),
         StatFsEvidence::Apfs { .. } => Err(SelectionError::MissingApfsContainer),
-        StatFsEvidence::Zfs {
-            containing_dataset: Some(dataset),
-        } if dataset.cowshed_root_available() => {
-            let pool = dataset.pool().to_owned();
-            Ok(SelectedSubstrate::Zfs {
-                evidence: vec![SelectionEvidence::DelegatedContainingDataset {
-                    dataset: dataset.dataset().to_owned(),
-                    pool: pool.clone(),
-                }],
-                pool,
+        StatFsEvidence::Zfs { containing_dataset } => {
+            let serving = containing_dataset
+                .as_ref()
+                .and_then(|dataset| Some((dataset.dataset(), dataset.root_parent()?)));
+            Ok(match serving {
+                Some((dataset, parent)) => SelectedSubstrate::Zfs {
+                    evidence: vec![SelectionEvidence::DelegatedContainingDataset {
+                        dataset: dataset.to_owned(),
+                        parent: parent.to_owned(),
+                    }],
+                    parent: parent.to_owned(),
+                },
+                None => SelectedSubstrate::Directory {
+                    evidence: SelectionEvidence::DirectoryStatFs {
+                        fs_type: "zfs".to_owned(),
+                    },
+                },
             })
         }
-        StatFsEvidence::Zfs { .. } | StatFsEvidence::Other { .. } => {
-            Err(SelectionError::ExplicitZfsRequired)
-        }
+        StatFsEvidence::Other { fs_type } => Ok(SelectedSubstrate::Directory {
+            evidence: SelectionEvidence::DirectoryStatFs { fs_type },
+        }),
     }
 }
 
@@ -1085,35 +1129,45 @@ pub fn select_substrate(
 pub enum SelectionError {
     #[error("APFS statfs evidence did not identify its container")]
     MissingApfsContainer,
-    #[error("selection requires explicit [substrate] kind = \"zfs\" and pool")]
-    ExplicitZfsRequired,
     #[error(
-        "configured ZFS pool {configured:?} conflicts with containing delegated pool {containing:?}"
+        "configured ZFS parent {configured:?} conflicts with {containing:?}, whose cowshed root already serves this user here"
     )]
-    AmbiguousPools {
+    AmbiguousParents {
         configured: String,
         containing: String,
     },
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum PoolNameError {
+pub enum DatasetNameError {
     #[error("pool names must be one non-empty component without whitespace or traversal")]
     InvalidPool,
-    #[error("invalid containing dataset {0:?}")]
+    #[error(
+        "invalid dataset {0:?}: a dataset is <pool>[/<component>…] of ASCII letters, digits and `._:-`"
+    )]
     InvalidDataset(String),
 }
 
-fn validate_pool_name(pool: &str) -> Result<(), PoolNameError> {
+fn validate_pool_name(pool: &str) -> Result<(), DatasetNameError> {
     let mut chars = pool.chars();
-    let first = chars.next().ok_or(PoolNameError::InvalidPool)?;
+    let first = chars.next().ok_or(DatasetNameError::InvalidPool)?;
     if first.is_ascii_digit()
         || !matches!(first, 'A'..='Z' | 'a'..='z' | '_')
         || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
     {
-        return Err(PoolNameError::InvalidPool);
+        return Err(DatasetNameError::InvalidPool);
     }
     Ok(())
+}
+
+/// A pool, or a dataset in one, as the helper will accept it: the pool's own grammar for the
+/// first component, the helper's ([`cowshed_helper::name::Dataset`]) for the whole name, so a
+/// name selection accepts is one every helper verb accepts below it.
+fn validate_dataset_name(dataset: &str) -> Result<(), DatasetNameError> {
+    validate_pool_name(dataset.split('/').next().unwrap_or_default())?;
+    cowshed_helper::name::Dataset::parse(dataset)
+        .map(|_| ())
+        .map_err(|_| DatasetNameError::InvalidDataset(dataset.to_owned()))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1121,6 +1175,9 @@ fn validate_pool_name(pool: &str) -> Result<(), PoolNameError> {
 pub enum SubstrateKind {
     Apfs,
     Zfs,
+    /// A store of real directories on whatever filesystem holds it: no volume, no dataset, no
+    /// clone. Its marker says so, so nothing reads a directory store as either of the others.
+    Directory,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1385,7 +1442,8 @@ impl FixturePortClaims {
     }
 
     /// `port`'s claim, handed over without an unbound interval to a reservation of its block.
-    #[cfg(target_os = "macos")]
+    // Its one caller binds a macOS port block; no other host has a block to hand over.
+    #[allow(dead_code)]
     pub(crate) fn take(
         &self,
         port: u16,
@@ -1615,8 +1673,8 @@ impl ExistingStorage {
     }
 }
 
-/// Evidence for only cowshed's fixed storage objects. Callers obtain this by exact APFS volume or
-/// ZFS dataset identity; the type intentionally cannot represent a pool scan.
+/// Evidence for only cowshed's fixed storage objects. Callers obtain this by exact APFS volume,
+/// ZFS dataset or host path identity; the type intentionally cannot represent a pool scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BootstrapEvidence {
     Apfs {
@@ -1630,6 +1688,41 @@ pub enum BootstrapEvidence {
         /// Boxed so four ZFS snapshots do not dwarf the two-snapshot APFS variant.
         projects: Box<ExistingStorage>,
     },
+    /// The store path of a directory store, and who it is provisioned for.
+    Directory {
+        store: ExistingDirectory,
+        owner: DirectoryOwner,
+    },
+}
+
+impl BootstrapEvidence {
+    fn kind(&self) -> SubstrateKind {
+        match self {
+            Self::Apfs { .. } => SubstrateKind::Apfs,
+            Self::Zfs { .. } => SubstrateKind::Zfs,
+            Self::Directory { .. } => SubstrateKind::Directory,
+        }
+    }
+}
+
+/// What one fixed path of a directory store holds, read without following a link. A directory
+/// store has no volume behind a path, so its marker alone says the path is published: there is
+/// no detached or mis-mounted state to repair, and anything that is neither of these two is
+/// refused by the gatherer by name, never planned over.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExistingDirectory {
+    /// No entry, or the owner's own empty directory that a provisioning cut short left without
+    /// its marker: nothing is there to lose, and provisioning creates or completes it.
+    Unpublished,
+    /// The owner's directory carrying its exact marker.
+    Published,
+}
+
+/// The user and group a directory store is provisioned for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryOwner {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1683,8 +1776,9 @@ impl ApfsVolumeProvision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostOperation {
+    /// Attest, by reading, that `required_root` exists and names the caller as its owner.
     VerifyZfsDelegation {
-        pool: String,
+        parent: String,
         required_root: String,
     },
     GuardMountpoint {
@@ -1775,24 +1869,21 @@ pub fn plan_bootstrap(
             plan_apfs(container, &roots, &store, &caches)?
         }
         (
-            SelectedSubstrate::Zfs { pool, .. },
+            SelectedSubstrate::Zfs { parent, .. },
             BootstrapEvidence::Zfs {
                 root,
                 store,
                 caches,
                 projects,
             },
-        ) => plan_zfs(pool, &roots, &root, &store, &caches, &projects)?,
-        (SelectedSubstrate::Apfs { .. }, BootstrapEvidence::Zfs { .. }) => {
-            return Err(PlanError::EvidenceSubstrateMismatch {
-                selected: SubstrateKind::Apfs,
-                evidence: SubstrateKind::Zfs,
-            });
+        ) => plan_zfs(parent, &roots, &root, &store, &caches, &projects)?,
+        (SelectedSubstrate::Directory { .. }, BootstrapEvidence::Directory { store, owner }) => {
+            plan_directory(roots.store(), VolumeRole::Store, store, owner)
         }
-        (SelectedSubstrate::Zfs { .. }, BootstrapEvidence::Apfs { .. }) => {
+        (selected, evidence) => {
             return Err(PlanError::EvidenceSubstrateMismatch {
-                selected: SubstrateKind::Zfs,
-                evidence: SubstrateKind::Apfs,
+                selected: selected.kind(),
+                evidence: evidence.kind(),
             });
         }
     };
@@ -2061,80 +2152,166 @@ fn apfs_mount(mountpoint: &Path, volume: VolumeRef) -> HostOperation {
     }
 }
 
+/// The mode of a directory store's own directories: what a freshly created dataset's or volume's
+/// root has. Everything private inside carries its own mode.
+const DIRECTORY_STORE_MODE: u32 = 0o755;
+
+/// Publish one fixed path of a directory store: every ancestor below `/` is root's and nobody
+/// else's to write, the path itself is the owner's, and its marker goes in last, so a marker's
+/// presence means the whole chain was provisioned.
+pub fn plan_directory(
+    path: &Path,
+    role: VolumeRole,
+    state: ExistingDirectory,
+    owner: DirectoryOwner,
+) -> Vec<HostOperation> {
+    let mut operations = vec![guard(path, role, SubstrateKind::Directory)];
+    if state == ExistingDirectory::Published {
+        return operations;
+    }
+    let mut ancestors: Vec<&Path> = path
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| ancestor.parent().is_some())
+        .collect();
+    ancestors.reverse();
+    operations.extend(
+        ancestors
+            .into_iter()
+            .map(|ancestor| HostOperation::EnsureOwnedDirectory {
+                path: ancestor.to_owned(),
+                uid: 0,
+                gid: 0,
+                mode: DIRECTORY_STORE_MODE,
+            }),
+    );
+    operations.push(HostOperation::EnsureOwnedDirectory {
+        path: path.to_owned(),
+        uid: owner.uid,
+        gid: owner.gid,
+        mode: DIRECTORY_STORE_MODE,
+    });
+    operations.push(marker(
+        path,
+        VolumeMarker::new(role, SubstrateKind::Directory),
+    ));
+    operations
+}
+
+/// The root dataset `<parent>/cowshed`.
+pub fn zfs_root(parent: &str) -> String {
+    zfs_name(parent, ZFS_COWSHED_ROOT)
+}
+
+/// One of the root's fixed children (09_substrates.md, "Fixed dataset hierarchy").
+pub fn zfs_child(parent: &str, child: &str) -> String {
+    zfs_name(&zfs_root(parent), child)
+}
+
 fn plan_zfs(
-    pool: &str,
+    parent: &str,
     roots: &CanonicalRoots,
     root_state: &ExistingStorage,
     store_state: &ExistingStorage,
     caches_state: &ExistingStorage,
     projects_state: &ExistingStorage,
 ) -> Result<Vec<HostOperation>, PlanError> {
-    let root = zfs_name(pool, ZFS_COWSHED_ROOT);
+    let root = zfs_root(parent);
     let store = zfs_name(&root, ZFS_STORE_CHILD);
-    let caches = zfs_name(&root, ZFS_CACHES_CHILD);
+    let caches = zfs_name(&root, ZFS_RETIRED_CACHES_CHILD);
     let projects = zfs_name(&root, ZFS_PROJECTS_CHILD);
     validate_zfs_evidence(root_state, &root)?;
     validate_zfs_evidence(store_state, &store)?;
     validate_zfs_evidence(caches_state, &caches)?;
     validate_zfs_evidence(projects_state, &projects)?;
-    validate_zfs_topology(root_state, store_state, caches_state, projects_state)?;
+    // The root is the administrator's to create: its owner property is the helper's whole
+    // authorization, and no helper verb takes the root itself.
+    if matches!(root_state, ExistingStorage::Absent) {
+        return Err(PlanError::MissingZfsRoot { root });
+    }
     validate_existing_marker(store_state, VolumeRole::Store, SubstrateKind::Zfs)?;
     validate_existing_marker(caches_state, VolumeRole::Caches, SubstrateKind::Zfs)?;
     validate_existing_marker(projects_state, VolumeRole::Projects, SubstrateKind::Zfs)?;
 
     let mut operations = vec![
         HostOperation::VerifyZfsDelegation {
-            pool: pool.to_owned(),
+            parent: parent.to_owned(),
             required_root: root.clone(),
         },
         guard(roots.store(), VolumeRole::Store, SubstrateKind::Zfs),
     ];
-    if matches!(root_state, ExistingStorage::Absent) {
-        operations.push(command(ZFS, ["create", "-o", "mountpoint=none", &root]));
-    }
-    plan_zfs_mounted_dataset(
-        &mut operations,
+    operations.extend(plan_zfs_mounted_dataset(
+        &root,
         &store,
         roots.store(),
         VolumeRole::Store,
         store_state,
-    );
+        DatasetMountpoint::Set,
+    )?);
     // The caches dataset is retired: never created, and an existing one is kept mounted so the
-    // migration can move what it holds (03_caches.md, "Retiring the caches volume").
+    // migration can move what it holds (03_caches.md, "Retiring the caches volume"). Its
+    // mountpoint is the one its own release set; the helper sets none outside the host paths.
     if !matches!(caches_state, ExistingStorage::Absent) {
         let mountpoint = Path::new(RETIRED_CACHES_MOUNTPOINT);
         operations.push(guard(mountpoint, VolumeRole::Caches, SubstrateKind::Zfs));
-        plan_zfs_mounted_dataset(
-            &mut operations,
+        operations.extend(plan_zfs_mounted_dataset(
+            &root,
             &caches,
             mountpoint,
             VolumeRole::Caches,
             caches_state,
-        );
+            DatasetMountpoint::Keep,
+        )?);
     }
     if matches!(projects_state, ExistingStorage::Absent) {
-        operations.push(command(ZFS, ["create", "-o", "mountpoint=none", &projects]));
-        operations.push(zfs_marker(&projects, VolumeRole::Projects));
+        operations.push(helper(
+            &root,
+            "create",
+            [projects, "mountpoint=none".to_owned()]
+                .into_iter()
+                .chain(zfs_marker(VolumeRole::Projects)),
+        ));
     }
     Ok(operations)
 }
 
-fn validate_zfs_topology(
-    root: &ExistingStorage,
-    store: &ExistingStorage,
-    caches: &ExistingStorage,
-    projects: &ExistingStorage,
-) -> Result<(), PlanError> {
-    if matches!(root, ExistingStorage::Absent)
-        && [store, caches, projects]
-            .into_iter()
-            .any(|state| !matches!(state, ExistingStorage::Absent))
-    {
-        return Err(PlanError::ImpossibleStorageTopology(
-            "ZFS root cannot be absent when a child dataset exists",
-        ));
-    }
-    Ok(())
+/// The build-cache dataset `<parent>/cowshed/build-cache` at `mountpoint`, planned apart from
+/// [`plan_bootstrap`] as the APFS build-cache volume is ([`plan_apfs_build_cache`]): only setup
+/// and doctor consult it.
+pub fn plan_zfs_build_cache(
+    parent: &str,
+    mountpoint: &Path,
+    state: &ExistingStorage,
+) -> Result<Vec<HostOperation>, PlanError> {
+    let root = zfs_root(parent);
+    let dataset = zfs_name(&root, ZFS_BUILD_CACHE_CHILD);
+    validate_zfs_evidence(state, &dataset)?;
+    validate_existing_marker(state, VolumeRole::BuildCache, SubstrateKind::Zfs)?;
+    let mut operations = vec![guard(
+        mountpoint,
+        VolumeRole::BuildCache,
+        SubstrateKind::Zfs,
+    )];
+    operations.extend(plan_zfs_mounted_dataset(
+        &root,
+        &dataset,
+        mountpoint,
+        VolumeRole::BuildCache,
+        state,
+        DatasetMountpoint::Set,
+    )?);
+    Ok(operations)
+}
+
+/// Destroy the retired caches dataset once it holds nothing but its marker (03_caches.md,
+/// "Retiring the caches volume", step 4): unmounted, then destroyed, and nothing below it.
+pub fn plan_zfs_retire_caches(parent: &str) -> Vec<HostOperation> {
+    let root = zfs_root(parent);
+    let caches = zfs_name(&root, ZFS_RETIRED_CACHES_CHILD);
+    vec![
+        helper(&root, "unmount", [caches.clone()]),
+        helper(&root, "destroy", [caches]),
+    ]
 }
 
 fn validate_existing_marker(
@@ -2166,13 +2343,12 @@ fn validate_existing_marker(
 fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), PlanError> {
     if matches!(
         state,
-        ExistingStorage::MountedIncomplete { .. }
-            | ExistingStorage::DetachedIncomplete { .. }
+        ExistingStorage::DetachedIncomplete { .. }
             | ExistingStorage::MisMountedIncomplete { .. }
             | ExistingStorage::FoundElsewhere { .. }
     ) {
         return Err(PlanError::ImpossibleStorageTopology(
-            "an APFS volume state cannot describe a ZFS dataset",
+            APFS_STATE_FOR_A_DATASET,
         ));
     }
     if let Some(actual) = state.exact_identifier()
@@ -2186,58 +2362,63 @@ fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), 
     Ok(())
 }
 
+const APFS_STATE_FOR_A_DATASET: &str = "an APFS volume state cannot describe a ZFS dataset";
+
+/// Whether mounting an existing dataset first sets its mountpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatasetMountpoint {
+    Set,
+    Keep,
+}
+
 fn plan_zfs_mounted_dataset(
-    operations: &mut Vec<HostOperation>,
+    root: &str,
     dataset: &str,
     mountpoint: &Path,
     role: VolumeRole,
     state: &ExistingStorage,
-) {
-    match state {
-        ExistingStorage::MountedValid { .. } => {}
-        ExistingStorage::Absent => {
-            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
-            operations.push(command(
-                ZFS,
-                [
-                    "create",
-                    "-o",
-                    &format!("mountpoint={}", mountpoint.display()),
-                    dataset,
-                ],
-            ));
-            operations.push(zfs_marker(dataset, role));
-            operations.push(marker(
-                mountpoint,
-                VolumeMarker::new(role, SubstrateKind::Zfs),
-            ));
-        }
+    existing: DatasetMountpoint,
+) -> Result<Vec<HostOperation>, PlanError> {
+    let at = format!("mountpoint={}", mountpoint.display());
+    Ok(match state {
+        ExistingStorage::MountedValid { .. } => Vec::new(),
+        // `create` mounts the dataset, making the mountpoint's directories as root, and hands
+        // its root directory to the caller; the marker file is then the caller's to write.
+        ExistingStorage::Absent => vec![
+            helper(
+                root,
+                "create",
+                [dataset.to_owned(), at].into_iter().chain(zfs_marker(role)),
+            ),
+            marker(mountpoint, VolumeMarker::new(role, SubstrateKind::Zfs)),
+        ],
         ExistingStorage::ExistingUnmounted { .. } => {
-            operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
-            operations.push(command(
-                ZFS,
-                [
-                    "set".to_owned(),
-                    format!("mountpoint={}", mountpoint.display()),
-                    dataset.to_owned(),
-                ],
-            ));
-            operations.push(command(ZFS, ["mount", dataset]));
+            let mut operations = Vec::with_capacity(3);
+            if existing == DatasetMountpoint::Set {
+                operations.push(helper(root, "set", [dataset.to_owned(), at]));
+            }
+            operations.push(helper(root, "mount", [dataset.to_owned()]));
             operations.push(guard(mountpoint, role, SubstrateKind::Zfs));
+            operations
         }
-        ExistingStorage::MountedIncomplete { .. } => {
-            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
+        // Mounted where it belongs and still empty, without its marker: a provisioning cut
+        // short between the create and the marker.
+        ExistingStorage::MountedIncomplete { .. } => vec![
+            helper(
+                root,
+                "set",
+                std::iter::once(dataset.to_owned()).chain(zfs_marker(role)),
+            ),
+            marker(mountpoint, VolumeMarker::new(role, SubstrateKind::Zfs)),
+        ],
+        ExistingStorage::DetachedIncomplete { .. }
+        | ExistingStorage::MisMountedIncomplete { .. }
+        | ExistingStorage::FoundElsewhere { .. } => {
+            return Err(PlanError::ImpossibleStorageTopology(
+                APFS_STATE_FOR_A_DATASET,
+            ));
         }
-        ExistingStorage::DetachedIncomplete { .. } => {
-            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
-        }
-        ExistingStorage::MisMountedIncomplete { .. } => {
-            unreachable!("incomplete APFS evidence was rejected for ZFS planning")
-        }
-        ExistingStorage::FoundElsewhere { .. } => {
-            unreachable!("cross-container APFS evidence was rejected for ZFS planning")
-        }
-    }
+    })
 }
 
 fn guard(path: &Path, role: VolumeRole, substrate: SubstrateKind) -> HostOperation {
@@ -2255,27 +2436,27 @@ fn marker(root: &Path, marker: VolumeMarker) -> HostOperation {
     }
 }
 
-fn command(
-    program: &'static str,
-    args: impl IntoIterator<Item = impl Into<String>>,
-) -> HostOperation {
-    HostOperation::RunCommand(HostCommand::new(program, args))
-}
-
 fn zfs_name(parent: &str, child: &str) -> String {
     format!("{parent}/{child}")
 }
 
-fn zfs_marker(dataset: &str, role: VolumeRole) -> HostOperation {
-    command(
-        ZFS,
-        [
-            "set".to_owned(),
-            format!("org.cowshed:version={}", marker_version(role)),
-            format!("org.cowshed:role={role}"),
-            dataset.to_owned(),
-        ],
-    )
+/// One invocation of the root helper: `cowshed-helper <root> <verb> …`, which runs exactly one
+/// `zfs` mutation on datasets strictly below `root` (09_substrates.md, "Privileged helper").
+fn helper(root: &str, verb: &str, arguments: impl IntoIterator<Item = String>) -> HostOperation {
+    HostOperation::RunCommand(HostCommand::new(
+        ZFS_HELPER,
+        [root.to_owned(), verb.to_owned()]
+            .into_iter()
+            .chain(arguments),
+    ))
+}
+
+/// The user properties that mark a dataset as `role`'s, as helper property arguments.
+fn zfs_marker(role: VolumeRole) -> [String; 2] {
+    [
+        format!("{ZFS_VERSION_PROPERTY}={}", marker_version(role)),
+        format!("{ZFS_ROLE_PROPERTY}={role}"),
+    ]
 }
 
 impl fmt::Display for VolumeRole {
@@ -2310,6 +2491,10 @@ pub enum PlanError {
     },
     #[error("impossible existing-storage topology: {0}")]
     ImpossibleStorageTopology(&'static str),
+    #[error(
+        "ZFS root {root} does not exist; whoever administers its parent creates it once, naming the user it serves: zfs create -o mountpoint=none -o cowshed:owner=<uid> {root}"
+    )]
+    MissingZfsRoot { root: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2356,7 +2541,9 @@ impl fmt::Display for HostCommandFailure {
 /// Narrow synchronous host boundary. Implementations may block and therefore must only be called
 /// by a [`BlockingLane`]. No planning function accepts this capability.
 pub trait BootstrapHost: Send + Sync {
-    fn verify_zfs_delegation(&self, pool: &str, required_root: &str) -> Result<(), HostError>;
+    /// Attest, by reading, that `required_root` is `parent`'s `cowshed` child and names the
+    /// caller as its owner.
+    fn verify_zfs_delegation(&self, parent: &str, required_root: &str) -> Result<(), HostError>;
     fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError>;
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError>;
     fn ensure_owned_directory(
@@ -2525,10 +2712,10 @@ where
 {
     match operation {
         HostOperation::VerifyZfsDelegation {
-            pool,
+            parent,
             required_root,
         } => host
-            .verify_zfs_delegation(pool, required_root)
+            .verify_zfs_delegation(parent, required_root)
             .map_err(BootstrapExecutionError::Host),
         HostOperation::GuardMountpoint {
             path,
@@ -2605,115 +2792,6 @@ where
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn parse_created_apfs_identifier(
-    stdout: &[u8],
-) -> Result<String, BootstrapExecutionError> {
-    let stdout = std::str::from_utf8(stdout).map_err(|_| {
-        BootstrapExecutionError::CreatedVolumeOutput(
-            "diskutil addVolume output is not UTF-8".to_owned(),
-        )
-    })?;
-    let prefix = "Created new APFS Volume ";
-    let identifiers: Vec<_> = stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix(prefix))
-        .collect();
-    if identifiers.len() != 1 {
-        return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
-            "expected one created DeviceIdentifier, found {}",
-            identifiers.len()
-        )));
-    }
-    let identifier = identifiers[0];
-    // `device` owns the `diskN[sM…]` grammar, and the inventory parser this identifier is later
-    // compared against uses it. Depth one is an APFS volume: `disk3` is a container and
-    // `disk3s1s4` is a snapshot of a slice, neither of which addVolume returns.
-    if cowshed_apfs::device::identifier_depth(identifier) != Some(1) {
-        return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
-            "malformed created DeviceIdentifier {identifier:?}"
-        )));
-    }
-    Ok(identifier.to_owned())
-}
-
-#[cfg(target_os = "macos")]
-/// Whether a newly created volume is still detached, or was mounted at the
-/// default `/Volumes/<name>` by the system before the attestation ran.
-///
-/// The caller unmounts the latter before mounting the volume at its private
-/// mountpoint, so provisioning converges to the same state on either host.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CreatedMountState {
-    Unmounted,
-    AutoMounted,
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn attest_created_apfs_info(
-    bytes: &[u8],
-    expected_identifier: &str,
-    expected_container: &str,
-    expected_name: &str,
-) -> Result<CreatedMountState, BootstrapExecutionError> {
-    let value = Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| BootstrapExecutionError::CreatedVolumeAttestation(error.to_string()))?;
-    let dictionary = value.as_dictionary().ok_or_else(|| {
-        BootstrapExecutionError::CreatedVolumeAttestation(
-            "diskutil info plist root is not a dictionary".to_owned(),
-        )
-    })?;
-    for (key, expected) in [
-        ("DeviceIdentifier", expected_identifier),
-        ("APFSContainerReference", expected_container),
-        ("VolumeName", expected_name),
-        ("FilesystemType", "apfs"),
-    ] {
-        let actual = dictionary.get(key).and_then(Value::as_string);
-        if actual != Some(expected) {
-            return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
-                "{key} is {actual:?}, expected {expected:?}"
-            )));
-        }
-    }
-    let mount_state = match dictionary.get("MountPoint") {
-        None => CreatedMountState::Unmounted,
-        Some(Value::String(value)) if value.is_empty() => CreatedMountState::Unmounted,
-        // Some macOS releases mount a freshly created APFS volume at its default
-        // location regardless of `-nomount`; both cowshed volumes on a macOS 26
-        // host are observed there immediately after `diskutil apfs addVolume`.
-        // Only that exact default is tolerated — any other mountpoint means the
-        // volume is not the pristine object this attestation is vouching for.
-        Some(Value::String(value)) if *value == format!("/Volumes/{expected_name}") => {
-            CreatedMountState::AutoMounted
-        }
-        Some(other) => {
-            return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
-                "new APFS volume is mounted at an unexpected location: {other:?}"
-            )));
-        }
-    };
-    if !matches!(dictionary.get("APFSSnapshot"), Some(Value::Boolean(false))) {
-        return Err(BootstrapExecutionError::CreatedVolumeAttestation(
-            "new APFS object is not an ordinary volume".to_owned(),
-        ));
-    }
-    for role_key in ["APFSVolumeRole", "APFSVolumeRoles", "Roles"] {
-        match dictionary.get(role_key) {
-            None => {}
-            Some(Value::Array(values)) if values.is_empty() => {}
-            Some(Value::String(value)) if value.is_empty() => {}
-            Some(_) => {
-                return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
-                    "new APFS volume unexpectedly has {role_key} metadata"
-                )));
-            }
-        }
-    }
-    Ok(mount_state)
-}
-
 #[derive(Debug, Error)]
 pub enum BootstrapExecutionError {
     #[error(transparent)]
@@ -2770,33 +2848,6 @@ mod tests {
         }
         for name in ["acme", "widget", "cache", "temp", ""] {
             assert!(!is_reserved_store_namespace(name), "{name}");
-        }
-    }
-
-    /// `device::identifier_depth` is the one device grammar, and it rejects leading zeros because
-    /// the kernel never prints them and these identifiers gate mount and detach decisions by
-    /// textual comparison. A volume attested as `disk01s1` would be recorded under a spelling the
-    /// inventory parser refuses, so provisioning could never match it to the device again.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn created_volume_identifier_shares_the_device_grammar() {
-        use super::parse_created_apfs_identifier;
-
-        assert_eq!(
-            parse_created_apfs_identifier(b"Created new APFS Volume disk3s5\n").unwrap(),
-            "disk3s5"
-        );
-        for rejected in [
-            &b"Created new APFS Volume disk01s1\n"[..],
-            b"Created new APFS Volume disk3s1s4\n",
-            b"Created new APFS Volume disk3\n",
-            b"Created new APFS Volume disk3sx\n",
-        ] {
-            assert!(
-                parse_created_apfs_identifier(rejected).is_err(),
-                "{}",
-                String::from_utf8_lossy(rejected)
-            );
         }
     }
 

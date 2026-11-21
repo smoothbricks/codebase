@@ -329,9 +329,16 @@ fn link(home: &Path, program: &Path) -> Result<MbxInstall> {
     })
 }
 
-/// The flake directory this build ships, found by walking up from the running executable:
-/// `dist/bin/<platform>/cowshed` in a package and `target/<profile>/cowshed` in a checkout are
-/// both below the package root that carries `nix/mbx`.
+/// The file Cargo keeps in every profile directory it builds into (`target/<profile>`, and
+/// `target/<triple>/<profile>`): an executable beside one is a build run from where Cargo left it.
+const CARGO_PROFILE_LOCK: &str = ".cargo-lock";
+
+/// The flake directory this build ships (14_nix.md, "mbx"): the first `nix/mbx` that holds a
+/// `flake.nix` above the running executable, which is the package root for a packaged build
+/// (`dist/bin/<platform>/cowshed`). A build run from its Cargo profile directory has no package
+/// above it, because the target directory is the workspace's, or a link to one outside the
+/// checkout, so it looks next above the crate sources it was compiled from: the flake of the
+/// checkout that built it. An installed package never takes that second walk.
 pub fn flake_directory() -> Result<PathBuf> {
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -341,25 +348,37 @@ pub fn flake_directory() -> Result<PathBuf> {
                 "reinstall cowshed",
             )
         })?;
-    flake_directory_from(&executable)
+    flake_directory_from(&executable, Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
-fn flake_directory_from(search_from: &Path) -> Result<PathBuf> {
+/// [`flake_directory`] for `executable`, a build of the crate at `manifest_directory`. The
+/// filesystem is read and nothing else: every directory above `executable`, then, only when
+/// `executable` lies in a Cargo profile directory, `manifest_directory` and every directory above
+/// it. The error names every candidate of the walks it took.
+fn flake_directory_from(executable: &Path, manifest_directory: &Path) -> Result<PathBuf> {
     let mut searched = Vec::new();
-    for ancestor in search_from.ancestors().skip(1) {
-        let candidate = FLAKE_DIRECTORY
-            .iter()
-            .fold(ancestor.to_path_buf(), |path, part| path.join(part));
-        if candidate.join(FLAKE_MANIFEST).is_file() {
-            return Ok(candidate);
-        }
-        searched.push(candidate);
+    if let Some(flake) = flake_above(executable.ancestors().skip(1), &mut searched) {
+        return Ok(flake);
     }
+    let cargo_built = executable
+        .parent()
+        .is_some_and(|profile| profile.join(CARGO_PROFILE_LOCK).is_file());
+    if cargo_built && let Some(flake) = flake_above(manifest_directory.ancestors(), &mut searched) {
+        return Ok(flake);
+    }
+    let sources = if cargo_built {
+        format!(
+            " or above the sources it was built from, {}",
+            manifest_directory.display()
+        )
+    } else {
+        String::new()
+    };
     Err(CowshedError::environment_missing(
         format!(
-            "could not find the mbx flake ({}/{FLAKE_MANIFEST}) above {}; looked in {}",
+            "could not find the mbx flake ({}/{FLAKE_MANIFEST}) above {}{sources}; looked in {}",
             FLAKE_DIRECTORY.join("/"),
-            search_from.display(),
+            executable.display(),
             searched
                 .iter()
                 .map(|path| path.display().to_string())
@@ -368,6 +387,24 @@ fn flake_directory_from(search_from: &Path) -> Result<PathBuf> {
         ),
         "reinstall cowshed; the npm package ships nix/mbx and this install is missing it",
     ))
+}
+
+/// The first of `roots` whose [`FLAKE_DIRECTORY`] holds a [`FLAKE_MANIFEST`]; every candidate
+/// that does not is added to `searched`.
+fn flake_above<'a>(
+    roots: impl Iterator<Item = &'a Path>,
+    searched: &mut Vec<PathBuf>,
+) -> Option<PathBuf> {
+    for root in roots {
+        let candidate = FLAKE_DIRECTORY
+            .iter()
+            .fold(root.to_path_buf(), |path, part| path.join(part));
+        if candidate.join(FLAKE_MANIFEST).is_file() {
+            return Some(candidate);
+        }
+        searched.push(candidate);
+    }
+    None
 }
 
 /// What setup or adopt added to mbx's two target-collection lists (03_caches.md, "mbx"): the
@@ -603,22 +640,164 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Where setup finds its flake, by the layout the executable runs from (14_nix.md, "mbx"):
+    /// above the executable wherever one is there, above the sources the build was compiled from
+    /// only for an executable in a Cargo profile directory, and nowhere else.
     #[test]
-    fn the_flake_is_found_from_both_shipped_binary_layouts() {
-        let package = scratch("layouts");
-        let flake = package.join("nix").join("mbx");
-        std::fs::create_dir_all(&flake).unwrap();
-        std::fs::write(flake.join(FLAKE_MANIFEST), b"{}").unwrap();
-        for relative in [
-            ["dist", "bin", "darwin-arm64", "cowshed"].as_slice(),
-            ["target", "release", "cowshed"].as_slice(),
-        ] {
-            let executable = relative
+    fn the_flake_is_found_above_the_executable_or_above_a_cargo_builds_sources() {
+        /// Which walk answers, or that none does.
+        enum Found {
+            AbovePackage,
+            AboveSources,
+            Nowhere { names_the_source_walk: bool },
+        }
+        struct Case {
+            name: &'static str,
+            /// The executable, below the package root.
+            executable: &'static [&'static str],
+            /// Whether Cargo's lock lies beside the executable.
+            cargo_profile: bool,
+            /// Whether the package root above the executable carries the flake.
+            package_flake: bool,
+            /// Whether the checkout above the manifest directory carries the flake.
+            source_flake: bool,
+            found: Found,
+        }
+        let cases = [
+            Case {
+                name: "packaged",
+                executable: &["dist", "bin", "linux-x64", "cowshed"],
+                cargo_profile: false,
+                package_flake: true,
+                source_flake: false,
+                found: Found::AbovePackage,
+            },
+            Case {
+                name: "package-target",
+                executable: &["target", "release", "cowshed"],
+                cargo_profile: true,
+                package_flake: true,
+                source_flake: true,
+                found: Found::AbovePackage,
+            },
+            Case {
+                name: "cargo-profile",
+                executable: &["target", "debug", "cowshed"],
+                cargo_profile: true,
+                package_flake: false,
+                source_flake: true,
+                found: Found::AboveSources,
+            },
+            Case {
+                name: "cargo-triple-profile",
+                executable: &["target", "x86_64-unknown-linux-gnu", "release", "cowshed"],
+                cargo_profile: true,
+                package_flake: false,
+                source_flake: true,
+                found: Found::AboveSources,
+            },
+            Case {
+                name: "cargo-profile-no-flake",
+                executable: &["target", "debug", "cowshed"],
+                cargo_profile: true,
+                package_flake: false,
+                source_flake: false,
+                found: Found::Nowhere {
+                    names_the_source_walk: true,
+                },
+            },
+            Case {
+                name: "installed-beside-sources",
+                executable: &["dist", "bin", "linux-x64", "cowshed"],
+                cargo_profile: false,
+                package_flake: false,
+                source_flake: true,
+                found: Found::Nowhere {
+                    names_the_source_walk: false,
+                },
+            },
+        ];
+        let flake_in = |root: &Path, present: bool| {
+            let flake = FLAKE_DIRECTORY
+                .iter()
+                .fold(root.to_path_buf(), |path, part| path.join(part));
+            if present {
+                std::fs::create_dir_all(&flake).unwrap();
+                std::fs::write(flake.join(FLAKE_MANIFEST), b"{}").unwrap();
+            }
+            flake
+        };
+        for case in cases {
+            let name = case.name;
+            let root = scratch(&format!("flake-{name}"));
+            // The executable's tree and the checkout share no ancestor that could carry a flake.
+            let package = root.join("built");
+            let checkout = root.join("checkout");
+            let manifest = checkout.join("crates").join("cowshed-cli");
+            std::fs::create_dir_all(&manifest).unwrap();
+            let executable = case
+                .executable
                 .iter()
                 .fold(package.clone(), |path, part| path.join(part));
-            assert_eq!(flake_directory_from(&executable).unwrap(), flake);
+            let profile = executable.parent().unwrap();
+            std::fs::create_dir_all(profile).unwrap();
+            if case.cargo_profile {
+                std::fs::write(profile.join(CARGO_PROFILE_LOCK), b"").unwrap();
+            }
+            let package_flake = flake_in(&package, case.package_flake);
+            let source_flake = flake_in(&checkout, case.source_flake);
+            let nearest_to_sources = flake_in(&manifest, false);
+
+            let found = flake_directory_from(&executable, &manifest);
+            match case.found {
+                Found::AbovePackage => assert_eq!(found.unwrap(), package_flake, "{name}"),
+                Found::AboveSources => assert_eq!(found.unwrap(), source_flake, "{name}"),
+                Found::Nowhere {
+                    names_the_source_walk,
+                } => {
+                    let error = found.expect_err(name);
+                    assert_eq!(
+                        error.code,
+                        cowshed_core::ErrorCode::EnvironmentMissing,
+                        "{name}"
+                    );
+                    let message = &error.message;
+                    let looked_in = |candidate: &Path| {
+                        message
+                            .split_once("; looked in ")
+                            .expect("the candidates")
+                            .1
+                            .split(", ")
+                            .any(|listed| Path::new(listed) == candidate)
+                    };
+                    assert!(
+                        message.starts_with(&format!(
+                            "could not find the mbx flake (nix/mbx/flake.nix) above {}",
+                            executable.display()
+                        )),
+                        "{name}: {message}"
+                    );
+                    assert!(looked_in(&package_flake), "{name}: {message}");
+                    assert!(
+                        looked_in(&flake_in(profile, false)),
+                        "{name}: the walk starts at the executable's directory: {message}"
+                    );
+                    for candidate in [&nearest_to_sources, &source_flake] {
+                        assert_eq!(
+                            looked_in(candidate),
+                            names_the_source_walk,
+                            "{name}: {message}"
+                        );
+                    }
+                    assert_eq!(
+                        message.contains(&manifest.display().to_string()),
+                        names_the_source_walk,
+                        "{name}: {message}"
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
         }
-        let _ = std::fs::remove_dir_all(&package);
     }
 
     #[test]

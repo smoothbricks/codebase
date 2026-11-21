@@ -27,6 +27,7 @@ mod repo_mirror;
 #[cfg(test)]
 #[path = "../../cowshed-core/tests/support/sealed_segments.rs"]
 mod sealed_segments;
+mod session_endpoint;
 mod sim_broker;
 mod task_server;
 mod telemetry;
@@ -81,6 +82,7 @@ pub use repo_mirror::{
     GATEWAY_GIT_FETCH_HELPER_ARG, GitFetchHelperError, MirrorInfo, RepoFetchOutcome, RepoFetchPlan,
     RepoMirrorError, RepoMirrorRequest, RepoTransport, run_gateway_git_fetch_helper,
 };
+pub use session_endpoint::data_socket_root;
 pub use sim_broker::{
     SimBrokerError, SimCommand, SimCommandOutput, SimDevice, SimGrant, SimInstallApproval,
     SimProjectConfig, SimRequest, SimResult, SimRunner,

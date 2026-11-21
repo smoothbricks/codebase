@@ -1,16 +1,18 @@
 //! Commands that run in warm exec hosts: the supervisor's side of [`super::shell_host`].
 //!
 //! A job keeps its own anonymous stdin/stdout/stderr pipes, pumped and quota-accounted by the
-//! supervisor exactly as for a one-shot child, and its exact exit. On Linux each command enters
-//! its controller-owned cgroup before argv exec or script interpretation; TERM uses retained
-//! cgroup members and KILL uses `cgroup.kill`, never the warm host's group. The capability survives
-//! host loss. On macOS the host retains the command's group leader until the job concludes, so
-//! signals still reach descendants that outlive it. Cold activation remains owned by its host.
+//! supervisor exactly as for a one-shot child, and its exact exit. Cold activation remains owned
+//! by its host. How a command's start is handed to its host and observed is the platform's
+//! (`shell_job/linux.rs`, `shell_job/macos.rs`): where a job has a kernel membership, each
+//! command enters it before argv exec or script interpretation, and its signals go to that
+//! membership, never the warm host's group, a capability that survives host loss. Where it has
+//! none, the host retains the command's group leader until the job concludes, so signals still
+//! reach descendants that outlive it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
@@ -26,8 +28,6 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::{mpsc, oneshot};
 
 use super::child_fence::{ChildFence, NotSignalled};
-#[cfg(target_os = "linux")]
-use super::job_cgroup::JobCgroup;
 use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, Inherited, MAX_FRAME_BYTES,
@@ -44,20 +44,30 @@ use super::shell_watch::{
     decode_direnv_watches,
 };
 use super::supervisor::{
-    OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess, SandboxEnvironment, StdinLane,
-    process_termination_from_wait, run_system_output, run_system_stdin,
+    CommandPlacement, JobMembership, OwnedProcess, ProcessEvent, ProcessSignal, RunningProcess,
+    SandboxEnvironment, StdinLane, process_termination_from_wait, run_system_output,
+    run_system_stdin,
 };
 use crate::api::dto::{ExitStatus, JobId, Sha256Digest};
 use crate::error::{CowshedError, Result};
-use crate::exec::{
-    ExecError, ProfileLaunch, SANDBOX_EXEC, classify_spawn_error, prepare_child_descriptors,
-};
+use crate::exec::{ExecError, ProfileLaunch, classify_spawn_error, prepare_child_descriptors};
 use crate::storage::job_artifact::StreamKind;
 use cowshed_os::fork_lock::Spawn as _;
 
 #[path = "shell_evaluation.rs"]
 mod evaluation;
 use evaluation::{ActivationGate, Tee};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::pipe_with;
 
 /// Everything that makes one warm shell interchangeable with another: the same profile (mode
 /// and grants) bound to the same build volume, the same sandbox environment, the same `.envrc`
@@ -121,8 +131,8 @@ pub(super) enum HostCommand {
 /// One command admitted to run in a warm shell.
 pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
-    #[cfg(target_os = "linux")]
-    pub cgroup: Arc<JobCgroup>,
+    /// Where the command is placed before it runs anything of the job's.
+    pub placement: CommandPlacement,
     pub command: HostCommand,
     pub cwd: PathBuf,
     /// The executed-child profile the supervisor rendered once for its authority.
@@ -134,12 +144,10 @@ pub(super) struct PooledSpawn<'a> {
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
-    /// The job's jobserver and, on macOS, its class nice, which the command alone runs under, never
-    /// its host.
+    /// The job's jobserver and count, which the command alone runs under, never its host.
     pub cpu: &'a super::supervisor::CpuPlacement,
     /// Whether the project has the mbx capability, which names the job's pool priority.
     pub mbx: bool,
-    #[cfg(target_os = "macos")]
     pub monitor: super::process_monitor::ProcessMonitor,
 }
 
@@ -230,10 +238,7 @@ impl WorkspaceShells {
             stderr,
             events.clone(),
         ));
-        let control = Arc::new(JobControl::new(
-            #[cfg(target_os = "linux")]
-            Arc::clone(&spawn.cgroup),
-        ));
+        let control = Arc::new(JobControl::new(spawn.placement.membership().cloned()));
         let (release, released) = oneshot::channel();
         tokio::spawn(drive(
             pool,
@@ -246,11 +251,7 @@ impl WorkspaceShells {
                 command: spawn.command,
                 cwd: spawn.cwd,
                 overlay,
-                #[cfg(target_os = "macos")]
-                nice: spawn.cpu.nice,
-                #[cfg(target_os = "linux")]
-                cgroup: spawn.cgroup,
-                #[cfg(target_os = "macos")]
+                placement: spawn.placement,
                 monitor: spawn.monitor.clone(),
             },
             Arc::clone(&control),
@@ -262,7 +263,6 @@ impl WorkspaceShells {
             stdin: StdinLane::new(stdin_sender),
             control,
             _release: release,
-            #[cfg(target_os = "macos")]
             monitor: spawn.monitor,
         }))
     }
@@ -282,46 +282,6 @@ pub(super) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     pipe_with(|| ())
 }
 
-/// [`pipe`], running `between` once the pair exists and before it is handed out. `pipe2` makes
-/// the pair close-on-exec in the one system call, so no spawn can come between.
-#[cfg(target_os = "linux")]
-fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut ends = [0; 2];
-    // SAFETY: `ends` has room for the two descriptors pipe2(2) writes.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors were just created and are owned here alone.
-    let ends = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-    between();
-    Ok(ends)
-}
-
-/// [`pipe`], running `between` after creating the pair and before marking it close-on-exec.
-/// Darwin has no `pipe2`: the two steps run under the exclusive fork lock, so no spawn forks
-/// between them ([`cowshed_os::fork_lock::create`]).
-#[cfg(not(target_os = "linux"))]
-fn pipe_with(between: impl FnOnce()) -> io::Result<(OwnedFd, OwnedFd)> {
-    cowshed_os::fork_lock::create(|| {
-        let mut ends = [0; 2];
-        // SAFETY: `ends` has room for the two descriptors pipe(2) writes.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: both descriptors were just created and are owned here alone.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-        between();
-        for end in [&read, &write] {
-            // SAFETY: plain fcntl on an owned descriptor.
-            if unsafe { libc::fcntl(end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok((read, write))
-    })
-}
-
 fn null_device() -> io::Result<OwnedFd> {
     Ok(OwnedFd::from(
         std::fs::OpenOptions::new().write(true).open("/dev/null")?,
@@ -333,15 +293,15 @@ fn null_device() -> io::Result<OwnedFd> {
 
 /// Where a job's signals go now, retaining requests until a command has been placed.
 ///
-/// A cold activation is signalled through its host's reap fence. Once activation ends, Linux
-/// signals use the job cgroup directly; macOS forwards them to the command's parent host. A
-/// request while placement is pending is replayed when the command starts, so signalling an
-/// initially empty cgroup cannot lose a cancellation. Linux keeps that authority after host loss.
+/// A cold activation is signalled through its host's reap fence. Once activation ends, a job
+/// with a kernel membership is signalled through it directly, and one without through the
+/// command's parent host. A request while placement is pending is replayed when the command
+/// starts, so signalling an initially empty membership cannot lose a cancellation. A kernel
+/// membership keeps that authority after host loss.
 pub(super) struct JobControl {
     target: Mutex<Target>,
     requested: AtomicI32,
-    #[cfg(target_os = "linux")]
-    cgroup: Arc<JobCgroup>,
+    membership: Option<JobMembership>,
 }
 
 #[derive(Default)]
@@ -356,15 +316,15 @@ enum Target {
 }
 
 impl Target {
-    fn deliver(&self, signal: i32, #[cfg(target_os = "linux")] cgroup: &JobCgroup) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        if !matches!(self, Self::Host(_)) {
-            return match signal {
-                libc::SIGTERM => cgroup.terminate(),
-                libc::SIGKILL => cgroup.kill(),
+    fn deliver(&self, signal: i32, membership: Option<&JobMembership>) -> Result<()> {
+        if let Some(membership) = membership
+            && !matches!(self, Self::Host(_))
+        {
+            return membership.signal(match signal {
+                libc::SIGTERM => ProcessSignal::Term,
+                libc::SIGKILL => ProcessSignal::Kill,
                 _ => unreachable!("job control only requests TERM or KILL"),
-            }
-            .map_err(super::supervisor::cgroup_error);
+            });
         }
         match self {
             Self::Host(fence) => fence.signal(signal).map_err(NotSignalled::into_error),
@@ -387,12 +347,11 @@ impl Target {
 
 impl JobControl {
     /// A job's control before any target exists: nothing requested, nothing stopped.
-    pub(super) fn new(#[cfg(target_os = "linux")] cgroup: Arc<JobCgroup>) -> Self {
+    pub(super) fn new(membership: Option<JobMembership>) -> Self {
         Self {
             target: Mutex::new(Target::Pending),
             requested: AtomicI32::new(0),
-            #[cfg(target_os = "linux")]
-            cgroup,
+            membership,
         }
     }
     /// Publish where signals go from now on, delivering the one already requested, if any.
@@ -402,11 +361,7 @@ impl JobControl {
         let delivered = if requested == 0 {
             Ok(())
         } else {
-            published.deliver(
-                requested,
-                #[cfg(target_os = "linux")]
-                &self.cgroup,
-            )
+            published.deliver(requested, self.membership.as_ref())
         };
         *target = published;
         delivered
@@ -421,18 +376,13 @@ impl JobControl {
         self.target
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .deliver(
-                signal,
-                #[cfg(target_os = "linux")]
-                &self.cgroup,
-            )
+            .deliver(signal, self.membership.as_ref())
     }
 }
 
 struct PooledProcess {
     stdin: StdinLane,
     control: Arc<JobControl>,
-    #[cfg(target_os = "macos")]
     monitor: super::process_monitor::ProcessMonitor,
     /// Dropped with the handle, once the job concluded or its supervisor went away: the run then
     /// has the host reap the command.
@@ -440,9 +390,8 @@ struct PooledProcess {
 }
 
 impl RunningProcess for PooledProcess {
-    #[cfg(target_os = "linux")]
-    fn cgroup(&self) -> Option<&Arc<JobCgroup>> {
-        Some(&self.control.cgroup)
+    fn membership(&self) -> Option<&JobMembership> {
+        self.control.membership.as_ref()
     }
 
     fn process(&self) -> Option<&OwnedProcess> {
@@ -455,7 +404,6 @@ impl RunningProcess for PooledProcess {
         None
     }
 
-    #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&super::process_monitor::ProcessMonitor> {
         Some(&self.monitor)
     }
@@ -493,13 +441,8 @@ struct RunCommand {
     command: HostCommand,
     cwd: PathBuf,
     overlay: Vec<(OsString, OsString)>,
-    /// The nice the command runs at, its class's (macOS); on Linux the job's cgroup carries its
-    /// class.
-    #[cfg(target_os = "macos")]
-    nice: i32,
-    #[cfg(target_os = "linux")]
-    cgroup: Arc<JobCgroup>,
-    #[cfg(target_os = "macos")]
+    /// Where the command is placed before it runs anything of the job's.
+    placement: CommandPlacement,
     monitor: super::process_monitor::ProcessMonitor,
 }
 
@@ -621,7 +564,6 @@ async fn run_pooled(
             // The cold activation is owned work, but the reusable host is not this command's
             // retained root. Keep that unobserved birth explicit rather than inventing an exit
             // when the host becomes reusable.
-            #[cfg(target_os = "macos")]
             {
                 let monitor = command.monitor.clone();
                 let pid = host.process.birth.pid();
@@ -661,7 +603,6 @@ async fn run_pooled(
             // The activation is over, however it ended, and the host is still held here: its
             // interval's cost is read now, before anything can reap the host or it serves
             // the command, so the job counts it once and nothing the host does later.
-            #[cfg(target_os = "macos")]
             let _ = events
                 .send(ProcessEvent::ActivationEnded {
                     job_id,
@@ -910,84 +851,23 @@ impl ExecHost {
             })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
-        #[cfg(target_os = "macos")]
-        let (gate, held) = super::process_fence::leader_gate().map_err(pipe_error)?;
-        #[cfg(target_os = "macos")]
-        let raw = [
-            descriptors[0].as_raw_fd(),
-            descriptors[1].as_raw_fd(),
-            descriptors[2].as_raw_fd(),
-            held.ready.as_raw_fd(),
-            held.go.as_raw_fd(),
-        ];
-        #[cfg(target_os = "linux")]
-        let placement = command
-            .cgroup
-            .placement()
-            .map_err(super::supervisor::cgroup_error)?
-            .into_descriptor();
-        #[cfg(target_os = "linux")]
-        let raw = [
-            descriptors[0].as_raw_fd(),
-            descriptors[1].as_raw_fd(),
-            descriptors[2].as_raw_fd(),
-            placement.as_raw_fd(),
-        ];
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let raw = descriptors.each_ref().map(AsRawFd::as_raw_fd);
+        let handoff = platform::Handoff::prepare(&command.placement)?;
+        let raw = handoff.descriptors(descriptors.each_ref().map(AsRawFd::as_raw_fd));
         self.send(frame, &raw).await?;
         drop(descriptors);
-        #[cfg(target_os = "linux")]
-        drop(placement);
-        // The nice the command was observed at while the fence held it, before it ran anything.
-        // A refusal fails the launch; this host is then dropped, which ends the held command.
-        #[cfg(target_os = "macos")]
-        let placed = {
-            drop(held);
-            let monitor = command.monitor.clone();
-            let nice = command.nice;
-            let (observed, placed) = tokio::task::spawn_blocking(move || {
-                let mut placed = None;
-                let observed = gate.observe(|pid| {
-                    monitor.watch(pid).map_err(io::Error::other)?;
-                    let placement = super::placement::macos::place_nice(pid, nice);
-                    let refused = placement
-                        .as_ref()
-                        .err()
-                        .map(|failure| io::Error::other(format!("{failure:?}")));
-                    placed = Some(placement);
-                    refused.map_or(Ok(()), Err)
-                });
-                (observed, placed)
-            })
-            .await
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
-            let placed = match placed {
-                Some(Err(failure)) => return Err(CowshedError::priority(failure)),
-                Some(Ok(nice)) => Some(nice),
-                None => None,
-            };
-            observed.map_err(pipe_error)?;
-            placed
-        };
-        // On Linux the job's cgroup carries its class: no nice is placed.
-        #[cfg(not(target_os = "macos"))]
-        let placed: Option<i32> = None;
+        // What the handoff placed and observed of the command before it ran anything. A refusal
+        // fails the launch; this host is then dropped, which ends the held command.
+        let placed = handoff.sent(&command.placement, &command.monitor).await?;
         let payload = self.receive().await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         let started = match tag {
             REPLY_STARTED => {
-                #[cfg(target_os = "macos")]
-                if placed.is_none() {
-                    return Err(protocol_error(
-                        "reply",
-                        "a command started that its fence never held",
-                    ));
-                }
+                placed.fenced()?;
+                let birth = fields.birth().map_err(|e| protocol_error("reply", e))?;
                 Started::Running {
-                    birth: fields.birth().map_err(|e| protocol_error("reply", e))?,
-                    nice: placed,
+                    nice: placed.started(&birth, &command.monitor).await,
+                    birth,
                 }
             }
             REPLY_EXITED => {
@@ -1271,9 +1151,10 @@ impl HostActivator {
             .map_err(|error| CowshedError::internal(format!("staging task failed: {error}")))??;
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(pipe_error)?;
         let theirs_raw = theirs.as_raw_fd();
-        let mut command = tokio::process::Command::new(SANDBOX_EXEC);
+        let launcher = crate::sandbox::launcher().map_err(|error| error.report())?;
+        let mut command = tokio::process::Command::new(launcher.program());
         command
-            .args(self.profile.launch()?.args())
+            .args(self.profile.launch()?.args(launcher))
             .arg(&staged)
             .args(self.program.arguments())
             .env_clear()
@@ -1718,39 +1599,19 @@ impl Activator for HostActivator {
 }
 
 /// Write the first `length` bytes of the bound program `source` to a new file at `destination`:
-/// a clone of the descriptor's file where its volume allows (`fclonefileat` on macOS), else
+/// a clone of the descriptor's file where its volume allows (`platform::clone_bound`), else
 /// [`copy_at_offsets`]. Neither reads the descriptor's offset, which every staging of the program
 /// shares, so concurrent stagings each copy the whole file.
 fn copy_bound(source: &std::fs::File, length: u64, destination: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+    if platform::clone_bound(source, destination)? {
+        let copied = std::fs::symlink_metadata(destination)?.len();
+        if copied != length {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a staged program is a file in a directory",
+                io::ErrorKind::InvalidData,
+                format!("the clone holds {copied} bytes of the program's {length}"),
             ));
-        };
-        let directory = std::fs::File::open(parent)?;
-        let name = std::ffi::CString::new(name.as_bytes())?;
-        // SAFETY: both descriptors stay open across the call, and the name is NUL-terminated.
-        let cloned = unsafe {
-            libc::fclonefileat(source.as_raw_fd(), directory.as_raw_fd(), name.as_ptr(), 0)
-        };
-        if cloned == 0 {
-            let copied = std::fs::symlink_metadata(destination)?.len();
-            if copied != length {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("the clone holds {copied} bytes of the program's {length}"),
-                ));
-            }
-            return Ok(());
         }
-        let error = io::Error::last_os_error();
-        // Another volume, or one that cannot clone: copy the bytes instead.
-        if !matches!(error.raw_os_error(), Some(libc::EXDEV | libc::ENOTSUP)) {
-            return Err(error);
-        }
+        return Ok(());
     }
     copy_at_offsets(source, length, destination)
 }

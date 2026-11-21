@@ -274,3 +274,37 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
         ["build", "build/2", "main", "ws", "ws/.trash"]
     );
 }
+
+/// A payload's cap is its dataset's `refquota`: read from the dataset, raised in place while the
+/// payload is mounted with a file open, and absent from a dataset made without one. Mounted at
+/// its own root, the dataset is the volume a job's usage samples read.
+#[test]
+#[ignore = "host proof: needs sudo, cowshed-helper on PATH and COWSHED_ZFS_TEST_PARENT (nx run cowshed:zfs-test)"]
+fn a_dataset_payloads_capacity_is_its_refquota_raised_in_place() {
+    use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeStat as _};
+
+    let fixture = Fixture::new();
+    let (payloads, datasets) = (&fixture.payloads, fixture.datasets());
+    const GIBIBYTE: u64 = 1 << 30;
+
+    let main = fixture.image("main.dmg");
+    datasets.create(&main, Some(GIBIBYTE)).unwrap();
+    assert_eq!(datasets.capacity(&main).unwrap(), Some(GIBIBYTE));
+
+    let checkout = fixture.directory.join("checkout");
+    bind(payloads, &main, &checkout).unwrap();
+    let held = fs::File::create(checkout.join("held")).unwrap();
+    datasets.set_capacity(&checkout, 2 * GIBIBYTE).unwrap();
+    assert_eq!(datasets.capacity(&checkout).unwrap(), Some(2 * GIBIBYTE));
+    drop(held);
+
+    let (volume, _) =
+        HostVolume::capture(&checkout).expect("a dataset mounted at its root is a volume");
+    HostVolumeStat
+        .used_bytes(&volume)
+        .expect("the same dataset is still mounted there");
+
+    let uncapped = fixture.image("build/1.dmg");
+    datasets.create(&uncapped, None).unwrap();
+    assert_eq!(datasets.capacity(&uncapped).unwrap(), None);
+}

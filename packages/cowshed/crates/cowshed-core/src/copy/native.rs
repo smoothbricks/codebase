@@ -1,35 +1,29 @@
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-
+#[cfg(target_os = "linux")]
+use linux as platform;
 #[cfg(target_os = "macos")]
-use std::ffi::{CStr, CString};
+use macos as platform;
+
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd as _;
-#[cfg(target_os = "macos")]
-use std::os::fd::RawFd;
+
+/// Materialize one leaf and carry one directory's attributes, with the platform's clone where
+/// its filesystem offers one.
+pub use platform::{copy_leaf, directory_metadata};
+
+/// Keep a descriptor's transfers out of the page cache where the platform has a per-descriptor
+/// policy for it; a platform without one leaves the cache to carry them.
+pub(crate) use platform::bypass_cache;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeafMaterialization {
     Cloned,
     Copied,
 }
-
-#[cfg(any(not(target_os = "macos"), test))]
-pub(super) fn clone_fallback_error(error: &std::io::Error) -> bool {
-    error.raw_os_error().is_some_and(|code| {
-        code == libc::EXDEV
-            || code == libc::EOPNOTSUPP
-            || code == libc::ENOTTY
-            || code == libc::EINVAL
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-pub use linux::{copy_leaf, directory_metadata};
-#[cfg(target_os = "macos")]
-pub use macos::{copy_leaf, directory_metadata};
 
 /// Observe a logical hole in a freshly opened regular file: its first data region is not the
 /// whole of `length`. Physical compression alone is not a hole: SEEK_HOLE answers in the logical
@@ -90,73 +84,4 @@ pub(crate) fn next_data_region(
         ));
     }
     Ok(Some((start, end)))
-}
-
-/// Keep this descriptor's transfers out of the page cache. A copy or a verification passes each
-/// byte through once, so caching it only evicts what the rest of the host is using: a 300 GB
-/// recovery image copied through the cache left 56 GiB in it and swapped the host. macOS
-/// `F_NOCACHE` is a per-descriptor policy that later reads and writes on it follow.
-#[cfg(target_os = "macos")]
-pub(crate) fn bypass_cache(file: &File) -> io::Result<()> {
-    // SAFETY: `F_NOCACHE` takes an int flag and only changes the descriptor's caching policy.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Linux has no per-descriptor uncached mode short of `O_DIRECT`, which binds every buffer,
-/// offset and length to the device's logical block alignment; these transfers keep no such
-/// contract. The page cache carries them, and this changes nothing.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn bypass_cache(_: &File) -> io::Result<()> {
-    Ok(())
-}
-
-/// Retain the native cause and descriptor context.
-#[cfg(target_os = "macos")]
-#[derive(Debug, thiserror::Error)]
-#[error("{operation} on descriptor {descriptor}, attribute {attribute:?}: {source}")]
-struct MetadataError {
-    operation: &'static str,
-    descriptor: RawFd,
-    attribute: Option<CString>,
-    #[source]
-    source: io::Error,
-}
-
-#[cfg(target_os = "macos")]
-fn metadata_error(
-    file: &File,
-    operation: &'static str,
-    attribute: Option<&CStr>,
-    source: io::Error,
-) -> io::Error {
-    io::Error::new(
-        source.kind(),
-        MetadataError {
-            operation,
-            descriptor: file.as_raw_fd(),
-            attribute: attribute.map(CStr::to_owned),
-            source,
-        },
-    )
-}
-#[cfg(test)]
-mod tests {
-    use super::clone_fallback_error;
-
-    #[test]
-    fn only_filesystem_clone_capability_errors_fall_back() {
-        for code in [libc::EXDEV, libc::EOPNOTSUPP, libc::ENOTTY, libc::EINVAL] {
-            assert!(clone_fallback_error(&std::io::Error::from_raw_os_error(
-                code
-            )));
-        }
-        for code in [libc::EIO, libc::ENOSPC, libc::EACCES] {
-            assert!(!clone_fallback_error(&std::io::Error::from_raw_os_error(
-                code
-            )));
-        }
-    }
 }

@@ -81,6 +81,7 @@
         "...",
         { "projects": ["cowshed"], "target": "apfs-test-root" },
         "apfs-test-sweep-bin",
+        "sandbox-exec-bin",
         { "projects": ["cowshed"], "target": "capability-probe" },
         { "projects": ["cowshed"], "target": "tsc-js" },
         { "projects": ["cowshed"], "target": "napi-native" }
@@ -88,6 +89,7 @@
       "inputs": [
         "...",
         { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
+        { "dependentTasksOutputFiles": "**/sandbox-exec/cowshed-sandbox-exec", "transitive": false },
         { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false },
         { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
@@ -101,12 +103,14 @@
         "...",
         { "projects": ["cowshed"], "target": "apfs-test-root" },
         "apfs-test-sweep-bin",
+        "sandbox-exec-bin",
         { "projects": ["cowshed"], "target": "tsc-js" },
         { "projects": ["cowshed"], "target": "napi-native" }
       ],
       "inputs": [
         "...",
         { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
+        { "dependentTasksOutputFiles": "**/sandbox-exec/cowshed-sandbox-exec", "transitive": false },
         { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
         { "externalDependencies": ["nx@24.0.3", "bun-lock:packages/cowshed"] },

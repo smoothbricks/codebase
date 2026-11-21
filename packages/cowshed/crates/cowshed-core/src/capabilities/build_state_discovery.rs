@@ -748,13 +748,13 @@ fn driver_answers(
 /// and its framing without a sandbox, for tests about what discovery does with the answers. The
 /// test process's own PATH is no project's canonical environment, so the job reports the `mbx`
 /// a test names, none by default, never whatever the host shell happens to hold.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct HostCargo {
     pub(crate) mbx: Option<PathBuf>,
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl CargoRunner for HostCargo {
     fn run(&mut self, args: &[&str], queries: &[CargoQuery]) -> Result<CargoAnswers> {
         use cowshed_os::test_backstop::CommandBackstop as _;
@@ -1675,7 +1675,6 @@ mod driver_tests {
     /// The driver as a job runs it: `bash` is looked up on a PATH that leads with the fixture's
     /// `bin` and keeps the host's own behind it, so the programs the fixture does not provide are
     /// the host's real ones (08_testing.md, "Fixtures").
-    #[cfg(target_os = "macos")]
     pub(super) fn run_driver(
         fixture: &Fixture,
         args: &[&str],
@@ -1873,7 +1872,7 @@ mod driver_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::super::test_support::Fixture;
     use super::driver_tests::{

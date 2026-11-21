@@ -393,7 +393,7 @@ fn not_admitted(error: &CowshedError, rerun: &str) -> String {
 }
 
 /// `word` as one shell word.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
             .bytes()

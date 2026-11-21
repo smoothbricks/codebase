@@ -27,6 +27,15 @@ use crate::capabilities::{bun, cargo, go, gradle, nix, npm, pnpm, uv, zig};
 use crate::storage::bootstrap::VOLUME_MARKER_FILE;
 use cowshed_os::fork_lock::Run as _;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The suffix of a copy that is not yet published: `.<name>.cowshed-retiring` beside `<name>`.
 pub const STAGING_SUFFIX: &str = ".cowshed-retiring";
 
@@ -1000,15 +1009,9 @@ fn remove_tree(path: &Path) -> io::Result<()> {
 /// inodes with its databases; a copy that followed links, reset times or split hard links would
 /// not be the same cache. macOS `cp -a` splits hard links and `ditto` keeps them; GNU `cp -a`
 /// keeps them too. GNU `cp` is found on PATH: NixOS keeps no `/bin/cp`, and spawning it failed
-/// with ENOENT.
-#[cfg(target_os = "macos")]
-const COPY_TREE: (&str, &[&str]) = ("/usr/bin/ditto", &[]);
-#[cfg(not(target_os = "macos"))]
-const COPY_TREE: (&str, &[&str]) = ("cp", &["-a"]);
-
-/// Copy the tree at `from` to the new path `to` with [`COPY_TREE`].
+/// with ENOENT. The program and its options are the platform's ([`platform::COPY_TREE`]).
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
-    let (program, options) = COPY_TREE;
+    let (program, options) = platform::COPY_TREE;
     // WHY unbounded: a local copy of this host's own files: it waits on no other process.
     #[allow(clippy::disallowed_methods)]
     let output = Command::new(program)

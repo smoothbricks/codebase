@@ -27,6 +27,9 @@ use cowshed_core::landing::{
 };
 use cowshed_core::repository::RepoId;
 
+#[cfg(target_os = "linux")]
+#[path = "support/sandbox_launcher.rs"]
+mod sandbox_launcher;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
 #[path = "support/temp_root.rs"]
@@ -44,6 +47,10 @@ struct Fixture(TempRoot, FixtureStore);
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        // Linux has no system launcher and a test binary is not its own: it names the one
+        // built with it before its controller Git launches.
+        #[cfg(target_os = "linux")]
+        sandbox_launcher::name(cowshed_core::sandbox::name_launcher);
         let fixture = Self(
             TempRoot::new_in(
                 &temp_parent::canonical_parent(),

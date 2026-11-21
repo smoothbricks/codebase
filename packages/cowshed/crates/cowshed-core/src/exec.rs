@@ -11,13 +11,13 @@ use cowshed_os::fork_lock::Spawn as _;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-mod other;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 mod profile_file;
 
 pub use profile_file::{ProfileFile, ProfileLaunch, collect_profiles, profile_directory};
-
-pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxExecRequest {
@@ -26,7 +26,7 @@ pub struct SandboxExecRequest {
     pub cwd: PathBuf,
 }
 
-/// A `sandbox-exec [-D NAME=value…] -f <profile> -- argv` launch.
+/// A `<launcher> [-D NAME=value…] -f <profile> -- argv` launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnPlan {
     pub program: PathBuf,
@@ -35,7 +35,7 @@ pub struct SpawnPlan {
 }
 
 impl SpawnPlan {
-    /// Where the command's own argv starts: after `sandbox-exec`'s `--`.
+    /// Where the command's own argv starts: after the launcher's `--`.
     pub fn command_start(&self) -> usize {
         self.args
             .iter()
@@ -95,7 +95,7 @@ impl std::error::Error for ExecError {
     }
 }
 
-/// Converts authoritative controller inputs into an argv-only sandbox-exec launch.
+/// Converts authoritative controller inputs into an argv-only launch under the sandbox.
 /// No child-provided text or environment participates in this plan.
 pub fn plan_exec(
     request: SandboxExecRequest,
@@ -127,13 +127,24 @@ pub fn plan_exec_under(
     validate_argv(&request.argv)?;
     let cwd = contained_cwd(&sandbox.workspace_mount, &request.cwd)?;
 
-    let mut args = profile.args();
+    let launcher = sandbox_launcher()?;
+    let mut args = profile.args(launcher);
     args.extend(request.argv);
 
     Ok(SpawnPlan {
-        program: PathBuf::from(SANDBOX_EXEC),
+        program: launcher.program().to_owned(),
         args,
         cwd,
+    })
+}
+
+/// The launcher this process's sandboxed commands start as ([`crate::sandbox::launcher`]). A
+/// process without one starts no command: nothing runs unsandboxed in its place.
+fn sandbox_launcher() -> Result<&'static crate::sandbox::Launcher, ExecError> {
+    crate::sandbox::launcher().map_err(|error| ExecError::WrapperFailure {
+        stage: WrapperStage::Spawn,
+        message: error.to_string(),
+        source: None,
     })
 }
 
@@ -165,35 +176,8 @@ pub struct SystemSpawnRunner;
 
 const DESCRIPTOR_PREPARATION_ERRNO: libc::c_int = libc::EOWNERDEAD;
 const SUPERVISOR_FD_CEILING: usize = 4_096;
-#[cfg(target_os = "linux")]
-use linux::prepare_child_descriptors as prepare_child_descriptors_platform;
-#[cfg(target_os = "macos")]
-use macos::prepare_child_descriptors as prepare_child_descriptors_platform;
 #[cfg(all(test, target_os = "macos"))]
 use macos::{mark_macos_non_stdio_close_on_exec, validate_fd_listing_size};
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-use other::prepare_child_descriptors as prepare_child_descriptors_platform;
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn descriptor_limit_with<GetLimit>(get_limit: GetLimit) -> io::Result<libc::rlim_t>
-where
-    GetLimit: FnOnce(*mut libc::rlimit) -> libc::c_int,
-{
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if get_limit(limit.as_mut_ptr()) == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a non-negative callback result is the contract that it initialized `limit`.
-    Ok(unsafe { limit.assume_init() }.rlim_cur)
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn descriptor_limit() -> io::Result<libc::rlim_t> {
-    descriptor_limit_with(|limit| {
-        // SAFETY: `limit` points to writable storage for one `rlimit`; getrlimit initializes it on success.
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit) }
-    })
-}
 
 fn mark_descriptor_close_on_exec_with<Fcntl, LastError>(
     descriptor: libc::c_int,
@@ -232,102 +216,11 @@ fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
     )
 }
 
-#[cfg(not(target_os = "macos"))]
-fn install_cloexec_pre_exec(
-    command: &mut Command,
-    descriptor_limit: libc::rlim_t,
-    mark: fn(libc::rlim_t) -> io::Result<()>,
-) {
-    use std::os::unix::process::CommandExt as _;
-
-    // SAFETY: the closure captures only the numeric limit and function pointer; `mark` performs
-    // only async-signal-safe descriptor syscalls and every failure becomes a fixed errno.
-    unsafe {
-        command.pre_exec(move || {
-            mark(descriptor_limit)
-                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-        });
-    }
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn fallback_descriptor_limit(limit: libc::rlim_t) -> io::Result<libc::c_int> {
-    if limit > SUPERVISOR_FD_CEILING as libc::rlim_t {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "descriptor fallback limit exceeds the supervisor FD ceiling",
-        ));
-    }
-    Ok(limit as libc::c_int)
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn mark_descriptor_range_close_on_exec_with<MarkDescriptor>(
-    limit: libc::rlim_t,
-    mut mark_descriptor: MarkDescriptor,
-) -> io::Result<()>
-where
-    MarkDescriptor: FnMut(libc::c_int) -> io::Result<()>,
-{
-    let limit = fallback_descriptor_limit(limit)?;
-    for descriptor in 3..limit {
-        mark_descriptor(descriptor)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", test))]
-const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-
-#[cfg(any(target_os = "linux", test))]
-fn close_range_result_with<LastError>(result: libc::c_long, last_error: LastError) -> io::Result<()>
-where
-    LastError: FnOnce() -> io::Error,
-{
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(last_error())
-    }
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn mark_non_stdio_close_on_exec_with<CloseRange, MarkDescriptor>(
-    limit: libc::rlim_t,
-    close_range: CloseRange,
-    mark_descriptor: MarkDescriptor,
-) -> io::Result<()>
-where
-    CloseRange: FnOnce(libc::c_uint, libc::c_uint, libc::c_uint) -> io::Result<()>,
-    MarkDescriptor: FnMut(libc::c_int) -> io::Result<()>,
-{
-    match close_range(3, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSYS) | Some(libc::EINVAL)
-            ) =>
-        {
-            mark_descriptor_range_close_on_exec_with(limit, mark_descriptor)
-        }
-        Err(error) => Err(error),
-    }
-}
-#[cfg(all(test, target_os = "linux"))]
-use linux::mark_non_stdio_close_on_exec;
-#[cfg(all(test, not(target_os = "macos"), not(target_os = "linux")))]
-use other::mark_non_stdio_close_on_exec;
-#[cfg(all(test, target_os = "macos"))]
-fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
-    mark_descriptor_range_close_on_exec_with(limit, mark_descriptor_close_on_exec)
-}
-
 /// Mark every non-stdio descriptor of `command`'s child close-on-exec between fork and exec: the
 /// one boundary a detached child (a deletion child, a declared land's after-land child) passes, so
 /// it holds no lock or ticket of the verb that started it (05_gateway.md "Deleting released images").
 pub fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
-    prepare_child_descriptors_platform(command)
+    platform::prepare_child_descriptors(command)
 }
 
 pub(crate) fn classify_spawn_error(source: io::Error) -> SpawnFailure {
@@ -500,6 +393,8 @@ mod tests {
 
     impl TestTree {
         fn new() -> Self {
+            // A plan names the launcher this process starts its commands as.
+            crate::sandbox::tests::name_launcher();
             let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
             let root_alias = std::env::temp_dir().join(format!(
                 "cowshed-exec-test-{}-{sequence}",
@@ -524,7 +419,7 @@ mod tests {
                 workspace_mount: self.workspace.clone(),
                 exec_temp_dir: self.root.join("tmp"),
                 store_root: self.root.join("store"),
-                port_block: PortBlock::new(40_960, 16).unwrap(),
+                port_block: Some(PortBlock::new(40_960, 16).unwrap()),
                 retained_port_blocks: Vec::new(),
                 cpu_pool_directory: None,
                 mode: RunSandboxMode::ReadWrite,
@@ -711,85 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_limit_reports_the_kernel_soft_limit() {
-        let mut expected = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, expected.as_mut_ptr()) },
-            0
-        );
-        let expected = unsafe { expected.assume_init() }.rlim_cur;
-
-        assert!(expected > libc::STDERR_FILENO as libc::rlim_t);
-        assert_eq!(descriptor_limit().unwrap(), expected);
-    }
-
-    #[test]
-    fn descriptor_limit_injection_preserves_boundaries_and_errors() {
-        for expected in [
-            SUPERVISOR_FD_CEILING as libc::rlim_t - 1,
-            SUPERVISOR_FD_CEILING as libc::rlim_t,
-            libc::RLIM_INFINITY,
-        ] {
-            let actual = descriptor_limit_with(|limit| {
-                unsafe {
-                    limit.write(libc::rlimit {
-                        rlim_cur: expected,
-                        rlim_max: libc::RLIM_INFINITY,
-                    });
-                }
-                0
-            })
-            .unwrap();
-            assert_eq!(actual, expected);
-        }
-
-        let positive_status_limit = 7;
-        let actual = descriptor_limit_with(|limit| {
-            unsafe {
-                limit.write(libc::rlimit {
-                    rlim_cur: positive_status_limit,
-                    rlim_max: positive_status_limit,
-                });
-            }
-            1
-        })
-        .unwrap();
-        assert_eq!(actual, positive_status_limit);
-
-        unsafe {
-            libc::close(-1);
-        }
-        let error = descriptor_limit_with(|_| -1).unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-    }
-
-    #[test]
-    fn descriptor_fallback_enforces_infinity_ceiling_and_boundaries() {
-        for accepted in [
-            0,
-            SUPERVISOR_FD_CEILING as libc::rlim_t - 1,
-            SUPERVISOR_FD_CEILING as libc::rlim_t,
-        ] {
-            assert_eq!(
-                fallback_descriptor_limit(accepted).unwrap(),
-                accepted as libc::c_int
-            );
-        }
-
-        for rejected in [
-            SUPERVISOR_FD_CEILING as libc::rlim_t + 1,
-            libc::RLIM_INFINITY,
-        ] {
-            let error = fallback_descriptor_limit(rejected).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert_eq!(
-                error.to_string(),
-                "descriptor fallback limit exceeds the supervisor FD ceiling"
-            );
-        }
-    }
-
-    #[test]
     fn descriptor_cloexec_preserves_existing_flags() {
         let descriptor = 17;
         let original_flags = 0b1010;
@@ -869,129 +685,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(set_error.raw_os_error(), Some(libc::EPERM));
         assert_eq!(invocation.get(), 2);
-    }
-
-    #[test]
-    fn close_range_uses_the_cloexec_flag_and_full_non_stdio_bounds() {
-        let invocation = RefCell::new(None);
-        let fallback_called = std::cell::Cell::new(false);
-
-        mark_non_stdio_close_on_exec_with(
-            SUPERVISOR_FD_CEILING as libc::rlim_t,
-            |first, last, flags| {
-                invocation.replace(Some((first, last, flags)));
-                Ok(())
-            },
-            |_| {
-                fallback_called.set(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            invocation.into_inner(),
-            Some((3, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC))
-        );
-        assert_eq!(CLOSE_RANGE_CLOEXEC, 4);
-        assert!(!fallback_called.get());
-    }
-
-    #[test]
-    fn close_range_result_accepts_only_the_success_sentinel() {
-        close_range_result_with(0, || panic!("success must not read errno")).unwrap();
-
-        for result in [-1, 1] {
-            let error =
-                close_range_result_with(result, || io::Error::from_raw_os_error(libc::EPERM))
-                    .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-        }
-    }
-
-    #[test]
-    fn close_range_fallback_visits_every_descriptor_below_the_bound() {
-        for unavailable_errno in [libc::ENOSYS, libc::EINVAL] {
-            let visited = RefCell::new(Vec::new());
-            mark_non_stdio_close_on_exec_with(
-                7,
-                |_, _, _| Err(io::Error::from_raw_os_error(unavailable_errno)),
-                |descriptor| {
-                    visited.borrow_mut().push(descriptor);
-                    Ok(())
-                },
-            )
-            .unwrap();
-
-            assert_eq!(visited.into_inner(), vec![3, 4, 5, 6]);
-        }
-    }
-
-    #[test]
-    fn descriptor_range_obeys_exclusive_limit_at_stdio_boundary() {
-        for (limit, expected) in [(2, &[][..]), (3, &[][..]), (4, &[3][..]), (5, &[3, 4][..])] {
-            let visited = RefCell::new(Vec::new());
-            mark_descriptor_range_close_on_exec_with(limit, |descriptor| {
-                visited.borrow_mut().push(descriptor);
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(visited.into_inner(), expected);
-        }
-    }
-
-    #[test]
-    fn close_range_and_fallback_errors_propagate() {
-        let close_range_error = mark_non_stdio_close_on_exec_with(
-            7,
-            |_, _, _| Err(io::Error::from_raw_os_error(libc::EPERM)),
-            |_| panic!("fallback must not run for an unexpected close_range error"),
-        )
-        .unwrap_err();
-        assert_eq!(close_range_error.raw_os_error(), Some(libc::EPERM));
-
-        let visited = RefCell::new(Vec::new());
-        let fallback_error = mark_non_stdio_close_on_exec_with(
-            7,
-            |_, _, _| Err(io::Error::from_raw_os_error(libc::ENOSYS)),
-            |descriptor| {
-                visited.borrow_mut().push(descriptor);
-                if descriptor == 5 {
-                    Err(io::Error::from_raw_os_error(libc::EIO))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(fallback_error.raw_os_error(), Some(libc::EIO));
-        assert_eq!(visited.into_inner(), vec![3, 4, 5]);
-    }
-
-    #[test]
-    fn descriptor_fallback_marks_every_descriptor_below_its_bound() {
-        use std::os::fd::AsRawFd;
-
-        let tree = TestTree::new();
-        let file = fs::File::open(&tree.root).unwrap();
-        let descriptor = file.as_raw_fd();
-        let original = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        assert_ne!(original, -1);
-        assert_ne!(
-            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original & !libc::FD_CLOEXEC) },
-            -1
-        );
-
-        mark_non_stdio_close_on_exec(libc::rlim_t::try_from(descriptor).unwrap() + 1).unwrap();
-        let prepared = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        assert_ne!(
-            unsafe { libc::fcntl(descriptor, libc::F_SETFD, original) },
-            -1
-        );
-
-        assert_ne!(prepared, -1);
-        assert_ne!(prepared & libc::FD_CLOEXEC, 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -1140,21 +833,28 @@ mod tests {
             cwd: PathBuf::from("nested"),
         };
         let plan = plan_exec(request, &tree.sandbox()).unwrap();
-        assert_eq!(plan.program, Path::new(SANDBOX_EXEC));
-        assert_eq!(plan.args[0], "-f");
-        assert!(
-            Path::new(&plan.args[1]).starts_with(tree.sandbox().profile_directory()),
-            "{:?}",
-            plan.args[1]
-        );
-        assert_eq!(plan.args[2], "--");
         assert_eq!(
-            &plan.args[3..],
+            plan.program,
+            crate::sandbox::launcher().unwrap().program(),
+            "the process's launcher, never a program found for the occasion"
+        );
+        // The launcher's own arguments end `-f <profile> --`; the command follows untouched.
+        let command = plan.command_start();
+        assert_eq!(plan.args[command - 3], "-f");
+        assert!(
+            Path::new(&plan.args[command - 2]).starts_with(tree.sandbox().profile_directory()),
+            "{:?}",
+            plan.args[command - 2]
+        );
+        assert_eq!(plan.args[command - 1], "--");
+        assert_eq!(
+            &plan.args[command..],
             ["printf", "%s", "$(touch /tmp/never); a b"]
         );
         assert_eq!(plan.cwd, tree.cwd);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn launch_plan_cannot_select_the_trusted_supervisor_profile() {
         let tree = TestTree::new();

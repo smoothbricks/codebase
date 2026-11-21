@@ -13,9 +13,8 @@ use cache::{SharedLayout, SharedToolHome};
 mod build_state;
 pub use build_state::{BuildStatePath, DeclaredState, RelPath, SeedRetention};
 mod build_state_discovery;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) use build_state_discovery::HostCargo;
-#[cfg(target_os = "macos")]
 pub(crate) use build_state_discovery::RemovedPackageCache;
 pub use build_state_discovery::{
     BuildStateDiscovery, BuildStateFinding, CargoAnswer, CargoDiscoveryPhase, CargoQuery,
@@ -1048,7 +1047,7 @@ pub fn host_program_directories(home: &Path) -> Vec<PathBuf> {
         home.join(".nix-profile/bin"),
         home.join(".local/state/nix/profile/bin"),
     ];
-    if let Some(user) = effective_user_name() {
+    if let Ok(Some(user)) = crate::host_path::user_name() {
         directories.push(Path::new("/etc/profiles/per-user").join(&user).join("bin"));
         directories.push(
             Path::new("/nix/var/nix/profiles/per-user")
@@ -1068,29 +1067,6 @@ pub fn host_program_directories(home: &Path) -> Vec<PathBuf> {
         .map(PathBuf::from),
     );
     directories
-}
-
-fn effective_user_name() -> Option<OsString> {
-    use std::os::unix::ffi::OsStringExt as _;
-    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-    let mut buffer = vec![0_u8; 4096];
-    let mut found = std::ptr::null_mut();
-    // SAFETY: entry and buffer are live writable storage; a successful result points into them.
-    let status = unsafe {
-        libc::getpwuid_r(
-            libc::geteuid(),
-            entry.as_mut_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut found,
-        )
-    };
-    if status != 0 || found.is_null() {
-        return None;
-    }
-    // SAFETY: a successful getpwuid_r returns a NUL-terminated pw_name within buffer.
-    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
-    Some(OsString::from_vec(name.to_bytes().to_vec()))
 }
 
 #[cfg(test)]

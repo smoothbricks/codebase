@@ -12,6 +12,13 @@ fn main() {
     if let Some(code) = cowshed_cli::volume_name::dispatch() {
         std::process::exit(code);
     }
+    // Where this binary is its own sandbox launcher (Linux, 04_sandbox.md "Linux enforcement"),
+    // a launch enters its namespaces and restricts itself here, as one thread, and becomes its
+    // command: it returns only the exit code of a launch that failed. Any other invocation is
+    // from here on a process whose sandboxed launches start this same image.
+    if let Some(code) = cowshed_core::sandbox::dispatch_launcher() {
+        std::process::exit(code);
+    }
     // The gateway host launchd runs (05_gateway.md "The gateway host") does nothing but run its
     // child, so it runs before anything else: one thread, no warm-host registration.
     let mut host = std::env::args_os().skip(1);

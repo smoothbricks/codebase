@@ -1,19 +1,27 @@
-//! The gateway host: the process launchd runs for the gateway agent (05_gateway.md "The gateway
-//! host").
+//! The gateway host: the process the service manager runs for the gateway agent (05_gateway.md
+//! "The gateway host"), launchd from the plist's `ProgramArguments` and systemd from the unit's
+//! `ExecStart`, the same argv.
 //!
-//! It runs from `bin/cowshed-gateway-host`, a path no install moves, signed with the user's
-//! cowshed identity ([`crate::code_signing`]), and does three things only: spawn its arguments
-//! as its child — `bin/cowshed gateway run`, so the daemon runs its own content-addressed copy —
-//! pass the child the signals launchd stops a job with, and exit as the child did.
+//! It runs from `bin/cowshed-gateway-host`, a path no install moves, signed on macOS with the
+//! user's cowshed identity ([`crate::code_signing`]), and does three things only: spawn its
+//! arguments as its child — `bin/cowshed gateway run`, so the daemon runs its own
+//! content-addressed copy — pass the child the signals the manager stops a job with, and exit as
+//! the child did.
 //!
 //! It exists for macOS's first-launch scan. The scan is charged to a run's responsible process;
 //! a launchd job is its own responsible process and everything it spawns inherits it. So every
 //! workspace job's responsible process is this host, and one Developer Tools entry for its fixed
-//! path and designated requirement exempts them all, across every install.
+//! path and designated requirement exempts them all, across every install. Linux scans nothing
+//! and signs nothing; the host is there all the same, so the unit never changes with the build
+//! and the manager's main process is one whose exit is the daemon's.
 //!
 //! It spawns and never execs: after an exec the process would take the new image's path and
 //! signature, and the entry would no longer name it. The child stays in the host's process
 //! group, so launchd's teardown of the job reaches it even when the host itself is killed.
+//! systemd signals the unit's main process only (`KillMode=process`, so the workspace
+//! supervisors in the unit's cgroup outlast a restart): the host passes its SIGTERM on, and the
+//! kernel SIGKILLs the child of a host killed at the unit's stop timeout (`linux.rs`). Either
+//! way the daemon never outlives its host.
 
 use std::ffi::OsString;
 use std::io;
@@ -22,10 +30,21 @@ use std::process::{Command, ExitStatus};
 
 use cowshed_os::fork_lock::Spawn as _;
 
-/// The hidden verb launchd's `ProgramArguments` give the host, followed by its child's argv.
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The hidden verb the definition's argv (launchd `ProgramArguments`, systemd `ExecStart=`) gives
+/// the host, followed by its child's argv.
 pub const VERB: &str = "__gateway-host";
 
-/// The signals launchd and an operator end a job with, passed on to the child unchanged.
+/// The signals the service manager and an operator end a job with, passed on to the child
+/// unchanged.
 const FORWARDED: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
 
 /// Serve as the gateway host for `child` (its program, then its arguments), and end this process
@@ -42,8 +61,8 @@ pub fn run(child: &[OsString]) -> ! {
     }
 }
 
-/// The host's own failure, before its child could run or be waited for: launchd's "exited with
-/// code 1", with the reason on the agent's stderr log.
+/// The host's own failure, before its child could run or be waited for: the manager's "exited
+/// with code 1", with the reason on the agent's stderr log.
 pub const EXIT_FAILED: i32 = 1;
 
 fn host(child: &[OsString]) -> io::Result<ExitStatus> {
@@ -77,10 +96,14 @@ fn host(child: &[OsString]) -> io::Result<ExitStatus> {
     }
     let mut daemon = Command::new(program);
     daemon.args(arguments);
-    // SAFETY: pthread_sigmask is async-signal-safe, and `empty` is an initialised set moved in.
+    // SAFETY: reads this process's own pid.
+    let host = unsafe { libc::getpid() };
+    // SAFETY: pthread_sigmask is async-signal-safe, `empty` is an initialised set moved in, and
+    // the platform's tie to the host makes async-signal-safe calls only.
     let empty = empty_signal_set();
     unsafe {
         daemon.pre_exec(move || {
+            platform::end_with_host(host)?;
             match libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) {
                 0 => Ok(()),
                 error => Err(io::Error::from_raw_os_error(error)),
@@ -125,7 +148,8 @@ fn empty_signal_set() -> libc::sigset_t {
 }
 
 /// End this process as `status` says the child ended: its exit code, or death by its signal,
-/// so launchd records for the agent exactly what it would have recorded for the daemon.
+/// so the service manager records for the agent exactly what it would have recorded for the
+/// daemon.
 fn exit_as(status: ExitStatus) -> ! {
     cowshed_os::stderr::flush();
     if let Some(code) = status.code() {

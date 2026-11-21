@@ -2,15 +2,17 @@
 //! environment (`.cowshed/`, never a tracked file).
 //!
 //! Every sandboxed process reaches the network through the workspace gateway's proxy endpoint
-//! (the `HTTP_PROXY`/`HTTPS_PROXY` variables), where a granted host's TLS is terminated with a
-//! leaf the workspace CA signed, or tunnelled opaquely. TLS clients that read one CA file get a
-//! combined trust bundle: the platform's roots (for opaque tunnels, which present the real
-//! upstream certificate) followed by the workspace CA (for intercepted hosts). Git and OpenSSL
-//! are pointed at it by the core; each detected tool's own variable comes from its capability
-//! (15_capabilities.md).
+//! (the `HTTP_PROXY`/`HTTPS_PROXY` variables, [`crate::workspace_environment::job_gateway_environment`]:
+//! the base of a macOS workspace's port block, `127.0.0.1:7644` in a Linux job's private
+//! loopback), where a granted host's TLS is terminated with a leaf the workspace CA signed, or
+//! tunnelled opaquely. TLS clients that read one CA file get a combined trust bundle: the
+//! platform's roots (for opaque tunnels, which present the real upstream certificate) followed by
+//! the workspace CA (for intercepted hosts). Git and OpenSSL are pointed at it by the core; each
+//! detected tool's own variable comes from its capability (15_capabilities.md).
 //!
 //! The port-0 preload (`crate::port_zero`) is the file every job's Node and Bun load, so a
-//! listener on an OS-picked port lands in the block the job can connect to (04_sandbox.md).
+//! listener on an OS-picked port lands in the block the job can connect to (04_sandbox.md). A
+//! Linux job has no block and the preload does nothing there.
 //!
 //! Written when the workspace is minted and rewritten before every exec. Writes are idempotent:
 //! an unchanged file is left as it is.
@@ -19,6 +21,15 @@ use std::ffi::CStr;
 use std::io;
 
 use cowshed_os::fsio::AnchoredDirectory;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
 /// The combined trust bundle, at the root of the private environment.
 pub const TRUST_BUNDLE_NAME: &CStr = c"ca-bundle.pem";
@@ -29,10 +40,7 @@ pub const SSL_CERT_ENV: &str = "SSL_CERT_FILE";
 
 /// The platform root bundle the combined bundle starts from: what an opaque-tunnelled client
 /// would verify the real upstream certificate against.
-#[cfg(target_os = "macos")]
-pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/cert.pem";
-#[cfg(not(target_os = "macos"))]
-pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+pub use platform::SYSTEM_TRUST_BUNDLE;
 
 /// The platform roots followed by the workspace CA.
 pub fn trust_bundle(system: &[u8], workspace_ca: &[u8]) -> Vec<u8> {

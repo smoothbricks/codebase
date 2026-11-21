@@ -162,11 +162,20 @@ Selection is convention, not guesswork, and the host storage anchor is distinct 
 macOS, `statfs` of the invoking user's home directory selects the APFS container that owns `cowshed.store`; cowshed
 never derives that container from the project root because an adopted root is itself mounted from a workspace image, and
 an unadopted source may live on another filesystem. The project path is still validated lexically and supplies
-repository identity/copy input, not host-volume authority. On Linux, `statfs` of an existing ZFS project selects its
-containing dataset only if the pool has a suitable delegated cowshed root. A non-ZFS checkout whose workspace data
-should live on ZFS requires an explicit `.cowshed.toml` `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed never
-scans pools or silently picks one. A configured pool must contain or permit creation of the exact hierarchy below.
-`cowshed doctor` prints the selected substrate, pool, and evidence.
+repository identity/copy input, not host-volume authority.
+
+On Linux a host has one store, and a store that is published decides the substrate by what answers at
+`/private/cowshed/store`: a dataset named `<parent>/cowshed/store` mounted there selects ZFS with that root, and a
+directory there carrying a directory-store marker selects the directory store. Only a host with no store yet selects
+from an anchor: the project root for an opening, the home for `cowshed setup`. An explicit `.cowshed.toml`
+`[substrate] kind = "zfs"` and `parent = "<parent>"` names the root's parent, the pool or any dataset in it, and wins;
+an opening reads its project's file, and setup reads the nearest one at or above the directory it runs in. Without a
+declaration, an anchor on ZFS selects the nearest of its dataset and that dataset's ancestors whose `cowshed` child
+carries the caller's `cowshed:owner` set locally, read by exact name; every other anchor selects the directory store.
+cowshed never scans pools or silently picks one. A declaration that names another parent than the published store's, or
+any declaration on a host whose store is a directory store, is refused naming both. The root `<parent>/cowshed` exists
+before setup runs: whoever administers `<parent>` creates it and sets its owner ("Privileged helper"), and setup refuses
+a root that is absent with that command. `cowshed doctor` prints the selected substrate, root, and evidence.
 
 ## APFS image substrate (reference)
 
@@ -199,6 +208,9 @@ mbx creates (16_build_volumes.md); its build volume stays an image here like eve
 
 ### Mapping
 
+`<pool>` in the names below, and in 01b_zfs.md, stands for the root's parent `<parent>`: the pool itself, or any dataset
+in it that `.cowshed.toml` names.
+
 | cowshed concept                   | ZFS object                                                                                                                                                                                                                                                                             |
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                                                                                                         |
@@ -220,14 +232,18 @@ self-healing stub `.envrc` is still written beneath the mountpoint — ZFS mount
 imported, and healing parity keeps its `cowshed attach` identical across substrates.
 
 Markers, tokens, grant semantics, secrets gates, and the cache taxonomy are unchanged. Detached metadata uses the same
-schema but `portBlock` is optional and omitted for ZFS/Linux. When a dataset is attached, the controller creates its
-private loopback-only netns, bind-mounts that incarnation's Unix gateway socket, and launches the trusted connector on
-namespace-local `127.0.0.1:7644`; package tools use that HTTP address, not a Unix-socket API. Detach drains and kills
-the connector cgroup and unlinks the socket before releasing the netns. Layer-2 extracted caches stay **in-dataset** and
-arrive via the clone, same as in-image: hardlinks cannot cross datasets, so a shared extracted cache would demote
-installs to copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes reflink-grade copies work _across_
-datasets in one pool; cowshed treats that as an opportunistic bonus, never load-bearing (it is version- and
-tunable-dependent).
+schema but `portBlock` is optional and omitted for ZFS/Linux: a sidecar recording `"platform": "linux"` is refused if it
+carries a `portBlock` or a `retainedPortBlocks`, the gateway's session inventory reserves no block for it, and nothing
+refuses it for holding none. The gateway serves an attached workspace's session on that incarnation's Unix socket,
+`<store>/run/gateway/<workspaceIncarnation>.sock`, binding it when the session is installed and unlinking it when the
+session is removed, which the project's reconcile does after a detach (05_gateway.md, "Placement and identity"). Each
+job launch has a private loopback-only netns with the trusted connector on namespace-local `127.0.0.1:7644` relaying to
+that socket (04_sandbox.md, "Linux enforcement", which also states what is not yet per attached workspace); package
+tools use that HTTP address, not a Unix-socket API, and the job environment names it wherever a macOS job names its
+block's base, with no synthetic base and no `COWSHED_PORT_BASE`. Layer-2 extracted caches stay **in-dataset** and arrive
+via the clone, same as in-image: hardlinks cannot cross datasets, so a shared extracted cache would demote installs to
+copies. OpenZFS ≥ 2.2 block cloning (`copy_file_range` → BRT) makes reflink-grade copies work _across_ datasets in one
+pool; cowshed treats that as an opportunistic bonus, never load-bearing (it is version- and tunable-dependent).
 
 ### The clone-origin dependency
 
@@ -263,7 +279,8 @@ in a container whose dataset tree is zoned to its user namespace (`zfs zone`) de
 dataset is still refused `zfs create` and `zfs snapshot` there, while the namespace's root may do all of them. Reads
 (`zfs list`, `zfs get`) need no privilege and never go through the helper.
 
-`cowshed-helper <root> <verb> …` runs exactly one `zfs` command per invocation:
+`cowshed-helper <root> <verb> …` runs at most one `zfs` command per invocation, and exactly one for every verb but
+`check`:
 
 | Verb       | Arguments                                              | `zfs` command                 |
 | ---------- | ------------------------------------------------------ | ----------------------------- |
@@ -276,6 +293,11 @@ dataset is still refused `zfs create` and `zfs snapshot` there, while the namesp
 | `mount`    | `<dataset>`                                            | `mount`                       |
 | `unmount`  | `<dataset> [--force]`                                  | `unmount`, `unmount -f`       |
 | `set`      | `<dataset> <property>=<value>…`                        | `set … <dataset>`             |
+| `check`    | none                                                   | none                          |
+
+`check` changes nothing and names no dataset. It answers 0 once the helper's own preconditions hold, that it runs as
+root and that `<root>` names the caller (the first refusal below), and that is all it proves: it is how an install is
+proven before anything depends on it ("Install and privilege").
 
 `rename` serves retire's trash namespace. `set` carries the mountpoint, the `canmount=off` of a retirement, a resize's
 `refquota` and a `--browse` workspace's property; it replaces a `set-mountpoint` verb. No verb passes `-r`, `-R`, `-p`
@@ -306,8 +328,44 @@ changes its owner only when the kernel says that descriptor is the mounted root 
 (`/proc/self/mountinfo` on Linux, `fstatfs` on macOS). A clone needs no handover, its root carries its origin's owner.
 `zfs` runs with an empty environment and a fixed system `PATH`, never the caller's.
 
-The helper is installed setuid root, or reached through `sudo` by a sudoers entry naming it, on hosts that forbid setuid
-helpers. Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
+#### Install and privilege
+
+The helper is part of a build's distribution on every platform that has this substrate, Linux and macOS: each platform
+directory carries `cowshed-helper` beside `cowshed` (`dist/bin/<platform>/`, and `.cache/bin/<platform>/` for a
+checkout's development build). The package's `helper-bin-<arch>-<os>` target builds it into a tree of its own
+(`.cache/helper/<platform>/`), because an output directory holds one `.build-inputs.json` and the platform directory
+holds cowshed's; `helper-<arch>-<os>` copies it beside the binary, and `cli-record-<arch>-<os>` depends on that, so
+`cli-native`, the publish jobs and the land's install build both. `cowshed setup`'s storage bootstrap runs the
+distribution's helper from there, before anything is installed.
+
+`cowshed setup` and `gateway start` install it beside the installed cowshed exactly as the Nx cache server is installed
+(05_gateway.md, "The installed cowshed"): a copy named for its digest and the stable name `cowshed-helper` as a link to
+it, in `~/Library/Application Support/dev.cowshed/bin`. A build with no `cowshed-helper` beside it is refused by name
+and installs nothing. The install is the user's own and cannot make the copy root's, so how the helper gets its
+privilege is decided per invocation from the file itself:
+
+- **A helper that is root's and setuid runs directly.** That is an administrator's install (a setuid copy in a
+  root-owned directory on `PATH`, or a NixOS `security.wrappers` entry). Of the helper files beside cowshed and then in
+  each absolute `PATH` directory, the first such one serves, before the installed one.
+- **Any other helper runs through `sudo -n`**, the first there is in that order, which is the installed one. A sudoers
+  entry must admit it without a password, because the gateway daemon has no terminal to type one at. The installed path
+  lies in a directory the user can write, so an entry naming the path alone would make root of whatever file is put
+  there: the entry pins the helper's bytes,
+  `#<uid> ALL=(root) NOPASSWD: sha256:<digest> <installed path, spaces escaped>`, and is written again when an install
+  changes those bytes.
+
+`cowshed setup` proves this once the helper is installed, on a store that is a ZFS dataset: it runs the `check` verb of
+the helper the installed cowshed reaches, as it reaches it, and through `sudo` with `-k` besides, so the credentials
+setup's own `sudo -v` cached do not answer for a daemon that has none. When the proof fails setup exits
+`environment-missing`, saying what the attempt answered, and its `next:` line is the one root command that mends it: for
+the installed helper, the entry above written to `/etc/sudoers.d/cowshed-helper-<uid>` (staged as
+`cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by `visudo -cf`, then renamed), with the entry itself in
+the message for a host that keeps its sudoers elsewhere; for a setuid helper that was reached instead, the
+`install -o 0 -g 0 -m 4755` that replaces it with this build's; and for an installed path sudoers cannot spell, the same
+setuid install into `/usr/local/bin`. `gateway stop --purge` and `setup --uninstall` remove the installed helper;
+neither removes a sudoers entry, which is root's.
+
+Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
 
 **Open: the mountpoint check and the mount are two steps.** Between the helper's ownership walk and ZFS's mount, a
 caller who owns the parent directory can replace a component with a symlink, and the dataset then mounts over a
@@ -330,6 +388,39 @@ tree:
 | `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`             |
 | `cowshed.build-cache` APFS volume at `/private/var/folders/cowshed/shared/build-cache` (the mbx store, `mbx/`) | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache` |
 | project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers  |
+
+A Linux host without a ZFS root that serves the user has a **directory store**: `/private/cowshed/store` and
+`/private/cowshed/build-cache` are plain directories of whatever filesystem holds them, owned by the user, and every
+workspace payload is a directory moved by rename (`storage/directory.rs`). Its markers say `"substrate": "directory"`,
+so nothing reads a directory store as a dataset or a volume, and no dataset or volume clone backs a fork: the source
+tree is cloned file by file. Because a rename never crosses a mount, setup and every validation refuse a directory store
+whose store path and per-user mount root (`~/.cowshed/mnt`) lie in different mounts, naming both.
+
+**Linux host setup.** `cowshed setup` reads the kernel mount table, each host path without following a link, and for ZFS
+`zfs get` of the exact dataset names, plans from that alone, and announces every action before it takes one:
+
+- **Directory store.** `/private` and `/private/cowshed` are root's and writable by root alone; the store and
+  build-cache directories below them are the user's, mode 0755, each published last by its marker. Making them is the
+  one step that needs root: setup runs `sudo` (which asks on the terminal where its policy wants a password) for
+  `install -d` of each missing directory, and nothing else. A path that holds entries without a marker, belongs to
+  another user, is a link, or is root's and empty (which is also what the mountpoint of an unmounted dataset looks like)
+  is refused by name and left as found; an ancestor that is not root's alone is refused the same way.
+- **ZFS.** Setup attests that the root names the caller, then creates what is missing through the helper, one run each:
+  `create <root>/store mountpoint=/private/cowshed/store`, `create <root>/projects mountpoint=none`,
+  `create <root>/build-cache mountpoint=/private/cowshed/build-cache`, each with its `cowshed:role` and
+  `cowshed:version` properties, and writes the marker file of each mounted one as the user. A dataset that exists
+  unmounted is mounted (`set mountpoint=…`, `mount`), and one mounted and still empty without its marker is completed. A
+  dataset mounted anywhere but its fixed path, or a fixed path that holds anything a mount would mask, is refused by
+  name. The helper is found beside the running cowshed, then on `PATH`; it is run directly when it is setuid root and
+  through `sudo -n` otherwise. No directory under `/private` is made by setup: `zfs` makes each mountpoint.
+- **Both.** The per-user mount root `~/.cowshed/mnt` and `~/.cowshed` are made 0700 by the user, and `host.json` is
+  published into a store that has none. Nothing is pinned in `/etc/fstab` and no system service is installed: a
+  directory store has no volume to mount, and ZFS mounts a root's datasets when their pool is imported.
+  `setup --uninstall` therefore removes nothing of the host's storage; the store stays, as a macOS volume does.
+
+Validation (`validate_existing_host_storage`, every command and the gateway's start) gathers the same evidence and
+performs only its reads, the marker guards and the root's attestation; anything a plan would change is reported as
+setup-required and never done.
 
 ### Fixed dataset hierarchy
 

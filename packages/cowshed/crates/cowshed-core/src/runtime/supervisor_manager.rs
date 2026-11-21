@@ -40,6 +40,15 @@ use crate::metadata::WorkspaceName;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::timing;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// How long a started supervisor may take to open its project, mount its workspace and answer.
 const START_BOUND: Duration = Duration::from_secs(180);
 /// How often a starting supervisor is asked whether it serves yet.
@@ -738,7 +747,7 @@ fn watch_child(mut child: tokio::process::Child, socket: PathBuf) {
 /// When a supervisor this manager did not start, and cannot `wait` for, ends: end any job it
 /// left running.
 fn watch_pid(pid: u32, socket: PathBuf) {
-    recover_after_exit(pid, socket, move || wait_for_exit(pid));
+    recover_after_exit(pid, socket, move || platform::wait_for_exit(pid));
 }
 
 /// Once `exited` returns, the supervisor `pid` has ended: end any job it left running.
@@ -815,78 +824,6 @@ async fn end_lost_jobs(socket: PathBuf, writer: super::job_groups::Writer) {
         ),
         Err(error) => cowshed_os::eprintln!("cowshed: ending lost jobs failed: {error}"),
     }
-}
-
-/// Block until `pid`, which is not this process's child, exits. A process already gone, or
-/// already exiting, has exited.
-#[cfg(target_os = "macos")]
-fn wait_for_exit(pid: u32) -> io::Result<()> {
-    let ident = usize::try_from(pid).map_err(io::Error::other)?;
-    // SAFETY: kqueue returns a new descriptor this function owns and closes.
-    let queue = unsafe { libc::kqueue() };
-    if queue < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the kevent structs are plain data that outlive the call; `queue` is live until
-    // the close below.
-    let result = unsafe {
-        let change = libc::kevent {
-            ident,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
-            fflags: libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        let mut event = std::mem::zeroed::<libc::kevent>();
-        let returned = libc::kevent(queue, &change, 1, &mut event, 1, std::ptr::null());
-        let outcome = match returned {
-            ..0 => Err(io::Error::last_os_error()),
-            // A registration that failed comes back as an event carrying the error.
-            _ if event.flags & libc::EV_ERROR != 0 => Err(i32::try_from(event.data)
-                .map_or_else(io::Error::other, io::Error::from_raw_os_error)),
-            _ => Ok(()),
-        };
-        libc::close(queue);
-        outcome
-    };
-    // ESRCH: it already exited, or began to, and its descriptors may still be open; a
-    // supervisor this manager signals is therefore watched before it is (`ExitWatch`).
-    match result {
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-        other => other,
-    }
-}
-
-/// Block until `pid`, which is not this process's child, exits. A process already gone has
-/// exited.
-#[cfg(target_os = "linux")]
-fn wait_for_exit(pid: u32) -> io::Result<()> {
-    let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
-    // SAFETY: pidfd_open returns a new descriptor this function owns and closes.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
-        };
-    }
-    let descriptor = i32::try_from(descriptor).map_err(io::Error::other)?;
-    let mut poll = libc::pollfd {
-        fd: descriptor,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `poll` describes one live descriptor this function owns.
-    let waited = unsafe { libc::poll(&mut poll, 1, -1) };
-    // SAFETY: closing the descriptor opened above.
-    unsafe { libc::close(descriptor) };
-    if waited < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// How long a supervisor of another build gets after each signal a lifecycle verb sends it.

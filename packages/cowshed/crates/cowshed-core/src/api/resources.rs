@@ -881,9 +881,13 @@ impl From<VolumeUsedBytesDelta> for i64 {
     deny_unknown_fields
 )]
 pub enum VolumeUnavailable {
-    /// The supervisor was given no volume to stat for it.
+    /// The supervisor was given no volume to stat for it. A plain-directory store's workspace
+    /// and build volume always say this: each is a directory on the filesystem that holds the
+    /// store, and that filesystem's usage is not theirs.
     Unconfigured,
-    /// This platform's volume substrate has no used-bytes stat.
+    /// The platform's substrate has no used-bytes stat. No build reports it any more: an APFS
+    /// volume and a ZFS dataset are read, and a plain directory is `Unconfigured`. It stays
+    /// declared so a sample an earlier Linux build recorded still decodes.
     UnsupportedPlatform,
     /// The volume's stat failed, at spawn or at this sample, or its change is no exact delta.
     Failed { message: String },

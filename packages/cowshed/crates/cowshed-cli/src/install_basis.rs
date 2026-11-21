@@ -343,6 +343,11 @@ pub(crate) mod tests {
 
     impl Main {
         pub(crate) fn new(label: &str) -> Self {
+            // The judgement runs controller Git under its sandbox. Linux has no system launcher
+            // and a test binary is not its own, so it names the one built with it; macOS's is
+            // `sandbox-exec`.
+            #[cfg(target_os = "linux")]
+            crate::sandbox_launcher::name(cowshed_core::sandbox::name_launcher);
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")

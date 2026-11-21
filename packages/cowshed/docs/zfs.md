@@ -7,10 +7,14 @@ faster: there is no attach step and no fsck pass.
 cowshed picks the substrate by looking at the filesystem your project root sits on: APFS → image substrate, ZFS → zfs
 substrate.
 
-Cowshed first uses `statfs` on the project root. APFS selects images. ZFS is selected only when the containing pool has
-a suitable delegated cowshed root. If `statfs` cannot identify a suitable ZFS dataset, configure both
-`[substrate] kind = "zfs"` and `pool = "<pool>"` in `.cowshed.toml`; cowshed never scans imported pools or silently
-chooses one.
+Cowshed first uses `statfs` on the project root. APFS selects images. ZFS is selected only when a cowshed root that
+names you (`cowshed:owner=<your uid>`, set by whoever administers its parent dataset) lies in the containing dataset's
+chain. If `statfs` cannot identify one, configure both `[substrate] kind = "zfs"` and `parent = "<parent>"` in
+`.cowshed.toml`, where `<parent>` is the pool or any dataset in it and `<parent>/cowshed` is the root; cowshed never
+scans imported pools or silently chooses one. A Linux host with no such root gets a directory store instead: each
+workspace is a real directory on whatever filesystem holds the store, with no capacity, no clone and no volume of its
+own. A project's `substrate` (the `project.open` answer, `Project.substrate` in the library) says which one its store
+is: `apfs`, `zfs` or `directory`.
 
 ## What lives where
 
@@ -23,7 +27,7 @@ chooses one.
 | Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`          |
 | Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` — same as macOS                                                 |
 | Linux gateway data plane                                 | per-incarnation Unix socket plus private-netns connector at `127.0.0.1:7644`; no `portBlock`        |
-| Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                               |
+| Secrets                                                  | one 0600 record file per binding in the 0700 `credentials` directory of cowshed's support directory |
 
 Mountpoints are ZFS properties and normally return at pool import. cowshed still writes the same underlying stub
 `.envrc` as APFS because an unimported pool also makes a mount disappear; `cowshed attach` verifies the mount, identity,
@@ -52,11 +56,31 @@ zfs create -o mountpoint=none -o cowshed:owner=$(id -u <user>) rpool/cowshed
 ```
 
 Every change cowshed makes below it goes through `cowshed-helper`, a small root binary with a fixed verb set (`create`,
-`clone`, `snapshot`, `destroy`, `rename`, `promote`, `mount`, `unmount`, `set`). `zfs allow` cannot stand in for it:
-Linux ignores ZFS _mount_ delegation (`mount(2)` wants `CAP_SYS_ADMIN`), and inside a container whose datasets are zoned
-to its user namespace delegation grants nothing. The helper refuses any dataset outside the root, any root whose
-`cowshed:owner` is not you, and any mountpoint outside a directory you own; reads (`zfs list`, `zfs get`) are
-unprivileged. Install it setuid root, or allow it through `sudo`.
+`clone`, `snapshot`, `destroy`, `rename`, `promote`, `mount`, `unmount`, `set`, and `check`, which changes nothing).
+`zfs allow` cannot stand in for it: Linux ignores ZFS _mount_ delegation (`mount(2)` wants `CAP_SYS_ADMIN`), and inside
+a container whose datasets are zoned to its user namespace delegation grants nothing. The helper refuses any dataset
+outside the root, any root whose `cowshed:owner` is not you, and any mountpoint outside a directory you own; reads
+(`zfs list`, `zfs get`) are unprivileged.
+
+The helper ships beside `cowshed` in every build, and `cowshed setup` installs it beside the installed cowshed
+(`~/Library/Application Support/dev.cowshed/bin/cowshed-helper`). That copy is yours, not root's, so cowshed runs it
+through `sudo -n`, and the gateway daemon has no terminal to type a password at: a sudoers entry has to admit it.
+`cowshed setup` checks this once the helper is installed, by running `cowshed-helper <root> check` the way the daemon
+will, and when the check fails it exits non-zero with the one command to run as root on its `next:` line:
+
+```
+$ cowshed setup
+…
+cowshed: …/bin/cowshed-helper did not act as root for the ZFS root rpool/cowshed, so nothing can change its datasets: … sudo: a password is required; …
+next: printf '%s\n' '#1000 ALL=(root) NOPASSWD: sha256:<digest> /home/you/Library/Application\ Support/dev.cowshed/bin/cowshed-helper' | sudo sh -c 'umask 227 && cat >/etc/sudoers.d/cowshed-helper-1000.new && visudo -cf /etc/sudoers.d/cowshed-helper-1000.new && mv /etc/sudoers.d/cowshed-helper-1000.new /etc/sudoers.d/cowshed-helper-1000' && cowshed setup
+```
+
+The entry admits exactly the installed helper: it names its path and pins its SHA-256, because that path is in a
+directory you can write and an entry naming the path alone would make root of any file put there. `visudo` checks the
+entry before it takes effect. A build that changes the helper changes the digest, and that build's setup prints the
+command again. On a host that reads no `/etc/sudoers.d` (NixOS), add the same entry, printed in the message, through its
+own sudoers configuration, or install the helper setuid root in a root-owned directory on `PATH` (a `security.wrappers`
+entry on NixOS): cowshed runs a setuid root helper directly, in preference to the installed one.
 
 Then, from your checkout:
 
@@ -83,6 +107,17 @@ next: cowshed exec raven -- <cmd>
   part of creation. No 250 ms attach, and no fsck pass — ZFS snapshots are transactionally consistent by construction,
   so the crash-consistency dance the image substrate does (sync, clone, verify) simply doesn't exist.
 - **Quotas are real:** each workspace dataset carries a `refquota` instead of a sparse-image capacity cap.
+  `cowshed adopt --capacity <size>` sets main's, every clone keeps its source's, and `cowshed resize <ws> <size>` (and
+  `--build` for the build volume and its seed) raises it in place, mounted, through the helper's `set` verb. Like the
+  image's, it only grows. `df` on the workspace shows it: the dataset's size is its `refquota`.
+- **Nothing fragments, nothing needs reclaiming.** `cowshed defrag` and `cowshed adopt --re-adopt` exist to rewrite and
+  replace an image file. A dataset has none, so both are refused before anything is stopped, as a `usage` error whose
+  `unsupported` field names the substrate and the operation
+  (`{ "substrate": "zfs", "operation": "defragmentWorkspace" }`). A directory store refuses `resize` the same way,
+  having no capacity to raise.
+- **Job volume samples are the dataset's.** A job's `volumes` reading is the change in the bytes its workspace dataset
+  and its build dataset reference, from `statvfs` on each mountpoint, as of the pool's last transaction group. A
+  directory store's workspace is no filesystem of its own, so its samples say `unconfigured`.
 - **Dev servers bind their default ports.** Every exec joins a private-loopback network namespace, so
   vite/metro/`devenv up` listen on their usual ports with no cross-workspace collisions — the macOS port-block scheme
   isn't needed for isolation here. Linux sidecars omit `portBlock`; there is no synthetic base and no

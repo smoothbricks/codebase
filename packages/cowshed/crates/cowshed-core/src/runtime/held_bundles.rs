@@ -313,7 +313,7 @@ mod tests {
             })
             .collect();
         paths.sort();
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         (
             Trash {
                 _root: root,

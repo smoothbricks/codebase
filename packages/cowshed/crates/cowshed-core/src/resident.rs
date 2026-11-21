@@ -51,6 +51,17 @@ use crate::storage::job_artifact::StreamKind;
 use crate::storage::{StorageLayout, WORKSPACE_MARKER_PATH};
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::mount_point_of;
+
 /// Git's own discovery honours these; a caller that sets one is answered by Git, through the
 /// controller, rather than by a walk that would not.
 const GIT_DISCOVERY_ENVIRONMENT: [&str; 5] = [
@@ -155,30 +166,6 @@ impl LiveProbe for HostProbe {
     fn hello(&self, socket: &Path) -> impl Future<Output = crate::Result<Hello>> {
         supervisor_socket::hello(socket)
     }
-}
-
-/// Where the filesystem holding `path` is mounted.
-#[cfg(target_os = "macos")]
-fn mount_point_of(path: &Path) -> Option<PathBuf> {
-    use std::ffi::{CStr, CString, OsStr};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `statfs` is plain old data; all-zero is a valid value for the kernel to overwrite.
-    let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `path` is NUL-terminated and `stats` is a valid, writable `statfs`.
-    if unsafe { libc::statfs(path.as_ptr(), &mut stats) } != 0 {
-        return None;
-    }
-    // SAFETY: Darwin NUL-terminates `f_mntonname` within its fixed-size array.
-    let mounted = unsafe { CStr::from_ptr(stats.f_mntonname.as_ptr()) };
-    Some(PathBuf::from(OsStr::from_bytes(mounted.to_bytes())))
-}
-
-/// Only the macOS runtime serves workspaces.
-#[cfg(not(target_os = "macos"))]
-fn mount_point_of(_path: &Path) -> Option<PathBuf> {
-    None
 }
 
 /// A mounted workspace whose records agree with its mount: everything `path` answers.

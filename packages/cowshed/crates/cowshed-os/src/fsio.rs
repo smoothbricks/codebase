@@ -14,6 +14,23 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+// The renames each platform's kernel makes atomic (`linux.rs`: `renameat2`; `macos.rs`:
+// `renameatx_np`), selected here and nowhere else.
+pub use platform::{rename_exchange, rename_noreplace};
+// What Linux alone has, which only Linux's own callers name: the mount identity of a held inode,
+// and a path held as a name (`O_PATH`).
+#[cfg(target_os = "linux")]
+pub use linux::{mount_id, open_path, open_path_nofollow};
+
 /// A held directory capability. Child preparation never re-resolves a mutable
 /// parent path after it has been opened.
 #[derive(Debug)]
@@ -161,16 +178,7 @@ impl AnchoredDirectory {
             return Err(error);
         }
         let result = loop {
-            #[cfg(target_os = "macos")]
-            // SAFETY: errno is thread-local; zero distinguishes readdir EOF from failure.
-            unsafe {
-                *libc::__error() = 0
-            };
-            #[cfg(target_os = "linux")]
-            // SAFETY: errno is thread-local; zero distinguishes readdir EOF from failure.
-            unsafe {
-                *libc::__errno_location() = 0
-            };
+            platform::clear_errno();
             // SAFETY: the directory stream remains held until closed below.
             let entry = unsafe { libc::readdir(directory) };
             if entry.is_null() {
@@ -208,7 +216,6 @@ impl AnchoredDirectory {
     }
 
     /// Whether the only entry in this held directory is the expected leaf.
-    #[cfg(target_os = "macos")]
     pub fn contains_only(&self, expected: &CStr) -> io::Result<bool> {
         validate_directory_leaf(expected)?;
         let mut found = false;
@@ -227,25 +234,7 @@ impl AnchoredDirectory {
     /// caller must check the path still names this inode around that observation. Mutations
     /// remain descriptor-relative even when the directory has moved.
     pub fn current_path(&self) -> io::Result<PathBuf> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut path =
-                vec![0_u8; usize::try_from(libc::PATH_MAX).expect("PATH_MAX fits usize")];
-            // SAFETY: F_GETPATH fills at most PATH_MAX bytes of the live directory's path.
-            if unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let length = CStr::from_bytes_until_nul(&path)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                .to_bytes()
-                .len();
-            path.truncate(length);
-            Ok(PathBuf::from(OsString::from_vec(path)))
-        }
-        #[cfg(target_os = "linux")]
-        {
-            fs::read_link(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
-        }
+        platform::current_path(&self.0)
     }
 
     /// Remove the supplied held child's contents and then its name, never following a link.
@@ -319,7 +308,6 @@ impl AnchoredDirectory {
     }
 
     /// Both names resolve against this held parent; an existing destination is never replaced.
-    #[cfg(target_os = "macos")]
     pub fn rename_child_noreplace(&self, source: &CStr, destination: &CStr) -> io::Result<()> {
         validate_directory_leaf(source)?;
         validate_directory_leaf(destination)?;
@@ -784,20 +772,6 @@ pub fn is_temp_artifact(file_name: &OsStr) -> bool {
     name.starts_with('.') && name.contains(".tmp.")
 }
 
-/// The Linux mount identity of an already-held inode, not its backing device number.
-/// A bind mount has a distinct identity even when both paths share the same filesystem.
-#[cfg(target_os = "linux")]
-pub fn mount_id(held: &File) -> io::Result<u64> {
-    use rustix::fs::{AtFlags, StatxFlags, statx};
-    let stat = statx(held, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    if !StatxFlags::from_bits_retain(stat.stx_mask).contains(StatxFlags::MNT_ID) {
-        return Err(io::Error::other(
-            "cannot prove mount boundary: STATX_MNT_ID unavailable",
-        ));
-    }
-    Ok(stat.stx_mnt_id)
-}
-
 /// Remove a directory tree a sandboxed process wrote, read-only directories included.
 ///
 /// Tools seal what they write: Go's module cache extracts every directory 0555, and
@@ -893,123 +867,6 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 /// resolved again between the change and its flush.
 pub fn sync_held_directory(directory: &File) -> io::Result<()> {
     full_sync(directory)
-}
-
-/// Atomically rename one directory-relative entry without replacing an existing destination.
-#[cfg(target_os = "macos")]
-pub fn rename_noreplace(
-    directory: std::os::fd::RawFd,
-    source: &std::ffi::CStr,
-    destination_directory: std::os::fd::RawFd,
-    destination: &std::ffi::CStr,
-) -> io::Result<()> {
-    // SAFETY: both names are NUL-terminated and remain live for the call; `directory` is an open
-    // directory descriptor owned by the caller. RENAME_EXCL makes the destination check atomic.
-    let result = unsafe {
-        libc::renameatx_np(
-            directory,
-            source.as_ptr(),
-            destination_directory,
-            destination.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Atomically rename one directory-relative entry without replacing an existing destination.
-#[cfg(target_os = "linux")]
-pub fn rename_noreplace(
-    directory: std::os::fd::RawFd,
-    source: &std::ffi::CStr,
-    destination_directory: std::os::fd::RawFd,
-    destination: &std::ffi::CStr,
-) -> io::Result<()> {
-    // SAFETY: both names are NUL-terminated and remain live for the syscall; `directory` is an
-    // open directory descriptor owned by the caller. libc supplies the kernel ABI flag value.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory,
-            source.as_ptr(),
-            destination_directory,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn rename_noreplace(
-    _directory: std::os::fd::RawFd,
-    _source: &std::ffi::CStr,
-    _destination_directory: std::os::fd::RawFd,
-    _destination: &std::ffi::CStr,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic create-new rename is unsupported",
-    ))
-}
-
-/// Atomically exchange two directory entries, without following either entry's symlink.
-/// Darwin uses RENAME_SWAP; Linux uses the renameat2 syscall directly so this also works
-/// with libc versions predating its wrapper. A failure leaves both entries unchanged.
-pub fn rename_exchange(
-    directory: std::os::fd::RawFd,
-    source: &CStr,
-    destination: &CStr,
-) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    // SAFETY: the NUL-terminated names remain live for the call. The caller owns the directory
-    // descriptor, or passes AT_FDCWD. RENAME_SWAP exchanges entries in one kernel operation.
-    let result = unsafe {
-        libc::renameatx_np(
-            directory,
-            source.as_ptr(),
-            directory,
-            destination.as_ptr(),
-            libc::RENAME_SWAP,
-        )
-    };
-    #[cfg(target_os = "linux")]
-    // SAFETY: the names and descriptor have the same lifetime contract as above. The syscall
-    // uses the kernel ABI flags, avoiding a dependency on glibc's newer renameat2 wrapper.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory,
-            source.as_ptr(),
-            directory,
-            destination.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (directory, source, destination);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic directory-entry exchange is unsupported",
-        ))
-    }
 }
 
 /// Open the directory at `path` for directory-relative work, refusing a symlink or a
@@ -1407,7 +1264,6 @@ mod tests {
         std::fs::canonicalize("/tmp").unwrap_or_else(|error| panic!("canonical /tmp: {error}"))
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn read_only_directory_capability_never_creates_or_follows_a_link() {
         let temporary =
@@ -1433,7 +1289,6 @@ mod tests {
         fs::remove_dir_all(temporary).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn held_directory_sole_entry_checks_do_not_share_a_directory_offset() {
         let temporary =
@@ -1457,7 +1312,6 @@ mod tests {
         fs::remove_dir_all(temporary).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn held_parent_rename_never_overwrites_or_follows_a_replaced_parent_path() {
         let temporary =

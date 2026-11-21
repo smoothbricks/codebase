@@ -1,4 +1,4 @@
-//! The fixed verb set: a caller's arguments become the argument vector of exactly one `zfs`
+//! The fixed verb set: a caller's arguments become the argument vector of at most one `zfs`
 //! command, or a refusal. Pure: nothing here runs a command or reads the host.
 
 use std::fmt;
@@ -65,6 +65,7 @@ impl fmt::Display for Refusal {
 }
 
 pub const USAGE: &str = "usage: cowshed-helper <root> <verb> …
+  check
   create   <dataset> [<property>=<value>…]
   clone    <dataset>@<snapshot> <dataset> [<property>=<value>…]
   snapshot <dataset>@<snapshot>
@@ -78,8 +79,10 @@ pub const USAGE: &str = "usage: cowshed-helper <root> <verb> …
 /// What one accepted invocation does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Plan {
-    /// The arguments of the one `zfs` command.
-    pub zfs: Vec<String>,
+    /// The arguments of the one `zfs` command, or `None` for `check`, which runs none: the
+    /// helper's own preconditions (it runs as root, and the root names the caller) are the whole
+    /// of what it proves.
+    pub zfs: Option<Vec<String>>,
     /// Every mountpoint path the command sets, for the host's ownership check.
     pub mountpoints: Vec<PathBuf>,
     /// The dataset `create` made: its mounted root goes to the caller, since a new dataset's
@@ -211,11 +214,16 @@ pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
     let (verb, rest) = arguments.split_first().ok_or(Refusal::Usage)?;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     let plain = |zfs: Vec<String>| Plan {
-        zfs,
+        zfs: Some(zfs),
         mountpoints: Vec::new(),
         own: None,
     };
     match (verb.as_str(), rest.as_slice()) {
+        ("check", []) => Ok(Plan {
+            zfs: None,
+            mountpoints: Vec::new(),
+            own: None,
+        }),
         ("create", [name, set @ ..]) => {
             let created = dataset(root, name)?;
             let set = properties(set)?;
@@ -223,7 +231,7 @@ pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
             zfs.extend(options(&set));
             zfs.push(created.to_string());
             Ok(Plan {
-                zfs,
+                zfs: Some(zfs),
                 mountpoints: set.mountpoints,
                 own: Some(created),
             })
@@ -236,7 +244,7 @@ pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
             zfs.extend(options(&set));
             zfs.extend([origin.as_str().to_owned(), clone.to_string()]);
             Ok(Plan {
-                zfs,
+                zfs: Some(zfs),
                 mountpoints: set.mountpoints,
                 own: None,
             })
@@ -314,13 +322,13 @@ pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
             zfs.extend(set.options.iter().cloned());
             zfs.push(target.to_string());
             Ok(Plan {
-                zfs,
+                zfs: Some(zfs),
                 mountpoints: set.mountpoints,
                 own: None,
             })
         }
         (
-            "create" | "clone" | "snapshot" | "destroy" | "rename" | "promote" | "mount"
+            "check" | "create" | "clone" | "snapshot" | "destroy" | "rename" | "promote" | "mount"
             | "unmount" | "set",
             _,
         ) => Err(Refusal::Usage),
@@ -344,6 +352,43 @@ mod tests {
         run(arguments)
             .unwrap_or_else(|refusal| panic!("{arguments:?}: {refusal}"))
             .zfs
+            .unwrap_or_else(|| panic!("{arguments:?} runs no zfs command"))
+    }
+
+    #[test]
+    fn check_runs_no_command_and_takes_no_argument() {
+        let main = format!("{REPO}/main");
+        assert_eq!(
+            run(&["check"]),
+            Ok(Plan {
+                zfs: None,
+                mountpoints: Vec::new(),
+                own: None,
+            })
+        );
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["check", &main],
+            vec!["check", ROOT],
+            vec!["check", "--force"],
+            vec!["check", "mountpoint=/home/u/w"],
+            vec!["check", ""],
+        ];
+        for arguments in cases {
+            assert_eq!(run(&arguments), Err(Refusal::Usage), "{arguments:?}");
+        }
+        // Every other verb runs a command: `check` is the only one that proves and changes
+        // nothing.
+        for arguments in [
+            vec!["mount", main.as_str()],
+            vec!["unmount", main.as_str()],
+            vec!["set", main.as_str(), "canmount=off"],
+        ] {
+            assert!(run(&arguments).unwrap().zfs.is_some(), "{arguments:?}");
+        }
+        assert_eq!(
+            run(&["Check"]),
+            Err(Refusal::UnknownVerb("Check".to_owned()))
+        );
     }
 
     #[test]

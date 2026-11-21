@@ -9,7 +9,8 @@
 //! leader may have forked unseen.
 //!
 //! The fold is pure: the sampler is its only writer, and [`observe`] is the thin kernel shell
-//! that feeds it on macOS.
+//! that feeds it, the platform's (`macos.rs`: `proc_pidinfo`, `KERN_PROCARGS2` and
+//! `proc_pid_rusage`; `linux.rs`: pidfds and procfs), selected here and nowhere else.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -19,10 +20,20 @@ use crate::api::process::{
     ProcessUsage,
 };
 use crate::api::resources::{CpuMicros, CpuMicrosDelta, CpuTotals, ResourceUnitError};
-use crate::runtime::job_groups::Process;
 use crate::runtime::process_tree::{ProcessIdentity, ProcessImage};
 use crate::runtime::process_usage::{ProcessUsageFold, UsageFoldError, UsageObservation};
 use crate::runtime::supervisor::LeafCoverage;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub use platform::observe;
 
 /// One process life the census saw.
 #[derive(Debug)]
@@ -335,72 +346,12 @@ fn covered_permille(observed: CpuMicros, total: CpuMicros) -> Option<u16> {
     Some(u16::try_from(covered * u128::from(PERMILLE_WHOLE) / total).unwrap_or(PERMILLE_WHOLE))
 }
 
-/// Read each member of the job's group into `census` at `at`: its identity, the image it runs
-/// and its own counters, each fenced to the life the membership read found. A member whose pid
-/// no longer names that life -- it exited, or the pid was given to another process -- is no
-/// member; a read failure of a member still running is an error.
-pub fn observe(
-    census: &mut Census,
-    members: &[Process],
-    at: std::time::Instant,
-) -> std::result::Result<(), ObserveError> {
-    use crate::runtime::process_events::{Darwin, ProcessReads as _};
-    use crate::runtime::process_tree::BirthToken;
-    use crate::runtime::process_usage::sample;
-
-    let reader = Darwin.reader_uid();
-    for member in members {
-        let pid = member.pid().cast_unsigned();
-        let read = |source| ObserveError::Read { pid, source };
-        // Read through the identity the membership read found, never the pid alone.
-        let Some(before) = member.record().map_err(read)? else {
-            continue;
-        };
-        let process = ProcessIdentity {
-            pid,
-            birth: BirthToken(before.unique_id),
-        };
-        // The image names the pid alone: it is this life's only if the member still holds the
-        // pid after the read.
-        let image = Darwin.image(pid);
-        let after = member.record().map_err(read)?;
-        match (image, after) {
-            (Ok(image), Some(_)) => census.found(process, Some(image)),
-            // The life ended around the read: the image may be a stranger's, or none.
-            (Ok(_) | Err(_), None) => census.found(process, None),
-            // `EINVAL` is also the kernel's refusal of another user's arguments, which its own
-            // credential rule says: an image the census lacks, not a failure.
-            (Err(source), Some(record))
-                if source.raw_os_error() == Some(libc::EINVAL)
-                    && reader != 0
-                    && reader != record.uid =>
-            {
-                census.unread_image(process);
-            }
-            // The census lacks this image whatever later reads find: the gap stays, beside the
-            // failure this read returns.
-            (Err(source), Some(_)) => {
-                census.unread_image(process);
-                return Err(ObserveError::Image { pid, source });
-            }
-        }
-        let start = census.usage().start(process);
-        if let crate::runtime::process_usage::Sampled::Read(reading) = sample(start, process, at)? {
-            census
-                .usage()
-                .apply(UsageObservation::Read { process, reading })?;
-        }
-    }
-    census.close()?;
-    Ok(())
-}
-
 /// Why the census could not read the job's members.
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveError {
     #[error("reading process {pid} failed: {source}")]
     Read { pid: u32, source: std::io::Error },
-    #[error("KERN_PROCARGS2 for running process {pid} failed: {source}")]
+    #[error("{} for running process {pid} failed: {source}", platform::IMAGE_READ)]
     Image { pid: u32, source: std::io::Error },
     #[error(transparent)]
     Sample(#[from] crate::runtime::process_usage::SampleError),

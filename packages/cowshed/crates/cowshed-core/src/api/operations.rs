@@ -9,6 +9,7 @@
 //! for the N-API and TypeScript projections. Adding a field to a request record or a row to the
 //! table changes every projection together; no adapter restates a field list.
 
+use super::dto::StoreSubstrate;
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DefragmentResult, DoctorReport,
     EmptyResult, ExecClass, ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet,
@@ -462,6 +463,10 @@ pub struct ProjectOpened {
     pub binding: Arc<RepositoryBinding>,
     pub git_root: Arc<Path>,
     pub store_root: Arc<Path>,
+    /// What the store keeps each payload as. Absent only from a controller of a build that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substrate: Option<StoreSubstrate>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -222,16 +222,16 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                     .expect("admit before descriptor exhaustion"),
             )
         };
+        #[cfg(target_os = "linux")]
+        let placement = CommandPlacement::from(JobMembership::from(Arc::clone(&cgroup)));
+        #[cfg(not(target_os = "linux"))]
+        let placement = CommandPlacement::at_nice(10);
         let (stdin, stdin_writer) = pipe().expect("job stdin");
         let (stdout_reader, stdout) = pipe().expect("job stdout");
         let (stderr_reader, stderr) = pipe().expect("job stderr");
-        let control = Arc::new(JobControl::new(
-            #[cfg(target_os = "linux")]
-            Arc::clone(&cgroup),
-        ));
+        let control = Arc::new(JobControl::new(placement.membership().cloned()));
         let (_release, released) = oneshot::channel();
         let (events, mut observed) = mpsc::channel(4);
-        #[cfg(target_os = "macos")]
         let monitor = super::super::process_monitor::ProcessMonitor::prepare(
             super::super::process_tree::TreeOwner::Job(job_id),
         )
@@ -251,11 +251,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 command: HostCommand::Argv(vec![OsString::from("true")]),
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
-                #[cfg(target_os = "macos")]
-                nice: 10,
-                #[cfg(target_os = "linux")]
-                cgroup: Arc::clone(&cgroup),
-                #[cfg(target_os = "macos")]
+                placement,
                 monitor,
             },
             Arc::clone(&control),

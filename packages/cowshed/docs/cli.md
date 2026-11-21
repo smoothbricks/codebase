@@ -416,6 +416,10 @@ next: cowshed fork <ws>
 <project-root>
 ```
 
+Re-adoption is an APFS store's verb: a sparse image keeps the space its files once used, and replacing main returns it.
+A ZFS or plain-directory store frees space as files are deleted, so `--re-adopt` is refused there (exit 2, and `--json`
+carries `unsupported: { substrate, operation: "reAdopt" }`).
+
 Use `cowshed adopt <checkout> --re-adopt` to reclaim guest-freed space. Default adopt remains idempotent. Run
 re-adoption from outside the checkout, after every source and build-volume holder has exited; it lists each holder's PID
 and command and refuses, rather than killing a process or forcing an unmount. Once the unmount succeeds, a device
@@ -974,8 +978,18 @@ empty directory.
 
 ### `cowshed resize <name|main> <size>`
 
-Grow one workspace's image. Sizes are `100g`, `200g`, `1t` — binary units, at least a mebibyte, and a whole number of
+Grow one workspace's capacity. Sizes are `100g`, `200g`, `1t` — binary units, at least a mebibyte, and a whole number of
 the 4 KiB blocks the image tools resize in.
+
+What the capacity is depends on what the store keeps a workspace as:
+
+| Store                   | Capacity                                                  | `resize`                                                                                                   |
+| ----------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| APFS (macOS)            | the sparse image's size                                   | detaches the workspace, grows the image, mounts it again                                                   |
+| ZFS (Linux)             | the dataset's `refquota`                                  | raises the `refquota` in place; the workspace stays mounted                                                |
+| plain directory (Linux) | none: it grows within the filesystem that holds the store | refused (exit 2; `--json` carries `unsupported: { substrate: "directory", operation: "resizeWorkspace" }`) |
+
+`--build` grows the workspace's build volume and its seed the same way.
 
 ```
 $ cowshed resize raven 200g
@@ -988,7 +1002,8 @@ named, before anything is touched. A mounted workspace is detached, grown, and p
 volume is busy refuses the resize rather than being torn out from under running work.
 
 Capacity itself is chosen once, at `cowshed adopt --capacity <size>` (default `100g`), because that is the only verb
-that mints an image — `fork` clones main's and inherits its capacity, so `resize` is how a clone gets a bigger one.
+that mints an image — `fork` clones main's and inherits its capacity, so `resize` is how a clone gets a bigger one. A
+ZFS store sets it as main's `refquota`, which each clone keeps; a plain-directory store reads the flag and caps nothing.
 
 ### `cowshed defrag <name|main>`
 
@@ -1019,6 +1034,10 @@ The copy needs as much free space on the store volume as the image has allocated
 and it keeps that space: clones taken earlier still share the old blocks, so the space comes back only as they are
 removed. Main fragments again as it is rewritten while new clones share it; stop the rewrites first, or the warning
 returns.
+
+`defrag` exists only where a workspace is an image file. A ZFS dataset and a plain directory have no extent map of their
+own to rewrite, so a Linux store refuses the verb before anything is stopped (exit 2; `--json` carries
+`unsupported: { substrate, operation: "defragmentWorkspace" }`).
 
 ### `cowshed reseed <name>`
 
@@ -1549,9 +1568,12 @@ cowshed: withheld from every child: REGISTRY_READ_TOKEN
   the credential is absent. `rm --origin <origin>` forgets one.
 - Network reach stays separate: `cowshed grant <ws> --egress <host>` is what lets a workspace reach the registry at all,
   and it is audited on its own.
-- On Linux the store is read-only by construction — the service manager supplies records through
-  `$CREDENTIALS_DIRECTORY` — so `add`/`rm`/`status` say that, with the mechanism named, instead of reporting a success
-  that wrote nothing.
+- On Linux the store is a directory instead of the Keychain: `credentials` in cowshed's support directory, owned by the
+  user at mode 0700, with one record file per binding at mode 0600. `add` writes the record (a temporary file, synced,
+  renamed over the record's name), `rm` unlinks it, and `ls`/`status` read it. The gateway reads the same directory
+  through `$CREDENTIALS_DIRECTORY`, which its systemd unit sets, and judges the directory and the record again at every
+  lookup, so a rotation needs no restart. Writer and reader refuse a directory that is a symlink, belongs to another
+  user, or grants group or other any permission.
 
 ### `cowshed identity add <remote>`
 
@@ -1593,6 +1615,10 @@ resolved. The project's gateway sessions are reconciled before each exec, shell 
 (`coordinator.destroy`, a `coordinator.land` that retires).
 
 ### `cowshed disk-command <diskutil|hdiutil> -- <args...>`
+
+`diskutil` and `hdiutil` are macOS's tools, so this is a macOS verb: on Linux neither exists and the verb exits 104, as
+it does for any tool the host lacks. A Linux store's datasets and directories are cowshed's own to manage
+([ZFS](zfs.md)).
 
 Runs one `diskutil` or `hdiutil` argv for a program that is not cowshed — a test script, a benchmark, a build adapter —
 through the same runner cowshed's own disk work uses, so it never needs to spawn a disk tool itself:

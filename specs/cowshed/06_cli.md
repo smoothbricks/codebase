@@ -187,6 +187,16 @@ Two verbs own the host story, both runnable from any directory:
   volume, its `/etc/fstab` pin and its mount-service entry inside that same single session, refusing while anything but
   the marker is left (03_caches.md, "Wiring").
 
+  On Linux the storage half of the same verb is 09_substrates.md's ("Linux host paths"): setup publishes a directory
+  store, or creates the datasets of the ZFS root that serves the user, and the per-user mount root. The one
+  authorization it can ask for is `sudo`'s, announced first, and only to make the root-owned directories of a directory
+  store that is not there yet; a ZFS root is changed through `cowshed-helper` and asks nothing. It pins nothing in
+  `/etc/fstab`, encrypts nothing and installs no system service, and its report says why no boot mount is pinned. Run
+  inside a checkout whose `.cowshed.toml` declares `[substrate]`, it provisions that root on a host that has no store
+  yet. The install half is the same: the invoking build becomes the installed cowshed under
+  `~/Library/Application Support/dev.cowshed/bin`, and the gateway runs as the systemd user unit
+  `dev.cowshed.gateway.service` (05_gateway.md), with nothing signed.
+
 The verbs that change workspace or lifecycle state or run a job through a workspace supervisor — `adopt`, `unadopt`,
 `fork`, `mv`, `path`, `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `cache clear`,
 `rekey`, `gc`, `push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs this CLI's
@@ -429,6 +439,18 @@ wrapper exit and `refused … nothing was detached`. A device name that was recy
 admission is never detached. The window that remains, from that read to `hdiutil`'s own open of the name, is the one
 every cowshed release has. A caller that detaches a device it did not just attach itself uses this, never `-force`
 (`packages/nx-plugin/README.md`, RAM temp).
+
+`disk-command` is a macOS verb: `diskutil` and `hdiutil` are that platform's tools. On Linux neither exists, and the
+verb exits with the wrapper's 104, as for any tool the host lacks.
+
+`resize`, `defrag`, `adopt --capacity` and `adopt --re-adopt` act on what the store keeps a workspace as (07_api.md,
+"Substrates"). On an APFS store they act on the image, as the table says. On a ZFS store `--capacity` and `resize` set
+and raise the dataset's `refquota`, in place and mounted, and `resize --build` the build dataset's and its seed's;
+`defrag` and `--re-adopt` are refused, since a dataset has no image file to rewrite or replace. On a plain-directory
+store `--capacity` is validated and caps nothing, and `resize`, `defrag` and `--re-adopt` are refused. Each refusal is
+decided before a supervisor is stopped or anything is changed: exit 2 (`usage`), the message naming the substrate and
+the operation, and under `--json` the error carrying `unsupported: { substrate, operation }`. `rekey`, `reseed`,
+`cache clear`, `attach`, `detach`, `fork`, `rm` and `gc` mean the same on every substrate.
 
 During an interrupted re-adoption (02 §Re-adoption), `adopt <checkout> --re-adopt` and
 `mount main --repo-id <owner/repo>` resolve from the existing controller checkout-path record only when a strict

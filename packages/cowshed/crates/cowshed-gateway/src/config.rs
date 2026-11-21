@@ -7,10 +7,7 @@ use std::{
     time::Duration,
 };
 
-use cowshed_gateway_types::{ConfigError, StartupHeal, SupervisorRecovery, WorkspaceSession};
-// The workspace data socket only exists on Linux; macOS sessions are TCP port blocks.
-#[cfg(target_os = "linux")]
-use cowshed_gateway_types::{WorkspaceEndpoint, validate_identifier};
+use cowshed_gateway_types::{ConfigError, StartupHeal, SupervisorRecovery};
 
 use crate::cache::{
     CacheConfig, DEFAULT_FILL_WAIT_TIMEOUT, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES,
@@ -249,7 +246,9 @@ pub struct GatewayConfig {
     pub simulator_drop_root: Option<PathBuf>,
     /// Exact trusted executable used for the isolated Git fetch helper.
     pub git_helper_executable: Option<PathBuf>,
-    /// Authoritative private directory for Linux workspace data sockets.
+    /// The private directory the workspace data sockets live in, where sessions have one
+    /// ([`crate::data_socket_root`]): a start makes it when absent, and every session's socket
+    /// lies directly inside it.
     pub data_socket_root: Option<PathBuf>,
     /// cowshed's user cache directory in production (`~/Library/Caches/dev.cowshed`, Linux
     /// `$XDG_CACHE_HOME/cowshed`); the mirror cache must be exactly its `mirror`.
@@ -329,14 +328,7 @@ impl GatewayConfig {
                 self.authorized_control_uid,
             )?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            let root = self
-                .data_socket_root
-                .as_deref()
-                .ok_or(ConfigError::MissingDataSocketRoot)?;
-            Self::validate_data_socket_root(root)?;
-        }
+        crate::session_endpoint::validate_config(self)?;
         Ok(())
     }
 
@@ -376,61 +368,6 @@ impl GatewayConfig {
             .as_deref()
             .ok_or(ConfigError::MissingGitHelperExecutable)?;
         self.validate_git_helper_executable(helper)?;
-        Ok(())
-    }
-
-    pub(crate) fn validate_session_endpoint(
-        &self,
-        session: &WorkspaceSession,
-    ) -> Result<(), ConfigError> {
-        #[cfg(target_os = "linux")]
-        {
-            let root = self
-                .data_socket_root
-                .as_deref()
-                .ok_or(ConfigError::MissingDataSocketRoot)?;
-            let WorkspaceEndpoint::Unix(path) = &session.endpoint else {
-                return Err(ConfigError::ExpectedUnixEndpoint);
-            };
-            if path.parent() != Some(root)
-                || self
-                    .control_socket
-                    .as_ref()
-                    .is_some_and(|control| control == path)
-            {
-                return Err(ConfigError::EndpointOutsideDataSocketRoot);
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .ok_or(ConfigError::InvalidDataSocketName)?;
-            if path.extension().and_then(|extension| extension.to_str()) != Some("sock")
-                || validate_identifier("workspace socket", stem).is_err()
-            {
-                return Err(ConfigError::InvalidDataSocketName);
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = session;
-        Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn validate_data_socket_root(root: &std::path::Path) -> Result<(), ConfigError> {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        if !root.is_absolute() {
-            return Err(ConfigError::RelativeSocketPath);
-        }
-        let metadata =
-            std::fs::symlink_metadata(root).map_err(|_| ConfigError::InsecureDataSocketRoot)?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(ConfigError::InsecureDataSocketRoot);
-        }
         Ok(())
     }
     fn validate_git_helper_executable(&self, path: &std::path::Path) -> Result<(), ConfigError> {

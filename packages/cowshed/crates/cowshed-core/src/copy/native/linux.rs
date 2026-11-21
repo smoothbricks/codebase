@@ -1,10 +1,21 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use super::{LeafMaterialization, clone_fallback_error};
+use super::LeafMaterialization;
+
+/// Whether a refused `FICLONE` says only that these two files cannot share extents, so the
+/// leaf is copied instead; any other failure is the copy's.
+fn clone_fallback_error(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        code == libc::EXDEV
+            || code == libc::EOPNOTSUPP
+            || code == libc::ENOTTY
+            || code == libc::EINVAL
+    })
+}
 
 fn set_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     use std::ffi::CString;
@@ -95,4 +106,30 @@ pub fn directory_metadata(source: &Path, destination: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     fs::set_permissions(destination, metadata.permissions())?;
     set_times(destination, &metadata)
+}
+
+/// Linux has no per-descriptor uncached mode short of `O_DIRECT`, which binds every buffer,
+/// offset and length to the device's logical block alignment; these transfers keep no such
+/// contract. The page cache carries them, and this changes nothing.
+pub(crate) fn bypass_cache(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clone_fallback_error;
+
+    #[test]
+    fn only_filesystem_clone_capability_errors_fall_back() {
+        for code in [libc::EXDEV, libc::EOPNOTSUPP, libc::ENOTTY, libc::EINVAL] {
+            assert!(clone_fallback_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        for code in [libc::EIO, libc::ENOSPC, libc::EACCES] {
+            assert!(!clone_fallback_error(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+    }
 }

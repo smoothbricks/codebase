@@ -40,7 +40,11 @@ mod subtree;
 pub mod tree_holders;
 pub mod volume_name;
 pub mod workspace_supervisor;
+pub mod zfs_helper;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../cowshed-core/tests/support/sandbox_launcher.rs"]
+mod sandbox_launcher;
 #[cfg(test)]
 #[path = "../../cowshed-core/tests/support/sealed_segments.rs"]
 mod sealed_segments;

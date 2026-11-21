@@ -1,4 +1,5 @@
 use super::call::{Binder, Binding, HostFields, JobFields, RepoFields, WorkspaceFields};
+use super::dto::StoreSubstrate;
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, DefragmentResult, DoctorReport, EmptyResult,
     ExecRequest, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
@@ -924,6 +925,7 @@ impl Cowshed {
             repo_id: wire.repo_id,
             binding: wire.binding,
             git_root: wire.git_root,
+            substrate: wire.substrate,
             paths,
             runtime: Arc::clone(&self.runtime),
         })
@@ -975,6 +977,7 @@ pub struct Project {
     repo_id: RepoId,
     binding: Arc<RepositoryBinding>,
     git_root: Arc<Path>,
+    substrate: Option<StoreSubstrate>,
     paths: ProjectPaths,
     runtime: Arc<dyn ControllerRuntime>,
 }
@@ -990,6 +993,12 @@ impl Project {
 
     pub fn git_root(&self) -> &Path {
         &self.git_root
+    }
+
+    /// What the project's store keeps each workspace and build volume as; `None` when the
+    /// controller that opened it is of a build that does not say.
+    pub fn substrate(&self) -> Option<StoreSubstrate> {
+        self.substrate
     }
 
     pub fn paths(&self) -> &ProjectPaths {
@@ -4405,6 +4414,7 @@ mod tests {
             repo_id: repo_id.clone(),
             binding: Arc::new(binding),
             git_root: Arc::from(Path::new("/repo")),
+            substrate: None,
             paths: ProjectPaths::with_mount_root(
                 "/tmp/cowshed-capability-tests",
                 "/tmp/cowshed-capability-tests/mnt",

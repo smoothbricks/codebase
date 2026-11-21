@@ -7,19 +7,25 @@ object per workspace instead of a hundred thousand inodes.
 
 ## Platforms
 
-The working first product path is macOS with APFS images and Seatbelt. Linux with ZFS, Landlock, and private network
-namespaces is a later platform goal; [zfs.md](zfs.md) records that contract but is not part of the basic macOS setup.
+The first product path is macOS with APFS images and Seatbelt. The Linux host is implemented: ZFS datasets or a
+plain-directory store, Landlock and namespaces, systemd user services ([zfs.md](zfs.md)). It compiles on Linux, but it
+has not yet been run end to end against a real ZFS pool, so treat it as unproven.
 
-| Platform | Substrate                       | Status                                        |
-| -------- | ------------------------------- | --------------------------------------------- |
-| macOS    | APFS image per workspace        | Current implementation and integration target |
-| Linux    | ZFS dataset clone per workspace | Subsequent Linux goal                         |
+| Platform | Substrate                                                     | Status                                        |
+| -------- | ------------------------------------------------------------- | --------------------------------------------- |
+| macOS    | APFS image per workspace (`apfs`)                             | Current implementation and integration target |
+| Linux    | ZFS dataset clone per workspace (`zfs`)                       | Implemented; not yet proven end to end        |
+| Linux    | real directory per workspace, where no ZFS root (`directory`) | Implemented; no clone, capacity or volume     |
 
-The workspace and test targets must still compile on Linux. Pure retained-input path witnesses are available across
-crate boundaries on every platform; disk-image attachment, native port allocation, and Darwin process-argument
-diagnostics remain macOS-only. From the repository root, `bun run check:linux` checks the full Linux target surface.
-Shell fixtures running under cleared child environments supply their tool PATH from the test environment rather than
-assuming coreutils live under `/bin` or `/usr/bin`.
+A project's `substrate` (`project.open`, `Project.substrate`) names which one its store is. `resize`, `defrag` and
+`adopt --re-adopt` act on what that substrate has: a verb it lacks is refused with a typed `unsupported` reason
+([cli.md](cli.md#cowshed-resize-namemain-size)).
+
+The workspace and test targets compile on both platforms. Pure retained-input path witnesses are available across crate
+boundaries on every platform; disk-image attachment, native port allocation, and Darwin process-argument diagnostics
+remain macOS-only. From the repository root, `bun run check:linux` checks the full Linux target surface. Shell fixtures
+running under cleared child environments supply their tool PATH from the test environment rather than assuming coreutils
+live under `/bin` or `/usr/bin`.
 
 ```sh
 $ cd ~/src/api

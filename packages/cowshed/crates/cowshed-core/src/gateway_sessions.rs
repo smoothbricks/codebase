@@ -1,10 +1,10 @@
 //! The gateway's session table is a cache of host inventory, never an authority.
 //!
-//! Every workspace's gateway session — its endpoint (port block), token, CA, and egress policy
-//! from the grants file — is derived from the machine-global store under
-//! `/private/cowshed/store`; the running gateway only caches those sessions so it can answer
-//! data-plane connections. Reconcile removes the selected workspace's stale incarnations by
-//! identity before a job starts.
+//! Every workspace's gateway session — its endpoint (a macOS workspace's port block, a Linux
+//! workspace's socket in the store), token, CA, and egress policy from the grants file — is
+//! derived from the machine-global store under `/private/cowshed/store`; the running gateway
+//! only caches those sessions so it can answer data-plane connections. Reconcile removes the
+//! selected workspace's stale incarnations by identity before a job starts.
 //! Project lifecycle and maintenance additionally evict a deleted project's session holding a
 //! reclaimed port block once no live workspace claims it. Workspace jobs never inspect or remove
 //! sibling sessions. Reconciles read gateway status before their inventory snapshot, and a write
@@ -13,12 +13,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cowshed_gateway_types::{
-    CanonicalHost, DaemonStatus, EgressGrant, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
-    WorkspaceSession, WorkspaceToken,
+    CanonicalHost, ConfigError, DaemonStatus, EgressGrant, WorkspaceCa, WorkspaceEndpoint,
+    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -29,7 +29,7 @@ use crate::gateway_inventory::{
     served_sessions,
 };
 use crate::metadata::{
-    EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
+    EgressMode as CoreEgressMode, GrantSet, PortBlock, WorkspaceIncarnation, WorkspaceName,
 };
 use crate::repository::RepoId;
 use crate::runtime::wait_spans::WaitFailure;
@@ -448,16 +448,42 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
     Ok(policy)
 }
 
-/// Convert typed macOS inventory, including off-host collision fixtures (05_gateway.md).
-/// IDs, token, CA and policy are validated by their constructors here. Validate the recorded
-/// port-block topology, not the runner's platform; the gateway validates the current host
-/// again at installation, where Linux continues to require a Unix endpoint.
+/// Where the gateway serves a workspace, by the topology its inventory records (05_gateway.md,
+/// "Placement and identity"): the base of a macOS workspace's port block, validated as that
+/// block; or, for a Linux workspace, which holds none, its incarnation's socket in `store`'s
+/// `run/gateway`. The recorded topology decides, never the platform of the host reading it: the
+/// gateway validates the current host again at installation, where macOS admits only the first
+/// and Linux only the second.
+fn session_endpoint(
+    port_block: Option<PortBlock>,
+    store: &Path,
+    incarnation: &WorkspaceIncarnation,
+) -> std::result::Result<WorkspaceEndpoint, ConfigError> {
+    match port_block {
+        Some(block) => {
+            let endpoint = WorkspaceEndpoint::Tcp {
+                address: SocketAddr::from((Ipv4Addr::LOCALHOST, block.base())),
+                block_size: block.size(),
+            };
+            endpoint.validate_macos_port_block()?;
+            Ok(endpoint)
+        }
+        None => {
+            let endpoint = WorkspaceEndpoint::linux_data_socket(store, incarnation.as_str());
+            endpoint.validate()?;
+            Ok(endpoint)
+        }
+    }
+}
+
+/// Convert typed inventory, including off-host macOS collision fixtures (05_gateway.md).
+/// IDs, token, CA and policy are validated by their constructors here, and the endpoint by
+/// [`session_endpoint`].
 pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
     session_snapshot_from_fact(fact).map(|snapshot| snapshot.session)
 }
 
 fn session_snapshot_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSessionSnapshot> {
-    let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, fact.port_block.base()));
     let token = WorkspaceToken::parse(fact.credentials.token()).map_err(|error| {
         CowshedError::integrity(
             format!(
@@ -480,26 +506,10 @@ fn session_snapshot_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSessi
             "cowshed doctor --json",
         )
     })?;
-    let session = WorkspaceSession {
-        workspace_id: stable_workspace_id(
-            &fact.repo_id,
-            fact.workspace.as_str(),
-            &fact.incarnation,
-        ),
-        repo_id: fact.repo_id.as_str().to_owned(),
-        revision: fact.revision,
-        endpoint: WorkspaceEndpoint::Tcp {
-            address: endpoint,
-            block_size: fact.port_block.size(),
-        },
-        token,
-        ca,
-        policy: policy_from_grants(&fact.grants)?,
-    };
-    session
-        .endpoint
-        .validate_macos_port_block()
-        .map_err(|error| {
+    let policy = policy_from_grants(&fact.grants)?;
+    // The endpoint is judged last: an invalid token, CA or policy is named before it.
+    let endpoint =
+        session_endpoint(fact.port_block, &fact.store, &fact.incarnation).map_err(|error| {
             CowshedError::integrity(
                 format!(
                     "gateway session for {}/{} is invalid: {error}",
@@ -508,6 +518,19 @@ fn session_snapshot_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSessi
                 "cowshed doctor --json",
             )
         })?;
+    let session = WorkspaceSession {
+        workspace_id: stable_workspace_id(
+            &fact.repo_id,
+            fact.workspace.as_str(),
+            &fact.incarnation,
+        ),
+        repo_id: fact.repo_id.as_str().to_owned(),
+        revision: fact.revision,
+        endpoint,
+        token,
+        ca,
+        policy,
+    };
     Ok(WorkspaceSessionSnapshot {
         incarnation: fact.incarnation,
         session,
@@ -973,4 +996,71 @@ fn inventory_error(error: impl std::fmt::Display) -> CowshedError {
 
 pub fn control_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::internal(format!("invalid gateway control configuration: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::{MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE};
+
+    /// A session's endpoint follows what its workspace's inventory records, on whatever host
+    /// reads it: a block is a macOS workspace's TCP listener, validated as a macOS block, and a
+    /// workspace with no block is a Linux one, served on its incarnation's socket in the store.
+    #[test]
+    fn a_sessions_endpoint_is_its_recorded_topology() {
+        let store = Path::new("/private/cowshed/store");
+        let incarnation =
+            WorkspaceIncarnation::new("00112233445566778899aabbccddeeff").expect("incarnation");
+        let block = |base, size| PortBlock::new(base, size).expect("an aligned block");
+        let tcp = |base: u16, block_size| {
+            Ok(WorkspaceEndpoint::Tcp {
+                address: SocketAddr::from((Ipv4Addr::LOCALHOST, base)),
+                block_size,
+            })
+        };
+        for (case, port_block, store, expected) in [
+            (
+                "a new macOS block",
+                Some(block(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE)),
+                store,
+                tcp(MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE),
+            ),
+            (
+                "a live 16-port macOS block",
+                Some(block(MACOS_PORT_MIN + 16, 16)),
+                store,
+                tcp(MACOS_PORT_MIN + 16, 16),
+            ),
+            (
+                "a block below the macOS range",
+                Some(block(
+                    MACOS_PORT_MIN - NEW_PORT_BLOCK_SIZE,
+                    NEW_PORT_BLOCK_SIZE,
+                )),
+                store,
+                Err(ConfigError::InvalidMacosPortBlock.to_string()),
+            ),
+            (
+                "a Linux workspace",
+                None,
+                store,
+                Ok(WorkspaceEndpoint::Unix(PathBuf::from(
+                    "/private/cowshed/store/run/gateway/00112233445566778899aabbccddeeff.sock",
+                ))),
+            ),
+            (
+                "a Linux workspace in a store that is not absolute",
+                None,
+                Path::new("store"),
+                Err(ConfigError::RelativeSocketPath.to_string()),
+            ),
+        ] {
+            assert_eq!(
+                session_endpoint(port_block, store, &incarnation)
+                    .map_err(|error| error.to_string()),
+                expected,
+                "{case}"
+            );
+        }
+    }
 }

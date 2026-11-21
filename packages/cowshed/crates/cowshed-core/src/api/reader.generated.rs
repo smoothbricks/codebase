@@ -805,6 +805,7 @@ static PROJECT_OPENED: Reader = Reader::Record(&[
     ("binding", &REPOSITORY_BINDING),
     ("gitRoot", &LEAF),
     ("storeRoot", &LEAF),
+    ("substrate", &STORE_SUBSTRATE),
 ]);
 static PROJECT_RETIREMENT_REPORT: Reader =
     Reader::Record(&[("repoId", &LEAF), ("archive", &LEAF), ("images", &LEAF)]);
@@ -964,6 +965,8 @@ static STDIN_KIND: Reader = Reader::External(&[
     ("workspaceFile", &LEAF),
 ]);
 static STORAGE_IO_TOTALS: Reader = Reader::Record(&[("readBytes", &LEAF), ("writeBytes", &LEAF)]);
+static STORE_SUBSTRATE: Reader =
+    Reader::External(&[("apfs", &LEAF), ("zfs", &LEAF), ("directory", &LEAF)]);
 static STREAM_INFO_REF: Reader = Reader::Record(&[
     ("storage", &OUTPUT_STORAGE),
     ("bytes", &LEAF),

@@ -46,7 +46,7 @@
 
 use std::fmt::Display;
 use std::fs::OpenOptions;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use crate::api::dto::ExecClass;
@@ -144,6 +144,20 @@ impl ClassCgroup {
             Self::Interactive | Self::Background => write(path, "pids.max", JOB_PIDS_MAX),
         }
     }
+}
+
+/// The nice a job of `class` is placed at: its class cgroup's `cpu.weight.nice`. The job's own
+/// processes keep the nice they were started with.
+pub fn placed_nice(class: ExecClass) -> i32 {
+    ClassCgroup::of(class).nice()
+}
+
+/// A step of interactive work's decay places nothing here. A job's class is its class cgroup, and
+/// cgroup v2 cannot move a job cgroup across class cgroups without migrating its pids, which
+/// would break the job cgroup's accounting. Only mbx's pool decays the job's asks; its kernel
+/// weight stays interactive's.
+pub fn decay_group(_pgid: i32, _nice: i32) -> io::Result<()> {
+    Ok(())
 }
 
 /// One interface write. A single formatted value reaches the file as one `write(2)`, which is how

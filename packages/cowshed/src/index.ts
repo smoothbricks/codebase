@@ -100,6 +100,7 @@ function normalizeNativeError(error: unknown): unknown {
     cpuAdmission: error.cpuAdmission,
     priority: error.priority,
     stdin: error.stdin,
+    unsupported: error.unsupported,
   });
 }
 
@@ -145,6 +146,10 @@ class ProjectImpl implements Project {
 
   get gitRoot(): string {
     return this.#native.gitRoot;
+  }
+
+  get substrate(): Api.StoreSubstrate | undefined {
+    return this.#native.substrate ?? undefined;
   }
 
   async main(): Promise<WorkspaceRef> {

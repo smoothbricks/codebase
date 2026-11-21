@@ -2,13 +2,19 @@ use super::cache::{SharedLayout, SharedToolHome};
 use super::{CapabilityContribution, CapabilityId, DetectionContext, Detector, add_bootstrap};
 use crate::Result;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
-const PNPM_HOME_PATH: &str = "Library/pnpm/store";
-#[cfg(not(target_os = "macos"))]
-const PNPM_HOME_PATH: &str = ".local/share/pnpm/store";
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// pnpm's default content-addressed store, under the platform's user data directory.
 pub static PNPM_HOME: SharedToolHome = SharedToolHome {
     variable: Some("PNPM_CONFIG_STORE_DIR"),
-    home: PNPM_HOME_PATH,
+    home: platform::PNPM_HOME_PATH,
     layout: SharedLayout::Whole,
 };
 

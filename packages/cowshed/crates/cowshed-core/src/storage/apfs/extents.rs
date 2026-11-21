@@ -20,11 +20,20 @@ use std::path::{Path, PathBuf};
 
 use super::ApfsStorageError;
 use crate::copy::RegionCursor;
-#[cfg(target_os = "macos")]
-use crate::copy::native::bypass_cache;
 use crate::copy::native::next_data_region;
 use crate::storage::lifecycle::ExtentCount;
 use cowshed_apfs::SECTOR_BYTES;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::{available_bytes, bypass_cache, physical_run, punch_hole, run_bytes};
 
 /// The rewrite's read/write unit: large enough that the allocator lays each write out as one run,
 /// small enough to stay one reusable buffer.
@@ -558,9 +567,7 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStor
 }
 
 /// Call `run` with the start of every physically contiguous run of the file's data, ascending,
-/// skipping holes, until `run` breaks: one `F_LOG2PHYS_EXT` query per run. Elsewhere than macOS
-/// nothing maps a file to the device and no RAW image lives there, so each data region counts as
-/// one run.
+/// skipping holes, until `run` breaks: one platform query per run (`platform::run_bytes`).
 pub(super) fn for_each_run(
     file: &File,
     length: u64,
@@ -580,131 +587,10 @@ pub(super) fn for_each_run(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn run_bytes(file: &File, offset: u64, length: u64) -> io::Result<u64> {
-    physical_run(file, offset, length).map(|run| run.bytes)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn run_bytes(_: &File, _: u64, length: u64) -> io::Result<u64> {
-    Ok(length)
-}
-
 /// One physically contiguous run of a file: where it starts on the device and how many bytes long.
 struct PhysicalRun {
     device: u64,
     bytes: u64,
-}
-
-/// The physically contiguous run from `offset` on, at most `length` bytes.
-#[cfg(target_os = "macos")]
-fn physical_run(file: &File, offset: u64, length: u64) -> io::Result<PhysicalRun> {
-    use std::os::fd::AsRawFd;
-
-    let mut query = libc::log2phys {
-        l2p_flags: 0,
-        l2p_contigbytes: libc::off_t::try_from(length).map_err(io::Error::other)?,
-        l2p_devoffset: libc::off_t::try_from(offset).map_err(io::Error::other)?,
-    };
-    // SAFETY: `query` is a live, writable `log2phys` for the duration of the call, which is the
-    // argument `F_LOG2PHYS_EXT` reads the file range from and writes the device run into.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_LOG2PHYS_EXT, &raw mut query) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let contiguous = query.l2p_contigbytes;
-    let device = query.l2p_devoffset;
-    let device = u64::try_from(device).map_err(|_| {
-        io::Error::other(format!(
-            "F_LOG2PHYS_EXT reported device offset {device} at offset {offset}"
-        ))
-    })?;
-    match u64::try_from(contiguous) {
-        Ok(0) | Err(_) => Err(io::Error::other(format!(
-            "F_LOG2PHYS_EXT reported {contiguous} contiguous bytes at offset {offset}"
-        ))),
-        Ok(contiguous) => Ok(PhysicalRun {
-            device,
-            bytes: contiguous.min(length),
-        }),
-    }
-}
-
-/// Deallocate `[offset, offset + length)`, leaving a hole that reads as zeros.
-#[cfg(target_os = "macos")]
-fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let mut hole = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: libc::off_t::try_from(offset).map_err(io::Error::other)?,
-        fp_length: libc::off_t::try_from(length).map_err(io::Error::other)?,
-    };
-    // SAFETY: `hole` is a live `fpunchhole_t` for the duration of the call; `F_PUNCHHOLE` reads
-    // the range from it and changes nothing but the file's allocation.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &raw mut hole) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
-        ApfsStorageError::Host(format!("path contains NUL: {}", directory.display()))
-    })?;
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `stats` is writable storage `statfs` fills on success.
-    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(io_error(
-            "read free space",
-            directory,
-            io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `statfs` returned 0, so it initialized every field.
-    let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.saturating_mul(u64::from(stats.f_bsize)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn physical_run(_: &File, _: u64, _: u64) -> io::Result<PhysicalRun> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "image extents are read with macOS F_LOG2PHYS_EXT",
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn punch_hole(_: &File, _: u64, _: u64) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "image holes are punched with macOS F_PUNCHHOLE",
-    ))
-}
-
-/// A rewrite copies a whole image, and the recovery copy's Linux pass-through would put every byte
-/// of it in the page cache: refuse, as every other rewrite primitive here does off macOS.
-#[cfg(not(target_os = "macos"))]
-fn bypass_cache(_: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "image rewrites bypass the cache with macOS F_NOCACHE",
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
-    Err(io_error(
-        "read free space",
-        directory,
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "free space is read with macOS statfs",
-        ),
-    ))
 }
 
 #[cfg(all(test, target_os = "macos"))]

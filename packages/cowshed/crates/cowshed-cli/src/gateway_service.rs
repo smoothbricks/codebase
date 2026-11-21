@@ -1,17 +1,18 @@
 use crate::agent_cycle::{self, Bootout, Held, LoadedAgent, Reload, Remains};
 use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
-use crate::code_signing::{self, Keychain, SigningIdentity};
+use crate::code_signing::{self, SigningIdentity};
 use crate::install_basis::{self, InstallSlot};
 use crate::land_turn::local_clock;
 use crate::launchd::{
-    BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest,
-    ExecutableInstallState, ExistingPlist, HostStableExecutable, InstallOutcome, InstallState,
-    InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
-    LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
-    PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_cargo_link_removal,
-    plan_executable_install, plan_executable_remove, plan_gateway_host_install, plan_install,
-    plan_remove, replace_symlink,
+    AGENT, AGENT_DEFINITION, BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, DEFINITION,
+    DevenvProfile, ExecutableDigest, ExecutableInstallState, ExistingPlist, HostStableExecutable,
+    InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget,
+    LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, MANAGER,
+    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink,
+    kickstart_hint, plan_cargo_link_removal, plan_executable_install, plan_executable_remove,
+    plan_gateway_host_install, plan_install, plan_remove, plan_required_directories,
+    plan_unsigned_gateway_host_install, replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -62,6 +63,20 @@ pub use cowshed_core::gateway_sessions::{
 };
 use cowshed_gateway_types::FirstLaunch;
 use std::collections::BTreeSet;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The package's Nx target that builds this host's `cowshed`; its `production` configuration is
+/// the release build. One per platform the package ships (`napi.targets`).
+pub use platform::RELEASE_CLI_TARGET;
+use platform::carry_listeners;
 
 /// Bind the runtime's gateway dependency once, without making a control request during open.
 pub fn runtime_control(storage: &ValidatedHostStorage) -> Result<Box<dyn GatewayControl>> {
@@ -296,6 +311,16 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
         if fact.revision > session.revision {
             return session_from_fact(fact);
         }
+        // A workspace served on a socket holds no block, so no other block frees its endpoint.
+        let Some(held) = fact.port_block else {
+            return Err(CowshedError::conflict(
+                format!(
+                    "gateway workspace {} holds no port block to move",
+                    fact.workspace
+                ),
+                "cowshed doctor --json",
+            ));
+        };
         let used = inventory
             .all_reserved_port_blocks()
             .await
@@ -305,16 +330,14 @@ impl GatewayPortReallocator for NativePortReallocator<'_> {
                     "cowshed doctor --json",
                 )
             })?;
-        let candidates = PortBlock::macos_candidates_with_size(
-            self.storage.port_allocation(),
-            fact.port_block.size(),
-        )
-        .map_err(|error| {
-            CowshedError::integrity(
-                format!("cannot enumerate workspace port capacity: {error}"),
-                "cowshed doctor --json",
-            )
-        })?;
+        let candidates =
+            PortBlock::macos_candidates_with_size(self.storage.port_allocation(), held.size())
+                .map_err(|error| {
+                    CowshedError::integrity(
+                        format!("cannot enumerate workspace port capacity: {error}"),
+                        "cowshed doctor --json",
+                    )
+                })?;
         for block in candidates {
             if used.overlapping(block).is_some() || rejected.contains(&block.base()) {
                 continue;
@@ -439,13 +462,12 @@ impl GatewayPaths {
             control_socket: Some(self.control_socket.clone()),
             control_tcp: None,
             simulator_drop_root: None,
-            data_socket_root: None,
+            data_socket_root: cowshed_gateway::data_socket_root(&self.store),
             production_cache_dir: Some(self.cache_dir.clone()),
             git_helper_executable: Some(git_helper_executable),
             authorized_control_uid: uid,
             mirror_cache: MirrorCacheConfig::new(self.mirror_cache.clone()),
-            #[cfg(target_os = "macos")]
-            listener_handoff: Some(cowshed_gateway::handoff_path(&self.control_socket)),
+            listener_handoff: platform::listener_handoff(&self.control_socket),
             ..GatewayConfig::default()
         }
     }
@@ -495,8 +517,8 @@ where
     }
 }
 
-/// How often a bootout reads launchd's hold on the job again, and how long each wait on the old
-/// process's exit lasts between those reads.
+/// How often a bootout reads the service manager's hold on the job again, and how long each wait
+/// on the old process's exit lasts between those reads.
 const BOOTOUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn launch_agent_is_loaded<F, C>(
@@ -513,8 +535,8 @@ where
         .map_err(launchd_error)
 }
 
-/// The loaded agent's process and exit timeout, as `launchctl print` reports them; `None` when
-/// launchd does not hold the agent.
+/// The loaded agent's process and exit timeout, as the manager's status reports them
+/// (`launchctl print`, `systemctl show`); `None` when the manager does not hold the agent.
 fn loaded_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -534,10 +556,7 @@ where
                 .map_err(|error| {
                     CowshedError::environment_missing(
                         format!("{} is loaded, but {error}", target.label()),
-                        format!(
-                            "read `launchctl print {}`",
-                            crate::launchd::service_target(uid, target.label())
-                        ),
+                        format!("read `{}`", crate::launchd::print_hint(uid, target.label())),
                     )
                 })
         }
@@ -577,7 +596,7 @@ impl ActivationError {
                 bootstrap,
             } => CowshedError::environment_missing(
                 format!(
-                    "launchd did not finish booting out {label} within its {}s exit timeout and \
+                    "{MANAGER} did not finish booting out {label} within its {}s exit timeout and \
                      the {}s its unload may trail it by: {remains}{}",
                     exit_timeout.as_secs(),
                     agent_cycle::UNLOAD_GRACE.as_secs(),
@@ -591,12 +610,13 @@ impl ActivationError {
     }
 }
 
-/// Load the agent and leave launchd running *this* plist.
+/// Load the agent and leave the service manager running *this* definition.
 ///
-/// A rewritten plist is only a file. launchd keeps the definition it bootstrapped, so a kickstart
-/// on its own restarts the program the agent was loaded with — which, for a plist rewritten to
-/// name the host-stable binary, is exactly the vanished path the rewrite exists to stop naming.
-/// A changed plist is therefore booted out first, and the bootstrap that follows reads it.
+/// A rewritten definition is only a file. The manager keeps the definition it loaded, so a
+/// kickstart on its own restarts the program the agent was loaded with — which, for a plist
+/// rewritten to name the host-stable binary, is exactly the vanished path the rewrite exists to
+/// stop naming. A changed definition is therefore booted out first, and the bootstrap that
+/// follows reads it (launchd bootstraps the plist; `systemctl enable` reloads the manager).
 ///
 /// Bootstrap already starts a `RunAtLoad` agent. `kickstart -k` on the heels of that returns
 /// launchctl 37 (operation already in progress) and fails a setup that already copied the binary.
@@ -659,7 +679,7 @@ where
         Reload::Blocked(remains) => {
             Err(ActivationError::Failed(CowshedError::environment_missing(
                 format!(
-                    "{} is not loaded again: launchd still holds it after its bootout went \
+                    "{} is not loaded again: {MANAGER} still holds it after its bootout went \
                      overdue, and {remains}",
                     target.label()
                 ),
@@ -672,20 +692,22 @@ where
     }
 }
 
-/// Boot the agent out and wait until its process has exited and launchd has dropped the job.
+/// Boot the agent out and wait until its process has exited and the service manager has dropped
+/// the job.
 ///
 /// `launchctl bootout` returns before the service has finished tearing down: launchd sends
-/// SIGTERM and lets the process drain until the agent's exit timeout, then SIGKILLs it. So the
+/// SIGTERM and lets the process drain until the agent's exit timeout, then SIGKILLs it.
+/// `systemctl disable --now` returns only once the stop job has ended, on the same terms. So the
 /// wait is for the real condition, both halves of it: the kernel's word that the process exited,
 /// which it posts once the process has released every descriptor, its listeners included, and
-/// launchd's word that it no longer holds the job. Watched from before the bootout signals it,
-/// so no exit is missed and no later process given the pid is waited on. The only bound is
-/// launchd's own: the exit timeout of the definition it loaded, read from `launchctl print`, and
+/// the manager's word that it no longer holds the job. Watched from before the bootout signals
+/// it, so no exit is missed and no later process given the pid is waited on. The only bound is
+/// the manager's own: the exit timeout of the definition it loaded, read from its status, and
 /// the grace its unload may trail its kill by ([`agent_cycle::bootout_deadline`]). A bootout
 /// that outlives it is [`ActivationError::BootoutOverdue`], naming what is left. A fixed 5 s
 /// wait stood here; launchd's default exit timeout is also 5 s, so it gave up at the very
 /// instant launchd killed a draining gateway, and the restore that followed kickstarted a job
-/// still in teardown (launchctl 37). `Ok` when launchd never had the agent loaded.
+/// still in teardown (launchctl 37). `Ok` when the manager never had the agent loaded.
 pub fn deactivate_launch_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -841,8 +863,8 @@ where
     let paths = GatewayPaths::from_storage(&storage);
     ensure_private_directory(&paths.telemetry)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    // The candidate path is derived first because the plist has to name it before the agent can be
-    // activated, and the install-then-activate pair is what has to be undoable as a whole.
+    // The candidate path is derived first because the definition has to name it before the agent
+    // can be activated, and the install-then-activate pair is what has to be undoable as a whole.
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let candidate = Candidate::of(supervisable_running_executable()?, &executable)?;
@@ -850,7 +872,7 @@ where
         adopted_mains(&home).await
     })
     .await?;
-    let identity = gateway_host_identity(&home)?;
+    let identity = code_signing::gateway_host_identity(&home)?;
     let bun = invoking_bun()?;
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers is refused the restart while a
@@ -862,6 +884,7 @@ where
     };
     let started = async {
         install_nx_cache_server(&mut executor, &home, &candidate.source)?;
+        install_helper(&mut executor, &home, &candidate.source)?;
         let spec = LaunchAgentSpec::gateway(storage.namespace(), &executable, &bun)
             .map_err(launchd_error)?;
         let observed = inspect_install_state(spec.target())?;
@@ -877,6 +900,7 @@ where
         );
         // Held until the restarted gateway serves: it took the listeners before it bound anything.
         let _carrying = carry_listeners(&paths.control_socket, downgrade);
+        ensure_required_directories(&mut executor, &spec)?;
         let written = executor.execute_install(&plan).map_err(launchd_error)?;
         install_and_activate_gateway(
             &mut executor,
@@ -904,37 +928,6 @@ where
     .await;
     lift_fence(fence).await;
     started
-}
-
-/// The install's side of the listener handoff (05_gateway.md "An install never refuses a client
-/// connection"): serving it from before the restart until the restarted gateway serves carries
-/// every workspace listener across the restart. A downgrade serves nothing: an older gateway may
-/// not take the listeners, and its own bind would then meet this install's copies. A handoff that
-/// cannot serve is said, and the restart refuses connections, as it did before.
-#[cfg(target_os = "macos")]
-fn carry_listeners(
-    control_socket: &Path,
-    downgrade: Downgrade,
-) -> Option<cowshed_gateway::HandoffServer> {
-    if downgrade == Downgrade::Allow {
-        return None;
-    }
-    match cowshed_gateway::HandoffServer::start(&cowshed_gateway::handoff_path(control_socket)) {
-        Ok(server) => Some(server),
-        Err(error) => {
-            cowshed_os::eprintln!(
-                "cowshed: the handoff socket cannot serve, so this restart carries no workspace \
-             listener: {error}"
-            );
-            None
-        }
-    }
-}
-
-/// Linux binds no TCP workspace listener, so a restart has none to carry and serves no handoff.
-#[cfg(not(target_os = "macos"))]
-const fn carry_listeners(_control_socket: &Path, _downgrade: Downgrade) -> Option<()> {
-    None
 }
 
 /// Wait until the gateway just activated serves: its control socket answers from the bytes
@@ -1071,7 +1064,7 @@ impl StartProgress {
                 StartWait::ControlSocket => String::from("its control socket does not answer yet…"),
                 StartWait::Startup(heal) => format!("{heal}…"),
                 StartWait::Drain => {
-                    String::from("the running gateway is draining before launchd restarts it…")
+                    format!("the running gateway is draining before {MANAGER} restarts it…")
                 }
             }
         ))
@@ -1094,10 +1087,11 @@ fn running_executable() -> Result<PathBuf> {
     })
 }
 
-/// Boot the agent out and delete its plist, reporting whether a plist was there.
+/// Boot the agent out and delete its definition, reporting whether a definition was there.
 ///
-/// Shared by `gateway stop` and `setup --uninstall`: an agent is deactivated
-/// before its definition is removed, or launchd keeps running a service whose plist has gone.
+/// Shared by `gateway stop` and `setup --uninstall`: an agent is deactivated before its
+/// definition is removed, or the service manager keeps running a service whose definition has
+/// gone.
 pub fn remove_launch_agent(target: &LaunchAgentTarget) -> Result<RemovalOutcome> {
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     deactivate_launch_agent(&mut executor, effective_uid(), target)?;
@@ -1237,8 +1231,10 @@ fn stop_service(namespace: HostNamespace, purge: bool) -> Result<RemovalOutcome>
         remove_path_entries(executable.path())?;
         let companion =
             HostStableExecutable::new(&home, "nx-cache-server").map_err(launchd_error)?;
+        let helper = HostStableExecutable::new(&home, HELPER_NAME).map_err(launchd_error)?;
         let removed = [
             remove_host_stable_executable(&companion)?,
+            remove_host_stable_executable(&helper)?,
             remove_host_stable_executable(&executable)?,
         ];
         return Ok(
@@ -1326,12 +1322,26 @@ pub(crate) struct FirstLaunchReading {
     pub(crate) restart: String,
 }
 
-/// Measure a first launch here, then ask the gateway to measure one. One after the other: the
-/// scans of both would otherwise wait in one queue and charge each other.
-pub(crate) async fn first_launch(roots: &CanonicalRoots) -> Result<FirstLaunchReading> {
+/// Doctor's first-launch probe, `None` on a platform that assesses no first launch
+/// ([`crate::first_launch::host_probe`]): nothing is measured there, the gateway is not asked,
+/// and there is no reading to judge.
+pub(crate) fn first_launch(
+    roots: &CanonicalRoots,
+) -> Option<impl Future<Output = Result<FirstLaunchReading>>> {
+    let measure = crate::first_launch::host_probe()?;
+    Some(measure_first_launch(roots, measure))
+}
+
+/// Measure a first launch here with `measure`, then ask the gateway to measure one. One after
+/// the other: the scans of both would otherwise wait in one queue and charge each other.
+async fn measure_first_launch(
+    roots: &CanonicalRoots,
+    measure: fn(&Path) -> io::Result<FirstLaunch>,
+) -> Result<FirstLaunchReading> {
     let gateway_host = HostStableExecutable::new(&canonical_home()?, COWSHED_BINARY_NAME)
         .map_err(launchd_error)?
         .gateway_host();
+    let restart = kickstart_hint(effective_uid(), &roots.namespace().launchd_label("gateway"));
     // Under the gateway host, inside a workspace job, this process's launches are a job's: there
     // is no host-shell launch here to compare the gateway's with.
     if crate::first_launch::responsible_program().is_some_and(|program| program == gateway_host) {
@@ -1344,7 +1354,7 @@ pub(crate) async fn first_launch(roots: &CanonicalRoots) -> Result<FirstLaunchRe
         ));
     }
     let template = running_executable()?;
-    let host = tokio::task::spawn_blocking(move || crate::first_launch::measure(&template))
+    let host = tokio::task::spawn_blocking(move || measure(&template))
         .await
         .map_err(|error| {
             CowshedError::internal(format!("the first-launch probe thread failed: {error}"))
@@ -1364,9 +1374,10 @@ pub(crate) async fn first_launch(roots: &CanonicalRoots) -> Result<FirstLaunchRe
         host,
         gateway,
         gateway_host,
-        restart: kickstart_hint(effective_uid(), &roots.namespace().launchd_label("gateway")),
+        restart,
     })
 }
+
 /// [`service_status`] for `doctor` (specs/cowshed/06_cli.md, "doctor"): a gateway that took the
 /// request and then said nothing, not even a heartbeat, for the control silence bound is
 /// [`Unanswered`] (05_gateway.md, "Deadlines").
@@ -1798,17 +1809,11 @@ async fn run_daemon() -> Result<()> {
             cap_bytes: 10 * 1024 * 1024 * 1024,
         }),
         // The RAM temp volume's disk is attached here, so no job owns its helper (05_gateway.md,
-        // "RAM disks").
-        #[cfg(target_os = "macos")]
-        ram_disks: Some(Arc::new(cowshed_apfs::ram_disk::SystemRamDisks::new(
-            storage.namespace(),
-        ))),
+        // "RAM disks"), on a platform that has one.
+        ram_disks: platform::ram_disks(storage.namespace()),
         // Doctor's first-launch probe runs here, so its launches have the responsible process
-        // every job has (05_gateway.md "The gateway host").
-        #[cfg(target_os = "macos")]
-        first_launch: Some(Arc::new(crate::first_launch::DaemonFirstLaunch::new(
-            executable.clone(),
-        ))),
+        // every job has (05_gateway.md "The gateway host"), on a platform that assesses one.
+        first_launch: crate::first_launch::daemon_probe(&executable),
         ..paths.config(effective_uid(), executable)
     };
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
@@ -1874,7 +1879,6 @@ async fn run_daemon() -> Result<()> {
 /// Start the watch that remounts a volume the gateway holds once it loses its mount, saying
 /// every one it finds on stderr, the gateway's log. A watch that cannot start is said there too,
 /// and the gateway serves without it: a lost mount then waits for a verb or the next start.
-#[cfg(target_os = "macos")]
 fn watch_lost_mounts(
     inventory: NativeGatewayInventory,
 ) -> Option<cowshed_core::lost_mounts::LostMountWatch> {
@@ -1900,12 +1904,6 @@ fn watch_lost_mounts(
             None
         }
     }
-}
-
-/// No kernel image a gateway holds off macOS can lose a mount under it.
-#[cfg(not(target_os = "macos"))]
-fn watch_lost_mounts(_inventory: NativeGatewayInventory) -> Option<()> {
-    None
 }
 
 /// The daemon's startup pass, as the gateway's status and its session changes see it: the
@@ -2158,7 +2156,7 @@ pub fn emit_gateway_status<W: Write, E: Write>(
     }
     let state = if let Some(cause) = &status.drain_cause {
         format!(
-            "gateway is draining and refuses new sessions: {cause}; it exits once its in-flight work ends, and launchd restarts it"
+            "gateway is draining and refuses new sessions: {cause}; it exits once its in-flight work ends, and {MANAGER} restarts it"
         )
     } else if let Some(stale) = &status.stale_daemon {
         format!(
@@ -2179,7 +2177,7 @@ pub fn emit_gateway_status<W: Write, E: Write>(
         )
     } else if status.running {
         format!(
-            "gateway is healthy: launchd loaded; control socket answers at {}",
+            "gateway is healthy: {MANAGER} loaded; control socket answers at {}",
             status.socket.display()
         )
     } else if status.installed {
@@ -2468,10 +2466,76 @@ where
 {
     let executable = HostStableExecutable::new(home, "nx-cache-server").map_err(launchd_error)?;
     let source = packaged_nx_cache_server(&executable, cowshed_source)?;
-    let retained = retain_previous_executable(executor, &executable)?;
-    let digest = executable_digest(&source)?;
-    install_stored_executable(executor, &executable, &digest, &source)?;
-    prune_superseded(executor, &executable, &digest, retained.as_deref());
+    install_companion(executor, &executable, &source)?;
+    Ok(executable)
+}
+
+/// Install `source` as `executable`, a file that belongs to a cowshed build and is installed
+/// beside it: its stored copy, the stable name as a link to that copy, and every copy but this
+/// one and the one it replaced removed.
+fn install_companion<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    executable: &HostStableExecutable,
+    source: &Path,
+) -> Result<()>
+where
+    F: LaunchdFilesystem,
+    C: LaunchctlCommand,
+{
+    let retained = retain_previous_executable(executor, executable)?;
+    let digest = executable_digest(source)?;
+    install_stored_executable(executor, executable, &digest, source)?;
+    prune_superseded(executor, executable, &digest, retained.as_deref());
+    Ok(())
+}
+
+/// The root helper's name (09_substrates.md, "Privileged helper"): what a distribution carries
+/// beside `cowshed`, and the stable name its install gives it beside the installed cowshed,
+/// where the running cowshed looks for it first.
+pub const HELPER_NAME: &str = cowshed_core::storage::bootstrap::ZFS_HELPER;
+
+/// The root helper that belongs to the cowshed build at `cowshed_source`: the file named
+/// [`HELPER_NAME`] beside it. For a build the install slot holds (`installed`'s directory) that
+/// is the stable name its install wrote; for any other build it is the helper its distribution
+/// carries in the same platform directory. A build without one is refused by name, as a build
+/// without its Nx cache server is: every mutation of a ZFS store goes through the helper, on
+/// every platform that has the ZFS substrate.
+fn packaged_helper(installed: &HostStableExecutable, cowshed_source: &Path) -> Result<PathBuf> {
+    let helper = if cowshed_source.parent() == Some(installed.directory()) {
+        installed.path().to_path_buf()
+    } else {
+        cowshed_source.with_file_name(installed.name())
+    };
+    if helper.is_file() {
+        return Ok(helper);
+    }
+    Err(CowshedError::environment_missing(
+        format!(
+            "the cowshed build {} has no {} beside it: {} is not a file",
+            cowshed_source.display(),
+            installed.name(),
+            helper.display()
+        ),
+        "build the distribution whole (in a checkout, nx run cowshed:cli-native), then run that cowshed's setup",
+    ))
+}
+
+/// Install the helper that belongs to this cowshed build ([`packaged_helper`]) beside the
+/// installed cowshed, as its Nx cache server is installed. The copy is this user's: what makes
+/// it act as root is the host administrator's, and `cowshed setup` proves it
+/// ([`crate::zfs_helper`]).
+fn install_helper<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    home: &Path,
+    cowshed_source: &Path,
+) -> Result<HostStableExecutable>
+where
+    F: LaunchdFilesystem,
+    C: LaunchctlCommand,
+{
+    let executable = HostStableExecutable::new(home, HELPER_NAME).map_err(launchd_error)?;
+    let source = packaged_helper(&executable, cowshed_source)?;
+    install_companion(executor, &executable, &source)?;
     Ok(executable)
 }
 
@@ -2516,24 +2580,19 @@ where
         .map_err(launchd_error)
 }
 
-/// This user's cowshed signing identity, made in cowshed's own keychain in `home` when it holds
-/// none ([`code_signing::prepare`], [`code_signing::ensure_identity`]).
-fn gateway_host_identity(home: &Path) -> Result<SigningIdentity> {
-    let keychain = Keychain::cowshed(home);
-    code_signing::prepare(&keychain)?;
-    code_signing::ensure_identity(&keychain)
-}
-
-/// Install the gateway host beside `executable` from `source`, signed with `identity`
-/// (05_gateway.md "The gateway host"): when it is absent, when it does not satisfy `identity`'s
-/// designated requirement, or when `moved` says this install moved the stable name to another
-/// build. Otherwise it is left as it is. A Developer Tools entry holds the host's path and
-/// requirement, and a rewrite keeps both, so the entry outlives every install.
+/// Install the gateway host beside `executable` from `source` (05_gateway.md "The gateway
+/// host"), signed with `identity` on a platform that signs it
+/// ([`code_signing::gateway_host_identity`]): when it is absent, when it does not satisfy
+/// `identity`'s designated requirement, or when `moved` says this install moved the stable name
+/// to another build. Otherwise it is left as it is. A Developer Tools entry holds the host's path
+/// and requirement, and a rewrite keeps both, so the entry outlives every install. With no
+/// identity nothing is signed or verified: a host that is there is current until the stable name
+/// moves.
 fn install_gateway_host<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     executable: &HostStableExecutable,
     source: &Path,
-    identity: SigningIdentity,
+    identity: Option<SigningIdentity>,
     moved: bool,
 ) -> Result<()>
 where
@@ -2545,15 +2604,18 @@ where
         None => false,
         Some(metadata) if is_user_owned(&metadata, false) => {
             !moved
-                && executor.satisfies(&host, identity).map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "could not check the gateway host {}'s signature: {error}",
-                            host.display()
-                        ),
-                        format!("codesign --verify --verbose '{}'", host.display()),
-                    )
-                })?
+                && match identity {
+                    None => true,
+                    Some(identity) => executor.satisfies(&host, identity).map_err(|error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "could not check the gateway host {}'s signature: {error}",
+                                host.display()
+                            ),
+                            format!("codesign --verify --verbose '{}'", host.display()),
+                        )
+                    })?,
+                }
         }
         Some(_) => {
             return Err(CowshedError::integrity(
@@ -2566,9 +2628,11 @@ where
         }
     };
     if !current {
-        executor
-            .execute_install(&plan_gateway_host_install(executable, source, identity))
-            .map_err(launchd_error)?;
+        let plan = match identity {
+            Some(identity) => plan_gateway_host_install(executable, source, identity),
+            None => plan_unsigned_gateway_host_install(executable, source),
+        };
+        executor.execute_install(&plan).map_err(launchd_error)?;
     }
     Ok(())
 }
@@ -2734,17 +2798,7 @@ pub fn refuse_unsupervisable_build(source: PathBuf, debug_build: bool) -> Result
     Ok(source)
 }
 
-/// The package's Nx target that builds this host's `cowshed`; its `production` configuration is
-/// the release build. One per platform the package ships (`napi.targets`).
-pub const RELEASE_CLI_TARGET: &str =
-    match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
-        (true, true) => "cli-arm64-macos",
-        (true, false) => "cli-x64-macos",
-        (false, true) => "cli-arm64-linux",
-        (false, false) => "cli-x64-linux",
-    };
-
-/// The running build, refused when it is unfit for launchd to supervise.
+/// The running build, refused when it is unfit for the service manager to supervise.
 fn supervisable_running_executable() -> Result<PathBuf> {
     refuse_unsupervisable_build(running_executable()?, cfg!(debug_assertions))
 }
@@ -3052,15 +3106,15 @@ pub fn restore_previous_executable(executable: &HostStableExecutable, retained: 
 /// The whole point is the last clause. `launchctl` failing after the copy is what left this host
 /// running a debug gateway with no agent: the binary had already been replaced, and nothing put it
 /// back. Activation is the step that can fail for reasons that have nothing to do with the bytes
-/// (a bootout launchd did not finish, a bootstrap it refused), so it is the step whose failure
-/// has to be recoverable.
+/// (a bootout the service manager did not finish, a bootstrap it refused), so it is the step
+/// whose failure has to be recoverable.
 fn install_and_activate_gateway<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
     candidate: &Candidate,
     target: &LaunchAgentTarget,
     plist: InstallOutcome,
-    identity: SigningIdentity,
+    identity: Option<SigningIdentity>,
 ) -> Result<HostStableExecutable>
 where
     F: LaunchdFilesystem,
@@ -3145,7 +3199,7 @@ where
             ),
         },
         Err(error) => format!(
-            "{} could NOT be reloaded: launchd's hold on it is unknown ({})",
+            "{} could NOT be reloaded: {MANAGER}'s hold on it is unknown ({})",
             target.label(),
             error.message
         ),
@@ -3242,7 +3296,7 @@ pub async fn refresh_gateway_binary(
         answering,
         &mut executor,
         invoking_bun,
-        || gateway_host_identity(home),
+        || code_signing::gateway_host_identity(home),
     )
     .await?;
     if let Some(ServiceBinaryRefresh::Refreshed { .. }) = &refresh {
@@ -3280,7 +3334,7 @@ struct IncomingBuild<'a> {
 /// without one needs no interpreter.
 #[expect(
     clippy::too_many_arguments,
-    reason = "each input is a seam setup's refresh tests inject: the host, the build, launchd, bun and the signing identity"
+    reason = "each input is a seam setup's refresh tests inject: the host, the build, the service manager, bun and the signing identity"
 )]
 async fn refresh_gateway_from<C: LaunchctlCommand>(
     namespace: HostNamespace,
@@ -3290,7 +3344,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     answering: Option<(&InstallSlot, &GatewayControlClient)>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
     bun: impl FnOnce() -> Result<BunDirectory>,
-    identity: impl FnOnce() -> Result<SigningIdentity>,
+    identity: impl FnOnce() -> Result<Option<SigningIdentity>>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let IncomingBuild {
         candidate,
@@ -3347,17 +3401,21 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
         _ => None,
     };
     let refreshed = async {
-        // The packaged Nx cache server is part of this build's install. A current agent is still
-        // repaired, so this runs before the no-op return and before any activation: a missing
-        // companion fails here rather than after the host has changed.
+        // The packaged Nx cache server and the root helper are part of this build's install. A
+        // current agent is still repaired, so this runs before the no-op return and before any
+        // activation: a missing companion fails here rather than after the host has changed.
         install_nx_cache_server(executor, home, &candidate.source)?;
+        install_helper(executor, home, &candidate.source)?;
         // The gateway host is repaired like the companion, before the no-op return and without a
-        // restart: a missing or foreign-signed host is rewritten, and launchd runs the rewritten
-        // file at the next start. An install that moves the stable name rewrites it below.
+        // restart: a missing or foreign-signed host is rewritten, and the service manager runs
+        // the rewritten file at the next start. An install that moves the stable name rewrites it
+        // below.
         let identity = identity()?;
         if !binary_is_stale {
             install_gateway_host(executor, &executable, &candidate.source, identity, false)?;
         }
+        // So are the directories the definition needs before the manager can start it.
+        ensure_required_directories(executor, &spec)?;
         if !restarts {
             return Ok(None);
         }
@@ -3475,6 +3533,8 @@ where
                 remedy: refusal.hint,
             });
         }
+        // Before the stable name moves: a build without its helper beside it installs nothing.
+        install_helper(executor, home, &candidate.source)?;
         let retained = retain_previous_executable(executor, &executable)?;
         install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
         record_installed_source(&executable, &candidate.source);
@@ -3485,6 +3545,10 @@ where
             &candidate.digest,
             retained.as_deref(),
         );
+    } else {
+        // A cowshed that is current has its helper repaired, as the gateway's refresh repairs
+        // the Nx cache server.
+        install_helper(executor, home, &candidate.source)?;
     }
     let from_installed_copy = candidate
         .source
@@ -3686,17 +3750,39 @@ pub(crate) fn inspect_install_state(target: &LaunchAgentTarget) -> Result<Observ
         }
         Some(_) => Err(CowshedError::integrity(
             format!(
-                "{} LaunchAgent plist is not a user-owned regular file: {}",
+                "{} {AGENT_DEFINITION} is not a user-owned regular file: {}",
                 target.label(),
                 target.plist_path().display()
             ),
-            "remove the unsafe plist and rerun the service start command",
+            format!("remove the unsafe {DEFINITION} and rerun the service start command"),
         )),
         None => Ok(ObservedInstallState {
             directory_mode,
             plist: None,
         }),
     }
+}
+
+/// Make the directories `spec`'s definition needs before the service manager can start it
+/// ([`LaunchAgentSpec::required_directories`]), each at its mode, when they are not already
+/// there so. None where the manager makes what a definition names.
+fn ensure_required_directories<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    spec: &LaunchAgentSpec,
+) -> Result<()>
+where
+    F: LaunchdFilesystem,
+    C: LaunchctlCommand,
+{
+    let mut observed = Vec::new();
+    for directory in spec.required_directories() {
+        let mode = private_directory_mode(&directory.path)?;
+        observed.push((directory, mode));
+    }
+    executor
+        .execute_install(&plan_required_directories(&observed))
+        .map_err(launchd_error)?;
+    Ok(())
 }
 
 /// Create a gateway-owned directory at exactly [`PRIVATE_DIRECTORY_MODE`], then prove it is ours.
@@ -3744,7 +3830,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
-    CowshedError::internal(format!("LaunchAgent operation failed: {error}"))
+    CowshedError::internal(format!("{AGENT} operation failed: {error}"))
 }
 
 pub(crate) fn output_error(error: io::Error) -> CowshedError {
@@ -3803,6 +3889,11 @@ mod tests {
         fs::create_dir_all(&directory).expect("builds directory");
         let path = directory.join(name);
         fs::write(&path, bytes).expect("build");
+        fs::write(
+            path.with_file_name(HELPER_NAME),
+            b"the packaged root helper",
+        )
+        .expect("helper");
         let companion = distribution_companion(home);
         fs::create_dir_all(companion.parent().unwrap()).expect("companion directory");
         fs::write(&companion, b"the packaged nx cache server").expect("companion");
@@ -3948,8 +4039,9 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    /// launchctl recorded and answered, and `codesign` recorded apart from it: answered as a
-    /// success (a verification failing when `unsatisfied`), or run for real for a host proof.
+    /// The service manager's control tool recorded and answered (a status read: not loaded), and
+    /// `codesign` recorded apart from it: answered as a success (a verification failing when
+    /// `unsatisfied`), or run for real for a host proof.
     #[derive(Default)]
     struct RecordingGatewayLaunchctl {
         argv: Vec<Vec<std::ffi::OsString>>,
@@ -3991,18 +4083,46 @@ mod tests {
                     stderr: Vec::new(),
                 });
             }
-            assert_eq!(executable, Path::new("/bin/launchctl"));
+            assert_eq!(executable, Path::new(crate::launchd::LAUNCHCTL_EXECUTABLE));
             self.argv.push(arguments.to_vec());
-            Ok(crate::launchd::LaunchctlOutput {
-                status: if arguments[0] == "print" {
-                    crate::launchd::CommandStatus::ExitCode(113)
-                } else {
-                    crate::launchd::CommandStatus::Success
-                },
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+            Ok(if crate::launchd::recorded::verb(arguments) == "print" {
+                crate::launchd::recorded::not_loaded()
+            } else {
+                crate::launchd::LaunchctlOutput::success()
             })
         }
+    }
+
+    /// The definition an earlier build wrote: today's without the descriptor limits a later one
+    /// added.
+    #[cfg(target_os = "macos")]
+    fn legacy_definition(desired: &str) -> String {
+        let limits_start = desired.find("  <key>SoftResourceLimits</key>").unwrap();
+        let limits_end = desired.rfind("</dict>\n</plist>\n").unwrap();
+        let mut legacy = desired.to_owned();
+        legacy.replace_range(limits_start..limits_end, "");
+        legacy
+    }
+
+    /// The definition an earlier build wrote: today's without the descriptor limit a later one
+    /// added.
+    #[cfg(target_os = "linux")]
+    fn legacy_definition(desired: &str) -> String {
+        let limit = "LimitNOFILE=245760:infinity\n";
+        assert!(desired.contains(limit), "{desired}");
+        desired.replace(limit, "")
+    }
+
+    /// Where the definition of `label` is under `home`.
+    #[cfg(target_os = "macos")]
+    fn definition_under(home: &Path, label: &str) -> PathBuf {
+        home.join(format!("Library/LaunchAgents/{label}.plist"))
+    }
+
+    /// Where the definition of `label` is under `home`.
+    #[cfg(target_os = "linux")]
+    fn definition_under(home: &Path, label: &str) -> PathBuf {
+        home.join(format!(".config/systemd/user/{label}.service"))
     }
 
     #[tokio::test]
@@ -4017,13 +4137,7 @@ mod tests {
         install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &candidate.source)
             .unwrap();
         let desired = spec.plist_bytes();
-        let desired_text = std::str::from_utf8(&desired).unwrap();
-        let limits_start = desired_text
-            .find("  <key>SoftResourceLimits</key>")
-            .unwrap();
-        let limits_end = desired_text.rfind("</dict>\n</plist>\n").unwrap();
-        let mut legacy = desired_text.to_owned();
-        legacy.replace_range(limits_start..limits_end, "");
+        let legacy = legacy_definition(std::str::from_utf8(&desired).unwrap());
         assert_ne!(legacy.as_bytes(), desired);
         fs::write(spec.plist_path(), &legacy).unwrap();
         let stored_inode = fs::metadata(executable.stored(&candidate.digest))
@@ -4052,7 +4166,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
-                || Ok(test_identity()),
+                || Ok(Some(test_identity())),
             )
             .await
             .unwrap();
@@ -4083,7 +4197,7 @@ mod tests {
                     None,
                     &mut executor,
                     || Ok(test_bun(&home)),
-                    || Ok(test_identity())
+                    || Ok(Some(test_identity()))
                 )
                 .await
                 .unwrap(),
@@ -4093,8 +4207,14 @@ mod tests {
         }
         let (_, command) = executor.into_parts();
         assert_eq!(command.argv.len(), 6);
-        assert_eq!(command.argv[2][0], "bootstrap");
-        assert_eq!(command.argv[5][0], "bootstrap");
+        assert_eq!(
+            crate::launchd::recorded::verb(&command.argv[2]),
+            "bootstrap"
+        );
+        assert_eq!(
+            crate::launchd::recorded::verb(&command.argv[5]),
+            "bootstrap"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -4125,7 +4245,7 @@ mod tests {
             None,
             &mut executor,
             || Ok(test_bun(&home)),
-            || Ok(test_identity()),
+            || Ok(Some(test_identity())),
         )
         .await
         .unwrap();
@@ -4137,8 +4257,8 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// The agent a namespace's verbs reach is the one its label names, in the home's
-    /// LaunchAgents: production's `dev.cowshed.gateway`, a test namespace's its own.
+    /// The agent a namespace's verbs reach is the one its label names, in the home's definition
+    /// directory: production's `dev.cowshed.gateway`, a test namespace's its own.
     #[test]
     fn the_gateway_agent_is_labelled_by_its_host_namespace() {
         let home = scratch_root("agent-label");
@@ -4148,7 +4268,7 @@ mod tests {
         assert_eq!(production.label(), "dev.cowshed.gateway");
         assert_eq!(
             production.plist_path(),
-            home.join("Library/LaunchAgents/dev.cowshed.gateway.plist")
+            definition_under(&home, "dev.cowshed.gateway")
         );
 
         let (_, test) = gateway_launch_agent(HostNamespace::Test(namespace), &home).unwrap();
@@ -4158,11 +4278,156 @@ mod tests {
         );
         assert_eq!(
             test.plist_path(),
-            home.join(format!(
-                "Library/LaunchAgents/dev.cowshed-test-{namespace}.gateway.plist"
-            ))
+            definition_under(&home, &format!("dev.cowshed-test-{namespace}.gateway"))
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A runner that answers each control call from a script, and records the lifecycle step
+    /// each call was and the bound it ran within.
+    #[derive(Default)]
+    struct ScriptedManager {
+        answers: std::collections::VecDeque<crate::launchd::LaunchctlOutput>,
+        steps: Vec<String>,
+        bounds: Vec<Duration>,
+    }
+
+    impl LaunchctlCommand for ScriptedManager {
+        fn run(
+            &mut self,
+            executable: &Path,
+            arguments: &[std::ffi::OsString],
+            deadline: &cowshed_os::deadline::Deadline,
+        ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
+        {
+            assert_eq!(executable, Path::new(crate::launchd::LAUNCHCTL_EXECUTABLE));
+            self.steps
+                .push(crate::launchd::recorded::verb(arguments).to_owned());
+            self.bounds.push(deadline.bound().within);
+            Ok(self
+                .answers
+                .pop_front()
+                .expect("one answer per control call"))
+        }
+    }
+
+    /// An activation takes the one step what the service manager holds allows (05_gateway.md
+    /// "Install order and rollback"): an agent it does not hold is bootstrapped; one it holds is
+    /// kickstarted, within its exit timeout, the unload grace and one more call; and one whose
+    /// definition was rewritten is booted out within its exit timeout and the grace, read again
+    /// until the manager has let go of it, and bootstrapped, never kickstarted onto the
+    /// definition the manager still held.
+    #[test]
+    fn an_activation_takes_the_one_step_what_the_manager_holds_allows() {
+        use crate::launchd::{LaunchctlOutput, recorded};
+        let target =
+            LaunchAgentTarget::new(Path::new("/host/home"), "dev.cowshed.gateway").unwrap();
+        for (case, definition, answers, steps, bounds) in [
+            (
+                "not held",
+                InstallOutcome::NoChange,
+                vec![recorded::not_loaded(), LaunchctlOutput::success()],
+                &["print", "bootstrap"][..],
+                &[10, 10][..],
+            ),
+            (
+                "held",
+                InstallOutcome::NoChange,
+                vec![recorded::loaded(30), LaunchctlOutput::success()],
+                &["print", "kickstart"][..],
+                &[10, 30 + 1 + 10][..],
+            ),
+            (
+                "held, its definition rewritten",
+                InstallOutcome::Changed,
+                vec![
+                    recorded::loaded(30),
+                    LaunchctlOutput::success(),
+                    recorded::not_loaded(),
+                    recorded::not_loaded(),
+                    LaunchctlOutput::success(),
+                ],
+                &["print", "bootout", "print", "print", "bootstrap"][..],
+                &[10, 30 + 1, 10, 10, 10][..],
+            ),
+        ] {
+            let mut executor = LaunchdExecutor::new(
+                (),
+                ScriptedManager {
+                    answers: answers.into(),
+                    ..ScriptedManager::default()
+                },
+            );
+            activate_launch_agent(&mut executor, 501, &target, definition).expect(case);
+            let (_, manager) = executor.into_parts();
+            assert_eq!(manager.steps, steps, "{case}");
+            assert_eq!(
+                manager.bounds,
+                bounds
+                    .iter()
+                    .map(|seconds| Duration::from_secs(*seconds))
+                    .collect::<Vec<_>>(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A manager whose status read fails is an error, never an agent that is not loaded: nothing
+    /// is bootstrapped over a manager that did not answer.
+    #[test]
+    fn an_activation_stops_at_a_manager_that_does_not_answer() {
+        struct Unreachable(Vec<String>);
+        impl LaunchctlCommand for Unreachable {
+            fn run(
+                &mut self,
+                _: &Path,
+                arguments: &[std::ffi::OsString],
+                deadline: &cowshed_os::deadline::Deadline,
+            ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
+            {
+                self.0
+                    .push(crate::launchd::recorded::verb(arguments).to_owned());
+                Err(cowshed_os::deadline::RunError::Spawn {
+                    op: deadline.op(),
+                    role: crate::launchd::TOOL,
+                    source: io::Error::new(io::ErrorKind::NotFound, "no such tool"),
+                })
+            }
+        }
+        let target =
+            LaunchAgentTarget::new(Path::new("/host/home"), "dev.cowshed.gateway").unwrap();
+        let mut executor = LaunchdExecutor::new((), Unreachable(Vec::new()));
+        assert!(
+            activate_launch_agent(&mut executor, 501, &target, InstallOutcome::NoChange).is_err()
+        );
+        let (_, manager) = executor.into_parts();
+        assert_eq!(manager.0, ["print"]);
+    }
+
+    /// The status line of a gateway that serves names the service manager that loaded it and the
+    /// socket that answers.
+    #[test]
+    fn a_serving_gateways_status_names_the_service_manager_and_the_socket() {
+        let socket = PathBuf::from("/host/store/gateway.sock");
+        let status = cli_status(
+            true,
+            socket.clone(),
+            Some(&daemon(false, None, Some("abc"))),
+            "abc",
+        );
+        assert!(status.running && status.installed, "{status:?}");
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+        emit_gateway_status(&mut output, false, status).unwrap();
+        let (stdout, stderr) = output.into_inner();
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            stderr.contains(&format!(
+                "gateway is healthy: {MANAGER} loaded; control socket answers at {}",
+                socket.display()
+            )),
+            "{stderr}"
+        );
     }
 
     /// Every setup removes the `cargo` link an earlier install planted, including a setup whose
@@ -4212,7 +4477,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
-                || Ok(test_identity()),
+                || Ok(Some(test_identity())),
             )
             .await
             .unwrap();
@@ -4357,7 +4622,7 @@ mod tests {
                 None,
                 executor,
                 || Ok(test_bun(&home)),
-                || Ok(test_identity()),
+                || Ok(Some(test_identity())),
             )
             .await
             .unwrap()
@@ -4446,7 +4711,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
-                || Ok(test_identity()),
+                || Ok(Some(test_identity())),
             )
             .await
             .unwrap()
@@ -4563,7 +4828,7 @@ mod tests {
                 None,
                 &mut executor,
                 || Ok(test_bun(&home)),
-                || Ok(test_identity())
+                || Ok(Some(test_identity()))
             )
             .await
             .unwrap(),
@@ -4642,12 +4907,17 @@ mod tests {
         impl LaunchctlCommand for RefusingLaunchctl {
             fn run(
                 &mut self,
-                _: &Path,
+                executable: &Path,
                 arguments: &[std::ffi::OsString],
                 _: &cowshed_os::deadline::Deadline,
             ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
             {
-                if arguments[0] == "bootstrap" && !self.saw_candidate {
+                // The gateway host's signature is not the service manager's business.
+                if executable == Path::new(code_signing::CODESIGN) {
+                    return Ok(crate::launchd::LaunchctlOutput::success());
+                }
+                let verb = crate::launchd::recorded::verb(arguments);
+                if verb == "bootstrap" && !self.saw_candidate {
                     assert_eq!(executable_digest(&self.stable).unwrap(), self.candidate);
                     assert!(
                         fs::symlink_metadata(&self.cargo).is_err(),
@@ -4655,14 +4925,14 @@ mod tests {
                     );
                     self.saw_candidate = true;
                 }
-                Ok(crate::launchd::LaunchctlOutput {
-                    status: match arguments[0].to_str() {
-                        Some("print") => crate::launchd::CommandStatus::ExitCode(113),
-                        Some("bootstrap") => crate::launchd::CommandStatus::ExitCode(37),
-                        _ => crate::launchd::CommandStatus::Success,
+                Ok(match verb {
+                    "print" => crate::launchd::recorded::not_loaded(),
+                    "bootstrap" => crate::launchd::LaunchctlOutput {
+                        status: crate::launchd::CommandStatus::ExitCode(37),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
                     },
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
+                    _ => crate::launchd::LaunchctlOutput::success(),
                 })
             }
         }
@@ -4695,9 +4965,9 @@ mod tests {
             &second,
             spec.target(),
             InstallOutcome::Changed,
-            test_identity(),
+            Some(test_identity()),
         )
-        .expect_err("launchctl refuses");
+        .expect_err("the service manager refuses");
         assert!(
             error.message.contains("this host is as it was found"),
             "{}",
@@ -4726,8 +4996,8 @@ mod tests {
     /// still tore down (launchctl 37). Whatever the bootout answered, an overdue bootout is
     /// overdue: the error says so, carries a refused bootout's answer as context, and the
     /// restore puts the previous build back and leaves the agent alone — no kickstart and no
-    /// bootstrap. launchd here holds the job throughout and reports an exit timeout of 0 s, so
-    /// the bootout is overdue after the 1 s unload grace.
+    /// bootstrap. The service manager here holds the job throughout and reports an exit timeout
+    /// of 0 s, so the bootout is overdue after the 1 s unload grace.
     #[test]
     fn an_overdue_bootout_is_never_kickstarted_whatever_launchctl_bootout_answered() {
         struct TearingDown {
@@ -4742,25 +5012,24 @@ mod tests {
                 _: &cowshed_os::deadline::Deadline,
             ) -> std::result::Result<crate::launchd::LaunchctlOutput, cowshed_os::deadline::RunError>
             {
-                // The gateway host's signature is not launchd's business.
+                // The gateway host's signature is not the service manager's business.
                 if executable == Path::new(code_signing::CODESIGN) {
                     return Ok(crate::launchd::LaunchctlOutput::success());
                 }
-                let verb = arguments[0].to_string_lossy().into_owned();
-                let (status, stdout) = match verb.as_str() {
-                    "print" => (
-                        crate::launchd::CommandStatus::Success,
-                        b"gui/501/dev.cowshed.gateway = {\n\tstate = not running\n\texit timeout = 0\n}\n"
-                            .to_vec(),
-                    ),
-                    "bootout" => (self.bootout, Vec::new()),
-                    _ => (crate::launchd::CommandStatus::Success, Vec::new()),
+                let verb = crate::launchd::recorded::verb(arguments).to_owned();
+                let answer = match verb.as_str() {
+                    "print" => crate::launchd::recorded::loaded(0),
+                    "bootout" => crate::launchd::LaunchctlOutput {
+                        status: self.bootout,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    _ => crate::launchd::LaunchctlOutput::success(),
                 };
                 self.argv.push(verb);
                 Ok(crate::launchd::LaunchctlOutput {
-                    status,
-                    stdout,
                     stderr: b"Boot-out failed: 5: Input/output error".to_vec(),
+                    ..answer
                 })
             }
         }
@@ -4770,7 +5039,7 @@ mod tests {
         ] {
             let (home, executable, spec) = host_with_agent(&format!("overdue-{case}"));
             let first = build(&home, "first", b"the supervised release build", Some(100));
-            let second = build(&home, "second", b"a build launchd never ran", Some(200));
+            let second = build(&home, "second", b"a build the manager never ran", Some(200));
             install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &first.source)
                 .unwrap();
             let mut executor = LaunchdExecutor::new(
@@ -4786,15 +5055,15 @@ mod tests {
                 &second,
                 spec.target(),
                 InstallOutcome::Changed,
-                test_identity(),
+                Some(test_identity()),
             )
             .expect_err("the bootout went overdue");
             assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{case}");
             assert!(
                 error.message.contains("did not finish booting out")
-                    && error
-                        .message
-                        .contains("its process exited and launchd still holds the job"),
+                    && error.message.contains(&format!(
+                        "its process exited and {MANAGER} still holds the job"
+                    )),
                 "{case}: {}",
                 error.message
             );
@@ -4811,7 +5080,10 @@ mod tests {
                 error.message
             );
             assert!(
-                error.hint.contains("launchctl bootstrap gui/"),
+                error.hint.contains(&crate::launchd::bootstrap_hint(
+                    effective_uid(),
+                    spec.target()
+                )),
                 "{case}: {}",
                 error.hint
             );
@@ -4843,13 +5115,13 @@ mod tests {
         }
     }
 
-    /// What one setup refresh of `candidate` did on `home`: its answer, the launchctl verbs it
-    /// ran and the `codesign` argv it ran, under the recording launchctl `command`.
+    /// What one setup refresh of `candidate` did on `home`: its answer, the control argv it ran
+    /// and the `codesign` argv it ran, under the recording runner `command`.
     async fn refresh_recording(
         home: &Path,
         candidate: &Candidate,
         command: RecordingGatewayLaunchctl,
-        identity: SigningIdentity,
+        identity: Option<SigningIdentity>,
     ) -> (
         Option<ServiceBinaryRefresh>,
         Vec<Vec<std::ffi::OsString>>,
@@ -4901,7 +5173,7 @@ mod tests {
             &home,
             &first,
             RecordingGatewayLaunchctl::default(),
-            identity,
+            Some(identity),
         )
         .await;
         assert!(refreshed.is_some());
@@ -4917,7 +5189,7 @@ mod tests {
             &home,
             &first,
             RecordingGatewayLaunchctl::default(),
-            identity,
+            Some(identity),
         )
         .await;
         assert_eq!(refreshed, None);
@@ -4936,7 +5208,7 @@ mod tests {
                 unsatisfied: true,
                 ..RecordingGatewayLaunchctl::default()
             },
-            identity,
+            Some(identity),
         )
         .await;
         assert_eq!(codesign.len(), 2, "verified, then signed: {codesign:?}");
@@ -4947,7 +5219,7 @@ mod tests {
             &home,
             &second,
             RecordingGatewayLaunchctl::default(),
-            identity,
+            Some(identity),
         )
         .await;
         assert!(refreshed.is_some());
@@ -4959,12 +5231,59 @@ mod tests {
             &home,
             &second,
             RecordingGatewayLaunchctl::default(),
-            identity,
+            Some(identity),
         )
         .await;
         assert_eq!(refreshed, None, "a repaired host restarts nothing");
         assert!(argv.is_empty(), "{argv:?}");
         signed_once(&codesign);
+        assert_eq!(fs::read(&host).unwrap(), b"the second release");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// An install given no identity, as on a platform that signs nothing: the gateway host is a
+    /// plain copy of the build, no `codesign` runs to sign or to verify it, a host that is there
+    /// is left alone, and it is rewritten when the stable name moves or the host is gone.
+    #[tokio::test]
+    async fn setup_installs_the_gateway_host_unsigned_when_given_no_identity() {
+        let (home, executable, _) = host_with_agent("unsigned-gateway-host");
+        let host = executable.gateway_host();
+        let first = build(&home, "first", b"the first release", None);
+        let second = build(&home, "second", b"the second release", None);
+        let refresh = async |candidate: &Candidate| {
+            let (refreshed, argv, codesign) =
+                refresh_recording(&home, candidate, RecordingGatewayLaunchctl::default(), None)
+                    .await;
+            assert!(codesign.is_empty(), "nothing is signed: {codesign:?}");
+            (refreshed, argv)
+        };
+
+        let (refreshed, _) = refresh(&first).await;
+        assert!(refreshed.is_some());
+        assert_eq!(fs::read(&host).unwrap(), b"the first release");
+        assert_eq!(
+            fs::metadata(&host).unwrap().mode() & 0o777,
+            STABLE_BINARY_MODE
+        );
+        let inode = fs::metadata(&host).unwrap().ino();
+
+        let (refreshed, argv) = refresh(&first).await;
+        assert_eq!(refreshed, None);
+        assert!(argv.is_empty(), "{argv:?}");
+        assert_eq!(
+            fs::metadata(&host).unwrap().ino(),
+            inode,
+            "a host that is there is left alone"
+        );
+
+        let (refreshed, _) = refresh(&second).await;
+        assert!(refreshed.is_some());
+        assert_eq!(fs::read(&host).unwrap(), b"the second release");
+
+        fs::remove_file(&host).unwrap();
+        let (refreshed, argv) = refresh(&second).await;
+        assert_eq!(refreshed, None, "a repaired host restarts nothing");
+        assert!(argv.is_empty(), "{argv:?}");
         assert_eq!(fs::read(&host).unwrap(), b"the second release");
         fs::remove_dir_all(home).unwrap();
     }
@@ -4977,7 +5296,7 @@ mod tests {
     #[tokio::test]
     async fn host_proof_a_throwaway_keychain_signs_without_a_dialog() {
         let keychain_home = scratch_root("host-proof-keychain");
-        let keychain = Keychain::cowshed(&keychain_home);
+        let keychain = code_signing::Keychain::cowshed(&keychain_home);
         prove_one_requirement_across_two_setups(&keychain_home).await;
         let listed = std::process::Command::new(code_signing::SECURITY)
             .args(["list-keychains", "-d", "user"])
@@ -5021,7 +5340,9 @@ mod tests {
     /// is not. Every step is given what it needs, so none can raise a dialog.
     #[cfg(target_os = "macos")]
     async fn prove_one_requirement_across_two_setups(keychain_home: &Path) {
-        let identity = gateway_host_identity(keychain_home).unwrap();
+        let identity = code_signing::gateway_host_identity(keychain_home)
+            .unwrap()
+            .expect("macOS signs the gateway host");
         let (home, executable, _) = host_with_agent("host-proof");
         let host = executable.gateway_host();
         let mut seen = Vec::new();
@@ -5034,7 +5355,7 @@ mod tests {
                     real_codesign: true,
                     ..RecordingGatewayLaunchctl::default()
                 },
-                identity,
+                Some(identity),
             )
             .await;
             let shown = std::process::Command::new(code_signing::CODESIGN)
@@ -5093,7 +5414,7 @@ mod tests {
             None,
             &mut executor,
             || Ok(test_bun(&home)),
-            || Ok(test_identity()),
+            || Ok(Some(test_identity())),
         )
         .await
         .expect_err("the companion is required");
@@ -5158,6 +5479,50 @@ mod tests {
             "{}",
             error.message
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The helper a build installs is the file beside it: the stable name for a build the
+    /// install slot holds, its distribution's own for any other, and a build with none is
+    /// refused by the name of the file it lacks.
+    #[test]
+    fn a_build_installs_the_helper_beside_it_or_is_refused_by_name() {
+        let home = scratch_root("helper-source");
+        let installed = HostStableExecutable::new(&home, HELPER_NAME).unwrap();
+        let slot = installed.directory().join("cowshed-0123");
+        let distribution = home.join("package/dist/bin/platform/cowshed");
+        let loose = home.join("tools/cowshed");
+        let cases = [
+            (&slot, installed.path().to_path_buf()),
+            (&distribution, distribution.with_file_name(HELPER_NAME)),
+            (&loose, loose.with_file_name(HELPER_NAME)),
+        ];
+        for (source, helper) in &cases {
+            let refused = |state: &str| {
+                let error = packaged_helper(&installed, source).expect_err(state);
+                assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{state}");
+                assert!(
+                    error.message.contains(&helper.display().to_string())
+                        && error.message.contains(&source.display().to_string()),
+                    "{state}: {}",
+                    error.message
+                );
+            };
+            refused("no helper beside the build");
+            // A directory of that name is no helper.
+            fs::create_dir_all(helper).unwrap();
+            refused("a directory where the helper goes");
+            fs::remove_dir(helper).unwrap();
+            fs::write(helper, b"helper").unwrap();
+            assert_eq!(
+                packaged_helper(&installed, source).unwrap(),
+                *helper,
+                "{}",
+                source.display()
+            );
+            // The next build finds no helper of this one's.
+            fs::remove_file(helper).unwrap();
+        }
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -5503,6 +5868,8 @@ mod tests {
             let gateway = Gateway::start(
                 GatewayConfig {
                     control_socket: Some(socket.clone()),
+                    // The store's data socket root, where this platform's sessions have one.
+                    data_socket_root: cowshed_gateway::data_socket_root(&store),
                     mirror_cache: MirrorCacheConfig::new(cache),
                     startup: Some(Arc::new(DaemonStartup { heal, manager })),
                     // The CLI asking runs the same bytes, so only the startup pass is reported.
@@ -5872,6 +6239,7 @@ mod tests {
 
     /// The restart form stays available for guidance issued after a successful
     /// install, where the service does exist.
+    #[cfg(target_os = "macos")]
     #[test]
     fn kickstart_guidance_targets_the_per_user_domain() {
         assert_eq!(
@@ -5940,6 +6308,9 @@ mod tests {
     /// "1 projects", and a daemon that does not answer yet is not claimed to be mounting.
     #[test]
     fn the_start_wait_says_what_the_daemon_reported() {
+        let draining = format!(
+            "waited 5s for the gateway: the running gateway is draining before {MANAGER} restarts it…"
+        );
         for (waiting, expected) in [
             (
                 StartWait::ControlSocket,
@@ -5953,10 +6324,7 @@ mod tests {
                 StartWait::Startup(StartupHeal::RestoringSessions),
                 "waited 5s for the gateway: restoring workspace sessions…",
             ),
-            (
-                StartWait::Drain,
-                "waited 5s for the gateway: the running gateway is draining before launchd restarts it…",
-            ),
+            (StartWait::Drain, draining.as_str()),
         ] {
             assert_eq!(
                 StartProgress::new().line(START_PROGRESS_INTERVAL, waiting),

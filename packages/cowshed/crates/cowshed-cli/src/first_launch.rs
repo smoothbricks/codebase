@@ -8,10 +8,13 @@
 //! scan and the second does not; an exempt one costs what the second does. `cowshed doctor`
 //! measures it in its own process (the host shell) and in the gateway daemon's, whose
 //! responsible process is every workspace job's.
+//!
+//! Only macOS assesses a first launch. What measures one, in the calling process and in the
+//! daemon, and which program answers for this process's launches come from the platform file:
+//! `linux.rs` has none of the three, so nothing is copied, signed or launched there, and no
+//! reading exists.
 
 use std::io;
-#[cfg(target_os = "macos")]
-use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -20,6 +23,17 @@ use cowshed_gateway_types::{FirstLaunch, FirstLaunchProbe};
 use cowshed_os::fork_lock::Run as _;
 
 use crate::code_signing::CODESIGN;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub use platform::{daemon_probe, host_probe, responsible_program};
 
 /// Mint a fresh executable from `template` and time its first and second launch from this
 /// process, each from spawn to exit.
@@ -140,43 +154,6 @@ impl FirstLaunchProbe for DaemonFirstLaunch {
     fn measure(&self) -> Result<FirstLaunch, String> {
         measure(&self.template).map_err(|error| error.to_string())
     }
-}
-
-/// The program macOS charges this process's launches to: its responsible process's executable,
-/// as libquarantine's `responsibility_get_pid_responsible_for_pid` and `proc_pidpath` name it.
-/// `None` when either does not answer.
-#[cfg(target_os = "macos")]
-pub fn responsible_program() -> Option<PathBuf> {
-    type Responsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
-    // SAFETY: a NUL-terminated symbol name looked up in the process's loaded images.
-    let symbol = unsafe {
-        libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
-        )
-    };
-    if symbol.is_null() {
-        return None;
-    }
-    // SAFETY: the symbol is libquarantine's `pid_t (pid_t)` function.
-    let responsible = unsafe { std::mem::transmute::<*mut libc::c_void, Responsible>(symbol) };
-    // SAFETY: it takes and returns a pid and touches no memory of ours.
-    let pid = unsafe { responsible(libc::getpid()) };
-    if pid <= 0 {
-        return None;
-    }
-    let capacity = u32::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?;
-    let mut path = vec![0u8; usize::try_from(capacity).ok()?];
-    // SAFETY: `path` is a writable buffer of the length passed.
-    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), capacity) };
-    let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
-    path.truncate(length);
-    Some(PathBuf::from(std::ffi::OsString::from_vec(path)))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn responsible_program() -> Option<PathBuf> {
-    None
 }
 
 /// Whether a responsible process's runs pay the first-launch scan.

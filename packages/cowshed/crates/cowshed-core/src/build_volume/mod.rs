@@ -17,7 +17,6 @@ pub mod cargo;
 pub mod discard;
 pub mod kept;
 pub mod link;
-#[cfg(target_os = "macos")]
 pub mod migrate;
 pub mod nx;
 #[cfg(target_os = "macos")]
@@ -55,7 +54,6 @@ pub(crate) const HOLD_SUFFIX: &str = ".hold";
 /// Where a seed compaction works ([`BuildVolumeLayout::compacting`]).
 pub(crate) const COMPACTING_DIRECTORY: &str = ".compacting";
 /// The seed compaction's one-at-a-time lock in [`COMPACTING_DIRECTORY`].
-#[cfg(target_os = "macos")]
 pub(crate) const COMPACTION_LOCK: &str = "lock";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
@@ -1050,7 +1048,6 @@ impl SeedRecords {
             .map(|(index, _)| index))
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn seed_of(
         &self,
         layout: &BuildVolumeLayout,
@@ -1346,7 +1343,7 @@ impl BuildVolumeLayout {
     /// [`Self::claim_release`] granted as the lock's waiter, within the test backstop. A probe
     /// right after the last hold's close can still see a transient kernel copy of its descriptor
     /// from another thread's spawn (cowshed-os `fork_lock`); the waiter's grant proves the release.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn claim_release_granted(&self, id: &BuildVolumeId) -> io::Result<ReleaseClaim> {
         use cowshed_os::test_backstop::FileBackstop as _;
         let file = open_hold(&self.hold_path(id))?;
@@ -1846,6 +1843,15 @@ fn io_error(operation: &str, path: &Path, error: &io::Error) -> crate::CowshedEr
 mod tests {
     use super::*;
     use crate::repository::RepoId;
+
+    #[cfg(target_os = "linux")]
+    mod linux;
+    #[cfg(target_os = "macos")]
+    mod macos;
+    #[cfg(target_os = "linux")]
+    use linux as platform;
+    #[cfg(target_os = "macos")]
+    use macos as platform;
 
     fn layout() -> BuildVolumeLayout {
         let project = ProjectPaths::with_mount_root(
@@ -2903,7 +2909,6 @@ mod tests {
     ///
     /// No timer orders the race: the claim is let go only once the holding thread has either
     /// answered while it was still held (the false refusal) or sleeps in the kernel on the lock.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_hold_waits_out_an_exclusive_claim_and_refuses_only_a_released_volume() {
         let root = std::env::temp_dir().join(format!(
@@ -2947,7 +2952,6 @@ mod tests {
 
     /// Claim `id` exclusively, start a hold of it on another thread, and let the claim go, after
     /// `settle`, once that hold has answered or sleeps in the kernel on the hold file's lock.
-    #[cfg(target_os = "macos")]
     fn hold_behind_claim(
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
@@ -2957,25 +2961,23 @@ mod tests {
             .claim_release(id)
             .unwrap()
             .expect("nothing holds the volume");
-        let (port, ported) = std::sync::mpsc::channel();
+        let (thread, named) = std::sync::mpsc::channel();
         let (answer, answered) = std::sync::mpsc::channel();
         let holder = {
             let (layout, id) = (layout.clone(), id.clone());
             std::thread::spawn(move || {
-                // SAFETY: names this thread's own Mach port and transfers no right.
-                port.send(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) })
-                    .unwrap();
+                thread.send(platform::this_thread()).unwrap();
                 answer
                     .send(layout.hold(&crate::census::this_test(), &id))
                     .unwrap();
             })
         };
-        let port = ported.recv().unwrap();
+        let thread = named.recv().unwrap();
         let early = loop {
             if let Ok(held) = answered.try_recv() {
                 break Some(held);
             }
-            if waits_in_kernel(port) {
+            if platform::waits_in_kernel(thread) {
                 break None;
             }
             std::thread::yield_now();
@@ -2987,21 +2989,6 @@ mod tests {
         });
         holder.join().unwrap();
         held
-    }
-
-    /// Whether `thread` sleeps interruptibly in the kernel, as a flock waiter does. A thread
-    /// that already ended answers no: it answered before it ended.
-    #[cfg(target_os = "macos")]
-    fn waits_in_kernel(thread: libc::mach_port_t) -> bool {
-        let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::zeroed();
-        let mut count = libc::THREAD_BASIC_INFO_COUNT;
-        let flavor = libc::thread_flavor_t::try_from(libc::THREAD_BASIC_INFO).unwrap();
-        // SAFETY: `info` has room for the `count` integers the basic flavor writes.
-        let status =
-            unsafe { libc::thread_info(thread, flavor, info.as_mut_ptr().cast(), &mut count) };
-        // SAFETY: a successful call wrote the whole basic info.
-        status == libc::KERN_SUCCESS
-            && unsafe { info.assume_init() }.run_state == libc::TH_STATE_WAITING
     }
 
     #[test]

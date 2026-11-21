@@ -139,8 +139,9 @@ const fn row(command: &'static str, argument: &'static str, counterpart: Counter
     }
 }
 
-const SETUP_DIALOG: &str = "setup's administrator authorization dialog is a human step a library \
-                            caller cannot provide (06_cli.md, rule 3)";
+const SETUP_DIALOG: &str = "setup's administrator authorization (the macOS dialog, sudo's prompt \
+                            on Linux) is a human step a library caller cannot provide (06_cli.md, \
+                            rule 3)";
 
 /// Every leaf verb and argument of the CLI, and its counterpart.
 #[rustfmt::skip]
@@ -368,7 +369,7 @@ pub const PARITY: &[Row] = &[
     row("gateway stop", "", field(&[("host.gatewayStop", "")], &[member("Host.gatewayStop")])),
     row("gateway stop", "purge", field(&[("host.gatewayStop", "purge")], &[argument("Host.gatewayStop", 0, "purge")])),
     row("gateway status", "", field(&[("host.gatewayStatus", "")], &[member("Host.gatewayStatus")])),
-    row("gateway run", "", Counterpart::CliOnly { reason: "process entrypoint: the daemon launchd execs; a library call never becomes it and no host connection runs it (07_api.md, Host operations)" }),
+    row("gateway run", "", Counterpart::CliOnly { reason: "process entrypoint: the daemon the user's service manager (launchd, systemd) execs; a library call never becomes it and no host connection runs it (07_api.md, Host operations)" }),
     row("gateway await-turns", "", input(member("spawnAwaitTurns"))),
     row("gateway await-turns", "gateway-socket", input(argument("spawnAwaitTurns", 0, "gatewaySocket"))),
     row("gateway await-turns", "argv", input(argument("spawnAwaitTurns", 0, "argv"))),

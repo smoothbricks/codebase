@@ -8,14 +8,28 @@
 //! mount roots held them, through the same settle and mount policy as every heal
 //! ([`NativeGatewayInventory::remount_lost`]). A workspace whose image lock a live operation holds
 //! is remounted once that holder lets go, by one wait per workspace the watch owns.
+//!
+//! The mount table and the kernel's change events are the platform's (`macos.rs`: `getfsstat`
+//! and a kqueue `EVFILT_FS` filter; `linux.rs`: `/proc/self/mountinfo` and its poll readiness),
+//! selected here and nowhere else.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cowshed_apfs::mounts::{MountTableEvents, kernel_mounts, vanished};
 use tokio::sync::mpsc;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::{MountTableEvents, kernel_mounts, vanished};
 
 use crate::gateway_inventory::{LostMount, NativeGatewayInventory, RemountScope};
 use crate::metadata::WorkspaceName;

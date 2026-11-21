@@ -4,15 +4,18 @@
 //! Nx spawns each isolated plugin worker detached (pinned Nx 24.0.3,
 //! `project-graph/plugins/isolation/isolated-plugin.js`), so a worker leads its own session and
 //! group: neither the job's ledgered group nor the daemon's session names it. When the daemon
-//! exits, launchd adopts its children, and from then on each one's kernel record names launchd as
-//! its parent. Nothing the kernel keeps then ties a worker to the daemon, and a look for
-//! launchd's children would find every other orphan of the host. So the set is captured while the
-//! workers are still the daemon's children, from the kernel's own bookkeeping: the children of
-//! the running daemon (`proc_listchildpids`), each kept only when its record names the daemon's
-//! `p_uniqueid` as its parent's, and held by its own unique id ([`Life`]) with its exit watched
-//! from then. A `NOTE_FORK` watch on the daemon, registered before the first listing, lists the
-//! children again after each later fork. A listing that ends with the daemon gone may have
-//! missed a child it forked as it exited; that is said, never guessed.
+//! exits, the host's reaper adopts its children (macOS: launchd; Linux: init or a subreaper),
+//! and from then on each one's kernel record names that reaper as its parent. Nothing the kernel
+//! keeps then ties a worker to the daemon, and a look for the reaper's children would find every
+//! other orphan of the host. So the set is captured while the workers are still the daemon's
+//! children, from the kernel's own bookkeeping: the children of the running daemon, each kept
+//! only when its record names the daemon's life as its parent's, and held by its own life
+//! ([`Life`]) with its exit watched from then. The watch of the daemon is the platform's
+//! (`macos.rs`: kqueue `NOTE_FORK` and `NOTE_EXIT`, registered before the first listing, so the
+//! children are listed again after each later fork; `linux.rs`: a pidfd, which reports the exit
+//! alone, so the children are listed when the watch is made and each time its caller follows
+//! the forks). A listing that ends with the daemon gone may have missed a child it forked as
+//! it exited; that is said, never guessed.
 //!
 //! Once the daemon has exited, each child still running is sent `SIGTERM` through its identity,
 //! and one that outlives the caller's grace `SIGKILL`. Every wait is on the kernel's exit event;
@@ -25,7 +28,6 @@
 //! ([`Orphans::of`]).
 
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
 use cowshed_os::process::ExitWatch;
@@ -33,11 +35,28 @@ use cowshed_os::process::ExitWatch;
 use super::job_groups::Life;
 use super::process_events::{Darwin, ProcessReads as _};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// What the daemon's watch reported at once.
+#[derive(Clone, Copy, Debug, Default)]
+struct Reported {
+    /// It forked an uncounted number of children.
+    forked: bool,
+    exited: bool,
+}
+
 /// A daemon's exit and the children it forked, watched from a moment it ran.
 pub(crate) struct DaemonWatch {
     daemon: Life,
-    /// `NOTE_FORK` and `NOTE_EXIT` of the daemon, each reported once.
-    queue: OwnedFd,
+    /// The daemon's exit, and its forks where the platform reports them.
+    source: platform::Source,
     children: Vec<Child>,
     exited: bool,
     /// A listing ended with the daemon gone, so a child it forked may be unseen.
@@ -62,48 +81,12 @@ impl DaemonWatch {
     /// Watch `daemon`'s exit and forks from now, holding the children it has; `None` once it has
     /// exited. Registered before any signal is sent.
     pub(crate) fn of(daemon: Life) -> io::Result<Option<Self>> {
-        // SAFETY: kqueue takes nothing and returns a new descriptor.
-        let queue = unsafe { libc::kqueue() };
-        if queue < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a fresh descriptor this function alone owns.
-        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
-        let change = libc::kevent {
-            ident: usize::try_from(daemon.pid).map_err(io::Error::other)?,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            fflags: libc::NOTE_FORK | libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // SAFETY: one change read from live memory, no event list, on a live queue. With no room
-        // for events a failed registration is the call's own error.
-        let registered = unsafe {
-            libc::kevent(
-                queue.as_raw_fd(),
-                &change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if registered != 0 {
-            let error = io::Error::last_os_error();
-            return match error.raw_os_error() {
-                Some(libc::ESRCH) => Ok(None),
-                _ => Err(error),
-            };
-        }
-        // Read after the registration, the pid still carries the daemon's unique id: the daemon
-        // ran throughout, and the watch names it.
-        if daemon.current()?.is_none() {
+        let Some(source) = platform::Source::of(daemon)? else {
             return Ok(None);
-        }
+        };
         let mut watch = Self {
             daemon,
-            queue,
+            source,
             children: Vec::new(),
             exited: false,
             incomplete: false,
@@ -114,7 +97,7 @@ impl DaemonWatch {
 
     /// Hold each child the daemon has now that is not yet held. A pid is the daemon's child only
     /// when its record, one read, names the daemon's unique id as its parent's: a pid reused since
-    /// the listing names a stranger, and one launchd adopted names launchd.
+    /// the listing names a stranger, and one the host's reaper adopted names that reaper.
     fn list(&mut self) -> io::Result<()> {
         let parent = u32::try_from(self.daemon.pid).map_err(io::Error::other)?;
         for pid in Darwin.children(parent)? {
@@ -133,17 +116,21 @@ impl DaemonWatch {
                 self.children.push(Child { life, exit });
             }
         }
-        // The kernel gives the daemon's children to launchd as it exits, so a listing that ends
-        // with the daemon gone may have missed one.
+        // The kernel gives the daemon's children to the host's reaper as it exits, so a listing
+        // that ends with the daemon gone may have missed one.
         if self.daemon.current()?.is_none() {
             self.incomplete = true;
         }
         Ok(())
     }
 
-    /// Take the forks, and the exit, the daemon has reported so far, without waiting.
+    /// Take the forks, and the exit, the daemon has reported so far, without waiting. Under a
+    /// watch that reports no fork, this is where a running daemon's children are listed again.
     pub(crate) fn follow_forks(&mut self) -> io::Result<()> {
-        self.take(Duration::ZERO).map(drop)
+        if !self.take(Duration::ZERO)? && !platform::Source::REPORTS_FORKS {
+            self.list()?;
+        }
+        Ok(())
     }
 
     /// `SIGTERM` the daemon through its identity: `Ok(false)` once it no longer runs.
@@ -174,43 +161,14 @@ impl DaemonWatch {
         let deadline = Instant::now() + within;
         while !self.exited {
             let left = deadline.saturating_duration_since(Instant::now());
-            let timeout = libc::timespec {
-                tv_sec: libc::time_t::try_from(left.as_secs()).map_err(io::Error::other)?,
-                tv_nsec: libc::c_long::from(left.subsec_nanos()),
+            let Some(reported) = self.source.next(left)? else {
+                return Ok(false);
             };
-            // SAFETY: `event` is plain data the call may write; the queue and timeout are live.
-            let (returned, event) = unsafe {
-                let mut event = std::mem::zeroed::<libc::kevent>();
-                let returned = libc::kevent(
-                    self.queue.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    &mut event,
-                    1,
-                    &timeout,
-                );
-                (returned, event)
-            };
-            match returned {
-                ..0 => {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-                0 => return Ok(false),
-                _ if event.flags & libc::EV_ERROR != 0 => {
-                    return Err(i32::try_from(event.data)
-                        .map_or_else(io::Error::other, io::Error::from_raw_os_error));
-                }
-                _ => {
-                    if event.fflags & libc::NOTE_FORK != 0 {
-                        self.list()?;
-                    }
-                    if event.fflags & libc::NOTE_EXIT != 0 {
-                        self.exited = true;
-                    }
-                }
+            if reported.forked {
+                self.list()?;
+            }
+            if reported.exited {
+                self.exited = true;
             }
         }
         Ok(true)

@@ -3,6 +3,7 @@
 import { fileURLToPath } from 'node:url';
 import typia from 'typia';
 import { loadAddon } from './addon.js';
+import type { StoreSubstrate } from './api.generated.js';
 import type {
   NativeCoordinatorOperations,
   NativeEvents,
@@ -24,6 +25,8 @@ import type { CoordinatorEndpoint } from './types.js';
 export interface NativeProjectHandle extends NativeProjectOperations {
   readonly repoId: string;
   readonly gitRoot: string;
+  /** The store's substrate as `project.open` answered it, or `null` when the controller's build does not say. */
+  readonly substrate: StoreSubstrate | null;
 }
 
 export interface NativeWorkspaceRefHandle extends NativeWorkspaceRefOperations {

@@ -66,11 +66,13 @@ pub(crate) enum ToolInput {
 }
 
 /// The tool's outcome, waited for off the async runtime: a disk-image command can run for as
-/// long as it takes.
+/// long as it takes. A host that has no disk tool refuses here, for the verb and for
+/// `host.diskCommand` alike, before anything is leased or spawned.
 pub(crate) async fn run(
     args: &DiskCommandArgs,
     input: ToolInput,
 ) -> Result<CommandOutput, CowshedError> {
+    crate::runtime::disk_tools()?;
     let request = request(args);
     let deadline = CommandDeadline::new(args.deadline);
     let registry_entry = args.registry_entry;

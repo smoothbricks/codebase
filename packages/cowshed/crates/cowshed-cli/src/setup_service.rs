@@ -3,24 +3,28 @@
 //! `setup` is the one command a stranded host can always run. It takes no project, because a host
 //! whose volumes are absent has no adopted checkout to name, and it dispatches beside `gateway`
 //! at the host-service layer rather than through the project runtime bridge
-//! (01a_apfs.md, "`cowshed setup` owns this transaction").
+//! (01a_apfs.md, "`cowshed setup` owns this transaction"). What the host's storage is, and what
+//! provisioning it needs, is the platform's (`cowshed_core::storage::bootstrap::native`): APFS
+//! volumes on macOS, a directory store or the datasets of a ZFS root on Linux. This module sees
+//! only the plan and the report.
 //!
 //! The verb is two phases on purpose. The plan is gathered *before* anything is executed so the
-//! authorization announcement required by 06_cli.md rule 3 can be printed before the dialog
+//! authorization announcement required by 06_cli.md rule 3 can be printed before the prompt
 //! appears rather than alongside it; a plan with nothing to escalate raises no prompt at all.
 //!
 //! `--uninstall` runs the same transaction backwards and is deliberately narrower: it removes
-//! cowshed's machine presence — the tagged `/etc/fstab` pins, the two LaunchAgents, the binaries
-//! they ran — and no volume, image, or workspace. Everything it removes is rebuildable;
-//! everything that holds data it leaves alone. That asymmetry is why teardown needs a census
-//! rather than a confirmation prompt: cowshed has no prompts (06_cli.md), so the refusal is the
-//! prompt and `--force` is the answer.
+//! cowshed's machine presence — the tagged `/etc/fstab` pins, the gateway's service definition,
+//! the binaries it ran — and no volume, image, or workspace. Everything it removes is
+//! rebuildable; everything that holds data it leaves alone. That asymmetry is why teardown needs
+//! a census rather than a confirmation prompt: cowshed has no prompts (06_cli.md), so the refusal
+//! is the prompt and `--force` is the answer.
 
 use crate::args::SetupArgs;
 use crate::capabilities::mbx::{MbxInstall, TargetCollection};
 use crate::gateway_service::{
-    CliInstall, Downgrade, ServiceBinaryRefresh, canonical_home, gateway_launch_agent,
-    output_error, remove_host_stable_executable, remove_launch_agent, remove_path_entries,
+    CliInstall, Downgrade, HELPER_NAME, ServiceBinaryRefresh, canonical_home, effective_uid,
+    gateway_launch_agent, output_error, remove_host_stable_executable, remove_launch_agent,
+    remove_path_entries,
 };
 use crate::install_basis::InstallSlot;
 use crate::launchd::RemovalOutcome;
@@ -183,9 +187,9 @@ impl HostArtifactRemoval {
 
 /// Everything `setup` does to a host, as the seam this verb is tested through.
 ///
-/// Injectable because the real implementation provisions APFS volumes, edits `/etc/fstab`, and
-/// drives launchd: the rendering and the refusal logic — which is all this module owns — have to
-/// be provable without any of them.
+/// Injectable because the real implementation provisions host storage, escalates to do it, and
+/// drives the service manager: the rendering and the refusal logic — which is all this module
+/// owns — have to be provable without any of them.
 #[async_trait]
 pub trait HostSetup: Send {
     async fn plan(&mut self, caches_volume: CachesVolume) -> Result<HostSetupPlan>;
@@ -196,6 +200,13 @@ pub trait HostSetup: Send {
     async fn census(&mut self) -> Result<WorkspaceCensus>;
     /// Which adopted projects have no mounted main, for the readiness sentence.
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
+    /// Prove that the installed cowshed's root helper can change a ZFS store
+    /// ([`crate::zfs_helper::prove`]): the refusal, carrying the one root command that mends it,
+    /// when it cannot. `None` for a store that keeps no datasets, and for a test host, which
+    /// must never run `sudo`.
+    async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
+        Ok(None)
+    }
     /// Probe every adopted checkout's git identity at the workspace mount root.
     async fn git_identity(&mut self) -> Result<GitIdentity>;
     /// Deactivate and delete the host services and the binaries they ran.
@@ -323,6 +334,11 @@ impl HostSetup for NativeHostSetup {
         crate::gateway_service::install_cli(&self.home, self.downgrade, &path)
             .await
             .map(Some)
+    }
+
+    async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
+        let storage = validate_existing_host_storage(&self.home).await?;
+        crate::zfs_helper::prove(storage.store(), &self.home, effective_uid())
     }
 
     async fn install_skill(&mut self) -> Result<Option<SkillInstallReport>> {
@@ -509,7 +525,7 @@ impl HostSetup for NativeHostSetup {
     /// an earlier cowshed installed for sccache.
     ///
     /// Order is load-bearing: the gateway agent is `KeepAlive`, so deleting the binary while its
-    /// agent is still loaded leaves launchd respawning a path that no longer resolves.
+    /// agent is still loaded leaves the service manager respawning a path that no longer resolves.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
         let namespace = self.roots.namespace();
         let (gateway_binary, gateway_agent) = gateway_launch_agent(namespace, &self.home)?;
@@ -526,6 +542,14 @@ impl HostSetup for NativeHostSetup {
             HostArtifactRemoval::new(
                 "installed cowshed binary",
                 remove_host_stable_executable(&gateway_binary)?,
+            ),
+            HostArtifactRemoval::new(
+                format!("installed {HELPER_NAME}"),
+                remove_host_stable_executable(
+                    &crate::launchd::HostStableExecutable::new(&self.home, HELPER_NAME).map_err(
+                        |error| CowshedError::internal(format!("{HELPER_NAME}: {error}")),
+                    )?,
+                )?,
             ),
             HostArtifactRemoval::new("mbx beside the installed cowshed", mbx_link),
             HostArtifactRemoval::new("mbx nix GC root", mbx_root),
@@ -857,6 +881,13 @@ where
         Some(_) => None,
         None => setup.install_cli().await?,
     };
+    // Every mutation of a ZFS store goes through the helper this run installed beside cowshed.
+    // It is proven able to act as root here, once it is installed: nothing else says so until a
+    // daemon with no terminal fails on it.
+    let helper = match (&failure, &cli) {
+        (None, Some(CliInstall::Installed { .. })) => setup.zfs_helper().await?,
+        _ => None,
+    };
     // After the cowshed it sits beside: the host's mbx is that build's own pin.
     let mbx = match &failure {
         Some(_) => None,
@@ -969,6 +1000,9 @@ where
     // Last, after every row and every hint: the operator sees the whole host before the reason
     // this exits non-zero. An mbx build that failed, or a foreign file where its link goes, must not
     // read as installed; the storage transaction succeeded, and that is exactly what the rows say.
+    if let Some(refusal) = helper {
+        return Err(refusal);
+    }
     if let Some(failure) = mbx.as_ref().and_then(MbxInstall::failure) {
         return Err(failure);
     }

@@ -14,6 +14,19 @@ use crate::api::resources::{
 };
 use crate::error::CowshedError;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The volume this host's substrate stats and the stat that reads it, and the volume mounted at
+/// a path as a job's spawn finds it: its identity and used bytes, or why it has neither.
+pub use platform::{HostVolume, HostVolumeStat, at_spawn};
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum VolumeStatError {
     #[error("volume used-byte stat failed: {0}")]
@@ -148,45 +161,6 @@ impl VolumeMountpoint {
     pub fn path(&self) -> &Path {
         &self.0
     }
-}
-
-/// The volume this host's substrate stats, an APFS volume fenced by its mount's filesystem id,
-/// and the stat that reads it.
-#[cfg(target_os = "macos")]
-pub use crate::storage::apfs::native::{
-    ApfsVolume as HostVolume, ApfsVolumeStat as HostVolumeStat,
-};
-
-/// The volume mounted at `mount` as a job's spawn finds it: its identity and used bytes, or why
-/// it has neither.
-#[cfg(target_os = "macos")]
-pub fn at_spawn(mount: &Path) -> VolumeAtSpawn<HostVolume> {
-    VolumeAtSpawn::observed(HostVolume::capture(mount))
-}
-
-/// No volume here has a used-bytes stat until the ZFS dataset stat exists: no value of this type
-/// can be made.
-#[cfg(not(target_os = "macos"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HostVolume {}
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HostVolumeStat;
-
-#[cfg(not(target_os = "macos"))]
-impl VolumeStat for HostVolumeStat {
-    type Volume = HostVolume;
-
-    fn used_bytes(&self, volume: &HostVolume) -> Result<u64, VolumeStatError> {
-        match *volume {}
-    }
-}
-
-/// Every volume here is unsupported: nothing is read.
-#[cfg(not(target_os = "macos"))]
-pub fn at_spawn(_mount: &Path) -> VolumeAtSpawn<HostVolume> {
-    VolumeAtSpawn::Unavailable(VolumeUnavailable::UnsupportedPlatform)
 }
 
 #[cfg(test)]
@@ -392,19 +366,6 @@ mod tests {
             JobVolumeUsage {
                 workspace: unavailable(VolumeUnavailable::Unconfigured),
                 build: None,
-            }
-        );
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn no_volume_has_a_used_bytes_stat_on_this_platform() {
-        let devfs = VolumeMountpoint::new(PathBuf::from("/dev")).expect("devfs is mounted at /dev");
-        assert_eq!(
-            VolumeBaseline::admitted(Some(&devfs), Some(Path::new("/dev"))).sample(&HostVolumeStat),
-            JobVolumeUsage {
-                workspace: unavailable(VolumeUnavailable::UnsupportedPlatform),
-                build: Some(unavailable(VolumeUnavailable::UnsupportedPlatform)),
             }
         );
     }

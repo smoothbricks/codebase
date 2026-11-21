@@ -9,12 +9,12 @@ use std::process::{Command, Output};
 
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
-use cowshed_core::exec::{ProfileLaunch, SANDBOX_EXEC};
+use cowshed_core::exec::ProfileLaunch;
 use cowshed_core::git::git_command_at;
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::metadata::PortBlock;
 use cowshed_core::sandbox::{
-    RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
+    RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, launcher, seatbelt_profile,
 };
 
 struct Scratch(PathBuf);
@@ -37,8 +37,9 @@ impl Drop for Scratch {
 fn job(config: &SandboxConfig, tools: &Path, argv: &[&str]) -> Output {
     let profile = seatbelt_profile(config, SandboxProfileRole::ExecutedChild).unwrap();
     let launch = ProfileLaunch::write(&config.profile_directory(), &profile).unwrap();
-    Command::new(SANDBOX_EXEC)
-        .args(launch.args())
+    let launcher = launcher().expect("the platform's sandbox launcher");
+    Command::new(launcher.program())
+        .args(launch.args(launcher))
         .args(argv)
         .current_dir(&config.workspace_mount)
         .env_clear()
@@ -108,7 +109,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
         exec_temp_dir: temporary,
         store_root: scratch.join("store"),
         cpu_pool_directory: None,
-        port_block: PortBlock::new(40_960, 16).unwrap(),
+        port_block: Some(PortBlock::new(40_960, 16).unwrap()),
         retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),

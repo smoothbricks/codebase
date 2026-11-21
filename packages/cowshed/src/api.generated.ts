@@ -137,11 +137,18 @@ export type AdmissionRefusal =
 export type AdoptOptions = {
   readonly path?: string;
   readonly repoId?: RepoId;
+  /**
+   * The capacity main is created with, as `resize` spells one (`20g`). An APFS store makes
+   * the sparse image that size, a ZFS store sets it as the dataset's `refquota`, and a
+   * plain-directory store has no capacity to set: it reads the value and caps nothing.
+   */
   readonly capacity?: string;
   readonly quarantine?: boolean;
   /**
    * Explicitly replace an adopted main through verified, retained-source re-adoption.
-   * False keeps ordinary adoption idempotent.
+   * False keeps ordinary adoption idempotent. Re-adoption returns the space of a sparse image
+   * that only grew, so only an APFS store has it: a ZFS or plain-directory store, which frees
+   * space as files are deleted, refuses it as [`SubstrateOperation::ReAdopt`].
    */
   readonly reAdopt?: boolean;
 };
@@ -230,12 +237,16 @@ export type AdoptionSkip =
   | { readonly kind: 'ungated' };
 
 export type AttachOptions = {
+  /**
+   * As [`ForkOptions::browse`]: Finder presentation, with no effect off an APFS store.
+   */
   readonly browse?: boolean;
   readonly observedPath?: string;
   /**
    * One attach of an aggregate (`attach` with no name, `attach --all`): it makes no room under
    * IOKit's IOMedia ceiling, since detaching some sessions to attach others frees nothing
-   * (02_workspaces.md, "Making room for an attach").
+   * (02_workspaces.md, "Making room for an attach"). The ceiling is macOS's; a Linux host has
+   * none, and no attach there makes room.
    */
   readonly aggregate?: boolean;
 };
@@ -474,6 +485,8 @@ export type CowshedError = {
   readonly priority?: PriorityFailure;
 } & {
   readonly removal?: RemovalRefusal;
+} & {
+  readonly unsupported?: SubstrateRefusal;
 };
 
 /**
@@ -608,7 +621,9 @@ export type DecimalU64 = string &
 
 /**
  * What `cowshed defrag` changed: the image's extents before and after its data was rewritten
- * contiguously, and the data bytes the rewrite copied.
+ * contiguously, and the data bytes the rewrite copied. Only an APFS store has an image to
+ * rewrite: a ZFS or plain-directory store refuses the verb
+ * ([`SubstrateOperation::DefragmentWorkspace`]).
  */
 export type DefragmentResult = {
   readonly workspace: WorkspaceName;
@@ -666,7 +681,9 @@ export type DiskCommandRequest = {
 };
 
 /**
- * The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path.
+ * The disk tool `host.diskCommand` runs, as `disk-command` names it: never a path. Both are
+ * macOS's own tools. A Linux host has neither, so the call is refused there as
+ * `environment-missing`: its store's datasets and directories are managed by cowshed itself.
  */
 export type DiskCommandTool = 'diskutil' | 'hdiutil';
 
@@ -988,6 +1005,10 @@ export type ForkCommitment = {
 export type ForkOptions = {
   readonly ref?: RevisionTarget;
   readonly clean?: boolean;
+  /**
+   * Show the workspace's volume in Finder. A presentation flag of an APFS mount: a ZFS or
+   * plain-directory store accepts it and has nothing to show it in.
+   */
   readonly browse?: boolean;
   readonly slot?: number & tags.Type<'uint32'>;
   /**
@@ -1016,7 +1037,8 @@ export type ForkRequest = {
 
 export type GatewayStatus = {
   /**
-   * Whether launchd has the gateway agent loaded.
+   * Whether the user's service manager (launchd on macOS, systemd on Linux) has the gateway
+   * service loaded.
    */
   readonly installed: boolean;
   /**
@@ -2742,6 +2764,11 @@ export type ProjectOpened = {
   readonly binding: RepositoryBinding;
   readonly gitRoot: string;
   readonly storeRoot: string;
+  /**
+   * What the store keeps each payload as. Absent only from a controller of a build that
+   * predates the field.
+   */
+  readonly substrate?: StoreSubstrate;
 };
 
 /**
@@ -3028,7 +3055,10 @@ export type ResizeRequest = {
 };
 
 /**
- * What `cowshed resize` changed, with both capacities as the image itself reports them.
+ * What `cowshed resize` changed, with both capacities as the volume itself reports them: an
+ * APFS image's size, or a ZFS dataset's `refquota`. A plain-directory store has no capacity and
+ * refuses the verb ([`SubstrateOperation::ResizeWorkspace`],
+ * [`SubstrateOperation::ResizeBuildVolume`]).
  */
 export type ResizeResult = {
   readonly workspace: WorkspaceName;
@@ -3038,7 +3068,7 @@ export type ResizeResult = {
 };
 
 /**
- * Which of a workspace's volumes `cowshed resize` grows: its image, or its build volume and the
+ * Which of a workspace's volumes `cowshed resize` grows: its own, or its build volume and the
  * workspace's seed with it (16_build_volumes.md, "Substrate").
  */
 export type ResizeVolume = 'workspace' | 'build';
@@ -3359,6 +3389,12 @@ export type StorageIoTotals = {
 };
 
 /**
+ * What a store keeps each workspace and build volume as (09_substrates.md). One store has one
+ * substrate, chosen when `cowshed setup` made it.
+ */
+export type StoreSubstrate = 'apfs' | 'zfs' | 'directory';
+
+/**
  * Bytes of one output stream the supervisor admitted: also the stream's next read cursor.
  */
 export type StreamBytes = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
@@ -3377,6 +3413,35 @@ export type StreamInfoRef = {
  * no `\n` ended.
  */
 export type StreamLines = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * A physical-volume operation some substrate does not have. A verb that needs one on a store
+ * without it is refused before anything is changed, as `unsupported` on the error
+ * ([`crate::error::SubstrateRefusal`]).
+ */
+export type SubstrateOperation =
+  | 'resizeWorkspace'
+  | 'resizeBuildVolume'
+  | 'defragmentWorkspace'
+  | 'defragmentBuildVolume'
+  | 'reAdopt'
+  | 'compactSeed'
+  | 'extentBudget'
+  | 'volumeLabel'
+  | 'readOnlyMount';
+
+/**
+ * Why a verb refused on this store (09_substrates.md): it needs a physical-volume operation
+ * the store's substrate does not have. Always a `Usage` refusal decided before anything was
+ * stopped or changed, so a caller branches on the two values and never on the message.
+ *
+ * Unknown fields are ignored and a substrate or operation a later build added decodes as no
+ * refusal (`CowshedError::substrate_source` answers `None`), like [`RemovalRefusal`].
+ */
+export type SubstrateRefusal = {
+  readonly substrate: StoreSubstrate;
+  readonly operation: SubstrateOperation;
+};
 
 /**
  * The workspace supervisors that served before the daemon started and that it has not finished

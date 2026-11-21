@@ -22,7 +22,6 @@ pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
-#[cfg(target_os = "macos")]
 pub(crate) mod store_inventory;
 pub mod trace_columns;
 pub mod trace_segment;
@@ -96,9 +95,7 @@ impl StorageLayout {
     /// and marks the owner directory as one (`bootstrap::OWNER_MARKER_FILE`), so store discovery
     /// reads it.
     ///
-    /// Path derivation remains side-effect free; only the macOS adopt path calls this in production.
-    /// Test builds retain the platform-neutral filesystem boundary checks on every host.
-    #[cfg(any(target_os = "macos", test))]
+    /// Path derivation remains side-effect free; only the adopt path calls this in production.
     pub(crate) fn provision_project(&self) -> Result<(), StorageLayoutError> {
         verify_no_symlinks(&self.project.store_root, &self.project.project_root)?;
         fs::create_dir_all(&self.project.project_root).map_err(|source| {

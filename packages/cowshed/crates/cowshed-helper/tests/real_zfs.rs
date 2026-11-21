@@ -201,6 +201,14 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
         &["create", &format!("{}/unowned/cowshed/x", fixture.tree)],
         "cowshed:owner",
     );
+    // `check` proves the same two things and changes nothing: root, and a root naming the caller.
+    fixture.run(&["check"]);
+    fixture.refused(
+        &format!("{}/unowned/cowshed", fixture.tree),
+        &["check"],
+        "cowshed:owner",
+    );
+    fixture.refused(&fixture.root, &["check", &raven], "usage:");
     fixture.refused(
         &fixture.root,
         &["destroy", &format!("{}/unowned", fixture.tree)],

@@ -3,13 +3,18 @@
 //! runs under a narrowed child profile without ambient root-wide data reads. Gitdir,
 //! common-dir and config/include indirection cannot widen the controller's discovery reads.
 //! The final fetch still runs under the normal child boundary: routing is not a grant.
+//!
+//! Discovery is one probe on every platform ([`probe_git`]): the workspace's own sandbox at the
+//! Git-discovery tier, launched as every sandboxed command is. A platform supplies only the Git
+//! it starts and the `PATH` it hands it ([`crate::git::sandboxed_git`]).
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CowshedError, Result};
 use crate::repository::RepositoryBinding;
-use crate::sandbox::SandboxConfig;
+use crate::sandbox::{SandboxConfig, SandboxProfileRole, SeatbeltProfile};
 
 pub const WORKSPACE_GIT_FETCH_CONFIG_PATH: &str = ".cowshed/git-fetch.inc";
 
@@ -201,85 +206,9 @@ fn publish_git_fetch_config(mount: &Path, mappings: &[GitFetchMapping]) -> Resul
     Ok(Some(path))
 }
 
-/// This probe, including every config Git might consult, is *already sandboxed*. No shell,
-/// PATH lookup, user HOME, inherited Git variables, network operation, or credential copying.
-/// Parsing only directory names also means a remote in an included config is never identity.
-#[cfg(target_os = "macos")]
-async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
-    use cowshed_os::fork_lock::Spawn as _;
-
-    let profile =
-        crate::sandbox::seatbelt_profile(sandbox, crate::sandbox::SandboxProfileRole::GitDiscovery)
-            .map_err(|error| failure(error.to_string()))?;
-    let profile = crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile)
-        .map_err(|error| {
-            failure(format!(
-                "cannot write the Git probe's sandbox profile into {}: {error}",
-                sandbox.profile_directory().display()
-            ))
-        })?;
-    let mut command = tokio::process::Command::new(crate::exec::SANDBOX_EXEC);
-    // The system selector names the active developer tools without consulting PATH.
-    // /usr/bin/git is an xcrun shim that writes host caches even for read-only probes.
-    command
-        .args(profile.args())
-        .arg(format!("{}/usr/bin/git", crate::sandbox::GIT_DEVELOPER_DIR))
-        .arg("-C")
-        .arg(root)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-        ])
-        .args(args)
-        .current_dir(&sandbox.workspace_mount)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("HOME", sandbox.workspace_mount.join(".cowshed/home"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    crate::exec::prepare_child_descriptors(command.as_std_mut())
-        .map_err(|error| failure(error.source.to_string()))?;
-    let mut child = command
-        .spawn_locked()
-        .map_err(|error| failure(format!("cannot inspect local Git object store: {error}")))?;
-    let (stdout, stderr, status) = collect_probe_output(&mut child).await.map_err(|error| {
-        failure(format!(
-            "cannot inspect local Git object store {}: {error}",
-            root.display()
-        ))
-    })?;
-    if !status.success() || !stderr.is_empty() {
-        return Err(failure(format!(
-            "cannot inspect local Git object store {}: {status}: {}",
-            root.display(),
-            String::from_utf8_lossy(&stderr)
-        )));
-    }
-    Ok(stdout)
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
-    let _ = (root, args, sandbox);
-    Err(CowshedError::environment_missing(
-        "local Git discovery requires the native macOS sandbox runtime",
-        "run the native cowshed controller on macOS",
-    ))
-}
-
-#[cfg(any(target_os = "macos", test))]
+/// The most either pipe of a Git probe may carry.
 const MAX_PROBE_PIPE_BYTES: u64 = 64 * 1024;
 
-#[cfg(any(target_os = "macos", test))]
 async fn read_probe_pipe(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
@@ -298,7 +227,6 @@ async fn read_probe_pipe(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::
 
 /// Both pipes are drained concurrently. A limit/error/deadline drops the other read,
 /// kills the child, and reaps it before returning; partial output is never accepted.
-#[cfg(any(target_os = "macos", test))]
 async fn collect_probe_output(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
@@ -350,6 +278,124 @@ async fn collect_probe_output(
             }
         }
     }
+}
+
+/// The profile the probe launches under: the workspace's own sandbox at the Git-discovery tier,
+/// in the form this platform's launcher enforces. It reads programs and libraries, the
+/// workspace and its grants, and nothing else of the host: not the operator's HOME, and not a
+/// path a checkout's configuration names outside those grants.
+fn probe_profile(sandbox: &SandboxConfig) -> Result<SeatbeltProfile> {
+    crate::sandbox::seatbelt_profile(sandbox, SandboxProfileRole::GitDiscovery)
+        .map_err(|error| failure(error.to_string()))
+}
+
+/// The probe's command behind the launcher's own arguments: `git` in `root`, hooks and the
+/// filesystem monitor off whatever the checkout's configuration selects, then `args`.
+fn probe_command(git: &Path, root: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut command = vec![
+        git.as_os_str().to_owned(),
+        OsString::from("-C"),
+        root.as_os_str().to_owned(),
+    ];
+    command.extend(
+        [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]
+        .into_iter()
+        .chain(args.iter().copied())
+        .map(OsString::from),
+    );
+    command
+}
+
+/// Everything the probe's environment holds; it inherits nothing. `HOME` is the workspace's
+/// own, never the operator's. Git reads no system, global or injected configuration and
+/// prompts for nothing. `search_path` is the platform's ([`crate::git::SandboxedGit`]), and
+/// without one the probe has no `PATH`.
+fn probe_environment(
+    workspace_mount: &Path,
+    search_path: Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    search_path
+        .map(|path| ("PATH", path))
+        .into_iter()
+        .chain([
+            (
+                "HOME",
+                workspace_mount.join(".cowshed/home").into_os_string(),
+            ),
+            ("GIT_CONFIG_GLOBAL", OsString::from("/dev/null")),
+            ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+            ("GIT_CONFIG_COUNT", OsString::from("0")),
+            ("GIT_TERMINAL_PROMPT", OsString::from("0")),
+        ])
+        .collect()
+}
+
+/// The sandboxed Git probe: the output of `git -C root args`, run where no configuration it
+/// consults can reach beyond the sandbox's grants.
+///
+/// This probe, including every config Git might consult, is *already sandboxed*. No shell,
+/// user HOME, inherited Git variables, network operation, or credential copying.
+/// Parsing only directory names also means a remote in an included config is never identity.
+/// It launches as a job does, through the platform's launcher with a profile file in the store
+/// the sandbox serves ([`crate::exec::ProfileLaunch`]), under [`probe_profile`] rather than the
+/// executed child's.
+async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Result<Vec<u8>> {
+    use cowshed_os::fork_lock::Spawn as _;
+
+    let profile = probe_profile(sandbox)?;
+    let profile = crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile)
+        .map_err(|error| {
+            failure(format!(
+                "cannot write the Git probe's sandbox profile into {}: {error}",
+                sandbox.profile_directory().display()
+            ))
+        })?;
+    let git = crate::git::sandboxed_git();
+    let launcher = crate::sandbox::launcher().map_err(|error| {
+        failure(format!(
+            "cannot inspect local Git object store {}: {error}",
+            root.display()
+        ))
+    })?;
+    let mut command = tokio::process::Command::new(launcher.program());
+    command
+        .args(profile.args(launcher))
+        .args(probe_command(&git.program, root, args))
+        .current_dir(&sandbox.workspace_mount)
+        .env_clear()
+        .envs(probe_environment(&sandbox.workspace_mount, git.search_path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    crate::exec::prepare_child_descriptors(command.as_std_mut())
+        .map_err(|error| failure(error.source.to_string()))?;
+    let mut child = command.spawn_locked().map_err(|error| {
+        failure(format!(
+            "cannot inspect local Git object store {}: cannot start {}: {error}",
+            root.display(),
+            launcher.program().display()
+        ))
+    })?;
+    let (stdout, stderr, status) = collect_probe_output(&mut child).await.map_err(|error| {
+        failure(format!(
+            "cannot inspect local Git object store {}: {error}",
+            root.display()
+        ))
+    })?;
+    if !status.success() || !stderr.is_empty() {
+        return Err(failure(format!(
+            "cannot inspect local Git object store {}: {status}: {}",
+            root.display(),
+            String::from_utf8_lossy(&stderr)
+        )));
+    }
+    Ok(stdout)
 }
 
 /// The object store of the checkout at `root`, when every directory its Git reaches is granted
@@ -773,7 +819,6 @@ mod tests {
     /// whose own store is not there is refused by that store's path, where reading the host
     /// store would have answered from another installation's bindings (04_sandbox.md, "Exec
     /// pipeline" step 4).
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn routes_are_read_from_the_store_the_sandbox_serves() {
         // Under the canonical /tmp parent: a grant inside the cowshed store is refused before any
@@ -835,7 +880,7 @@ mod tests {
             platform: Platform::Macos,
             publication_state: PublicationState::Active,
             updated_at: "2026-11-11T00:00:00Z".to_owned(),
-            grants: GrantSet::closed_baseline(Some(config.port_block)).expect("grants"),
+            grants: GrantSet::closed_baseline(config.port_block).expect("grants"),
             info_snapshot: WorkspaceInfoSnapshot {
                 project_root: checkout.to_owned(),
                 role: WorkspaceRole::Main,
@@ -926,7 +971,6 @@ mod tests {
         );
         assert!(!route.exists(), "the unbound project's route is withdrawn");
     }
-    #[cfg(target_os = "macos")]
     fn sandbox(root: &Path, checkout: &Path) -> SandboxConfig {
         SandboxConfig {
             home: root.join("home"),
@@ -935,7 +979,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: root.join("temp"),
             store_root: root.join("store"),
-            port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
+            port_block: Some(crate::metadata::PortBlock::new(49_136, 16).expect("ports")),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
@@ -955,6 +999,136 @@ mod tests {
             repository_caches: Vec::new(),
             program_directories: Vec::new(),
             capabilities: Default::default(),
+        }
+    }
+
+    /// The probe inherits nothing: its environment is these entries and no other, with the
+    /// workspace's own HOME and no Git configuration from the host, and a platform decides only
+    /// which `PATH`, if any, is among them.
+    #[test]
+    fn the_probe_environment_is_closed_and_a_platform_chooses_only_its_path() {
+        let mount = Path::new("/mnt/acme/widget/workspaces/raven/mount");
+        for (case, search_path) in [
+            (
+                "the system's directories",
+                Some("/usr/bin:/bin:/usr/sbin:/sbin"),
+            ),
+            (
+                "a controller's own PATH",
+                Some("/run/current-system/sw/bin:/usr/local/bin:/usr/bin"),
+            ),
+            ("a controller with no PATH", None),
+        ] {
+            let mut expected: Vec<(&str, OsString)> = search_path
+                .map(|path| ("PATH", OsString::from(path)))
+                .into_iter()
+                .collect();
+            expected.extend([
+                (
+                    "HOME",
+                    OsString::from("/mnt/acme/widget/workspaces/raven/mount/.cowshed/home"),
+                ),
+                ("GIT_CONFIG_GLOBAL", OsString::from("/dev/null")),
+                ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+                ("GIT_CONFIG_COUNT", OsString::from("0")),
+                ("GIT_TERMINAL_PROMPT", OsString::from("0")),
+            ]);
+            assert_eq!(
+                probe_environment(mount, search_path.map(OsString::from)),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// The probe's command is the platform's Git in the checkout with hooks and the filesystem
+    /// monitor off before anything the caller asks, whether Git is a path or a name.
+    #[test]
+    fn the_probe_command_switches_hooks_and_fsmonitor_off_before_its_arguments() {
+        for git in ["git", "/var/select/developer_dir/usr/bin/git"] {
+            assert_eq!(
+                probe_command(
+                    Path::new(git),
+                    Path::new("/src/widget"),
+                    &["count-objects", "-v"]
+                ),
+                [
+                    git,
+                    "-C",
+                    "/src/widget",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "count-objects",
+                    "-v",
+                ]
+                .map(OsString::from),
+                "{git}"
+            );
+        }
+    }
+
+    /// The probe launches under the workspace's own sandbox at the Git-discovery tier, as this
+    /// platform's launcher enforces it: it reads the granted checkout and the workspace, and
+    /// neither the host at large nor the operator's HOME, so a configuration that includes a
+    /// file outside the grants fails the probe rather than being read with the controller's
+    /// authority.
+    #[test]
+    fn the_probe_profile_reads_the_grants_and_not_the_host() {
+        let root = Path::new("/fixture");
+        let config = sandbox(root, &root.join("checkout"));
+        let profile = probe_profile(&config).expect("a discovery profile");
+        assert_eq!(profile.build_volume(), None);
+        #[cfg(target_os = "linux")]
+        {
+            let profile: serde_json::Value =
+                serde_json::from_str(profile.text()).expect("the launcher's profile is JSON");
+            let access = |path: &str| -> Vec<String> {
+                profile["rules"]
+                    .as_array()
+                    .expect("rules")
+                    .iter()
+                    .filter(|rule| rule["path"] == path)
+                    .map(|rule| {
+                        assert_eq!(rule["scope"], "subtree", "{rule}");
+                        rule["access"].as_str().expect("access").to_owned()
+                    })
+                    .collect()
+            };
+            assert_eq!(access("/fixture/checkout"), ["read"]);
+            assert_eq!(access("/fixture/mounts/workspace"), ["read-write"]);
+            assert_eq!(access("/fixture/temp"), ["read-write"]);
+            assert_eq!(access("/usr"), ["read"]);
+            // Landlock admits by rule alone: none of these has one, and neither has anything
+            // beside the checkout (`/fixture/secret`, an include outside the grants).
+            for closed in [
+                "/",
+                "/etc",
+                "/proc",
+                "/sys",
+                "/tmp",
+                "/fixture",
+                "/fixture/home",
+                "/fixture/store",
+                "/fixture/mounts",
+            ] {
+                assert!(access(closed).is_empty(), "{closed}");
+            }
+            // It may start what it reads (Git's own helpers); no pool directory, no connector.
+            assert_eq!(profile["exec"], "follows-read");
+            assert_eq!(profile["gateway"], serde_json::Value::Null);
+            assert_eq!(profile["masks"], serde_json::json!(["/fixture/store/run"]));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let text = profile.text();
+            assert!(text.contains("(allow file-read* (subpath \"/fixture/checkout\"))"));
+            assert!(text.contains("(allow file-read* (literal \"/dev/null\"))"));
+            // Never the broad read every other tier starts from, so nothing beside the checkout
+            // (`/fixture/secret`, an include outside the grants) is readable.
+            assert!(!text.contains("(allow file-read-data (subpath \"/\"))"));
+            assert!(!text.contains("/fixture/secret"));
         }
     }
 

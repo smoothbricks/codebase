@@ -1,5 +1,6 @@
-//! A rendered Seatbelt profile as the file `sandbox-exec -f` reads, and the parameters a launch
-//! binds with `-D` (07_api.md, `SandboxSpec::wrap`; 04_sandbox.md, "Exec pipeline" step 4).
+//! A rendered sandbox profile as the file the launcher reads (`sandbox-exec -f` on macOS, the
+//! process's own launcher on Linux), and the parameters a launch binds with `-D` (07_api.md,
+//! `SandboxSpec::wrap`; 04_sandbox.md, "Exec pipeline" step 4).
 //!
 //! A profile on the command line (`sandbox-exec -p <profile>`) is one argv element of the
 //! launched process. Profiles grow with grants past the 128 KiB a command argument may hold
@@ -28,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::api::dto::Sha256Digest;
-use crate::sandbox::{BUILD_VOLUME_PARAM, SeatbeltProfile};
+use crate::sandbox::{Launcher, SeatbeltProfile};
 
 /// Where the profile files of `store_root`'s launches live: beside its supervisors' sockets in
 /// its `run` directory.
@@ -188,7 +189,7 @@ fn oldest_live_supervisor(run: &Path) -> io::Result<Option<SystemTime>> {
     Ok(oldest)
 }
 
-/// How `sandbox-exec` is told a profile: its file and the parameters its rules name.
+/// How the launcher is told a profile: its file and the parameters its rules name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileLaunch {
     file: ProfileFile,
@@ -218,22 +219,11 @@ impl ProfileLaunch {
         &self.file
     }
 
-    /// `sandbox-exec`'s arguments before the command: each parameter's `-D NAME=value`, then
-    /// `-f <file> --`. The profile travels in its file, never as an argument.
-    pub fn args(&self) -> Vec<OsString> {
-        let mut args = Vec::with_capacity(5);
-        if let Some(volume) = &self.build_volume {
-            let mut binding = OsString::from(BUILD_VOLUME_PARAM);
-            binding.push("=");
-            binding.push(volume);
-            args.extend([OsString::from("-D"), binding]);
-        }
-        args.extend([
-            OsString::from("-f"),
-            self.file.path.clone().into_os_string(),
-            OsString::from("--"),
-        ]);
-        args
+    /// `launcher`'s arguments before the command ([`Launcher::launch_arguments`]): what makes
+    /// it a launcher, each parameter's `-D NAME=value`, then `-f <file> --`. The profile travels
+    /// in its file, never as an argument.
+    pub fn args(&self, launcher: &Launcher) -> Vec<OsString> {
+        launcher.launch_arguments(&self.file.path, self.build_volume.as_deref())
     }
 
     /// What tells one launch's sandbox from another's: the profile and every binding.
@@ -403,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_binds_the_build_volume_before_its_file() {
+    fn a_pivot_is_another_launch_of_the_same_file() {
         let file = ProfileFile {
             path: PathBuf::from("/private/cowshed/store/run/profiles/a.sb"),
         };
@@ -412,23 +402,16 @@ mod tests {
             build_volume: volume.map(PathBuf::from),
         };
         assert_eq!(
-            launch(None).args(),
-            ["-f", "/private/cowshed/store/run/profiles/a.sb", "--"]
-        );
-        assert_eq!(
-            launch(Some("/m/.build/o/r/0123")).args(),
-            [
-                "-D",
-                "BUILD_VOLUME=/m/.build/o/r/0123",
-                "-f",
-                "/private/cowshed/store/run/profiles/a.sb",
-                "--"
-            ]
+            launch(Some("/m/.build/o/r/0123")).file(),
+            launch(Some("/m/.build/o/r/4567")).file()
         );
         assert_ne!(
             launch(Some("/m/.build/o/r/0123")).identity(),
             launch(Some("/m/.build/o/r/4567")).identity(),
-            "a pivot is another launch of the same file"
+        );
+        assert_ne!(
+            launch(Some("/m/.build/o/r/0123")).identity(),
+            launch(None).identity()
         );
     }
 }

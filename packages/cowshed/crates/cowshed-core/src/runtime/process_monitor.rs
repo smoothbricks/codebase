@@ -1,20 +1,22 @@
 //! One job's native observation writer (07_api.md, "Process-tree observations").
 //!
-//! The writer alone owns the kqueue, retained fold and event journal. Readers load one immutable
-//! snapshot; a demand stream reads the retained journal without resampling or moving a CPU window.
-//! A user event wakes the writer for control requests, never another reader of process events.
-//! A sealed job drops its monitor: the writer, its thread, kqueue, fold and journal end with the
-//! last clone, after any subscriber still attached has read to the end.
+//! The writer alone owns the event source, retained fold and event journal. Readers load one
+//! immutable snapshot; a demand stream reads the retained journal without resampling or moving a
+//! CPU window. A wake of the platform's own kind (`macos.rs`: a user event on the observer's
+//! kqueue; `linux.rs`: the eventfd in its epoll set) brings the writer to its control requests,
+//! never another reader of process events. A sealed job drops its monitor: the writer, its
+//! thread, event source, fold and journal end with the last clone, after any subscriber still
+//! attached has read to the end.
 //!
 //! The writer is also the job's sole retirement authority (11_shell.md, "Complete-group
 //! termination"). Whole-job membership includes the held group; a subtree uses only immutable
-//! ancestry in the retained fold. Both signal exact lives and join their kernel NOTE_EXIT.
+//! ancestry in the retained fold. Both signal exact lives and join their kernel exit event.
 //! Issued subtree capabilities bind a job, retained index and unguessable per-root nonce; exec,
 //! exit and reparenting never move that capability to another life. No other registry takes part.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -39,8 +41,16 @@ use crate::api::process::{
 use crate::api::resources::{CpuTotals, ResourceUnitError};
 use crate::error::{CowshedError, Result};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 const DEFAULT_SAMPLE: Duration = Duration::from_secs(1);
-const CONTROL_EVENT: usize = usize::MAX;
 /// The least time SIGKILLed lives get to report their exits, whatever the TERM grace: the
 /// bound `job_groups`' recovery gives its own KILL rounds.
 const KILL_JOIN: Duration = Duration::from_secs(1);
@@ -178,7 +188,7 @@ struct Snapshot {
 
 struct Driver {
     job_id: TreeOwner,
-    wake: OwnedFd,
+    wake: platform::Wake,
     requests: mpsc::Sender<Request>,
     snapshot: Arc<ArcSwap<Snapshot>>,
     /// Retirement attempts the writer completed; only the writer advances it.
@@ -191,7 +201,7 @@ impl Driver {
         self.requests
             .send(request)
             .map_err(|_| unavailable(self.job_id))?;
-        control(self.wake.as_raw_fd(), 0, libc::NOTE_TRIGGER).map_err(|error| {
+        self.wake.raise().map_err(|error| {
             CowshedError::internal(format!(
                 "cannot wake {}'s process observer: {error}",
                 self.job_id
@@ -253,16 +263,7 @@ impl ProcessMonitor {
         reads: P,
     ) -> Result<Self> {
         let observer = KqueueObserver::prepare_with(reads).map_err(observation_error)?;
-        control(observer.as_raw_fd(), libc::EV_ADD | libc::EV_CLEAR, 0).map_err(|error| {
-            CowshedError::internal(format!(
-                "cannot prepare the process observer's control event: {error}"
-            ))
-        })?;
-        let wake = observer.wake_handle().map_err(|error| {
-            CowshedError::internal(format!(
-                "cannot retain the process observer's wake descriptor: {error}"
-            ))
-        })?;
+        let wake = platform::Wake::prepare(&observer)?;
         let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot {
             tree: match job_id {
                 TreeOwner::Job(_) => SnapshotTree::Job(Err(CowshedError::conflict(
@@ -414,8 +415,9 @@ impl ProcessMonitor {
     /// sent SIGTERM; after `grace` the survivors are sent SIGSTOP and their children listed while
     /// they are stopped, then every owned life is sent SIGKILL. It answers only once the fold
     /// holds every owned life's kernel exit and the group read under the proof is empty. A
-    /// stop's delivery proves no quiescence: a fork after it is the forking life's own
-    /// `NOTE_FORK`, and its child is owned and killed like the others.
+    /// stop's delivery proves no quiescence: a fork after it is reported of the forking life, by
+    /// its event or at the next custody step's look, and its child is owned and killed like the
+    /// others.
     ///
     /// The proof is [`JobContainment::Observed`]: its `lost` are the adoptions the observer saw
     /// it miss, empty when it saw none, which is no completeness claim. `outlived` names each life
@@ -823,6 +825,13 @@ impl<P: ProcessReads> Writer<P> {
                         if let Err(error) = self.observer.clock(origin) {
                             self.publish(Err(observation_error(error)));
                         }
+                        // The clock starts once the job's first process has spawned, so the
+                        // held root has exec'd: a source that reports an exec only when asked
+                        // is asked here, not a sampling tick later.
+                        let surveyed = self.observer.survey();
+                        if surveyed.is_err() || self.observer.has_events() {
+                            let _ = self.publish_drained(surveyed);
+                        }
                     }
                     Request::Finish { reply } => {
                         self.finished = true;
@@ -912,11 +921,11 @@ impl<P: ProcessReads> Writer<P> {
             }
             if !self.ended && Instant::now() >= self.next_sample {
                 if self.observer.watching() {
-                    let result = self
-                        .observer
-                        .sample(Instant::now())
-                        .map_err(observation_error);
-                    self.publish(result);
+                    // The tick is also where the source is asked for what it reports only when
+                    // asked; a read it failed that the fold holds as a gap leaves the tree
+                    // readable.
+                    let sampled = self.observer.sample(Instant::now());
+                    let _ = self.publish_drained(sampled);
                 }
                 let every = self
                     .subscribers
@@ -942,7 +951,7 @@ impl<P: ProcessReads> Writer<P> {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: one writable poll descriptor; its kqueue is owned for this whole call.
+            // SAFETY: one writable poll descriptor; its event source is owned for this whole call.
             if unsafe { libc::poll(&raw mut descriptor, 1, timeout) } < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
@@ -1302,23 +1311,6 @@ fn refused(job_id: TreeOwner, error: ObserveError) -> CowshedError {
     )
 }
 
-fn control(queue: i32, flags: u16, fflags: u32) -> io::Result<()> {
-    let change = libc::kevent {
-        ident: CONTROL_EVENT,
-        filter: libc::EVFILT_USER,
-        flags,
-        fflags,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: one readable change, no returned events; the queue is owned by this caller.
-    if unsafe { libc::kevent(queue, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,7 +1321,7 @@ mod tests {
     #[test]
     fn a_spare_activation_root_is_watched_and_retired_without_a_job() {
         let monitor = ProcessMonitor::prepare(TreeOwner::Spare).unwrap();
-        let mut command = std::process::Command::new("/bin/cat");
+        let mut command = std::process::Command::new("cat");
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null());
@@ -1362,7 +1354,6 @@ mod tests {
         assert!(!child.wait_bounded().unwrap().success());
         assert!(monitor.running_lives().is_empty());
     }
-    use crate::api::process::ProcessCoverage;
     use crate::runtime::process_spans::read_process_segment;
     use crate::runtime::process_tree::BirthToken;
     use crate::temp_root::TempRoot;
@@ -1459,7 +1450,7 @@ if sibling == 0:
         for _ in range(64):
             child = os.fork()
             if child == 0:
-                os.execv("/usr/bin/true", ["true"])
+                os.execvp("true", ["true"])
             _, status = os.waitpid(child, 0)
             if status != 0:
                 os._exit(2)
@@ -1481,7 +1472,7 @@ for line in sys.stdin:
                 ProcessMonitor::prepare(TreeOwner::Job(JobId::new(401).unwrap())).unwrap();
             let (ready_read, ready_write) = std::io::pipe().unwrap();
             let (gate_read, mut gate_write) = std::io::pipe().unwrap();
-            let mut command = Command::new("/bin/bash");
+            let mut command = Command::new("bash");
             command
                 .args(["-c", "exec python3 -c \"$1\"", "subtree-fixture", script])
                 .env("COWSHED_TEST_SUBTREE_CHURN", if churn { "1" } else { "0" })
@@ -1880,7 +1871,7 @@ os._exit(0)
         let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         let (ready_read, ready_write) = std::io::pipe().unwrap();
         let (gate_read, mut gate_write) = std::io::pipe().unwrap();
-        let mut command = Command::new("/bin/bash");
+        let mut command = Command::new("bash");
         command
             .args([
                 "-c",
@@ -2086,7 +2077,7 @@ os._exit(0)
         use cowshed_os::fork_lock::Spawn as _;
 
         let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
-        let mut child = std::process::Command::new("/bin/cat")
+        let mut child = std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .expect("spawn the observed life");
@@ -2119,9 +2110,9 @@ os._exit(0)
     async fn finishing_a_live_observation_neither_invents_loss_nor_ends_its_reader() {
         let monitor = ProcessMonitor::prepare(TreeOwner::Job(JobId::new(1).unwrap())).unwrap();
         monitor.watch(std::process::id()).unwrap();
-        assert_eq!(monitor.tree().unwrap().coverage, ProcessCoverage::Complete);
+        let coverage = monitor.tree().unwrap().coverage;
         monitor.finish().unwrap();
-        assert_eq!(monitor.tree().unwrap().coverage, ProcessCoverage::Complete);
+        assert_eq!(monitor.tree().unwrap().coverage, coverage);
         let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
         assert!(
             matches!(events.next().await, Some(Ok(JobProcessEvent::Born { process, .. })) if process.pid == std::process::id())
@@ -2165,157 +2156,5 @@ os._exit(0)
             "{window:?} is on a clock that started at the origin it was told"
         );
         monitor.finish().unwrap();
-    }
-
-    /// Darwin's reads, except that the kernel refuses the read a flag names once it is set, as a
-    /// loaded host answers: an image read with `EINVAL`, what `KERN_PROCARGS2` says of a process
-    /// caught between two images, and a child list with `ESRCH`, a parent that vanished under the
-    /// read.
-    #[derive(Clone, Default)]
-    struct KernelRefuses {
-        images: Arc<std::sync::atomic::AtomicBool>,
-        children: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl ProcessReads for KernelRefuses {
-        fn record(
-            &self,
-            pid: u32,
-        ) -> io::Result<Option<crate::runtime::job_groups::ProcessRecord>> {
-            Darwin.record(pid)
-        }
-
-        fn image(&self, pid: u32) -> io::Result<crate::runtime::process_tree::ProcessImage> {
-            if self.images.load(Ordering::SeqCst) {
-                Err(io::Error::from_raw_os_error(libc::EINVAL))
-            } else {
-                Darwin.image(pid)
-            }
-        }
-
-        fn children(&self, pid: u32) -> io::Result<Vec<u32>> {
-            if self.children.load(Ordering::SeqCst) {
-                Err(io::Error::from_raw_os_error(libc::ESRCH))
-            } else {
-                Darwin.children(pid)
-            }
-        }
-
-        fn reader_uid(&self) -> u32 {
-            Darwin.reader_uid()
-        }
-
-        fn usage(
-            &self,
-            process: ProcessIdentity,
-            start: Option<crate::runtime::process_usage::StartStamp>,
-            at: Instant,
-        ) -> std::result::Result<
-            crate::runtime::process_usage::Sampled,
-            crate::runtime::process_usage::SampleError,
-        > {
-            Darwin.usage(process, start, at)
-        }
-
-        fn group(
-            &self,
-            leader: &Birth,
-        ) -> io::Result<Vec<crate::runtime::job_groups::ProcessRecord>> {
-            Darwin.group(leader)
-        }
-
-        fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
-            Darwin.signal(process, signal)
-        }
-    }
-
-    /// Run `script` as the observed job's only life, let the kernel refuse as `refuse` says once
-    /// the life runs, release the script, and answer the first failure the event stream reports,
-    /// the status read that follows it, and the life's pid. The script starts by reading a line
-    /// and ends when its stdin does.
-    async fn status_after_the_first_failure(
-        script: &str,
-        refuse: impl FnOnce(&KernelRefuses),
-    ) -> (CowshedError, Result<JobProcessTree>, u32) {
-        use cowshed_os::fork_lock::Spawn as _;
-        use std::io::Write as _;
-
-        let kernel = KernelRefuses::default();
-        let monitor =
-            ProcessMonitor::prepare_with(TreeOwner::Job(JobId::new(1).unwrap()), kernel.clone())
-                .unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", script])
-            .stdin(std::process::Stdio::piped())
-            .spawn_locked()
-            .expect("spawn the observed life");
-        let pid = child.id();
-        monitor.watch(pid).unwrap();
-        let mut events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
-
-        refuse(&kernel);
-        let mut input = child.stdin.take().expect("the child's stdin is piped");
-        input.write_all(b"go\n").unwrap();
-        let failure = loop {
-            match events.next().await {
-                Some(Err(error)) => break error,
-                Some(Ok(_)) => {}
-                None => panic!("the events ended before the failed read was reported"),
-            }
-        };
-        let status = monitor.tree();
-        drop(input);
-        assert!(child.wait_bounded().unwrap().success());
-        (failure, status, pid)
-    }
-
-    /// An exec whose image the kernel will not read is a coverage gap of the tree, and the failed
-    /// read is returned beside it to whoever follows the events (07_api.md, "Process-tree
-    /// observations"). It is no reason for a running job's status read to fail: the observer
-    /// folded everything it saw and stays usable.
-    #[tokio::test]
-    async fn an_unreadable_image_is_a_gap_a_running_jobs_status_read_still_returns() {
-        let (failure, status, pid) =
-            status_after_the_first_failure("read go; exec /bin/cat", |kernel| {
-                kernel.images.store(true, Ordering::SeqCst);
-            })
-            .await;
-        assert!(failure.to_string().contains("KERN_PROCARGS2"), "{failure}");
-
-        let tree = status.expect(
-            "a running job's status read returns its status when an image could not be read",
-        );
-        assert_eq!(
-            tree.coverage,
-            ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::UnreadImage { pid }
-            }
-        );
-    }
-
-    /// A member's fork whose children the kernel will not list is the fork's gap, which the
-    /// observer records before it reads the list; the failed read is returned beside it, and a
-    /// running job's status read still returns the tree.
-    #[tokio::test]
-    async fn an_unlistable_child_list_is_a_gap_a_running_jobs_status_read_still_returns() {
-        let (failure, status, pid) =
-            status_after_the_first_failure("read go; /usr/bin/true; read rest; exit 0", |kernel| {
-                kernel.children.store(true, Ordering::SeqCst);
-            })
-            .await;
-        assert!(
-            failure.to_string().contains("proc_listchildpids"),
-            "{failure}"
-        );
-
-        let tree = status.expect(
-            "a running job's status read returns its status when a child list could not be read",
-        );
-        assert_eq!(
-            tree.coverage,
-            ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::UncountedFork { pid }
-            }
-        );
     }
 }

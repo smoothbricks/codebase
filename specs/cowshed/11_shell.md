@@ -29,7 +29,10 @@ by unlinking and creating it, is not the host, and removing the path takes nothi
 not its bytes; a publisher that rewrote the same file in place would change what a later staging copies, and the staged
 name with it. Copies read the file by clone or by positioned reads, never its shared offset, so concurrent stagings each
 copy all of it. A workspace with no `.envrc` above the command's cwd gets hosts that skip activation and hold the
-sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those hosts. A devenv project
+sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those hosts. Such a job's PATH is
+the initial sandbox PATH: cowshed's own directories, then the host's system PATH as the platform's service manager gives
+it to the daemon — launchd's default on macOS, the user manager's without the setuid wrappers on Linux (04_sandbox.md,
+"devenv / Nix inside the sandbox") — and an activation's PATH is built in front of the same one. A devenv project
 activates through `use devenv` in its own `.envrc`. A caller without an exec host can activate read-write argv commands
 in a one-shot executed child (`direnv allow` then `direnv exec`); controller-owned work after supervisor retirement uses
 this path, including land's Nx socket cleanup (04_sandbox.md, lifecycle signal authority). It is never a read-only

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow_array::RecordBatch;
 use uuid::Uuid;
 
+use super::platform::own_io;
 use crate::runtime::job_spans::SEAL_INTERVAL;
 use crate::storage::apfs::extents;
 use crate::storage::trace_columns::{I64, Optional, Required, U32, U64, Utf8, trace_columns};
@@ -172,17 +173,6 @@ impl Observation {
 
 fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).expect("an operation fits in u64 microseconds")
-}
-
-fn own_io() -> Result<u64, String> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::runtime::process_usage::own_process_write_bytes().map_err(|error| error.to_string())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("APFS process-window I/O requires macOS proc_pid_rusage".into())
-    }
 }
 
 /// One lazily started writer per native host, not one seal per observation. Last-owner

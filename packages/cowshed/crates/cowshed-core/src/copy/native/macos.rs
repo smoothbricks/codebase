@@ -7,10 +7,10 @@
 //! one `clonefileat(2)` on the two paths, which opens no descriptor.
 
 use super::LeafMaterialization;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
@@ -130,7 +130,7 @@ fn copy_regular(input: &File, output: &File) -> io::Result<()> {
         COPYFILE_ALL
     };
     fcopyfile(input, output, flags)
-        .map_err(|error| super::metadata_error(output, "copy data and metadata", None, error))
+        .map_err(|error| metadata_error(output, "copy data and metadata", None, error))
 }
 
 fn copy_symlink_from(input: &File, source: &Path, destination: &Path) -> io::Result<()> {
@@ -145,6 +145,46 @@ pub fn directory_metadata(source: &Path, destination: &Path) -> io::Result<()> {
         &open_object(source)?,
         &open_object(destination)?,
         libc::COPYFILE_METADATA,
+    )
+}
+
+/// Keep this descriptor's transfers out of the page cache. A copy or a verification passes each
+/// byte through once, so caching it only evicts what the rest of the host is using: a 300 GB
+/// recovery image copied through the cache left 56 GiB in it and swapped the host. macOS
+/// `F_NOCACHE` is a per-descriptor policy that later reads and writes on it follow.
+pub(crate) fn bypass_cache(file: &File) -> io::Result<()> {
+    // SAFETY: `F_NOCACHE` takes an int flag and only changes the descriptor's caching policy.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Retain the native cause and descriptor context.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation} on descriptor {descriptor}, attribute {attribute:?}: {source}")]
+struct MetadataError {
+    operation: &'static str,
+    descriptor: RawFd,
+    attribute: Option<CString>,
+    #[source]
+    source: io::Error,
+}
+
+fn metadata_error(
+    file: &File,
+    operation: &'static str,
+    attribute: Option<&CStr>,
+    source: io::Error,
+) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        MetadataError {
+            operation,
+            descriptor: file.as_raw_fd(),
+            attribute: attribute.map(CStr::to_owned),
+            source,
+        },
     )
 }
 

@@ -30,6 +30,20 @@ use tokio::time::Sleep;
 
 use crate::process::{ExitWatch, RunState};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+// Where a run bounded by its progress reads its members (`run_by_progress`): a process group of
+// the child's own on every platform (`Members::OwnGroup`), and whatever else the platform has
+// (Linux: a cgroup v2 leaf).
+pub use platform::Members;
+
 /// One request and its one answer from a running cowshed daemon over a local socket.
 pub const CONTROL: Bound = Bound::new(LatencyClass::Control, Duration::from_secs(5));
 /// Connecting to a daemon that should already be running, and its hello.
@@ -917,138 +931,7 @@ pub fn output_within(
     })
 }
 
-/// Where a run's members are read ([`run_by_progress`]): who belongs to it, the CPU they have
-/// used, and whom a silent run's SIGTERM reaches. Each is authoritative for every member, whatever
-/// parent it was reparented to (05_gateway.md "Deadlines").
-#[derive(Clone, Copy, Debug)]
-pub enum Members<'a> {
-    /// The child leads a process group of its own, which Darwin lists (`proc_listpgrppids`).
-    #[cfg(target_os = "macos")]
-    OwnGroup,
-    /// A cgroup v2 leaf of this run alone, `path` opened as `cgroup`, which the child enters
-    /// before it executes: the leaf an after-land job makes for each command.
-    #[cfg(target_os = "linux")]
-    Leaf {
-        cgroup: std::os::fd::BorrowedFd<'a>,
-        path: &'a std::path::Path,
-    },
-    /// No source borrows on this platform: the lifetime's uninhabited carrier.
-    #[doc(hidden)]
-    #[cfg(not(target_os = "linux"))]
-    Unborrowed(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
-}
-
-impl Members<'_> {
-    /// The leaf a run's child enters, for an error to name.
-    fn leaf(self) -> Option<std::path::PathBuf> {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::OwnGroup => None,
-            #[cfg(target_os = "linux")]
-            Self::Leaf { path, .. } => Some(path.to_path_buf()),
-            #[cfg(not(target_os = "linux"))]
-            Self::Unborrowed(never, _) => match never {},
-        }
-    }
-
-    /// Make `command`'s child a member before it executes anything.
-    fn admit(self, command: &mut std::process::Command) -> io::Result<()> {
-        use std::os::unix::process::CommandExt as _;
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::OwnGroup => {
-                command.process_group(0);
-                Ok(())
-            }
-            #[cfg(target_os = "linux")]
-            Self::Leaf { cgroup, .. } => {
-                use std::os::fd::{AsRawFd as _, FromRawFd as _};
-                // SAFETY: a NUL-terminated name relative to a live directory descriptor.
-                let procs = unsafe {
-                    libc::openat(
-                        cgroup.as_raw_fd(),
-                        c"cgroup.procs".as_ptr(),
-                        libc::O_WRONLY | libc::O_CLOEXEC,
-                    )
-                };
-                if procs < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: openat just returned this descriptor; the hook below owns it.
-                let procs = unsafe { std::os::fd::OwnedFd::from_raw_fd(procs) };
-                // SAFETY: write(2) is async-signal-safe; "0" names the writing process, the
-                // child, which enters the leaf before it executes.
-                unsafe {
-                    command.pre_exec(move || {
-                        if libc::write(procs.as_raw_fd(), c"0".as_ptr().cast(), 1) == 1 {
-                            Ok(())
-                        } else {
-                            Err(io::Error::last_os_error())
-                        }
-                    });
-                }
-                Ok(())
-            }
-            #[cfg(not(target_os = "linux"))]
-            Self::Unborrowed(never, _) => match never {},
-        }
-    }
-
-    /// The CPU the members have used so far, in a unit comparable only to another reading.
-    fn cpu(self, child: u32) -> io::Result<u64> {
-        #[cfg(target_os = "linux")]
-        let _ = child;
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::OwnGroup => crate::process::group_cpu(group_of(child)?),
-            #[cfg(target_os = "linux")]
-            Self::Leaf { cgroup, .. } => crate::process::cgroup_cpu(cgroup),
-            #[cfg(not(target_os = "linux"))]
-            Self::Unborrowed(never, _) => match never {},
-        }
-    }
-
-    /// The running members, each by pid, command and state.
-    fn members(self, child: u32) -> io::Result<Vec<crate::process::GroupMember>> {
-        #[cfg(target_os = "linux")]
-        let _ = child;
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::OwnGroup => crate::process::group_members(group_of(child)?),
-            #[cfg(target_os = "linux")]
-            Self::Leaf { cgroup, .. } => crate::process::cgroup_members(cgroup),
-            #[cfg(not(target_os = "linux"))]
-            Self::Unborrowed(never, _) => match never {},
-        }
-    }
-
-    /// Send SIGTERM to every member: a silent run's end.
-    fn terminate(self, child: u32) {
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::OwnGroup => {
-                if let Ok(group) = group_of(child) {
-                    // SAFETY: `group` is the process group this process's own child leads.
-                    unsafe { libc::killpg(group, libc::SIGTERM) };
-                }
-            }
-            #[cfg(target_os = "linux")]
-            Self::Leaf { cgroup, .. } => {
-                let _ = crate::process::signal_cgroup(cgroup, libc::SIGTERM);
-            }
-            #[cfg(not(target_os = "linux"))]
-            Self::Unborrowed(never, _) => match never {},
-        }
-        // The child itself, in every case: it may have left the source (setpgid, a cgroup move).
-        if let Ok(pid) = libc::pid_t::try_from(child) {
-            // SAFETY: `pid` is this process's own unreaped child.
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
-}
-
 /// The process group a child of [`Members::OwnGroup`] leads: its own pid.
-#[cfg(target_os = "macos")]
 fn group_of(child: u32) -> io::Result<libc::pid_t> {
     libc::pid_t::try_from(child).map_err(io::Error::other)
 }
@@ -1646,65 +1529,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
 /// `connection`: `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux. It is the process that
 /// connected or made the pair, read from this connection, never whoever owns its path.
 pub fn peer_pid(connection: &impl AsFd) -> io::Result<libc::pid_t> {
-    let descriptor = connection.as_fd().as_raw_fd();
-    #[cfg(target_vendor = "apple")]
-    {
-        let mut pid: libc::pid_t = 0;
-        let mut length = socklen_of::<libc::pid_t>()?;
-        // SAFETY: `connection` keeps `descriptor` open through the call, and the pointer and
-        // length describe one initialized `pid_t`.
-        let read = unsafe {
-            libc::getsockopt(
-                descriptor,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERPID,
-                std::ptr::from_mut(&mut pid).cast(),
-                &mut length,
-            )
-        };
-        answered::<libc::pid_t>(read, length, "LOCAL_PEERPID")?;
-        Ok(pid)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length = socklen_of::<libc::ucred>()?;
-        // SAFETY: `connection` keeps `descriptor` open through the call, and the pointer and
-        // length describe one initialized `ucred`.
-        let read = unsafe {
-            libc::getsockopt(
-                descriptor,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                std::ptr::from_mut(&mut credentials).cast(),
-                &mut length,
-            )
-        };
-        answered::<libc::ucred>(read, length, "SO_PEERCRED")?;
-        Ok(credentials.pid)
-    }
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-    {
-        let _ = descriptor;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this kernel reports no peer pid",
-        ))
-    }
+    platform::peer_pid(connection.as_fd())
 }
 
 /// The size of one `T` as a `getsockopt` buffer length.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn socklen_of<T>() -> io::Result<libc::socklen_t> {
     libc::socklen_t::try_from(std::mem::size_of::<T>()).map_err(io::Error::other)
 }
 
 /// `getsockopt`'s return `read` for `option`, which was to fill `length` bytes of one `T`.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn answered<T>(read: libc::c_int, length: libc::socklen_t, option: &str) -> io::Result<()> {
     if read != 0 {
         return Err(io::Error::last_os_error());
@@ -1974,10 +1807,7 @@ fn unix_address(socket: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t
     }
     let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
     let length = libc::socklen_t::try_from(length).map_err(io::Error::other)?;
-    #[cfg(target_vendor = "apple")]
-    {
-        address.sun_len = u8::try_from(length).map_err(io::Error::other)?;
-    }
+    platform::record_length(&mut address, length)?;
     Ok((address, length))
 }
 
@@ -2265,10 +2095,8 @@ mod tests {
     }
 
     /// A log file of this test's own, removed on every exit path.
-    #[cfg(target_os = "macos")]
     struct LogFile(std::path::PathBuf);
 
-    #[cfg(target_os = "macos")]
     impl LogFile {
         fn new(label: &str) -> Self {
             Self(std::env::temp_dir().join(format!(
@@ -2285,14 +2113,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl Drop for LogFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_run_to_log_appends_both_streams_and_answers_the_exit() {
         let log = LogFile::new("exit");
@@ -2312,7 +2138,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_run_to_log_that_goes_silent_fails_naming_its_hung_process_and_is_ended() {
         let log = LogFile::new("silent");

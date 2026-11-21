@@ -9,6 +9,9 @@
 //!   below the supervisor's own, and read back before it runs anything of the job's.
 //! - Linux (`linux.rs`) places it on the job's class cgroup as `cpu.weight.nice`: every job of
 //!   a class shares one weight against the other classes, however many threads its jobs run.
+//!
+//! What a caller asks of either is the same: the nice a class is placed at ([`placed_nice`]) and
+//! a step of interactive work's decay ([`decay_group`]).
 
 use crate::api::dto::ExecClass;
 use std::time::Duration;
@@ -17,6 +20,12 @@ use std::time::Duration;
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub use platform::{decay_group, placed_nice};
 
 /// The nice a job of `class` runs at: interactive work and an interactive resident 0, since a
 /// person or model waits on them; a gate 5; background and a resident 10. On macOS it is an

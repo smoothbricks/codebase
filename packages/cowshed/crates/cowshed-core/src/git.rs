@@ -9,12 +9,22 @@ use std::sync::Arc;
 
 use tokio::process::Command;
 
-#[cfg(any(target_os = "macos", test))]
-use crate::api::dto::Sha256Digest;
-use crate::api::dto::{GitOid, UnlandedChange, UnlandedPath};
+use crate::api::dto::{GitOid, Sha256Digest, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
+
+mod confined;
+#[cfg(test)]
+mod launch_tests;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
@@ -25,7 +35,6 @@ pub struct RemoteUrl {
 /// The working-state digest a rename compares before and after handing a linked worktree across.
 /// A value only: it carries no authority and grants nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg(any(target_os = "macos", test))]
 pub(crate) struct RenameWorkState {
     /// SHA-256 of the length-framed status, index-vs-HEAD diff, working-vs-index diff, untracked
     /// and restored-link sections; see `GitRepository::rename_work_state`.
@@ -516,13 +525,7 @@ impl GitRepository {
     /// Resolve the standalone repository containing `path`, for a controller serving `store_root`.
     pub async fn discover(store_root: &Arc<Path>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let output = run_git_at(
-            #[cfg(target_os = "macos")]
-            store_root,
-            path,
-            ["rev-parse", "--show-toplevel"],
-        )
-        .await?;
+        let output = run_git_at(store_root, path, ["rev-parse", "--show-toplevel"]).await?;
         if output.status.success() {
             return Ok(Self::from_root(
                 store_root,
@@ -531,7 +534,6 @@ impl GitRepository {
         }
 
         let git_dir_output = run_git_at(
-            #[cfg(target_os = "macos")]
             store_root,
             path,
             ["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -886,7 +888,6 @@ impl GitRepository {
         parse_oid(value, "HEAD")
     }
 
-    #[cfg(any(target_os = "macos", test))]
     /// Read-only digest of a workspace's working state for rename preservation. Without optional
     /// locks it covers the porcelain status with its branch header, the binary index-against-HEAD
     /// diff, the binary working-against-index diff, and the path, mode and bytes of every
@@ -987,7 +988,6 @@ impl GitRepository {
         })
     }
 
-    #[cfg(any(target_os = "macos", test))]
     /// The index file of a linked worktree, resolved without reading it.
     async fn linked_index_path(&self) -> Result<PathBuf> {
         let output = self
@@ -999,7 +999,6 @@ impl GitRepository {
         parse_one_path(&output.stdout, "linked worktree index")
     }
 
-    #[cfg(any(target_os = "macos", test))]
     /// SHA-256 of index bytes already read, hashed off the runtime's threads.
     async fn digest_index_bytes(bytes: Vec<u8>) -> Result<Sha256Digest> {
         tokio::task::spawn_blocking(move || {
@@ -1010,7 +1009,6 @@ impl GitRepository {
         .map_err(|error| CowshedError::internal(format!("hash linked worktree index: {error}")))
     }
 
-    #[cfg(any(target_os = "macos", test))]
     /// The restored links Git itself reports as tracked or untracked non-ignored, sorted. Ignored
     /// links are not Git's work, so they are neither exempted nor hashed.
     async fn git_visible_restored_links(&self, restored: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1054,7 +1052,6 @@ impl GitRepository {
         Ok(sorted)
     }
 
-    #[cfg(target_os = "macos")]
     /// The plan that restores this tree's inherited links, as the paths it would rewrite, in order.
     /// Refuses, naming each link, when any link cannot be restored.
     pub(crate) async fn rename_link_paths(&self) -> Result<Vec<PathBuf>> {
@@ -1197,9 +1194,7 @@ impl GitRepository {
             .collect())
     }
 
-    /// The index's tracked paths, preserving non-UTF-8 names for source-mtime reconciliation, which
-    /// only the macOS land runs.
-    #[cfg(target_os = "macos")]
+    /// The index's tracked paths, preserving non-UTF-8 names for source-mtime reconciliation.
     pub(crate) async fn tracked_paths(&self) -> Result<Vec<PathBuf>> {
         let output = self.run(["ls-files", "--cached", "-z"]).await?;
         if !output.status.success() {
@@ -1582,7 +1577,6 @@ impl GitRepository {
     ///    ([`Self::measure_by_patch_ids`]).
     /// 3. Otherwise (a bundle written before sidecars, or one whose sidecar no longer applies)
     ///    the bundle is fetched to measure it ([`Self::measure_fetched`]).
-    #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn measure_bundle(
         &self,
         bundle: &Path,
@@ -1610,7 +1604,6 @@ impl GitRepository {
 
     /// Whether every one of `oids` is a commit in this repository's object store, asked of one
     /// `git cat-file --batch-check` that reads them all on its stdin.
-    #[cfg(any(target_os = "macos", test))]
     async fn holds_commits(&self, oids: &[&str]) -> Result<bool> {
         let mut input = Vec::with_capacity(oids.iter().map(|oid| oid.len() + 1).sum());
         for oid in oids {
@@ -1655,7 +1648,6 @@ impl GitRepository {
     /// Each of `tips`, commits this repository holds, measured against `target_tip`: the commits
     /// it carries beyond the target and which of them this repository holds by patch identity
     /// ([`Self::held_commits`]).
-    #[cfg(any(target_os = "macos", test))]
     async fn measure_tips(&self, target_tip: &str, tips: &[&str]) -> Result<Vec<BundleTip>> {
         let mut measured = Vec::with_capacity(tips.len());
         for tip in tips {
@@ -1682,7 +1674,6 @@ impl GitRepository {
     /// keeps the bundle, so nothing is read for it. Otherwise this repository's commits beyond the
     /// sidecar's base are streamed through `git patch-id` ([`Self::stream_patch_ids`]) until every
     /// identity the bundle carries has been seen, and a commit is held once its identity is.
-    #[cfg(any(target_os = "macos", test))]
     async fn measure_by_patch_ids(
         &self,
         patch_ids: &AbandonPatchIds,
@@ -1727,7 +1718,6 @@ impl GitRepository {
     /// this repository nor the bundle changes, and each tip its header advertises is measured
     /// there. The scratch is removed before answering. A bundle requiring commits this
     /// repository lacks is refused before anything is fetched: no fetch could measure it.
-    #[cfg(any(target_os = "macos", test))]
     async fn measure_fetched(
         &self,
         bundle: &Path,
@@ -1756,13 +1746,8 @@ impl GitRepository {
         let target_objects = self.object_directory().await?;
         let scratch = GitScratch::create(parent, ScratchUse::BundleVerification)?;
         let measured = async {
-            let output = run_git_at(
-                #[cfg(target_os = "macos")]
-                &self.store_root,
-                &scratch.path,
-                ["init", "--bare", "."],
-            )
-            .await?;
+            let output =
+                run_git_at(&self.store_root, &scratch.path, ["init", "--bare", "."]).await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "initialize the abandon bundle's measuring repository",
@@ -2041,11 +2026,9 @@ impl GitRepository {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
         let git = || {
             git_command_with_objects(
-                #[cfg(target_os = "macos")]
                 &self.store_root,
                 &self.root,
                 self.alternate_objects.as_deref(),
-                #[cfg(target_os = "macos")]
                 None,
             )
         };
@@ -2176,13 +2159,8 @@ impl GitRepository {
         let scratch = GitScratch::create(parent, ScratchUse::BundleVerification)?;
 
         let verification = async {
-            let output = run_git_at(
-                #[cfg(target_os = "macos")]
-                &self.store_root,
-                &scratch.path,
-                ["init", "--bare", "."],
-            )
-            .await?;
+            let output =
+                run_git_at(&self.store_root, &scratch.path, ["init", "--bare", "."]).await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "initialize abandonment bundle verification repository",
@@ -2431,11 +2409,9 @@ impl GitRepository {
         S: AsRef<OsStr>,
     {
         let mut command = git_command_with_objects(
-            #[cfg(target_os = "macos")]
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
-            #[cfg(target_os = "macos")]
             None,
         )?;
         for setting in &merge.overrides {
@@ -3728,13 +3704,7 @@ impl GitRepository {
         if url == main_mount {
             return Ok(true);
         }
-        Ok(url.is_absolute()
-            && !is_git_repository(
-                #[cfg(target_os = "macos")]
-                &self.store_root,
-                url,
-            )
-            .await?)
+        Ok(url.is_absolute() && !is_git_repository(&self.store_root, url).await?)
     }
 
     /// The URL cowshed recorded for `name`, or `None` if cowshed never wrote one.
@@ -3798,14 +3768,7 @@ impl GitRepository {
             self.remote_url(remote_name).await?
         };
         let repository = match &url {
-            Some(path) if path.is_absolute() => {
-                is_git_repository(
-                    #[cfg(target_os = "macos")]
-                    &self.store_root,
-                    path,
-                )
-                .await?
-            }
+            Some(path) if path.is_absolute() => is_git_repository(&self.store_root, path).await?,
             _ => false,
         };
         Ok(CowshedUpstream {
@@ -4152,11 +4115,9 @@ impl GitRepository {
                 CowshedError::internal(format!("prepare worktree staging: {error}"))
             })??;
             let output = run_git_at_with_objects(
-                #[cfg(target_os = "macos")]
                 &main.store_root,
                 &main.root,
                 main.alternate_objects.as_deref(),
-                #[cfg(target_os = "macos")]
                 Some(&staging),
                 [
                     OsStr::new("worktree"),
@@ -4270,11 +4231,9 @@ impl GitRepository {
     /// runs after moving either end.
     pub async fn repair_linked_worktree(&self, mount: &Path) -> Result<()> {
         let output = run_git_at_with_objects(
-            #[cfg(target_os = "macos")]
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
-            #[cfg(target_os = "macos")]
             Some(mount),
             [
                 OsStr::new("worktree"),
@@ -4384,11 +4343,9 @@ impl GitRepository {
         S: AsRef<OsStr>,
     {
         run_git_at_with_objects(
-            #[cfg(target_os = "macos")]
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
-            #[cfg(target_os = "macos")]
             None,
             args,
         )
@@ -4405,11 +4362,9 @@ impl GitRepository {
         S: AsRef<OsStr>,
     {
         let mut child = git_command_with_objects(
-            #[cfg(target_os = "macos")]
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
-            #[cfg(target_os = "macos")]
             None,
         )?
         .env("GIT_INDEX_FILE", index)
@@ -4445,11 +4400,9 @@ impl GitRepository {
         S: AsRef<OsStr>,
     {
         let mut child = git_command_with_objects(
-            #[cfg(target_os = "macos")]
             &self.store_root,
             &self.root,
             self.alternate_objects.as_deref(),
-            #[cfg(target_os = "macos")]
             None,
         )?
         .args(args)
@@ -4469,25 +4422,12 @@ impl GitRepository {
     }
 }
 
-async fn run_git_at<I, S>(
-    #[cfg(target_os = "macos")] store_root: &Path,
-    root: &Path,
-    args: I,
-) -> Result<Output>
+async fn run_git_at<I, S>(store_root: &Path, root: &Path, args: I) -> Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git_at_with_objects(
-        #[cfg(target_os = "macos")]
-        store_root,
-        root,
-        None,
-        #[cfg(target_os = "macos")]
-        None,
-        args,
-    )
-    .await
+    run_git_at_with_objects(store_root, root, None, None, args).await
 }
 
 /// Bundle object transport is the narrow exception to sandboxed Git: the
@@ -4537,10 +4477,7 @@ fn bundle_git_command(root: &Path, alternate_objects: Option<&Path>) -> Command 
 /// subject has gone". `rev-parse --git-dir` is git's own answer and covers every shape — worktree,
 /// bare, submodule pointer file — where a `.git` existence check covers one. A path that is not a
 /// directory at all fails the same way, which is the answer we want.
-async fn is_git_repository(
-    #[cfg(target_os = "macos")] store_root: &Path,
-    path: &Path,
-) -> Result<bool> {
+async fn is_git_repository(store_root: &Path, path: &Path) -> Result<bool> {
     match tokio::fs::try_exists(path).await {
         Ok(false) => return Ok(false),
         Ok(true) => {}
@@ -4554,15 +4491,10 @@ async fn is_git_repository(
             ));
         }
     }
-    Ok(run_git_at(
-        #[cfg(target_os = "macos")]
-        store_root,
-        path,
-        ["rev-parse", "--git-dir"],
-    )
-    .await?
-    .status
-    .success())
+    Ok(run_git_at(store_root, path, ["rev-parse", "--git-dir"])
+        .await?
+        .status
+        .success())
 }
 
 /// Point git at a checkout without allowing repository metadata to run hooks or
@@ -4609,217 +4541,6 @@ pub fn git_command_at(root: &Path) -> std::process::Command {
         .env_remove("GIT_SEQUENCE_EDITOR")
         .env_remove("GIT_EDITOR");
     command
-}
-
-/// A job can rewrite a linked worktree's `.git` pointer. Its claimed common
-/// repository gains write authority only when that repository's own worktree
-/// registration points back to this exact checkout.
-#[cfg(target_os = "macos")]
-fn registered_worktree_git_dir(root: &Path) -> Result<Option<PathBuf>> {
-    let pointer = root.join(".git");
-    let metadata = match fs::symlink_metadata(&pointer) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(CowshedError::integrity(
-                format!(
-                    "cannot inspect Git worktree pointer {}: {error}",
-                    pointer.display()
-                ),
-                "repair the Git worktree",
-            ));
-        }
-    };
-    if !metadata.file_type().is_file() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&pointer).map_err(|error| {
-        CowshedError::integrity(
-            format!(
-                "cannot read Git worktree pointer {}: {error}",
-                pointer.display()
-            ),
-            "repair the Git worktree",
-        )
-    })?;
-    let admin = content.trim_end().strip_prefix("gitdir: ").ok_or_else(|| {
-        CowshedError::integrity("invalid Git worktree pointer", "repair the Git worktree")
-    })?;
-    let admin = fs::canonicalize(admin).map_err(|error| {
-        CowshedError::integrity(
-            format!("cannot resolve Git worktree administration: {error}"),
-            "repair the Git worktree",
-        )
-    })?;
-    let worktrees = admin.parent().ok_or_else(|| {
-        CowshedError::integrity(
-            "Git worktree administration has no parent",
-            "repair the Git worktree",
-        )
-    })?;
-    if worktrees.file_name() != Some(OsStr::new("worktrees")) {
-        return Err(CowshedError::integrity(
-            "Git worktree administration is not under worktrees",
-            "repair the Git worktree",
-        ));
-    }
-    let common = worktrees.parent().ok_or_else(|| {
-        CowshedError::integrity(
-            "Git worktree has no common repository",
-            "repair the Git worktree",
-        )
-    })?;
-    let reverse = fs::read_to_string(admin.join("gitdir")).map_err(|error| {
-        CowshedError::integrity(
-            format!("cannot read reverse Git worktree registration: {error}"),
-            "repair the Git worktree",
-        )
-    })?;
-    if fs::canonicalize(reverse.trim_end()).ok().as_deref() != Some(pointer.as_path()) {
-        return Err(CowshedError::integrity(
-            "Git worktree registration does not point back to this workspace",
-            "repair the Git worktree",
-        ));
-    }
-    Ok(Some(common.to_owned()))
-}
-
-/// Git stops following includes this deep (`MAX_INCLUDE_DEPTH` in Git's `config.c`).
-#[cfg(target_os = "macos")]
-const MAX_GIT_INCLUDE_DEPTH: usize = 10;
-
-/// The most config files one linked worktree's common config may bring in through includes.
-#[cfg(target_os = "macos")]
-const MAX_GIT_INCLUDED_FILES: usize = 64;
-
-/// The largest Git config file the controller reads to resolve includes.
-#[cfg(target_os = "macos")]
-const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
-
-/// The files main's tree holds that a linked worktree's common config includes, transitively:
-/// the read grants its controller Git needs (02_workspaces.md, "Git-worktree workspaces").
-///
-/// The common config lives in main's `.git`, and an include it names by a path relative to it
-/// (`include.path = ../tooling/workspace.gitconfig`) lands in main's working tree, which the
-/// worktree's sandboxed Git cannot otherwise read, so Git fails before it reads `HEAD`. Every
-/// job of the workspace can write that config, so what it names is held to the narrowest
-/// reading: a target inside the workspace or the common directory is already readable and is
-/// followed without a grant; a regular file inside main's tree is granted, by itself; any other
-/// target is refused by name. `~/` resolves against `git_home`, the HOME the sandboxed Git runs
-/// with. An include that does not exist is skipped, as Git skips it. A conditional include is
-/// held to the same bounds whatever its condition, which is Git's to decide. Every file is read
-/// without following a final symlink or blocking on a FIFO, only when it is a regular file, and
-/// only up to [`MAX_GIT_CONFIG_BYTES`].
-#[cfg(target_os = "macos")]
-fn included_config_files(common: &Path, workspace: &Path, git_home: &Path) -> Result<Vec<PathBuf>> {
-    let main_tree = common
-        .parent()
-        .filter(|_| common.file_name() == Some(OsStr::new(".git")));
-    let refuse = |file: &Path, target: &Path, reason: &str| {
-        CowshedError::integrity(
-            format!(
-                "Git config {} includes {}, which {reason}; a git-worktree workspace's controller Git reads only regular config files inside main's checkout, the common Git directory or the workspace",
-                file.display(),
-                target.display()
-            ),
-            "move the included file into main's checkout or remove the include from main's .git/config",
-        )
-    };
-    let mut granted: Vec<PathBuf> = Vec::new();
-    let mut seen: Vec<PathBuf> = Vec::new();
-    let mut pending = vec![(common.join("config"), 0)];
-    while let Some((file, depth)) = pending.pop() {
-        let text = match read_git_config_bounded(&file)? {
-            Some(text) => text,
-            None => continue,
-        };
-        let directory = file.parent().unwrap_or(Path::new("/"));
-        for path in config_include_paths(&String::from_utf8_lossy(&text)) {
-            let target = match path.strip_prefix("~/") {
-                Some(relative) => git_home.join(relative),
-                None => directory.join(path),
-            };
-            let target = match fs::canonicalize(&target) {
-                Ok(target) => target,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(refuse(
-                        &file,
-                        &target,
-                        &format!("cannot be resolved: {error}"),
-                    ));
-                }
-            };
-            if seen.contains(&target) {
-                continue;
-            }
-            if target.starts_with(workspace) || target.starts_with(common) {
-                // Readable already; nothing to grant.
-            } else if main_tree.is_some_and(|tree| target.starts_with(tree)) {
-                granted.push(target.clone());
-            } else {
-                return Err(refuse(&file, &target, "is outside main's checkout"));
-            }
-            if seen.len() == MAX_GIT_INCLUDED_FILES {
-                return Err(refuse(
-                    &file,
-                    &target,
-                    &format!("is past the {MAX_GIT_INCLUDED_FILES} included files allowed"),
-                ));
-            }
-            seen.push(target.clone());
-            if depth + 1 < MAX_GIT_INCLUDE_DEPTH {
-                pending.push((target, depth + 1));
-            }
-        }
-    }
-    Ok(granted)
-}
-
-/// One Git config file's bytes, or `None` when it does not exist. Refused unless it is a
-/// regular file within [`MAX_GIT_CONFIG_BYTES`]: its path comes from config a job can write, so
-/// it may name a FIFO, a device or a symlink to one.
-#[cfg(target_os = "macos")]
-fn read_git_config_bounded(path: &Path) -> Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let refuse = |reason: String| {
-        CowshedError::integrity(
-            format!("Git config {} {reason}", path.display()),
-            "repair the repository's Git config",
-        )
-    };
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        // Regular files ignore O_NONBLOCK; a FIFO must not block the open before fstat refuses it.
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(refuse(format!("cannot be opened: {error}"))),
-    };
-    let metadata = file
-        .metadata()
-        .map_err(|error| refuse(format!("cannot be inspected: {error}")))?;
-    if !metadata.file_type().is_file() {
-        return Err(refuse("is not a regular file".to_owned()));
-    }
-    if metadata.len() > MAX_GIT_CONFIG_BYTES {
-        return Err(refuse(format!(
-            "is larger than {MAX_GIT_CONFIG_BYTES} bytes"
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_GIT_CONFIG_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| refuse(format!("cannot be read: {error}")))?;
-    if bytes.len() as u64 > MAX_GIT_CONFIG_BYTES {
-        return Err(refuse(format!(
-            "is larger than {MAX_GIT_CONFIG_BYTES} bytes"
-        )));
-    }
-    Ok(Some(bytes))
 }
 
 /// The `-c` overrides that switch off every filter, merge and diff driver a linked worktree's
@@ -4881,363 +4602,49 @@ fn driver_overrides(listing: &[u8]) -> Result<Vec<String>> {
     Ok(overrides)
 }
 
-/// The values of `include.path` and every `includeIf.<condition>.path` in one Git config file,
-/// in file order, read with Git's syntax: section and key names are case-insensitive, a
-/// `key = value` may follow a section header on its line, a value may be double-quoted with
-/// backslash escapes, and an unquoted `#` or `;` starts a comment.
-#[cfg(target_os = "macos")]
-fn config_include_paths(text: &str) -> Vec<String> {
-    let mut including = false;
-    let mut paths = Vec::new();
-    for line in text.lines() {
-        let mut rest = line.trim_start();
-        if let Some(header) = rest.strip_prefix('[') {
-            let mut quoted = false;
-            let Some(end) = header.char_indices().find_map(|(index, character)| {
-                match character {
-                    '"' => quoted = !quoted,
-                    ']' if !quoted => return Some(index),
-                    _ => {}
-                }
-                None
-            }) else {
-                including = false;
-                continue;
-            };
-            let name = header[..end]
-                .split(|character: char| character.is_whitespace() || character == '"')
-                .next()
-                .unwrap_or_default();
-            including =
-                name.eq_ignore_ascii_case("include") || name.eq_ignore_ascii_case("includeif");
-            rest = header[end + 1..].trim_start();
-        }
-        if !including {
-            continue;
-        }
-        if let Some((key, value)) = rest.split_once('=')
-            && key.trim().eq_ignore_ascii_case("path")
-        {
-            paths.push(config_value(value));
-        }
-    }
-    paths
-}
-
-/// One Git config value as Git reads it: quotes removed, escapes applied, a trailing comment
-/// and the unquoted whitespace around the value dropped.
-#[cfg(target_os = "macos")]
-fn config_value(raw: &str) -> String {
-    let mut value = String::new();
-    let mut quoted = false;
-    let mut spaces = String::new();
-    let mut characters = raw.trim_start().chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '"' => {
-                value.push_str(&spaces);
-                spaces.clear();
-                quoted = !quoted;
-            }
-            '\\' => {
-                let escaped = match characters.next() {
-                    Some('n') => '\n',
-                    Some('t') => '\t',
-                    Some('b') => '\u{8}',
-                    Some(other) => other,
-                    None => break,
-                };
-                value.push_str(&spaces);
-                spaces.clear();
-                value.push(escaped);
-            }
-            '#' | ';' if !quoted => break,
-            character if character.is_whitespace() && !quoted => spaces.push(character),
-            character => {
-                value.push_str(&spaces);
-                spaces.clear();
-                value.push(character);
-            }
-        }
-    }
-    value
-}
-
 /// Controller Git can consume repository-selected filters, merge drivers and
 /// transports. Run it with the GitDiscovery policy: writable only in this
-/// checkout; other trees require controller-supplied, explicit roots.
-#[cfg(target_os = "macos")]
+/// checkout; other trees require controller-supplied, explicit roots. It runs
+/// under the platform's sandbox launcher or not at all.
 pub fn sandboxed_git_command_at(store_root: &Path, root: &Path) -> Result<std::process::Command> {
-    sandboxed_git_command_with_paths(store_root, root, None, None)
-}
-
-/// A tree outside the checkout that controller Git reads, as the controller names it: never a
-/// path the repository's own config or remote URL chose.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-enum ExtraRead<'a> {
-    /// A checkout fetched from by local path. Git runs `upload-pack` for it through a shell.
-    FetchSource(&'a Path),
-    /// Another repository's object store, read in place through `GIT_ALTERNATE_OBJECT_DIRECTORIES`.
-    AlternateObjects(&'a Path),
-}
-
-#[cfg(target_os = "macos")]
-impl<'a> ExtraRead<'a> {
-    fn kind(self) -> &'static str {
-        match self {
-            Self::FetchSource(_) => "Git source checkout",
-            Self::AlternateObjects(_) => "Git object store",
-        }
-    }
-
-    fn path(self) -> &'a Path {
-        match self {
-            Self::FetchSource(path) | Self::AlternateObjects(path) => path,
-        }
-    }
+    confined::sandboxed_git_command(store_root, root)
 }
 
 /// Git for a workspace fetch from `source`, a checkout the controller resolved: main's mount,
 /// a lane base, a unit. The repository's own remote URL never authorizes a host read.
-#[cfg(target_os = "macos")]
 pub(crate) fn sandboxed_git_fetch_command(
     store_root: &Path,
     root: &Path,
     source: &Path,
 ) -> Result<std::process::Command> {
-    sandboxed_git_command_with_paths(store_root, root, Some(ExtraRead::FetchSource(source)), None)
+    confined::sandboxed_git_fetch_command(store_root, root, source)
 }
 
-#[cfg(target_os = "macos")]
-fn sandboxed_git_command_with_paths(
-    store_root: &Path,
-    root: &Path,
-    extra: Option<ExtraRead<'_>>,
-    writable: Option<&Path>,
-) -> Result<std::process::Command> {
-    use crate::sandbox::{
-        RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, seatbelt_profile,
-    };
-    let parent = root
-        .parent()
-        .ok_or_else(|| CowshedError::internal("git checkout has no parent"))?;
-    // Seatbelt filters the resolved spelling. Temporary checkouts often arrive
-    // through /var -> /private/var; granting only their lexical name denies cwd.
-    let canonical = match fs::canonicalize(root) {
-        Ok(canonical) => canonical,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::canonicalize(parent)
-            .map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "cannot resolve git checkout parent {}: {error}",
-                        parent.display()
-                    ),
-                    "repair the checkout path",
-                )
-            })?
-            .join(
-                root.file_name()
-                    .ok_or_else(|| CowshedError::internal("git checkout has no name"))?,
-            ),
-        Err(error) => {
-            return Err(CowshedError::integrity(
-                format!("cannot resolve git checkout {}: {error}", root.display()),
-                "repair the checkout path",
-            ));
-        }
-    };
-    let parent = canonical
-        .parent()
-        .ok_or_else(|| CowshedError::internal("git checkout has no parent"))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        CowshedError::environment_missing(
-            "HOME is unset",
-            "set HOME to the operator's home directory",
-        )
-    })?;
-    let common = registered_worktree_git_dir(&canonical)?;
-    let git_home = canonical.join(".cowshed/home");
-    let mut read = match &common {
-        Some(common) => included_config_files(common, &canonical, &git_home)?,
-        None => Vec::new(),
-    };
-    let linked = common.is_some();
-    // Reads of main's checkout that the workspace's jobs cannot make: no program the config
-    // selects may run beside them, whatever name it is selected by, or whenever it is added.
-    // A controller-named tree (`extra`) is not among them: it is one the controller chose. An
-    // object store is read in place and runs nothing. A local fetch runs Git's upload-pack through
-    // a shell, which a Git that may execute only Git cannot start, so the two never meet: such a
-    // fetch is refused here, by name, before Git runs (02_workspaces.md, "Git-worktree workspaces").
-    if let Some(ExtraRead::FetchSource(source)) = extra
-        && !read.is_empty()
-    {
-        return Err(CowshedError::sandbox_denied(
-            format!(
-                "a linked worktree whose main config includes main-tree files cannot fetch: {} reads {} from main's checkout through those includes, so its Git may execute only Git, and fetching from {} runs upload-pack through a shell",
-                canonical.display(),
-                read.iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                source.display()
-            ),
-            "move each included file into main's .git or remove the include from main's .git/config, or rebase and land through a standalone lane",
-        ));
+/// What about starting Git under the sandbox launcher differs by platform, for a caller that
+/// builds its own launch (the Git discovery probe, [`crate::workspace_git_fetch`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SandboxedGit {
+    /// The Git the launch starts: a path on macOS, a name the launcher resolves on Linux.
+    pub(crate) program: PathBuf,
+    /// The `PATH` a launch that inherits no environment is handed; `None` hands it none.
+    pub(crate) search_path: Option<OsString>,
+}
+
+/// This platform's [`SandboxedGit`].
+pub(crate) fn sandboxed_git() -> SandboxedGit {
+    SandboxedGit {
+        program: platform::git_program(),
+        search_path: platform::git_search_path(),
     }
-    let role = if read.is_empty() {
-        SandboxProfileRole::GitDiscovery
-    } else {
-        SandboxProfileRole::GitDiscoveryGitOnly
-    };
-    if let Some(extra) = extra {
-        read.push(fs::canonicalize(extra.path()).map_err(|error| {
-            CowshedError::integrity(
-                format!(
-                    "cannot resolve the {} {}: {error}",
-                    extra.kind(),
-                    extra.path().display()
-                ),
-                "repair the path the controller named",
-            )
-        })?);
-    }
-    let config = SandboxConfig {
-        home,
-        mount_root: PathBuf::from(cowshed_gateway_types::STORE_ROOT),
-        workspace_mount: canonical.clone(),
-        shed_links: Vec::new(),
-        exec_temp_dir: canonical.clone(),
-        // The profile file lives in the store this controller serves: the host's in production, a
-        // fixture's own in a test, never one it does not serve (04_sandbox.md, "Exec pipeline"
-        // step 4; 08_testing.md, "Fixtures").
-        store_root: store_root.to_path_buf(),
-        port_block: crate::metadata::PortBlock::new(40_960, 16).expect("static macOS port block"),
-        retained_port_blocks: Vec::new(),
-        cpu_pool_directory: None,
-        mode: RunSandboxMode::ReadWrite,
-        grants: SandboxGrants {
-            read,
-            write: writable
-                .map(|path| {
-                    fs::canonicalize(path).map_err(|error| {
-                        CowshedError::integrity(
-                            format!(
-                                "cannot resolve Git worktree staging {}: {error}",
-                                path.display()
-                            ),
-                            "repair the linked worktree staging directory",
-                        )
-                    })
-                })
-                .transpose()?
-                .into_iter()
-                .chain(common)
-                .collect(),
-            ..SandboxGrants::default()
-        },
-        allowed_unix_sockets: Vec::new(),
-        additional_denies: Vec::new(),
-        git_worktree_repository: None,
-        main_mount: None,
-        build_volume_mount: None,
-        repository_caches: Vec::new(),
-        // Controller Git detects no capability, so it resolves no program.
-        program_directories: Vec::new(),
-        capabilities: Default::default(),
-    };
-    let profile = seatbelt_profile(&config, role).map_err(|error| {
-        CowshedError::integrity(
-            format!(
-                "cannot sandbox controller git in {}: {error}",
-                root.display()
-            ),
-            "repair the workspace Git path",
-        )
-    })?;
-    let profile = crate::exec::ProfileLaunch::write(&config.profile_directory(), &profile)
-        .map_err(|error| {
-            let message = format!(
-                "cannot write controller git's sandbox profile into {}: {error}",
-                config.profile_directory().display()
-            );
-            if error.raw_os_error() == Some(libc::EPERM) {
-                CowshedError::sandbox_denied(
-                    format!("{message}: the process running cowshed is sandboxed away from cowshed's store"),
-                    "rerun the command from a shell whose sandbox allows writing the cowshed store",
-                )
-            } else {
-                CowshedError::environment_missing(
-                    message,
-                    "run `cowshed setup` so the store's run directory exists and is yours",
-                )
-            }
-        })?;
-    let build = || -> Result<std::process::Command> {
-        let git = git_command_at(&canonical);
-        let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
-        command
-            .args(profile.args())
-            .arg(format!("{}/usr/bin/git", crate::sandbox::GIT_DEVELOPER_DIR));
-        command.args(git.get_args());
-        for (name, value) in git.get_envs() {
-            match value {
-                Some(value) => {
-                    command.env(name, value);
-                }
-                None => {
-                    command.env_remove(name);
-                }
-            }
-        }
-        command
-            .current_dir(if canonical.is_dir() {
-                &canonical
-            } else {
-                parent
-            })
-            .env("HOME", &git_home);
-        if let Some(identity) = workspace_git_identity_config(&canonical)? {
-            command.env("GIT_CONFIG_GLOBAL", identity);
-        }
-        Ok(command)
-    };
-    let mut command = build()?;
-    if linked {
-        // Git's own reading of its config, under the same profile, names every driver it could
-        // select; each is switched off for the command the caller runs.
-        // WHY unbounded: a workspace git with hooks off and drivers off or confined by the workspace
-        // Git sandbox (`git_command_with_objects`): it waits on no other process. Git creates its lock
-        // files exclusively: a held index lock refuses at once, a held ref lock after the pinned timeout
-        // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
-        #[allow(clippy::disallowed_methods)]
-        let listing = build()?
-            .args(["config", "-z", "--name-only", "--list"])
-            .output_locked()
-            .map_err(|error| git_spawn_error(&error))?;
-        if !listing.status.success() {
-            return Err(CowshedError::integrity(
-                format!(
-                    "cannot read the Git config of {}: {}",
-                    root.display(),
-                    git_ended(&listing)
-                ),
-                "repair the repository's Git config",
-            ));
-        }
-        for setting in driver_overrides(&listing.stdout)? {
-            command.arg("-c").arg(setting);
-        }
-    }
-    Ok(command)
 }
 
 /// The one spelling of "git itself could not run", so the same failure never carries two
-/// different instructions depending on which runner hit it.
+/// different instructions depending on which runner hit it. The instruction is the platform's:
+/// where its Git comes from.
 pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("cannot execute git: {error}"),
-        "install the macOS command line developer tools, then retry",
+        platform::INSTALL_GIT,
     )
 }
 
@@ -5253,20 +4660,12 @@ pub(crate) fn git_ended(output: &Output) -> String {
 
 /// Controller Git at `root` with `alternate_objects` attached, before its verb.
 fn git_command_with_objects(
-    #[cfg(target_os = "macos")] store_root: &Path,
+    store_root: &Path,
     root: &Path,
     alternate_objects: Option<&Path>,
-    #[cfg(target_os = "macos")] writable: Option<&Path>,
+    writable: Option<&Path>,
 ) -> Result<Command> {
-    #[cfg(target_os = "macos")]
-    let git = sandboxed_git_command_with_paths(
-        store_root,
-        root,
-        alternate_objects.map(ExtraRead::AlternateObjects),
-        writable,
-    )?;
-    #[cfg(not(target_os = "macos"))]
-    let git = git_command_at(root);
+    let git = confined::controller_git_command(store_root, root, alternate_objects, writable)?;
     let mut command = Command::from(git);
     if let Some(objects) = alternate_objects {
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
@@ -5281,28 +4680,21 @@ fn git_command_with_objects(
 // (core.filesRefLockTimeout 100 ms, core.packedRefsTimeout 1 s), never waited out.
 #[allow(clippy::disallowed_methods)]
 async fn run_git_at_with_objects<I, S>(
-    #[cfg(target_os = "macos")] store_root: &Path,
+    store_root: &Path,
     root: &Path,
     alternate_objects: Option<&Path>,
-    #[cfg(target_os = "macos")] writable: Option<&Path>,
+    writable: Option<&Path>,
     args: I,
 ) -> Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    git_command_with_objects(
-        #[cfg(target_os = "macos")]
-        store_root,
-        root,
-        alternate_objects,
-        #[cfg(target_os = "macos")]
-        writable,
-    )?
-    .args(args)
-    .output_locked()
-    .await
-    .map_err(|error| git_spawn_error(&error))
+    git_command_with_objects(store_root, root, alternate_objects, writable)?
+        .args(args)
+        .output_locked()
+        .await
+        .map_err(|error| git_spawn_error(&error))
 }
 
 fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
@@ -5588,7 +4980,6 @@ fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
 /// `git diff` arguments for the rename work digest: no optional locks, no external or textconv
 /// filters, binary bytes, and the pathspecs the caller built (`--`, `.`, and literal exclusions).
 fn diff_args(cached: bool, pathspecs: &[OsString]) -> Vec<OsString> {
@@ -5608,7 +4999,6 @@ fn diff_args(cached: bool, pathspecs: &[OsString]) -> Vec<OsString> {
     args
 }
 
-#[cfg(any(target_os = "macos", test))]
 /// Hash the bytes of untracked non-ignored paths and the presence of restored links. Each path
 /// contributes its raw bytes, mode and content (a symlink contributes its target; a regular file
 /// is streamed without following links). Any other entry type, or any read failure, refuses.
@@ -5788,7 +5178,6 @@ pub fn is_hidden_path(path: &[u8]) -> bool {
 /// One tip an abandon bundle advertises, measured by [`GitRepository::measure_bundle`] (or, when
 /// measured from its sidecar, all of them at once): the commits it carries beyond the target, and
 /// those of them the target holds by patch identity.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BundleTip {
     pub(crate) commits: Vec<String>,
@@ -5800,7 +5189,6 @@ pub(crate) struct BundleTip {
 /// is patch-equivalent to one the target holds, or a merge that authors nothing. A tip that
 /// carries nothing beyond the target is held by ancestry. A bundle that advertises no tip proves
 /// nothing and is kept.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn bundle_is_held(tips: &[BundleTip]) -> bool {
     !tips.is_empty()
         && tips
@@ -5810,15 +5198,12 @@ pub(crate) fn bundle_is_held(tips: &[BundleTip]) -> bool {
 
 /// The longest header [`read_bundle_header`] reads: a bundle cowshed writes advertises a handful
 /// of refs, so a header past this is refused rather than read on.
-#[cfg(any(target_os = "macos", test))]
 const BUNDLE_HEADER_LIMIT: u64 = 1 << 20;
 
 /// The longest line [`read_bundle_header`] accepts in a bundle's header.
-#[cfg(any(target_os = "macos", test))]
 const BUNDLE_HEADER_LINE_LIMIT: usize = 64 << 10;
 
 /// One ref a bundle's header advertises: the object it names and the ref's name.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BundleHeaderTip {
     oid: GitOid,
@@ -5827,7 +5212,6 @@ struct BundleHeaderTip {
 
 /// What a git bundle's header declares (`gitformat-bundle(5)`): the commits it requires but does
 /// not carry, and the refs it advertises, in the bundle's order.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BundleHeader {
     prerequisites: Vec<GitOid>,
@@ -5835,7 +5219,6 @@ struct BundleHeader {
 }
 
 /// The signature a bundle's header starts with.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BundleVersion {
     V2,
@@ -5849,7 +5232,6 @@ enum BundleVersion {
 /// Nothing after that line is read, so the pack never is. A header longer than
 /// [`BUNDLE_HEADER_LIMIT`] or a line longer than [`BUNDLE_HEADER_LINE_LIMIT`] is refused, and so
 /// are an unknown signature, an unreadable line and a file that ends inside its header.
-#[cfg(any(target_os = "macos", test))]
 async fn read_bundle_header(path: &Path) -> Result<BundleHeader> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
     let refused = |reason: String| {
@@ -6038,7 +5420,6 @@ impl AbandonPatchIds {
     }
 
     /// The sidecar `text` spells, or why it spells none.
-    #[cfg(any(target_os = "macos", test))]
     fn parse(text: &str) -> std::result::Result<Self, String> {
         let oid = |value: &str| {
             GitOid::new(value).map_err(|error| format!("{value:?} is not a git object id: {error}"))
@@ -6098,7 +5479,6 @@ impl AbandonPatchIds {
 
     /// Whether this sidecar was written for a bundle whose header is `header`: one that
     /// advertises exactly its heads.
-    #[cfg(any(target_os = "macos", test))]
     fn describes(&self, header: &BundleHeader) -> bool {
         let advertised: std::collections::BTreeSet<&GitOid> =
             header.tips.iter().map(|tip| &tip.oid).collect();
@@ -6109,7 +5489,6 @@ impl AbandonPatchIds {
 
 /// The patch-identity sidecar at `sidecar`, or `None` when its bundle has none: one written before
 /// sidecars, or without a target. A sidecar that does not parse is refused, never ignored.
-#[cfg(any(target_os = "macos", test))]
 async fn read_patch_ids(sidecar: &Path) -> Result<Option<AbandonPatchIds>> {
     let text = match tokio::fs::read_to_string(sidecar).await {
         Ok(text) => text,
@@ -6493,8 +5872,6 @@ fn parse_one_line<'a>(bytes: &'a [u8], description: &str) -> Result<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use cowshed_os::test_backstop::ChildBackstop as _;
     use cowshed_os::test_backstop::{AsyncCommandBackstop as _, CommandBackstop as _};
     use std::ffi::OsString;
     use std::fs;
@@ -6534,508 +5911,6 @@ mod tests {
         fs::remove_file(&lock).expect("let the ref's lock go");
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_worktree_pointer_cannot_grant_a_foreign_repository_write_access() {
-        let main = repository();
-        let workspace = main.with_extension("candidate");
-        fs::create_dir_all(&workspace).expect("workspace");
-        let admin = main.join(".git/worktrees/candidate");
-        fs::create_dir_all(&admin).expect("registration");
-        fs::write(
-            workspace.join(".git"),
-            format!("gitdir: {}\n", admin.display()),
-        )
-        .expect("writable pointer");
-        fs::write(
-            admin.join("gitdir"),
-            main.join(".git").display().to_string(),
-        )
-        .expect("foreign registration");
-        let workspace = workspace.canonicalize().expect("canonical workspace");
-        assert!(super::registered_worktree_git_dir(&workspace).is_err());
-        fs::write(
-            admin.join("gitdir"),
-            workspace.join(".git").display().to_string(),
-        )
-        .expect("real registration");
-        assert_eq!(
-            super::registered_worktree_git_dir(&workspace).expect("registered"),
-            Some(
-                main.join(".git")
-                    .canonicalize()
-                    .expect("common Git directory")
-            ),
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fetching_main_outside_the_workspace_tree_needs_an_explicit_read_root() {
-        let store = crate::temp_root::FixtureStore::new();
-        let main = repository();
-        let parent = main.join("units");
-        fs::create_dir_all(&parent).expect("units");
-        let workspace = parent.join("raven");
-        let cloned = Command::new("git")
-            .args(["clone", "-q"])
-            .arg(&main)
-            .arg(&workspace)
-            .status_bounded()
-            .expect("clone workspace");
-        assert!(cloned.success());
-        let main = main.canonicalize().expect("canonical main");
-        let workspace = workspace.canonicalize().expect("canonical workspace");
-        let source = main.to_str().expect("UTF-8 fixture");
-        let denied = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            .args(["fetch", "--no-tags", source])
-            .output_bounded()
-            .expect("sandboxed fetch");
-        assert!(
-            !denied.status.success(),
-            "a repository URL cannot grant its own read"
-        );
-        let admitted = super::sandboxed_git_fetch_command(store.shared(), &workspace, &main)
-            .expect("trusted read grant")
-            .args(["fetch", "--no-tags", source])
-            .output_bounded()
-            .expect("sandboxed fetch");
-        assert!(
-            admitted.status.success(),
-            "trusted source fetch: {}",
-            String::from_utf8_lossy(&admitted.stderr)
-        );
-    }
-
-    /// Main's config is a linked worktree's config, and a file it includes by a path relative to
-    /// main's `.git` is in main's working tree, which the worktree's sandboxed Git cannot
-    /// otherwise read: every controller verb on a git-worktree workspace failed at its first Git
-    /// command with "unable to access …/.git/../tooling/workspace.gitconfig".
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_linked_worktree_reads_the_files_its_common_config_includes() {
-        let store = crate::temp_root::FixtureStore::new();
-        let main = repository();
-        fs::create_dir_all(main.join("tooling")).expect("tooling");
-        fs::write(
-            main.join("tooling/workspace.gitconfig"),
-            "[core]\n\tabbrev = 12\n",
-        )
-        .expect("included config");
-        git(
-            &main,
-            &["config", "include.path", "../tooling/workspace.gitconfig"],
-        );
-        let workspace = main.with_extension("linked");
-        let added = Command::new("git")
-            .arg("-C")
-            .arg(&*main)
-            .args(["worktree", "add", "-q", "--detach"])
-            .arg(&workspace)
-            .status_bounded()
-            .expect("add linked worktree");
-        assert!(added.success());
-        let workspace = workspace.canonicalize().expect("canonical workspace");
-        let output = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            .args(["config", "core.abbrev"])
-            .output_bounded()
-            .expect("sandboxed Git");
-        assert!(
-            output.status.success(),
-            "the include is readable: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"12\n");
-        let head = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            .args(["rev-parse", "HEAD"])
-            .output_bounded()
-            .expect("sandboxed Git");
-        assert!(
-            head.status.success(),
-            "HEAD reads: {}",
-            String::from_utf8_lossy(&head.stderr)
-        );
-    }
-
-    /// Include paths are read with Git's own syntax, and only from include sections.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn config_include_paths_follow_git_syntax() {
-        let config = "[core]\n\tpath = not-an-include\n[include]\n\tpath = ../tooling/a.gitconfig ; comment\n[Include] PATH = \"b c.gitconfig\"\n[includeIf \"gitdir:~/src/]x\"]\n\tpath = ~/work.gitconfig\n\tother = d\n[user]\n\tname = x\n";
-        assert_eq!(
-            super::config_include_paths(config),
-            [
-                "../tooling/a.gitconfig",
-                "b c.gitconfig",
-                "~/work.gitconfig"
-            ]
-        );
-    }
-
-    /// A git-worktree workspace whose main config includes each of `includes`, and main.
-    #[cfg(target_os = "macos")]
-    fn linked_worktree(includes: &[&str]) -> (Repository, PathBuf) {
-        let main = repository();
-        for include in includes {
-            git(&main, &["config", "--add", "include.path", include]);
-        }
-        let workspace = main.with_extension("linked");
-        let added = Command::new("git")
-            .arg("-C")
-            .arg(&*main)
-            .args(["worktree", "add", "-q", "--detach"])
-            .arg(&workspace)
-            .status_bounded()
-            .expect("add linked worktree");
-        assert!(added.success());
-        let workspace = workspace.canonicalize().expect("canonical workspace");
-        (main, workspace)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn sandboxed_config(store_root: &Path, workspace: &Path, key: &str) -> String {
-        let output = super::sandboxed_git_command_at(store_root, workspace)
-            .expect("narrow Git")
-            .args(["config", key])
-            .output_bounded()
-            .expect("sandboxed Git");
-        assert!(
-            output.status.success(),
-            "{key}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).expect("UTF-8 value")
-    }
-
-    /// `~/` is the HOME the sandboxed Git runs with, inside the workspace; a conditional include
-    /// inside main's checkout is followed and its own relative include is granted too.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linked_worktree_includes_resolve_home_conditions_and_nesting() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace) = linked_worktree(&["~/home.gitconfig"]);
-        git(
-            &main,
-            &[
-                "config",
-                "includeIf.gitdir:/.path",
-                "../tooling/outer.gitconfig",
-            ],
-        );
-        fs::create_dir_all(main.join("tooling")).expect("tooling");
-        fs::write(
-            main.join("tooling/outer.gitconfig"),
-            "[include]\n\tpath = inner.gitconfig\n",
-        )
-        .expect("outer");
-        fs::write(
-            main.join("tooling/inner.gitconfig"),
-            "[core]\n\tabbrev = 11\n",
-        )
-        .expect("inner");
-        fs::create_dir_all(workspace.join(".cowshed/home")).expect("git home");
-        fs::write(
-            workspace.join(".cowshed/home/home.gitconfig"),
-            "[user]\n\tname = Home Include\n",
-        )
-        .expect("home include");
-        assert_eq!(
-            sandboxed_config(store.shared(), &workspace, "core.abbrev"),
-            "11\n"
-        );
-        assert_eq!(
-            sandboxed_config(store.shared(), &workspace, "user.name"),
-            "Home Include\n"
-        );
-    }
-
-    /// An include outside main's checkout stays denied: the controller refuses it by name rather
-    /// than granting it, and never opens a device or a FIFO a job named.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linked_worktree_includes_outside_main_or_not_regular_are_refused() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace) = linked_worktree(&[]);
-        // Written by file, from outside the repository: Git opening main would read the include.
-        let config = main.join(".git/config");
-        let include = |target: &str| {
-            let status = Command::new("git")
-                .args(["config", "--file"])
-                .arg(&config)
-                .args(["include.path", target])
-                .current_dir("/")
-                .status_bounded()
-                .expect("git config --file");
-            assert!(status.success());
-        };
-        let outside = main.with_extension("outside.gitconfig");
-        fs::write(&outside, "[core]\n\tabbrev = 13\n").expect("outside include");
-        for target in [outside.to_str().expect("UTF-8 path"), "/dev/zero"] {
-            include(target);
-            let refused = super::sandboxed_git_command_at(store.shared(), &workspace)
-                .expect_err("an include outside main is refused");
-            assert!(
-                refused.message.contains("outside main's checkout"),
-                "{}",
-                refused.message
-            );
-        }
-        let fifo = main.join("tooling.fifo");
-        let made = Command::new("mkfifo")
-            .arg(&fifo)
-            .status_bounded()
-            .expect("mkfifo");
-        assert!(made.success());
-        include("../tooling.fifo");
-        let refused = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect_err("a FIFO include is refused without blocking");
-        assert!(
-            refused.message.contains("is not a regular file"),
-            "{}",
-            refused.message
-        );
-    }
-
-    /// The config a workspace's jobs write cannot run a filter under the controller's read of
-    /// main's checkout: the same `git add` that runs the clean filter unconfined passes the file
-    /// through unchanged under the controller's Git.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linked_worktree_controller_git_runs_no_repository_filter() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace) = linked_worktree(&[]);
-        git(
-            &main,
-            &[
-                "config",
-                "filter.marker.clean",
-                "sh -c 'echo ran >> .filter-ran; cat'",
-            ],
-        );
-        fs::write(workspace.join(".gitattributes"), "README filter=marker\n").expect("attributes");
-        fs::write(workspace.join("README"), "changed\n").expect("change README");
-        let added = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            .args(["add", "README"])
-            .output_bounded()
-            .expect("sandboxed add");
-        assert!(
-            added.status.success(),
-            "{}",
-            String::from_utf8_lossy(&added.stderr)
-        );
-        assert!(
-            !workspace.join(".filter-ran").exists(),
-            "the controller's Git ran the repository's clean filter"
-        );
-        // New content, so the unconfined add cleans the file rather than trusting the index.
-        fs::write(workspace.join("README"), "changed again\n").expect("change README again");
-        git(&workspace, &["add", "README"]);
-        assert!(
-            workspace.join(".filter-ran").exists(),
-            "unconfined Git runs the filter, so the fixture would have shown it"
-        );
-    }
-
-    /// A git-worktree workspace whose main config includes a file of main's checkout, so its
-    /// controller Git holds that read, with a forged signed commit in main and an executable in
-    /// the workspace that records it ran: what a job could leave behind for `rm`'s `git log` or
-    /// a land's `git merge` to run.
-    #[cfg(target_os = "macos")]
-    fn worktree_with_a_planted_program() -> (Repository, PathBuf, String, PathBuf) {
-        use cowshed_os::fork_lock::Spawn as _;
-        let (main, workspace) = linked_worktree(&["../tooling/workspace.gitconfig"]);
-        fs::create_dir_all(main.join("tooling")).expect("tooling");
-        fs::write(
-            main.join("tooling/workspace.gitconfig"),
-            "[core]\n\tabbrev = 12\n",
-        )
-        .expect("included config");
-        let marker = workspace.join(".program-ran");
-        let program = workspace.join("planted-gpg");
-        fs::write(
-            &program,
-            format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
-        )
-        .expect("planted program");
-        fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("executable");
-        let rev = |spec: &str| {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&*main)
-                .args(["rev-parse", spec])
-                .output_bounded()
-                .expect("rev-parse");
-            String::from_utf8(output.stdout)
-                .expect("oid")
-                .trim()
-                .to_owned()
-        };
-        let body = format!(
-            "tree {}\nparent {}\nauthor Forger <f@example.invalid> 0 +0000\ncommitter Forger <f@example.invalid> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n forged\n -----END PGP SIGNATURE-----\n\nforged\n",
-            rev("HEAD^{tree}"),
-            rev("HEAD")
-        );
-        let mut hash = Command::new("git")
-            .arg("-C")
-            .arg(&*main)
-            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .expect("hash-object");
-        std::io::Write::write_all(&mut hash.stdin.take().expect("stdin"), body.as_bytes())
-            .expect("write commit");
-        let output = hash.wait_with_output_bounded().expect("hash-object output");
-        assert!(output.status.success());
-        let forged = String::from_utf8(output.stdout)
-            .expect("oid")
-            .trim()
-            .to_owned();
-        git(
-            &main,
-            &["config", "gpg.program", program.to_str().expect("UTF-8")],
-        );
-        (main, workspace, forged, marker)
-    }
-
-    /// `log.showSignature` makes `git log` run `gpg.program` on a signed commit. The controller's
-    /// Git for a workspace holding main-tree reads cannot run it: only Git's own executables run.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linked_worktree_controller_git_runs_no_gpg_program_for_log() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace, forged, marker) = worktree_with_a_planted_program();
-        git(&main, &["config", "log.showSignature", "true"]);
-        let _ = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            // Git writes the signature to a temporary file before it runs gpg.program; a TMPDIR
-            // the sandbox can write isolates the exec rule as the only thing that stops it.
-            .env("TMPDIR", &workspace)
-            .args(["log", "-1", "--pretty=format:%H", &forged])
-            .output_bounded()
-            .expect("sandboxed log");
-        assert!(!marker.exists(), "the controller's Git ran gpg.program");
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["log", "-1", "--pretty=format:%H", &forged])
-            .output_bounded()
-            .expect("unconfined log");
-        assert!(
-            marker.exists(),
-            "unconfined Git runs it, so the fixture would have shown it"
-        );
-    }
-
-    /// `merge.verifySignatures` makes `git merge` run `gpg.program` on the commit it would take.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn linked_worktree_controller_git_runs_no_gpg_program_for_merge() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace, forged, marker) = worktree_with_a_planted_program();
-        git(&main, &["config", "merge.verifySignatures", "true"]);
-        let merged = super::sandboxed_git_command_at(store.shared(), &workspace)
-            .expect("narrow Git")
-            .env("TMPDIR", &workspace)
-            .args(["merge", "--ff-only", &forged])
-            .output_bounded()
-            .expect("sandboxed merge");
-        assert!(
-            !merged.status.success(),
-            "an unverifiable commit is not merged"
-        );
-        assert!(!marker.exists(), "the controller's Git ran gpg.program");
-    }
-
-    /// `rm`'s unlanded-work proof and `ls --landing` read a linked worktree through another
-    /// repository's object store (`with_alternate_objects`). That is a read, not a fetch: no shell
-    /// runs, so it works under the Git-only profile that main-tree include grants impose.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn an_alternate_object_read_works_under_main_tree_include_grants() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace) = linked_worktree(&["../tooling/workspace.gitconfig"]);
-        fs::create_dir_all(main.join("tooling")).expect("tooling");
-        fs::write(
-            main.join("tooling/workspace.gitconfig"),
-            "[core]\n\tabbrev = 12\n",
-        )
-        .expect("included config");
-        let other = repository();
-        let objects = other.join(".git/objects").canonicalize().expect("objects");
-        let held = GitRepository::from_root(store.shared(), &workspace)
-            .with_alternate_objects(objects)
-            .expect("alternate objects")
-            .content_not_held("HEAD", "HEAD")
-            .await
-            .expect("an alternate-object read is not a fetch");
-        assert_eq!(held, crate::git::ContentNotHeld::default());
-    }
-
-    /// A driver added after the command was built — by a job of this or a sibling workspace,
-    /// between construction and spawn — is named by no override, and still cannot run.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_driver_added_after_construction_cannot_run() {
-        let store = crate::temp_root::FixtureStore::new();
-        let (main, workspace, _, marker) = worktree_with_a_planted_program();
-        let mut command =
-            super::sandboxed_git_command_at(store.shared(), &workspace).expect("narrow Git");
-        git(
-            &main,
-            &[
-                "config",
-                "filter.late.clean",
-                workspace.join("planted-gpg").to_str().expect("UTF-8"),
-            ],
-        );
-        fs::write(workspace.join(".gitattributes"), "README filter=late\n").expect("attributes");
-        fs::write(workspace.join("README"), "changed\n").expect("change README");
-        let _ = command
-            .args(["add", "README"])
-            .output_bounded()
-            .expect("sandboxed add");
-        assert!(
-            !marker.exists(),
-            "a late driver ran under the controller's Git"
-        );
-    }
-
-    /// Controller Git run for a fixture writes its sandbox profile into the fixture's own store,
-    /// never the host's (04_sandbox.md, "Exec pipeline" step 4). A runner without a host store,
-    /// like CI, otherwise refuses every controller Git command for a store nobody asked it to
-    /// serve.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn controller_git_writes_its_profile_into_the_store_it_serves() {
-        let store = crate::temp_root::FixtureStore::new();
-        let root = repository();
-        let head = GitRepository::from_root(store.shared(), &root)
-            .head_oid()
-            .await
-            .expect("controller Git runs for the fixture's store");
-        assert_eq!(head.as_str().len(), 40);
-        let profiles: Vec<PathBuf> = fs::read_dir(crate::exec::profile_directory(store.shared()))
-            .expect("the served store holds the profile directory")
-            .map(|entry| entry.expect("profile entry").path())
-            .filter(|path| path.extension() == Some(std::ffi::OsStr::new("sb")))
-            .collect();
-        assert_eq!(
-            profiles.len(),
-            1,
-            "one profile for one plain checkout: {profiles:?}"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
     #[test]
     fn driver_overrides_switch_off_every_named_driver() {
         let listing = b"core.abbrev\0filter.lfs.clean\0filter.lfs.smudge\0filter.a.b.process\0merge.ours.driver\0diff.img.textconv\0diff.ext.command\0merge.ours.name\0";
@@ -7064,7 +5939,7 @@ mod tests {
     /// beside it (`with_extension`) lands inside that scratch too, and dropping the fixture
     /// removes the scratch on every exit path: a failed assertion unwinds through `TempRoot`'s
     /// `Drop` exactly as a passing test does.
-    struct Repository {
+    pub(super) struct Repository {
         root: PathBuf,
         _scratch: crate::temp_root::TempRoot,
     }
@@ -7148,7 +6023,7 @@ mod tests {
     /// subject and a nested path, and a merge, which lists what it changes against its first parent.
     #[tokio::test]
     async fn a_range_listing_names_each_commit_with_its_subject_and_first_parent_paths() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         let base = repo.head_oid().await.expect("read base");
@@ -7200,7 +6075,7 @@ mod tests {
     /// repository: its store stays as the merge found it.
     #[tokio::test]
     async fn no_merge_driver_makes_a_branch_merge_to_the_target_tree() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         fs::write(root.join("ours"), "base\n").expect("write ours");
@@ -7296,10 +6171,9 @@ mod tests {
         assert!(!changes_path(&changes, b"dir/x/y"));
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn tracked_paths_keep_raw_names_and_exclude_ignored_outputs() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         // Every byte git's quoting would rewrite without `-z` (non-ASCII under the default
         // `core.quotePath`, a tab, a double quote), in a name APFS accepts: it refuses a name that
@@ -7318,7 +6192,7 @@ mod tests {
 
     /// A committed repository on `main`, cloned from this run's template ([`write_repository`]):
     /// the run's first fixture writes it, and every fixture after it starts no git.
-    fn repository() -> Repository {
+    pub(super) fn repository() -> Repository {
         let scratch = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
             "cowshed-git-test",
@@ -7443,7 +6317,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_carry_clean_and_ref_preserve_source_bytes_and_index() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         for linked in [false, true] {
             for session in [false, true] {
                 let main = repository();
@@ -7619,7 +6493,7 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_hidden_paths_are_junk_and_do_not_make_a_tree_dirty() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let git = GitRepository::from_root(store.shared(), &root);
         assert!(!git.is_dirty().await.expect("clean fixture"));
@@ -7772,7 +6646,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandon_bundle_main_picked_is_held_and_one_with_more_work_is_not() {
         use super::bundle_is_held;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         git(&root, &["checkout", "-q", "-b", "work"]);
@@ -7875,7 +6749,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandon_bundle_main_holds_the_tips_of_is_measured_from_its_header_alone() {
         use super::bundle_is_held;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         git(&root, &["checkout", "-q", "-b", "work"]);
@@ -7919,7 +6793,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandon_bundle_main_lacks_the_tips_of_is_measured_from_its_sidecar() {
         use super::{UNCOMMITTED_REF, bundle_is_held};
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main_root = repository();
         let main_repo = GitRepository::from_root(store.shared(), &main_root);
         let workspace = workspace_of(&main_root, "abandoned");
@@ -7991,7 +6865,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandon_bundle_without_a_sidecar_is_measured_by_fetching_it() {
         use super::bundle_is_held;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main_root = repository();
         let main_repo = GitRepository::from_root(store.shared(), &main_root);
         let workspace = workspace_of(&main_root, "legacy");
@@ -8145,7 +7019,7 @@ mod tests {
     /// they were.
     #[tokio::test]
     async fn uncommitted_work_commits_on_head_and_leaves_the_repository_as_it_was() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         for name in ["gone", "moved"] {
@@ -8217,7 +7091,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_untracked_path_main_holds_identically_was_inherited_not_written() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let main = repository();
         let git = GitRepository::from_root(store.shared(), &root);
@@ -8377,7 +7251,7 @@ mod tests {
 
     #[tokio::test]
     async fn minting_without_direnv_leaves_repository_hooks_absent() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let workspace = root.with_extension("plain-workspace");
         copy_tree(&root, &workspace);
@@ -8414,7 +7288,7 @@ mod tests {
     /// gated a tree that was not its commit, and its land then refused it as dirty.
     #[tokio::test]
     async fn a_clone_of_main_starts_at_mains_committed_head() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         fs::write(root.join(".gitignore"), "/ignored/\n").expect("ignore rules");
         fs::write(root.join("kept.txt"), "committed\n").expect("tracked file");
@@ -8499,7 +7373,7 @@ mod tests {
     #[tokio::test]
     async fn a_clone_of_main_leaves_the_volumes_own_bookkeeping_alone() {
         use std::os::unix::fs::PermissionsExt;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let workspace = root.with_extension("bookkeeping-workspace");
         copy_tree(&root, &workspace);
@@ -8546,7 +7420,7 @@ mod tests {
 
     #[tokio::test]
     async fn minting_preserves_project_shell_hooks_without_a_managed_loader() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         for linked in [false, true] {
             let root = repository();
             let hook = if linked {
@@ -8596,7 +7470,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_head_has_no_current_branch() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let status = Command::new("git")
             .arg("-C")
@@ -8615,7 +7489,7 @@ mod tests {
 
     #[tokio::test]
     async fn current_branch_propagates_unexpected_git_failure() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let missing_root = root.join("missing");
         let error = GitRepository::from_root(store.shared(), &missing_root)
@@ -8673,7 +7547,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovers_repository_and_reads_head() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::discover(store.shared(), root.join(".git"))
             .await
@@ -8694,7 +7568,7 @@ mod tests {
 
     #[tokio::test]
     async fn cowshed_excludes_are_idempotent_preserve_user_patterns_and_hide_runtime_state() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let exclude = root.join(".git/info/exclude");
         fs::write(&exclude, b"user-pattern").expect("seed user exclude");
@@ -8741,7 +7615,7 @@ mod tests {
 
     #[tokio::test]
     async fn cowshed_exclude_wiring_rejects_a_symlink_target() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let exclude = root.join(".git/info/exclude");
         let unrelated = root.join("unrelated");
@@ -8765,7 +7639,7 @@ mod tests {
     /// Main's exclude file has to read exactly as it did before the refusal.
     #[tokio::test]
     async fn cowshed_exclude_wiring_refuses_a_linked_pointer_root_and_leaves_main_untouched() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let scratch = main.parent().expect("scratch root").to_path_buf();
         let pointer_root = scratch.join("raven");
@@ -8798,7 +7672,7 @@ mod tests {
     /// the preserved state is the one that was captured.
     #[tokio::test]
     async fn rename_work_digest_changes_when_dirty_and_untracked_bytes_change() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
 
@@ -8835,7 +7709,7 @@ mod tests {
     /// can carry by path, so the digest refuses it before any capture, naming it and the way out.
     #[tokio::test]
     async fn rename_work_refuses_an_untracked_nested_repository() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let nested = root.join("nested");
         fs::create_dir_all(&nested).expect("nested directory");
@@ -8882,7 +7756,7 @@ mod tests {
     /// An untracked symlink's target bytes are work, so retargeting it changes the digest.
     #[tokio::test]
     async fn rename_work_digest_covers_untracked_symlink_targets() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         symlink("a", root.join("ln")).expect("untracked link");
@@ -8905,7 +7779,7 @@ mod tests {
     /// The branch header is part of the digest: a switch at the same HEAD changes it.
     #[tokio::test]
     async fn rename_work_digest_covers_the_branch_header() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         let first = repo
@@ -8927,7 +7801,7 @@ mod tests {
     /// different depths; the branch survives restoration.
     #[tokio::test]
     async fn restored_inherited_links_compare_by_path_and_branch_survives_restoration() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let source = repository();
         let scratch = source.parent().expect("scratch root").to_path_buf();
         fs::create_dir_all(source.join("deps")).expect("deps directory");
@@ -8998,7 +7872,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_standalone_workspace_branch_and_only_the_local_main_remote() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let status = Command::new("git")
             .arg("-C")
@@ -9066,7 +7940,7 @@ mod tests {
     /// has since dropped goes too, so `rm` has the workspace's one branch to judge.
     #[tokio::test]
     async fn mint_keeps_only_the_workspace_branch() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         git(&main, &["branch", "carried"]);
         git(&main, &["branch", "moved"]);
@@ -9109,7 +7983,7 @@ mod tests {
     /// what the first pass recorded, and a fork of that workspace carries them.
     #[tokio::test]
     async fn a_fork_resolves_main_without_a_fetch() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         git(&main, &["branch", "carried"]);
         let tip = git_stdout(&main, &["rev-parse", "main"]);
@@ -9173,7 +8047,7 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_workspace_resume_accepts_only_its_current_branch() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         // A different repository: two fixtures made in one second can share a commit id.
@@ -9268,7 +8142,7 @@ mod tests {
     /// registration, no second repository, the branch in main's namespace, and no remote at all.
     #[tokio::test]
     async fn adopting_a_clone_as_a_linked_worktree_leaves_one_registration_and_no_remote() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         // Uncommitted work in main is carried by the clone, and must read as modified rather than
         // as the wholesale deletion an empty index would report.
@@ -9335,7 +8209,7 @@ mod tests {
     /// handoff and a crash after it both resume to the same bytes, and the source is never touched.
     #[tokio::test]
     async fn rename_preserves_linked_source_index_wip_and_branch_across_resumed_handoff() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let scratch = main.parent().expect("scratch root").to_path_buf();
         let source = scratch.join("raven");
@@ -9443,7 +8317,7 @@ mod tests {
 
     #[tokio::test]
     async fn linked_worktree_resume_reuses_completed_registration() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let mount = clone_image(&main);
         let workspace = GitRepository::from_root(store.shared(), &mount);
@@ -9630,7 +8504,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fork_repairs_links_from_its_producer_without_changing_git_identity() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let trees = ThreeDepths::new(true);
         let workspace = GitRepository::from_root(store.shared(), &trees.destination);
         let branch = workspace.current_branch().await.expect("inherited branch");
@@ -9650,7 +8524,7 @@ mod tests {
     #[tokio::test]
     async fn a_standalone_mint_resolves_inherited_links_against_its_source_and_remotes_against_main()
      {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let trees = ThreeDepths::new(true);
         let workspace = GitRepository::from_root(store.shared(), &trees.destination);
         workspace
@@ -9671,7 +8545,7 @@ mod tests {
     #[tokio::test]
     async fn a_linked_worktree_mint_resolves_inherited_links_against_its_source_and_registers_in_main()
      {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let trees = ThreeDepths::new(true);
         let workspace = GitRepository::from_root(store.shared(), &trees.destination);
         workspace
@@ -9709,7 +8583,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_inherited_link_writes_nothing_and_a_resumed_mint_repairs_it_from_the_source()
     {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let trees = ThreeDepths::new(false);
         let workspace = GitRepository::from_root(store.shared(), &trees.destination);
         let error = workspace
@@ -9763,7 +8637,7 @@ mod tests {
     /// `git worktree prune` would silently take with it.
     #[tokio::test]
     async fn unregistering_one_worktree_spares_a_detached_sibling() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let raven = clone_image(&main);
         let detached = main.with_extension("detached");
@@ -9796,7 +8670,7 @@ mod tests {
     /// repair runs from main's new path and has to fix both directions.
     #[tokio::test]
     async fn repair_reconciles_both_pointers_after_main_moves() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let mount = clone_image(&main);
         GitRepository::from_root(store.shared(), &mount)
@@ -9842,7 +8716,7 @@ mod tests {
     /// both collisions have to be refused rather than silently renamed by git.
     #[tokio::test]
     async fn adoption_refuses_a_branch_or_registration_main_already_holds() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let mount = clone_image(&main);
         let status = Command::new("git")
@@ -9866,7 +8740,7 @@ mod tests {
     /// afterwards rather than by whether a command was issued.
     #[tokio::test]
     async fn main_remote_configuration_is_idempotent_and_never_clobbers_a_foreign_remote() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let mount = PathBuf::from("/tmp/cowshed-canonical-mount");
         let repo = GitRepository::from_root(store.shared(), &root);
@@ -9950,7 +8824,7 @@ mod tests {
     /// while `mv` and `attach` both reported success.
     #[tokio::test]
     async fn a_legacy_main_remote_naming_a_dead_path_is_reclaimed_rather_than_stood_beside() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let mount = root.join("main-mount");
         fs::create_dir_all(&mount).expect("main mount");
@@ -9985,7 +8859,7 @@ mod tests {
     /// workspace's user named `host` and never removes it.
     #[tokio::test]
     async fn a_remote_named_host_is_the_users_and_survives_configuration() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let theirs = PathBuf::from("/tmp/cowshed-users-host-remote");
         let mount = PathBuf::from("/tmp/cowshed-canonical-mount");
@@ -10011,7 +8885,7 @@ mod tests {
     /// Reverse registration lives in main's repository and disappears with the workspace.
     #[tokio::test]
     async fn workspace_registration_round_trips_and_absent_removal_succeeds() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let mount = PathBuf::from("/tmp/cowshed-raven-mount");
         let main = GitRepository::from_root(store.shared(), &root);
@@ -10048,7 +8922,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_non_utf8_main_remote_argument() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let main_mount = PathBuf::from(OsString::from_vec(b"/tmp/cowshed-main-\xff".to_vec()));
         let repo = GitRepository::from_root(store.shared(), &root);
@@ -10091,19 +8965,14 @@ mod tests {
 
     #[tokio::test]
     async fn repository_probe_propagates_filesystem_query_errors() {
-        #[cfg(target_os = "macos")]
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let loop_path = root.join("filesystem-loop");
         symlink(&loop_path, &loop_path).expect("create symlink loop");
 
-        let error = is_git_repository(
-            #[cfg(target_os = "macos")]
-            store.shared(),
-            &loop_path,
-        )
-        .await
-        .expect_err("an undetermined path is not an absent repository");
+        let error = is_git_repository(store.shared(), &loop_path)
+            .await
+            .expect_err("an undetermined path is not an absent repository");
         assert!(
             error.to_string().contains("filesystem-loop"),
             "error must identify the path whose state could not be read: {error}"
@@ -10114,7 +8983,7 @@ mod tests {
 
     #[tokio::test]
     async fn preservation_requires_a_host_branch_or_cowshed_ref_containing_the_commit() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let host = repository();
         let host_repo = GitRepository::from_root(store.shared(), &host);
         let host_head = host_repo.head_oid().await.expect("read host head");
@@ -10210,7 +9079,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_in_progress_operation() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         fs::write(root.join(".git/MERGE_HEAD"), "deadbeef\n").expect("write merge marker");
         let error = GitRepository::from_root(store.shared(), &root)
@@ -10231,7 +9100,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_auto_merge_is_not_an_in_progress_operation() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         fs::write(root.join(".git/AUTO_MERGE"), "deadbeef\n").expect("write stale merge tree");
         let git = GitRepository::from_root(store.shared(), &root);
@@ -10321,7 +9190,7 @@ mod tests {
     }
 
     /// `git <args>` in `root`, committing as the fixture's author: a CI runner has no global identity.
-    fn git(root: &Path, args: &[&str]) {
+    pub(super) fn git(root: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
             .arg(root)
@@ -10340,7 +9209,7 @@ mod tests {
     #[tokio::test]
     async fn a_repository_copied_off_a_case_insensitive_volume_reads_case_sensitive_once_recorded()
     {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         git(&root, &["config", "core.ignorecase", "true"]);
         GitRepository::from_root(store.shared(), &root)
@@ -10359,7 +9228,7 @@ mod tests {
 
     #[tokio::test]
     async fn ancestry_answers_landed_and_treats_an_unknown_object_as_not_held() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         let base = repo.head_oid().await.expect("read base");
@@ -10419,7 +9288,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlanded_count_falls_back_to_the_whole_history_without_a_usable_exclude() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
         let base = repo.head_oid().await.expect("read base");
@@ -10448,7 +9317,7 @@ mod tests {
 
     #[tokio::test]
     async fn rewritten_main_bundle_matches_the_live_range_and_fetches_into_an_empty_repository() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let main = repository();
         let main_repo = GitRepository::from_root(store.shared(), &main);
         commit_on(&main, "old-one");
@@ -10575,7 +9444,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_empty_repository_verification_leaves_the_workspace_intact() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let workspace = repository();
         let repo = GitRepository::from_root(store.shared(), &workspace);
         let base = repo.head_oid().await.expect("read base");
@@ -10631,7 +9500,7 @@ mod tests {
     #[tokio::test]
     async fn a_retried_abandonment_keeps_its_verified_bundle_and_ignores_a_lock_at_its_name() {
         use std::os::unix::fs::MetadataExt as _;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
 
         let workspace = repository();
         let repo = GitRepository::from_root(store.shared(), &workspace);
@@ -10673,7 +9542,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_cowshed_upstream_does_not_write_and_skips_a_foreign_main() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let workspace = repository();
         let main_mount = repository();
         let repo = GitRepository::from_root(store.shared(), &workspace);
@@ -10706,7 +9575,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_cowshed_upstream_reports_a_dead_owned_remote_and_configure_clears_it() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let workspace = repository();
         let main_mount = repository();
         let dead = workspace.join("gone-checkout");

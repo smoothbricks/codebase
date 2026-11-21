@@ -48,6 +48,15 @@ use crate::storage::trace_segment::{
     seal_segment, system_fields, trace_batch,
 };
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The name of a process span's start and end rows.
 pub const PROCESS_RUN: &str = "process.run";
 
@@ -140,44 +149,6 @@ trace_enum! {
 }
 
 impl ExitSignal {
-    /// Linux's real-time signals `32..=64`, indexed by their offset from 32.
-    #[cfg(target_os = "linux")]
-    const REAL_TIME: [Self; 33] = [
-        Self::Rt32,
-        Self::Rt33,
-        Self::Rt34,
-        Self::Rt35,
-        Self::Rt36,
-        Self::Rt37,
-        Self::Rt38,
-        Self::Rt39,
-        Self::Rt40,
-        Self::Rt41,
-        Self::Rt42,
-        Self::Rt43,
-        Self::Rt44,
-        Self::Rt45,
-        Self::Rt46,
-        Self::Rt47,
-        Self::Rt48,
-        Self::Rt49,
-        Self::Rt50,
-        Self::Rt51,
-        Self::Rt52,
-        Self::Rt53,
-        Self::Rt54,
-        Self::Rt55,
-        Self::Rt56,
-        Self::Rt57,
-        Self::Rt58,
-        Self::Rt59,
-        Self::Rt60,
-        Self::Rt61,
-        Self::Rt62,
-        Self::Rt63,
-        Self::Rt64,
-    ];
-
     /// The host's signal `signal`, or `None` for a number this host never delivers.
     pub fn from_raw(signal: i32) -> Option<Self> {
         Some(match signal {
@@ -210,20 +181,8 @@ impl ExitSignal {
             libc::SIGWINCH => Self::Winch,
             libc::SIGUSR1 => Self::Usr1,
             libc::SIGUSR2 => Self::Usr2,
-            #[cfg(target_os = "macos")]
-            libc::SIGEMT => Self::Emt,
-            #[cfg(target_os = "macos")]
-            libc::SIGINFO => Self::Info,
-            #[cfg(target_os = "linux")]
-            libc::SIGSTKFLT => Self::Stkflt,
-            #[cfg(target_os = "linux")]
-            libc::SIGPWR => Self::Pwr,
-            #[cfg(target_os = "linux")]
-            real_time @ 32..=64 => {
-                let offset = usize::try_from(real_time - 32).ok()?;
-                *Self::REAL_TIME.get(offset)?
-            }
-            _ => return None,
+            // What only this host's kernel delivers is its own table.
+            other => return platform::host_signal(other),
         })
     }
 }
@@ -1223,7 +1182,7 @@ mod tests {
 
     #[test]
     fn every_signal_this_host_delivers_has_one_declared_name() {
-        let highest = if cfg!(target_os = "linux") { 64 } else { 31 };
+        let highest = platform::HIGHEST_SIGNAL;
         let mut names = (1..=highest)
             .map(|signal| {
                 ExitSignal::from_raw(signal)

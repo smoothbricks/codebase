@@ -14,19 +14,29 @@
 //! foreign holder: the operation's own leases and image locks already refuse the operations a
 //! census guards.
 
-#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
-#[cfg(target_os = "macos")]
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+// The kernel's unique id of the running process `pid` where the kernel gives one: `None` once
+// it has exited, and always on Linux, which records none.
+use platform::unique_id;
 
 /// The process a lease file names. Read from either lease, so a land lease's `holding` is not one
 /// of its fields.
@@ -74,20 +84,6 @@ fn display_command(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> S
     command
 }
 
-/// The kernel's unique id of the running process `pid`; `None` once it has exited.
-#[cfg(target_os = "macos")]
-fn unique_id(pid: u32) -> io::Result<Option<crate::api::held_lock::DecimalU64>> {
-    let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
-    Ok(crate::runtime::job_groups::process_record(pid)?
-        .map(|record| crate::api::held_lock::DecimalU64::new(record.unique_id)))
-}
-
-/// Linux records no unique id: its census asks every process (`procfs_census`).
-#[cfg(not(target_os = "macos"))]
-fn unique_id(_pid: u32) -> io::Result<Option<crate::api::held_lock::DecimalU64>> {
-    Ok(None)
-}
-
 /// Write `holder` into the lease `file` this process has just locked, replacing whatever an
 /// earlier holder left: the record's bytes are truncated and rewritten on the locked inode itself,
 /// which is never unlinked or replaced, so the lock and every waiter queued on it stay with it.
@@ -123,8 +119,9 @@ pub fn clear(file: &File, path: &Path) {
 /// cannot read names nothing, and so does a store the owner enumeration refuses (a layout that
 /// predates owner markers): the census then asks those processes, as it asks any other. This
 /// process is always asked, lease or not (02_workspaces.md: genuine holders, including the
-/// controller's own pid, refuse).
-#[cfg(target_os = "macos")]
+/// controller's own pid, refuse). Only Darwin's census consults it: Linux's asks every process,
+/// and no lease there carries a unique id, so it would name none.
+#[allow(dead_code)]
 pub(crate) fn running_lifecycle(
     store: &Path,
     mut read: impl FnMut(&Path) -> io::Result<Vec<u8>>,
@@ -156,7 +153,6 @@ pub(crate) fn running_lifecycle(
 }
 
 /// The subdirectories of `directory`; none when it cannot be listed.
-#[cfg(target_os = "macos")]
 fn directories(directory: &Path) -> Vec<PathBuf> {
     fs::read_dir(directory).map_or_else(
         |_| Vec::new(),
@@ -179,7 +175,6 @@ pub fn is_lease(name: &str) -> bool {
 }
 
 /// The intent and land lease files in a project's `sessions` directory ([`is_lease`]).
-#[cfg(target_os = "macos")]
 fn leases(sessions: &Path) -> Vec<PathBuf> {
     fs::read_dir(sessions).map_or_else(
         |_| Vec::new(),
@@ -234,100 +229,5 @@ mod tests {
             current.unique_id,
             Some(crate::api::held_lock::DecimalU64::new(42))
         );
-    }
-
-    /// A lease names this process with its unique id from the moment it is recorded, and records
-    /// nothing once cleared.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_recorded_holder_names_this_life_and_a_cleared_lease_names_nothing() {
-        let root = crate::temp_root::TempRoot::new("lease-holder");
-        let path = root.join("topic.intent.lock");
-        let file = File::create(&path).expect("lease file");
-        record(&file, &Process::this().expect("this process")).expect("record");
-        let written: Process =
-            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
-        assert_eq!(written.pid, std::process::id());
-        assert_eq!(
-            written.unique_id,
-            unique_id(std::process::id()).expect("own record")
-        );
-        assert!(written.unique_id.is_some());
-        clear(&file, &path);
-        assert!(fs::read(&path).expect("read").is_empty());
-    }
-
-    /// Only a marked owner's leases pass a process over (01_storage.md, "Owners are marked, never
-    /// inferred"; 02_workspaces.md, "Holders cowshed does not run"): a live process a marked
-    /// owner's lease names is found, while one a lease under the reserved `run/` namespace names
-    /// (marked or not, among thousands of entries there) or an unmarked directory's lease names is
-    /// asked like any other. A marked owner this user cannot list names nothing and fails nothing.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn only_a_marked_owners_leases_pass_a_process_over() {
-        use cowshed_os::fork_lock::Spawn as _;
-        use cowshed_os::test_backstop::ChildBackstop as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = crate::temp_root::TempRoot::new("lease-owners");
-        let store = root.join("store");
-        let live = || {
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg("read _")
-                .stdin(std::process::Stdio::piped())
-                .spawn_locked()
-                .expect("a live lease holder")
-        };
-        let lease = |owner: &str, holder: &std::process::Child| {
-            let sessions = store
-                .join(owner)
-                .join("widget")
-                .join(crate::repository::SESSIONS_DIRECTORY);
-            fs::create_dir_all(&sessions).expect("sessions");
-            let record = Process {
-                pid: holder.id(),
-                unique_id: unique_id(holder.id()).expect("its record"),
-                since: "2026-11-21T00:00:00Z".to_owned(),
-                command: "cowshed fork main topic".to_owned(),
-            };
-            assert!(record.unique_id.is_some(), "the holder runs");
-            fs::write(
-                sessions.join("topic.intent.lock"),
-                serde_json::to_vec(&record).expect("record"),
-            )
-            .expect("lease");
-        };
-        let mut holders = [live(), live(), live(), live()];
-        let [marked, reserved, unmarked, unreadable] = &holders;
-        lease("acme", marked);
-        crate::storage::bootstrap::write_owner_marker(&store.join("acme")).expect("mark acme");
-        lease("run", reserved);
-        crate::storage::bootstrap::write_owner_marker(&store.join("run")).expect("mark run");
-        for index in 0..4096 {
-            fs::write(store.join(format!("run/{index:032x}.sock.lock")), b"").expect("run entry");
-        }
-        lease("drifter", unmarked);
-        lease("locked", unreadable);
-        let locked = store.join("locked");
-        crate::storage::bootstrap::write_owner_marker(&locked).expect("mark locked");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock owner");
-        let denied = fs::read_dir(&locked)
-            .map(|_| ())
-            .expect_err("this user lists no project there");
-
-        let running = running_lifecycle(&store, |lease| fs::read(lease));
-
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock owner");
-        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied, "{denied}");
-        let pid = |holder: &std::process::Child| libc::pid_t::try_from(holder.id()).expect("pid");
-        assert_eq!(
-            running,
-            BTreeSet::from([pid(marked)]),
-            "only the marked owner's lease passes its holder over"
-        );
-        for holder in &mut holders {
-            drop(holder.stdin.take());
-            holder.wait_bounded().expect("the holder ends");
-        }
     }
 }

@@ -464,12 +464,20 @@ pub enum Labelled {
 /// Synchronous macOS/filesystem boundary. Implementations must use the primitives in
 /// `cowshed_apfs`; the storage executor calls this trait only through [`ApfsBlockingLane`].
 pub trait ApfsExecutionHost: Send + Sync + 'static {
-    /// Whether this host's workspaces are kernel volumes with physical identity: a label, a
-    /// device, a capacity and block statistics. A directory store has none of them, so the
-    /// executor and the runtime skip only the cosmetic steps (volume labels, volume sampling)
-    /// that exist for physical volumes; every physical claim such a host is asked for anyway is
-    /// refused with [`ApfsStorageError::Unsupported`].
+    /// Whether this host's workspaces are image files attached as kernel devices: a label, a
+    /// device and an extent map. A directory host has none of them, whatever its store, so the
+    /// executor and the runtime skip the steps that exist for images (volume labels, extent
+    /// proofs, seed compaction). What a host's payloads can do beyond that is its
+    /// [`Self::substrate`]'s to say (`StoreSubstrate::supports`, `has_volumes`), and an
+    /// operation a host is asked for without having it is refused with
+    /// [`ApfsStorageError::Unsupported`].
     const HAS_PHYSICAL_VOLUMES: bool = true;
+    /// What this host keeps a payload as. The image host answers APFS; a directory host answers
+    /// from the store it was built over, where a ZFS dataset is a volume with a capacity and
+    /// block statistics and a plain directory is not.
+    fn substrate(&self) -> crate::api::dto::StoreSubstrate {
+        crate::api::dto::StoreSubstrate::Apfs
+    }
     type LockGuard: Send + 'static;
     /// The holder census of this host's store ([`crate::census::CensusScope`]), built once when
     /// the host is.
@@ -653,7 +661,10 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// its mount is not as [`Substrate::ensure_mounted`] leaves it ([`Self::mount_settled`]): its
     /// volume, or the build volume its checkout links, lost a mount no cowshed release made, as a
     /// restart of `fseventsd` took about 100 on 2026-11-10 (05_gateway.md, "Lost mounts"). `None`
-    /// for a settled workspace and for a detached one, which holds nothing to lose.
+    /// for a settled workspace and for a detached one, which holds nothing to lose. A store of
+    /// ZFS datasets answers the dataset whose mount record stands while the kernel has it
+    /// mounted nowhere, as a pool import that mounted nothing leaves it; a store of plain
+    /// directories has no kernel mount to lose.
     fn lost_mount(
         &self,
         workspace: &LifecycleWorkspace,
@@ -869,6 +880,14 @@ pub enum ApfsStorageError {
     /// an unbinding took the workspace away with it.
     #[error("workspace image lock {0} is gone: the workspace was retired or its project unbound")]
     WorkspaceGone(PathBuf),
+    /// A ZFS clone depends on its origin snapshot, so a payload other payloads were forked from
+    /// cannot be retired or destroyed while they live (09_substrates.md, "The clone-origin
+    /// dependency"). `forks` names each dependent dataset.
+    #[error("{} still has {} it: {}", payload.display(), if forks.len() == 1 { "a fork that depends on" } else { "forks that depend on" }, forks.join(", "))]
+    DependentForks {
+        payload: PathBuf,
+        forks: Vec<String>,
+    },
     #[error("lifecycle conflict: {0}")]
     Conflict(#[from] super::lifecycle::Conflict),
     #[error("derived APFS state is inconsistent: {0}")]
@@ -897,11 +916,11 @@ pub enum ApfsStorageError {
     },
     #[error("unexpected lifecycle operation result")]
     UnexpectedResult,
-    /// A physical-volume operation asked of a backend whose workspaces are not kernel volumes.
-    #[error("{backend} storage does not support {operation}")]
+    /// A physical-volume operation asked of a host whose substrate has none.
+    #[error("{substrate} storage does not support {operation}")]
     Unsupported {
-        backend: &'static str,
-        operation: &'static str,
+        substrate: crate::api::dto::StoreSubstrate,
+        operation: crate::api::dto::SubstrateOperation,
     },
     #[error("invalid APFS lifecycle plan: {0}")]
     InvalidPlan(&'static str),
@@ -1083,7 +1102,6 @@ fn build_volume_held(
 
 /// What to do about a [`ApfsStorageError::BuildVolumeHeld`]: end the process that has it, or
 /// wait for it. Nothing about the store needs repair.
-#[cfg(target_os = "macos")]
 pub(crate) fn build_volume_held_hint(
     holds: &[cowshed_os::process::Holder],
     open: &[cowshed_os::process::Holder],
@@ -1197,7 +1215,6 @@ where
     /// [`ApfsStorageError::ImageLocksHeld`] instead of waiting: a pass finishing another process's
     /// residue runs so, since it never waits while it holds an intent lease (01_storage.md,
     /// "Lock order").
-    #[cfg(target_os = "macos")]
     pub(crate) fn take_image_locks(&mut self, mode: LockMode) -> LockMode {
         std::mem::replace(&mut self.image_lock_mode, mode)
     }
@@ -1205,7 +1222,6 @@ where
     /// Wait until no other process holds any of `locks`, then let go of them at once. Only a caller
     /// holding no intent lease waits (`_unleased`), so a verb on a name whose residue that caller
     /// would finish is never refused that name's lease meanwhile (01_storage.md, "Lock order").
-    #[cfg(target_os = "macos")]
     pub(crate) async fn wait_for_image_locks(
         &self,
         _unleased: super::recovery::Unleased<'_>,
@@ -2047,7 +2063,6 @@ where
 
     /// [`ApfsExecutionHost::lost_mount`] for `workspace`, read without its lock: what `doctor`
     /// reports, never what a remount acts on.
-    #[cfg(target_os = "macos")]
     pub(crate) async fn lost_mount(
         &self,
         workspace: &LifecycleWorkspace,
@@ -2088,7 +2103,6 @@ where
     /// [`Self::mount_without_waiting`], and a mount that needs the held lock waits for it in
     /// `flock` once it has said on stderr which processes hold it. The wait has no deadline of
     /// its own: the supervisor manager's start bound is its only one.
-    #[cfg(target_os = "macos")]
     pub(crate) async fn mount_for_supervisor(
         &self,
         workspace: &LifecycleWorkspace,
@@ -2176,7 +2190,6 @@ where
             })
             .await
     }
-    #[cfg(any(target_os = "macos", test))]
     /// Runs a non-lifecycle metadata mutation while holding the same hardened image lock used by
     /// APFS lifecycle operations. The job's result is deliberately opaque to this layer so callers
     /// can preserve their own error taxonomy while lock acquisition remains an APFS concern.
@@ -2198,7 +2211,6 @@ where
     /// same image lock lifecycle operations take: a re-adoption's retention and its build
     /// replacement's publication happen under main's lock, so staging collection, which takes
     /// it too before it acts, never interleaves with them.
-    #[cfg(target_os = "macos")]
     pub(crate) async fn dispatch_on_host_with_image_lock<T, F>(
         &self,
         lock_path: PathBuf,
@@ -3890,15 +3902,12 @@ mod tests {
         );
         let unseen = held(Vec::new(), Vec::new());
         assert!(unseen.contains("no process of this user holds"), "{unseen}");
-        #[cfg(target_os = "macos")]
-        {
-            let hint = build_volume_held_hint(&[], &[holder(64266, "cat /tmp/fifo")]);
-            assert_eq!(
-                hint,
-                "end pid 64266 (cat /tmp/fifo) or wait for it to exit, then retry"
-            );
-            assert!(!hint.contains("repair"), "{hint}");
-        }
+        let hint = build_volume_held_hint(&[], &[holder(64266, "cat /tmp/fifo")]);
+        assert_eq!(
+            hint,
+            "end pid 64266 (cat /tmp/fifo) or wait for it to exit, then retry"
+        );
+        assert!(!hint.contains("repair"), "{hint}");
     }
 
     fn identity() -> OperationIdentity {

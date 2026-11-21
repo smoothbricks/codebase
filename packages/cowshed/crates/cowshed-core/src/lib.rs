@@ -20,17 +20,16 @@ mod held_change;
 pub mod held_lock;
 pub mod host_dirs;
 pub mod host_load;
+pub mod host_path;
 pub mod host_pressure;
 pub mod host_readings;
 mod inherited_daemons;
-#[cfg(target_os = "macos")]
 mod inherited_git_locks;
 pub mod inherited_links;
 mod input_memo;
 pub mod land_turn;
 pub mod landing;
 pub mod lease_holder;
-#[cfg(target_os = "macos")]
 pub mod lost_mounts;
 pub mod media_room;
 pub mod metadata;
@@ -67,10 +66,16 @@ mod alloc_census;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;
+#[cfg(test)]
+#[path = "../tests/support/lock_program.rs"]
+mod lock_program;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/sandbox_launcher.rs"]
+mod sandbox_launcher;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]
 mod scratch_apfs;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[path = "../tests/support/scratch_directory.rs"]
 mod scratch_directory;
 #[cfg(all(test, target_os = "macos"))]

@@ -159,7 +159,6 @@ pub struct ProcessNode<'a> {
     pub exit: Option<&'a ProcessExit>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct IssuedSubtree {
     nonce: String,
@@ -171,7 +170,6 @@ struct Life {
     identity: ProcessIdentity,
     parent: Option<usize>,
     /// Issued once for this retained root, never copied to a sibling or a reused pid.
-    #[cfg(target_os = "macos")]
     subtree: Option<IssuedSubtree>,
     ppid: u32,
     /// Shared with the parent until this life execs: a fork copies no argv.
@@ -357,7 +355,6 @@ impl ProcessTreeFold {
     }
 
     /// A root's opaque capability stays attached to its retained life after exec or exit.
-    #[cfg(target_os = "macos")]
     pub(crate) fn subtree_nonce(&self, index: usize) -> Option<&str> {
         self.lives
             .get(index)?
@@ -367,7 +364,6 @@ impl ProcessTreeFold {
     }
 
     /// Only the native writer issues capabilities, after authenticating this live index.
-    #[cfg(target_os = "macos")]
     pub(crate) fn issue_subtree(&mut self, index: usize, nonce: String) {
         self.lives[index].subtree.get_or_insert(IssuedSubtree {
             nonce,
@@ -375,7 +371,6 @@ impl ProcessTreeFold {
         });
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn subtree_spent(&self, index: usize) -> bool {
         self.lives
             .get(index)
@@ -384,7 +379,6 @@ impl ProcessTreeFold {
     }
 
     /// Native success alone consumes the capability. Operational errors leave it retryable.
-    #[cfg(target_os = "macos")]
     pub(crate) fn spend_subtree(&mut self, index: usize) {
         self.lives[index]
             .subtree
@@ -479,7 +473,6 @@ impl ProcessTreeFold {
             parent,
             ppid,
             image,
-            #[cfg(target_os = "macos")]
             subtree: None,
             image_known,
             born_at: at,
@@ -692,7 +685,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn subtree_capability_stays_on_its_life_and_spending_cannot_be_reissued() {
         let mut fold = ProcessTreeFold::default();

@@ -15,6 +15,15 @@ use cowshed_core::{CowshedError, Result};
 use crate::gateway_service::InstalledBuild;
 use crate::launchd::HostStableExecutable;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The argument the after-land child is started with, before its request file.
 pub const VERB: &str = "__land-after";
 
@@ -195,11 +204,19 @@ fn installed_detail(
         argv.join(" ")
     ))
 }
-/// One command's run: its own outcome, and why its cgroup leaf could not be retired when it could
-/// not (Linux), said beside that outcome and never in its place.
+/// One command's run: its own outcome, and why its cgroup leaf could not be retired when it had
+/// one and it could not, said beside that outcome and never in its place.
 struct Executed {
     ran: std::result::Result<std::process::ExitStatus, String>,
     unretired: Option<String>,
+}
+
+/// The run of a command that had no leaf to retire, or never came to have one.
+fn ran(outcome: std::result::Result<std::process::ExitStatus, String>) -> Executed {
+    Executed {
+        ran: outcome,
+        unretired: None,
+    }
 }
 
 /// `detail`, with the leaf's retirement failure after it when there was one.
@@ -210,14 +227,11 @@ fn beside(unretired: Option<String>, detail: String) -> String {
     }
 }
 /// Run one command, `role`, in main's pure environment, its output appended to `log` as it comes
-/// and its silence bounded by [`SILENCE`]. Its members are its own process group on Darwin, and on
-/// Linux a cgroup leaf of its own inside this after-land job's cgroup, named for its log and
-/// retired once it ends, so nothing an earlier command left behind is counted as this one's.
+/// and its silence bounded by [`SILENCE`]. Who its members are is the platform's
+/// (`platform::run_to_log`): its own process group on Darwin, and on Linux a cgroup leaf of its
+/// own inside this after-land job's cgroup, named for its log and retired once it ends, so
+/// nothing an earlier command left behind is counted as this one's.
 fn execute(role: &'static str, request: &AfterRequest, argv: &[String], log: &Path) -> Executed {
-    let ran = |ran| Executed {
-        ran,
-        unretired: None,
-    };
     let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
     let environment: Vec<(OsString, OsString)> = request
         .environment
@@ -228,54 +242,11 @@ fn execute(role: &'static str, request: &AfterRequest, argv: &[String], log: &Pa
         Ok(output) => output,
         Err(error) => return ran(Err(format!("cannot open {}: {error}", log.display()))),
     };
-    let mut command =
-        match crate::declared_land::declared_command(&request.main, &argv, &environment) {
-            Ok(command) => command,
-            Err(error) => return ran(Err(error.message)),
-        };
-    #[cfg(target_os = "macos")]
-    return ran(cowshed_os::deadline::run_to_log(
-        role,
-        &mut command,
-        cowshed_os::deadline::Members::OwnGroup,
-        output,
-        SILENCE,
-    )
-    .map_err(|error| error.to_string()));
-    #[cfg(target_os = "linux")]
-    {
-        let own = match cowshed_os::process::own_cgroup() {
-            Ok(own) => own,
-            Err(error) => return ran(Err(error.to_string())),
-        };
-        let name = format!(
-            "after-{}",
-            log.file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
-        );
-        let leaf = match cowshed_core::runtime::job_cgroup::RunCgroup::inside(&own, &name) {
-            Ok(leaf) => leaf,
-            Err(error) => return ran(Err(error.to_string())),
-        };
-        let outcome = cowshed_os::deadline::run_to_log(
-            role,
-            &mut command,
-            cowshed_os::deadline::Members::Leaf {
-                cgroup: leaf.directory(),
-                path: leaf.path(),
-            },
-            output,
-            SILENCE,
-        )
-        .map_err(|error| error.to_string());
-        Executed {
-            ran: outcome,
-            unretired: leaf
-                .retire(cowshed_os::deadline::REAP)
-                .err()
-                .map(|error| error.to_string()),
-        }
-    }
+    let command = match crate::declared_land::declared_command(&request.main, &argv, &environment) {
+        Ok(command) => command,
+        Err(error) => return ran(Err(error.message)),
+    };
+    platform::run_to_log(role, command, log, output)
 }
 
 fn note(request: &AfterRequest, event: LandEvent, detail: String) {

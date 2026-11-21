@@ -110,7 +110,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         workspace_mount: mount,
         exec_temp_dir,
         store_root,
-        port_block: PortBlock::new(port_base, 16).expect("port block"),
+        port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,
@@ -887,7 +887,7 @@ fn probe_workspace(
     probe: &Path,
 ) -> SandboxConfig {
     let mut sandbox = workspace(root, block.base());
-    sandbox.port_block = block;
+    sandbox.port_block = Some(block);
     sandbox.retained_port_blocks = retained;
     sandbox.grants.read.push(probe.to_path_buf());
     sandbox
@@ -1136,9 +1136,9 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
             class: cowshed_core::api::dto::ExecClass::Background,
             held: false,
             started_ms: 0,
-            #[cfg(target_os = "macos")]
             nice: 0,
         },
+        membership: None,
     }
 }
 
@@ -2378,7 +2378,7 @@ async fn host_controller_managed_cargo_is_the_toolchain_and_the_installed_cli_st
             capability_env: &sandbox.capabilities.contribution,
         },
         cowshed_core::metadata::Platform::Macos,
-        Some(sandbox.port_block),
+        sandbox.port_block,
     )
     .expect("publish the controller's served environment");
     std::fs::write(

@@ -21,16 +21,30 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::num::{NonZeroU32, NonZeroU128};
+use std::num::NonZeroU128;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
-use crate::api::process::ProcessIoUnavailable;
 use crate::api::process::{ProcessCoverageGap, ProcessCpuWindow, ProcessStorageIo, ProcessUsage};
 use crate::api::resources::{
-    CpuMicros, OneCoreCpuPermille, ResidentBytes, ResourceUnitError, StorageIoBytes, WallMicros,
+    CpuMicros, OneCoreCpuPermille, ResidentBytes, ResourceUnitError, WallMicros,
 };
 use crate::runtime::process_tree::ProcessIdentity;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The platform's reader of a life's own counters: `sample(process, held, start, at)`, one
+/// signature on both, each fencing the read to the life by what its kernel gives (a held pidfd
+/// on Linux, the life's start and unique id on macOS). macOS's reader also carries what only
+/// its own accounting names: the Mach timebase its CPU times are kept in, and this process's
+/// own disk-write counter.
+pub use platform::*;
 
 /// When a process started, on the kernel clock the counters were read with: macOS
 /// `ri_proc_start_abstime`, Linux `starttime` clock ticks after boot. On macOS it tells the lives
@@ -362,89 +376,6 @@ pub enum Sampled {
     Unproven,
 }
 
-/// Read `process`'s own counters at the supervisor's sample tick `at`. `held` is
-/// the pidfd the observer opened for this very life. The caller folds a proven reading once.
-#[cfg(target_os = "linux")]
-pub fn sample(
-    process: ProcessIdentity,
-    held: std::os::fd::BorrowedFd<'_>,
-    at: Instant,
-) -> Result<Sampled, SampleError> {
-    let failed = |source| SampleError::Read {
-        pid: process.pid,
-        source,
-    };
-    let pid =
-        libc::pid_t::try_from(process.pid).map_err(|error| failed(io::Error::other(error)))?;
-    let Some(counters) = own_counters(pid).map_err(failed)? else {
-        return Ok(Sampled::Gone);
-    };
-    if !unreaped(held).map_err(failed)? {
-        return Ok(Sampled::Gone);
-    }
-    Ok(Sampled::Read(counters.reading(at)))
-}
-
-/// Read `process`'s own counters at the supervisor's sample tick `at`; the caller folds them.
-///
-/// A first read names the pid alone. It is of `process` if the pid names `process`'s unique id
-/// after the read: the observer saw that life before, and a life holds its pid until it is
-/// reaped, so it held it during the read too. That read anchors the life's start; every later
-/// read carries its own start, so it is fenced by the read itself, an exited life included.
-#[cfg(target_os = "macos")]
-pub fn sample(
-    start: Option<StartStamp>,
-    process: ProcessIdentity,
-    at: Instant,
-) -> Result<Sampled, SampleError> {
-    let failed = |source| SampleError::Read {
-        pid: process.pid,
-        source,
-    };
-    let pid =
-        libc::pid_t::try_from(process.pid).map_err(|error| failed(io::Error::other(error)))?;
-    let Some(counters) = own_counters(pid).map_err(failed)? else {
-        return Ok(Sampled::Gone);
-    };
-    match start {
-        Some(start) if counters.started != start => return Ok(Sampled::Gone),
-        Some(_) => {}
-        None => match crate::runtime::job_groups::process_record(pid).map_err(failed)? {
-            Some(record) if record.unique_id == process.birth.0 => {}
-            Some(_) => return Ok(Sampled::Gone),
-            // Exited, reaped or not: no unique id can be asked of it now.
-            None => return Ok(Sampled::Unproven),
-        },
-    }
-    Ok(Sampled::Read(counters.reading(at)))
-}
-
-/// Whether the process a pidfd names has not been reaped: signal 0 reaches an exited, unreaped
-/// process and fails with `ESRCH` only once it is reaped.
-#[cfg(target_os = "linux")]
-fn unreaped(held: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
-    use std::os::fd::AsRawFd as _;
-
-    // SAFETY: pidfd_send_signal reads a live descriptor and takes no info pointer.
-    let sent = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            held.as_raw_fd(),
-            0,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if sent == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(false);
-    }
-    Err(error)
-}
-
 /// A process's own counters, read in one call, named by pid alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OwnCounters {
@@ -476,244 +407,6 @@ fn unit(error: ResourceUnitError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-/// `proc_pid_rusage(RUSAGE_INFO_V4)`: the process's own CPU (not `ri_child_*`, the children it
-/// reaped), resident size and disk I/O bytes (`ri_diskio_*`: the I/O it issued to disk, which
-/// its cache hits issue none of), which still answers for an exited process its parent has not
-/// reaped. `None` once it is reaped. Its times are Mach ticks (xnu `task_power_info_locked`
-/// stores `rm_time_mach` unconverted; measured 125/3 ns per tick on Apple silicon), converted
-/// once by the timebase. An exited process (`ri_proc_exit_abstime` set) answers with the size
-/// it last held; it holds none.
-#[cfg(target_os = "macos")]
-fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is writable storage of the size the V4 flavor writes.
-    let result =
-        unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    // SAFETY: a successful call filled the V4 record.
-    let info = unsafe { info.assume_init() };
-    let tick = MachTick::read().map_err(io::Error::other)?;
-    let cpu = |ticks| tick.micros(ticks).map_err(unit);
-    let exited = info.ri_proc_exit_abstime != 0;
-    Ok(Some(OwnCounters {
-        started: StartStamp(info.ri_proc_start_abstime),
-        cpu_user: cpu(info.ri_user_time)?,
-        cpu_sys: cpu(info.ri_system_time)?,
-        resident: if exited {
-            ResidentBytes::ZERO
-        } else {
-            ResidentBytes::new(info.ri_resident_size).map_err(unit)?
-        },
-        io: ProcessStorageIo::Read {
-            read_bytes: StorageIoBytes::new(info.ri_diskio_bytesread).map_err(unit)?,
-            write_bytes: StorageIoBytes::new(info.ri_diskio_byteswritten).map_err(unit)?,
-        },
-        exited,
-    }))
-}
-
-/// The current process's observed disk-write counter, not an image or job total.
-/// Shares the native sampler with process spans; no children or later async writes.
-#[cfg(target_os = "macos")]
-pub(crate) fn own_process_write_bytes() -> io::Result<u64> {
-    // SAFETY: getpid has no pointer arguments or preconditions.
-    let counters = own_counters(unsafe { libc::getpid() })?
-        .ok_or_else(|| io::Error::other("current process has no rusage record"))?;
-    match counters.io {
-        ProcessStorageIo::Read { write_bytes, .. } => Ok(write_bytes.get()),
-        ProcessStorageIo::Unavailable { reason } => Err(io::Error::other(format!(
-            "process I/O unavailable: {reason:?}"
-        ))),
-    }
-}
-
-/// `struct mach_timebase_info` (`<mach/mach_time.h>`): one tick is `numer / denom` ns. The
-/// `libc` crate's declaration is deprecated in favor of another crate; this is all of it.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MachTimebase {
-    numer: u32,
-    denom: u32,
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
-}
-
-/// Why the length of a Mach tick could not be read.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum TimebaseError {
-    #[error("mach_timebase_info failed with kern_return_t {0}")]
-    Failed(libc::c_int),
-    #[error("mach_timebase_info reported a zero denominator")]
-    ZeroDenominator,
-}
-
-/// The length of one Mach tick: `numerator / denominator` nanoseconds (125/3 on Apple silicon,
-/// 1/1 on Intel). Kernel CPU times kept in ticks are converted through it once, never read as
-/// nanoseconds.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MachTick {
-    pub numerator: u32,
-    pub denominator: NonZeroU32,
-}
-
-#[cfg(target_os = "macos")]
-impl MachTick {
-    pub fn read() -> Result<Self, TimebaseError> {
-        let mut timebase = MachTimebase { numer: 0, denom: 0 };
-        // SAFETY: one writable timebase record.
-        let result = unsafe { mach_timebase_info(&mut timebase) };
-        if result != libc::KERN_SUCCESS {
-            return Err(TimebaseError::Failed(result));
-        }
-        Ok(Self {
-            numerator: timebase.numer,
-            denominator: NonZeroU32::new(timebase.denom).ok_or(TimebaseError::ZeroDenominator)?,
-        })
-    }
-
-    /// `ticks` of this length, in whole microseconds.
-    pub fn micros(self, ticks: u64) -> Result<CpuMicros, ResourceUnitError> {
-        CpuMicros::of_ticks(ticks, self.numerator, self.denominator)
-    }
-}
-
-/// `/proc/<pid>/stat`'s `utime` and `stime` (fields 14 and 15: the process's own, not the
-/// `cutime`/`cstime` of children it waited for), `starttime` (field 22) and `rss` pages
-/// (field 24), read at once, then its storage I/O ([`storage_io`]). An exited process keeps
-/// both until it is reaped; `None` once it is. An exited one (state `Z` or `X`) holds no memory.
-#[cfg(target_os = "linux")]
-fn own_counters(pid: libc::pid_t) -> io::Result<Option<OwnCounters>> {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
-            // An unmounted procfs proves nothing about `pid`.
-            std::fs::metadata("/proc/self/stat")?;
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let invalid = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("process {pid}'s stat {stat:?} {what}"),
-        )
-    };
-    // The command name is parenthesized and may hold anything; field 3 follows the last ')'.
-    // Walk only the required fields, once, without allocating a vector of every field.
-    let mut fields = stat
-        .rfind(')')
-        .map(|closing| stat[closing + 1..].split_whitespace())
-        .ok_or_else(|| invalid("has no command delimiter"))?;
-    let field = |value: Option<&str>| -> io::Result<u64> {
-        value
-            .ok_or_else(|| invalid("is too short"))?
-            .parse()
-            .map_err(|_| invalid("holds a field that is no count"))
-    };
-    let state = fields.next().ok_or_else(|| invalid("has no state"))?;
-    let user_ticks = field(fields.nth(10))?; // Field 14, after the consumed state (field 3).
-    let sys_ticks = field(fields.next())?; // Field 15.
-    let started = field(fields.nth(6))?; // Field 22, after field 15.
-    let exited = matches!(state, "Z" | "X");
-    let resident_pages = if exited {
-        0
-    } else {
-        field(fields.nth(1))? // Field 24, after field 22.
-    };
-    // SAFETY: sysconf takes a plain integer and touches no memory of ours.
-    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let hertz = u32::try_from(hertz)
-        .ok()
-        .and_then(NonZeroU32::new)
-        .ok_or_else(|| io::Error::other(format!("the clock tick rate {hertz} is no rate")))?;
-    // SAFETY: sysconf takes a plain integer and touches no memory of ours.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page = u64::try_from(page)
-        .map_err(|_| io::Error::other(format!("the page size {page} is no size")))?;
-    let cpu = |ticks| CpuMicros::of_ticks(ticks, 1_000_000_000, hertz).map_err(unit);
-    let resident = if exited {
-        ResidentBytes::ZERO
-    } else {
-        let bytes = resident_pages
-            .checked_mul(page)
-            .ok_or_else(|| invalid("holds more resident bytes than a u64 counts"))?;
-        ResidentBytes::new(bytes).map_err(unit)?
-    };
-    let Some(io) = storage_io(pid)? else {
-        return Ok(None);
-    };
-    Ok(Some(OwnCounters {
-        started: StartStamp(started),
-        cpu_user: cpu(user_ticks)?,
-        cpu_sys: cpu(sys_ticks)?,
-        resident,
-        io,
-        exited,
-    }))
-}
-
-/// `/proc/<pid>/io`'s `read_bytes` (reads the process caused to be fetched from storage; its
-/// page-cache hits count none) and `write_bytes` (pages it dirtied for storage, counted when
-/// dirtied, not at writeback). A refused read is [`ProcessIoUnavailable::NotPermitted`]; a
-/// missing file, of a process whose stat was just read, is a kernel without per-task I/O
-/// accounting -- unless the process was reaped meanwhile, which the caller's fence finds.
-/// `None` when the kernel says the process is gone (`ESRCH`).
-#[cfg(target_os = "linux")]
-fn storage_io(pid: libc::pid_t) -> io::Result<Option<ProcessStorageIo>> {
-    let text = match std::fs::read_to_string(format!("/proc/{pid}/io")) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return Ok(Some(ProcessStorageIo::Unavailable {
-                reason: ProcessIoUnavailable::NotPermitted,
-            }));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Some(ProcessStorageIo::Unavailable {
-                reason: ProcessIoUnavailable::NotAccounted,
-            }));
-        }
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let counter = |name: &str| -> io::Result<StorageIoBytes> {
-        let value = text
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("process {pid}'s io {text:?} has no {name}"),
-                )
-            })?;
-        let value = value.trim().parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("process {pid}'s io {name} {value:?} is no count"),
-            )
-        })?;
-        StorageIoBytes::new(value).map_err(unit)
-    };
-    Ok(Some(ProcessStorageIo::Read {
-        read_bytes: counter("read_bytes")?,
-        write_bytes: counter("write_bytes")?,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
@@ -721,9 +414,10 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use super::platform::own_counters;
     use super::{
         OwnCounters, ProcessUsageFold, Sampled, StartStamp, UsageFoldError, UsageObservation,
-        UsageReading, own_counters, sample,
+        UsageReading, sample,
     };
     use crate::api::process::{
         ProcessCoverageGap, ProcessCpuWindow, ProcessIoUnavailable, ProcessStorageIo, ProcessUsage,
@@ -1411,6 +1105,21 @@ mod tests {
         pidfd: std::os::fd::OwnedFd,
     }
 
+    impl Observed {
+        /// The pidfd held for the life, where the platform's observer holds one.
+        fn held(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsFd as _;
+                Some(self.pidfd.as_fd())
+            }
+            #[cfg(target_os = "macos")]
+            {
+                None
+            }
+        }
+    }
+
     fn observed(pid: u32) -> Observed {
         let pid_t = libc::pid_t::try_from(pid).expect("pid");
         #[cfg(target_os = "macos")]
@@ -1448,14 +1157,13 @@ mod tests {
 
     /// One supervisor tick's read of `life`, applied once to this test's fold.
     fn tick(fold: &mut ProcessUsageFold, life: &Observed) -> Sampled {
-        #[cfg(target_os = "linux")]
-        let sampled = {
-            use std::os::fd::AsFd as _;
-            sample(life.identity, life.pidfd.as_fd(), Instant::now())
-        };
-        #[cfg(target_os = "macos")]
-        let sampled = sample(fold.start(life.identity), life.identity, Instant::now());
-        let sampled = sampled.expect("a sample");
+        let sampled = sample(
+            life.identity,
+            life.held(),
+            fold.start(life.identity),
+            Instant::now(),
+        )
+        .expect("a sample");
         if let Sampled::Read(reading) = sampled {
             fold.apply(UsageObservation::Read {
                 process: life.identity,

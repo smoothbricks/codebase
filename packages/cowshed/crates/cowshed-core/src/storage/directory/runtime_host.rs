@@ -1,18 +1,21 @@
 //! The project controller's storage capabilities over a directory store.
 //!
-//! Build volumes are real payload directories (`build_volumes.rs`). Volume labels, capacities
-//! and re-adoption are physical-image operations: re-adoption moves a replaced main's image and
-//! its build image aside, attaches them read-only and proves the replacement sparse, and none of
-//! that has a directory counterpart, so each is refused with `ApfsStorageError::Unsupported`.
+//! Build volumes are real payload directories or datasets (`build_volumes.rs`), and a dataset's
+//! capacity is its `refquota`. Volume labels, defragmenting, seed compaction and re-adoption are
+//! physical-image operations: re-adoption moves a replaced main's image and its build image
+//! aside, attaches them read-only and proves the replacement sparse, and none of that has a
+//! directory or dataset counterpart, so each is refused with `ApfsStorageError::Unsupported`,
+//! naming the store's substrate and the operation.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::{DirectoryExecutionHost, unsupported};
+use super::DirectoryExecutionHost;
+use crate::api::dto::SubstrateOperation;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
-use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
+use crate::metadata::{DetachedWorkspaceMetadata, Platform, WorkspaceName};
 use crate::repository::RepoId;
 use crate::runtime::build_volumes::{HeldVolume, Quiet};
 use crate::runtime::storage_host::RuntimeStorageHost;
@@ -24,6 +27,10 @@ use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
 
 impl RuntimeStorageHost for DirectoryExecutionHost {
+    fn sidecar_platform(&self) -> Platform {
+        super::host_platform()
+    }
+
     fn canonical_metadata(
         &self,
         repo: &RepoId,
@@ -45,7 +52,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _image: &Path,
         _label: &str,
     ) -> Result<Labelled, ApfsStorageError> {
-        Err(unsupported("volume labels"))
+        Err(self.unsupported(SubstrateOperation::VolumeLabel))
     }
 
     fn create_build_volume(
@@ -228,34 +235,34 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _image: &Path,
         _mount: &Path,
     ) -> Result<Vec<cowshed_os::process::Holder>, ApfsStorageError> {
-        Err(unsupported("re-adoption volume holders"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn retain_re_adopt_source(&self, _source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn attached_capacity_bytes(&self, _image: &Path) -> Result<u64, ApfsStorageError> {
-        Err(unsupported("attached image capacities"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn retained_re_adopt_main_is_mounted(
         &self,
         _source: &ReAdoptSource,
     ) -> Result<bool, ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn mount_re_adopt_sources(&self, _source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn release_re_adopt_sources(&self, _source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn copy_re_adopt_build(&self, _source: &ReAdoptSource) -> Result<(), ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn require_sparse_replacement(
@@ -264,7 +271,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _retained: &Path,
         _capacity_bytes: u64,
     ) -> Result<(u64, u64), ApfsStorageError> {
-        Err(unsupported("sparse image replacement"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn publish_re_adopt_build(
@@ -275,7 +282,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _mbx: Option<&Path>,
         _retention: &[crate::capabilities::BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
-        Err(unsupported("re-adoption"))
+        Err(self.unsupported(SubstrateOperation::ReAdopt))
     }
 
     fn defragment_build_volume(
@@ -283,21 +290,21 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _layout: &BuildVolumeLayout,
         _claim: &ReleaseClaim,
     ) -> Result<crate::storage::lifecycle::DefragmentOutcome, ApfsStorageError> {
-        Err(unsupported("defragmenting a build volume"))
+        Err(self.unsupported(SubstrateOperation::DefragmentBuildVolume))
     }
 
     fn release_seed_compaction_leftovers(
         &self,
         _layout: &BuildVolumeLayout,
     ) -> Result<(), ApfsStorageError> {
-        Err(unsupported("compacting a seed"))
+        Err(self.unsupported(SubstrateOperation::CompactSeed))
     }
     fn stage_seed_compaction(
         &self,
         _layout: &BuildVolumeLayout,
         _seed: &BuildVolumeId,
     ) -> Result<crate::storage::apfs::native::CompactionSource, ApfsStorageError> {
-        Err(unsupported("compacting a seed"))
+        Err(self.unsupported(SubstrateOperation::CompactSeed))
     }
 
     fn copy_seed_compaction(
@@ -306,7 +313,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _minimum_extents: u64,
         _keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<crate::storage::apfs::native::SeedCompaction, ApfsStorageError> {
-        Err(unsupported("compacting a seed"))
+        Err(self.unsupported(SubstrateOperation::CompactSeed))
     }
 
     fn publish_seed_compaction(
@@ -316,7 +323,7 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _destination: &BuildVolumeId,
         _registration: crate::build_volume::Registration,
     ) -> Result<(), ApfsStorageError> {
-        Err(unsupported("compacting a seed"))
+        Err(self.unsupported(SubstrateOperation::CompactSeed))
     }
 
     fn catch_up_seed_compaction(
@@ -325,6 +332,6 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         _next: crate::storage::apfs::native::CompactionSource,
         _keep_going: &mut dyn FnMut(u64) -> std::ops::ControlFlow<String>,
     ) -> Result<crate::storage::apfs::native::SeedCatchUp, ApfsStorageError> {
-        Err(unsupported("compacting a seed"))
+        Err(self.unsupported(SubstrateOperation::CompactSeed))
     }
 }

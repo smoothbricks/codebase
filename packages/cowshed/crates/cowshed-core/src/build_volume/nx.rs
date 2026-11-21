@@ -1,6 +1,11 @@
 //! Nx's state inside a build volume: who holds its task database open, its daemon, and the
 //! run summary stock Nx writes after every run (16_build_volumes.md, "The adoption needs the
 //! target's Nx database closed", Land steps 4 to 7).
+//!
+//! Who holds a file, a tree or a volume is read from the platform's process table (`linux.rs`:
+//! procfs; `macos.rs`: libproc), selected here and nowhere else: each lists the live pids and a
+//! pid's lineage, names a pid's executable, and answers the descriptor, inode, tree and volume
+//! censuses over the processes a census asks about.
 
 use std::fs;
 use std::io;
@@ -24,7 +29,20 @@ pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 use cowshed_os::process::{DescriptorName, Holder};
 
-use crate::census::{Asked, CensusScope, Lineage, Listed};
+use crate::census::{CensusScope, Listed};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub(crate) use platform::inode_holders;
+use platform::{all_pids, census_pids, descriptor_holders, executable, lineage_of};
+pub use platform::{tree_holds, volume_holders};
 
 /// Processes, each as `pid <n> (<argv>)`, joined by `; `.
 pub struct Holders<'a>(pub &'a [Holder]);
@@ -99,7 +117,6 @@ impl std::fmt::Display for TreeHold {
 
 /// Every process holding anything inside the directory tree at `root` ([`tree_holds`]),
 /// without what it holds.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn tree_holders(census: &CensusScope, root: &Path) -> io::Result<Vec<Holder>> {
     Ok(tree_holds(census, root)?
         .into_iter()
@@ -140,7 +157,6 @@ pub fn discard_daemon_records(volume: &Path, state: &BuildVolumeState) -> io::Re
 /// state through the link when it opens it, as its clients do, so it serves the checkout on
 /// `into` as it did on `from`. A sandboxed daemon (a workspace keeper's) is left to exit: its
 /// grant names `from` alone, and its keeper starts the next one with a grant naming `into`.
-#[cfg(target_os = "macos")]
 pub fn hand_over_daemon_records(
     from: &Path,
     state: &BuildVolumeState,
@@ -200,7 +216,6 @@ impl std::fmt::Display for Busy {
 /// (`SIGTERM` to the pid its record names, `daemon/client/client.js` `stop`), wait for its exit,
 /// and ask once more. Any holder then is [`Busy`]; nothing is stopped except a daemon already
 /// asked to.
-#[cfg(target_os = "macos")]
 pub fn close(
     census: &CensusScope,
     volume: &Path,
@@ -280,7 +295,6 @@ fn first_held(
 
 /// Whether any process holds one `workspace-data` directory's task databases open. This never
 /// reads a daemon record, connects to its socket or signals a process.
-#[cfg(target_os = "macos")]
 pub(crate) fn held_workspace_data(
     census: &CensusScope,
     data: &Path,
@@ -291,7 +305,6 @@ pub(crate) fn held_workspace_data(
 /// Whether any process holds one of the volume's task databases open, without stopping
 /// anything: the second look [`close`] takes, for a caller that has to know nothing opened one
 /// since.
-#[cfg(target_os = "macos")]
 pub fn held(
     census: &CensusScope,
     volume: &Path,
@@ -313,7 +326,6 @@ pub fn held(
 /// one of the databases: an opener waits on the lock, then opens the database by its path, so
 /// through whatever the checkout's build link names once they are let go. Fenced (`fork_lock`):
 /// Nx gets them back when this is dropped, whatever this process is spawning.
-#[cfg(target_os = "macos")]
 #[must_use]
 pub struct Opens {
     _locks: Vec<cowshed_os::fork_lock::Fenced<fs::File>>,
@@ -321,7 +333,6 @@ pub struct Opens {
 
 /// A task database an Nx process is opening: the processes that have its open lock open, the
 /// one holding it and any waiting on it.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Opening {
     pub database: PathBuf,
@@ -335,7 +346,6 @@ pub struct Opening {
 /// Answers the held locks, or the first database an Nx process is opening right now, after
 /// letting go of the rest. While the locks are held, a final [`held`] check distinguishes
 /// existing database holders from openers waiting until these guards are dropped.
-#[cfg(target_os = "macos")]
 pub fn hold_opens(
     census: &CensusScope,
     volume: &Path,
@@ -412,7 +422,6 @@ pub(crate) fn live_daemon(data: &Path) -> Option<i32> {
 /// [`DAEMON_EXIT_GRACE`], which guards only against a hang. The daemon's own termination handler
 /// removes its socket and record. A worker that could not be ended is said on stderr, and the mount
 /// census names it while it holds the checkout.
-#[cfg(target_os = "macos")]
 fn stop_daemon(pid: i32) -> io::Result<bool> {
     let Some(daemon) = crate::runtime::job_groups::process_record(pid)? else {
         return Ok(true);
@@ -433,168 +442,10 @@ fn stop_daemon(pid: i32) -> io::Result<bool> {
     }
 }
 
-/// [`stop_daemon`] through a pidfd: opened before the signal, so an exit between the two is never
-/// missed, and the signal goes through the descriptor, so it can only ever reach the process the
-/// descriptor was opened on, never another that reuses the pid.
-#[cfg(target_os = "linux")]
-fn stop_daemon(pid: i32) -> io::Result<bool> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
-    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if opened < 0 {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            _ => Err(error),
-        };
-    }
-    let descriptor = i32::try_from(opened).map_err(io::Error::other)?;
-    // SAFETY: `descriptor` is a fresh descriptor this function alone owns.
-    let process = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    // SAFETY: a pidfd, SIGTERM, no siginfo and no flags: the call reads nothing else.
-    let signalled = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            process.as_raw_fd(),
-            libc::SIGTERM,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if signalled != 0 {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            _ => Err(error),
-        };
-    }
-    let mut poll = libc::pollfd {
-        fd: process.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = libc::c_int::try_from(DAEMON_EXIT_GRACE.as_millis()).map_err(io::Error::other)?;
-    loop {
-        // SAFETY: `poll` describes one live descriptor this function owns.
-        match unsafe { libc::poll(&mut poll, 1, timeout) } {
-            1 => return Ok(true),
-            0 => return Ok(false),
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-    }
-}
-
-/// Every process that has `path` open, from procfs: each `/proc/<pid>/fd` link that names the
-/// file. A process of another user, or one that exited since the listing, shows none.
-#[cfg(target_os = "linux")]
-pub fn holders(census: &CensusScope, path: &Path) -> io::Result<Vec<Holder>> {
-    let file = match fs::canonicalize(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let open = procfs_census(census, |process| {
-        fs::read_dir(process.join("fd"))
-            .is_ok_and(|descriptors| {
-                descriptors.flatten().any(|descriptor| {
-                    fs::read_link(descriptor.path()).is_ok_and(|link| link == file)
-                })
-            })
-            .then_some(())
-    })?;
-    Ok(open.into_iter().map(|(holder, ())| holder).collect())
-}
-
-/// [`holders`] of each of `files`, in order.
-#[cfg(target_os = "linux")]
-fn descriptor_holders(census: &CensusScope, files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
-    files.iter().map(|file| holders(census, file)).collect()
-}
-
-/// Every process with a descriptor on the inode `(device, inode)`, with those descriptors, from
-/// procfs: each `/proc/<pid>/fd` entry whose file (followed, so its device and inode, not its path)
-/// is that inode. A process of another user, or one that exited since the listing, shows none.
-#[cfg(target_os = "linux")]
-pub(crate) fn inode_holders(
-    census: &CensusScope,
-    identity: (u64, u64),
-) -> io::Result<Vec<(Holder, Vec<i32>)>> {
-    use std::os::unix::fs::MetadataExt;
-    procfs_census(census, |process| {
-        let descriptors: Vec<i32> = fs::read_dir(process.join("fd"))
-            .ok()?
-            .flatten()
-            .filter(|descriptor| {
-                fs::metadata(descriptor.path())
-                    .is_ok_and(|file| (file.dev(), file.ino()) == identity)
-            })
-            .filter_map(|descriptor| descriptor.file_name().to_str()?.parse().ok())
-            .collect();
-        (!descriptors.is_empty()).then_some(descriptors)
-    })
-}
-
-/// Every process holding anything on the volume mounted at `mount` -- an open file, a mapped
-/// file, its working directory, its root, its executable -- which is what keeps `umount`
-/// answering `EBUSY`. From procfs, so a process of another user, or one that exited since the
-/// listing, shows none.
-#[cfg(target_os = "linux")]
-pub fn volume_holders(census: &CensusScope, mount: &Path) -> io::Result<Vec<Holder>> {
-    tree_holders(census, mount)
-}
-
-/// Every process holding anything inside the directory tree at `root` -- its working directory,
-/// its root, its executable, an open file, a mapped file, checked in that order -- whether or not
-/// `root` is a volume's mount point, each with the first hold found. A plain checkout's holders,
-/// which `volume_holders` cannot name without naming its whole volume. From procfs, so a process
-/// of another user, or one that exited since the listing, shows none. `root` is canonicalized
-/// first, so a symlinked path names the tree its target does; a missing `root` has none.
-#[cfg(target_os = "linux")]
-pub fn tree_holds(census: &CensusScope, root: &Path) -> io::Result<Vec<TreeHold>> {
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let under = |link: PathBuf| link.starts_with(&root).then_some(link);
-    let holds = procfs_census(census, |process| {
-        let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(under);
-        link("cwd")
-            .map(Hold::WorkingDirectory)
-            .or_else(|| link("root").map(Hold::RootDirectory))
-            .or_else(|| link("exe").map(Hold::Executable))
-            .or_else(|| {
-                fs::read_dir(process.join("fd"))
-                    .ok()?
-                    .flatten()
-                    .find_map(|descriptor| fs::read_link(descriptor.path()).ok().and_then(under))
-                    .map(Hold::OpenFile)
-            })
-            // A mapping's path is its line's last field and the line's first `/`: the
-            // address range, permissions, offset, device and inode before it hold none.
-            .or_else(|| {
-                fs::read_to_string(process.join("maps"))
-                    .ok()?
-                    .lines()
-                    .find_map(|mapping| under(PathBuf::from(&mapping[mapping.find('/')?..])))
-                    .map(Hold::MappedFile)
-            })
-    })?;
-    Ok(holds
-        .into_iter()
-        .map(|(holder, hold)| TreeHold { holder, hold })
-        .collect())
-}
-
 /// Process-table walks this process has begun: every listing of all pids a holder census starts
-/// from ([`census_pids`] on macOS, a `/proc` read on Linux). Never on an interval and never in a
-/// supervisor's actor (02_workspaces.md, "Holders cowshed does not run"), but for the one exception
-/// that section admits: a land-turn head naming who has its outside lock open, once per 90 s report
+/// from ([`census_pids`]). Never on an interval and never in a supervisor's actor
+/// (02_workspaces.md, "Holders cowshed does not run"), but for the one exception that section
+/// admits: a land-turn head naming who has its outside lock open, once per 90 s report
 /// (`land_turn::take`). Tests read the count through [`process_table_walks`].
 static PROCESS_TABLE_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -607,152 +458,13 @@ fn walk_begins() {
     PROCESS_TABLE_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Every process `census` asks ([`census_pids`]) that `held` names something for, given its
-/// `/proc/<pid>` directory, with what it named.
-#[cfg(target_os = "linux")]
-fn procfs_census<T>(
-    census: &CensusScope,
-    held: impl Fn(&Path) -> Option<T>,
-) -> io::Result<Vec<(Holder, T)>> {
-    let mut holders = Vec::new();
-    for pid in census_pids(census)?.pids {
-        if let Some(hold) = held(Path::new(&format!("/proc/{pid}"))) {
-            holders.push((
-                Holder {
-                    pid,
-                    command: command_line(pid),
-                },
-                hold,
-            ));
-        }
-    }
-    Ok(holders)
-}
-
-/// Every pid procfs lists now: the one walker every Linux census starts from, counted once per
-/// census ([`walk_begins`]).
-#[cfg(target_os = "linux")]
-fn all_pids() -> io::Result<Vec<libc::pid_t>> {
-    walk_begins();
-    let mut pids = Vec::new();
-    for process in fs::read_dir("/proc")? {
-        if let Some(pid) = process?
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse().ok())
-        {
-            pids.push(pid);
-        }
-    }
-    Ok(pids)
-}
-
-/// `pid`'s argument vector joined by spaces, or its executable path, or a placeholder naming that
-/// neither could be read.
-#[cfg(target_os = "linux")]
-fn command_line(pid: libc::pid_t) -> String {
-    if let Ok(arguments) = fs::read(format!("/proc/{pid}/cmdline")) {
-        let command = arguments
-            .split(|&byte| byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .map(|argument| String::from_utf8_lossy(argument).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !command.is_empty() {
-            return command;
-        }
-    }
-    fs::read_link(format!("/proc/{pid}/exe")).map_or_else(
-        |_| "command unreadable".to_owned(),
-        |executable| executable.display().to_string(),
-    )
-}
-
 /// Every process with a descriptor open on the file at `path` ([`descriptor_holders`]). A missing
 /// file has none.
-#[cfg(target_os = "macos")]
 pub fn holders(census: &CensusScope, path: &Path) -> io::Result<Vec<Holder>> {
     Ok(descriptor_holders(census, &[path.to_owned()])?
         .into_iter()
         .flatten()
         .collect())
-}
-
-/// The processes with a descriptor open on each of `files`, in order, from one pass over the
-/// processes a census asks about ([`census_pids`]): each vnode descriptor's device and inode
-/// (`PROC_PIDFDVNODEINFO`) against each file's. Event-only opens hold nothing. A missing file has
-/// no holder. No mapped region is walked: a database or lock is only ever held through a
-/// descriptor.
-#[cfg(target_os = "macos")]
-fn descriptor_holders(census: &CensusScope, files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
-    use std::os::unix::fs::MetadataExt;
-    let mut identities = Vec::with_capacity(files.len());
-    for file in files {
-        identities.push(match fs::metadata(file) {
-            Ok(metadata) => Some((metadata.dev(), metadata.ino())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        });
-    }
-    let mut held = vec![Vec::new(); files.len()];
-    if identities.iter().all(Option::is_none) {
-        return Ok(held);
-    }
-    let vinfo_size = c_size::<VnodeFdinfo>()?;
-    for pid in census_pids(census)?.pids {
-        let mut holds = vec![false; files.len()];
-        for fd in vnode_descriptors(pid)? {
-            let Some(identity) = vnode_fd_identity(pid, fd, vinfo_size) else {
-                continue;
-            };
-            for (hold, file) in holds.iter_mut().zip(&identities) {
-                *hold |= *file == Some(identity);
-            }
-        }
-        if holds.contains(&true) {
-            let command = command_line(pid);
-            for (holders, _) in held.iter_mut().zip(holds).filter(|(_, hold)| *hold) {
-                holders.push(Holder {
-                    pid,
-                    command: command.clone(),
-                });
-            }
-        }
-    }
-    Ok(held)
-}
-
-/// Every process with a vnode descriptor on the inode `(device, inode)`, with those descriptors:
-/// each process [`census_pids`] asks about, each vnode descriptor's device and inode
-/// (`PROC_PIDFDVNODEINFO`). Event-only opens hold nothing. A process a cowshed lifecycle operation
-/// runs in is not asked: a fork's first mount of its new image holds that image's vnode for up to
-/// minutes, and every per-descriptor query of the fork waits that long (measured 2026-10-25: 245
-/// extent-map copies of 50-221 s, the `image-lock wait` holder line and `lsof` stalled behind them).
-/// A lock's custody takes such a holder from the lock's own record instead
-/// (`held_lock::kernel_view`).
-#[cfg(target_os = "macos")]
-pub(crate) fn inode_holders(
-    census: &CensusScope,
-    identity: (u64, u64),
-) -> io::Result<Vec<(Holder, Vec<i32>)>> {
-    let vinfo_size = c_size::<VnodeFdinfo>()?;
-    let mut holders = Vec::new();
-    for pid in census_pids(census)?.pids {
-        let descriptors: Vec<i32> = vnode_descriptors(pid)?
-            .into_iter()
-            .filter(|&fd| vnode_fd_identity(pid, fd, vinfo_size) == Some(identity))
-            .collect();
-        if !descriptors.is_empty() {
-            holders.push((
-                Holder {
-                    pid,
-                    command: command_line(pid),
-                },
-                descriptors,
-            ));
-        }
-    }
-    Ok(holders)
 }
 
 /// One process holding a kernel object a census asked about ([`object_holders`]): the process,
@@ -787,7 +499,6 @@ pub struct ObjectCensus<K> {
 /// Darwin, is one a cowshed lifecycle operation of the census's store runs in, whose descriptors
 /// are never read: a fork's first mount of its new image holds that vnode for minutes
 /// ([`inode_holders`]).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn object_holders<K: Copy>(
     census: &CensusScope,
     objects: &[(DescriptorName, K)],
@@ -879,462 +590,8 @@ pub fn object_holders<K: Copy>(
     })
 }
 
-/// Every process holding anything on the volume mounted at `mount` -- its working or root
-/// Every process holding anything on the volume mounted at `mount` -- its working or root
-/// directory, a thread's working directory, an open file, its executable or another mapped file --
-/// which is what keeps `umount` answering `Resource busy`. Event-only opens (FSEvents, Spotlight)
-/// never block an unmount and are left out. It is the walk libproc's `proc_listpidspath` makes
-/// with `PROC_LISTPIDSPATH_PATH_IS_VOLUME | PROC_LISTPIDSPATH_EXCLUDE_EVTONLY`, by device, over the
-/// processes a census asks about ([`census_pids`]) rather than libproc's own listing, which asks
-/// every process, a lifecycle operation's included ([`on_volume`]). A missing mount has none.
-#[cfg(target_os = "macos")]
-pub fn volume_holders(census: &CensusScope, mount: &Path) -> io::Result<Vec<Holder>> {
-    use std::os::unix::fs::MetadataExt;
-    let device = match fs::metadata(mount) {
-        Ok(metadata) => metadata.dev(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut holders = Vec::new();
-    for pid in census_pids(census)?.pids {
-        if on_volume(pid, device)? {
-            holders.push(Holder {
-                pid,
-                command: command_line(pid),
-            });
-        }
-    }
-    Ok(holders)
-}
-
-/// Whether `pid` holds anything on the volume of `device`, asked as `proc_listpidspath` asks it
-/// (xnu `libsyscall/wrappers/libproc/proc_listpidspath.c`): its working and root directory
-/// (`PROC_PIDVNODEPATHINFO`), its vnode descriptors ([`vnode_fd_identity`]), the working directory
-/// of each thread that has its own (only for a process the kernel flags `PROC_FLAG_THCWD`), then
-/// the first mapped region on the device, its executable's text included (one call,
-/// `PROC_PIDREGIONPATHINFO3`). A process that exited or is withheld from this user holds none.
-#[cfg(target_os = "macos")]
-fn on_volume(pid: libc::pid_t, device: u64) -> io::Result<bool> {
-    let on = |stat: &libc::vinfo_stat| u64::from(stat.vst_dev) == device;
-    let size = c_size::<libc::proc_vnodepathinfo>()?;
-    // SAFETY: `proc_vnodepathinfo` is plain C data, for which all zeros is a valid value; it is
-    // read only when the kernel fills all of it.
-    let mut directories: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `directories` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            std::ptr::from_mut(&mut directories).cast(),
-            size,
-        )
-    };
-    if filled == size
-        && (on(&directories.pvi_cdir.vip_vi.vi_stat) || on(&directories.pvi_rdir.vip_vi.vi_stat))
-    {
-        return Ok(true);
-    }
-    let vinfo_size = c_size::<VnodeFdinfo>()?;
-    if vnode_descriptors(pid)?
-        .into_iter()
-        .any(|fd| vnode_fd_identity(pid, fd, vinfo_size).is_some_and(|(dev, _)| dev == device))
-    {
-        return Ok(true);
-    }
-    if thread_directories(pid)?.iter().any(on) {
-        return Ok(true);
-    }
-    // The private flavor `proc_listpidspath` asks for the first region whose file is on the device
-    // its argument names (xnu `bsd/sys/proc_info_private.h`).
-    const PROC_PIDREGIONPATHINFO3: libc::c_int = 23;
-    let size = c_size::<RegionWithPath>()?;
-    // SAFETY: `RegionWithPath` is plain C data, for which all zeros is a valid value; it is read
-    // only when the kernel fills all of it.
-    let mut region: RegionWithPath = unsafe { std::mem::zeroed() };
-    // SAFETY: `region` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDREGIONPATHINFO3,
-            device,
-            std::ptr::from_mut(&mut region).cast(),
-            size,
-        )
-    };
-    Ok(filled == size && on(&region.prp_vip.vip_vi.vi_stat))
-}
-
-/// `sys/proc_info.h`'s `struct proc_regionwithpathinfo`, which libc 0.2 does not bind: the 96-byte
-/// `proc_regioninfo` (four `uint32_t`, a `uint64_t`, fourteen `uint32_t`, two `uint64_t`), then the
-/// region's file.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct RegionWithPath {
-    _prp_prinfo: [u64; 12],
-    prp_vip: libc::vnode_info_path,
-}
-
-/// The attributes of each thread working directory `pid`'s threads set of their own
-/// (`pthread_chdir_np`): none unless the kernel flags the process `PROC_FLAG_THCWD`, then one
-/// listing (`PROC_PIDLISTTHREADS`) and one call per thread (`PROC_PIDTHREADPATHINFO`).
-#[cfg(target_os = "macos")]
-fn thread_directories(pid: libc::pid_t) -> io::Result<Vec<libc::vinfo_stat>> {
-    // `sys/proc_info.h`; libc 0.2 binds none of the three.
-    const PROC_FLAG_THCWD: u32 = 0x100;
-    const PROC_PIDLISTTHREADS: libc::c_int = 6;
-    const PROC_PIDTHREADPATHINFO: libc::c_int = 10;
-    let size = c_size::<libc::proc_bsdinfo>()?;
-    // SAFETY: `proc_bsdinfo` is plain C data, for which all zeros is a valid value; it is read only
-    // when the kernel fills all of it.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size || info.pbi_flags & PROC_FLAG_THCWD == 0 {
-        return Ok(Vec::new());
-    }
-    let mut capacity = 64usize;
-    let threads = loop {
-        let mut threads = vec![0u64; capacity];
-        let bytes = libc::c_int::try_from(capacity * size_of::<u64>()).map_err(io::Error::other)?;
-        // SAFETY: `threads` is writable for `bytes` bytes, its whole length.
-        let filled = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDLISTTHREADS,
-                0,
-                threads.as_mut_ptr().cast(),
-                bytes,
-            )
-        };
-        let Ok(filled) = usize::try_from(filled) else {
-            return Ok(Vec::new());
-        };
-        let count = filled / size_of::<u64>();
-        // A listing that filled the buffer may have been cut short: grow it and list again.
-        if count >= capacity {
-            capacity *= 4;
-            continue;
-        }
-        threads.truncate(count);
-        break threads;
-    };
-    let size = c_size::<ThreadWithPath>()?;
-    let mut directories = Vec::new();
-    for thread in threads {
-        // SAFETY: `ThreadWithPath` is plain C data, for which all zeros is a valid value; it is
-        // read only when the kernel fills all of it.
-        let mut info: ThreadWithPath = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-        let filled = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDTHREADPATHINFO,
-                thread,
-                std::ptr::from_mut(&mut info).cast(),
-                size,
-            )
-        };
-        if filled == size {
-            directories.push(info.pvip.vip_vi.vi_stat);
-        }
-    }
-    Ok(directories)
-}
-
-/// `sys/proc_info.h`'s `struct proc_threadwithpathinfo`, which libc 0.2 does not bind: a thread's
-/// `proc_threadinfo`, then its own working directory.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct ThreadWithPath {
-    _pt: libc::proc_threadinfo,
-    pvip: libc::vnode_info_path,
-}
-
-/// Every process holding anything inside the directory tree at `root` -- its working directory
-/// or root directory, its executable, an open file -- whether or not `root` is a volume's mount
-/// point, each with the first hold found ([`hold_in_tree`]). A plain checkout's holders, which
-/// `volume_holders` cannot name without naming its whole volume. A process the kernel withholds
-/// from this user, or that exited since the listing, shows none. A missing `root` has none.
-#[cfg(target_os = "macos")]
-pub fn tree_holds(census: &CensusScope, root: &Path) -> io::Result<Vec<TreeHold>> {
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let mut holds = Vec::new();
-    for pid in census_pids(census)?.pids {
-        if let Some(hold) = hold_in_tree(pid, &root)? {
-            holds.push(TreeHold {
-                holder: Holder {
-                    pid,
-                    command: command_line(pid),
-                },
-                hold,
-            });
-        }
-    }
-    Ok(holds)
-}
-
-/// What `pid` holds inside `root`, on `device`, if anything. Cheapest first: the directories
-/// cost one call, the executable one more, and the descriptors a listing plus one call per vnode.
-#[cfg(target_os = "macos")]
-fn hold_in_tree(pid: libc::pid_t, root: &Path) -> io::Result<Option<Hold>> {
-    if let Some(hold) = directories(pid)?
-        .into_iter()
-        .find(|hold| hold.path().starts_with(root))
-    {
-        return Ok(Some(hold));
-    }
-    if let Some(executable) = executable(pid).filter(|path| path.starts_with(root)) {
-        return Ok(Some(Hold::Executable(executable)));
-    }
-    Ok(open_vnodes(pid)?
-        .into_iter()
-        .find(|path| path.starts_with(root))
-        .map(Hold::OpenFile))
-}
-
-/// `pid`'s working directory and root directory (`PROC_PIDVNODEPATHINFO`). A process the kernel
-/// withholds from this user, or that exited, names none.
-#[cfg(target_os = "macos")]
-fn directories(pid: libc::pid_t) -> io::Result<Vec<Hold>> {
-    let size = c_size::<libc::proc_vnodepathinfo>()?;
-    // SAFETY: `proc_vnodepathinfo` is plain C data (integers and byte arrays), for which all
-    // zeros is a valid value; it is read only when the kernel fills all of it, as checked below.
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size {
-        return Ok(Vec::new());
-    }
-    Ok([
-        c_path(info.pvi_cdir.vip_path.as_flattened()).map(Hold::WorkingDirectory),
-        c_path(info.pvi_rdir.vip_path.as_flattened()).map(Hold::RootDirectory),
-    ]
-    .into_iter()
-    .flatten()
-    .collect())
-}
-
-/// The path of each open vnode descriptor of `pid` ([`vnode_descriptors`]), then one
-/// `PROC_PIDFDVNODEPATHINFO` call per vnode. A descriptor closed since the listing names none, and
-/// an event-only open (`O_EVTONLY`: FSEvents, Spotlight, a file watcher) holds nothing, as
-/// `volume_holders` leaves it out.
-#[cfg(target_os = "macos")]
-fn open_vnodes(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
-    let vinfo_size = c_size::<VnodeFdinfoWithPath>()?;
-    Ok(vnode_descriptors(pid)?
-        .into_iter()
-        .filter_map(|fd| vnode_fd_path(pid, fd, vinfo_size))
-        .collect())
-}
-
-/// `pid`'s vnode descriptors: one listing (`PROC_PIDLISTFDS`). A process that exited or is
-/// withheld from this user has none.
-#[cfg(target_os = "macos")]
-fn vnode_descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::c_int>> {
-    // Descriptors opened between the sizing call and the listing still fit.
-    const HEADROOM: usize = 32;
-    let entry = size_of::<libc::proc_fdinfo>();
-    // SAFETY: a null buffer of zero bytes asks only how many bytes the listing needs.
-    let needed =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    // Negative: the process exited or is withheld from this user, so it holds no descriptor here.
-    let Ok(needed) = usize::try_from(needed) else {
-        return Ok(Vec::new());
-    };
-    let mut capacity = needed / entry + HEADROOM;
-    loop {
-        let mut fds = vec![
-            libc::proc_fdinfo {
-                proc_fd: 0,
-                proc_fdtype: 0
-            };
-            capacity
-        ];
-        let bytes = libc::c_int::try_from(capacity * entry).map_err(io::Error::other)?;
-        // SAFETY: `fds` is writable for `bytes` bytes, its whole length.
-        let filled = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDLISTFDS,
-                0,
-                fds.as_mut_ptr().cast(),
-                bytes,
-            )
-        };
-        let Ok(filled) = usize::try_from(filled) else {
-            return Ok(Vec::new());
-        };
-        let count = filled / entry;
-        // A listing that filled the buffer may have been cut short: grow it and list again.
-        if count >= capacity {
-            capacity *= 4;
-            continue;
-        }
-        fds.truncate(count);
-        return Ok(fds
-            .into_iter()
-            .filter(|fd| {
-                libc::c_int::try_from(fd.proc_fdtype)
-                    .is_ok_and(|kind| kind == libc::PROX_FDTYPE_VNODE)
-            })
-            .map(|fd| fd.proc_fd)
-            .collect());
-    }
-}
-
-/// The device and inode of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEINFO`), or `None` if
-/// the descriptor closed since its listing or is an event-only open. `size` is `VnodeFdinfo`'s
-/// size: the kernel fills exactly that or nothing.
-#[cfg(target_os = "macos")]
-fn vnode_fd_identity(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Option<(u64, u64)> {
-    // libc 0.2 binds neither this flavor nor `vnode_fdinfo`; `sys/proc_info.h` defines the
-    // flavor as 1.
-    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
-    let mut info = VnodeFdinfo {
-        pfi_openflags: 0,
-        _pfi_rest: [0; 20],
-        // SAFETY: `vnode_info` is plain C data (integers), for which all zeros is a valid value;
-        // it is read only when the kernel fills all of it, as checked below.
-        pvi: unsafe { std::mem::zeroed() },
-    };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidfdinfo(
-            pid,
-            fd,
-            PROC_PIDFDVNODEINFO,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size || info.pfi_openflags & O_EVTONLY != 0 {
-        return None;
-    }
-    Some((
-        u64::from(info.pvi.vi_stat.vst_dev),
-        info.pvi.vi_stat.vst_ino,
-    ))
-}
-
-/// `sys/proc_info.h`'s `struct vnode_fdinfo`, which libc 0.2 does not bind: the 24-byte
-/// `proc_fileinfo` head [`VnodeFdinfoWithPath`] also has, then the vnode's attributes.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct VnodeFdinfo {
-    pfi_openflags: u32,
-    _pfi_rest: [u8; 20],
-    pvi: libc::vnode_info,
-}
-
-/// The path of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEPATHINFO`), or `None` if the kernel
-/// names none or the descriptor is an event-only open. `size` is `VnodeFdinfoWithPath`'s size:
-/// the kernel fills exactly that or nothing.
-#[cfg(target_os = "macos")]
-fn vnode_fd_path(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Option<PathBuf> {
-    // libc 0.2 binds neither this flavor nor `vnode_fdinfowithpath`; `sys/proc_info.h` defines
-    // the flavor as 2.
-    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
-    let mut info = VnodeFdinfoWithPath {
-        pfi_openflags: 0,
-        _pfi_rest: [0; 20],
-        // SAFETY: `vnode_info_path` is plain C data (integers and byte arrays), for which all
-        // zeros is a valid value; it is read only when the kernel fills all of it, as checked.
-        pvip: unsafe { std::mem::zeroed() },
-    };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidfdinfo(
-            pid,
-            fd,
-            PROC_PIDFDVNODEPATHINFO,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size || info.pfi_openflags & O_EVTONLY != 0 {
-        return None;
-    }
-    c_path(info.pvip.vip_path.as_flattened())
-}
-
-/// `sys/proc_info.h`'s `struct vnode_fdinfowithpath`, which libc 0.2 does not bind: a 24-byte
-/// `proc_fileinfo` head whose first field is the descriptor's open flags, then the vnode's path.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct VnodeFdinfoWithPath {
-    pfi_openflags: u32,
-    _pfi_rest: [u8; 20],
-    pvip: libc::vnode_info_path,
-}
-
-/// `fcntl.h`'s `O_EVTONLY` as `proc_fileinfo.fi_openflags` carries it: an open for event
-/// notification only, which holds no data and never blocks an unmount.
-#[cfg(target_os = "macos")]
-const O_EVTONLY: u32 = 0x0000_8000;
-
-/// The processes `census` asks about ([`crate::census::asked`]): of every live pid, those its reach
-/// covers (all of them for the host store, the namespace owner's tree for a fixture's), but those a
-/// cowshed lifecycle operation of its store runs in, as their leases record them
-/// ([`crate::lease_holder::running_lifecycle`]). Such a process can hold one of its descriptors'
-/// vnodes in one kernel call for a minute -- a fork's read-write mount of a new clone, which pays
-/// the clone's extent-map copy -- and every per-descriptor query of it waits that long; the
-/// operation's own leases and image locks already refuse what a census guards. The one walker
-/// every macOS census starts from, counted once per census ([`walk_begins`]).
-#[cfg(target_os = "macos")]
-fn census_pids(census: &CensusScope) -> io::Result<Asked> {
-    census_pids_reading(census, |lease| fs::read(lease))
-}
-
-/// [`census_pids`], reading each lease of the census's store with `read`.
-#[cfg(target_os = "macos")]
-fn census_pids_reading(
-    census: &CensusScope,
-    read: impl FnMut(&Path) -> io::Result<Vec<u8>>,
-) -> io::Result<Asked> {
-    let lifecycle = crate::lease_holder::running_lifecycle(census.store(), read);
-    Ok(crate::census::asked(
-        census.reach(),
-        &listed(census)?,
-        &lifecycle,
-    ))
-}
-
-/// The processes `census` asks about ([`crate::census::asked`]): of every live pid, those its reach
-/// covers. Linux records no unique id, so no lease passes a process over: its census asks every
-/// process in its reach. The one walker every Linux census starts from ([`walk_begins`]).
-#[cfg(target_os = "linux")]
-fn census_pids(census: &CensusScope) -> io::Result<Asked> {
-    Ok(crate::census::asked(
-        census.reach(),
-        &listed(census)?,
-        &std::collections::BTreeSet::new(),
-    ))
-}
-
 /// Every live pid ([`all_pids`]), each with its lineage when `census`'s reach needs it
 /// ([`lineage_of`]).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn listed(census: &CensusScope) -> io::Result<Vec<Listed>> {
     let lineage = census.reach().needs_lineage();
     Ok(all_pids()?
@@ -1346,110 +603,8 @@ fn listed(census: &CensusScope) -> io::Result<Vec<Listed>> {
         .collect())
 }
 
-/// `pid`'s parent and process group (`PROC_PIDT_SHORTBSDINFO`): one call that reads the
-/// process's own fields and never a vnode, so it never waits on a kernel call the process is in.
-/// `None` once it has exited, or when the kernel will not describe it to this user: such a process
-/// is in no fixture's reach.
-#[cfg(target_os = "macos")]
-fn lineage_of(pid: libc::pid_t) -> Option<Lineage> {
-    let size = c_size::<libc::proc_bsdshortinfo>().ok()?;
-    // SAFETY: `proc_bsdshortinfo` is plain C data, for which all zeros is a valid value; it is
-    // read only when the kernel fills all of it.
-    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDT_SHORTBSDINFO,
-            0,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size {
-        return None;
-    }
-    Some(Lineage {
-        parent: libc::pid_t::try_from(info.pbsi_ppid).ok()?,
-        group: libc::pid_t::try_from(info.pbsi_pgid).ok()?,
-    })
-}
-
-/// `pid`'s parent and process group, the two fields after the state in `/proc/<pid>/stat` (the
-/// command before them, in parentheses, may hold any byte but the last `)`). `None` once it has
-/// exited.
-#[cfg(target_os = "linux")]
-fn lineage_of(pid: libc::pid_t) -> Option<Lineage> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace().skip(1);
-    Some(Lineage {
-        parent: fields.next()?.parse().ok()?,
-        group: fields.next()?.parse().ok()?,
-    })
-}
-
-/// Every live pid the kernel lists (`proc_listallpids`, which answers a count of pids, not bytes),
-/// except pid 0. The listing grows until it fits.
-#[cfg(target_os = "macos")]
-fn all_pids() -> io::Result<Vec<libc::pid_t>> {
-    walk_begins();
-    let mut capacity = 256usize;
-    loop {
-        let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-        let bytes =
-            libc::c_int::try_from(capacity * size_of::<libc::pid_t>()).map_err(io::Error::other)?;
-        // SAFETY: `pids` is writable for `bytes` bytes, its whole length.
-        let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-        if filled < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let count = usize::try_from(filled).map_err(io::Error::other)?;
-        if count < capacity {
-            pids.truncate(count);
-            return Ok(pids.into_iter().filter(|&pid| pid > 0).collect());
-        }
-        capacity *= 4;
-    }
-}
-
-/// `T`'s byte size as the `c_int` the kernel's buffer arguments take.
-#[cfg(target_os = "macos")]
-fn c_size<T>() -> io::Result<libc::c_int> {
-    libc::c_int::try_from(size_of::<T>()).map_err(io::Error::other)
-}
-
-/// The path a NUL-terminated `c_char` buffer holds, or `None` if it holds none. `c_char` is signed
-/// on x86-64 Apple and unsigned on arm64 Apple; `to_ne_bytes` reads either as the same byte.
-#[cfg(target_os = "macos")]
-fn c_path(bytes: &[libc::c_char]) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    let path: Vec<u8> = bytes
-        .iter()
-        .take_while(|&&byte| byte != 0)
-        .map(|&byte| u8::from_ne_bytes(byte.to_ne_bytes()))
-        .collect();
-    if path.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsString::from_vec(path)))
-}
-
-/// `pid`'s executable path (`proc_pidpath`), or `None` if the kernel names none.
-#[cfg(target_os = "macos")]
-fn executable(pid: libc::pid_t) -> Option<PathBuf> {
-    let mut path: Vec<libc::c_char> =
-        vec![0; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).ok()?];
-    let capacity = u32::try_from(path.len()).ok()?;
-    // SAFETY: `path` is writable for `capacity` bytes, its whole length.
-    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), capacity) };
-    // A negative length is the kernel naming nothing: the conversion fails and `None` follows.
-    path.truncate(usize::try_from(length).ok()?);
-    c_path(&path)
-}
-
-/// `pid`'s argument vector joined by spaces (`KERN_PROCARGS2`), or its executable path, or a
-/// placeholder naming why neither could be read.
-#[cfg(target_os = "macos")]
+/// `pid`'s argument vector joined by spaces, or its executable path, or a placeholder naming that
+/// neither could be read.
 fn command_line(pid: libc::pid_t) -> String {
     if let Ok(arguments) = cowshed_os::process::process_arguments(pid)
         && !arguments.argv.is_empty()
@@ -1473,7 +628,7 @@ fn command_line(pid: libc::pid_t) -> String {
 /// and every process with a descriptor on the inode, by pid, command and descriptors, so the
 /// run that bound ends names the process that kept the lock. A census that cannot be read is
 /// said as such, and the wait is still taken.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(test)]
 pub(crate) fn hold_announced(
     census: &CensusScope,
     opened: crate::held_lock::Opened,
@@ -1877,13 +1032,30 @@ fn parse_utc_millis(value: &str) -> Option<u128> {
 mod tests {
     use super::*;
     use crate::capabilities::BuildStatePath;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use cowshed_os::fork_lock::Spawn as _;
     use cowshed_os::test_backstop::ChildBackstop as _;
-    #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::UnixStreamBackstop as _;
 
-    fn scratch(label: &str) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    mod linux;
+    #[cfg(target_os = "macos")]
+    mod macos;
+    #[cfg(target_os = "linux")]
+    use linux as platform;
+    #[cfg(target_os = "macos")]
+    use macos as platform;
+
+    use platform::Events;
+
+    /// What an [`Events`] queue reports: a watched file's write, extend or attribute change, or
+    /// a watched process's exit.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        File,
+        Exit,
+    }
+
+    pub(super) fn scratch(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "cowshed-build-nx-{label}-{}",
             uuid::Uuid::new_v4().simple()
@@ -2094,8 +1266,7 @@ mod tests {
     /// Read a holder child's `ready`: it says so only after the descriptor it holds is
     /// open or the directory it works in is its own, so the census that follows reads a
     /// settled fact once. The child's exit closes the pipe, which the empty line names.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn holder_ready(child: &mut std::process::Child) {
+    pub(super) fn holder_ready(child: &mut std::process::Child) {
         use std::io::BufRead as _;
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.as_mut().expect("piped stdout"))
@@ -2104,7 +1275,6 @@ mod tests {
         assert_eq!(line, "ready\n", "the holder child announced its readiness");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_open_database_names_its_holder_and_a_closed_one_none() {
         let root = scratch("holders");
@@ -2147,7 +1317,6 @@ mod tests {
 
     /// One census answers every database at once, each with its own holders: the shell holding
     /// the second database is named for it alone, and a database that vanished has none.
-    #[cfg(target_os = "macos")]
     #[test]
     fn one_census_names_each_databases_own_holders() {
         let root = scratch("census");
@@ -2192,7 +1361,6 @@ mod tests {
     /// A busy detach names what holds the volume. The holder a checkout most often has is a
     /// process whose working directory is in it -- an Nx daemon, a shell -- with no file open,
     /// which a per-file query never sees.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_process_whose_cwd_is_on_a_volume_is_one_of_its_holders() {
         let root = scratch("volume-holders");
@@ -2226,7 +1394,6 @@ mod tests {
     /// A plain checkout's holders are the processes inside its tree, which `volume_holders`
     /// cannot name: a process working in a subdirectory of the tree, with no file open, is one of
     /// them; a process working in a sibling tree is not.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_process_working_inside_a_plain_tree_is_one_of_its_holders() {
         let root = scratch("tree-holders");
@@ -2268,17 +1435,14 @@ mod tests {
         fs::remove_dir_all(&sibling).unwrap();
     }
 
-    /// A checkout of the repository's own stock Nx, its daemon enabled, under a test root: on
-    /// macOS a scratch root, whose teardown ends every process working in it, the daemon with the
-    /// rest, whatever ends the test; elsewhere the test stops the daemon it may start itself
-    /// ([`RecordedDaemon`]).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// A checkout of the repository's own stock Nx, its daemon enabled, under a scratch root,
+    /// whose teardown ends every process working in it, the daemon with the rest, whatever ends
+    /// the test.
     struct StockNx {
         nx: PathBuf,
         checkout: PathBuf,
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl StockNx {
         fn new(root: &Path) -> Self {
             let package = repository()
@@ -2303,13 +1467,11 @@ mod tests {
         }
 
         /// Run `nx daemon <verb>` in the checkout as [`Self::run`] does.
-        #[cfg(target_os = "macos")]
         fn daemon(&self, verb: &str) -> String {
             self.run(&["daemon", verb])
         }
 
         /// Run [`Self::command`]; it must exit 0. Answers what it printed.
-        #[cfg(target_os = "macos")]
         fn run(&self, args: &[&str]) -> String {
             let output = self
                 .command(args)
@@ -2339,10 +1501,8 @@ mod tests {
     /// The daemon a test's own Nx client may start in a checkout's `workspace-data`, stopped as
     /// stock `nx daemon --stop` stops it ([`stop_recorded_daemon`]) however the test ends. The
     /// client detaches the daemon, so where no scratch root's teardown ends it nothing else does.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct RecordedDaemon(PathBuf);
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl Drop for RecordedDaemon {
         fn drop(&mut self) {
             let failure = match stop_recorded_daemon(&self.0) {
@@ -2366,14 +1526,12 @@ mod tests {
     /// The checkout's Nx state reached through a build link, as cowshed lays it out
     /// (`.nx/workspace-data` -> `.cowshed/build/nx/workspace-data`), and two volumes the link
     /// can name: `from`, which it names, and `into`.
-    #[cfg(target_os = "macos")]
     struct Linked {
         from: PathBuf,
         into: PathBuf,
         state: BuildVolumeState,
     }
 
-    #[cfg(target_os = "macos")]
     impl Linked {
         fn new(root: &crate::scratch_directory::ScratchRoot, stock: &StockNx) -> Self {
             let [from, into] = ["from", "into"].map(|name| root.path().join("volumes").join(name));
@@ -2408,7 +1566,6 @@ mod tests {
     /// native `connectToNxDb` Nx's own clients and daemon call) and keeps it open until its
     /// stdin closes, after printing `open`. The connection stays referenced, as Nx keeps its
     /// own: a collected one closes the database.
-    #[cfg(target_os = "macos")]
     fn nx_opener(stock: &StockNx) -> std::process::Child {
         let native = stock
             .nx
@@ -2432,7 +1589,6 @@ mod tests {
     }
 
     /// Read the opener's `open`: it opened the task database.
-    #[cfg(target_os = "macos")]
     fn opened(opener: &mut std::process::Child) {
         use std::io::BufRead as _;
         let mut line = String::new();
@@ -2442,110 +1598,11 @@ mod tests {
         assert_eq!(line, "open\n", "the opener opened the task database");
     }
 
-    /// One kernel event queue: a file's write, extend or attribute change, and processes' exits.
-    #[cfg(target_os = "macos")]
-    struct Events {
-        queue: std::os::fd::OwnedFd,
-        _watched: Vec<std::os::fd::OwnedFd>,
-    }
-
-    #[cfg(target_os = "macos")]
-    impl Events {
-        fn new() -> Self {
-            use std::os::fd::FromRawFd as _;
-            // SAFETY: `kqueue` takes no arguments; a negative answer is an error.
-            let queue = unsafe { libc::kqueue() };
-            assert!(queue >= 0, "kqueue: {}", io::Error::last_os_error());
-            Self {
-                // SAFETY: `queue` is a fresh descriptor only this value owns.
-                queue: unsafe { std::os::fd::OwnedFd::from_raw_fd(queue) },
-                _watched: Vec::new(),
-            }
-        }
-
-        fn add(&self, ident: libc::uintptr_t, filter: i16, fflags: u32) {
-            use std::os::fd::AsRawFd as _;
-            let change = libc::kevent {
-                ident,
-                filter,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: one valid change, no events requested back.
-            let added = unsafe {
-                libc::kevent(
-                    self.queue.as_raw_fd(),
-                    &change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            assert!(added == 0, "kevent: {}", io::Error::last_os_error());
-        }
-
-        /// Changes to `path`'s contents or attributes, watched without holding it open.
-        fn file(&mut self, path: &Path) {
-            use std::os::fd::{AsRawFd as _, FromRawFd as _};
-            use std::os::unix::ffi::OsStrExt as _;
-            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-            // SAFETY: `name` is NUL-terminated; a negative answer is an error.
-            let file = unsafe { libc::open(name.as_ptr(), libc::O_EVTONLY) };
-            assert!(
-                file >= 0,
-                "open {}: {}",
-                path.display(),
-                io::Error::last_os_error()
-            );
-            // SAFETY: `file` is a fresh descriptor only this value owns.
-            let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(file) };
-            self.add(
-                file.as_raw_fd() as libc::uintptr_t,
-                libc::EVFILT_VNODE,
-                libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_ATTRIB,
-            );
-            self._watched.push(file);
-        }
-
-        fn exit(&self, pid: u32) {
-            self.add(pid as libc::uintptr_t, libc::EVFILT_PROC, libc::NOTE_EXIT);
-        }
-
-        /// The filter of the next event, waiting for it.
-        fn next(&self) -> i16 {
-            use std::os::fd::AsRawFd as _;
-            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
-            loop {
-                // SAFETY: room for one event; no timeout.
-                let ready = unsafe {
-                    libc::kevent(
-                        self.queue.as_raw_fd(),
-                        std::ptr::null(),
-                        0,
-                        event.as_mut_ptr(),
-                        1,
-                        std::ptr::null(),
-                    )
-                };
-                if ready == 1 {
-                    // SAFETY: the kernel wrote one event.
-                    return unsafe { event.assume_init() }.filter;
-                }
-                let error = io::Error::last_os_error();
-                assert_eq!(error.kind(), io::ErrorKind::Interrupted, "kevent: {error}");
-            }
-        }
-    }
-
     /// An Nx process that opens the task database while [`hold_opens`] holds its lock waits,
     /// and once the lock is let go opens the database the checkout's link names then: never the
     /// one the link named when it started opening. Without the lock it opened `from`'s and kept
     /// it after the link moved, while every later process (its next daemon included) opened
     /// `into`'s.
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_nx_opener_waits_out_held_opens_and_opens_the_database_the_moved_link_names() {
         let root = crate::scratch_directory::ScratchRoot::new("nx-opens").expect("scratch root");
@@ -2583,7 +1640,7 @@ mod tests {
         events.exit(opener.id());
         assert_eq!(
             events.next(),
-            libc::EVFILT_VNODE,
+            Event::File,
             "the opener reached `from`'s lock before it could exit"
         );
         super::super::link::point(&stock.checkout, &linked.into).unwrap();
@@ -2607,7 +1664,6 @@ mod tests {
 
     /// A taken open lock is an Nx process opening its database: [`hold_opens`] answers that
     /// database and the process, and holds nothing.
-    #[cfg(target_os = "macos")]
     #[test]
     fn hold_opens_names_an_nx_process_that_is_opening() {
         let root = scratch("opening");
@@ -2623,15 +1679,9 @@ mod tests {
             fingerprint: None,
             mbx: None,
         };
-        // `lockf` takes the lock as Nx does (`flock`), then runs its command.
-        let mut opening = std::process::Command::new("/usr/bin/lockf")
-            .args([
-                "-k",
-                lock.to_str().unwrap(),
-                "/bin/sh",
-                "-c",
-                "echo held; read _",
-            ])
+        // The host's lock program takes the lock as Nx does (`flock`), then runs its command.
+        let mut opening = crate::lock_program::holding(&lock)
+            .args(["/bin/sh", "-c", "echo held; read _"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn_locked()
@@ -2652,10 +1702,8 @@ mod tests {
             }) => {
                 assert_eq!(named, database);
                 assert!(
-                    holders
-                        .iter()
-                        .any(|holder| holder.pid == pid
-                            && holder.command.starts_with("/usr/bin/lockf")),
+                    holders.iter().any(|holder| holder.pid == pid
+                        && holder.command.starts_with(crate::lock_program::NAME)),
                     "{holders:?}"
                 );
             }
@@ -2675,7 +1723,6 @@ mod tests {
     /// A host daemon whose record is handed over keeps serving the checkout after its build
     /// link moves, and a client finds it there. The same move without the record ends the
     /// daemon by its own check that the record names it.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move() {
         let root =
@@ -2702,14 +1749,13 @@ mod tests {
         let events = Events::new();
         events.exit(daemon as u32);
         super::super::link::point(&stock.checkout, &linked.from).unwrap();
-        assert_eq!(events.next(), libc::EVFILT_PROC);
+        assert_eq!(events.next(), Event::Exit);
         assert!(!cowshed_os::process::running(daemon).unwrap());
     }
 
     /// Land 5.3's output enumeration (16_build_volumes.md): a root whose package graph resolves no
     /// `@smoothbricks/nx-plugin` answers `null`, no policy naming its outputs, and a plugin that is
     /// there but cannot answer — its policy module missing — is a failure, never read as absent.
-    #[cfg(target_os = "macos")]
     #[test]
     fn source_paths_answer_null_only_for_a_root_without_the_plugin() {
         use std::io::Write as _;
@@ -2766,7 +1812,6 @@ mod tests {
     /// The repository this test binary was built from. Read at run time: `env!` would compile
     /// this checkout's path into the test binary, and a test binary built in one checkout must
     /// not reach another's files.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn repository() -> PathBuf {
         PathBuf::from(
             std::env::var_os("CARGO_MANIFEST_DIR")
@@ -2776,7 +1821,6 @@ mod tests {
     }
 
     /// A fixture checkout at `checkout` of the installed Nx package `nx`, configured by `nx_json`.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn fixture_checkout(checkout: &Path, nx: &Path, nx_json: &str) {
         fs::write(
             checkout.join("package.json"),
@@ -2790,7 +1834,6 @@ mod tests {
 
     /// `command` without the caller's `NX_*` or `CI`, so no setting of the shell running the test
     /// decides what Nx does.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn without_caller_nx(command: &mut std::process::Command) {
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("NX_") || key == "CI" {
@@ -2801,7 +1844,6 @@ mod tests {
 
     /// `node` in `checkout` without the caller's `NX_*` or `CI`: no daemon, no Nx Cloud, plugins
     /// loaded in process, and Nx's cache and task database in the checkout (`.nx/`).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn checkout_node(checkout: &Path) -> std::process::Command {
         let mut node = std::process::Command::new("node");
         node.current_dir(checkout)
@@ -2822,7 +1864,6 @@ mod tests {
     }
 
     /// Run `node` with `stdin` as its whole input; what it exited with and printed.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn node_output(mut node: std::process::Command, stdin: &[u8]) -> std::process::Output {
         use std::io::Write as _;
         let mut child = node.spawn_locked().expect("node runs");
@@ -2839,7 +1880,6 @@ mod tests {
     /// `installed`: `nx run a:build` caches `a:build` and the `a:prep` it depends on, their
     /// outputs are removed, and the helper restores both from the checkout's own cache, the
     /// dependency first.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn restore_outputs_restores_a_dependency_under(version: &str, installed: &str) {
         const PROJECT: &str = r#"{"name":"a","targets":{
             "prep":{"executor":"nx:run-commands","cache":true,"inputs":["{projectRoot}/src.txt"],"outputs":["{projectRoot}/prep.txt"],"options":{"command":"node -e \"require('fs').writeFileSync('a/prep.txt','prep')\""}},
@@ -2929,7 +1969,6 @@ mod tests {
     }
 
     /// Nx 23.2.1 lists a task's dependency by its id.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_outputs_restores_a_dependency_under_nx_23_2_1() {
         restore_outputs_restores_a_dependency_under(
@@ -2939,7 +1978,6 @@ mod tests {
     }
 
     /// Nx 24.0.3 lists a task's dependency as an edge naming it in `id`.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_outputs_restores_a_dependency_under_nx_24_0_3() {
         restore_outputs_restores_a_dependency_under("24.0.3", "node_modules/nx");
@@ -2947,7 +1985,6 @@ mod tests {
 
     /// A root whose Nx is a version `restore_outputs.js` does not declare is refused by name before
     /// any module of that Nx loads: the `yargs` it would load first marks a load, and none happens.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_outputs_refuses_an_undeclared_nx_before_loading_it() {
         let root = crate::temp_root::TempRoot::new_in(
@@ -2991,7 +2028,6 @@ mod tests {
     /// Stopping the daemon natively is exactly stock `nx daemon --stop` (`SIGTERM` to the
     /// recorded pid): a real Nx daemon exits on it, and `nx daemon --start` afterwards starts a
     /// new one cleanly. If stock Nx ever needs more than the signal, this fails.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_stock_nx_daemon_stopped_natively_restarts_cleanly() {
         let root = crate::scratch_directory::ScratchRoot::new("nx-daemon").expect("scratch root");
@@ -3015,7 +2051,7 @@ mod tests {
             close(&crate::census::this_test(), &stock.checkout, &state).unwrap(),
             Ok(())
         );
-        // Exited, though launchd may not have reaped it yet: a zombie, which `kill(pid, 0)`
+        // Exited, though its parent may not have reaped it yet: a zombie, which `kill(pid, 0)`
         // still reaches.
         assert!(
             !cowshed_os::process::running(first).unwrap(),
@@ -3048,18 +2084,11 @@ mod tests {
     /// starts a daemon: the control fails if the environment makes both arms daemonless.
     /// Whether Node passes the descriptor on to its daemon is a runtime implementation detail,
     /// not a Linux/Darwin contract. Direct descriptor custody is proved at `held_lock::hand_to`.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn an_nx_client_holding_a_lock_starts_no_daemon_that_would_keep_it() {
-        #[cfg(target_os = "macos")]
         let scratch =
             crate::scratch_directory::ScratchRoot::new("nx-held-lock").expect("scratch root");
-        #[cfg(target_os = "macos")]
         let root = scratch.path();
-        #[cfg(target_os = "linux")]
-        let scratch = crate::temp_root::TempRoot::new("cowshed-nx-held-lock");
-        #[cfg(target_os = "linux")]
-        let root: &Path = &scratch;
         let stock = StockNx::new(root);
         fs::create_dir_all(stock.checkout.join("p")).unwrap();
         fs::write(
@@ -3175,7 +2204,6 @@ mod tests {
     /// detaches from the `nx daemon --start` that started it, so nothing but the fixture's own
     /// teardown ever ends it: a failed assertion between `--start` and [`close`] left it running
     /// in a deleted directory, watching files, for good.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_test_that_fails_with_a_live_nx_daemon_leaves_none_under_its_root() {
         let root =
@@ -3193,7 +2221,7 @@ mod tests {
         let daemon = daemon
             .get()
             .expect("the daemon was live when the test failed");
-        let left = crate::scratch_namespace::processes::processes_in(|cwd| cwd.starts_with(&path))
+        let left = crate::scratch_directory::processes_in(&path)
             .expect("list the processes working under the root");
         assert_eq!(
             left,
@@ -3205,7 +2233,6 @@ mod tests {
     /// `held` answers from the task databases' open locks alone. A daemon record rewritten after a
     /// snapshot to name a foreign live process changes nothing it answers, signals nothing, and
     /// leaves that process running.
-    #[cfg(target_os = "macos")]
     #[test]
     fn held_reads_task_databases_only_and_a_rewritten_daemon_record_signals_nothing() {
         let scratch = crate::temp_root::TempRoot::new("nx-held-record");
@@ -3265,230 +2292,47 @@ mod tests {
         foreign.wait_bounded().unwrap();
     }
 
-    /// A census asks nothing of a process a held lifecycle lease names with the unique id it has
-    /// now: [`census_pids`], the one walker, passes over it, so the descriptor, tree and volume
-    /// censuses never query a descriptor of it (a fork in its new build image's first write, which
-    /// its read-write mount makes, held one for 54-90 s). A foreign holder of the same file is
-    /// still found by each census, this process is asked whatever its lease says, and a record
-    /// whose unique id another life has names nothing, so a reused pid is asked again.
-    #[cfg(target_os = "macos")]
+    /// A taken open lock is an opening whoever took it: [`hold_opens`] answers its database and
+    /// the process holding the lock, here this one through an open of its own, and takes the lock
+    /// once that hold is let go.
     #[test]
-    fn a_census_asks_nothing_of_a_process_a_held_lifecycle_lease_names() {
-        let root = scratch("lifecycle-lease");
-        let sessions = root.join("store/acme/widget/sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        crate::storage::bootstrap::write_owner_marker(&root.join("store/acme")).unwrap();
-        let database = root.join("T-v3.db");
+    fn hold_opens_names_the_holder_of_a_taken_open_lock() {
+        let root = scratch("opening-held");
+        let data = root.join("nx/workspace-data");
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("T-v3.db");
         fs::write(&database, b"").unwrap();
-        let hold = || {
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg("exec 3<\"$0\"; echo ready; read _")
-                .arg(&database)
-                .current_dir(&root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn_locked()
-                .unwrap()
+        let next = scratch("opening-held-next");
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+            mbx: None,
         };
-        let (mut lifecycle, mut foreign) = (hold(), hold());
-        let (lifecycle_pid, foreign_pid) = (lifecycle.id() as i32, foreign.id() as i32);
-        let own_pid = std::process::id() as i32;
-        let _own = fs::File::open(&database).unwrap();
-        let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
-        holder_ready(&mut lifecycle);
-        holder_ready(&mut foreign);
-        let life = crate::runtime::job_groups::process_record(lifecycle_pid)
-            .unwrap()
-            .expect("the lifecycle stand-in runs")
-            .unique_id;
-        let record = |path: PathBuf, process: crate::lease_holder::Process| {
-            fs::write(path, serde_json::to_vec(&process).unwrap()).unwrap();
-        };
-        let fork = |unique_id| crate::lease_holder::Process {
-            pid: lifecycle.id(),
-            unique_id: Some(crate::api::held_lock::DecimalU64::new(unique_id)),
-            since: "2026-10-21T00:00:00Z".to_owned(),
-            command: "cowshed fork main topic".to_owned(),
-        };
-        record(sessions.join("topic.intent.lock"), fork(life));
-        record(
-            sessions.join("main.land.lock"),
-            crate::lease_holder::Process::this().unwrap(),
-        );
-        let census = crate::storage::bootstrap::CanonicalRoots::fixture(
-            cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
-            root.join("store"),
-        )
-        .census();
-        let censuses = || {
-            (
-                census_pids(&census).unwrap().pids,
-                pids(&holders(&census, &database).unwrap()),
-                pids(&tree_holders(&census, &root).unwrap()),
-                pids(&volume_holders(&census, &root).unwrap()),
-            )
-        };
-        let (asked, held, tree, volume) = censuses();
-        assert!(
-            !asked.contains(&lifecycle_pid),
-            "the lifecycle process was asked"
-        );
-        assert!(asked.contains(&foreign_pid) && asked.contains(&own_pid));
-        for (census, found) in [("descriptor", &held), ("tree", &tree), ("volume", &volume)] {
-            assert!(
-                found.contains(&foreign_pid) && !found.contains(&lifecycle_pid),
-                "{census} census: {found:?}"
-            );
-        }
-        assert!(held.contains(&own_pid), "this process is asked: {held:?}");
-
-        record(sessions.join("topic.intent.lock"), fork(life + 1));
-        let (asked, held, _, _) = censuses();
-        assert!(asked.contains(&lifecycle_pid) && held.contains(&lifecycle_pid));
-
-        for child in [&mut lifecycle, &mut foreign] {
-            drop(child.stdin.take());
-            child.wait_bounded().unwrap();
-        }
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A census reads the lifecycle leases of the store its roots name and no other store's: a
-    /// fixture's census opens each lease of the fixture store once, and none of another store
-    /// beside it nor of the host's (02_workspaces.md, "Holders cowshed does not run"). The lease
-    /// reader is the only injected part; the store comes from the fixture's roots.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_fixture_census_reads_its_own_stores_leases_and_no_other() {
-        let root = scratch("census-leases");
-        let lease = |store: &Path, project: &str, name: &str| {
-            let sessions = store
-                .join("acme")
-                .join(project)
-                .join(crate::repository::SESSIONS_DIRECTORY);
-            fs::create_dir_all(&sessions).unwrap();
-            crate::storage::bootstrap::write_owner_marker(&store.join("acme")).unwrap();
-            let path = sessions.join(name);
-            let holder = crate::lease_holder::Process::this().unwrap();
-            fs::write(&path, serde_json::to_vec(&holder).unwrap()).unwrap();
-            path
-        };
-        let (fixture_store, other_store) = (root.join("fixture"), root.join("other"));
-        let mut expected = vec![
-            lease(&fixture_store, "widget", "main.land.lock"),
-            lease(&fixture_store, "widget", "topic.intent.lock"),
-            lease(&fixture_store, "gadget", "main.intent.lock"),
-        ];
-        lease(&other_store, "widget", "main.land.lock");
-        let census = crate::storage::bootstrap::CanonicalRoots::fixture(
-            cowshed_os::namespace::TestNamespace::of(std::process::id(), 0).unwrap(),
-            fixture_store,
-        )
-        .census();
-        let mut opened = Vec::new();
-        let asked = census_pids_reading(&census, |lease| {
-            opened.push(lease.to_owned());
-            fs::read(lease)
-        })
-        .unwrap();
-        opened.sort();
-        expected.sort();
-        assert_eq!(
-            opened, expected,
-            "the census read the fixture store's leases alone"
-        );
-        assert!(
-            asked.pids.contains(&(std::process::id() as i32)),
-            "a lease naming this process passes nothing over"
-        );
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A fixture's census asks the process that minted its namespace, the processes in its process
-    /// group and their descendants, and no other. A run the fixture backgrounded from a shell that
-    /// exited, which launchd adopted, stays in the group and is named; a process launchd adopted
-    /// after it made a session of its own, as a detached daemon does, is never asked, so no
-    /// per-descriptor query of a process outside the fixture can stall it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_fixture_census_asks_its_owners_group_and_tree_alone() {
-        let root = scratch("census-reach");
-        let database = root.join("T-v3.db");
-        fs::write(&database, b"").unwrap();
-        // The shell starts both holders in the background, prints their pids and exits, so launchd
-        // adopts them. Each reads this test's pipe, kept on descriptor 4, so it ends when the pipe
-        // closes, on every exit path of this test.
-        let mut detaching = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(concat!(
-                "exec 4<&0; ",
-                "(exec 3<\"$0\"; echo ready; read _ <&4) & echo \"grouped $!\"; ",
-                "/usr/bin/perl -MPOSIX -e 'POSIX::setsid() > 0 or die \"setsid: $!\"; ",
-                "open(my $held, \"<\", $ARGV[0]) or die \"open: $!\"; $| = 1; ",
-                "print \"ready\\n\"; <STDIN>' \"$0\" <&4 & echo \"own $!\"",
-            ))
-            .arg(&database)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .unwrap();
-        let mut lines =
-            std::io::BufRead::lines(std::io::BufReader::new(detaching.stdout.take().unwrap()));
-        let (mut grouped, mut own) = (None, None);
-        for _ in 0..4 {
-            let line = lines.next().unwrap().unwrap();
-            match line.split_once(' ') {
-                Some(("grouped", pid)) => grouped = Some(pid.parse::<i32>().unwrap()),
-                Some(("own", pid)) => own = Some(pid.parse::<i32>().unwrap()),
-                _ => assert_eq!(line, "ready"),
+        // Nx takes the lock with `flock`, which holds it per open: the open `hold_opens` makes
+        // waits behind this one as it would behind another process's.
+        let taken = fs::File::create(database.with_extension("lock")).unwrap();
+        taken.try_lock().unwrap();
+        let own = i32::try_from(std::process::id()).unwrap();
+        match hold_opens(&crate::census::this_test(), &root, &state, &next).unwrap() {
+            Err(Opening {
+                database: named,
+                holders,
+            }) => {
+                assert_eq!(named, database);
+                assert!(
+                    holders.iter().any(|holder| holder.pid == own),
+                    "{holders:?}"
+                );
             }
+            Ok(_) => panic!("a taken open lock is an opening"),
         }
-        let (grouped, own) = (grouped.unwrap(), own.unwrap());
-        let holding = detaching.stdin.take();
-        assert!(detaching.wait_bounded().unwrap().success());
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exec 3<\"$0\"; echo ready; read _")
-            .arg(&database)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn_locked()
-            .unwrap();
-        holder_ready(&mut child);
-        let child_pid = child.id() as i32;
-        let census = crate::census::this_test();
-        let asked = census_pids(&census).unwrap().pids;
-        let mut held: Vec<i32> = holders(&census, &database)
-            .unwrap()
-            .iter()
-            .map(|holder| holder.pid)
-            .collect();
-        held.sort_unstable();
-        let parents = [grouped, own].map(|pid| {
-            crate::runtime::job_groups::process_record(pid)
+        drop(taken);
+        drop(
+            hold_opens(&crate::census::this_test(), &root, &state, &next)
                 .unwrap()
-                .map(|record| record.ppid)
-        });
-        let listed = all_pids().unwrap();
-        drop(child.stdin.take());
-        child.wait_bounded().unwrap();
-        drop(holding);
-        assert_eq!(parents, [Some(1), Some(1)], "launchd adopted both holders");
-        assert!(
-            listed.contains(&own),
-            "the holder with a session of its own runs"
-        );
-        assert!(
-            asked.contains(&grouped) && asked.contains(&child_pid) && !asked.contains(&own),
-            "asked {asked:?}: grouped {grouped}, own session {own}, child {child_pid}"
-        );
-        let mut expected = vec![grouped, child_pid];
-        expected.sort_unstable();
-        assert_eq!(
-            held, expected,
-            "the group's and the tree's holders are named"
+                .expect("nothing is opening"),
         );
         fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&next).unwrap();
     }
 }

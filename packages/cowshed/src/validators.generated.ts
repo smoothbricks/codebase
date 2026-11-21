@@ -1649,6 +1649,12 @@ export const assertStorageIoTotalsList = typia.createAssertEquals<readonly Api.S
 export const parseStorageIoTotalsList = (json: string): readonly Api.StorageIoTotals[] =>
   assertStorageIoTotalsList(JSON.parse(json));
 
+export const assertStoreSubstrate = typia.createAssertEquals<Api.StoreSubstrate>();
+export const parseStoreSubstrate = (json: string): Api.StoreSubstrate => assertStoreSubstrate(JSON.parse(json));
+export const assertStoreSubstrateList = typia.createAssertEquals<readonly Api.StoreSubstrate[]>();
+export const parseStoreSubstrateList = (json: string): readonly Api.StoreSubstrate[] =>
+  assertStoreSubstrateList(JSON.parse(json));
+
 export const assertStreamBytes = typia.createAssertEquals<Api.StreamBytes>();
 export const parseStreamBytes = (json: string): Api.StreamBytes => assertStreamBytes(JSON.parse(json));
 export const assertStreamBytesList = typia.createAssertEquals<readonly Api.StreamBytes[]>();
@@ -1671,6 +1677,19 @@ export const parseStreamLines = (json: string): Api.StreamLines => assertStreamL
 export const assertStreamLinesList = typia.createAssertEquals<readonly Api.StreamLines[]>();
 export const parseStreamLinesList = (json: string): readonly Api.StreamLines[] =>
   assertStreamLinesList(JSON.parse(json));
+
+export const assertSubstrateOperation = typia.createAssertEquals<Api.SubstrateOperation>();
+export const parseSubstrateOperation = (json: string): Api.SubstrateOperation =>
+  assertSubstrateOperation(JSON.parse(json));
+export const assertSubstrateOperationList = typia.createAssertEquals<readonly Api.SubstrateOperation[]>();
+export const parseSubstrateOperationList = (json: string): readonly Api.SubstrateOperation[] =>
+  assertSubstrateOperationList(JSON.parse(json));
+
+export const assertSubstrateRefusal = typia.createAssertEquals<Api.SubstrateRefusal>();
+export const parseSubstrateRefusal = (json: string): Api.SubstrateRefusal => assertSubstrateRefusal(JSON.parse(json));
+export const assertSubstrateRefusalList = typia.createAssertEquals<readonly Api.SubstrateRefusal[]>();
+export const parseSubstrateRefusalList = (json: string): readonly Api.SubstrateRefusal[] =>
+  assertSubstrateRefusalList(JSON.parse(json));
 
 export const assertSupervisorRecovery = typia.createAssertEquals<Api.SupervisorRecovery>();
 export const parseSupervisorRecovery = (json: string): Api.SupervisorRecovery =>

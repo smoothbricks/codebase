@@ -143,8 +143,8 @@ Find the symptom in the left column and follow the link.
 - **Owners.** [04_sandbox.md §Baseline (closed) profile](./04_sandbox.md#baseline-closed-profile);
   [01a_apfs.md §Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root);
   [08_testing.md §Fixtures](./08_testing.md#fixtures) (the runtime link is never canonicalized back to the long path).
-  Code: [`cowshed-core/src/sandbox.rs`] `validate_path`, `resolve_deny`; [`cowshed-core/src/exec.rs`] `plan_exec`;
-  [`cowshed-core/src/storage/host_config.rs`] `canonical_mount_root`. See also
+  Code: [`cowshed-core/src/sandbox.rs`] `validate_path`; [`cowshed-core/src/sandbox/macos.rs`] `resolve_deny`;
+  [`cowshed-core/src/exec.rs`] `plan_exec`; [`cowshed-core/src/storage/host_config.rs`] `canonical_mount_root`. See also
   [`/dev/stdout` is a link into `/dev/fd`](#devstdout-is-a-link-into-devfd).
 
 ### `/private/var/folders` is root-owned and swept
@@ -164,8 +164,8 @@ Find the symptom in the left column and follow the link.
   [01_storage.md §Directory layout](./01_storage.md#directory-layout);
   [08_testing.md §Integration tests (real substrate)](./08_testing.md#integration-tests-real-substrate) (the scratch
   parent `t`). Code: [`cowshed-core/src/storage/bootstrap/native/macos.rs`] `mount_root_operations`;
-  [`cowshed-core/src/storage/host_config.rs`] `MACOS_MOUNT_PREFIX`; [`cowshed-os/src/scratch.rs`] `macos_scratch_root`.
-  See also
+  [`cowshed-core/src/storage/host_config/macos.rs`] `MACOS_MOUNT_PREFIX`; [`cowshed-os/src/scratch.rs`]
+  `macos_scratch_root`. See also
   [Spotlight (`mds`) leaks a media port per admitted volume](#spotlight-mds-leaks-a-media-port-per-admitted-volume).
 
 ### The per-user temp directory comes from `dirhelper`
@@ -197,8 +197,8 @@ Find the symptom in the left column and follow the link.
   (the `xcrun` cache); [08_testing.md §Host-controller authority](./08_testing.md#host-controller-authority) (the
   developer directory);
   [16_build_volumes.md §One Cargo environment on every path](./16_build_volumes.md#one-cargo-environment-on-every-path)
-  (the linker). Code: [`cowshed-core/src/sandbox.rs`] `GIT_DEVELOPER_DIR`; [`cowshed-core/src/runtime/supervisor.rs`]
-  `developer_directory`; `tooling/direnv/devenv.nix` `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`.
+  (the linker). Code: [`cowshed-core/src/sandbox.rs`] `GIT_DEVELOPER_DIR`; [`cowshed-core/src/host_path/macos.rs`]
+  `DEVELOPER_DIRECTORIES`; `tooling/direnv/devenv.nix` `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER`.
 
 ## Images and clones
 
@@ -389,8 +389,8 @@ Find the symptom in the left column and follow the link.
   [06_cli.md §Onboarding and repair](./06_cli.md#onboarding-and-repair) (names the probe);
   [docs/troubleshooting.md §Every attach fails with `error code 150`](../../packages/cowshed/docs/troubleshooting.md#every-attach-fails-with-error-code-150).
   Code: [`cowshed-apfs/src/disk_image_helpers.rs`]; [`cowshed-apfs/src/attach_budget.rs`];
-  [`cowshed-cli/src/runtime.rs`] `orphaned_disk_image_helpers_finding`, `disk_image_attach_budget_finding`. See also
-  [Every image attach is in-kernel, never DiskImages2](#every-image-attach-is-in-kernel-never-diskimages2),
+  [`cowshed-cli/src/runtime/macos.rs`] `orphaned_disk_image_helpers_finding`, `disk_image_attach_budget_finding`. See
+  also [Every image attach is in-kernel, never DiskImages2](#every-image-attach-is-in-kernel-never-diskimages2),
   [The IOMedia match-notification ceiling](#the-iomedia-match-notification-ceiling).
 
 ### The IOMedia match-notification ceiling
@@ -543,9 +543,9 @@ Find the symptom in the left column and follow the link.
   [docs/troubleshooting.md §`cowshed doctor` warns `departed-volume-references`](../../packages/cowshed/docs/troubleshooting.md#cowshed-doctor-warns-departed-volume-references);
   [docs/cli.md §`cowshed setup [--uninstall] [--force] [--downgrade]`](../../packages/cowshed/docs/cli.md#cowshed-setup---uninstall---force---downgrade)
   (the fixed physical path and Spotlight admission); [01_storage.md §Directory layout](./01_storage.md#directory-layout)
-  (the canonical mount root). Code: [`cowshed-core/src/storage/host_config.rs`] `MACOS_MOUNT_PREFIX`;
+  (the canonical mount root). Code: [`cowshed-core/src/storage/host_config/macos.rs`] `MACOS_MOUNT_PREFIX`;
   [`cowshed-os/src/scratch.rs`] `macos_scratch_root`; [`cowshed-apfs/src/attach_budget.rs`] `DEPARTED_ATTRIBUTION_HINT`;
-  [`cowshed-cli/src/runtime.rs`] `departed_volume_references_finding`;
+  [`cowshed-cli/src/runtime/macos.rs`] `departed_volume_references_finding`;
   [`packages/nx-plugin/src/executors/bounded-exec/ram-temp.ts`] `ramTempPaths`.
 
 ### Spotlight indexing opt-outs
@@ -738,7 +738,7 @@ Find the symptom in the left column and follow the link.
   [14_nix.md §Posture B — dedicated `dev` uid (recommended hardening)](./14_nix.md#posture-b--dedicated-dev-uid-recommended-hardening);
   [docs/gateway.md §Start at login (launchd)](../../packages/cowshed/docs/gateway.md#start-at-login-launchd);
   [docs/troubleshooting.md §A command says "the cowshed daemon is build X; this cowshed is build Y"](../../packages/cowshed/docs/troubleshooting.md#a-command-says-the-cowshed-daemon-is-build-x-this-cowshed-is-build-y).
-  Code: [`cowshed-cli/src/launchd.rs`] `gui_domain`, `bootstrap_hint`.
+  Code: [`cowshed-cli/src/launchd.rs`] `bootstrap_hint`; [`cowshed-cli/src/launchd/macos.rs`] `gui_domain`.
 
 ### `KeepAlive` restarts whatever the plist names
 
@@ -790,7 +790,7 @@ Find the symptom in the left column and follow the link.
 - **Rule.** Every cowshed LaunchAgent is `ProcessType` `Interactive`, so the gateway, every workspace supervisor and
   every job run at the host's own band.
 - **Owners.** [05_gateway.md §Placement and identity](./05_gateway.md#placement-and-identity). Code:
-  [`cowshed-cli/src/launchd.rs`] `PROCESS_TYPE`.
+  [`cowshed-cli/src/launchd/macos.rs`] `PROCESS_TYPE`.
 
 ### A launchd job starts with 256 open files
 
@@ -921,8 +921,8 @@ Find the symptom in the left column and follow the link.
   [04_sandbox.md §Trusted supervisor and child profiles](./04_sandbox.md#trusted-supervisor-and-child-profiles) (the
   Notes); [04_sandbox.md §Baseline (closed) profile](./04_sandbox.md#baseline-closed-profile);
   [08_testing.md §Unit tests (pure, all platforms)](./08_testing.md#unit-tests-pure-all-platforms). Code:
-  [`cowshed-core/src/sandbox.rs`] `seatbelt_profile`, `push_line`, `hard_denies`,
-  `no_allow_precedes_a_deny_that_covers_it`, `secret_denies_follow_grants_and_carve_backs`.
+  [`cowshed-core/src/sandbox.rs`] `seatbelt_profile`, `hard_denies`, `no_allow_precedes_a_deny_that_covers_it`,
+  `secret_denies_follow_grants_and_carve_backs`; [`cowshed-core/src/sandbox/macos.rs`] `push_line`.
 
 ### A path's ancestors need metadata access
 
@@ -935,7 +935,7 @@ Find the symptom in the left column and follow the link.
 - **Owners.** [04_sandbox.md §Baseline (closed) profile](./04_sandbox.md#baseline-closed-profile);
   [04_sandbox.md §Trusted supervisor and child profiles](./04_sandbox.md#trusted-supervisor-and-child-profiles) (the
   Read policy); [15_capabilities.md §One contribution contract](./15_capabilities.md#one-contribution-contract). Code:
-  [`cowshed-core/src/sandbox.rs`] `push_readable_ancestors`, `push_capability_grant`.
+  [`cowshed-core/src/sandbox/macos.rs`] `push_readable_ancestors`, `push_capability_grant`.
 
 ### dyld needs broad read access
 
@@ -974,7 +974,7 @@ Find the symptom in the left column and follow the link.
   [00_overview.md §Goals](./00_overview.md#goals);
   [docs/gateway.md §Client wiring (files, not hand-written env)](../../packages/cowshed/docs/gateway.md#client-wiring-files-not-hand-written-env)
   (the workspace token a sibling reads this way is worth nothing there). Code:
-  [`cowshed-core/src/runtime/supervisor.rs`] `gateway_proxy_url`.
+  [`cowshed-core/src/workspace_environment.rs`] `gateway_proxy_url`.
 
 ### Mach services, OpenDirectory and keychains are denied
 
@@ -1021,7 +1021,8 @@ Find the symptom in the left column and follow the link.
   [04_sandbox.md §Fixture roots under /tmp](./04_sandbox.md#fixture-roots-under-tmp);
   [04_sandbox.md §Sandbox-denial evidence](./04_sandbox.md#sandbox-denial-evidence);
   [08_testing.md §Unit tests (pure, all platforms)](./08_testing.md#unit-tests-pure-all-platforms) (port-block rule
-  generation). Code: [`cowshed-core/src/sandbox.rs`] `seatbelt_profile`, `push_fixture_root_rules`.
+  generation). Code: [`cowshed-core/src/sandbox.rs`] `seatbelt_profile`; [`cowshed-core/src/sandbox/macos.rs`]
+  `push_fixture_root_rules`.
 
 ### A Seatbelt denial is `EPERM`; the log is closed to non-admins
 

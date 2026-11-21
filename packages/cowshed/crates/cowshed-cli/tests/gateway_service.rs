@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, parse_args};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use cowshed_cli::gateway_service::{
     GatewayDrain, GatewayPaths, RELEASE_CLI_TARGET, activate_launch_agent, drain_after_shutdown,
     emit_gateway_status, install_host_stable_executable, refuse_unsupervisable_build,
     remove_host_stable_executable, restore_previous_executable, retain_previous_executable,
 };
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use cowshed_cli::launchd::{
     BunDirectory, COWSHED_BINARY_NAME, CommandStatus, ExecutableDigest, HostStableExecutable,
     InstallOutcome, LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdExecutor,
@@ -14,9 +16,11 @@ use cowshed_cli::output::Output;
 use cowshed_core::api::GatewayStatus as CliGatewayStatus;
 use cowshed_core::storage::bootstrap::CanonicalRoots;
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
+#[cfg(target_os = "macos")]
 use cowshed_os::deadline::{Deadline, RunError};
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 
+#[cfg(target_os = "macos")]
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -25,6 +29,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[test]
@@ -46,6 +51,7 @@ fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct RecordingLaunchctl {
     outputs: VecDeque<std::result::Result<LaunchctlOutput, RunError>>,
@@ -54,6 +60,7 @@ struct RecordingLaunchctl {
     bounds: Vec<Duration>,
 }
 
+#[cfg(target_os = "macos")]
 impl RecordingLaunchctl {
     fn new(
         outputs: impl IntoIterator<Item = std::result::Result<LaunchctlOutput, RunError>>,
@@ -65,6 +72,7 @@ impl RecordingLaunchctl {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl LaunchctlCommand for RecordingLaunchctl {
     fn run(
         &mut self,
@@ -88,6 +96,7 @@ fn bun() -> BunDirectory {
         .expect("valid bun directory")
 }
 
+#[cfg(target_os = "macos")]
 fn launch_spec() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(
         HostNamespace::Production,
@@ -98,6 +107,7 @@ fn launch_spec() -> LaunchAgentSpec {
     .expect("valid spec")
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn launch_agent_activation_bootstraps_only_when_not_loaded() {
     let command = RecordingLaunchctl::new([
@@ -124,6 +134,7 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
 
 /// A loaded agent is kickstarted within its exit timeout, as `launchctl print` read it, the unload
 /// grace and one launchctl call: `kickstart -k` waits for the old process to go.
+#[cfg(target_os = "macos")]
 #[test]
 fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     let command = RecordingLaunchctl::new([
@@ -178,6 +189,7 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
 /// print(gone) to confirm the bootout actually finished, print(gone) again from the activation,
 /// then bootstrap. That confirming probe is what stops the caller taking the kickstart branch
 /// against a teardown still in progress.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
     let not_loaded = || {
@@ -348,6 +360,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
     assert!(stderr.is_empty());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gateway_status_names_launchd_socket_and_both_versions() {
     let cases = [

@@ -24,6 +24,11 @@ naturally; child-spawn code does not change them. Kernel-wide descriptor capacit
 reconciles the generated plist as well as the installed cowshed (below), including on hosts whose installed copy already
 matches.
 
+On Linux the gateway runs as the systemd user unit `dev.cowshed.gateway.service`, started at login
+(`WantedBy=default.target`). Its `LimitNOFILE=245760:infinity` states the same finite soft limit and asks for whatever
+hard limit the user manager has: a user manager cannot raise its own, and gives the closest it has rather than refuse
+the start. The unit, and each launchd step as systemd takes it, are in "The installed cowshed" ("On Linux").
+
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus the store's
 `<store>/gateway.sock`, production's `/private/cowshed/store/gateway.sock`, for status, audit tail, and coordinator
 verbs; every client derives the socket from the store it was given, so a test namespace's gateway binds and answers only
@@ -45,21 +50,32 @@ connector; namespace separation makes it a different listener. Data-plane topolo
   workspace's and not the newer one's, at startup and in every per-project reconcile, with
   `next: cowshed doctor --repair`, serving every other session (04_sandbox.md, `portBlock` collisions); neither startup
   nor a reconcile fails over a collision.
-- **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
-  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts
-  that one socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has
-  loopback up but no veth, routed interface, or default route. For ordinary package/proxy clients, the controller
-  launches exactly one trusted minimal connector in that netns under a controller-owned process identity and dedicated
-  cgroup that workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4 `127.0.0.1:7644`, accepts
-  no non-loopback traffic, and forwards bytes bidirectionally and unchanged only to `/run/cowshed/gateway.sock`. It
-  parses no protocol, owns no policy, token, CA key, registry credential, or upstream-network authority, and cannot
-  select a different Unix socket. The socket inode plus private netns is the primary workspace identity;
-  `127.0.0.1:7644` is only a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach
-  siblings.
+- **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated, and a Linux workspace's
+  metadata records none. The gateway serves each session on its own Unix stream socket,
+  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock`, in the data socket root of the store it serves. A
+  gateway start makes `run/gateway` at mode 0700 when it is absent and never repairs one that is there: a root that is
+  another user's, a link, or that group or others may enter refuses the start. Installing a session binds its socket,
+  removing a stale socket of the user's at that path first, and sets it to mode 0600; removing the session, moving it to
+  another endpoint, or draining the gateway unlinks it. A session is refused unless its endpoint is `<name>.sock`
+  directly inside the root and is not the control socket, so no controller can have the gateway bind anywhere else. The
+  controller derives the same path from the workspace's store and incarnation that the gateway is configured with and
+  that a job's connector dials; the socket is one spelling in all three. The socket serves exactly the protocol a macOS
+  workspace's TCP listener serves. A job's private network namespace has loopback up but no veth, routed interface, or
+  default route, and exactly one trusted minimal connector in it, which binds only IPv4 `127.0.0.1:7644`, accepts no
+  non-loopback traffic, and forwards bytes bidirectionally and unchanged only to the workspace's socket. It parses no
+  protocol, owns no policy, token, CA key, registry credential, or upstream-network authority, and cannot select a
+  different Unix socket. The socket a connection arrived on is the primary workspace identity: two workspaces' sockets
+  are two listeners with two sessions, so a connection is attributed before any byte of it is read. `127.0.0.1:7644` is
+  only a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach siblings. What the
+  namespace and connector are scoped to today (a launch, not an attached workspace), and that the socket is not
+  bind-mounted at `/run/cowshed/gateway.sock`, are stated in 04_sandbox.md, "Linux enforcement".
 
-Port-block inventory is macOS data even when a pure inventory test runs on another host. Its session conversion
-validates the recorded macOS block; actual gateway installation always validates the current host's topology and rejects
-TCP sessions on Linux. A namespace-local connector is never a TCP gateway-session endpoint.
+A session's endpoint follows the topology its workspace's metadata records, on whatever host reads it: a recorded
+`portBlock` is a macOS workspace's TCP listener, validated as a macOS block, and a workspace recording none is a Linux
+one, served on its incarnation's socket. Port-block inventory is therefore macOS data even when a pure inventory test
+runs on another host, a Linux workspace reserves no block, and nothing refuses it for holding none. Actual gateway
+installation always validates the current host's topology: macOS rejects Unix sessions and Linux rejects TCP sessions. A
+namespace-local connector is never a TCP gateway-session endpoint.
 
 The allocator's publication marker excludes other cowshed creators while it binds all ports in the candidate block.
 Those listeners are released only after the image and grant are published. A separate host process can still claim a
@@ -96,14 +112,18 @@ separate uid for the gateway and its workspaces. The token is never exported bar
 `.cowshed/env` carries `COWSHED_WORKSPACE_TOKEN` (03_caches.md), and `.cowshed/workspace.json` is what marks a
 workspace.
 
-Create and fork mint a token. Detach drains the Linux connector and gateway connections, kills the connector cgroup and
-unlinks the socket without rotating persistent authority; attach creates the socket and connector before admitting
-execs. Remove uninstalls the session with its listener, so the removed workspace's token authenticates nowhere,
-including at a later workspace given the freed block, which mints its own. A policy miss after successful endpoint and
-token authentication is 403 with a machine-parsable grant hint naming both remedies, the standing one first:
-`cowshed grant --project-wide --egress <host>` (every workspace of the project) or `cowshed grant <ws> --egress <host>`
-(that workspace). The hint names the bare canonical DNS name or IP address, never a CONNECT authority: the grant host
-grammar is shared with grant admission and exec (04_sandbox.md).
+Create and fork mint a token. On Linux, as on macOS, a detached workspace's session is removed by its project's next
+reconcile and installed again by the reconcile that precedes an attached workspace's exec; there the removal closes the
+session's gateway connections and unlinks its socket without rotating persistent authority, and the install binds the
+socket again. Between the two a job's connector finds a gateway that is not listening, exactly as a client finds a proxy
+that is down. A socket file a gateway that did not exit cleanly left behind answers nothing (`ECONNREFUSED`) and is
+replaced by the next install at its path; one whose workspace has since been detached stays as an unanswered file until
+that incarnation attaches again [open]. Remove uninstalls the session with its listener, so the removed workspace's
+token authenticates nowhere, including at a later workspace given the freed block, which mints its own. A policy miss
+after successful endpoint and token authentication is 403 with a machine-parsable grant hint naming both remedies, the
+standing one first: `cowshed grant --project-wide --egress <host>` (every workspace of the project) or
+`cowshed grant <ws> --egress <host>` (that workspace). The hint names the bare canonical DNS name or IP address, never a
+CONNECT authority: the grant host grammar is shared with grant admission and exec (04_sandbox.md).
 
 Main is a first-class data-plane client with identical platform wiring and policy. Gateway startup and absence are
 covered under "Availability and offline behavior".
@@ -120,6 +140,7 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | `cowshed-<sha256>`       | A stored copy, named for the SHA-256 of its bytes (64 lowercase hex digits), mode 0755.        |
 | `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
 | `nx-cache-server`        | The Nx cache server's stable name, a link to its own stored copy `nx-cache-server-<sha256>`.   |
+| `cowshed-helper`         | The ZFS root helper's stable name, a link to its own stored copy `cowshed-helper-<sha256>`.    |
 | `cowshed-gateway-host`   | The program launchd runs for the gateway: a copy of the build, signed ("The gateway host").    |
 
 `cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
@@ -127,6 +148,13 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 answers to `cargo`: the project shell owns Cargo routing (11_shell.md, "Canonical mbx environment"). An install removes
 only a `cargo` link owned by cowshed, one naming the stable cowshed or a stored cowshed copy. A foreign file or link
 there is refused by name and left untouched.
+
+**The root helper is installed with the build, never made root's by it.** Every install (`setup`, `gateway start`)
+copies the `cowshed-helper` beside the build into `bin` the same content-addressed way, as the user's own file at mode
+0755, and a build with none beside it is refused by name before the stable name moves. No install sets a setuid bit or
+writes sudoers on any platform: what lets the helper act as root is one command the operator runs as root, which `setup`
+names and proves only on a store that is a ZFS dataset (09_substrates.md, "Install and privilege"). On an APFS store the
+installed helper is never run.
 
 **The Nx cache server is JavaScript run by the shell's `bun`** (the owner's rulings, 2026-10-17 and 2026-10-18). Neither
 `@smoothbricks/cowshed` nor `@smoothbricks/nx-cache-server` ships a compiled server or an interpreter. An install copies
@@ -253,6 +281,51 @@ audit flush finish before launchd's kill. Measured 2026-10-22: launchd's default
 none, so a bootout SIGKILLed a draining gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5 s,
 gave up 0.03 s earlier and reported the bootout stuck; its restore then kickstarted the job still in teardown (launchctl
 37), and launchd dropped it a moment later, leaving the host with no gateway.
+
+**On Linux the service manager is systemd's user manager.** The installed cowshed, its `bin` and the daemon's log are at
+the same paths under the home, and everything above holds with these substitutions. The definition is the unit
+`~/.config/systemd/user/<label>.service` (mode 0600, published through the same temporary-file rename); that directory
+is made 0755 with its parents when missing and is otherwise left as it is. Nothing is signed: there is no keychain, no
+identity and no `codesign`, the gateway host is a plain copy of the build, rewritten when the stable name moves to
+another build or the host is gone, and no first-launch probe runs — the daemon serves none, and `cowshed doctor`
+launches nothing and asks the gateway for nothing, so its reading is that of an exempt host. The unit:
+
+| Unit key                                                     | Why                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ExecStart=`                                                 | The argv launchd's `ProgramArguments` is: the gateway host, `__gateway-host`, the stable name, `gateway run`. Each argument is double-quoted, with `\`, `"`, `%` (as `%%`) and `$` (as `$$`) escaped.                                                                                                                                                        |
+| `Type=exec`                                                  | A start has succeeded once the host runs, so a bootstrap reports a host that cannot be executed.                                                                                                                                                                                                                                                             |
+| `Restart=always`, `RestartSec=1`, `StartLimitIntervalSec=0`  | `KeepAlive`: the manager starts the pair again whenever it exits, however often.                                                                                                                                                                                                                                                                             |
+| `TimeoutStopSec=30`                                          | `ExitTimeOut` (`GATEWAY_EXIT_TIMEOUT`): the manager SIGKILLs the host that long after a stop's SIGTERM, so the drain's 20 s force stop finishes first.                                                                                                                                                                                                       |
+| `KillMode=process`                                           | A stop signals the host only, which passes SIGTERM to the daemon. The workspace supervisors and their jobs live in the unit's cgroup and outlast a gateway restart, as they do under launchd; `mixed` and `control-group` SIGKILL everything left in the cgroup the moment the host has exited. The kernel ends the daemon of a host killed at that timeout. |
+| `Delegate=cpu memory io pids`, `DelegateSubgroup=controller` | The unit's cgroup subtree and those controllers are the service's, and the service starts in the `controller` leaf, so the unit's own cgroup holds no process and distributes the controllers to the class cgroups the job cgroups sit in ("Classes"; 07_api.md).                                                                                            |
+| `Environment="PATH=…"`                                       | The `bun` directory setup found, then the user manager's own default (`/run/wrappers/bin`, the user's and the default nix profiles spelt with the specifiers `%h` and `%u`, `/run/current-system/sw/bin`), then `/usr/local/bin:/usr/bin:/bin`. A unit that states `PATH` replaces the manager's.                                                            |
+| `Environment="CREDENTIALS_DIRECTORY=…"`                      | `~/Library/Application Support/dev.cowshed/credentials`, where the gateway's credential provider reads its records; it refuses to start without the variable.                                                                                                                                                                                                |
+| `StandardError=append:…`                                     | `StandardErrorPath`: `~/Library/Logs/cowshed/daemon-stderr.log`.                                                                                                                                                                                                                                                                                             |
+| `LimitNOFILE=245760:infinity`                                | "Placement and identity".                                                                                                                                                                                                                                                                                                                                    |
+
+The daemon is the host's child, and between fork and exec it asks the kernel for SIGKILL at its parent's death
+(`PR_SET_PDEATHSIG`). The manager's SIGKILL of the host at the stop timeout therefore ends the pair, as launchd's kill
+of the job's process group does, and no daemon outlives its host holding the control socket.
+
+systemd makes neither the log's directory (a unit whose `append:` path has no parent fails every start) nor the
+credentials directory, so an install makes both, mode 0700, before it activates the agent, and a setup that finds one
+missing makes it without a restart. Each lifecycle step is one `systemctl --user` call on the unit, under the bound of
+the launchctl call it stands for ("Deadlines"):
+
+| Step      | Call                                                                                          | What it guarantees                                                                                                                                                                             |
+| --------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| bootstrap | `enable --now <unit>`                                                                         | The manager reloads, so it reads the unit just written; it starts the unit, and starts it at every login.                                                                                      |
+| bootout   | `disable --now <unit>`                                                                        | The unit is no longer started at login, and the call returns once its stop job has ended. The install still watches the host's exit in the kernel and reads the status until the unit is gone. |
+| kickstart | `restart <unit>`                                                                              | The definition the manager loaded is stopped and started again; a rewritten unit is read only by a bootstrap.                                                                                  |
+| print     | `show <unit> --property=LoadState,ActiveState,SubState,UnitFileState,MainPID,TimeoutStopUSec` | Exit 0 whatever the unit's state, which the properties say.                                                                                                                                    |
+
+The manager holds the unit — launchd's "loaded" — while `ActiveState` is `active`, `activating`, `deactivating`,
+`reloading` or `refreshing`, or `UnitFileState` is `enabled`: a unit that is enabled and stopped is still booted out, so
+its `default.target.wants` link never outlives its file. Any other exit of `systemctl`, and an answer with no
+`ActiveState`, is an error and never "not loaded". `MainPID` is the gateway host (`0` between two runs) and
+`TimeoutStopUSec` the exit timeout of the definition the manager loaded; `infinity` there is refused, since a stop with
+no bound has no deadline to wait within. `gateway stop` and `setup --uninstall` boot the unit out and then remove its
+file.
 
 **An install refuses while a land runs.** Activating the agent restarts a gateway that runs, and so does the host move
 inside `setup`, and a restart refuses a land's next command its connection to the daemon ("A land step waits for an
@@ -392,10 +465,11 @@ Readiness, which is no other install holding the install slot, is judged before 
 `gateway status`, and again before `setup`: an install that is not ready builds nothing, and is deferred (unverified,
 when the status cannot be read) with the command that reruns the script. A land turn held or queued is no reason to
 defer: the install waits for it in order (below). It stages both from the shed's outputs in
-`.cache/cowshed-release/<head>/` laid out as a distribution (`<package>/dist/bin/<platform>/cowshed`, the server under
-`<package>/node_modules`, where setup looks for it): the debug build every land replays into `dist/bin` replaces the
-release binary there, and a stage is the copy whose path an operator is told to run until three newer stages exist, each
-newer install superseding it. The shed's re-point, build and stage run under the release lock
+`.cache/cowshed-release/<head>/` laid out as a distribution (`<package>/dist/bin/<platform>/cowshed` with the root
+helper `cowshed-helper` beside it, without which setup installs nothing (09_substrates.md, "Install and privilege"), the
+server under `<package>/node_modules`, where setup looks for it): the debug build every land replays into `dist/bin`
+replaces the release binary there, and a stage is the copy whose path an operator is told to run until three newer
+stages exist, each newer install superseding it. The shed's re-point, build and stage run under the release lock
 (`.cache/cowshed-release.lock`), which orders installs as the install slot does: no land turn orders two after-jobs, so
 a second install waits in line for the first, never moves the shared shed under its build, and finds the stage already
 whole when the first built its head; only after-jobs take it, so no land waits on it, and removing the `*.partial` a
@@ -710,8 +784,15 @@ The HTTP URL base is `http://127.0.0.1:<portBlock.base>` on macOS and exactly `h
 workspace client is configured for a mirror route: bun (its repository's registry), cargo and Go reach their public
 registries through the generic `HTTP_PROXY`/`HTTPS_PROXY` variables (and lowercase equivalents) on `<base>`
 (03_caches.md) — intercepted for npm and crates.io, an opaque tunnel for Go, which sends no credential to plain HTTP. On
-Linux the trusted connector carries these byte streams to the mounted Unix socket; clients never speak HTTP over Unix
-sockets. Endpoint selection and the token still authenticate every request.
+Linux the trusted connector carries these byte streams to the workspace's Unix socket; clients never speak HTTP over
+Unix sockets. Endpoint selection and the token still authenticate every request. A job's environment is one derivation
+on both platforms (`workspace_environment`): the four proxy variables are `http://cowshed:<token>@127.0.0.1:<port>` and
+`NO_PROXY`/`no_proxy` keep loopback direct, where `<port>` is the base of the workspace's recorded block, or 7644 for a
+workspace that records none. `COWSHED_PORT_BASE` and `COWSHED_PORT_BLOCK_SIZE` are exported only for a workspace with a
+block; a Linux job has neither, and a value its caller sourced from another workspace's `.cowshed/env` is withheld from
+it. `.cowshed/env` follows the same rule, so a Linux workspace's file names `http://127.0.0.1:7644/nx` and no port
+block; that address answers only inside a job's namespace, so a host shell outside a job has no Nx remote cache on Linux
+[open].
 
 ### npm registry mirror — eligible requests to an admitted registry
 
@@ -2706,15 +2787,27 @@ pressure (it changes who is selectable, never who comes first) and `priority`, w
 
 ## Credentials
 
-- Secrets use macOS Keychain generic passwords under service `dev.cowshed.gateway`; Linux runner credentials use the
-  platform mechanism specified in 10_ci.md. Records carry protocol, exact HTTPS origin, admitted methods, normalized
-  path/package/module scopes, and project `repo_id` where applicable; a bare host-only secret record is invalid.
+- Secrets use macOS Keychain generic passwords under service `dev.cowshed.gateway`. Records carry protocol, exact HTTPS
+  origin, admitted methods, normalized path/package/module scopes, and project `repo_id` where applicable; a bare
+  host-only secret record is invalid.
+- On Linux the credential store is the directory `credentials` in cowshed's support directory, owned by the user at mode
+  0700, holding one record file per binding at mode 0600. `cowshed credential` verbs write it. Enrolment creates the
+  directory when it is absent, writes the record to an exclusively created temporary file in that directory, syncs it
+  and renames it over the record's name, so a reader sees the old record or the new one; removal unlinks the record. The
+  gateway reads the store through `$CREDENTIALS_DIRECTORY`, which its unit sets to that directory, and judges the
+  directory and the record again at every lookup. Writer and reader alike refuse a directory that is a symlink, belongs
+  to another user, or grants group or other any permission; the reader also refuses a record that is not that user's
+  regular file at mode 0600 or 0400. A record's file name is its account key
+  `v1|<repo_id>|<protocol>|<base64url exact origin>` with the `/` of `repo_id` written `%2F` and a `%` written `%25`,
+  which makes it one file-name component. A binding whose name would exceed 255 bytes is refused at enrolment, never
+  truncated; nothing is enrolled under it, so lookup, status and removal find it absent.
 - Credential lookup happens only after endpoint identity, token, project admission, CONNECT authority/SNI, method, and
   normalized path checks. Rotation is observed on next use. Values are never logged, cached in telemetry, placed in
   URLs, or returned to clients.
 - Each workspace CA private key is controller-owned mode 0600 outside every mount. The matching public certificate is an
   in-image server trust anchor only. Create/fork mint a key; destroy removes it.
-- The gateway process is host-side and credential-store access is restricted to that executable identity.
+- The gateway process is host-side and credential-store access is restricted to that executable identity on macOS; on
+  Linux it is restricted to the user that owns the store, by the modes above.
 
 ## Startup contract: mains eagerly, sessions on use
 
@@ -2826,6 +2919,21 @@ lost then. A removal is such a holder from before it unmounts the first build vo
 is released (02_workspaces.md, `rm` step 4), so the watch mounts nothing of a workspace being removed. The watch is the
 one owner of those waits, one per workspace. When it starts, it makes one pass over every workspace of every recorded
 project, for a mount lost while no gateway watched.
+
+On Linux the watch's table and signal are both `/proc/self/mountinfo` (`lost_mounts/linux.rs`): the table is the file's
+text, and the signal is its poll readiness, since the kernel raises `POLLPRI | POLLERR` on an open `mountinfo` whenever
+a mount or unmount changed the namespace since that descriptor's last poll. The inventory, the startup pass and this
+watch all run on the platform's native execution host (`runtime::native_host`): the APFS image host on macOS, and on
+Linux the directory host, which keeps each payload as a ZFS dataset when the store is a cowshed `store` dataset and as a
+plain directory otherwise. A plain directory is no kernel mount, so it has none to lose
+(`DirectoryExecutionHost::lost_mount`). A dataset has one: a pool import that mounted nothing, or a `zfs unmount` no
+cowshed verb made, leaves its mount record (the symlink at its image path, naming the mountpoint) standing while the
+kernel has nothing of the cowshed root mounted there. `lost_mount` answers that dataset, the one `zfs list` shows with
+that `mountpoint`, for the workspace's own dataset and for the build volume its checkout links; it reads the record, the
+kernel and `zfs list` and changes nothing. The settle then mounts the dataset again from its own `mountpoint` through
+the helper's `mount` verb (`ZfsPayloads::settle`, which `heal_mount` runs before the tree at the mountpoint is judged,
+since an unmounted mountpoint is an empty directory that carries no marker), and the stderr line below names the dataset
+where an image's device stands.
 
 A workspace whose image lock is gone has nothing to remount: the remount, and the wait for a holder, take only a lock
 that exists (01_storage.md, "Lock order"), so a pass that runs after `unadopt` unbound the project recreates neither the

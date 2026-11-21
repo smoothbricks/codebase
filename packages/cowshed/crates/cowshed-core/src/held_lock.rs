@@ -43,6 +43,15 @@ use crate::api::held_lock::{
 use crate::lease_holder;
 use crate::runtime::job_groups;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The inode `metadata` describes.
 fn inode_of(metadata: &fs::Metadata) -> Inode {
     Inode {
@@ -355,17 +364,16 @@ impl std::fmt::Display for Observation {
 }
 
 /// What the kernel showed of one process's descriptors on the locked inode, as the per-OS shell
-/// read it: the facts the pure decision ([`judge`]) works from.
+/// read it: the facts the pure decision ([`judge`]) works from. A platform's shell makes only its
+/// own views, so a build for one leaves the other's unmade; the decision judges every one.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KernelView {
     /// Linux: whether the fdinfo of any of its descriptors on the inode shows the granted flock.
-    #[cfg(any(target_os = "linux", test))]
     Custody { holds: bool },
     /// Linux: at least one candidate descriptor could not be inspected and none proved custody.
-    #[cfg(any(target_os = "linux", test))]
     Unexposed,
     /// Darwin, which shows no lock state: the process's kernel unique id, `None` once it has exited.
-    #[cfg(any(target_os = "macos", test))]
     Identity { unique_id: Option<u64> },
 }
 
@@ -381,13 +389,9 @@ pub(crate) struct Seen {
 /// the record names by pid and the unique id it has now, never for a pid a later life was given.
 fn custody_of(pid: i32, view: KernelView, recorded: Option<&lease_holder::Process>) -> Custody {
     match (pid, view, recorded) {
-        #[cfg(any(target_os = "linux", test))]
         (_, KernelView::Custody { holds: true }, _) => Custody::Holds,
-        #[cfg(any(target_os = "linux", test))]
         (_, KernelView::Custody { holds: false }, _) => Custody::Open,
-        #[cfg(any(target_os = "linux", test))]
         (_, KernelView::Unexposed, _) => Custody::Unexposed,
-        #[cfg(any(target_os = "macos", test))]
         (pid, KernelView::Identity { unique_id }, recorded) => {
             let named = recorded.is_some_and(|record| {
                 i64::from(record.pid) == i64::from(pid)
@@ -417,9 +421,7 @@ pub(crate) fn judge(
         .map(|process| Descriptor {
             pid: process.pid,
             unique_id: match process.view {
-                #[cfg(any(target_os = "macos", test))]
                 KernelView::Identity { unique_id } => unique_id.map(DecimalU64::new),
-                #[cfg(any(target_os = "linux", test))]
                 KernelView::Custody { .. } | KernelView::Unexposed => None,
             },
             custody: custody_of(process.pid, process.view, recorded),
@@ -499,7 +501,7 @@ pub fn observe(census: &crate::census::CensusScope, path: &Path) -> io::Result<O
     file.read_to_end(&mut record)?;
     let recorded = serde_json::from_slice::<lease_holder::Process>(&record).ok();
     let own = i32::try_from(std::process::id()).map_err(io::Error::other)?;
-    let (locked, seen) = kernel_view(census, &file, inode, recorded.as_ref())?;
+    let (locked, seen) = platform::kernel_view(census, &file, inode, recorded.as_ref())?;
     let (owner, descriptors) = judge(seen, recorded.as_ref(), own);
     // A request is believed only as far as its owner is proven.
     let holding = owner
@@ -514,161 +516,6 @@ pub fn observe(census: &crate::census::CensusScope, path: &Path) -> io::Result<O
         holding,
         descriptors,
     })
-}
-
-/// Linux: each process with a descriptor on `inode` and whether its fdinfo shows the flock, and
-/// whether the kernel's lock table shows the inode locked (`/proc/locks`, which also covers a
-/// holder of another user whose descriptors this user cannot read).
-#[cfg(target_os = "linux")]
-fn kernel_view(
-    census: &crate::census::CensusScope,
-    _file: &File,
-    inode: Inode,
-    _recorded: Option<&lease_holder::Process>,
-) -> io::Result<(bool, Vec<Seen>)> {
-    let mut seen = Vec::new();
-    for (holder, fds) in
-        crate::build_volume::nx::inode_holders(census, (inode.dev.get(), inode.ino.get()))?
-    {
-        let view = fdinfo_custody(
-            fds.iter()
-                .map(|fd| fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", holder.pid))),
-            u64::from(libc::major(inode.dev.get())),
-            u64::from(libc::minor(inode.dev.get())),
-            inode.ino.get(),
-        );
-        if let Some(view) = view {
-            seen.push(Seen {
-                pid: holder.pid,
-                command: holder.command,
-                view,
-            });
-        }
-    }
-    let locked = seen
-        .iter()
-        .any(|process| process.view == KernelView::Custody { holds: true })
-        || lock_table_holds(&fs::read_to_string("/proc/locks")?, inode);
-    Ok((locked, seen))
-}
-
-/// Aggregate descriptor evidence without turning an unreadable candidate into negative custody.
-/// A proven grant wins; otherwise any unreadable candidate is unexposed. Disappeared candidates
-/// contribute nothing, and an entirely disappeared process is omitted from the observation.
-#[cfg(any(target_os = "linux", test))]
-fn fdinfo_custody<S: AsRef<str>>(
-    infos: impl IntoIterator<Item = io::Result<S>>,
-    major: u64,
-    minor: u64,
-    ino: u64,
-) -> Option<KernelView> {
-    let mut view = None;
-    for info in infos {
-        match info {
-            Ok(info) => {
-                if fdinfo_holds_flock(info.as_ref(), major, minor, ino) {
-                    return Some(KernelView::Custody { holds: true });
-                }
-                view.get_or_insert(KernelView::Custody { holds: false });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => view = Some(KernelView::Unexposed),
-        }
-    }
-    view
-}
-
-/// Whether fdinfo names a granted `flock(2)` on the requested inode, not a different lock on a
-/// reused descriptor. Waiters are never granted custody; `/proc/locks` marks them `->`.
-#[cfg(any(target_os = "linux", test))]
-fn fdinfo_holds_flock(info: &str, major: u64, minor: u64, ino: u64) -> bool {
-    info.lines().any(|line| {
-        line.strip_prefix("lock:")
-            .is_some_and(|lock| lock_line_holds(lock, major, minor, ino))
-    })
-}
-
-/// Whether `/proc/locks` shows a granted `flock(2)` on `inode`: a line `N: FLOCK ... <pid>
-/// <maj>:<min>:<ino> ...` (hexadecimal major and minor) that is no `->` waiter.
-#[cfg(target_os = "linux")]
-fn lock_table_holds(table: &str, inode: Inode) -> bool {
-    let (dev, ino) = (inode.dev.get(), inode.ino.get());
-    let (major, minor) = (libc::major(dev), libc::minor(dev));
-    table
-        .lines()
-        .any(|line| lock_line_holds(line, u64::from(major), u64::from(minor), ino))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn lock_line_holds(line: &str, major: u64, minor: u64, ino: u64) -> bool {
-    let mut fields = line.split_whitespace();
-    fields.next();
-    if fields.next() != Some("FLOCK") {
-        return false;
-    }
-    fields.any(|field| {
-        let mut parts = field.split(':');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(maj), Some(min), Some(number), None) => {
-                u64::from_str_radix(maj, 16).ok() == Some(major)
-                    && u64::from_str_radix(min, 16).ok() == Some(minor)
-                    && number.parse::<u64>().ok() == Some(ino)
-            }
-            _ => false,
-        }
-    })
-}
-
-/// Darwin: each process with a descriptor on `inode` and its kernel unique id, and whether
-/// `F_GETLK` shows the inode exclusively locked: a `flock(2)` conflicts with the shared lock it
-/// asks about. The descriptor census asks no process a cowshed lifecycle operation of `census`'s
-/// store runs in ([`crate::build_volume::nx::inode_holders`]): a fork's first mount of its new image
-/// holds its vnode for minutes. The lock's `recorded` holder, when it is such a process, is seen by
-/// its unique id alone, which the process table answers without reading a descriptor, so a fork
-/// holding `main.dmg.lock` is still its proven owner.
-#[cfg(target_os = "macos")]
-fn kernel_view(
-    census: &crate::census::CensusScope,
-    file: &File,
-    inode: Inode,
-    recorded: Option<&lease_holder::Process>,
-) -> io::Result<(bool, Vec<Seen>)> {
-    let mut seen = Vec::new();
-    for (holder, _fds) in
-        crate::build_volume::nx::inode_holders(census, (inode.dev.get(), inode.ino.get()))?
-    {
-        let unique_id = job_groups::process_record(holder.pid)?.map(|record| record.unique_id);
-        seen.push(Seen {
-            pid: holder.pid,
-            command: holder.command,
-            view: KernelView::Identity { unique_id },
-        });
-    }
-    if let Some(recorded) = recorded
-        && let Ok(pid) = i32::try_from(recorded.pid)
-        && !seen.iter().any(|process| process.pid == pid)
-        && lease_holder::running_lifecycle(census.store(), |lease| fs::read(lease)).contains(&pid)
-        && let Some(record) = job_groups::process_record(pid)?
-    {
-        seen.push(Seen {
-            pid,
-            command: recorded.command.clone(),
-            view: KernelView::Identity {
-                unique_id: Some(record.unique_id),
-            },
-        });
-    }
-    // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
-    let mut probe = unsafe { std::mem::zeroed::<libc::flock>() };
-    probe.l_type = libc::c_short::try_from(libc::F_RDLCK).map_err(io::Error::other)?;
-    probe.l_whence = libc::c_short::try_from(libc::SEEK_SET).map_err(io::Error::other)?;
-    // SAFETY: F_GETLK reads and writes `probe`, a live `flock` this function owns.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let locked =
-        probe.l_type != libc::c_short::try_from(libc::F_UNLCK).map_err(io::Error::other)?;
-    Ok((locked, seen))
 }
 
 /// The cancellation authority a waiter captures at its start: the kernel's identity of each life
@@ -1002,65 +849,6 @@ mod tests {
             held_command_environment(Some(OsStr::new(""))).expect("empty means zero"),
             held_command_environment(Some(OsStr::new("0"))).expect("zero is a count")
         );
-    }
-
-    #[test]
-    fn an_fdinfo_lock_line_is_a_granted_flock_and_nothing_else_is() {
-        let held = "pos:\t0\nflags:\t02100002\nmnt_id:\t31\nino:\t1311\nlock:\t1: FLOCK  ADVISORY  WRITE 4242 08:02:1311 0 EOF\n";
-        assert!(fdinfo_holds_flock(held, 8, 2, 1311));
-        assert!(!fdinfo_holds_flock(held, 8, 2, 1312));
-        assert!(!fdinfo_holds_flock(held, 9, 2, 1311));
-        let posix = "pos:\t0\nlock:\t1: POSIX  ADVISORY  WRITE 4242 08:02:1311 0 EOF\n";
-        assert!(!fdinfo_holds_flock(posix, 8, 2, 1311));
-        assert!(!fdinfo_holds_flock(
-            "pos:\t0\nflags:\t02100002\n",
-            8,
-            2,
-            1311
-        ));
-    }
-
-    #[test]
-    fn unreadable_fdinfo_is_unexposed_and_disappeared_fdinfo_is_not_a_descriptor() {
-        let held = "lock:\t1: FLOCK ADVISORY WRITE 4242 08:02:1311 0 EOF\n";
-        let open = "pos:\t0\nflags:\t02100002\n";
-        let gone = || Err::<&str, _>(io::Error::from(io::ErrorKind::NotFound));
-        let unreadable = || Err::<&str, _>(io::Error::from(io::ErrorKind::PermissionDenied));
-        assert_eq!(fdinfo_custody([gone()], 8, 2, 1311), None);
-        assert_eq!(
-            fdinfo_custody([unreadable()], 8, 2, 1311),
-            Some(KernelView::Unexposed)
-        );
-        assert_eq!(
-            fdinfo_custody([Ok(open), gone()], 8, 2, 1311),
-            Some(KernelView::Custody { holds: false })
-        );
-        for infos in [[Ok(open), unreadable()], [unreadable(), Ok(open)]] {
-            assert_eq!(
-                fdinfo_custody(infos, 8, 2, 1311),
-                Some(KernelView::Unexposed)
-            );
-        }
-        for infos in [[Ok(held), unreadable()], [unreadable(), Ok(held)]] {
-            assert_eq!(
-                fdinfo_custody(infos, 8, 2, 1311),
-                Some(KernelView::Custody { holds: true })
-            );
-        }
-        assert_eq!(
-            fdinfo_custody([Ok(held), unreadable()], 8, 2, 1312),
-            Some(KernelView::Unexposed)
-        );
-    }
-
-    #[test]
-    fn a_lock_table_line_names_its_inode_and_never_a_waiter() {
-        let granted = "1: FLOCK  ADVISORY  WRITE 4242 fd:01:1311 0 EOF";
-        assert!(lock_line_holds(granted, 0xfd, 1, 1311));
-        assert!(!lock_line_holds(granted, 0xfd, 1, 1312));
-        assert!(!lock_line_holds(granted, 8, 1, 1311));
-        let waiter = "1: -> FLOCK  ADVISORY  WRITE 4343 fd:01:1311 0 EOF";
-        assert!(!lock_line_holds(waiter, 0xfd, 1, 1311));
     }
 
     /// The lock at `path`, once the kernel grants it after its holders let go. A probe at a

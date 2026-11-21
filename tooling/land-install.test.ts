@@ -618,6 +618,8 @@ run)
     mkdir -p "packages/cowshed/dist/bin/darwin-$arch"
     cp "$FIX_STATE/staged.sh" "packages/cowshed/dist/bin/darwin-$arch/cowshed"
     chmod +x "packages/cowshed/dist/bin/darwin-$arch/cowshed"
+    cp "$FIX_STATE/staged.sh" "packages/cowshed/dist/bin/darwin-$arch/cowshed-helper"
+    chmod +x "packages/cowshed/dist/bin/darwin-$arch/cowshed-helper"
     echo "release record" >"packages/cowshed/dist/bin/darwin-$arch/cowshed.build"
     ;;
   *) exit 97 ;;
@@ -936,6 +938,8 @@ describe('land-install.sh', () => {
     expect(statSync(binary).mode & 0o111).not.toBe(0);
     // Setup judges the install by the release record beside the binary, so the stage carries it.
     expect(readFileSync(`${binary}.build`, 'utf8')).toBe('release record\n');
+    // Setup installs nothing from a build with no root helper beside it, so the stage carries that too.
+    expect(statSync(`${binary}-helper`).mode & 0o111).not.toBe(0);
     expect(
       readFileSync(
         join(install.stage, 'node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js'),
@@ -1527,6 +1531,9 @@ describe('land-install.sh', () => {
     mkdirSync(dirname(binary), { recursive: true });
     writeFileSync(binary, STAGED_STUB);
     chmodSync(binary, 0o755);
+    // A stage is whole only with the root helper beside the binary.
+    writeFileSync(`${binary}-helper`, STAGED_STUB);
+    chmodSync(`${binary}-helper`, 0o755);
     // A stage is whole only with the release record setup judges the binary by.
     writeFileSync(`${binary}.build`, 'staged earlier\n');
     const server = join(install.stage, 'node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js');

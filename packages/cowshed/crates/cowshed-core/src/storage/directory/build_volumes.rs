@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     DirectoryExecutionHost, MountPointState, Payloads, bind, confirmed_tree_holders, host_error,
-    mount_point_state, observed_mount, observed_payload_root, unbind, unsupported,
+    mount_point_state, observed_mount, observed_payload_root, unbind,
 };
+use crate::api::dto::SubstrateOperation;
 use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
     CapturedBuildVolume, LinkResolution, Registrant, Registration, ReleaseClaim, link,
@@ -457,7 +458,6 @@ impl DirectoryExecutionHost {
 
     /// Directory counterpart of shared-source custody. The runtime owns the hold and image lock;
     /// this controlled tree copy does not claim native point-in-time atomicity.
-    #[cfg(target_os = "macos")]
     pub(crate) fn clone_shared_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -1106,21 +1106,28 @@ impl DirectoryExecutionHost {
         }
     }
 
+    /// A build volume's cap: its dataset's `refquota`. A plain directory has none.
     pub fn build_volume_capacity(
         &self,
-        _layout: &BuildVolumeLayout,
-        _id: &BuildVolumeId,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
     ) -> Result<ImageCapacity, ApfsStorageError> {
-        Err(unsupported("build volume capacities"))
+        self.payload_capacity(&layout.image(id), SubstrateOperation::ResizeBuildVolume)
     }
 
+    /// Raise a build volume's cap in place, as [`ApfsExecutionHost::resize`] raises a
+    /// workspace's.
     pub fn resize_build_volume(
         &self,
-        _layout: &BuildVolumeLayout,
-        _id: &BuildVolumeId,
-        _capacity: ImageCapacity,
+        layout: &BuildVolumeLayout,
+        id: &BuildVolumeId,
+        capacity: ImageCapacity,
     ) -> Result<ResizeOutcome, ApfsStorageError> {
-        Err(unsupported("resizing a build volume"))
+        self.grow_payload(
+            &layout.image(id),
+            capacity,
+            SubstrateOperation::ResizeBuildVolume,
+        )
     }
 }
 

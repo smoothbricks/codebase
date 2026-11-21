@@ -23,9 +23,11 @@
 #    anything is built there the .envrc is approved by the rule the land gate applies to a workspace's
 #    (tooling/land-envrc.sh): one byte-identical to main's is approved here, one the operator already approved runs, and
 #    any other is recorded 'failed', naming it and the 'direnv allow' that approves it, with nothing built.
-#    The CLI, the Nx cache server bundle it installs with and the mbx flake its setup pins are copied
-#    from the shed to .cache/cowshed-release/<head>/, laid out as a distribution (<package>/dist/bin/<platform>/cowshed,
-#    <package>/nix/mbx as the npm package ships it, the server under <package>/node_modules). The debug build every land
+#    The CLI, the root helper built beside it (cowshed-helper, without which setup installs nothing), the Nx cache
+#    server bundle it installs with and the mbx flake its setup pins are copied from the shed to
+#    .cache/cowshed-release/<head>/, laid out as a distribution (<package>/dist/bin/<platform>/cowshed with
+#    cowshed-helper beside it, <package>/nix/mbx as the npm package ships it, the server under
+#    <package>/node_modules). The debug build every land
 #    replays into dist/bin replaces the release binary there; a stage no later build rewrites keeps the command this
 #    script prints true until three newer stages exist. The lock is held by this script's own re-entry,
 #    'land-install.sh --under-lock <before> <head>', which is not a command to run by hand.
@@ -97,22 +99,24 @@ gateway_blockers() {
   readiness=$(bun "$here/land-install.ts" blockers "$status")
 }
 
-# A stage is whole with its binary, the release record setup judges the binary by, the cache server bundle and the mbx
-# flake its setup pins.
+# A stage is whole with its binary, the root helper beside it, the release record setup judges the binary by, the cache
+# server bundle and the mbx flake its setup pins.
 stage_whole() {
-  [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -f "$stage/dist/bin/$platform/cowshed.build" ] &&
+  [ -x "$stage/dist/bin/$platform/cowshed" ] && [ -x "$stage/dist/bin/$platform/cowshed-helper" ] &&
+    [ -f "$stage/dist/bin/$platform/cowshed.build" ] &&
     [ -f "$stage/$server" ] && [ -f "$stage/nix/mbx/flake.nix" ]
 }
 
-# Assembles the stage from the shed's build outputs $built and $bundle. A stage is whole or absent: it is assembled
-# beside its name and renamed into it. The release lock is held, so a .partial found here is a crashed run's and
-# removing every one of them is safe. It is chained with && because it runs where a failing command must stop it.
+# Assembles the stage from the shed's build outputs $built, $helper and $bundle. A stage is whole or absent: it is
+# assembled beside its name and renamed into it. The release lock is held, so a .partial found here is a crashed run's
+# and removing every one of them is safe. It is chained with && because it runs where a failing command must stop it.
 stage_release() {
   root=$(dirname "$stage") &&
     mkdir -p "$root" &&
     rm -rf "$root"/*.partial "$stage" &&
     mkdir -p "$stage.partial/dist/bin/$platform" "$stage.partial/$(dirname "$server")" "$stage.partial/nix/mbx" &&
     cp -p "$built" "$stage.partial/dist/bin/$platform/cowshed" &&
+    cp -p "$helper" "$stage.partial/dist/bin/$platform/cowshed-helper" &&
     cp -p "$built.build" "$stage.partial/dist/bin/$platform/cowshed.build" &&
     cp -p "$bundle" "$stage.partial/$server" &&
     cp -p "$shed/packages/cowshed/nix/mbx/flake.nix" "$shed/packages/cowshed/nix/mbx/flake.lock" "$stage.partial/nix/mbx/" &&
@@ -153,9 +157,10 @@ build_in_shed() {
     return 3
   fi
   built=$shed/packages/cowshed/dist/bin/$platform/cowshed
+  helper=$shed/packages/cowshed/dist/bin/$platform/cowshed-helper
   bundle=$shed/packages/nx-cache-server/dist/server/nx-cache-server.js
-  if [ ! -x "$built" ] || [ ! -f "$built.build" ] || [ ! -f "$bundle" ]; then
-    record failed "the production build left no $built, no release record $built.build or no $bundle"
+  if [ ! -x "$built" ] || [ ! -x "$helper" ] || [ ! -f "$built.build" ] || [ ! -f "$bundle" ]; then
+    record failed "the production build left no $built, no $helper, no release record $built.build or no $bundle"
     return 3
   fi
   stage_status=0

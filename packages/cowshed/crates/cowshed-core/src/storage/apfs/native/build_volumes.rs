@@ -282,53 +282,6 @@ where
         }
     }
 
-    /// Quiet retains the stopped supervisor's socket lease against replacement admission and
-    /// the landing's shared GC hold. Taking a second exclusive claim would conflict with that
-    /// hold; upgrading it would open an admission gap (16_build_volumes.md, Land step 4).
-    #[cfg(target_os = "macos")]
-    pub(crate) fn clone_quiet_build_volume(
-        &self,
-        layout: &BuildVolumeLayout,
-        quiet: &crate::runtime::build_volumes::Quiet,
-        destination: &BuildVolumeId,
-        registration: &Registration,
-    ) -> Result<Option<Duration>, ApfsStorageError> {
-        let source = quiet.id();
-        self.verify_controller_path(&layout.image(source))?;
-        let mount = layout.mount(source);
-        let mounted = self.mounted_at(&mount)?.is_some();
-        self.clone_build_volume_under_hold(
-            layout,
-            source,
-            destination,
-            registration,
-            mounted.then_some(mount.as_path()),
-        )
-    }
-
-    /// Snapshot retained state under existing shared custody, without claiming or stopping its
-    /// writers. The caller's lifecycle/image lock excludes adoption and the hold excludes release.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn clone_shared_build_volume(
-        &self,
-        layout: &BuildVolumeLayout,
-        source: &crate::runtime::build_volumes::HeldVolume,
-        destination: &BuildVolumeId,
-        registration: &Registration,
-    ) -> Result<Option<Duration>, ApfsStorageError> {
-        let source = source.id();
-        self.verify_controller_path(&layout.image(source))?;
-        let mount = layout.mount(source);
-        let mounted = self.mounted_at(&mount)?.is_some();
-        self.clone_build_volume_under_hold(
-            layout,
-            source,
-            destination,
-            registration,
-            mounted.then_some(mount.as_path()),
-        )
-    }
-
     /// Clone the build volume `claim` holds to `destination`, borrowing that claim through
     /// capture, the immutable freshness mark and the destination's record. A second exclusive
     /// claim on the same hold file would conflict with it, and an upgrade would reopen admission
@@ -356,7 +309,7 @@ where
 
     /// Register `destination`, capture `source` into it, fix its freshness mark and publish it:
     /// [`Self::capture_build_volume_under_hold`], then [`Self::finish_captured_build_volume`].
-    fn clone_build_volume_under_hold(
+    pub(super) fn clone_build_volume_under_hold(
         &self,
         layout: &BuildVolumeLayout,
         source: &BuildVolumeId,

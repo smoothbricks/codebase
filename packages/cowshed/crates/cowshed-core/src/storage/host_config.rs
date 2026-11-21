@@ -17,40 +17,21 @@ pub const RETIRED_LAYOUT_HINT: &str =
 const HOST_CONFIG_VERSION: u32 = 1;
 pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 
-/// Stable macOS presentation root; numeric uid avoids home and temporary-directory aliases.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
-pub(crate) const MACOS_MOUNT_PREFIX: &str = "/private/var/folders/cowshed";
-
-/// The build-cache mountpoint's parent, directly under [`MACOS_MOUNT_PREFIX`]: a mountpoint
-/// needs a user-owned parent, so this one is the provisioning user's, group `nixbld`, 0750
-/// (01c_macos.md, "`/private/var/folders` is root-owned and swept").
+pub(crate) mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
 #[cfg(target_os = "macos")]
-pub(crate) const BUILD_CACHE_PARENT: &str = "/private/var/folders/cowshed/shared";
+use macos as platform;
 
-/// Where the dedicated build-cache volume mounts, directly under [`BUILD_CACHE_PARENT`]
-/// (01a_apfs.md, "Dedicated build-cache volume"), published to every workspace as
-/// `COWSHED_BUILD_CACHE` (02_workspaces.md, "Workspace environment").
-#[cfg(target_os = "macos")]
-pub const BUILD_CACHE_MOUNTPOINT: &str = "/private/var/folders/cowshed/shared/build-cache";
-
-pub(crate) fn canonical_mount_root(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = home;
-        macos_mount_root(unsafe { libc::getuid() })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".cowshed/mnt")
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_mount_root(uid: u32) -> PathBuf {
-    Path::new(MACOS_MOUNT_PREFIX)
-        .join(uid.to_string())
-        .join("mnt")
-}
+/// Where this host keeps its build cache; the path and what backs it are the platform's
+/// (`linux.rs`, `macos.rs`).
+pub use platform::BUILD_CACHE_MOUNTPOINT;
+/// The fixed per-user workspace mount root: `/private/var/folders/cowshed/<uid>/mnt` on macOS,
+/// `~/.cowshed/mnt` on Linux (01_storage.md, "Directory layout").
+pub(crate) use platform::canonical_mount_root;
 
 /// One approved gateway-backed registry route, as host state rather than workspace state.
 ///
@@ -197,17 +178,7 @@ impl HostConfig {
     pub fn load_for_store(store_root: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         let root = if store_root == Path::new(STORE_ROOT) {
-            #[cfg(target_os = "macos")]
-            {
-                macos_mount_root(unsafe { libc::getuid() })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
-                let home = PathBuf::from(home);
-                validate_absolute_path(&home)?;
-                canonical_mount_root(&home)
-            }
+            platform::production_mount_root()?
         } else {
             store_root.join(RETIRED_MOUNT_DIRECTORY)
         };
@@ -662,6 +633,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_default_is_uid_stable_and_keeps_dirhelper_names_above_repo_owners() {
+        use super::platform::macos_mount_root;
         let uid = unsafe { libc::getuid() };
         let expected = PathBuf::from(format!("/private/var/folders/cowshed/{uid}/mnt"));
         assert_eq!(canonical_mount_root(Path::new("/Users/first")), expected);

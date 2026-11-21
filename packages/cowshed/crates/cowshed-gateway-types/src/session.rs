@@ -4,7 +4,11 @@
 //! material, and an egress policy. The daemon's own configuration — listeners, limits, timeouts,
 //! cache roots — stays in `cowshed-gateway`, because only the daemon has any use for it.
 
-use std::{fmt, net::SocketAddr, path::PathBuf};
+use std::{
+    fmt,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use subtle::ConstantTimeEq;
@@ -37,6 +41,20 @@ const _: () = assert!(
 /// check validates a live block against its own recorded size, never against this constant.
 pub const NEW_PORT_BLOCK_SIZE: u16 = 64;
 
+/// Where a store keeps its workspaces' gateway data sockets on Linux, below the store root:
+/// one `<workspace incarnation>.sock` per served workspace, in a directory only its owner
+/// enters (05_gateway.md, "Placement and identity").
+pub const LINUX_DATA_SOCKET_DIRECTORY: &str = "run/gateway";
+/// The loopback port a Linux workspace's clients name. Each job's private network namespace
+/// has its own listener there, the connector that relays to the workspace's data socket
+/// (04_sandbox.md, "Linux enforcement"); it is never a gateway session endpoint.
+pub const LINUX_CONNECTOR_PORT: u16 = 7_644;
+
+/// The directory of `store` that holds its Linux data sockets.
+pub fn linux_data_socket_root(store: &Path) -> PathBuf {
+    store.join(LINUX_DATA_SOCKET_DIRECTORY)
+}
+
 /// A port block is `size` contiguous ports from `base`, where `size` is a power of two of at
 /// least two (the gateway listener plus one service port) and `base` is aligned to it. The
 /// alignment is what makes blocks of different sizes nest instead of straddle: two aligned
@@ -62,6 +80,8 @@ pub enum WorkspaceEndpoint {
         address: SocketAddr,
         block_size: u16,
     },
+    /// Linux: the workspace's data socket ([`Self::linux_data_socket`]). The socket a
+    /// connection arrived on is the workspace it speaks for.
     Unix(PathBuf),
 }
 
@@ -77,6 +97,13 @@ impl fmt::Display for WorkspaceEndpoint {
 }
 
 impl WorkspaceEndpoint {
+    /// Linux: the data socket of the workspace incarnation `workspace_incarnation` in `store`,
+    /// `<store>/run/gateway/<workspace incarnation>.sock`. One spelling for the controller that
+    /// installs the session, the gateway that binds it and the connector that dials it.
+    pub fn linux_data_socket(store: &Path, workspace_incarnation: &str) -> Self {
+        Self::Unix(linux_data_socket_root(store).join(format!("{workspace_incarnation}.sock")))
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self {
             Self::Tcp { address, .. } if !address.ip().is_loopback() => {
@@ -490,5 +517,24 @@ mod tests {
         assert!(is_port_block(0, 2));
         assert!(is_port_block(u16::MAX - 63, 64));
         assert!(!is_port_block(u16::MAX - 63, 128));
+    }
+
+    /// The Linux data socket is one spelling: the store's `run/gateway`, the incarnation,
+    /// `.sock`. The gateway's port there is the connector's, never an endpoint.
+    #[test]
+    fn a_linux_data_socket_is_named_after_its_workspace_incarnation() {
+        let store = std::path::Path::new("/private/cowshed/store");
+        let endpoint =
+            super::WorkspaceEndpoint::linux_data_socket(store, "00112233445566778899aabbccddeeff");
+        assert_eq!(
+            endpoint.to_string(),
+            "/private/cowshed/store/run/gateway/00112233445566778899aabbccddeeff.sock"
+        );
+        endpoint.validate().expect("an absolute socket path");
+        assert_eq!(
+            super::linux_data_socket_root(store),
+            store.join(super::LINUX_DATA_SOCKET_DIRECTORY)
+        );
+        assert_eq!(super::LINUX_CONNECTOR_PORT, 7_644);
     }
 }

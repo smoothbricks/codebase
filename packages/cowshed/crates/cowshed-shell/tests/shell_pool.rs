@@ -103,7 +103,7 @@ impl Workspace {
             mount_root,
             exec_temp_dir: root.join("tmp"),
             store_root: root.join("store"),
-            port_block: PortBlock::new(port_base, 16).expect("port block"),
+            port_block: Some(PortBlock::new(port_base, 16).expect("port block")),
             retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),

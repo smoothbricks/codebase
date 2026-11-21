@@ -116,7 +116,8 @@ pub struct CowshedError {
     stdin: Option<Box<StdinRefusal>>,
 
     /// One cold refusal of the causes that never occur together (CPU admission, priority, an
-    /// explicit removal's reason): one pointer slot in every Result, never one per cause.
+    /// explicit removal's reason, an operation the store's substrate lacks): one pointer slot in
+    /// every Result, never one per cause.
     #[serde(flatten, default, deserialize_with = "known_to_this_build")]
     cold: Option<Box<ColdRefusal>>,
     /// What the storage layer refused with, or the wait on another process that expired, for a
@@ -140,7 +141,6 @@ enum LocalCause {
     /// A membership retirement whose every life it left running it had sent SIGKILL (11_shell.md):
     /// each ends once its kernel call returns, so its exit, not this refusal, answers a supervisor
     /// quiesce or retirement waiting on the job.
-    #[cfg(target_os = "macos")]
     SurvivedSigkill,
 }
 
@@ -159,6 +159,10 @@ enum ColdRefusal {
     /// naming why.
     Removal {
         removal: RemovalRefusal,
+    },
+    /// Present only on a verb refused because the store's substrate has no such operation.
+    Substrate {
+        unsupported: SubstrateRefusal,
     },
 }
 
@@ -370,6 +374,44 @@ pub enum RemovalRefusal {
     },
 }
 
+/// Why a verb refused on this store (09_substrates.md): it needs a physical-volume operation
+/// the store's substrate does not have. Always a `Usage` refusal decided before anything was
+/// stopped or changed, so a caller branches on the two values and never on the message.
+///
+/// Unknown fields are ignored and a substrate or operation a later build added decodes as no
+/// refusal (`CowshedError::substrate_source` answers `None`), like [`RemovalRefusal`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubstrateRefusal {
+    pub substrate: crate::api::dto::StoreSubstrate,
+    pub operation: crate::api::dto::SubstrateOperation,
+}
+
+impl SubstrateRefusal {
+    /// What the caller does instead: nothing, where the operation exists only to manage an
+    /// image file.
+    const fn remedy(self) -> &'static str {
+        use crate::api::dto::SubstrateOperation as Operation;
+        match self.operation {
+            Operation::ResizeWorkspace | Operation::ResizeBuildVolume => {
+                "a plain-directory store sets no capacity: its workspaces and build volumes grow within the filesystem that holds the store"
+            }
+            Operation::DefragmentWorkspace
+            | Operation::DefragmentBuildVolume
+            | Operation::CompactSeed
+            | Operation::ExtentBudget => {
+                "only an APFS image has extents to rewrite: this store's payloads need no defragmenting"
+            }
+            Operation::ReAdopt => {
+                "re-adoption returns a sparse image's unused space: this store frees space as files are deleted, so there is none to reclaim"
+            }
+            Operation::VolumeLabel | Operation::ReadOnlyMount => {
+                "the verb needs an APFS volume: this store's payloads have no such operation"
+            }
+        }
+    }
+}
+
 /// The most paths a [`FenceRefusal`] names; `total` still counts every one.
 pub const MAX_FENCE_PATHS: usize = 64;
 
@@ -505,13 +547,23 @@ impl CowshedError {
     pub fn cpu_admission_source(&self) -> Option<&CpuAdmissionRefusal> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Admission { cpu_admission }) => Some(cpu_admission),
-            Some(ColdRefusal::Priority { .. } | ColdRefusal::Removal { .. }) | None => None,
+            Some(
+                ColdRefusal::Priority { .. }
+                | ColdRefusal::Removal { .. }
+                | ColdRefusal::Substrate { .. },
+            )
+            | None => None,
         }
     }
     pub fn priority_source(&self) -> Option<&PriorityFailure> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Priority { priority }) => Some(priority),
-            Some(ColdRefusal::Admission { .. } | ColdRefusal::Removal { .. }) | None => None,
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Removal { .. }
+                | ColdRefusal::Substrate { .. },
+            )
+            | None => None,
         }
     }
 
@@ -578,7 +630,6 @@ impl CowshedError {
     /// A membership retirement's refusal whose every surviving life it sent SIGKILL: a `Conflict`
     /// that says so to the supervisor, whose quiesce and retirement wait for those exits
     /// (11_shell.md).
-    #[cfg(target_os = "macos")]
     pub(crate) fn survived_sigkill(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             local_cause: Some(Box::new(LocalCause::SurvivedSigkill)),
@@ -774,6 +825,21 @@ impl CowshedError {
         }
     }
 
+    /// A verb refused because the store's substrate has no such operation: always a `Usage`
+    /// refusal that changed nothing, carrying both as [`SubstrateRefusal`].
+    pub fn unsupported_on_substrate(refusal: SubstrateRefusal) -> Self {
+        let message = format!(
+            "{} storage does not support {}",
+            refusal.substrate, refusal.operation
+        );
+        Self {
+            cold: Some(Box::new(ColdRefusal::Substrate {
+                unsupported: refusal,
+            })),
+            ..Self::usage(message, refusal.remedy())
+        }
+    }
+
     pub fn environment_missing(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(ErrorCode::EnvironmentMissing, message, hint)
     }
@@ -876,7 +942,6 @@ impl CowshedError {
         match self.local_cause.as_deref()? {
             LocalCause::LifecycleConflict(conflict) => Some(conflict),
             LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
-            #[cfg(target_os = "macos")]
             LocalCause::SurvivedSigkill => None,
         }
     }
@@ -886,14 +951,12 @@ impl CowshedError {
         match self.local_cause.as_deref()? {
             LocalCause::ImageLocksHeld(locks) => Some(locks),
             LocalCause::LifecycleConflict(_) | LocalCause::Wait(_) => None,
-            #[cfg(target_os = "macos")]
             LocalCause::SurvivedSigkill => None,
         }
     }
 
     /// Whether this is a membership retirement's refusal whose every surviving life it sent
     /// SIGKILL ([`Self::survived_sigkill`]).
-    #[cfg(target_os = "macos")]
     pub(crate) fn survivors_were_killed(&self) -> bool {
         matches!(
             self.local_cause.as_deref(),
@@ -926,7 +989,6 @@ impl CowshedError {
         match self.local_cause.as_deref()? {
             LocalCause::Wait(failure) => Some(failure),
             LocalCause::LifecycleConflict(_) | LocalCause::ImageLocksHeld(_) => None,
-            #[cfg(target_os = "macos")]
             LocalCause::SurvivedSigkill => None,
         }
     }
@@ -974,7 +1036,27 @@ impl CowshedError {
     pub fn removal_source(&self) -> Option<&RemovalRefusal> {
         match self.cold.as_deref() {
             Some(ColdRefusal::Removal { removal }) => Some(removal),
-            Some(ColdRefusal::Admission { .. } | ColdRefusal::Priority { .. }) | None => None,
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Priority { .. }
+                | ColdRefusal::Substrate { .. },
+            )
+            | None => None,
+        }
+    }
+
+    /// The substrate and the operation it lacks, when this is that refusal. Production reads the
+    /// refusal from the wire envelope, never from the value; the round-trip tests read it here.
+    #[cfg(test)]
+    pub fn substrate_source(&self) -> Option<SubstrateRefusal> {
+        match self.cold.as_deref() {
+            Some(ColdRefusal::Substrate { unsupported }) => Some(*unsupported),
+            Some(
+                ColdRefusal::Admission { .. }
+                | ColdRefusal::Priority { .. }
+                | ColdRefusal::Removal { .. },
+            )
+            | None => None,
         }
     }
 
@@ -998,7 +1080,6 @@ impl std::error::Error for CowshedError {
         match self.local_cause.as_deref()? {
             LocalCause::LifecycleConflict(conflict) => Some(conflict),
             LocalCause::ImageLocksHeld(_) | LocalCause::Wait(_) => None,
-            #[cfg(target_os = "macos")]
             LocalCause::SurvivedSigkill => None,
         }
     }
@@ -1064,6 +1145,64 @@ mod tests {
             assert!(decoded.cpu_admission_source().is_none());
             assert!(decoded.priority_source().is_none());
         }
+    }
+
+    /// A verb the store's substrate has no operation for is a `Usage` refusal whose flat
+    /// `unsupported` names both, in the spellings the API declares; every substrate decides by
+    /// the one table, and a substrate or operation of a later build keeps the envelope.
+    #[test]
+    fn a_substrate_refusal_names_the_substrate_and_the_operation_it_lacks() {
+        use super::SubstrateRefusal;
+        use crate::api::dto::{StoreSubstrate, SubstrateOperation};
+        let refusal = SubstrateRefusal {
+            substrate: StoreSubstrate::Zfs,
+            operation: SubstrateOperation::DefragmentWorkspace,
+        };
+        let refused = CowshedError::unsupported_on_substrate(refusal);
+        assert_eq!(refused.code, ErrorCode::Usage);
+        assert_eq!(
+            refused.message,
+            "zfs storage does not support defragmenting a workspace"
+        );
+        let value = serde_json::to_value(&refused).expect("serialize the refusal");
+        assert_eq!(
+            value["unsupported"],
+            serde_json::json!({"substrate":"zfs", "operation":"defragmentWorkspace"})
+        );
+        let decoded: CowshedError = serde_json::from_value(value).expect("decode the refusal");
+        assert_eq!(decoded.substrate_source(), Some(refusal));
+        assert!(decoded.removal_source().is_none());
+        assert!(
+            CowshedError::usage("bad flag", "fix it")
+                .substrate_source()
+                .is_none()
+        );
+
+        for substrate in [
+            StoreSubstrate::Apfs,
+            StoreSubstrate::Zfs,
+            StoreSubstrate::Directory,
+        ] {
+            assert_eq!(
+                serde_json::to_value(substrate).expect("serialize"),
+                substrate.as_str(),
+                "the accessor spells the substrate as the wire does"
+            );
+        }
+        assert!(StoreSubstrate::Apfs.supports(SubstrateOperation::ReAdopt));
+        assert!(StoreSubstrate::Zfs.supports(SubstrateOperation::ResizeWorkspace));
+        assert!(StoreSubstrate::Zfs.supports(SubstrateOperation::ResizeBuildVolume));
+        assert!(!StoreSubstrate::Zfs.supports(SubstrateOperation::ReAdopt));
+        assert!(!StoreSubstrate::Directory.supports(SubstrateOperation::ResizeWorkspace));
+        assert!(StoreSubstrate::Zfs.has_volumes());
+        assert!(!StoreSubstrate::Directory.has_volumes());
+
+        let mut later = serde_json::to_value(CowshedError::usage("kept", "kept hint")).unwrap();
+        later["unsupported"] = serde_json::json!({"substrate":"btrfs", "operation":"snapshot"});
+        let decoded: CowshedError =
+            serde_json::from_value(later).expect("an unknown substrate keeps the envelope");
+        assert_eq!(decoded.message, "kept");
+        assert!(decoded.substrate_source().is_none());
     }
 
     const CODES: [ErrorCode; 7] = [

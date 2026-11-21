@@ -2471,6 +2471,7 @@ mod tests {
     }
 
     /// This process's cumulative Unix and Mach syscall counts, read from `PROC_PIDTASKINFO`.
+    /// Linux keeps no per-process syscall count to read, so what measures by it is macOS's.
     #[cfg(target_os = "macos")]
     fn own_syscalls() -> io::Result<(i32, i32)> {
         let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();

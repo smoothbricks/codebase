@@ -16,14 +16,13 @@
 //! and touches nothing else.
 
 use async_trait::async_trait;
-use cowshed_apfs::SystemCommandRunner;
 use cowshed_core::api::MountResult;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, MetadataError, PublicationState, WorkspaceName, read_json,
 };
 use cowshed_core::repository::{RepoId, RepositoryBinding};
+use cowshed_core::runtime::native_host;
 use cowshed_core::storage::StorageLayout;
-use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
 use cowshed_core::storage::lifecycle::{MountIntent, MountState, Substrate};
 use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
@@ -213,9 +212,7 @@ impl MainMountBackend for NativeMainMountBackend {
             runtime.shutdown().await?;
         }
         let config = ApfsSubstrateConfig::for_storage(&self.storage, &resolved.checkout_path);
-        let host =
-            MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config.clone())
-                .map_err(storage_error)?;
+        let host = native_host(config.clone()).map_err(storage_error)?;
         let substrate = ApfsSubstrate::new(config, host);
         let workspaces = substrate
             .list(&resolved.repo_id)

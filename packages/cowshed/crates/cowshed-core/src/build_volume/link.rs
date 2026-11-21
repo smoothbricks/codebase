@@ -22,6 +22,15 @@ use super::BuildStateTool;
 use crate::capabilities::BuildStatePath;
 use crate::error::{CowshedError, Result};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The one name a checkout reaches its build volume through, relative to the checkout root.
 pub const BUILD_LINK: &str = ".cowshed/build";
 
@@ -220,7 +229,6 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
 /// so does every directory above it. It never removes a directory above the package's, anything
 /// the volume holds behind the link, or whatever else holds the path. Returns the paths whose link
 /// it removed.
-#[cfg(target_os = "macos")]
 pub(crate) fn unlink_removed(
     checkout: &Path,
     removed: &[crate::capabilities::RemovedPackageCache],
@@ -496,32 +504,7 @@ const MADE_BY_COWSHED: &std::ffi::CStr = c"user.cowshed.made-for-link";
 /// system holding no extended attributes leaves it unmarked, so never removed by cowshed.
 fn mark_made(directory: &Path) -> io::Result<()> {
     let path = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
-    let value = [1u8];
-    // SAFETY: the path and name are NUL-terminated and the one-byte value is live across the call,
-    // which only reads them.
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            MADE_BY_COWSHED.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    // SAFETY: as above.
-    #[cfg(not(target_os = "macos"))]
-    let result = unsafe {
-        libc::lsetxattr(
-            path.as_ptr(),
-            MADE_BY_COWSHED.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result == 0 {
+    if platform::set_attribute(&path, MADE_BY_COWSHED, &[1u8]) == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
@@ -533,24 +516,11 @@ fn mark_made(directory: &Path) -> io::Result<()> {
 
 /// Whether `directory` carries the mark [`contained_parent`] gives each directory it makes. Reads
 /// only; a directory it cannot read the mark of is not proven cowshed's.
-#[cfg(target_os = "macos")]
 fn made_by_cowshed(directory: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(directory.as_os_str().as_bytes()) else {
         return false;
     };
-    // SAFETY: the path and name are NUL-terminated and live across the call; a null buffer of
-    // size zero asks only for the value's length.
-    let length = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            MADE_BY_COWSHED.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-            0,
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    length >= 0
+    platform::attribute_length(&path, MADE_BY_COWSHED) >= 0
 }
 
 /// The real parent directory of `relative` inside `checkout`, created where missing, and its
@@ -919,7 +889,6 @@ mod tests {
     /// stays though empty. The volume keeps what it held. A directory holding anything else stays,
     /// and a link aimed elsewhere or a real directory at the path is left as it is.
     #[test]
-    #[cfg(target_os = "macos")]
     fn unlinking_a_removed_package_s_cache_takes_only_its_exact_link_and_what_it_emptied() {
         let scratch = Scratch::new("removed-package");
         let checkout = scratch.checkout();

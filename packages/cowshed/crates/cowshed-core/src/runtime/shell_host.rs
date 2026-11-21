@@ -36,6 +36,15 @@ use super::job_groups::{Birth, GroupLeader};
 use super::process_tree::TreeOwner;
 use crate::api::dto::{ExitStatus, JobId};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// The argument that turns the `cowshed` binary into an exec host.
 pub const SHELL_HOST_ARGUMENT: &str = "--cowshed-shell-host";
 
@@ -379,18 +388,12 @@ impl<'a> FrameReader<'a> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Nice readback
+// errno
 
-/// Clear this thread's `errno`: `getpriority` returns -1 for a nice of -1 as well as for an
-/// error, so only a cleared `errno` tells them apart. A plain store; async-signal-safe. macOS
-/// only: Linux places no nice (its job cgroup carries the class).
-#[cfg(target_os = "macos")]
-pub(crate) fn clear_errno() {
-    // SAFETY: the location is this thread's own errno.
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
+/// Clear this thread's `errno`, for the calls whose return value alone cannot tell an answer
+/// from an error: `getpriority` returns -1 for a nice of -1 as well as for a failure, and
+/// `readdir` returns null at the end of a stream as well as for one.
+pub(crate) use platform::clear_errno;
 
 // ---------------------------------------------------------------------------------------------
 // SCM_RIGHTS
@@ -467,12 +470,7 @@ fn receive_with_descriptors(
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
     header.msg_controllen = control_len as _;
-    // Linux installs every received descriptor close-on-exec atomically, including the cgroup
-    // placement authority, so no command can inherit it through a concurrent exec.
-    #[cfg(target_os = "linux")]
-    let flags = libc::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = 0;
+    let flags = platform::RECEIVE_FLAGS;
     let received = loop {
         // SAFETY: `header` references live, writable buffers for the duration of the call.
         let received = unsafe { libc::recvmsg(socket, &mut header, flags) };
@@ -498,8 +496,7 @@ fn receive_with_descriptors(
                     let raw = std::ptr::read_unaligned(data.add(index));
                     // Owned from here, so a malformed frame still closes what it carried.
                     let owned = OwnedFd::from_raw_fd(raw);
-                    #[cfg(not(target_os = "linux"))]
-                    libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                    platform::close_on_exec(&owned);
                     descriptors.push(owned);
                 }
             }

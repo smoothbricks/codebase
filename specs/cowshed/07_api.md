@@ -899,6 +899,48 @@ generator first when needed. Generated files are changed only by this generator.
 facades call the generated adapters with the generated DTO types; they do not redefine protocol records. The operation
 corpus covers the same operation table; CLI/N-API option parity is its own gate (see "CLI and N-API option parity").
 
+### Substrates
+
+A store keeps each workspace and build volume as one of three payloads, chosen when `cowshed setup` made the store
+(09_substrates.md): `StoreSubstrate = "apfs" | "zfs" | "directory"`. macOS serves `apfs` (one sparse image per payload,
+attached and mounted); Linux serves `zfs` (one dataset per payload, mounted where the store has the payload's directory)
+and `directory` (one real directory per payload on whatever filesystem holds the store). The execution host answers
+which it is from the store itself, and `project.open` reports it:
+`ProjectOpened = { repoId, binding, gitRoot, storeRoot, substrate? }`. `substrate` is absent only from a controller of a
+build that predates the field; the Rust `Project::substrate()` and the TypeScript `Project.substrate` read it, the
+latter `undefined` when it is absent.
+
+No caller branches on the platform. A verb means what its substrate can do, and a verb that needs a physical-volume
+operation the substrate lacks is refused by one table, `StoreSubstrate::supports(SubstrateOperation)`, before a
+supervisor is stopped or anything is changed:
+
+| Verb (operation)                                                          | `apfs`                                | `zfs`                                                         | `directory`                      |
+| ------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------- | -------------------------------- |
+| `adopt` with `capacity`                                                   | the sparse image's size               | the dataset's `refquota`                                      | read and validated, caps nothing |
+| `coordinator.resize`, workspace (`resizeWorkspace`)                       | grows the image, detached             | raises `refquota` in place, mounted                           | refused                          |
+| `coordinator.resize`, build (`resizeBuildVolume`)                         | grows the build image and its seed    | raises the build dataset's and its seed's `refquota` in place | refused                          |
+| `coordinator.defragment` (`defragmentWorkspace`, `defragmentBuildVolume`) | rewrites the images contiguously      | refused: a dataset has no image file to rewrite               | refused                          |
+| `coordinator.adopt` with `reAdopt` (`reAdopt`)                            | replaces main, returning sparse space | refused: space returns as files are deleted                   | refused                          |
+| `coordinator.compactSeed` (`compactSeed`)                                 | copies a fragmented seed              | answers `noSeed`: nothing fragments                           | answers `noSeed`                 |
+| `coordinator.rekey`                                                       | rotates the workspace CA              | the same: it reads store records, never the payload           | the same                         |
+| job `volumes` samples                                                     | the volume's used bytes               | the dataset's referenced bytes (`statvfs` on its mountpoint)  | `unconfigured`                   |
+
+`resize` only ever grows on both substrates that have it: a capacity that does not exceed the current one is a usage
+error naming both. `ResizeResult.previousCapacity` and `capacity` are read back from the image or the dataset. A dataset
+an operator left without a `refquota` has no capacity to read, and its resize is refused saying so, with nothing set.
+
+The refusal is typed. It is a `usage` error whose `unsupported` field names the store's substrate and the operation it
+lacks, `SubstrateRefusal = { substrate: StoreSubstrate, operation: SubstrateOperation }`, with
+`SubstrateOperation = "resizeWorkspace" | "resizeBuildVolume" | "defragmentWorkspace" | "defragmentBuildVolume" | "reAdopt" | "compactSeed" | "extentBudget" | "volumeLabel" | "readOnlyMount"`.
+The last four are operations no public verb asks a store without them for; they type the storage layer's own refusal
+(`ApfsStorageError::Unsupported { substrate, operation }`), which maps to the same error if one is ever reached. The
+message and hint are for a person. `CowshedError::substrate_source()` and the TypeScript `CowshedError.unsupported` read
+the field; a substrate or operation a later build added decodes as no refusal, never as a lost error.
+
+`host.diskCommand` runs macOS's `diskutil` and `hdiutil`. A Linux host has neither tool and no disk image to manage, so
+the call is refused there as `environment-missing`, before a disk lease is taken or anything is spawned, exactly as
+`disk-command` exits 104.
+
 ### Job monitoring
 
 `JobInfo.resources` and `SealedJob.resources` carry the latest `JobResourceSample` once the child has spawned, frozen at
@@ -936,7 +978,7 @@ pub struct HostCores(u16);
 pub struct HostLoadSample { pub load1: HostLoad1, pub cores: HostCores }
 pub enum VolumeUnavailable {
     Unconfigured,                     // the supervisor was configured with no volume to stat
-    UnsupportedPlatform,              // this platform's substrate has no used-bytes stat yet
+    UnsupportedPlatform,              // reported by no build any more; declared so an earlier Linux build's sample decodes
     Failed { message: String },       // the stat failed at spawn or at this sample, or its delta is inexact
 }
 pub enum VolumeUsage { Read { delta_bytes: VolumeUsedBytesDelta }, Unavailable { reason: VolumeUnavailable } }
@@ -1014,11 +1056,17 @@ per-process write syscalls or exclusive attribution when commands overlap. Usage
 scan or a shared-store/container free-space proxy. Each volume answers for itself: `Read` with its delta, or
 `Unavailable` with why, so one volume that cannot be read never fails the sample or hides the other's reading. `build`
 is absent when the job runs with no build volume. A stat that fails at spawn or at the sample is that volume's `Failed`,
-never absence or zero usage; a platform whose substrate has no used-bytes stat reports `UnsupportedPlatform` (Linux
-until the ZFS dataset stat), and a supervisor configured with no volumes reports `Unconfigured`. The supervisor's
-configuration carries the workspace volume's mountpoint, refused at construction when nothing is mounted there; each
-job's build volume is the one its admission grants. Both baselines are read at admission, immediately before the job's
-first process is dispatched, so nothing the job writes precedes them.
+never absence or zero usage, and a supervisor configured with no volumes reports `Unconfigured`. An APFS store's volume
+and a ZFS store's dataset are each a filesystem mounted at the payload's own root, so both are read: macOS by the
+volume's `statfs`, Linux by `statvfs` on the mountpoint, where blocks less free blocks are the bytes the dataset
+references and the size is its `refquota`. ZFS publishes both as of the pool's last transaction group, so a Linux
+reading trails a write by at most that interval. A plain-directory store's workspace is a directory on the filesystem
+that holds the store; that filesystem's usage is not the workspace's, so its supervisor is configured with no volume and
+every sample says `Unconfigured`. Each volume is fenced by the identity read at spawn (the filesystem id, and on Linux
+the mount root's device), so a later mount at the same path is `Failed`, never its successor's usage. No build reports
+`UnsupportedPlatform` any more. The supervisor's configuration carries the workspace volume's mountpoint, refused at
+construction when nothing is mounted there; each job's build volume is the one its admission grants. Both baselines are
+read at admission, immediately before the job's first process is dispatched, so nothing the job writes precedes them.
 
 Stream watermarks count admitted bytes and newline-delimited lines separately for stdout/stderr; a non-empty trailing
 partial line counts as one line. `bytes` is also the next byte cursor. `tail(cursor, limits)` returns a bounded raw
@@ -1590,9 +1638,10 @@ supervisor that ran the job retires.
   validated `GitRef`, and otherwise as a validated `BranchName`. Invalid values return `DtoError`; git rev expressions
   such as `HEAD~1` never fall back to another resolver. `ExpectedRefHead` projects as `{missing:true}` or `{oid}`. Oids
   are validated lowercase 40- or 64-hex strings.
-- `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `reAdopt: false` keeps default adoption
-  idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
-  main's image is missing, the plain-checkout recovery in §Missing main image. `coordinator.adopt` answers
+- `AdoptOptions = { path?, repoId?, capacity?, quarantine, reAdopt }`; `capacity` and `reAdopt` mean what the store's
+  substrate gives them ("Substrates"); `reAdopt: false` keeps default adoption idempotent, while `true` selects the
+  verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when main's image is missing, the
+  plain-checkout recovery in §Missing main image. `coordinator.adopt` answers
   `AdoptView = { workspace: WorkspaceView, reAdoption: ReAdoption | null }`, with
   `ReAdoption = { replacement, retained }` and `reAdoption` non-null exactly when the call re-adopted main; the
   TypeScript `Coordinator.adopt` resolves `Adopted = { workspace: WorkspaceRef, reAdoption: ReAdoption | null }`. The
@@ -1719,7 +1768,7 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission, stdin, retry: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin, retry, unsupported: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
@@ -1727,6 +1776,7 @@ impl CowshedError {
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
     pub fn stdin_source(&self) -> Option<StdinRefusal>;
     pub fn retry_source(&self) -> Option<Retry>;
+    pub fn substrate_source(&self) -> Option<SubstrateRefusal>;   // "Substrates": wire `"unsupported": {substrate, operation}`
 }
 
 pub enum ErrorCode {
@@ -1791,6 +1841,9 @@ export function openProject(endpoint: CoordinatorEndpoint, path: string): Promis
 
 export interface Project {
   // discovery + read-only
+  readonly repoId: string;
+  readonly gitRoot: string;
+  readonly substrate: StoreSubstrate | undefined; // "Substrates"
   main(): Promise<WorkspaceRef>;
   workspace(name: string): Promise<WorkspaceRef>;
   workspaceAt(path: string): Promise<WorkspaceRef>;
@@ -1818,6 +1871,29 @@ descriptor. An embedding process gets such a socket by making a socketpair and s
 with one end as its standard input (06_cli.md); the other end is what `coordinatorEndpoint` and `Cowshed::connect` take.
 That child is the controller: it is the host's own build, so the daemon starts workspace supervisors for it, which it
 would refuse to do for a controller running inside the embedding process (11_shell.md, Protocol).
+
+So the addon and every other client of a controller launch nothing sandboxed themselves: that controller does, and it is
+the cowshed binary, which is its own sandbox launcher (04_sandbox.md, "Linux enforcement", "The launcher"). A Rust
+program that calls `cowshed-core`'s launch paths in its own process — `exec::plan_exec` and `exec::execute`, controller
+Git through `git::GitRepository`, a supervisor it hosts; this repository's test binaries are the ones that do — is not a
+launcher on Linux, where there is no system one, and says which program is:
+
+```rust
+// cowshed-core::sandbox
+pub const SANDBOX_EXEC_NAME: &str = "cowshed-sandbox-exec";   // the launcher binary cowshed-core builds
+pub fn name_launcher(executable: &Path) -> Result<(), LauncherError>;  // once, before the first launch
+pub fn launcher() -> Result<&'static Launcher, LauncherError>;         // what this process launches through
+pub enum LauncherError { Unnamed, NotAbsolute { path }, NotAFile { path }, AlreadyNamed { named, refused } }
+```
+
+`name_launcher` takes the absolute path of the `cowshed-sandbox-exec` built from the same `cowshed-core` the program
+links (`cargo build -p cowshed-core --bin cowshed-sandbox-exec`). The first naming stands for the life of the process,
+the same file named again changes nothing, and another is refused. `launcher()` is what every launch path reads: the
+named launcher, on macOS always `/usr/bin/sandbox-exec` (naming there only answers `Ok`), and `LauncherError::Unnamed`
+in a Linux process that named none, which every launch path reports as `environment-missing` without starting anything.
+`exec::ProfileLaunch::args` takes that launcher, since what precedes a launch's `-f <profile> --` is the launcher's own.
+A launcher built from other sandbox sources than the program refuses each profile by its build, exit 65. The addon
+exports none of this.
 
 The mutation surface accepts a fresh endpoint plus project path because the handshake identifies the repository while
 `Cowshed::open` still requires the checkout path. `connectWorkspace(workerDescriptor)` consumes a distinct 256-bit,

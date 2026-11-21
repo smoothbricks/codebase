@@ -46,9 +46,10 @@ pub use ram_disk::{
 };
 pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use session::{
-    ConfigError, MACOS_FIXTURE_PORT_MIN, MACOS_FIXTURE_PORTS, MACOS_PORT_MAX, MACOS_PORT_MIN,
-    NEW_PORT_BLOCK_SIZE, TOKEN_BYTES, WorkspaceCa, WorkspaceEndpoint, WorkspaceSession,
-    WorkspaceToken, is_macos_port_block, is_port_block, validate_identifier,
+    ConfigError, LINUX_CONNECTOR_PORT, LINUX_DATA_SOCKET_DIRECTORY, MACOS_FIXTURE_PORT_MIN,
+    MACOS_FIXTURE_PORTS, MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, TOKEN_BYTES,
+    WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken, is_macos_port_block,
+    is_port_block, linux_data_socket_root, validate_identifier,
 };
 pub use status::{DaemonStatus, SessionStatus, StartupHeal, SupervisorRecovery};
 
@@ -65,6 +66,10 @@ use std::path::{Path, PathBuf};
 ///
 /// Bootstrap volumes cannot follow `$HOME`: doing so gives each user a different view of the
 /// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
+///
+/// The path is the same on every host (09_substrates.md, "Linux host paths"); what answers at it
+/// is the substrate's: the `cowshed.store` APFS volume, the `<root>/store` dataset, or the
+/// directory a directory store is.
 pub const STORE_ROOT: &str = "/private/cowshed/store";
 
 /// Production's gateway control socket, at production's store root: where production's disk tools
@@ -85,12 +90,12 @@ pub fn production_control_socket() -> PathBuf {
 /// `gateway stop` (05_gateway.md "Install order and rollback").
 pub const GATEWAY_DRAIN_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The gateway agent's launchd `ExitTimeOut`: how long launchd waits after the SIGTERM of a
-/// bootout or `kickstart -k` before it SIGKILLs the daemon. The drain ([`GATEWAY_DRAIN_WITHIN`])
-/// plus the force stop, the Nx backends' exit and the audit flush after it fit inside it.
-/// launchd's own default is 5 s (measured 2026-10-22, `launchctl print`: "exit timeout = 5"),
-/// which SIGKILLed a gateway mid-drain.
+/// How long the service manager waits after the SIGTERM of a stop or restart before it SIGKILLs
+/// the daemon: the gateway agent's launchd `ExitTimeOut`, its systemd unit's `TimeoutStopSec`.
+/// The drain ([`GATEWAY_DRAIN_WITHIN`]) plus the force stop, the Nx backends' exit and the audit
+/// flush after it fit inside it. launchd's own default is 5 s (measured 2026-10-22,
+/// `launchctl print`: "exit timeout = 5"), which SIGKILLed a gateway mid-drain.
 pub const GATEWAY_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-// launchd's SIGKILL must never come before the drain's own deadline.
+// The service manager's SIGKILL must never come before the drain's own deadline.
 const _: () = assert!(GATEWAY_DRAIN_WITHIN.as_secs() < GATEWAY_EXIT_TIMEOUT.as_secs());

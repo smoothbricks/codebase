@@ -22,7 +22,9 @@ use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, RetainedInput};
+use cowshed_apfs::{
+    ApfsBackend, ApfsError, CommandRunner, DetachIntent, MountAccess, RetainedInput,
+};
 
 /// The files beside a workspace image: its grants sidecar and its CA companion.
 const MAIN_COMPANION_SUFFIXES: [&str; 2] =
@@ -851,6 +853,75 @@ where
             .attach_mounted(image, mount, access, false)
             .map(|_| ())
             .map_err(Into::into)
+    }
+
+    /// The unmount refused: name the processes that hold the volume, if it was mounted.
+    fn capture_unmount_refusal(
+        &self,
+        source: &Path,
+        mount_point: Option<&Path>,
+        refusal: ApfsError,
+    ) -> ApfsStorageError {
+        if !cowshed_apfs::detach_was_dissented(&refusal) {
+            return refusal.into();
+        }
+        let Some(mount_point) = mount_point else {
+            return refusal.into();
+        };
+        let holders = match self.mounted_at(mount_point) {
+            Ok(Some(_)) => match crate::build_volume::nx::volume_holders(&self.census, mount_point)
+            {
+                Ok(holders) => holders,
+                Err(error) => {
+                    return ApfsStorageError::Cleanup {
+                        operation: "name capture source holders",
+                        primary: Box::new(refusal.into()),
+                        cleanup: Box::new(io_error(
+                            "list capture source holders",
+                            mount_point,
+                            error,
+                        )),
+                    };
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                return ApfsStorageError::Cleanup {
+                    operation: "inspect refused capture source",
+                    primary: Box::new(refusal.into()),
+                    cleanup: Box::new(error),
+                };
+            }
+        };
+        ApfsError::CaptureSourceBusy {
+            image: source.to_owned(),
+            held: cowshed_apfs::CaptureHold::Volume {
+                mount_point: mount_point.to_owned(),
+                holders,
+            },
+            refusal: Box::new(refusal),
+        }
+        .into()
+    }
+}
+
+impl ReAdoptSource {
+    /// `path` as the retained-input token the disk-image layer's read-only attachment takes: one
+    /// of exactly the images this validated record names.
+    pub(crate) fn retained_input<'a>(
+        &self,
+        path: &'a Path,
+    ) -> crate::Result<cowshed_apfs::RetainedInput<'a>> {
+        self.validate()?;
+        cowshed_apfs::RetainedInput::named_by(self, path).ok_or_else(|| {
+            crate::CowshedError::integrity(
+                format!(
+                    "{} is not an input named by this re-adoption record",
+                    path.display()
+                ),
+                "keep the source images and repair the replacement record",
+            )
+        })
     }
 }
 

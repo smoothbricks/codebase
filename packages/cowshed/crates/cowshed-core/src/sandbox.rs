@@ -1,12 +1,20 @@
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::capabilities::{
-    CapabilityGrant, DetectedCapabilities, DetectionContext, GrantAccess, GrantScope,
-};
+use crate::capabilities::{DetectedCapabilities, DetectionContext};
 pub use crate::metadata::PortBlock;
 use cowshed_gateway_types::STORE_ROOT;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
 fn cowshed_root() -> &'static Path {
     Path::new(STORE_ROOT)
@@ -158,8 +166,9 @@ pub struct SandboxConfig {
     /// no pool directory.
     pub cpu_pool_directory: Option<PathBuf>,
     /// The block the workspace's environment names (`COWSHED_PORT_BASE`/`_SIZE`) and its
-    /// gateway listens on.
-    pub port_block: PortBlock,
+    /// gateway listens on. `None` for a workspace that records none (Linux): its jobs own a
+    /// private loopback and reach the gateway through the launch's connector.
+    pub port_block: Option<PortBlock>,
     /// Blocks the workspace was relocated away from, still reserved to it until they retire:
     /// a background process a finished job left behind may still listen on one, and the
     /// workspace's own children keep reaching it. Outbound loopback TCP is admitted to these as
@@ -409,9 +418,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
             )
         })?,
         workspace_mount: mount,
-        port_block: grants.port_block.ok_or_else(|| {
-            CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
-        })?,
+        port_block: grants.port_block,
         retained_port_blocks: grants.retained_port_blocks.clone(),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants {
@@ -534,24 +541,33 @@ impl fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-struct ValidatedSandboxPaths<'a> {
+/// What one authority tier of a sandbox admits, validated and normalized, before any enforcer's
+/// syntax: the configuration (its mode, mount and carve-backs) and tier, the read roots and
+/// read-write roots its grants name, the sockets it reaches, and every path no grant may reach.
+/// Each platform turns this one value into its own enforcement: macOS renders it as a Seatbelt
+/// program, Linux compiles it into a Landlock ruleset and a namespace plan.
+struct ProfilePolicy<'a> {
+    config: &'a SandboxConfig,
+    role: SandboxProfileRole,
     hard_denies: Vec<Cow<'a, Path>>,
     read_grants: Vec<&'a Path>,
     write_grants: Vec<&'a Path>,
     sockets: Vec<&'a Path>,
 }
 
-/// Validate every path and grant boundary that profile generation enforces.
+/// Validate every path and grant boundary that profile generation enforces, and everything this
+/// platform's enforcer cannot enforce and so refuses.
 ///
 /// Controllers call this before publishing a grant snapshot, so an invalid grant never becomes
 /// durable state that only fails when the next child is launched.
 pub fn validate_sandbox_config(config: &SandboxConfig) -> Result<(), SandboxError> {
-    validated_sandbox_paths(config).map(|_| ())
+    platform::validate(&profile_policy(config, SandboxProfileRole::ExecutedChild)?)
 }
 
-fn validated_sandbox_paths(
+fn profile_policy(
     config: &SandboxConfig,
-) -> Result<ValidatedSandboxPaths<'_>, SandboxError> {
+    role: SandboxProfileRole,
+) -> Result<ProfilePolicy<'_>, SandboxError> {
     validate_path(&config.home)?;
     validate_path(&config.mount_root)?;
     validate_path(&config.workspace_mount)?;
@@ -685,7 +701,9 @@ fn validated_sandbox_paths(
         }
     }
 
-    Ok(ValidatedSandboxPaths {
+    Ok(ProfilePolicy {
+        config,
+        role,
         hard_denies,
         read_grants,
         write_grants,
@@ -693,30 +711,22 @@ fn validated_sandbox_paths(
     })
 }
 
-/// A rendered profile and the build volume its rules name as [`BUILD_VOLUME_PARAM`].
+/// A rendered profile, in the form this platform's enforcer reads, and the build volume its
+/// rules name as [`BUILD_VOLUME_PARAM`].
 ///
-/// The text names the build volume only as `(param "BUILD_VOLUME")`, so a pivot binds a new
-/// path to the same text (04_sandbox.md, "Exec pipeline" step 4). An unbound `param` evaluates
-/// to `#f`, and `sandbox-exec` refuses the whole profile ("invalid data type of path filter;
-/// expected pattern, got boolean", exit 65). The binding therefore travels with the text it
-/// completes: [`crate::exec::ProfileLaunch::write`] takes both from this one value.
+/// The text names the build volume only as that parameter, so a pivot binds a new path to the
+/// same text (04_sandbox.md, "Exec pipeline" step 4). On macOS the text is an SBPL program: an
+/// unbound `param` evaluates to `#f`, and `sandbox-exec` refuses the whole profile ("invalid
+/// data type of path filter; expected pattern, got boolean", exit 65). On Linux it is the
+/// launcher's Landlock and namespace plan, which the launcher refuses the same way. The binding
+/// therefore travels with the text it completes: [`crate::exec::ProfileLaunch::write`] takes
+/// both from this one value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeatbeltProfile {
     text: String,
     build_volume: Option<PathBuf>,
 }
 
-/// The SBPL text one profile is built into, and whether its role starts only what it reads.
-struct ProfileText {
-    text: String,
-    /// Exec follows read: each rule that decides `file-read-data` is followed by the same rule for
-    /// `process-exec`, so last-match-wins starts a program exactly where it reads one. macOS checks
-    /// only `process-exec` when it starts a file, so with exec allowed everywhere a program the job
-    /// could not read still started: a 755 `#!/usr/bin/env bun` entry Bun then failed to read ran
-    /// again through Bun's command fallback, one nested process per level (04_sandbox.md,
-    /// "Baseline (closed) profile"). Git's executes-only-Git role names its programs instead.
-    exec_follows_read: bool,
-}
 impl SeatbeltProfile {
     /// A profile whose text names no parameter: a test's hand-written host profile.
     #[cfg(test)]
@@ -745,46 +755,9 @@ impl SeatbeltProfile {
     }
 }
 
-/// The one program a workspace command runs outside the sandbox. macOS refuses a sandboxed exec
-/// of a set-user-ID program whatever the profile allows, and `/bin/ps` is one, so without this a
-/// job cannot list its own processes or read their start environment (04_sandbox.md, "Process
-/// inspection"). `ps` only reads the process table and prints it, and shows the environment of
-/// this user's processes alone, which every job already reads through `kern.procargs2`.
-const PROCESS_STATUS_EXEC: &str = "(allow process-exec (literal \"/bin/ps\") (with no-sandbox))";
-
-/// Where a fixture's short root lies: directly under the world-shared `/tmp`, spelled canonically
-/// because Seatbelt matches the resolved path and `/tmp` is a symlink to `/private/tmp`.
-const FIXTURE_PARENT: &str = "/private/tmp";
-
-/// What starts a fixture's names beneath [`FIXTURE_PARENT`]: the root `cx<pid>-<2 alphanumerics>`
-/// its process creates and removes with everything beneath it, and the `cxsweep.lock` that
-/// serializes reclaiming a dead run's roots (04_sandbox.md, "Fixture roots under /tmp"). It holds
-/// no regex metacharacter.
-const FIXTURE_PREFIX: &str = "cx";
-
-/// The one place a job writes in `/tmp`: a fixture root and what lies beneath it, the sweep lock,
-/// and the Unix sockets a daemon binds inside a root. Only these spellings match, so a lookalike
-/// name and every other entry of `/tmp` stay denied. A regex is the one SBPL filter that names a
-/// pattern, and its engine does not honor a `{n}` interval (measured: `[A-Za-z0-9]{2}` compiles
-/// and does not match `ab`), so the two random characters are two classes. The sweep reads
-/// `/tmp`'s names with the `file-read-data` the broad allow already grants; no other entry gains
-/// metadata.
-fn push_fixture_root_rules(profile: &mut ProfileText) {
-    let root = format!("^{FIXTURE_PARENT}/{FIXTURE_PREFIX}[0-9]+-[A-Za-z0-9][A-Za-z0-9]");
-    let lock = format!("{FIXTURE_PARENT}/{FIXTURE_PREFIX}sweep.lock");
-    push_line(
-        profile,
-        &format!("(allow file-read* file-write* (regex #\"{root}(/|$)\") (literal \"{lock}\"))"),
-    );
-    push_line(
-        profile,
-        &format!(
-            "(allow network-bind network-inbound network-outbound (local unix-socket (path-regex #\"{root}/\")) (remote unix-socket (path-regex #\"{root}/\")))"
-        ),
-    );
-}
-
-/// Generate a complete, deterministic SBPL profile for one authority tier.
+/// Render the profile one authority tier of `config` launches under, in the form this
+/// platform's enforcer reads: a Seatbelt program on macOS, a Landlock ruleset with its namespace
+/// plan on Linux.
 ///
 /// Paths must already be canonical controller data. Child argv, environment,
 /// output, and repository-controlled grants are deliberately absent from the
@@ -793,575 +766,155 @@ pub fn seatbelt_profile(
     config: &SandboxConfig,
     role: SandboxProfileRole,
 ) -> Result<SeatbeltProfile, SandboxError> {
-    let ValidatedSandboxPaths {
-        hard_denies,
-        read_grants,
-        write_grants,
-        sockets,
-    } = validated_sandbox_paths(config)?;
-
-    let cowshed = cowshed_root();
-    let mut profile = ProfileText {
-        text: String::new(),
-        exec_follows_read: role != SandboxProfileRole::GitDiscoveryGitOnly,
-    };
-
-    push_line(&mut profile, "(version 1)");
-    push_line(&mut profile, "(deny default)");
-    // Hard-link creation is a separate SBPL operation from file-write*.
-    // Keep aliases unavailable to both authority tiers.
-    push_line(&mut profile, "(deny file-link)");
-    if !matches!(
-        role,
-        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
-    ) {
-        push_line(&mut profile, "(allow file-read-data (subpath \"/\"))");
-        // The broad allow is for system paths. Nothing under HOME is readable unless a later
-        // rule names it: an explicit grant, the workspace's own mount, the exec temp dir, an
-        // allowed socket, or a detected capability's grant. Every one of those follows here,
-        // so last-match-wins carves each back.
-        push_subpath_rule(&mut profile, "deny file-read*", &config.home)?;
-    } else {
-        // Git's isolated global configuration is the empty device, not user HOME.
-        push_literal_rule(&mut profile, "allow file-read*", Path::new("/dev/null"))?;
-    }
-    // Every runtime seeds itself from the kernel's entropy before it runs a line; Python reads
-    // `/dev/urandom` for it, and without it dies in `_Py_HashRandomization_Init`. Git's own
-    // profile may run a standalone repository's merge drivers too, so every role reads both devices.
-    for device in ["/dev/random", "/dev/urandom"] {
-        push_literal_rule(&mut profile, "allow file-read*", Path::new(device))?;
-    }
-    // Directory metadata is distinct from file-read-data in Seatbelt. Toolchain
-    // launchers (notably /usr/bin/git -> xcrun) must traverse their immutable
-    // system roots without gaining metadata access to the user's home.
-    // Nix tools load libraries from other immutable store entries even without a Nix
-    // capability: dyld needs their metadata as well as the baseline data reads.
-    for root in [
-        "/Applications",
-        "/Library",
-        "/System",
-        "/bin",
-        "/nix/store",
-        "/opt",
-        "/private/var/select",
-        "/sbin",
-        "/usr",
-        "/var/select",
-    ] {
-        push_exact_and_subpath_rule(&mut profile, "allow file-read*", Path::new(root))?;
-        push_readable_ancestors(&mut profile, Path::new(root))?;
-    }
-    if role == SandboxProfileRole::GitDiscoveryGitOnly {
-        push_line(&mut profile, "(allow process-fork)");
-        // The developer-dir `git` the sandbox launches and the helpers it re-executes from its
-        // exec path, in both the spelling Git is launched by and the one the link resolves to.
-        // Nothing else runs: not a shell, so not any command a config key names.
-        let developer = Path::new(GIT_DEVELOPER_DIR);
-        // Seatbelt matches the resolved spelling. A developer directory that does not resolve
-        // would leave only a rule that never matches, and Git would die with no cause named.
-        let resolved = std::fs::canonicalize(developer).map_err(|_| SandboxError::InvalidPath {
-            path: developer.to_owned(),
-            reason: "the active developer directory does not resolve",
-        })?;
-        for root in [developer.to_owned(), resolved] {
-            push_literal_rule(
-                &mut profile,
-                "allow process-exec",
-                &root.join("usr/bin/git"),
-            )?;
-            push_subpath_rule(
-                &mut profile,
-                "allow process-exec",
-                &root.join("usr/libexec/git-core"),
-            )?;
-        }
-    } else {
-        // Exec comes from each read rule's exec twin (ProfileText::exec_follows_read).
-        push_line(&mut profile, "(allow process-fork)");
-        // After the `/bin` carve-back's exec twin, which would otherwise match `/bin/ps` last and
-        // keep it sandboxed.
-        push_line(&mut profile, PROCESS_STATUS_EXEC);
-    }
-    push_line(&mut profile, "(allow file-map-executable)");
-    push_line(&mut profile, "(allow sysctl-read)");
-    push_line(&mut profile, "(allow pseudo-tty)");
-    push_line(&mut profile, "(allow process-info* (target same-sandbox))");
-    push_line(&mut profile, "(allow signal (target same-sandbox))");
-    push_line(
-        &mut profile,
-        "(allow mach-priv-task-port (target same-sandbox))",
-    );
-    // Filesystem watchers need this service port or they silently receive no
-    // events. FSEvents still filters notifications through the file-read
-    // policy: the real watcher regression covers an allowed update and a
-    // denied descendant. This service adds no filesystem authority.
-    push_line(
-        &mut profile,
-        "(allow mach-lookup (global-name \"com.apple.FSEvents\"))",
-    );
-    // pwd.h/grp.h use OpenDirectory's read-only libinfo lookup service, as
-    // Apple's opendirectory.sb documents. Stock id and ssh-keygen need it to
-    // resolve the effective uid; record (.api) and membership services stay denied.
-    push_line(
-        &mut profile,
-        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.libinfo\"))",
-    );
-    // The per-user directory helper (`com.apple.bsd.dirhelper`) stays denied, so `confstr(3)`'s
-    // `DARWIN_USER_TEMP_DIR` and `DARWIN_USER_CACHE_DIR` answer EIO and tools fall back to
-    // `TMPDIR` or `/tmp`. Answered, they name the host user's own `/var/folders` directories,
-    // which no job may write (every host process's temp files live there): `mktemp` under a
-    // devenv shell then picked one and failed with EPERM instead of using the job's temp dir.
-
-    for socket in &sockets {
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
-                sbpl_path(socket)?
-            ),
-        );
-    }
-    push_line(
-        &mut profile,
-        "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
-    );
-    // Unix sockets the workspace's own processes rendezvous over — devenv's and nx's in the
-    // runtime dir, a test's in its temp dir, a tool's under the checkout — are admitted in the
-    // workspace's own tree and nowhere else: exec temp, and the whole source mount only for a
-    // read-write job. Generic rendezvous state stays private to the job mode; the contributed
-    // shared daemon leaf is granted separately below. `path-prefix` is a string prefix, so the
-    // trailing slash excludes sibling names.
-    let runtime_link = sandbox_runtime_link(config);
-    let private_runtime_link =
-        PathBuf::from("/private").join(runtime_link.strip_prefix("/").unwrap_or(&runtime_link));
-    let own_mount = (config.mode == RunSandboxMode::ReadWrite).then_some(&config.workspace_mount);
-    for tree in
-        own_mount
-            .into_iter()
-            .chain([&config.exec_temp_dir, &runtime_link, &private_runtime_link])
-    {
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}/\")) (remote unix-socket (path-prefix \"{0}/\")))",
-                sbpl_path(tree)?
-            ),
-        );
-    }
-    // Every port of every block the workspace holds, current and retained, one literal each; a
-    // loopback-any grant admits every loopback port instead (04_sandbox.md).
-    if config.grants.loopback_any {
-        push_line(
-            &mut profile,
-            "(allow network-outbound (remote tcp \"localhost:*\"))",
-        );
-    } else {
-        for block in held_port_blocks(config) {
-            for port in block.ports().map_err(|_| SandboxError::InvalidPortBlock {
-                base: block.base,
-                size: block.size,
-            })? {
-                push_line(
-                    &mut profile,
-                    &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
-                );
-            }
-        }
-    }
-
-    if !matches!(
-        role,
-        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
-    ) {
-        let directory = crate::host_dirs::installed_binary_directory(&config.home);
-        let stable = directory.join("cowshed");
-        let installed = match std::fs::canonicalize(&stable) {
-            Ok(path) => Some(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(SandboxError::InstalledCowshed {
-                    path: stable.clone(),
-                    cause: error.to_string(),
-                });
-            }
-        };
-        if let Some(installed) = installed {
-            let metadata =
-                std::fs::metadata(&installed).map_err(|error| SandboxError::InstalledCowshed {
-                    path: installed.clone(),
-                    cause: error.to_string(),
-                })?;
-            if !metadata.is_file() {
-                return Err(SandboxError::InvalidPath {
-                    path: installed,
-                    reason: "the installed cowshed must resolve to one regular executable",
-                });
-            }
-            // Only the installed copy is readable. Lookup of the stable name and its ancestors
-            // needs metadata, never directory contents.
-            for name in [&stable, &installed] {
-                for ancestor in name.ancestors() {
-                    push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
-                }
-            }
-            push_literal_rule(&mut profile, "allow file-read*", &installed)?;
-        }
-    }
-
-    for path in &read_grants {
-        push_subpath_rule(&mut profile, "allow file-read*", path)?;
-    }
-    for path in &write_grants {
-        push_subpath_rule(&mut profile, "allow file-read* file-write*", path)?;
-    }
-    // The machine-global evidence layer and the fixed per-user mount tree are separate protected
-    // roots. The mount tree needs its own deny, outside the `/private/cowshed` boundary.
-    push_subpath_rule(&mut profile, "deny file-read* file-write*", cowshed)?;
-    push_subpath_rule(
-        &mut profile,
-        "deny file-read* file-write*",
-        &config.mount_root,
-    )?;
-    // `getcwd(2)` and path resolution need read access to every exact ancestor. Literal rules
-    // reveal no sibling subtree and are emitted after both broad denies, while the own-workspace
-    // subpath grant below carves back only this workspace.
-    push_readable_ancestors(&mut profile, &config.workspace_mount)?;
-    for path in read_grants.iter().chain(write_grants.iter()) {
-        push_readable_ancestors(&mut profile, path)?;
-    }
-    // A shed link is the spelling a workspace reaches a sibling repository by (`../<name>`), and
-    // it sits inside the mount-root deny above. Only a link whose target a grant covers is carved
-    // back, as a literal: the link stays unreadable until its target is granted, and reading it
-    // reveals nothing a granted subtree does not already show.
-    for link in &config.shed_links {
-        if read_grants
-            .iter()
-            .chain(write_grants.iter())
-            .any(|grant| paths_intersect(&link.target, grant))
-        {
-            push_readable_ancestors(&mut profile, &link.link)?;
-        }
-    }
-    // Connecting to an allowed socket resolves its path, so every ancestor must
-    // be traversable. Socket directories are not under the immutable roots
-    // granted above — the nix daemon socket resolves into `/private/var/run`,
-    // while a socket under the store is itself behind the `/private/cowshed` deny — so
-    // the literals must land here, after the store-wide deny, or last-match-wins
-    // re-denies them and the connect fails on path resolution before the
-    // outbound rule is ever consulted.
-    for socket in &sockets {
-        push_readable_ancestors(&mut profile, socket)?;
-    }
-    // The workspace's CPU pool directory, `<store>/run/cpu/<incarnation>` (05_gateway.md
-    // "Parallelism inside a job"), holds its jobs' jobserver fifos (05_gateway.md "Cargo reads
-    // its holder's jobserver"). It sits behind the `/private/cowshed` deny, so its rules land
-    // here for the reason the socket ancestors above do: emitted before that deny, last-match-wins
-    // re-denied the jobserver FIFO's open with EPERM, and Cargo ran without its jobserver. The
-    // profile is rendered per workspace, not per job, so no job's fifo can be a literal here: the
-    // scope is this workspace's own pool directory, and inside it only FIFOs open. Its ancestors
-    // and entries resolve by metadata, as the installed cowshed's do: neither the directory nor
-    // `run/cpu`, where sibling workspaces' directories sit, is listable.
-    if let Some(directory) = &config.cpu_pool_directory {
-        for ancestor in directory.ancestors().skip(1) {
-            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
-        }
-        let directory = sbpl_path(directory)?;
-        push_line(
-            &mut profile,
-            &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
-        );
-        // Its jobserver fifo's tokens are read and written back (05_gateway.md "Cargo reads its
-        // holder's jobserver"), and nothing else there is.
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow file-read-data file-write-data (require-all (subpath \"{directory}\") (vnode-type FIFO)))"
-            ),
-        );
-    }
-    // Every tool-specific authority is a detected capability's contribution (15_capabilities.md):
-    // its shared caches with their access where the host keeps them, their ancestors beneath HOME
-    // metadata only, and its exact grants. Configuration, credentials and binaries a tool keeps
-    // beside them stay hard denies, which follow every grant below.
-    let contribution = &config.capabilities.contribution;
-    for cache in &contribution.shared_caches {
-        push_capability_grant(
-            &mut profile,
-            &config.home,
-            &CapabilityGrant {
-                path: cache.path.clone(),
-                scope: GrantScope::Subtree,
-                access: cache.access,
-            },
-        )?;
-    }
-    for grant in &contribution.grants {
-        push_capability_grant(&mut profile, &config.home, grant)?;
-    }
-    // Build state is not source. Grant only the controller-selected physical volume, after
-    // the store and mount-tree denies; sibling volumes and images remain inaccessible. The volume
-    // is the profile's one parameter (`BUILD_VOLUME_PARAM`), so a build-volume pivot binds a new
-    // path to the same profile rather than rendering another.
-    if let Some(volume) = &config.build_volume_mount {
-        if let Some(parent) = volume.parent() {
-            push_readable_ancestors(&mut profile, parent)?;
-        }
-        push_volume_exact_and_subpath_rule(
-            &mut profile,
-            "allow file-read* file-write*",
-            volume,
-            volume,
-        )?;
-    }
-    push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
-    if config.mode == RunSandboxMode::ReadWrite {
-        push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
-    }
-    // Last-match-wins: a workspace-relative deny must follow every mount and grant allow.
-    // Deny rename/unlink on ancestors too, or renaming `.git` would move the protected
-    // children out of the denied spelling before rewriting them.
-    for (relatives, operations) in [
-        (&config.grants.deny_write, "deny file-write*"),
-        (&config.grants.deny, "deny file-read* file-write*"),
-    ] {
-        for relative in relatives {
-            let mut parent = config.workspace_mount.clone();
-            for component in relative.components() {
-                parent.push(component);
-                push_literal_rule(&mut profile, "deny file-write-unlink", &parent)?;
-            }
-            push_exact_and_subpath_rule(
-                &mut profile,
-                operations,
-                &config.workspace_mount.join(relative),
-            )?;
-            if let Some(volume) = &config.build_volume_mount {
-                let resolved = resolve_deny(&config.workspace_mount.join(relative))?;
-                if let Ok(relative) = resolved.strip_prefix(volume) {
-                    let mut parent = volume.clone();
-                    for component in relative.components() {
-                        parent.push(component);
-                        push_line(
-                            &mut profile,
-                            &format!(
-                                "(deny file-write-unlink (literal {}))",
-                                volume_expression(volume, &parent)?
-                            ),
-                        );
-                    }
-                    push_volume_exact_and_subpath_rule(
-                        &mut profile,
-                        operations,
-                        volume,
-                        &resolved,
-                    )?;
-                }
-            }
-        }
-    }
-    let workspace_metadata = config.workspace_mount.join(".cowshed");
-    let job_artifacts = workspace_metadata.join("job");
-
-    // SBPL is last-match-wins. Policy denies (project roots the host configured) come first,
-    // then the two carve-backs they would otherwise close, then the immutable secret denies as
-    // the profile's last word on the shared tree: no grant may follow a secret's deny.
-    let (policy, secrets): (Vec<_>, Vec<_>) = hard_denies
-        .into_iter()
-        .filter(|path| path.as_ref() != cowshed && path.as_ref() != config.mount_root.as_path())
-        .partition(|path| {
-            config
-                .additional_denies
-                .iter()
-                .any(|extra| extra == path.as_ref())
-        });
-    for deny in policy {
-        push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
-    }
-
-    // After every deny that would otherwise close it: the mount-root deny covers
-    // main under the symlink layout, and policy denies the project root under direct mount. The
-    // carve-back is narrowed to `.git`, never main's working tree, which stays as unreachable as
-    // any sibling workspace.
-    if let Some(repository) = &config.git_worktree_repository {
-        push_readable_ancestors(&mut profile, repository)?;
-        push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
-    }
-
-    // The consumer imports sealed pins from main, not from a live provider checkout. This is a
-    // controller-derived read exception, after main's deny and before every immutable secret deny.
-    if let Some(main) = &config.main_mount
-        && let Some(warning) = push_main_snapshot_store(&mut profile, config, main)?
-    {
-        cowshed_os::eprintln!("{warning}");
-    }
-
-    // The exec temp dir is exported as TMPDIR and lives in the project's store directory, so its
-    // grant must follow every deny that covers it - the store-wide one and the project root
-    // above - or last-match-wins re-denies it: every `mktemp` in a child then fails on a path
-    // the child never chose. Read and write both - a child reads back what it wrote there, and
-    // metadata on the directory is what a `realpath(os.tmpdir())` needs.
-    push_subpath_rule(&mut profile, "allow file-read*", &config.exec_temp_dir)?;
-    push_line(
-        &mut profile,
-        &format!(
-            "(allow file-write* (subpath \"{}\") (literal \"/dev/null\"))",
-            sbpl_path(&config.exec_temp_dir)?
-        ),
-    );
-    // A child writes the null device through a descriptor its parent opened write-only (a
-    // shell's `>/dev/null`, a detached job's stdio), and runtimes fstat their stdio before
-    // running a line: Node aborts in its process setup, with no message, when that fstat
-    // fails. fstat on a write-only descriptor is file-read-metadata, which neither the
-    // write grant above nor file-read-data on `/` includes.
-    push_literal_rule(
-        &mut profile,
-        "allow file-read-metadata",
-        Path::new("/dev/null"),
-    )?;
-    // A child opens its stdio by name too (usdt's proc macro runs `dtrace -h -s /dev/stdin -o
-    // /dev/stdout`). The names are links into /dev/fd, and Seatbelt matches the resolved
-    // spelling: a rule on a link name never admits an open, only its lookup, which is
-    // file-read-metadata. The open lands on /dev/fd/N, which duplicates a descriptor this
-    // process already holds and refuses an access mode wider than that descriptor's, so the
-    // subtree reaches nothing the child could not already read or write.
-    for link in ["/dev/stdin", "/dev/stdout", "/dev/stderr"] {
-        push_literal_rule(&mut profile, "allow file-read-metadata", Path::new(link))?;
-    }
-    push_subpath_rule(
-        &mut profile,
-        "allow file-read* file-write*",
-        Path::new("/dev/fd"),
-    )?;
-    push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
-    // A contributed daemon leaf (Nx's run/nx) is shared across modes, never the surrounding
-    // generic runtime directory. The rest of a read-only job's rendezvous state stays private.
-    let shared_alias = shared_daemon_runtime_link(config);
-    let shared_runtime = shared_daemon_runtime_dir(config);
-    for alias in &config
-        .capabilities
-        .contribution
-        .daemon_isolation
-        .directories
-    {
-        let Ok(relative) = alias.strip_prefix(&shared_alias) else {
-            continue;
-        };
-        validate_path(alias)?;
-        if relative.as_os_str().is_empty() {
-            return Err(SandboxError::InvalidPath {
-                path: alias.clone(),
-                reason: "a shared daemon grant must name a leaf below its runtime root",
-            });
-        }
-        let directory = shared_runtime.join(relative);
-        push_readable_ancestors(&mut profile, &directory)?;
-        push_subpath_rule(&mut profile, "allow file-read* file-write*", &directory)?;
-        let canonical_alias = Path::new("/private").join(alias.strip_prefix("/").unwrap_or(alias));
-        for socket_tree in [&directory, alias, &canonical_alias] {
-            push_line(
-                &mut profile,
-                &format!(
-                    "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}/\")) (remote unix-socket (path-prefix \"{0}/\")))",
-                    sbpl_path(socket_tree)?
-                ),
-            );
-        }
-        for name in [
-            &shared_alias,
-            &Path::new("/private").join(shared_alias.strip_prefix("/").unwrap_or(&shared_alias)),
-        ] {
-            push_literal_rule(&mut profile, "allow file-read-metadata", name)?;
-        }
-    }
-    // Generic short runtime links resolve to the mode's own runtime directory. Only metadata
-    // on their exact names is allowed, never metadata for the rest of /tmp.
-    let runtime_name = runtime_link
-        .file_name()
-        .expect("runtime link has a file name");
-    for tmp in ["/tmp", "/private/tmp"] {
-        push_literal_rule(&mut profile, "allow file-read-metadata", Path::new(tmp))?;
-        push_literal_rule(
-            &mut profile,
-            "allow file-read-metadata",
-            &Path::new(tmp).join(runtime_name),
-        )?;
-    }
-
-    // The one world-shared `/tmp` area a job writes: a fixture's short root and its sweep lock
-    // (04_sandbox.md, "Fixture roots under /tmp"). Controller Git keeps its narrower write
-    // boundary.
-    if !matches!(
-        role,
-        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
-    ) {
-        push_fixture_root_rules(&mut profile);
-    }
-
-    for deny in secrets {
-        push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
-    }
-
-    for protected in [
-        crate::storage::WORKSPACE_MARKER_PATH,
-        crate::workspace_credentials::CA_CERTIFICATE_PATH,
-        crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
-        crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH,
-        crate::workspace_git_fetch::WORKSPACE_GIT_FETCH_CONFIG_PATH,
-        crate::git::WORKSPACE_GIT_IDENTITY_CONFIG_PATH,
-    ] {
-        push_literal_rule(
-            &mut profile,
-            "deny file-write*",
-            &config.workspace_mount.join(protected),
-        )?;
-    }
-    // The staged exec host every warm shell runs as. A job that could replace it would run its
-    // own program as every later command's parent, able to forge their wait status.
-    push_exact_and_subpath_rule(
-        &mut profile,
-        "deny file-write*",
-        &config
-            .workspace_mount
-            .join(crate::runtime::shell_host::SHELL_HOST_DIRECTORY),
-    )?;
-
-    match role {
-        SandboxProfileRole::TrustedSupervisor => {
-            // The trusted writer's reserved authority is the final narrow
-            // carve-back, including when the repository itself is read-only.
-            push_exact_and_subpath_rule(&mut profile, "allow file-write*", &job_artifacts)?;
-        }
-        SandboxProfileRole::ExecutedChild
-        | SandboxProfileRole::GitDiscovery
-        | SandboxProfileRole::GitDiscoveryGitOnly => {
-            // These terminal rules are emitted after every configurable or broad
-            // allow. Denying create/unlink at the metadata directory itself
-            // prevents replacing or renaming that ancestor without blocking
-            // writes to unrelated metadata children.
-            // file-write* covers create, data write/truncate, rename, unlink, and
-            // symlink creation. Hard links are separately denied for both tiers.
-            push_literal_rule(
-                &mut profile,
-                "deny file-write-create file-write-unlink",
-                &workspace_metadata,
-            )?;
-            push_exact_and_subpath_rule(&mut profile, "deny file-write*", &job_artifacts)?;
-            let tool_root = match config.mode {
-                RunSandboxMode::ReadOnly => config.exec_temp_dir.join("tools"),
-                RunSandboxMode::ReadWrite => workspace_metadata.join("tools"),
-            };
-            push_exact_and_subpath_rule(&mut profile, "deny file-write*", &tool_root)?;
-        }
-    }
-    Ok(SeatbeltProfile {
-        text: profile.text,
-        build_volume: config.build_volume_mount.clone(),
-    })
+    platform::render(profile_policy(config, role)?)
 }
 
-/// The current block, then every retained one.
+/// The program a process's sandboxed launches start as, and what makes that program a launcher.
+///
+/// A launch must be enforced by the build that rendered its profile, so a process never searches
+/// for a launcher: it has the one its own program named ([`launcher`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Launcher {
+    program: PathBuf,
+    /// The first argument of a program that is a launcher only when told so: a binary that is
+    /// its own launcher answers a verb. A program that is nothing else takes none.
+    verb: Option<&'static str>,
+}
+
+impl Launcher {
+    /// The program a launch starts.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// The arguments before the command: what makes the program a launcher, each parameter's
+    /// `-D NAME=value`, then `-f <file> --`. The profile travels in its file, never as an
+    /// argument.
+    pub(crate) fn launch_arguments(
+        &self,
+        file: &Path,
+        build_volume: Option<&Path>,
+    ) -> Vec<OsString> {
+        let mut args: Vec<OsString> = self.verb.map(OsString::from).into_iter().collect();
+        if let Some(volume) = build_volume {
+            let mut binding = OsString::from(BUILD_VOLUME_PARAM);
+            binding.push("=");
+            binding.push(volume);
+            args.extend([OsString::from("-D"), binding]);
+        }
+        args.extend([
+            OsString::from("-f"),
+            file.as_os_str().to_owned(),
+            OsString::from("--"),
+        ]);
+        args
+    }
+}
+
+/// The launcher `cowshed-core` builds for a program that links it and is not the cowshed binary
+/// (`cargo build -p cowshed-core --bin cowshed-sandbox-exec`): its `main` is [`launcher_main`]
+/// and nothing else. Such a program names the copy built with it ([`name_launcher`]).
+pub const SANDBOX_EXEC_NAME: &str = "cowshed-sandbox-exec";
+
+/// Why a process has no launcher to start a sandboxed command with. No launch runs unsandboxed
+/// instead, and none goes looking for another program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LauncherError {
+    /// The process named no launcher: it is not the cowshed binary, which is its own, and it
+    /// never called [`name_launcher`].
+    Unnamed,
+    /// The launcher a process named must be spelled absolutely: a launch runs in its command's
+    /// working directory.
+    NotAbsolute { path: PathBuf },
+    /// The launcher a process named is not a file there.
+    NotAFile { path: PathBuf },
+    /// A process has one launcher: `refused` was named after `named`.
+    AlreadyNamed { named: PathBuf, refused: PathBuf },
+}
+
+impl fmt::Display for LauncherError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unnamed => write!(
+                formatter,
+                "this process has no sandbox launcher: it is not the cowshed binary, which is its own, and it named no {SANDBOX_EXEC_NAME}"
+            ),
+            Self::NotAbsolute { path } => write!(
+                formatter,
+                "the sandbox launcher {} is not an absolute path",
+                path.display()
+            ),
+            Self::NotAFile { path } => write!(
+                formatter,
+                "the sandbox launcher {} is not a file",
+                path.display()
+            ),
+            Self::AlreadyNamed { named, refused } => write!(
+                formatter,
+                "this process launches through {} and cannot also launch through {}",
+                named.display(),
+                refused.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LauncherError {}
+
+impl LauncherError {
+    /// The error as a command reports it: a missing piece of the environment, with both ways
+    /// to have a launcher. A method and no `From`: `CowshedError` converts from nothing, which
+    /// is what lets a `?` on it infer its error type.
+    pub(crate) fn report(&self) -> crate::error::CowshedError {
+        crate::error::CowshedError::environment_missing(
+            self.to_string(),
+            format!(
+                "run the command through the cowshed binary, or have the program that links cowshed-core name the {SANDBOX_EXEC_NAME} built with it"
+            ),
+        )
+    }
+}
+
+/// Run this process as the sandbox launcher when its arguments name it one: `Some` exit code
+/// when they do and the launch failed (a launch that succeeds becomes the command and never
+/// returns), `None` when this process is no launcher. The binary answers this before it starts
+/// any thread: a launcher enters its namespaces and restricts itself as one thread.
+///
+/// A binary that answers this is its own launcher wherever the platform has no system one: its
+/// launches run its own image, so the build that renders a profile is the build that enforces
+/// it, whatever is installed since (04_sandbox.md, "Linux enforcement").
+pub fn dispatch_launcher() -> Option<i32> {
+    platform::dispatch_launcher()
+}
+
+/// Name the launcher of a program that links `cowshed-core` and is not the cowshed binary: the
+/// [`SANDBOX_EXEC_NAME`] built from the same `cowshed-core` as the caller, by its absolute path.
+/// The first naming stands for the life of the process, and naming the same file again changes
+/// nothing. Where the platform's launcher is the system's (macOS), there is nothing to name and
+/// this only answers `Ok`.
+pub fn name_launcher(executable: &Path) -> Result<(), LauncherError> {
+    platform::name_launcher(executable)
+}
+
+/// The launcher this process's sandboxed launches start as: `sandbox-exec` on macOS; on Linux
+/// the one this process's program named, itself ([`dispatch_launcher`]) or the
+/// [`SANDBOX_EXEC_NAME`] built with it ([`name_launcher`]).
+pub fn launcher() -> Result<&'static Launcher, LauncherError> {
+    platform::launcher()
+}
+
+/// The whole `main` of [`SANDBOX_EXEC_NAME`]: launch what the arguments name and never return
+/// from a launch that succeeds; the exit code of one that failed.
+pub fn launcher_main() -> i32 {
+    platform::launcher_main()
+}
+
+/// The current block, when the workspace holds one, then every retained one.
 fn held_port_blocks(config: &SandboxConfig) -> impl Iterator<Item = PortBlock> + '_ {
-    std::iter::once(config.port_block).chain(config.retained_port_blocks.iter().copied())
+    config
+        .port_block
+        .into_iter()
+        .chain(config.retained_port_blocks.iter().copied())
 }
 
 fn hard_denies<'a>(
@@ -1405,41 +958,6 @@ fn normalized_paths(paths: &[PathBuf]) -> Result<Vec<&Path>, SandboxError> {
     Ok(paths)
 }
 
-/// Resolve a deny even when its leaf has not been created. This adds no authority: only
-/// deny rules beneath an already controller-selected physical build volume use the result.
-fn resolve_deny(path: &Path) -> Result<PathBuf, SandboxError> {
-    let mut existing = path;
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::canonicalize(existing) {
-            Ok(mut resolved) => {
-                for part in suffix.into_iter().rev() {
-                    resolved.push(part);
-                }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(name) = existing.file_name() else {
-                    return Err(SandboxError::DenyResolution {
-                        path: path.to_owned(),
-                        cause: error.to_string(),
-                    });
-                };
-                suffix.push(name);
-                existing = existing
-                    .parent()
-                    .expect("an absolute named path has a parent");
-            }
-            Err(error) => {
-                return Err(SandboxError::DenyResolution {
-                    path: path.to_owned(),
-                    cause: error.to_string(),
-                });
-            }
-        }
-    }
-}
-
 fn validate_path(path: &Path) -> Result<(), SandboxError> {
     if !path.is_absolute() {
         return Err(SandboxError::InvalidPath {
@@ -1466,44 +984,6 @@ fn paths_intersect(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
 
-fn sbpl_path(path: &Path) -> Result<String, SandboxError> {
-    validate_path(path)?;
-    Ok(path
-        .as_os_str()
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\""))
-}
-
-/// One capability grant. Every grant makes its path and ancestors resolvable; a read-write
-/// literal is a file the tool itself writes, and a subtree extends the grant to everything
-/// beneath its root. An ancestor beneath HOME gets metadata only: enough to resolve and
-/// `realpath` through it, never to list `~` or `~/Library/Application Support`, which the
-/// HOME-wide read deny keeps closed.
-fn push_capability_grant(
-    profile: &mut ProfileText,
-    home: &Path,
-    grant: &CapabilityGrant,
-) -> Result<(), SandboxError> {
-    for ancestor in grant.path.ancestors().skip(1) {
-        let operation = if ancestor.starts_with(home) {
-            "allow file-read-metadata"
-        } else {
-            "allow file-read*"
-        };
-        push_literal_rule(profile, operation, ancestor)?;
-    }
-    let operation = match grant.access {
-        GrantAccess::ReadMetadata => "allow file-read-metadata",
-        GrantAccess::Read => "allow file-read*",
-        GrantAccess::ReadWrite => "allow file-read* file-write*",
-    };
-    match grant.scope {
-        GrantScope::Literal => push_literal_rule(profile, operation, &grant.path),
-        GrantScope::Subtree => push_subpath_rule(profile, operation, &grant.path),
-    }
-}
-
 fn is_build_volume_mount(mount_root: &Path, volume: &Path) -> bool {
     volume.strip_prefix(mount_root).is_ok_and(|relative| {
         relative.starts_with(".build")
@@ -1520,12 +1000,20 @@ fn is_build_volume_mount(mount_root: &Path, volume: &Path) -> bool {
     })
 }
 
-/// Read the one controller-named store, including its fixed build-volume link, never main's cache.
-fn push_main_snapshot_store(
-    profile: &mut ProfileText,
-    config: &SandboxConfig,
-    main: &Path,
-) -> Result<Option<String>, SandboxError> {
+/// Main's linked-snapshot store as a shed's sandbox may read it.
+enum MainSnapshotStore {
+    /// Main keeps no store.
+    Absent,
+    /// The store resolves somewhere it may not, or cannot be resolved: the warning names where
+    /// and why. No read is granted and no launch is refused.
+    Refused(String),
+    /// The one controller-named store: `store` and what it resolves to are read.
+    Readable { store: PathBuf, resolved: PathBuf },
+}
+
+/// Resolve the one controller-named store, including its fixed build-volume link, never main's
+/// cache.
+fn main_snapshot_store(config: &SandboxConfig, main: &Path) -> MainSnapshotStore {
     let store = main.join(".cache/linked-snapshots");
     let warning = |resolved: Option<&Path>, cause: String| {
         let target = resolved.map_or_else(
@@ -1539,8 +1027,10 @@ fn push_main_snapshot_store(
     };
     let resolved = match std::fs::canonicalize(&store) {
         Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Ok(Some(warning(None, error.to_string()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return MainSnapshotStore::Absent;
+        }
+        Err(error) => return MainSnapshotStore::Refused(warning(None, error.to_string())),
     };
     let canonical = |path: &Path| {
         std::fs::canonicalize(path)
@@ -1563,139 +1053,27 @@ fn push_main_snapshot_store(
         Ok(())
     };
     if let Err(cause) = fence() {
-        return Ok(Some(warning(Some(&resolved), cause)));
+        return MainSnapshotStore::Refused(warning(Some(&resolved), cause));
     }
-    // A symlink in the fixed store path passes through main/.cowshed/build. Only lookup is
-    // admitted at those hops and at every ancestor, including the otherwise-denied build volume.
-    for path in [&store, &resolved, &build_link] {
-        for ancestor in path.ancestors() {
-            push_literal_rule(profile, "allow file-read-metadata", ancestor)?;
-        }
-    }
-    for path in [&store, &resolved] {
-        push_subpath_rule(profile, "allow file-read*", path)?;
-    }
-    Ok(None)
+    MainSnapshotStore::Readable { store, resolved }
 }
 
-fn push_readable_ancestors(profile: &mut ProfileText, path: &Path) -> Result<(), SandboxError> {
-    for ancestor in path.ancestors() {
-        push_literal_rule(profile, "allow file-read*", ancestor)?;
-    }
-    Ok(())
-}
+/// Where controller Git runs from on macOS: the active developer directory's `usr/bin/git` and
+/// its `usr/libexec/git-core` exec path.
+pub const GIT_DEVELOPER_DIR: &str = "/var/select/developer_dir";
 
-/// Where controller Git runs from: the active developer directory's `usr/bin/git` and its
-/// `usr/libexec/git-core` exec path.
-pub(crate) const GIT_DEVELOPER_DIR: &str = "/var/select/developer_dir";
-
-fn push_subpath_rule(
-    profile: &mut ProfileText,
-    operation: &str,
-    path: &Path,
-) -> Result<(), SandboxError> {
-    push_line(
-        profile,
-        &format!("({operation} (subpath \"{}\"))", sbpl_path(path)?),
-    );
-    Ok(())
-}
-
-fn push_literal_rule(
-    profile: &mut ProfileText,
-    operation: &str,
-    path: &Path,
-) -> Result<(), SandboxError> {
-    push_line(
-        profile,
-        &format!("({operation} (literal \"{}\"))", sbpl_path(path)?),
-    );
-    Ok(())
-}
-
-fn push_exact_and_subpath_rule(
-    profile: &mut ProfileText,
-    operation: &str,
-    path: &Path,
-) -> Result<(), SandboxError> {
-    let path = sbpl_path(path)?;
-    push_line(
-        profile,
-        &format!("({operation} (literal \"{path}\") (subpath \"{path}\"))"),
-    );
-    Ok(())
-}
-
-/// The Seatbelt parameter a profile names its build volume by; `sandbox-exec -D` binds it at
-/// launch (04_sandbox.md, "Exec pipeline" step 4).
+/// The parameter a profile names its build volume by; the launcher's `-D` binds it at launch
+/// (04_sandbox.md, "Exec pipeline" step 4).
 pub const BUILD_VOLUME_PARAM: &str = "BUILD_VOLUME";
 
-/// `path`, inside the build volume `volume`, as an SBPL string expression over the
-/// [`BUILD_VOLUME_PARAM`] parameter.
-fn volume_expression(volume: &Path, path: &Path) -> Result<String, SandboxError> {
-    sbpl_path(path)?;
-    let parameter = format!("(param \"{BUILD_VOLUME_PARAM}\")");
-    let relative = path
-        .strip_prefix(volume)
-        .map_err(|_| SandboxError::InvalidPath {
-            path: path.to_owned(),
-            reason: "a build volume rule must name a path inside the build volume",
-        })?;
-    if relative.as_os_str().is_empty() {
-        return Ok(parameter);
-    }
-    let relative = relative
-        .as_os_str()
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    Ok(format!("(string-append {parameter} \"/{relative}\")"))
-}
-
-fn push_volume_exact_and_subpath_rule(
-    profile: &mut ProfileText,
-    operation: &str,
-    volume: &Path,
-    path: &Path,
-) -> Result<(), SandboxError> {
-    let path = volume_expression(volume, path)?;
-    push_line(
-        profile,
-        &format!("({operation} (literal {path}) (subpath {path}))"),
-    );
-    Ok(())
-}
-
-fn push_line(profile: &mut ProfileText, line: &str) {
-    profile.text.push_str(line);
-    profile.text.push('\n');
-    let Some((operations, filters)) = line.split_once(" (") else {
-        return;
-    };
-    let Some((effect, names)) = operations.split_once(' ') else {
-        return;
-    };
-    let wildcard = names.split_whitespace().any(|name| name == "file-read*");
-    // An explicit file-read-data rule takes precedence over file-read*, even
-    // when the wildcard comes later. Give every read rule the same specificity
-    // so ordered denies and carve-backs govern actual reads as well as metadata.
-    if wildcard {
-        profile.text.push_str(effect);
-        profile.text.push_str(" file-read-data (");
-        profile.text.push_str(filters);
-        profile.text.push('\n');
-    }
-    if profile.exec_follows_read && (wildcard || names == "file-read-data") {
-        profile.text.push_str(effect);
-        profile.text.push_str(" process-exec (");
-        profile.text.push_str(filters);
-        profile.text.push('\n');
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(target_os = "macos")]
+    use super::macos::{
+        FIXTURE_PREFIX, PROCESS_STATUS_EXEC, ProfileText, push_main_snapshot_store,
+    };
     use super::*;
+    use crate::capabilities::{CapabilityGrant, GrantAccess, GrantScope};
     #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Spawn as _;
     #[cfg(target_os = "macos")]
@@ -1709,7 +1087,7 @@ mod tests {
 
     static NEXT_SANDBOX_DIR: AtomicU64 = AtomicU64::new(0);
 
-    fn config(mode: RunSandboxMode) -> SandboxConfig {
+    pub(crate) fn config(mode: RunSandboxMode) -> SandboxConfig {
         SandboxConfig {
             home: PathBuf::from("/Users/tester"),
             mount_root: PathBuf::from("/Users/tester/.cowshed/mnt"),
@@ -1719,7 +1097,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             store_root: PathBuf::from("/private/tmp/cowshed-raven-store"),
-            port_block: PortBlock::new(40_960, 16).unwrap(),
+            port_block: Some(PortBlock::new(40_960, 16).unwrap()),
             retained_port_blocks: Vec::new(),
             mode,
             grants: SandboxGrants {
@@ -1742,6 +1120,97 @@ mod tests {
             repository_caches: Vec::new(),
             program_directories: Vec::new(),
             capabilities: DetectedCapabilities::default(),
+        }
+    }
+
+    /// Give this test process the launcher its sandboxed launches start as. Linux has no system
+    /// launcher and a test binary is not its own, so it names the `cowshed-sandbox-exec` built
+    /// with it, as any program that links this crate does; macOS's is `sandbox-exec`.
+    pub(crate) fn name_launcher() {
+        #[cfg(target_os = "linux")]
+        crate::sandbox_launcher::name(super::name_launcher);
+    }
+
+    /// A fixture's own store in a process that has its launcher: what a fixture whose
+    /// controller Git or command runs sandboxed starts from. The store holds the profiles those
+    /// launches write (08_testing.md, "Fixtures").
+    pub(crate) fn fixture_store() -> crate::temp_root::FixtureStore {
+        name_launcher();
+        crate::temp_root::FixtureStore::new()
+    }
+
+    /// A launch's arguments before its command, for a program that is a launcher when told so
+    /// by a verb and for one that is nothing else: the verb leads, each binding precedes the
+    /// file, and `--` ends them.
+    #[test]
+    fn a_launch_leads_with_its_launchers_verb_and_binds_the_build_volume_before_its_file() {
+        let file = Path::new("/private/cowshed/store/run/profiles/a.sb");
+        let volume = Path::new("/m/.build/o/r/0123");
+        for (verb, lead) in [(Some("__verb"), &["__verb"][..]), (None, &[][..])] {
+            let launcher = Launcher {
+                program: PathBuf::from("/bin/launcher"),
+                verb,
+            };
+            assert_eq!(launcher.program(), Path::new("/bin/launcher"));
+            let expected = |tail: &[&str]| -> Vec<OsString> {
+                lead.iter().chain(tail).map(OsString::from).collect()
+            };
+            assert_eq!(
+                launcher.launch_arguments(file, None),
+                expected(&["-f", "/private/cowshed/store/run/profiles/a.sb", "--"]),
+                "{verb:?}"
+            );
+            assert_eq!(
+                launcher.launch_arguments(file, Some(volume)),
+                expected(&[
+                    "-D",
+                    "BUILD_VOLUME=/m/.build/o/r/0123",
+                    "-f",
+                    "/private/cowshed/store/run/profiles/a.sb",
+                    "--"
+                ]),
+                "{verb:?}"
+            );
+        }
+    }
+
+    /// A launcher that cannot be had says which, and reaches a caller as a missing environment
+    /// that names both ways to have one.
+    #[test]
+    fn a_launcher_error_names_what_was_looked_for() {
+        let named = PathBuf::from("/opt/a/cowshed-sandbox-exec");
+        let refused = PathBuf::from("/opt/b/cowshed-sandbox-exec");
+        for (error, said) in [
+            (LauncherError::Unnamed, SANDBOX_EXEC_NAME),
+            (
+                LauncherError::NotAbsolute {
+                    path: PathBuf::from("target/debug/cowshed-sandbox-exec"),
+                },
+                "target/debug/cowshed-sandbox-exec is not an absolute path",
+            ),
+            (
+                LauncherError::NotAFile {
+                    path: named.clone(),
+                },
+                "/opt/a/cowshed-sandbox-exec is not a file",
+            ),
+            (
+                LauncherError::AlreadyNamed {
+                    named: named.clone(),
+                    refused: refused.clone(),
+                },
+                "/opt/a/cowshed-sandbox-exec and cannot also launch through /opt/b/cowshed-sandbox-exec",
+            ),
+        ] {
+            assert!(error.to_string().contains(said), "{error}");
+            let reported = error.report();
+            assert_eq!(reported.code, crate::error::ErrorCode::EnvironmentMissing);
+            assert_eq!(reported.message, error.to_string());
+            assert!(
+                reported.hint.contains(SANDBOX_EXEC_NAME),
+                "{}",
+                reported.hint
+            );
         }
     }
 
@@ -1828,7 +1297,7 @@ mod tests {
         let (old_text, old) = launch(&sandbox);
         let touch = |profile: &crate::exec::ProfileLaunch, path: &Path| {
             std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(profile.args())
+                .args(profile.args(launcher().unwrap()))
                 .arg("/usr/bin/touch")
                 .arg(path)
                 .output_bounded()
@@ -1938,7 +1407,7 @@ mod tests {
         let launch =
             crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
         let ran = std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(launch.args())
+            .args(launch.args(launcher().unwrap()))
             .arg("/usr/bin/true")
             .output_bounded()
             .unwrap();
@@ -2098,7 +1567,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
 "#
             );
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(launch.args())
+                .args(launch.args(launcher().unwrap()))
                 .arg("/usr/bin/env")
                 .args(["node", "-e", &script])
                 .current_dir(&sandbox.workspace_mount)
@@ -2264,6 +1733,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn custom_mount_root_denies_siblings_and_carves_back_only_own_workspace() {
         let mut custom = config(RunSandboxMode::ReadWrite);
@@ -2306,6 +1776,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     /// grant — so last-match-wins admits each of those and nothing else. The capability grants
     /// here have the detectors' shapes: Bun's still-unshared install cache, a bootstrap probe
     /// through the Nix profile link, and an installed tool's link in cowshed's support directory.
+    #[cfg(target_os = "macos")]
     #[test]
     fn home_reads_deny_by_default_and_every_carve_back_follows_the_deny() {
         let home = Path::new("/Users/tester");
@@ -2419,7 +1890,9 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
                     deny: PathBuf::from("/Users/tester/.cowshed/mnt"),
                 }),
             ),
-            // Enclosing a secret is harmless: the secret denies are the profile's last word.
+            // Enclosing a secret is harmless under Seatbelt: the secret denies are the profile's
+            // last word. Landlock has no last word and refuses it (`linux.rs`).
+            #[cfg(target_os = "macos")]
             (
                 grant(
                     "/Users/tester/.cargo",
@@ -2441,6 +1914,7 @@ assert.throws(() => fs.writeFileSync(linked, 'changed'), {{code: 'EPERM'}});
     /// Main's checkout sits at the operator's own path, outside the mount root, so the sibling
     /// deny never reached it. The production builder denies it by name to every other
     /// workspace, in the same shape as a sibling's deny, and never to main itself.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_workspace_builder_denies_main_to_every_workspace_but_main() {
         let home = Path::new("/Users/tester");
@@ -2615,7 +2089,7 @@ if ({writable}) {{
                 writable = mode == RunSandboxMode::ReadWrite
             );
             let output = std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(launch.args())
+                .args(launch.args(launcher().unwrap()))
                 .arg("/usr/bin/env")
                 .args(["node", "-e", &script])
                 .current_dir(&mount)
@@ -2714,7 +2188,7 @@ if ({writable}) {{
         let launch =
             crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
         let output = std::process::Command::new("/usr/bin/sandbox-exec")
-            .args(launch.args())
+            .args(launch.args(launcher().unwrap()))
             .arg("/usr/bin/true")
             .output_bounded()
             .unwrap();
@@ -2765,7 +2239,7 @@ if ({writable}) {{
             crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
         let run = |program: &Path| {
             std::process::Command::new("/usr/bin/sandbox-exec")
-                .args(launch.args())
+                .args(launch.args(launcher().unwrap()))
                 .arg(program)
                 .current_dir(&sandbox.workspace_mount)
                 .output_bounded()
@@ -2786,6 +2260,7 @@ if ({writable}) {{
     /// A workspace-relative deny closes reads and writes beneath a path of the job's own mount:
     /// the read+write deny (with its file-read-data twin) and the ancestor unlink denies follow
     /// every mount allow, the same shape a write-only deny has.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_workspace_relative_deny_closes_reads_and_writes_after_every_mount_allow() {
         let mount = "/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount";
@@ -2947,6 +2422,7 @@ if ({writable}) {{
         assert_inside(&none);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn shed_link_is_readable_exactly_when_its_target_is_granted() {
         let mut custom = config(RunSandboxMode::ReadWrite);
@@ -3023,11 +2499,12 @@ if ({writable}) {{
 
     /// A live workspace's 16-port block and a new workspace's block each get one literal rule
     /// per port of their own recorded size.
+    #[cfg(target_os = "macos")]
     #[test]
     fn profile_is_deterministic_and_has_one_literal_rule_per_block_port() {
         for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
             let mut config = config(RunSandboxMode::ReadWrite);
-            config.port_block = PortBlock::new(40_960, size).unwrap();
+            config.port_block = Some(PortBlock::new(40_960, size).unwrap());
             let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
                 .unwrap()
                 .into_text();
@@ -3055,10 +2532,11 @@ if ({writable}) {{
     /// A relocated workspace keeps reaching the blocks it still holds, and only those: every
     /// port of the current and each retained block has its literal rule, a neighbouring block's
     /// ports have none, and an invalid retained block refuses the profile.
+    #[cfg(target_os = "macos")]
     #[test]
     fn retained_port_blocks_admit_their_own_ports_and_no_neighbour() {
         let mut config = config(RunSandboxMode::ReadWrite);
-        config.port_block = PortBlock::new(41_088, 128).unwrap();
+        config.port_block = Some(PortBlock::new(41_088, 128).unwrap());
         config.retained_port_blocks = vec![
             PortBlock::new(40_960, 64).unwrap(),
             PortBlock::new(41_024, 16).unwrap(),
@@ -3102,6 +2580,7 @@ if ({writable}) {{
 
     /// A loopback-any grant admits outbound loopback TCP to every port with one wildcard rule in
     /// place of the held blocks' literal ports, and leaves bind and inbound as they were.
+    #[cfg(target_os = "macos")]
     #[test]
     fn loopback_any_admits_every_loopback_port_in_place_of_the_block_literals() {
         let mut config = config(RunSandboxMode::ReadWrite);
@@ -3132,6 +2611,7 @@ if ({writable}) {{
 
     /// The git-worktree hole, stated as what the profile actually says: narrowed to `.git`, and
     /// last, because the store-wide deny and the project-root deny both cover the path it opens.
+    #[cfg(target_os = "macos")]
     #[test]
     fn git_worktree_repository_carve_back_is_narrow_and_outlives_every_deny() {
         let mut linked = config(RunSandboxMode::ReadWrite);
@@ -3172,6 +2652,7 @@ if ({writable}) {{
     /// A host service socket under the store-wide deny — a capability's daemon socket, for one —
     /// stays connectable: SBPL is last-match-wins, so the ancestor literals that make the
     /// connect's path resolution work are emitted after the store deny.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_admitted_socket_under_the_store_deny_stays_connectable() {
         let mut with_socket = config(RunSandboxMode::ReadWrite);
@@ -3192,7 +2673,7 @@ if ({writable}) {{
         assert!(store_deny < socket_literal);
     }
 
-    fn grant(path: &str, scope: GrantScope, access: GrantAccess) -> CapabilityGrant {
+    pub(super) fn grant(path: &str, scope: GrantScope, access: GrantAccess) -> CapabilityGrant {
         CapabilityGrant {
             path: PathBuf::from(path),
             scope,
@@ -3200,7 +2681,10 @@ if ({writable}) {{
         }
     }
 
-    fn with_contribution(grants: Vec<CapabilityGrant>, shared: &[&str]) -> SandboxConfig {
+    pub(super) fn with_contribution(
+        grants: Vec<CapabilityGrant>,
+        shared: &[&str],
+    ) -> SandboxConfig {
         let mut config = config(RunSandboxMode::ReadWrite);
         config.capabilities.contribution.grants = grants;
         config.capabilities.contribution.shared_caches = shared
@@ -3216,6 +2700,7 @@ if ({writable}) {{
 
     /// A plain repository detects no capability, and its profile names no tool: no shared cache
     /// is writable and nothing in a host tool home is readable by grant.
+    #[cfg(target_os = "macos")]
     #[test]
     fn without_capabilities_no_tool_cache_or_tool_home_is_granted() {
         let profile = seatbelt_profile(
@@ -3240,6 +2725,7 @@ if ({writable}) {{
     /// A capability's shared caches are read-write subtrees with metadata-only ancestors beneath
     /// HOME, its grants are emitted exactly as contributed — a literal as a literal with its
     /// ancestors, a subtree as a subtree — and every secret deny still follows them.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_contribution_is_emitted_exactly_and_the_secret_denies_follow_it() {
         let config = with_contribution(
@@ -3303,6 +2789,8 @@ if ({writable}) {{
                 GrantScope::Literal,
                 GrantAccess::Read,
             ),
+            // Above a secret: admitted where a later deny closes the secret again.
+            #[cfg(target_os = "macos")]
             grant(
                 "/Users/tester/.cargo",
                 GrantScope::Subtree,
@@ -3401,6 +2889,7 @@ if ({writable}) {{
     /// Cargo/libgit2 canonicalizes a newly fetched git cache path, so a shared cache's ancestors
     /// beneath HOME resolve after the HOME read deny without an unrelated socket grant: metadata
     /// only, never a listing of the tool's home.
+    #[cfg(target_os = "macos")]
     #[test]
     fn shared_cache_ancestors_resolve_without_reading_their_home() {
         let config = with_contribution(Vec::new(), &["/Users/tester/.cargo/git"]);
@@ -3424,6 +2913,7 @@ if ({writable}) {{
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn read_only_removes_only_workspace_write_carve_back() {
         let read_write = seatbelt_profile(
@@ -3444,6 +2934,7 @@ if ({writable}) {{
         assert!(read_only.contains("(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn profile_allows_system_tool_metadata_and_exact_workspace_ancestors() {
         let profile = seatbelt_profile(
@@ -3471,6 +2962,7 @@ if ({writable}) {{
         assert!(mount_parent < secret_deny);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn nix_store_reads_are_baseline_authority_without_nix_state_or_writes() {
         for mode in [RunSandboxMode::ReadOnly, RunSandboxMode::ReadWrite] {
@@ -3503,6 +2995,7 @@ if ({writable}) {{
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn secret_denies_follow_grants_and_carve_backs() {
         let profile = seatbelt_profile(
@@ -3668,6 +3161,7 @@ if ({writable}) {{
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn executed_child_is_a_terminal_narrowing_of_the_supervisor() {
         let config = config(RunSandboxMode::ReadOnly);
@@ -3703,6 +3197,7 @@ if ({writable}) {{
         assert_eq!(common_child, common_supervisor);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn protected_artifacts_cannot_be_regranted_or_aliased() {
         let mut config = config(RunSandboxMode::ReadWrite);
@@ -3754,7 +3249,7 @@ if ({writable}) {{
         );
 
         let mut moved = config(RunSandboxMode::ReadWrite);
-        moved.port_block = PortBlock::new(49_152, 64).unwrap();
+        moved.port_block = Some(PortBlock::new(49_152, 64).unwrap());
         let link = sandbox_runtime_link(&raven);
         assert_eq!(sandbox_runtime_link(&moved), link);
         assert_eq!(shared_daemon_runtime_link(&raven), link);
@@ -3803,6 +3298,7 @@ if ({writable}) {{
     /// Every role, Git's included, reads the entropy devices; none reaches the per-user directory
     /// helper, whose answers name host directories no job may write
     /// (`host_controller_seatbelt_gives_every_role_entropy` runs both).
+    #[cfg(target_os = "macos")]
     #[test]
     fn every_role_has_entropy_and_no_user_directory_helper() {
         let config = config(RunSandboxMode::ReadWrite);
@@ -3828,6 +3324,7 @@ if ({writable}) {{
     /// resolves the links by metadata and opens through /dev/fd, and names no link in any other
     /// rule, where it could never match an open (`host_controller_a_child_opens_its_stdio_by_name`
     /// runs it).
+    #[cfg(target_os = "macos")]
     #[test]
     fn every_role_opens_stdio_through_the_descriptor_directory() {
         let config = config(RunSandboxMode::ReadWrite);
@@ -3858,6 +3355,7 @@ if ({writable}) {{
     /// Every role that runs workspace commands executes `/bin/ps` outside the sandbox, after the
     /// broad exec allow, and no other program leaves it. Git's executes-only-Git role keeps it
     /// out with everything but Git (`git_only_profile_executes_only_git`).
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_process_status_leaves_the_sandbox() {
         let config = config(RunSandboxMode::ReadWrite);
@@ -3889,6 +3387,7 @@ if ({writable}) {{
 
     /// An admitted socket reaches the profile as an outbound rule with its directory traversable,
     /// or connecting fails on path resolution before the outbound rule is consulted.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_admitted_socket_is_connectable_and_its_directory_traversable() {
         let socket = PathBuf::from("/private/var/run/daemon-socket/socket");
@@ -4321,6 +3820,7 @@ if ({writable}) {{
     /// two rules in either mode, controller Git's roles carry neither, and no write rule names
     /// `/tmp` itself. The rules follow the store deny and precede the secret denies, so
     /// last-match-wins leaves them as emitted.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_fixture_namespace_is_the_only_tmp_write_and_only_workspace_commands_carry_it() {
         let files = "(allow file-read* file-write* (regex #\"^/private/tmp/cx[0-9]+-[A-Za-z0-9][A-Za-z0-9](/|$)\") (literal \"/private/tmp/cxsweep.lock\"))";

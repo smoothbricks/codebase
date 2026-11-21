@@ -319,6 +319,38 @@ fn unified_membership(content: &str) -> Result<&str> {
         })
 }
 
+/// The job cgroup the process `pid` runs in, by its `/proc/<pid>/cgroup`: its cgroup, or the
+/// nearest one above it (a run's leaf sits inside its job's), that is named as a job's and sits
+/// directly in a class cgroup. `None` for a process outside every job cgroup. A pid that names
+/// no process is the `NotFound` error.
+pub(crate) fn job_cgroup_of(pid: libc::pid_t) -> io::Result<Option<PathBuf>> {
+    let file = format!("/proc/{pid}/cgroup");
+    let membership = fs::read_to_string(&file).map_err(|error| {
+        // procfs answers ESRCH for a task that exited after its file was opened.
+        let kind = match error.raw_os_error() {
+            Some(libc::ESRCH) => io::ErrorKind::NotFound,
+            _ => error.kind(),
+        };
+        io::Error::new(kind, format!("{file}: {error}"))
+    })?;
+    let unified = unified_membership(&membership)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{file}: {error}")))?;
+    let current = Path::new(CGROUP_MOUNT).join(unified.trim_start_matches('/'));
+    Ok(current
+        .ancestors()
+        .find(|cgroup| {
+            let job = cgroup
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(JOB_PREFIX));
+            let class = cgroup.parent().and_then(Path::file_name);
+            job && ClassCgroup::ALL
+                .iter()
+                .any(|known| class == Some(OsStr::new(known.name())))
+        })
+        .map(Path::to_path_buf))
+}
+
 /// Every controller of `wanted` that `cgroup.controllers` content lists, or the first it lacks.
 fn require_controllers(path: &Path, available: &str, wanted: &[Controller]) -> Result<()> {
     for controller in wanted {

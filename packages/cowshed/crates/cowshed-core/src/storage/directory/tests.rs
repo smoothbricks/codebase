@@ -939,7 +939,6 @@ fn directory_retirement_retry_and_held_recovery_keep_complete_authority() {
     assert!(host.recover_pending(&host.config, &[]).is_err());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn directory_fixture_retirement_moves_the_inode_once_for_every_payload_size() {
     use crate::scratch_directory::{retire_directory_tree, retirement_rename_attempts};

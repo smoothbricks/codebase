@@ -189,6 +189,18 @@ by PATH to a symlink whose realpath is the pinned revision's executable beside t
 imperative `cowshed setup`, `dev.cowshed/mbx-shim/` holds mbx's generated `cargo` and `mbx-target`, which run that
 executable; and no install in either mode writes an mbx plist, socket or second copy anywhere.
 
+**Setup finds that flake before it changes anything, from where its own executable runs.** It is the first `nix/mbx`
+holding a `flake.nix` in a directory above the canonical running executable. A build under the package, shipped
+(`dist/bin/<platform>/cowshed`) or made by the package's `cli-<arch>-<os>` target, has the package root above it, and
+the package root carries `nix/mbx`. A build run from its Cargo profile directory has no package above it: the Cargo
+target directory is the workspace's, or a link to an mbx-managed target outside the checkout. Cargo marks every profile
+directory it builds into with `.cargo-lock`, so an executable beside that file looks next in the crate directory it was
+compiled from and every directory above it, which is the checkout that built it and therefore the flake of the sources
+it is. The rule is one on every platform, and an executable in no Cargo profile directory never takes the second walk:
+an installed package that lacks `nix/mbx` is refused, the error naming every directory it looked in, and setup has
+changed nothing (`a_build_that_cannot_find_its_mbx_flake_changes_nothing`). Enforced by `cowshed-cli`'s
+`the_flake_is_found_above_the_executable_or_above_a_cargo_builds_sources`.
+
 ## Deployment postures
 
 Paths are uid-relative under every posture: cowshed state is rooted at `/private/cowshed/store`, and trusted policy is

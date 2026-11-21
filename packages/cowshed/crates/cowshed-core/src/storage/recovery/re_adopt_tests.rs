@@ -313,6 +313,8 @@ fn begin_and_mark_mutating(journal: &Path, intent: LifecycleIntent) {
     .expect("mark ReAdopt intent mutating");
 }
 
+// The retained-input token is the macOS image layer's (`storage/apfs/native/re_adopt.rs`).
+#[cfg(target_os = "macos")]
 #[test]
 fn retained_input_refuses_an_unrecorded_path() {
     let fixture = Fixture::new();

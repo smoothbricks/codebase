@@ -22,7 +22,18 @@ shards = 8
 
 [[bin]]
 name = "apfs-benchmark"
-path = "src/bin/apfs_benchmark.rs"
+path = "src/bin/apfs_benchmark/main.rs"
+test = false
+bench = false
+
+# The sandbox launcher of a program that links this crate and is not the cowshed binary, which
+# is its own (specs/cowshed/04_sandbox.md, "Linux enforcement", "The launcher"): its main is
+# `sandbox::launcher_main` and nothing else. Built from this crate so that such a program has a
+# launcher of exactly the cowshed-core it links; the test binaries of this workspace are such
+# programs, and the Nx target `cowshed:sandbox-exec-bin` builds theirs.
+[[bin]]
+name = "cowshed-sandbox-exec"
+path = "src/bin/sandbox_exec.rs"
 test = false
 bench = false
 

@@ -39,7 +39,7 @@ fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
         shed_links: Vec::new(),
         exec_temp_dir: execution,
         store_root: temp.join("store"),
-        port_block: PortBlock::new(40_960, 16).expect("port block"),
+        port_block: Some(PortBlock::new(40_960, 16).expect("port block")),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,

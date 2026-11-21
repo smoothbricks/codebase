@@ -291,9 +291,9 @@ pub(super) const PIN_FSTAB_ACTION: &str = "pin cowshed APFS volumes in /etc/fsta
 /// The operations `ExistingOnly` refuses to dispatch, named for its error.
 ///
 /// Coarse for `RunCommand` on purpose: this list is refused work, not an audit
-/// trail. The macOS adapter's `read_only_validation_actions` keeps the opposite
-/// policy and matches `HostOperation` exhaustively too, so a new variant cannot
-/// compile in one table and vanish from the other.
+/// trail. Each adapter's read-only validation keeps the opposite policy and
+/// matches `HostOperation` exhaustively too, so a new variant cannot compile in
+/// one table and vanish from the other.
 pub(crate) fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
     plan.operations()
         .iter()
@@ -333,8 +333,28 @@ fn is_unprivileged_apfs_remount(command: &HostCommand) -> bool {
 
 #[derive(Debug, Error)]
 pub enum NativeBootstrapError {
-    #[error("native storage bootstrap is unsupported on {0}")]
-    UnsupportedPlatform(&'static str),
+    #[error(
+        "{existing} is this host's store, but .cowshed.toml declares the ZFS parent {configured:?}; a host has one store"
+    )]
+    SubstrateConflict {
+        existing: String,
+        configured: String,
+    },
+    #[error("host path {path:?} cannot hold cowshed storage: {reason}")]
+    ForeignHostPath { path: PathBuf, reason: String },
+    #[error(
+        "the directory store {store:?} and the workspace mount root {mount_root:?} are on different mounted filesystems ({store_mount:?} and {mount_root_mount:?}); a directory store moves a workspace by rename, which never crosses a mount"
+    )]
+    SplitDirectoryStore {
+        store: PathBuf,
+        mount_root: PathBuf,
+        store_mount: PathBuf,
+        mount_root_mount: PathBuf,
+    },
+    #[error("cannot read ZFS dataset {dataset}: {message}")]
+    ZfsRead { dataset: String, message: String },
+    #[error("cannot read the substrate declaration {path:?}: {message}")]
+    SubstrateDeclaration { path: PathBuf, message: String },
     #[error("path must be absolute and normalized: {0:?}")]
     NonCanonicalPath(PathBuf),
     #[error("cannot inspect filesystem for {path:?}: {source}")]

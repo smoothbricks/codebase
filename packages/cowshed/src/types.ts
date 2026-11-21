@@ -28,7 +28,7 @@ export type ProtocolViolation = {
 };
 
 export type CowshedErrorOptions = ErrorOptions &
-  Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'> & {
+  Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin' | 'unsupported'> & {
     readonly violation?: ProtocolViolation;
   };
 
@@ -42,6 +42,8 @@ export class CowshedError extends Error {
   /** Present only when an owned job's child could not be placed at its nice, so its command never ran. */
   readonly priority?: Api.PriorityFailure;
   readonly stdin: Api.StdinRefusal | undefined;
+  /** Present only on a verb the store's substrate has no operation for (`usage`), naming both: branch on it, never on the message. */
+  readonly unsupported?: Api.SubstrateRefusal;
   /** Present only on a launcher's `integrity` error: the line its verb's descriptor broke the protocol with. */
   readonly violation?: ProtocolViolation;
 
@@ -60,6 +62,9 @@ export class CowshedError extends Error {
       this.priority = options.priority;
     }
     this.stdin = options?.stdin;
+    if (options?.unsupported !== undefined) {
+      this.unsupported = options.unsupported;
+    }
     if (options?.violation !== undefined) {
       this.violation = options.violation;
     }
@@ -115,6 +120,11 @@ export interface CoordinatorEndpoint {
 export interface Project {
   readonly repoId: string;
   readonly gitRoot: string;
+  /**
+   * What the project's store keeps each workspace and build volume as: an APFS image, a ZFS dataset or a plain
+   * directory. `undefined` only when the controller is of a build that does not say.
+   */
+  readonly substrate: Api.StoreSubstrate | undefined;
   main(): Promise<WorkspaceRef>;
   workspace(name: string): Promise<WorkspaceRef>;
   workspaceAt(path: string): Promise<WorkspaceRef>;
@@ -226,8 +236,15 @@ export interface Coordinator {
   rebase(workspace: string, options?: RebaseOptions): Promise<Api.RebaseReport>;
   land(workspace: string, options?: LandOptions): Promise<Api.LandReport>;
   detach(workspace: string): Promise<void>;
+  /**
+   * Grows the workspace's volume, or its build volume: an APFS image's size, a ZFS dataset's `refquota`. A
+   * plain-directory store has no capacity and rejects `usage` with `unsupported` naming the operation.
+   */
   resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult>;
-  /** Rewrites the workspace's image contiguously; a busy workspace refuses before its image is touched. */
+  /**
+   * Rewrites the workspace's image contiguously; a busy workspace refuses before its image is touched. Only an APFS
+   * store has an image to rewrite: a ZFS or plain-directory store rejects `usage` with `unsupported`.
+   */
   defragment(workspace: string): Promise<Api.DefragmentResult>;
   /** Replaces the workspace's build volume with a clone of its target's seed; its source, branch and uncommitted files stay. */
   reseed(workspace: string): Promise<Api.ReseedResult>;

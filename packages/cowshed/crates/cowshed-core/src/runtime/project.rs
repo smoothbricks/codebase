@@ -1,4 +1,3 @@
-#[cfg(target_os = "macos")]
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -10,11 +9,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
 
-#[cfg(target_os = "macos")]
 use super::storage_host::RuntimeStorageHost;
-#[cfg(target_os = "macos")]
 use crate::api::dto::GitOid;
-#[cfg(target_os = "macos")]
 use crate::api::dto::{AbandonedPreservation, AbandonedWork};
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CommandArg, DoctorReport, EmptyResult, ExecRequest,
@@ -24,9 +20,7 @@ use crate::api::dto::{
     RemoveProjectOptions, RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob,
     StdinSource, WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
-#[cfg(target_os = "macos")]
 use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
-#[cfg(target_os = "macos")]
 use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
     self, AdoptRequest, AdoptView, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest,
@@ -43,18 +37,14 @@ use crate::api::server::{
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
-#[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
-#[cfg(target_os = "macos")]
 use crate::runtime::supervisor::{NxDaemonRetirement, RetireWhen};
 use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::storage::recovery::RetireOptions;
-#[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
-#[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
 
 const ROUTER_CAPACITY: usize = 64;
@@ -74,7 +64,6 @@ pub const BUILD_VOLUME_COLLECTION_VERB: &str = "__collect-build-volumes";
 /// The land's declared-output helper uses the landing workspace's read-write profile
 /// (16_build_volumes.md, step 5.3), so a missing or stale shell activation can be refreshed
 /// before enumeration. Read-only jobs adopt that activation but never refresh it themselves.
-#[cfg(target_os = "macos")]
 pub(super) const SOURCE_PATHS_MODE: RunSandboxMode = RunSandboxMode::ReadWrite;
 
 /// Immutable facts returned by one authoritative substrate enumeration.
@@ -115,13 +104,11 @@ pub struct RuntimeLogChunk {
 /// without a `clean` choice is a historical create, and a recorded choice is a fork. Private to
 /// the runtime; the stored `clean` field and its serde shape are unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(target_os = "macos")]
 enum MintMode {
     Historical,
     Fork { clean: bool },
 }
 
-#[cfg(target_os = "macos")]
 fn mint_mode(options: &crate::storage::recovery::MintOptions) -> MintMode {
     match options.clean {
         None => MintMode::Historical,
@@ -167,6 +154,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// supervisor's to answer"). A host that publishes none has every call routed in turn.
     fn job_lanes(&self) -> crate::resident::JobLanes {
         crate::resident::JobLanes::default()
+    }
+    /// What the store this host serves keeps a payload as (`project.open` answers it). A host
+    /// over no store names none.
+    fn substrate(&self) -> Option<crate::api::dto::StoreSubstrate> {
+        None
     }
 
     async fn recover(&mut self) -> Result<()>;
@@ -584,7 +576,6 @@ pub enum RecoveryScope {
 
 /// What recovery does with one unfinished intent under a [`RecoveryScope`]. Only the native
 /// macOS host recovers, so only it asks.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntentReplay {
     /// Another verb's work: left journaled and unleased.
@@ -597,7 +588,6 @@ enum IntentReplay {
 
 /// Work a pass finishes that another process left behind
 /// ([`StorageProjectRuntimeHost::finish_residue`]).
-#[cfg(target_os = "macos")]
 enum Residue {
     /// The workspace's unfinished lifecycle intent.
     Intent,
@@ -610,7 +600,6 @@ enum Residue {
     },
 }
 
-#[cfg(target_os = "macos")]
 impl RecoveryScope {
     /// Read selection for a named opening. `None` deliberately retains full Store/Inspect
     /// diagnostics; the main binding is always part of a name-scoped project observation.
@@ -833,7 +822,6 @@ mod recovery_scope_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
 /// The unfinished rename claiming `name`, if any: a true rename record names its source and its
 /// destination, and neither may be admitted until the record completes.
 fn unfinished_rename_claim<'a>(
@@ -850,7 +838,6 @@ fn unfinished_rename_claim<'a>(
     }
 }
 
-#[cfg(target_os = "macos")]
 /// Whether a verb naming `scope`'s workspaces replays this pending rename because it names the
 /// rename's source. The destination is then that verb's own work.
 fn rename_selected_by_source(
@@ -945,18 +932,7 @@ impl ProjectRuntime {
         project_root: &Path,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Option<RepoId>> {
-        #[cfg(target_os = "macos")]
-        {
-            discard_intent_only_adoption(project_root, storage).await
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (project_root, storage);
-            Err(CowshedError::environment_missing(
-                "the native cowshed project runtime requires macOS APFS",
-                "run the controller on macOS or use an injected test host",
-            ))
-        }
+        discard_intent_only_adoption(project_root, storage).await
     }
 
     /// Opens the production runtime for a background verb a land or fork starts
@@ -1130,40 +1106,22 @@ impl ProjectRuntime {
         storage: crate::storage::bootstrap::ValidatedHostStorage,
         gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            let host = StorageProjectRuntimeHost::open(
-                project_root,
-                mode,
-                requested_repo_id.as_ref(),
-                RuntimeServices {
-                    continuity: continuity_from_environment()?,
-                    gateway_factory,
-                    notes: super::verb_spans::VerbNotes::default(),
-                },
-                BindingRemoteValidation::Strict,
-                scope,
-                Some(storage),
-                crate::storage::directory::DirectoryExecutionHost::new,
-            )
-            .await?;
-            Self::start(host).await
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (
-                project_root,
-                mode,
-                requested_repo_id,
-                scope,
-                storage,
+        let host = StorageProjectRuntimeHost::open(
+            project_root,
+            mode,
+            requested_repo_id.as_ref(),
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
                 gateway_factory,
-            );
-            Err(CowshedError::environment_missing(
-                "the cowshed directory project runtime currently requires macOS",
-                "run the controller on macOS",
-            ))
-        }
+                notes: super::verb_spans::VerbNotes::default(),
+            },
+            BindingRemoteValidation::Strict,
+            scope,
+            Some(storage),
+            crate::storage::directory::DirectoryExecutionHost::new,
+        )
+        .await?;
+        Self::start(host).await
     }
 
     async fn open_native(
@@ -1175,44 +1133,18 @@ impl ProjectRuntime {
         recovery_scope: RecoveryScope,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            let host = NativeProjectRuntimeHost::open(
-                project_root,
-                mode,
-                requested_repo_id.as_ref(),
-                services,
-                validation,
-                recovery_scope,
-                storage,
-                |config| {
-                    crate::storage::apfs::native::MacOsApfsExecutionHost::new(
-                        cowshed_apfs::SystemCommandRunner::new(config.namespace),
-                        config,
-                    )
-                },
-            )
-            .await?;
-            Self::start(host).await
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (
-                project_root,
-                mode,
-                requested_repo_id,
-                services.continuity,
-                services.gateway_factory,
-                services.notes,
-                validation,
-                recovery_scope,
-                storage,
-            );
-            Err(CowshedError::environment_missing(
-                "the native cowshed project runtime requires macOS APFS",
-                "run the controller on macOS or use an injected test host",
-            ))
-        }
+        let host = NativeProjectRuntimeHost::open(
+            project_root,
+            mode,
+            requested_repo_id.as_ref(),
+            services,
+            validation,
+            recovery_scope,
+            storage,
+            super::storage_host::native_host,
+        )
+        .await?;
+        Self::start(host).await
     }
 
     /// Starts a runtime from an injected host after strict recovery completes.
@@ -2104,6 +2036,7 @@ impl ProjectActor {
             binding: std::sync::Arc::clone(&descriptor.binding),
             git_root: std::sync::Arc::clone(&descriptor.git_root),
             store_root: std::sync::Arc::clone(descriptor.storage.roots().shared_store()),
+            substrate: self.host.substrate(),
         })
     }
 
@@ -2662,7 +2595,6 @@ impl ProjectActor {
 /// the checkout's remotes. The adopt's intent lease must be free, since a held one is a live
 /// adopt, and it is held through the removal so none starts meanwhile. The removal is the
 /// unbinding's own, binding-absent path ([`finish_restored_project_unbinding`]).
-#[cfg(target_os = "macos")]
 async fn discard_intent_only_adoption(
     project_root: &Path,
     supplied: Option<crate::storage::bootstrap::ValidatedHostStorage>,
@@ -2786,7 +2718,6 @@ async fn discard_intent_only_adoption(
 
 /// The host storage an opening serves: the caller's own store, or this host's, bootstrapped for
 /// `mode` from the checkout at `git_root`.
-#[cfg(target_os = "macos")]
 async fn host_storage(
     git_root: &Path,
     mode: crate::storage::bootstrap::native::NativeBootstrapMode,
@@ -2811,15 +2742,7 @@ async fn host_storage(
     )
     .await
     .map_err(native_environment_error)?;
-    if !matches!(
-        bootstrap.substrate(),
-        crate::storage::bootstrap::SelectedSubstrate::Apfs { .. }
-    ) {
-        return Err(CowshedError::environment_missing(
-            "the macOS runtime requires the APFS image substrate",
-            "remove the unsupported substrate override and retry",
-        ));
-    }
+    super::storage_host::require_native_substrate(bootstrap.substrate())?;
     Ok(crate::storage::bootstrap::ValidatedHostStorage::new(
         home.clone(),
         crate::capabilities::host_program_directories(&home),
@@ -2830,7 +2753,6 @@ async fn host_storage(
 /// The last of an unbinding (02_workspaces.md): the identity's
 /// `.retirements/<owner>/<repo>.lease` goes too, unless another process shares it or a
 /// retirement record stands beside it; either is said on stderr, never skipped silently.
-#[cfg(target_os = "macos")]
 fn report_unbound_lease(
     lease: &crate::project_retirement::ProjectReadLease,
     store: &Path,
@@ -3089,21 +3011,17 @@ fn exec_request(
     ))
 }
 
-#[cfg(target_os = "macos")]
 #[path = "project_re_adopt.rs"]
 mod re_adopt;
 
-#[cfg(target_os = "macos")]
-type NativeProjectRuntimeHost = StorageProjectRuntimeHost<
-    crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
->;
+/// The runtime host over this host's native storage: the APFS image host on macOS, the
+/// directory host on Linux.
+type NativeProjectRuntimeHost = StorageProjectRuntimeHost<super::storage_host::NativeHost>;
 
-#[cfg(target_os = "macos")]
 type StorageHostFactory<H> = fn(
     crate::storage::apfs::ApfsSubstrateConfig,
 ) -> std::result::Result<H, crate::storage::apfs::ApfsStorageError>;
 
-#[cfg(target_os = "macos")]
 struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     descriptor: ProjectDescriptor,
     git: crate::git::GitRepository,
@@ -3165,7 +3083,6 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
 }
 
 /// Who runs a workspace's supervisor.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SupervisorHome {
     /// The gateway daemon's manager starts it as a process of its own: every controller.
@@ -3175,7 +3092,6 @@ enum SupervisorHome {
 }
 
 /// How long a lost supervisor's jobs get between TERM and KILL.
-#[cfg(target_os = "macos")]
 const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a served supervisor stays idle (no named session, no running job, and its keeper
@@ -3184,7 +3100,6 @@ const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// A port-block change asked of a workspace that runs jobs: its supervisor is left serving them.
-#[cfg(target_os = "macos")]
 fn port_change_while_busy(error: CowshedError) -> CowshedError {
     match error.code {
         ErrorCode::Conflict => CowshedError::conflict(
@@ -3196,7 +3111,6 @@ fn port_change_while_busy(error: CowshedError) -> CowshedError {
 }
 
 /// What the supervisor process's serving loop woke for.
-#[cfg(target_os = "macos")]
 enum ServeEvent {
     Ended(std::result::Result<Result<()>, tokio::task::JoinError>),
     Advance(tokio::sync::oneshot::Sender<Result<super::supervisor::WorkspaceAuthoritySnapshot>>),
@@ -3207,7 +3121,6 @@ enum ServeEvent {
 }
 
 /// A supervisor this process runs and serves on the workspace's socket.
-#[cfg(target_os = "macos")]
 struct ServedSupervisor {
     /// The actor itself, for what only its owner may do: advance its grant revision in place.
     actor: super::supervisor::WorkspaceSupervisorHandle,
@@ -3222,14 +3135,12 @@ struct ServedSupervisor {
 
 /// A controller that stops serving a supervisor ends it, as dropping an in-process supervisor
 /// always did: the server lets go of its handle, and the actor ends the jobs it still runs.
-#[cfg(target_os = "macos")]
 impl Drop for ServedSupervisor {
     fn drop(&mut self) {
         self.server.abort();
     }
 }
 
-#[cfg(target_os = "macos")]
 struct PortGrantReservation {
     grants: GrantSet,
     markers: Vec<PathBuf>,
@@ -3239,7 +3150,6 @@ struct PortGrantReservation {
     claims: Vec<cowshed_os::fork_lock::Fenced<std::net::TcpListener>>,
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for PortGrantReservation {
     fn drop(&mut self) {
         self.listeners.clear();
@@ -3257,7 +3167,6 @@ impl Drop for PortGrantReservation {
 
 /// Whether the process owning a reservation marker has not exited; a zombie owner has, and its
 /// cell is reclaimed. An owner whose state cannot be read keeps its cell.
-#[cfg(target_os = "macos")]
 fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -3265,7 +3174,6 @@ fn process_is_alive(pid: u32) -> bool {
     cowshed_os::process::running(pid).unwrap_or(true)
 }
 
-#[cfg(target_os = "macos")]
 fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf>> {
     claim_port_block_with(staging, base, |marker| std::fs::read_link(marker))
 }
@@ -3277,7 +3185,6 @@ fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf
 /// a dead one) in that gap. A marker that is gone when read or removed is a released cell, never an
 /// error, and the claim is tried again. `read_owner` reads the marker's link; tests interpose there
 /// to release the cell inside that gap.
-#[cfg(target_os = "macos")]
 fn claim_port_block_with(
     staging: &Path,
     base: u16,
@@ -3323,7 +3230,6 @@ fn claim_port_block_with(
 }
 
 /// A block's kernel listeners while its reservation runs.
-#[cfg(target_os = "macos")]
 struct BoundPortBlock {
     listeners: Vec<std::net::TcpListener>,
     /// The store's own claims inside the block, taken from it rather than bound again.
@@ -3332,7 +3238,6 @@ struct BoundPortBlock {
 
 /// Binds every port of `block` that `existing` grants do not cover, taking each one the store's
 /// fixture `claims` hold (a detached or retired workspace's block) with no unbound interval.
-#[cfg(target_os = "macos")]
 fn bind_port_block(
     block: crate::metadata::PortBlock,
     existing: Option<&GrantSet>,
@@ -3363,7 +3268,6 @@ fn bind_port_block(
     Ok(Some(bound))
 }
 
-#[cfg(target_os = "macos")]
 async fn reserve_specific_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
@@ -3372,7 +3276,6 @@ async fn reserve_specific_port_grants(
     reserve_port_grant_replacement(inventory, reservation_root, block, None).await
 }
 
-#[cfg(target_os = "macos")]
 async fn reserve_port_grant_replacement(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
@@ -3433,7 +3336,6 @@ async fn reserve_port_grant_replacement(
 
 /// Claims the lowest initial-size block disjoint from every published block. All allocation
 /// sizes claim the same grid cells, so unpublished reservations exclude overlapping creators.
-#[cfg(target_os = "macos")]
 async fn reserve_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
@@ -3449,7 +3351,6 @@ async fn reserve_port_grants(
 }
 
 /// Claims the lowest `size`-port block disjoint from every block `used` holds.
-#[cfg(target_os = "macos")]
 async fn reserve_port_grants_of_size(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
@@ -3479,7 +3380,6 @@ async fn reserve_port_grants_of_size(
 /// (04_sandbox.md, `portBlock`): a colliding current block becomes the lowest free block of its
 /// size, claimed by the returned reservation until the grants publish, and a colliding retained
 /// block is dropped, since its ports are the older workspace's. Answers the current block after.
-#[cfg(target_os = "macos")]
 async fn reserve_port_collision_repair(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
@@ -3490,8 +3390,14 @@ async fn reserve_port_collision_repair(
     GrantSet,
     Option<PortGrantReservation>,
 )> {
+    // A workspace that records no block holds no retained one either (`GrantSet::validate`), so
+    // it is in no collision and its caller refused before here. Colliding retained blocks with no
+    // current one are grants no platform publishes.
     let current = owned.port_block.ok_or_else(|| {
-        CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
+        CowshedError::integrity(
+            "workspace holds colliding retained port blocks and no current port block",
+            "cowshed doctor --json",
+        )
     })?;
     let mut repaired = owned.clone();
     repaired
@@ -3514,7 +3420,19 @@ async fn reserve_port_collision_repair(
     Ok((block, repaired, Some(reservation)))
 }
 
-#[cfg(target_os = "macos")]
+/// The refusal of a verb that acts on a workspace's port block when the workspace records none:
+/// a Linux workspace, each of whose jobs owns a private loopback with every port in it
+/// (04_sandbox.md, "Linux enforcement"). A `Usage` refusal decided before anything was stopped,
+/// reserved or written.
+fn no_port_block(operation: &str) -> CowshedError {
+    CowshedError::usage(
+        format!(
+            "cannot {operation}: this workspace holds no port block, its jobs own a private loopback"
+        ),
+        "bind service ports directly inside the workspace",
+    )
+}
+
 fn retain_port_authority(grants: &mut GrantSet, block: crate::metadata::PortBlock) {
     grants
         .retained_port_blocks
@@ -3530,16 +3448,15 @@ fn retain_port_authority(grants: &mut GrantSet, block: crate::metadata::PortBloc
     grants.port_block = Some(block);
 }
 
-#[cfg(target_os = "macos")]
 async fn reserve_grown_port_grants(
     inventory: &crate::gateway_inventory::NativeGatewayInventory,
     reservation_root: &Path,
     owned: &GrantSet,
     size: u16,
 ) -> Result<PortGrantReservation> {
-    let existing = owned.port_block.ok_or_else(|| {
-        CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
-    })?;
+    let existing = owned
+        .port_block
+        .ok_or_else(|| no_port_block("grow service-port capacity"))?;
     let used = inventory
         .all_reserved_port_blocks()
         .await
@@ -3588,7 +3505,6 @@ async fn reserve_grown_port_grants(
 
 /// What the unbinding does with one entry of a project's terminal storage, by the store
 /// inventory ([`StoreArtifact`]); planned whole before anything is done.
-#[cfg(target_os = "macos")]
 enum TerminalEntry {
     /// A derived file, removed.
     File(PathBuf),
@@ -3601,7 +3517,6 @@ enum TerminalEntry {
 }
 
 /// An entry the unbinding cannot discard, because it is not cowshed's derived state.
-#[cfg(target_os = "macos")]
 enum Kept {
     /// User work, and why it is.
     UserWork(PathBuf, &'static str),
@@ -3612,7 +3527,6 @@ enum Kept {
     Foreign(PathBuf),
 }
 
-#[cfg(target_os = "macos")]
 impl std::fmt::Display for Kept {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3633,7 +3547,6 @@ impl std::fmt::Display for Kept {
 
 /// A project's terminal storage, judged entry by entry: what the unbinding does with every
 /// derived entry, children before their directory, and what it cannot discard.
-#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct TerminalSurvey {
     plan: Vec<TerminalEntry>,
@@ -3642,7 +3555,6 @@ struct TerminalSurvey {
 
 /// The trees an unbinding deletes (02_workspaces.md, "Checkout layouts"), beside the project
 /// root's own locks.
-#[cfg(target_os = "macos")]
 const TERMINAL_STORAGE_TREES: [&str; 4] = [
     crate::storage::recovery::STAGING_NAMESPACE,
     crate::repository::SESSIONS_DIRECTORY,
@@ -3650,7 +3562,6 @@ const TERMINAL_STORAGE_TREES: [&str; 4] = [
     crate::build_volume::IMAGES_DIRECTORY,
 ];
 
-#[cfg(target_os = "macos")]
 fn terminal_storage_error(what: &str, path: &Path, error: std::io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!(
@@ -3663,7 +3574,6 @@ fn terminal_storage_error(what: &str, path: &Path, error: std::io::Error) -> Cow
 
 /// Judge every entry of the project's terminal storage trees and its root's `*.lock` files by
 /// the store inventory. Reads only; nothing is moved or removed.
-#[cfg(target_os = "macos")]
 fn survey_terminal_storage(project_root: &Path) -> Result<TerminalSurvey> {
     let mut survey = TerminalSurvey::default();
     for tree in TERMINAL_STORAGE_TREES {
@@ -3682,7 +3592,6 @@ fn survey_terminal_storage(project_root: &Path) -> Result<TerminalSurvey> {
     Ok(survey)
 }
 
-#[cfg(target_os = "macos")]
 fn survey_terminal_entry(
     project_root: &Path,
     relative: &Path,
@@ -3724,7 +3633,6 @@ fn survey_terminal_entry(
 /// into the store's own `.deleting` under a fresh name and handed to the gateway's cleanup at
 /// `cleanup` (05_gateway.md, "Deleting released images"), since the unbinding frees nothing
 /// itself; every other derived entry is removed.
-#[cfg(target_os = "macos")]
 fn discard_terminal_storage(
     project_root: &Path,
     plan: Vec<TerminalEntry>,
@@ -3758,7 +3666,6 @@ fn discard_terminal_storage(
 
 /// Move `image`, a released image listed in `directory`, into the store's `.deleting` at
 /// `target` under a fresh name, and nudge the gateway's cleanup at `cleanup`.
-#[cfg(target_os = "macos")]
 fn move_terminal_release(
     image: &Path,
     directory: &Path,
@@ -3798,7 +3705,6 @@ fn move_terminal_release(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn release_failed(what: &str, path: &Path, error: std::io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("cannot {what} {}: {error}", path.display()),
@@ -3812,7 +3718,6 @@ fn release_failed(what: &str, path: &Path, error: std::io::Error) -> CowshedErro
 /// So do build volumes, which the unbinding releases before it plans, refusing while the
 /// project is still bound if one stays. The restore checks this before it retires main, because
 /// the same refusal after it leaves a binding only a retry of the restore removes.
-#[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
     let survey = survey_terminal_storage(project_root)?;
     let kept = survey
@@ -3837,7 +3742,6 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
 /// Discards the project's terminal storage, the derived state of its trees and its root's
 /// locks. The whole of it is surveyed before one entry is touched, so a refusal names everything
 /// that blocks it and leaves the storage as it found it.
-#[cfg(target_os = "macos")]
 fn clean_terminal_project_storage(project_root: &Path, cleanup: Option<&Path>) -> Result<()> {
     let survey = survey_terminal_storage(project_root)?;
     if !survey.kept.is_empty() {
@@ -3857,7 +3761,6 @@ fn clean_terminal_project_storage(project_root: &Path, cleanup: Option<&Path>) -
     discard_terminal_storage(project_root, survey.plan, cleanup)
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnbindCheckpoint {
     BeforeBindingRemoval,
@@ -3866,12 +3769,10 @@ pub(crate) enum UnbindCheckpoint {
 }
 
 /// Created only after this transaction has synced the binding's absence.
-#[cfg(target_os = "macos")]
 struct DurablyUnboundProject<'a> {
     paths: &'a crate::repository::ProjectPaths,
 }
 
-#[cfg(target_os = "macos")]
 fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result<()> {
     let build =
         crate::build_volume::BuildVolumeLayout::new(paths).map_err(native_integrity_error)?;
@@ -3885,7 +3786,6 @@ fn remove_project_mount_trees(paths: &crate::repository::ProjectPaths) -> Result
 }
 
 /// The real restore finisher, also used when a retry finds the binding already absent.
-#[cfg(target_os = "macos")]
 pub(crate) fn finish_restored_project_unbinding(
     paths: &crate::repository::ProjectPaths,
     expected: &RepositoryBinding,
@@ -3997,7 +3897,6 @@ pub(crate) fn finish_restored_project_unbinding(
 
 /// Release controller metadata only through the durable-unbinding proof. The checkout-root
 /// record remains until this succeeds so a failed cleanup still identifies its continuation.
-#[cfg(target_os = "macos")]
 fn remove_unbound_project_state(unbound: &DurablyUnboundProject<'_>) -> Result<()> {
     let paths = unbound.paths;
     for file in [
@@ -4018,7 +3917,6 @@ fn remove_unbound_project_state(unbound: &DurablyUnboundProject<'_>) -> Result<(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn remove_unbound_file(file: &Path) -> Result<()> {
     match std::fs::remove_file(file) {
         Ok(()) => Ok(()),
@@ -4033,7 +3931,6 @@ fn remove_unbound_file(file: &Path) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn remove_directory_if_empty(directory: &Path) -> Result<()> {
     match std::fs::remove_dir(directory) {
         Ok(()) => Ok(()),
@@ -4056,7 +3953,6 @@ fn remove_directory_if_empty(directory: &Path) -> Result<()> {
 }
 
 /// An unbound project's store owner goes with its last project, marker and all.
-#[cfg(target_os = "macos")]
 fn remove_store_owner_if_projectless(owner: &Path) -> Result<()> {
     crate::storage::bootstrap::remove_owner_if_projectless(owner).map_err(|error| {
         CowshedError::environment_missing(
@@ -4073,7 +3969,6 @@ fn remove_store_owner_if_projectless(owner: &Path) -> Result<()> {
 /// `.staging`: empty directories on the volume the tree lives on. The whole tree is planned
 /// first; a file, or a directory on another device (a volume still mounted there), is reported and
 /// nothing of the tree is removed.
-#[cfg(target_os = "macos")]
 fn remove_empty_mount_tree(root: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4108,7 +4003,6 @@ fn remove_empty_mount_tree(root: &Path) -> Result<()> {
 
 /// Plans the removal of `path`, children before their directory, if it and everything below it are
 /// directories on `device`.
-#[cfg(target_os = "macos")]
 fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4137,7 +4031,6 @@ fn plan_empty_directories_on(path: &Path, device: u64, plan: &mut Vec<PathBuf>) 
     plan.push(path.to_owned());
     Ok(())
 }
-#[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// What a plain `gc`'s held-bundle sweep measures (02_workspaces.md, `rm` step 1), read in the
     /// actor: the abandon bundles in the trash and the tip of main's checked-out branch. The
@@ -10050,15 +9943,29 @@ self.finish_retire_intent(&workspace).await?;
         }
     }
 
+    /// The grants a new workspace starts with, by the platform this host records in its sidecar.
+    /// A macOS workspace starts with the lowest free port block, claimed and bound by the
+    /// returned reservation until its image owns it. A Linux workspace holds no block, so its
+    /// closed baseline names none and its reservation holds nothing.
     async fn fresh_grants(&self) -> Result<PortGrantReservation> {
-        let storage = self.descriptor.storage.clone();
-        let reservation_root = storage.store().join(".staging");
-        let inventory = crate::gateway_inventory::NativeGatewayInventory::new(storage);
-        let used = inventory
-            .all_reserved_port_blocks()
-            .await
-            .map_err(native_integrity_error)?;
-        reserve_port_grants(&inventory, &reservation_root, used).await
+        match self.substrate.host().sidecar_platform() {
+            crate::metadata::Platform::Macos => {
+                let storage = self.descriptor.storage.clone();
+                let reservation_root = storage.store().join(".staging");
+                let inventory = crate::gateway_inventory::NativeGatewayInventory::new(storage);
+                let used = inventory
+                    .all_reserved_port_blocks()
+                    .await
+                    .map_err(native_integrity_error)?;
+                reserve_port_grants(&inventory, &reservation_root, used).await
+            }
+            crate::metadata::Platform::Linux => Ok(PortGrantReservation {
+                grants: GrantSet::closed_baseline(None).map_err(native_integrity_error)?,
+                markers: Vec::new(),
+                listeners: Vec::new(),
+                claims: Vec::new(),
+            }),
+        }
     }
     /// A retried clone uses the grant already fenced into its canonical image. A fresh
     /// operation alone needs a process-lifetime claim until that image owns the block.
@@ -10598,9 +10505,10 @@ self.finish_retire_intent(&workspace).await?;
             &mount,
             current.derived.workspace.incarnation(),
         )?;
-        // Directory stores own no kernel volume; their job samples explicitly remain
-        // unconfigured rather than reporting the containing filesystem's usage.
-        let workspace_volume = if H::HAS_PHYSICAL_VOLUMES {
+        // A plain directory is no volume of its own: its job samples stay unconfigured rather
+        // than reporting the usage of the filesystem that holds the store. An image and a
+        // dataset are, and the workspace is mounted at its own root.
+        let workspace_volume = if self.substrate.host().substrate().has_volumes() {
             Some(super::volume_usage::VolumeMountpoint::new(mount.clone())?)
         } else {
             None
@@ -10933,6 +10841,24 @@ self.finish_retire_intent(&workspace).await?;
                 .await?;
         }
         Ok(())
+    }
+
+    /// Refuse a verb that needs `operation` on a store whose substrate has none, before anything
+    /// is stopped or changed (07_api.md, "Substrates").
+    fn require_substrate_operation(
+        &self,
+        operation: crate::api::dto::SubstrateOperation,
+    ) -> Result<()> {
+        let substrate = self.substrate.host().substrate();
+        if substrate.supports(operation) {
+            return Ok(());
+        }
+        Err(CowshedError::unsupported_on_substrate(
+            crate::error::SubstrateRefusal {
+                substrate,
+                operation,
+            },
+        ))
     }
 
     /// The ledger of the process groups `workspace`'s supervisor runs, and of the groups a lost
@@ -11747,7 +11673,6 @@ self.finish_retire_intent(&workspace).await?;
 
 /// The abandon bundles directly in the project trash `trash`, in name order: each regular file with
 /// the bundle extension. None when the trash does not exist.
-#[cfg(target_os = "macos")]
 fn abandon_bundles_in(trash: &Path) -> Result<Vec<PathBuf>> {
     let unreadable = |error: std::io::Error| {
         CowshedError::environment_missing(
@@ -11782,7 +11707,6 @@ fn abandon_bundles_in(trash: &Path) -> Result<Vec<PathBuf>> {
 /// The token a session open replaced, when it names another session. The supervisor answers a
 /// name it still holds with that session's own identity, so a reopen's previous token is the
 /// session just opened, and closing it would close the session the caller is about to run in.
-#[cfg(target_os = "macos")]
 fn superseded_session(
     previous: super::supervisor::SessionToken,
     reopened: u64,
@@ -11790,7 +11714,6 @@ fn superseded_session(
     (previous.identity() != reopened).then_some(previous)
 }
 
-#[cfg(target_os = "macos")]
 struct NativeWorkspace {
     derived: crate::storage::lifecycle::DerivedWorkspace,
     metadata: crate::metadata::DetachedWorkspaceMetadata,
@@ -11799,7 +11722,6 @@ struct NativeWorkspace {
 
 /// Whether a main restore loses commits. `retained_head` is where the retained checkout stands,
 /// when it names one; an abandonment bundles main's history beyond it.
-#[cfg(target_os = "macos")]
 enum MainPreservation {
     Preserved,
     Unpreserved {
@@ -11809,7 +11731,6 @@ enum MainPreservation {
 }
 
 /// Refuse a checkout destination anything already occupies: a move never replaces what is there.
-#[cfg(target_os = "macos")]
 fn require_vacant_move_destination(destination: &Path) -> Result<()> {
     match std::fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -11827,7 +11748,6 @@ fn require_vacant_move_destination(destination: &Path) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn recover_repository_identity_intent(store_root: &Path) -> Result<()> {
     let store_root = store_root.to_owned();
     crate::storage::lifecycle::dispatch_blocking(move || {
@@ -11864,7 +11784,6 @@ async fn recover_repository_identity_intent(store_root: &Path) -> Result<()> {
 ///
 /// Synchronous and blocking on purpose: from the first rename until the last sidecar is rewritten
 /// the store has two namespaces in play, and nothing else may enumerate it in between.
-#[cfg(target_os = "macos")]
 fn apply_identity_change(
     intent: &crate::storage::recovery::RepositoryIdentityIntent,
 ) -> Result<()> {
@@ -11903,7 +11822,6 @@ fn apply_identity_change(
 /// Both present is the state that must never be guessed at: one of them holds the project and the
 /// other holds whatever a previous interruption left, and picking wrong loses a workspace image.
 /// Neither present is equally unguessable — the directory the intent names is simply gone.
-#[cfg(target_os = "macos")]
 fn move_identity_namespace(
     namespace: &str,
     old: &Path,
@@ -11972,7 +11890,6 @@ fn move_identity_namespace(
 /// Idempotent by inspection of what it already says: still the old identity means the rename is
 /// owed, already the new one means it is done. Anything else is a binding this transaction has no
 /// business rewriting, and is refused rather than overwritten.
-#[cfg(target_os = "macos")]
 fn converge_binding_identity(
     path: &Path,
     old_repo_id: &RepoId,
@@ -12018,7 +11935,6 @@ fn converge_binding_identity(
 /// is what enumeration, publication recovery and mount-path derivation read. Leaving one behind
 /// makes the image invisible to the project that owns it, which is why this walks the whole project
 /// directory rather than only the workspaces the caller happened to enumerate.
-#[cfg(target_os = "macos")]
 fn rewrite_sidecar_identities(
     project_root: &Path,
     old_repo_id: &RepoId,
@@ -12071,7 +11987,6 @@ fn rewrite_sidecar_identities(
 ///
 /// Symlinks are never followed and never descended: the store is cowshed's own tree, and a symlink
 /// inside it is either not ours or is an attempt to make this walk write outside the project.
-#[cfg(target_os = "macos")]
 fn project_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
     let mut sidecars = Vec::new();
     let mut pending = vec![root.to_owned()];
@@ -12119,14 +12034,12 @@ fn project_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(sidecars)
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectRootValidation {
     Strict,
     AllowDetachedMainRelocation,
 }
 
-#[cfg(target_os = "macos")]
 fn validate_workspace_controller_root(
     derived: &crate::storage::lifecycle::DerivedWorkspace,
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
@@ -12156,7 +12069,6 @@ fn validate_workspace_controller_root(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeRemovalGitFence {
     incarnation: WorkspaceIncarnation,
@@ -12171,7 +12083,6 @@ struct NativeRemovalGitFence {
 }
 
 /// Whether the branch that outlives a workspace already holds the workspace's work.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeLandedState {
     branch: String,
@@ -12183,7 +12094,6 @@ struct NativeLandedState {
 }
 
 /// What the containment gate authorized of a session's commits.
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct NativeLandedAuthority {
     /// The state an authorized abandonment bundles before deleting, when there is something to
@@ -12196,7 +12106,6 @@ struct NativeLandedAuthority {
 
 /// The branch a removal measures a session against, in the repository that holds it: main's
 /// checked-out branch for `rm`; for `land`'s retire, the branch the unit just landed on.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeContainment {
     /// The workspace whose repository holds `branch`: main, or the lane base a unit landed in.
@@ -12206,7 +12115,6 @@ struct NativeContainment {
     branch: String,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeContainment {
     /// What a retire intent journals of this containment for its replay: the workspace and the
     /// branch it measured, main's included, so a replay measures that branch even after main's
@@ -12219,7 +12127,6 @@ impl NativeContainment {
     }
 }
 /// What a unit lands into or rebases onto: main, or a lane base.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeLandingInto {
     name: WorkspaceName,
@@ -12229,7 +12136,6 @@ struct NativeLandingInto {
     mount: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
 impl NativeLandingInto {
     /// The branch a land moves when the caller names none: the one the target's checkout has
     /// checked out, main's as every lane base's (02_workspaces.md, "Lanes").
@@ -12248,7 +12154,6 @@ impl NativeLandingInto {
 
 /// What resolving a landing target does with a detached lane base: a land or a rebase attaches
 /// it to run Git in it; a land preflight, which mutates nothing, refuses it.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DetachedTarget {
     Attach,
@@ -12257,7 +12162,6 @@ enum DetachedTarget {
 
 /// What land's fences before its check read: the source as the land saw it, its target, and the
 /// heads the fences held to the caller's expectations.
-#[cfg(target_os = "macos")]
 struct LandFenced {
     current: NativeWorkspace,
     into: NativeLandingInto,
@@ -12267,7 +12171,6 @@ struct LandFenced {
     target_head: Option<GitOid>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeAdoptRollbackState {
     Retained,
@@ -12367,7 +12270,7 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn land_moves_only_the_branch_main_has_checked_out() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
@@ -12420,7 +12323,7 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
@@ -12485,7 +12388,7 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn a_dirty_tree_refuses_even_under_autostash_instead_of_succeeding_over_conflicts() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
@@ -12570,7 +12473,7 @@ mod rebase_recovery_tests {
                 base,
                 main,
                 lane,
-                store: crate::temp_root::FixtureStore::new(),
+                store: crate::sandbox::tests::fixture_store(),
             }
         }
 
@@ -14708,7 +14611,6 @@ mod rebase_recovery_tests {
         require_distinct_target(&Lane::name("unit"), &Lane::name("lane")).expect("its lane base");
     }
 }
-#[cfg(target_os = "macos")]
 #[async_trait]
 impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> {
     fn descriptor(&self) -> &ProjectDescriptor {
@@ -14717,6 +14619,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     fn job_lanes(&self) -> crate::resident::JobLanes {
         self.lanes.clone()
+    }
+
+    fn substrate(&self) -> Option<crate::api::dto::StoreSubstrate> {
+        Some(self.substrate.host().substrate())
     }
 
     fn release_intent_leases(&mut self) {
@@ -14817,6 +14723,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 
     async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)> {
+        self.require_substrate_operation(crate::api::dto::SubstrateOperation::ReAdopt)?;
         self.re_adopt_main(options).await
     }
 
@@ -14981,7 +14888,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     timed_async(
                         "adopt",
                         "daemons",
-                        crate::inherited_daemons::macos::discard_in(
+                        crate::inherited_daemons::discard_in(
                             &stage.mount_point,
                             crate::capabilities::mint_daemon_states(
                                 &stage.mount_point,
@@ -15271,7 +15178,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         timed_async(
                             "fork",
                             "daemons",
-                            crate::inherited_daemons::macos::discard_in(
+                            crate::inherited_daemons::discard_in(
                                 &stage.mount_point,
                                 crate::capabilities::mint_daemon_states(
                                     &stage.mount_point,
@@ -15692,7 +15599,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         },
                         move |stage, prepared| async move {
                             crate::inherited_git_locks::discard_in(&stage.mount_point).await?;
-                            crate::inherited_daemons::macos::discard_in(
+                            crate::inherited_daemons::discard_in(
                                 &stage.mount_point,
                                 crate::capabilities::mint_daemon_states(
                                     &stage.mount_point,
@@ -16386,6 +16293,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         volume: crate::api::dto::ResizeVolume,
     ) -> Result<crate::api::dto::ResizeResult> {
         use crate::storage::lifecycle::Substrate;
+        self.require_substrate_operation(match volume {
+            crate::api::dto::ResizeVolume::Workspace => {
+                crate::api::dto::SubstrateOperation::ResizeWorkspace
+            }
+            crate::api::dto::ResizeVolume::Build => {
+                crate::api::dto::SubstrateOperation::ResizeBuildVolume
+            }
+        })?;
         self.validate_binding().await?;
         let requested = parse_capacity(&capacity)?;
         let current = self.current(&workspace).await?;
@@ -16445,6 +16360,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::DefragmentResult> {
         use crate::storage::lifecycle::Substrate;
+        self.require_substrate_operation(crate::api::dto::SubstrateOperation::DefragmentWorkspace)?;
         self.validate_binding().await?;
         // An inspecting opening must not race the original creator, which may hold its source
         // image lock rather than this destination's lock. Retain the existing intent lease
@@ -17043,10 +16959,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let required_size = requested_port_block_size(&delta, revoke)?;
         refuse_linux_loopback_any(&delta)?;
         delta.service_ports = None;
-        let previous_block = current.metadata.grants.port_block.ok_or_else(|| {
-            CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
-        })?;
-        let growth_size = required_size.filter(|size| *size > previous_block.size());
+        let previous_block = current.metadata.grants.port_block;
+        let growth_size = match (required_size, previous_block) {
+            (Some(size), Some(block)) => (size > block.size()).then_some(size),
+            // Capacity is ports of a block: a workspace that records none has none to grow.
+            (Some(_), None) => return Err(no_port_block("grow service-port capacity")),
+            (None, _) => None,
+        };
         // Port authority changes require an idle workspace. The actor rejects a busy
         // request atomically, without queuing it or stopping any existing workload.
         let port_lease = if growth_size.is_some() {
@@ -17119,7 +17038,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         normalize_grant_delta(&mut delta, revoke)?;
                         let previous = current.metadata.grants.clone();
                         if let Some(block) = replacement_block {
-                            if previous.port_block != Some(previous_block)
+                            if previous.port_block != previous_block
                                 || previous.retained_port_blocks != previous_retained_blocks
                             {
                                 return Err(CowshedError::conflict(
@@ -17322,9 +17241,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .metadata
             .grants
             .port_block
-            .ok_or_else(|| {
-                CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
-            })?
+            .ok_or_else(|| no_port_block("assign a port slot"))?
             .size();
         let block = crate::metadata::PortBlock::new(base, size)
             .map_err(|error| CowshedError::usage(error.to_string(), "choose another slot"))?;
@@ -19170,7 +19087,6 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn binding_from_git(
     git: &crate::git::GitRepository,
     requested_repo_id: Option<&RepoId>,
@@ -19179,7 +19095,6 @@ async fn binding_from_git(
     binding_from_remotes(&remotes, requested_repo_id)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn binding_from_remotes(
     remotes: &[crate::git::RemoteUrl],
     requested_repo_id: Option<&RepoId>,
@@ -19307,7 +19222,6 @@ fn binding_from_remotes(
 /// an SSH login name. The recorded URL keys a fetch route (`workspace_git_fetch`), and Git rewrites
 /// a URL only when it starts with the recorded one, so the login that addresses the server's
 /// account stays. An HTTPS username can itself be a token, and a password always is one.
-#[cfg(any(target_os = "macos", test))]
 fn persistable_remote_url(value: &Path) -> Option<String> {
     let value = value.to_str()?;
     let suffix = value
@@ -19331,7 +19245,6 @@ fn persistable_remote_url(value: &Path) -> Option<String> {
     Some(format!("{scheme}://{authority}/{path}"))
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "repair the repository binding")
 }
@@ -19364,7 +19277,6 @@ async fn read_workspace_marker(path: &Path) -> Result<Option<crate::metadata::Wo
     .map_err(native_integrity_error)
 }
 
-#[cfg(target_os = "macos")]
 fn prepare_detached_checkout_relocation(
     record: &crate::checkout::CheckoutRecord,
     source: &Path,
@@ -19426,7 +19338,6 @@ fn prepare_detached_checkout_relocation(
 }
 
 /// What a workspace marker tells an opening controller about the project it belongs to.
-#[cfg(target_os = "macos")]
 struct WorkspaceOrigin {
     repo_id: RepoId,
     workspace: WorkspaceName,
@@ -19436,7 +19347,6 @@ struct WorkspaceOrigin {
     project_root: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
 async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<WorkspaceOrigin>> {
     let Some(marker) = read_workspace_marker(project_root).await? else {
         return Ok(None);
@@ -19493,7 +19403,6 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
 /// through a marker naming an identity it recorded as former, and refusing that would refuse to open
 /// the very project the change produced. The workspace name and its random incarnation still have to
 /// match a live storage fact exactly, so a marker from some other workspace is still refused.
-#[cfg(target_os = "macos")]
 fn validate_workspace_origin_against_inventory(
     origin: &WorkspaceOrigin,
     owned_repo_ids: &OwnedRepoIds,
@@ -19555,7 +19464,6 @@ fn names_one_root(recorded: &Path, observed: &Path) -> bool {
 ///
 /// `Ok(None)` means the binding already matches (or the caller opened for the identity change,
 /// where the recorded pairing is about to be superseded and must not block its own supersession).
-#[cfg(any(target_os = "macos", test))]
 fn reconcile_binding_with_remotes(
     binding: &RepositoryBinding,
     remotes: &[crate::git::RemoteUrl],
@@ -19638,7 +19546,6 @@ fn reconcile_binding_with_remotes(
 /// path, a backup clone), an identity this binding already holds or once held, and a URL any other
 /// adopted project binds are refused: a fetch URL routes to exactly one clone
 /// (`workspace_git_fetch`), so no two bindings may share a route.
-#[cfg(any(target_os = "macos", test))]
 fn bind_remote(
     binding: &RepositoryBinding,
     remotes: &[crate::git::RemoteUrl],
@@ -19733,57 +19640,45 @@ pub async fn bind_remote_identity(
     descriptor: &ProjectDescriptor,
     remote_name: &str,
 ) -> Result<crate::api::IdentityReport> {
-    #[cfg(target_os = "macos")]
-    {
-        let layout =
-            crate::storage::StorageLayout::new(descriptor.storage.store(), &descriptor.repo_id)
-                .map_err(native_integrity_error)?;
-        let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
-            CowshedError::integrity(
-                format!("project {} has no repository binding", descriptor.repo_id),
-                "cowshed doctor --json",
-            )
-        })?;
-        let remotes = crate::git::GitRepository::from_root(
-            descriptor.storage.roots().shared_store(),
-            &*descriptor.git_root,
+    let layout =
+        crate::storage::StorageLayout::new(descriptor.storage.store(), &descriptor.repo_id)
+            .map_err(native_integrity_error)?;
+    let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
+        CowshedError::integrity(
+            format!("project {} has no repository binding", descriptor.repo_id),
+            "cowshed doctor --json",
         )
-        .remotes()
-        .await?;
-        let store = descriptor.storage.store().to_path_buf();
-        let project = descriptor.repo_id.clone();
-        let others =
-            crate::storage::lifecycle::dispatch_blocking(move || other_bindings(&store, &project))
-                .await
-                .map_err(|error| CowshedError::internal(error.to_string()))??;
-        let (identity, updated) = bind_remote(&binding, &remotes, remote_name, &others)?;
-        let added = updated.is_some();
-        let binding = match updated {
-            Some(updated) => {
-                persist_binding(&layout, &updated).await?;
-                updated
-            }
-            None => binding,
-        };
-        Ok(crate::api::IdentityReport {
-            repo_id: descriptor.repo_id.clone(),
-            added,
-            identity,
-            identities: binding.identities,
-        })
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (descriptor, remote_name);
-        Err(CowshedError::environment_missing(
-            "the native cowshed project runtime requires macOS APFS",
-            "run the controller on macOS",
-        ))
-    }
+    })?;
+    let remotes = crate::git::GitRepository::from_root(
+        descriptor.storage.roots().shared_store(),
+        &*descriptor.git_root,
+    )
+    .remotes()
+    .await?;
+    let store = descriptor.storage.store().to_path_buf();
+    let project = descriptor.repo_id.clone();
+    let others =
+        crate::storage::lifecycle::dispatch_blocking(move || other_bindings(&store, &project))
+            .await
+            .map_err(|error| CowshedError::internal(error.to_string()))??;
+    let (identity, updated) = bind_remote(&binding, &remotes, remote_name, &others)?;
+    let added = updated.is_some();
+    let binding = match updated {
+        Some(updated) => {
+            persist_binding(&layout, &updated).await?;
+            updated
+        }
+        None => binding,
+    };
+    Ok(crate::api::IdentityReport {
+        repo_id: descriptor.repo_id.clone(),
+        added,
+        identity,
+        identities: binding.identities,
+    })
 }
 
 /// Every adopted project's binding but `project`'s, read as the fetch-route refresh reads them.
-#[cfg(target_os = "macos")]
 fn other_bindings(store: &Path, project: &RepoId) -> Result<Vec<(RepoId, RepositoryBinding)>> {
     crate::gateway_inventory::discover_repositories(store)
         .map_err(native_integrity_error)?
@@ -19809,7 +19704,6 @@ fn other_bindings(store: &Path, project: &RepoId) -> Result<Vec<(RepoId, Reposit
 
 /// Persists a binding atomically, off the async runtime: a transport-move heal and
 /// `cowshed identity add` both write through here.
-#[cfg(target_os = "macos")]
 async fn persist_binding(
     layout: &crate::storage::StorageLayout,
     binding: &RepositoryBinding,
@@ -19824,7 +19718,6 @@ async fn persist_binding(
     .map_err(native_integrity_error)
 }
 
-#[cfg(target_os = "macos")]
 async fn read_persisted_binding(
     layout: &crate::storage::StorageLayout,
 ) -> Result<Option<RepositoryBinding>> {
@@ -19861,7 +19754,6 @@ async fn read_persisted_binding(
 ///
 /// `None` means no adopted project owns this identity, which is the only case where the remotes get
 /// to decide what the project is called — that is adoption.
-#[cfg(target_os = "macos")]
 async fn project_owning_repo_id(
     store_root: &Path,
     repo_id: &RepoId,
@@ -19899,7 +19791,6 @@ async fn project_owning_repo_id(
 }
 
 /// The live project that owns `repo_id`, found by scanning the store's bindings.
-#[cfg(target_os = "macos")]
 async fn identity_owner_in_store(
     store_root: &Path,
     repo_id: &RepoId,
@@ -19921,7 +19812,6 @@ async fn identity_owner_in_store(
 /// be adopted under a name a since-renamed project once used. Several repositories merged into one
 /// monorepo likewise leave their old identities recorded in the monorepo alone, where they block
 /// nothing but a second live claim on the same name.
-#[cfg(target_os = "macos")]
 async fn refuse_identity_owned_by_a_live_project(
     store_root: &Path,
     repo_id: &RepoId,
@@ -19950,7 +19840,6 @@ async fn refuse_identity_owned_by_a_live_project(
 /// in. When those roots differ, the marker identity and persisted binding are the complete project
 /// authority. In particular, the recorded checkout may be a missing direct mount; no Git command
 /// may be aimed at it merely to learn an identity the store already records.
-#[cfg(target_os = "macos")]
 async fn project_binding_from_workspace_origin(
     store_root: &Path,
     invocation_root: &Path,
@@ -19974,7 +19863,6 @@ async fn project_binding_from_workspace_origin(
     Ok(Some((repo_id, layout, binding)))
 }
 
-#[cfg(target_os = "macos")]
 async fn load_or_validate_binding(
     layout: &crate::storage::StorageLayout,
     candidate: RepositoryBinding,
@@ -20011,7 +19899,6 @@ async fn load_or_validate_binding(
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn enforce_adopt_secret_policy(
     root: PathBuf,
     waivers_path: PathBuf,
@@ -20060,7 +19947,6 @@ async fn enforce_adopt_secret_policy(
     .map_err(|error| CowshedError::internal(format!("secret scan task failed: {error}")))?
 }
 
-#[cfg(target_os = "macos")]
 fn secret_scan_error(waivers_path: &Path, error: crate::secrets::SecretScanError) -> CowshedError {
     match error {
         crate::secrets::SecretScanError::InvalidWaiver { .. }
@@ -20080,7 +19966,6 @@ fn secret_scan_error(waivers_path: &Path, error: crate::secrets::SecretScanError
     }
 }
 
-#[cfg(target_os = "macos")]
 fn secret_findings_error(
     findings: &[crate::secrets::SecretFinding],
     waivers_path: &Path,
@@ -20101,7 +19986,6 @@ fn secret_findings_error(
     )
 }
 
-#[cfg(target_os = "macos")]
 fn quarantine_secret_files(
     root: &Path,
     quarantine_root: &Path,
@@ -20210,7 +20094,6 @@ fn quarantine_secret_files(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn secure_quarantine_directory(root: &Path, relative: &Path) -> Result<PathBuf> {
     let mut current = root.to_path_buf();
     for component in std::iter::once(None).chain(relative.components().map(Some)) {
@@ -20261,7 +20144,6 @@ fn secure_quarantine_directory(root: &Path, relative: &Path) -> Result<PathBuf> 
     Ok(current)
 }
 
-#[cfg(target_os = "macos")]
 fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     use std::io::Read;
 
@@ -20291,7 +20173,6 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn sync_parent(path: &Path) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         CowshedError::integrity(
@@ -20304,7 +20185,6 @@ fn sync_parent(path: &Path) -> Result<()> {
         .map_err(|error| quarantine_io_error("sync directory", parent, error))
 }
 
-#[cfg(target_os = "macos")]
 fn quarantine_io_error(operation: &str, path: &Path, error: std::io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("{operation} at {} failed: {error}", path.display()),
@@ -20312,7 +20192,6 @@ fn quarantine_io_error(operation: &str, path: &Path, error: std::io::Error) -> C
     )
 }
 
-#[cfg(target_os = "macos")]
 fn pre_cowshed_path(root: &Path) -> Result<PathBuf> {
     if root.file_name().is_none() {
         return Err(CowshedError::usage(
@@ -21647,10 +21526,7 @@ mod removal_supervisor_tests {
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
                     process: process.clone(),
-                    #[cfg(target_os = "macos")]
                     nice: Some(request.cpu.nice),
-                    #[cfg(not(target_os = "macos"))]
-                    nice: None,
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;
@@ -21687,7 +21563,6 @@ mod removal_supervisor_tests {
             None
         }
 
-        #[cfg(target_os = "macos")]
         fn observations(&self) -> Option<&super::super::process_monitor::ProcessMonitor> {
             None
         }
@@ -21825,7 +21700,6 @@ mod removal_supervisor_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn revision_target(target: &crate::api::dto::RevisionTarget) -> String {
     match target {
         crate::api::dto::RevisionTarget::Branch(branch) => branch.as_str().to_owned(),
@@ -21834,7 +21708,6 @@ fn revision_target(target: &crate::api::dto::RevisionTarget) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn current_snapshot_mount<H: RuntimeStorageHost>(
     host: &StorageProjectRuntimeHost<H>,
     workspace: &NativeWorkspace,
@@ -21847,7 +21720,6 @@ fn current_snapshot_mount<H: RuntimeStorageHost>(
 /// Land fast-forwards through the target's checkout, and `merge` moves whichever branch that
 /// checkout is on, so any other target would be reported as landed while a different branch moved.
 /// Updating a branch that is not checked out is a separate path this runtime does not have.
-#[cfg(target_os = "macos")]
 async fn require_target_checked_out(
     store_root: &std::sync::Arc<Path>,
     git_root: &Path,
@@ -21878,7 +21750,6 @@ async fn require_target_checked_out(
 
 /// The branch a land target has checked out, main's or a lane base's: what units land on and
 /// rebase onto, and what `rm` measures against when the target is main.
-#[cfg(target_os = "macos")]
 async fn target_checked_out_branch(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -21900,7 +21771,6 @@ async fn target_checked_out_branch(
 }
 
 /// The source checkout and the exact branch head validated for delivery.
-#[cfg(target_os = "macos")]
 struct NativeLandingSource<'a> {
     mount: &'a Path,
     workspace: &'a WorkspaceName,
@@ -21916,7 +21786,6 @@ struct NativeLandingSource<'a> {
 /// fetch is the hand-back, pull-based like every other direction cowshed moves work, into the
 /// unit's preservation ref in the target's repository. It is also the revalidation: if the unit
 /// advanced since `source_head` was validated, what arrived is not what was checked.
-#[cfg(target_os = "macos")]
 async fn deliver_into(
     target: &WorkspaceName,
     repository: &crate::git::GitRepository,
@@ -22019,7 +21888,6 @@ async fn deliver_into(
 
 /// What holds the target's ref while git moves it (02_workspaces.md "`cowshed land`" step 3): the
 /// land's ref lock, handed to git as a held descriptor, or its ref turn, which git is bound to.
-#[cfg(target_os = "macos")]
 enum Fence<'a> {
     Lock(std::os::fd::RawFd),
     Turn(&'a mut super::ref_turn::RefTurn),
@@ -22030,7 +21898,6 @@ enum Fence<'a> {
 /// git ends, a cowshed killed mid-fast-forward never leaves git moving the ref outside it, and no
 /// git background work detaches with it (02_workspaces.md "Held locks"). Hooks and the fsmonitor
 /// are already off for every controller git. `fetch_source` names the checkout a fetch reads.
-#[cfg(target_os = "macos")]
 fn fence_git_command(
     store_root: &Path,
     root: &Path,
@@ -22056,7 +21923,6 @@ fn fence_git_command(
 /// git binds itself to as it starts (`RefTurn::bind_at_exec`), so the gateway holds the turn until
 /// it exits however this process ends. A bind the gateway refuses, or the turn's loss while git
 /// runs, stops the git before it moves anything it has not moved yet.
-#[cfg(target_os = "macos")]
 // WHY unbounded: a sandboxed git of this host's own repository, fetching only from one on this
 // host's disk: it waits on no other process.
 #[allow(clippy::disallowed_methods)]
@@ -22144,7 +22010,6 @@ async fn fence_git(
 /// Send SIGTERM to the ref fence's git `pid`, a child of this process not yet reaped, so git
 /// removes its lock files as it ends; reap it within the reap bound; and say what became of it. A
 /// git whose reap expires is named and left to tokio's orphan reaper when its child is dropped.
-#[cfg(target_os = "macos")]
 async fn stop_fence_git(child: &mut tokio::process::Child, pid: u32) -> String {
     let (signal, last) = match libc::pid_t::try_from(pid) {
         // SAFETY: kill takes plain integers; `pid` is this process's unreaped child.
@@ -22187,7 +22052,6 @@ async fn stop_fence_git(child: &mut tokio::process::Child, pid: u32) -> String {
 /// takes part, and no remote name has to exist on either side. The fetch lands in a staging ref,
 /// so the destination only ever moves to the exact object the caller's expectations were checked
 /// against, in one compare-and-swap `update-ref`. The staging ref is removed on every path.
-#[cfg(target_os = "macos")]
 async fn preserve_workspace_branch(
     store_root: &std::sync::Arc<Path>,
     main_root: &Path,
@@ -22262,7 +22126,6 @@ async fn preserve_workspace_branch(
 }
 
 /// Move `destination_ref` to what `staging_ref` holds, refusing any expectation that moved.
-#[cfg(target_os = "macos")]
 async fn install_preserved(
     store_root: &std::sync::Arc<Path>,
     main_root: &Path,
@@ -22309,7 +22172,6 @@ async fn install_preserved(
 /// A lane base is a repository of its own, so its branch reaches a unit only by a fetch from its
 /// mount — the same pull the land uses in the other direction. Fetching on every rebase is what
 /// keeps the destination current as lane-mates land.
-#[cfg(target_os = "macos")]
 async fn fetch_target_branch(
     store_root: &std::sync::Arc<Path>,
     unit_root: &Path,
@@ -22322,7 +22184,6 @@ async fn fetch_target_branch(
 
 /// Fetch `branch` of the lane base at `target_root` into the unit at `unit_root`, as
 /// `refs/cowshed/targets/<target>/<branch>`, and answer that ref.
-#[cfg(target_os = "macos")]
 async fn fetch_target_ref(
     store_root: &std::sync::Arc<Path>,
     unit_root: &Path,
@@ -22354,7 +22215,6 @@ async fn fetch_target_ref(
 /// is: nothing is fetched and nothing replayed. Otherwise the branch is fetched into the unit, as
 /// `rebase --into` fetches it, and the unit is replayed onto it by `git rebase`; a replay that
 /// conflicts is rolled back and refused, naming the conflicted paths, with the unit as it was.
-#[cfg(target_os = "macos")]
 async fn rebase_onto_target_branch(
     store_root: &std::sync::Arc<Path>,
     unit_root: &Path,
@@ -22391,7 +22251,6 @@ async fn rebase_onto_target_branch(
 }
 
 /// A rebase has one destination: what the unit lands into, or an explicit revision.
-#[cfg(target_os = "macos")]
 fn require_single_destination(
     onto: Option<&crate::api::dto::RevisionTarget>,
     into: Option<&WorkspaceTarget>,
@@ -22408,7 +22267,6 @@ fn require_single_destination(
 }
 
 /// A unit never lands into, or rebases onto, itself.
-#[cfg(target_os = "macos")]
 fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Result<()> {
     if unit == target {
         return Err(CowshedError::usage(
@@ -22421,7 +22279,6 @@ fn require_distinct_target(unit: &WorkspaceName, target: &WorkspaceName) -> Resu
 
 /// What a land does beside Git (02_workspaces.md, "`cowshed land`" and "Lanes";
 /// 16_build_volumes.md, "Land" and "Ungated folds").
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LandPlan {
     /// The checks, seed freeze, adoption and output restoration.
@@ -22431,7 +22288,6 @@ enum LandPlan {
     Ungated,
 }
 
-#[cfg(target_os = "macos")]
 impl LandPlan {
     /// How the retire treats the unit's Nx state. A gated land quiesced it at Land step 4, so its
     /// retire only inspects holders; an ungated land never quiesced it, so it retires as `rm`
@@ -22446,7 +22302,6 @@ impl LandPlan {
 
 /// A land's plan. An ungated land runs no check and advances its lane base, so it refuses
 /// `check` and `push_only`, and folds only into a lane base.
-#[cfg(target_os = "macos")]
 fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> {
     if options.ref_lock.is_some() && options.ref_turn.is_some() {
         return Err(CowshedError::usage(
@@ -22480,7 +22335,6 @@ fn land_plan(options: &LandOptions, target: &WorkspaceName) -> Result<LandPlan> 
 }
 
 /// Only a land into main gates (02_workspaces.md "Lanes"), so main refuses an ungated fold.
-#[cfg(target_os = "macos")]
 fn require_lane_target(target: &WorkspaceName) -> Result<()> {
     if target.is_main() {
         return Err(CowshedError::usage(
@@ -22499,7 +22353,6 @@ fn require_lane_target(target: &WorkspaceName) -> Result<()> {
 /// Refuse a target that is no longer the workspace its reference was resolved to: a lane base
 /// removed and recreated under the same name is a different workspace, and delivering into it
 /// would put a unit's work where its coordinator never aimed it.
-#[cfg(target_os = "macos")]
 fn require_target_incarnation(
     target: &WorkspaceName,
     current: &WorkspaceIncarnation,
@@ -22525,7 +22378,6 @@ fn require_target_incarnation(
 }
 
 /// Refuse a source workspace whose head is not the one the caller expected `verb` to act on.
-#[cfg(target_os = "macos")]
 fn require_source_head(expected: Option<&GitOid>, observed: &GitOid, verb: &str) -> Result<()> {
     match expected {
         Some(expected) if expected != observed => Err(CowshedError::fence_refusal(
@@ -22540,7 +22392,6 @@ fn require_source_head(expected: Option<&GitOid>, observed: &GitOid, verb: &str)
 }
 
 /// Refuse a rebase whose destination `onto` resolved to another commit than the caller expected.
-#[cfg(target_os = "macos")]
 fn require_onto_head(expected: Option<&GitOid>, onto: &str, observed: &GitOid) -> Result<()> {
     match expected {
         Some(expected) if expected != observed => Err(CowshedError::fence_refusal(
@@ -22555,7 +22406,6 @@ fn require_onto_head(expected: Option<&GitOid>, onto: &str, observed: &GitOid) -
 }
 
 /// Refuse a land whose target branch is not at the head the caller expected.
-#[cfg(target_os = "macos")]
 fn require_target_head(
     expected: Option<&crate::api::dto::ExpectedRefHead>,
     observed: Option<&GitOid>,
@@ -22571,7 +22421,6 @@ fn require_target_head(
     })
 }
 
-#[cfg(target_os = "macos")]
 async fn run_git<const N: usize>(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22581,7 +22430,6 @@ async fn run_git<const N: usize>(
     require_git_success("git operation", &output)
 }
 
-#[cfg(target_os = "macos")]
 async fn run_git_fetch<const N: usize>(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22610,7 +22458,6 @@ async fn run_git_fetch<const N: usize>(
 /// once a second while a phase moves, so a remote silent for the whole bound is one that stopped
 /// sending, and the transfer fails `SILENT` naming the git. A git that ends unsuccessfully is read
 /// as git's own words from the log, as every other git operation's are.
-#[cfg(target_os = "macos")]
 async fn transfer_mirror(
     operation: &'static str,
     mut command: std::process::Command,
@@ -22668,7 +22515,6 @@ async fn transfer_mirror(
 /// output, or CPU anywhere in its process group (a merge driver, filter or hook at work), restarts
 /// the heartbeat silence. A git that shows neither for that long, a hook hung on nothing, fails
 /// `SILENT` naming its group's running processes by pid and command, and they are ended.
-#[cfg(target_os = "macos")]
 async fn invoke_git(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22702,7 +22548,6 @@ async fn invoke_git(
 /// How a replay that conflicts ends: stopped in progress, for `cowshed rebase --continue` or
 /// `--abort` (the rebase verb), or rolled back with the workspace as it was (a land's replay,
 /// which leaves no unit half-replayed).
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConflictEnd {
     Stop,
@@ -22712,10 +22557,8 @@ enum ConflictEnd {
 /// The file in the workspace's git directory that names the rebase cowshed started, from before
 /// its replay until the replay ends: what `--continue` and `--abort` resume, and the proof that a
 /// stopped rebase is cowshed's to carry on.
-#[cfg(target_os = "macos")]
 const STOPPED_REBASE: &str = "cowshed-rebase.json";
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoppedRebase {
@@ -22726,7 +22569,6 @@ struct StoppedRebase {
 
 /// Replay the branch at `source_head` onto `onto`, rolling a conflict back: a land's replay
 /// (02_workspaces.md, "`cowshed land`", `--ungated`).
-#[cfg(target_os = "macos")]
 async fn run_git_rebase_atomically(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22747,7 +22589,6 @@ async fn run_git_rebase_atomically(
 /// parked stash yet exits 0, so this verb would report success over a conflicted tree. Without it
 /// git refuses a dirty tree before touching anything, which is refused as dirty. A replay that
 /// conflicts stops in progress or rolls back, as `end` says.
-#[cfg(target_os = "macos")]
 async fn replay(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22903,7 +22744,6 @@ async fn replay(
 
 /// Abort the rebase cowshed started, then put the branch back exactly: `source_ref` attached at
 /// `source_head`, both rebase directories gone. Answers what could not be restored.
-#[cfg(target_os = "macos")]
 async fn roll_back(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -22949,7 +22789,6 @@ async fn roll_back(
 }
 
 /// The workspace's absolute git directory.
-#[cfg(target_os = "macos")]
 async fn workspace_git_dir(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<PathBuf> {
     let output = invoke_git(store_root, root, &["rev-parse", "--absolute-git-dir"]).await?;
     require_git_success("resolve git directory", &output)?;
@@ -22960,7 +22799,6 @@ async fn workspace_git_dir(store_root: &std::sync::Arc<Path>, root: &Path) -> Re
 
 /// The refusal of a rebase while one is in progress: cowshed's own, to carry on, or one it did
 /// not start, which it never touches.
-#[cfg(target_os = "macos")]
 fn rebase_in_progress(git_dir: &Path) -> CowshedError {
     if git_dir.join(STOPPED_REBASE).exists() {
         CowshedError::conflict(
@@ -22976,7 +22814,6 @@ fn rebase_in_progress(git_dir: &Path) -> CowshedError {
 }
 
 /// How a stopped rebase is carried on, with the fences the closing of a finished one names.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Resume {
     Continue,
@@ -22989,7 +22826,6 @@ enum Resume {
     },
 }
 
-#[cfg(target_os = "macos")]
 impl Resume {
     /// What `options` resume, if anything. A finalize names the whole move it closes, and no other
     /// rebase names the head a finished replay left.
@@ -23031,7 +22867,6 @@ impl Resume {
 /// `--continue`, `--abort` or `--finalize` of the rebase cowshed stopped at a conflict in the
 /// workspace at `root` (02_workspaces.md, "`cowshed rebase`"). Only a stopped rebase this verb
 /// started, which its [`STOPPED_REBASE`] file names, is carried on.
-#[cfg(target_os = "macos")]
 async fn resume_rebase(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -23227,7 +23062,6 @@ async fn resume_rebase(
 
 /// Whether a resolved file still carries a conflict marker line git writes (`<<<<<<< `,
 /// `>>>>>>> `); a file that cannot be read, deleted in the resolution, carries none.
-#[cfg(target_os = "macos")]
 fn has_conflict_markers(path: &Path) -> bool {
     std::fs::read(path).is_ok_and(|bytes| {
         bytes
@@ -23237,7 +23071,6 @@ fn has_conflict_markers(path: &Path) -> bool {
 }
 
 /// The unmerged paths of a replay that stopped on a conflict.
-#[cfg(target_os = "macos")]
 async fn unmerged_paths(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<Vec<String>> {
     let output = invoke_git(
         store_root,
@@ -23255,7 +23088,6 @@ async fn unmerged_paths(store_root: &std::sync::Arc<Path>, root: &Path) -> Resul
 }
 
 /// How a replay conflict's refusal names its paths: ten, then a count of the rest.
-#[cfg(target_os = "macos")]
 fn conflicted_paths(unmerged: Result<Vec<String>>) -> String {
     const NAMED: usize = 10;
     match unmerged {
@@ -23279,12 +23111,10 @@ fn conflicted_paths(unmerged: Result<Vec<String>>) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn git_oid(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<GitOid> {
     git_revision_oid(store_root, root, "HEAD").await
 }
 
-#[cfg(target_os = "macos")]
 async fn git_revision_oid(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -23302,7 +23132,6 @@ async fn git_revision_oid(
 /// `rev-parse --verify --quiet` is the spelling that distinguishes those two outcomes: `show-ref
 /// --verify` is *fatal* (exit 128) on an absent ref, which would turn "the target branch does not
 /// exist yet" into an internal error instead of the `None` every caller here is written for.
-#[cfg(target_os = "macos")]
 async fn git_optional_ref_oid(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
@@ -23325,7 +23154,6 @@ async fn git_optional_ref_oid(
         .map_err(native_integrity_error)
 }
 
-#[cfg(target_os = "macos")]
 fn require_expected_ref(
     expected: Option<&crate::api::dto::ExpectedRefHead>,
     actual: Option<&GitOid>,
@@ -23348,14 +23176,12 @@ fn require_expected_ref(
 }
 
 /// A land retains only its own checks' attributed summaries in memory until output restoration.
-#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct CheckedLandChecks {
     runs: Vec<crate::build_volume::nx::CheckedRun>,
     unattributed: Vec<crate::api::dto::UnattributedCheck>,
 }
 
-#[cfg(target_os = "macos")]
 impl CheckedLandChecks {
     fn capture(
         &mut self,
@@ -23406,7 +23232,6 @@ impl CheckedLandChecks {
 }
 
 /// Require a source or landed target's current activation before another fork consumes it.
-#[cfg(target_os = "macos")]
 async fn require_current_shell(workspace: &WorkspaceName, mount: &Path) -> Result<()> {
     let workspace = workspace.clone();
     let mount = mount.to_owned();
@@ -23429,7 +23254,6 @@ async fn require_current_shell(workspace: &WorkspaceName, mount: &Path) -> Resul
 /// It carries no environment of its own, so a check builds the units an interactive command
 /// builds. Forcing `CARGO_INCREMENTAL=0` here once made every workspace member a separate unit,
 /// recompiled on each landing.
-#[cfg(target_os = "macos")]
 fn land_check_request(check: &str) -> ExecRequest {
     ExecRequest {
         command: crate::api::dto::ExecCommand::Argv(vec![
@@ -23476,7 +23300,6 @@ mod land_check_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
 /// Turn a failed git invocation into an error whose `next:` names what actually went wrong.
 ///
 /// A single catch-all hint is worse than no hint: it covers several unrelated failures, so a
@@ -23525,7 +23348,6 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
 }
 
 /// A mint's source snapshot may widen its initial reads; later job snapshots never do.
-#[cfg(target_os = "macos")]
 async fn inherited_developer_read_grants(
     source: PathBuf,
     stores: crate::developer_links::PackageStores,
@@ -23554,7 +23376,6 @@ async fn inherited_developer_read_grants(
 /// `nx show target inputs <task> --json` run there (`nx::task_inputs` pins its shape), and their
 /// digest. A task Nx cannot describe, or whose description cannot be read whole, keeps its hash
 /// and says why; nothing is inferred from partial output.
-#[cfg(target_os = "macos")]
 async fn task_inputs(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
@@ -23600,7 +23421,6 @@ async fn task_inputs(
 }
 
 /// The whole stdout of the finished job `job`, or where its read failed.
-#[cfg(target_os = "macos")]
 async fn read_job_stdout(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     job: JobId,
@@ -23617,7 +23437,6 @@ async fn read_job_stdout(
 /// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at
 /// `mount`, as the root's own directory so its `.envrc` gives its toolchain. Read-write, as a
 /// run: stock Nx records task details in the root's database. It asks for one token at `class`.
-#[cfg(target_os = "macos")]
 fn nx_probe_request(
     mount: &Path,
     root: &Path,
@@ -23660,7 +23479,6 @@ fn nx_probe_request(
 
 /// Run one probe job and read its stdout. A job that cannot start, be waited on, or exit 0 is
 /// that root's failure, with the supervisor's diagnosis.
-#[cfg(target_os = "macos")]
 async fn nx_probe_stdout(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
@@ -23688,7 +23506,6 @@ async fn nx_probe_stdout(
 /// Publish one attributed Nx run of a passed land check: its task hashes, from the cache of the
 /// Nx root it ran in, through the landing workspace's own Nx cache route (the job's
 /// `NX_SELF_HOSTED_REMOTE_CACHE_SERVER`), as a gate-class job of that workspace.
-#[cfg(target_os = "macos")]
 async fn publish_nx_run(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
@@ -23714,7 +23531,6 @@ async fn publish_nx_run(
     let stdout = nx_probe_stdout(handle, build_volume, request).await?;
     crate::build_volume::nx::published(&stdout)
 }
-#[cfg(target_os = "macos")]
 /// Read back the bounded tail of a finished job's stderr for diagnostic purposes.
 ///
 /// Best effort by design: a check whose output cannot be read still fails with its exit
@@ -23743,7 +23559,6 @@ async fn read_job_stderr_tail(
     super::supervisor::diagnostic_stderr_tail(&collected)
 }
 
-#[cfg(target_os = "macos")]
 /// Recognize a Seatbelt-class denial in a child's own stderr, quoted verbatim in the
 /// resulting diagnostic.
 ///
@@ -23806,7 +23621,6 @@ fn refuse_linux_loopback_any(delta: &GrantDelta) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(target_os = "macos")]
 fn normalize_grant_delta(delta: &mut GrantDelta, revoke: bool) -> Result<()> {
     normalize_grant_paths(&mut delta.read)?;
     normalize_grant_paths(&mut delta.write)?;
@@ -23815,7 +23629,6 @@ fn normalize_grant_delta(delta: &mut GrantDelta, revoke: bool) -> Result<()> {
     normalize_egress_delta(&mut delta.egress, revoke)
 }
 
-#[cfg(target_os = "macos")]
 fn normalize_egress_delta(rules: &mut [crate::metadata::EgressRule], revoke: bool) -> Result<()> {
     for rule in rules {
         match cowshed_gateway_types::HostPattern::parse(&rule.host) {
@@ -23832,7 +23645,6 @@ fn normalize_egress_delta(rules: &mut [crate::metadata::EgressRule], revoke: boo
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn normalize_relative_denies(paths: &mut Vec<PathBuf>) -> Result<()> {
     for path in paths.iter_mut() {
         if path.as_os_str().is_empty()
@@ -23855,7 +23667,6 @@ fn normalize_relative_denies(paths: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn normalize_grant_paths(paths: &mut Vec<PathBuf>) -> Result<()> {
     for path in paths.iter_mut() {
         let original = std::mem::take(path);
@@ -23866,7 +23677,6 @@ fn normalize_grant_paths(paths: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn grant_path_usage(path: &Path, detail: impl std::fmt::Display) -> CowshedError {
     CowshedError::usage(
         format!("grant path {} {detail}", path.display()),
@@ -23874,7 +23684,6 @@ fn grant_path_usage(path: &Path, detail: impl std::fmt::Display) -> CowshedError
     )
 }
 
-#[cfg(target_os = "macos")]
 fn resolve_grant_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() || crate::sandbox::canonical_lexical_absolute(path).is_none() {
         return Err(grant_path_usage(
@@ -23894,7 +23703,6 @@ fn resolve_grant_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn require_canonical_grant_path(original: &Path, real: PathBuf) -> Result<PathBuf> {
     if !crate::repository::is_lexically_canonical(&real) {
         return Err(grant_path_usage(
@@ -23905,12 +23713,10 @@ fn require_canonical_grant_path(original: &Path, real: PathBuf) -> Result<PathBu
     Ok(real)
 }
 
-#[cfg(target_os = "macos")]
 fn ambiguous_grant_parent_dir(path: &Path) -> Result<PathBuf> {
     Err(grant_path_usage(path, "has '..' after a missing component"))
 }
 
-#[cfg(target_os = "macos")]
 fn resolve_missing_grant_path(path: &Path) -> Result<PathBuf> {
     let mut resolved = PathBuf::from("/");
     let mut remaining = path.components();
@@ -23974,7 +23780,6 @@ fn resolve_missing_grant_path(path: &Path) -> Result<PathBuf> {
     require_canonical_grant_path(path, resolved)
 }
 
-#[cfg(target_os = "macos")]
 fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     update_ordered_set(&mut grants.read, delta.read, revoke);
     update_ordered_set(&mut grants.write, delta.write, revoke);
@@ -23988,14 +23793,12 @@ fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn update_ordered_set<T: Ord>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
     update_set(current, delta, revoke);
     current.sort();
     current.dedup();
 }
 
-#[cfg(target_os = "macos")]
 fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
     if revoke {
         current.retain(|value| !delta.contains(value));
@@ -24012,7 +23815,6 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
 /// restates its rule in place, or appends it for a host not yet granted; revoking a host removes
 /// its rule whatever it holds. Comparing whole rules instead left an intercepted and an opaque rule
 /// side by side for one host, so no grant could ever change a host's mode.
-#[cfg(target_os = "macos")]
 fn update_egress(
     current: &mut Vec<crate::metadata::EgressRule>,
     delta: Vec<crate::metadata::EgressRule>,
@@ -24062,7 +23864,7 @@ mod grant_unit_tests {
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
             store_root: mount_root.join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            port_block: Some(crate::metadata::PortBlock::new(40_960, 16).unwrap()),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: RunSandboxMode::ReadWrite,
@@ -24475,7 +24277,6 @@ mod grant_unit_tests {
 /// project policy. One reader for every consumer — the supervisor sandbox, its reuse check, and
 /// the grant verbs' validation — so none of them can see a different snapshot than the gateway
 /// session built from the same policy.
-#[cfg(target_os = "macos")]
 fn effective_workspace_grants(
     layout: &crate::storage::StorageLayout,
     workspace: &GrantSet,
@@ -24487,7 +24288,6 @@ fn effective_workspace_grants(
 
 /// The trusted project policy; a policy that cannot be read completely fails closed before any
 /// supervisor launches or any grant is recorded against it.
-#[cfg(target_os = "macos")]
 fn read_project_policy(path: &Path) -> Result<crate::project_policy::ProjectPolicy> {
     crate::project_policy::ProjectPolicy::read(path).map_err(|error| {
         CowshedError::integrity(
@@ -24498,7 +24298,6 @@ fn read_project_policy(path: &Path) -> Result<crate::project_policy::ProjectPoli
 }
 
 /// Refuse a grant snapshot the sandbox would refuse at launch, with the remedy for each cause.
-#[cfg(target_os = "macos")]
 fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> {
     crate::sandbox::validate_sandbox_config(config).map_err(|error| match error {
         crate::sandbox::SandboxError::GrantIntersectsDeny { .. } => CowshedError::sandbox_denied(
@@ -24522,7 +24321,6 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
 
 /// `build_volume_mount` is the checkout's build volume as resolved now
 /// ([`crate::build_volume::BuildVolumeLayout::grant`]); a grant-only validation passes `None`.
-#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn supervisor_sandbox(
     home: &Path,
@@ -24559,13 +24357,11 @@ fn supervisor_sandbox(
 
 /// The retirements the trash records: each image there whose grants sidecar names it. An image
 /// without one has no record to read.
-#[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct RetiredTrash {
     recorded: Vec<crate::storage::lifecycle::RetiredRef>,
 }
 
-#[cfg(target_os = "macos")]
 fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     project_root: &Path,
     repo_id: &RepoId,
@@ -24924,7 +24720,6 @@ mod retired_recovery_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn native_staged_error(
     error: crate::storage::apfs::StagedExecutionError<CowshedError>,
 ) -> CowshedError {
@@ -24945,7 +24740,6 @@ fn native_staged_error(
 
 /// A fork's or rename's staged clone error, noting in `reclaimed` whether the storage reclaimed
 /// the fresh clone the refusing initializer ran on, which decides what the verb withdraws.
-#[cfg(target_os = "macos")]
 fn native_clone_error(
     error: crate::storage::apfs::StagedExecutionError<CowshedError>,
     reclaimed: &mut bool,
@@ -24957,7 +24751,6 @@ fn native_clone_error(
     native_staged_error(error)
 }
 
-#[cfg(target_os = "macos")]
 fn native_retire_error(
     error: crate::storage::apfs::RetireExecutionError<CowshedError>,
 ) -> CowshedError {
@@ -24969,7 +24762,6 @@ fn native_retire_error(
 
 /// Read a capacity the way both image verbs spell it, refusing anything the tools would have to
 /// round or reinterpret before the caller's workspace is touched.
-#[cfg(target_os = "macos")]
 fn parse_capacity(value: &str) -> Result<cowshed_apfs::image::ImageCapacity> {
     cowshed_apfs::image::ImageCapacity::parse(value).map_err(|error| {
         CowshedError::usage(
@@ -24984,7 +24776,6 @@ fn parse_capacity(value: &str) -> Result<cowshed_apfs::image::ImageCapacity> {
 /// minted). A marker from before lineage was recorded is healed once: its ancestors are exactly
 /// the foreign origins already in its records — every one was admitted by the controller that
 /// wrote it — so the marker is rewritten with them and is strict from then on.
-#[cfg(target_os = "macos")]
 fn workspace_lineage(
     census: &crate::census::CensusScope,
     mount: &Path,
@@ -25023,16 +24814,18 @@ fn workspace_lineage(
     Ok(marker.lineage.unwrap_or_default().into_iter().collect())
 }
 
-#[cfg(target_os = "macos")]
 fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     match error {
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
             CowshedError::lifecycle_conflict(error)
         }
-        error @ crate::storage::apfs::ApfsStorageError::Unsupported { .. } => CowshedError::usage(
-            error.to_string(),
-            "use the native APFS backend for physical-volume operations",
-        ),
+        crate::storage::apfs::ApfsStorageError::Unsupported {
+            substrate,
+            operation,
+        } => CowshedError::unsupported_on_substrate(crate::error::SubstrateRefusal {
+            substrate,
+            operation,
+        }),
         crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::retryable(
             crate::error::Retry::GcPlanStale,
             "garbage-collection plan became stale: an image was reclaimed or retired between the \
@@ -25088,6 +24881,13 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             error.to_string(),
             crate::storage::apfs::build_volume_held_hint(holds, open),
         ),
+        // Forks still depend on the workspace: the store is healthy, and the remedy is theirs.
+        ref error @ crate::storage::apfs::ApfsStorageError::DependentForks { .. } => {
+            CowshedError::conflict(
+                error.to_string(),
+                "land or remove each fork first, then retry",
+            )
+        }
         // An operation taking image locks without waiting found one held: its caller, a pass
         // finishing residue, keeps the locks to wait for them alone (01_storage.md, "Lock order").
         ref error @ crate::storage::apfs::ApfsStorageError::ImageLocksHeld { ref held } => {
@@ -25111,14 +24911,12 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
 /// Direct land retirement only inspects holders: Land 4 owns its quiesce signal authority.
 /// Other callers retain their existing record-nominated close, whose ownership hardening
 /// remains open (04_sandbox.md, "Trusted supervisor and child profiles").
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 enum CheckoutNxCheck {
     Held,
     CloseRecorded,
 }
 
-#[cfg(target_os = "macos")]
 impl CheckoutNxCheck {
     fn supervisor_retirement(self) -> NxDaemonRetirement {
         match self {
@@ -25139,7 +24937,6 @@ impl CheckoutNxCheck {
 /// after adoption it may still name the target's build volume, which does not retire here.
 /// [`crate::build_volume::nx::Busy`] is the caller's to judge: `detach` refuses on it, while
 /// retirement reports it and retains the grace and force for its own workspace image.
-#[cfg(target_os = "macos")]
 async fn check_checkout_nx(
     census: crate::census::CensusScope,
     workspace: &WorkspaceName,
@@ -25175,14 +24972,12 @@ async fn check_checkout_nx(
 
 /// Whether `path` is a directory with nothing in it, as a replaced main leaves its checkout.
 /// Anything unreadable is not proven empty.
-#[cfg(target_os = "macos")]
 fn is_empty_directory(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Whether a file system is mounted exactly at `path`: its device differs from its parent's.
 /// A path nothing is mounted at is a directory of the volume that holds it.
-#[cfg(target_os = "macos")]
 fn is_mount_point(path: &Path) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let Some(parent) = path.parent() else {
@@ -25197,7 +24992,6 @@ fn is_mount_point(path: &Path) -> std::io::Result<bool> {
 
 /// Main was just mounted from `image`, so naming it must find its volume. A skip says the mount
 /// is not the one cowshed just made: an internal error, never a silent success.
-#[cfg(target_os = "macos")]
 fn require_named_after_mount(named: crate::storage::apfs::Labelled, image: &Path) -> Result<()> {
     use crate::storage::apfs::Labelled;
     match named {
@@ -25213,10 +25007,8 @@ fn require_named_after_mount(named: crate::storage::apfs::Labelled, image: &Path
 
 /// Names a workspace image's volume through the APFS host, which renames only the volume device
 /// the kernel maps that image under the store to.
-#[cfg(target_os = "macos")]
 struct ApfsLabeller<H>(std::sync::Arc<H>);
 
-#[cfg(target_os = "macos")]
 impl<H: RuntimeStorageHost> super::supervisor::VolumeLabeller for ApfsLabeller<H> {
     fn ensure_label(
         &self,
@@ -25234,7 +25026,6 @@ impl<H: RuntimeStorageHost> super::supervisor::VolumeLabeller for ApfsLabeller<H
 /// that is not broken: first the tree census, then the volume census, which also walks mapped
 /// files. With neither naming a process, say so, and name what is mounted inside the volume:
 /// what still holds it then is another user's process or the kernel, which this user cannot see.
-#[cfg(target_os = "macos")]
 fn detach_refused(
     census: &crate::census::CensusScope,
     workspace: &WorkspaceName,
@@ -25329,7 +25120,6 @@ fn detach_refused(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn native_environment_error(
     error: crate::storage::bootstrap::native::NativeBootstrapError,
 ) -> CowshedError {
@@ -25354,7 +25144,6 @@ fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "cowshed doctor --json")
 }
 
-#[cfg(target_os = "macos")]
 fn main_name() -> WorkspaceName {
     WorkspaceName::main()
 }
@@ -25367,7 +25156,6 @@ fn main_name() -> WorkspaceName {
 /// a refusal's hint learns to reach for it by reflex, so the hints here name safe remedies only —
 /// land it, commit it, finish the merge — and the destructive flag is documented where a human
 /// reads options deliberately, in `cowshed rm`'s usage text.
-#[cfg(target_os = "macos")]
 fn removal_in_progress_refusal(workspace: &WorkspaceName, operation: &str) -> CowshedError {
     CowshedError::conflict(
         format!("workspace {workspace} has an in-progress {operation} Git operation"),
@@ -25378,12 +25166,10 @@ fn removal_in_progress_refusal(workspace: &WorkspaceName, operation: &str) -> Co
 /// The age below which an explicit `rm` refuses a session workspace unless forced
 /// (02_workspaces.md, `rm` step 1): younger than the time it takes to write a first edit, a clean
 /// workspace at main is indistinguishable from a landed one, and it is not abandoned.
-#[cfg(target_os = "macos")]
 const YOUNG_WORKSPACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// What a removal does with a workspace's live owner: a job its supervisor runs or a named shell
 /// session it holds (02_workspaces.md, `rm` step 2; `land` step 5, "Folds").
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LiveOwner<'a> {
     /// Let the running jobs finish first, as `rm` does; `--force` stops them.
@@ -25396,7 +25182,6 @@ enum LiveOwner<'a> {
     },
 }
 
-#[cfg(target_os = "macos")]
 impl LiveOwner<'_> {
     const fn retire_when(self, force: bool) -> RetireWhen {
         match (self, force) {
@@ -25409,14 +25194,12 @@ impl LiveOwner<'_> {
 
 /// Whether a removal still asks how young its workspace is. Only an explicit removal does: a
 /// land retires the unit it just landed, and a replay finishes a removal already authorized.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum YoungPolicy {
     Refuse,
     Authorized,
 }
 
-#[cfg(target_os = "macos")]
 impl YoungPolicy {
     /// `workspace`, when this removal refuses it for being younger than [`YOUNG_WORKSPACE`].
     fn of(self, workspace: &NativeWorkspace) -> Result<Option<YoungWorkspace>> {
@@ -25432,14 +25215,12 @@ impl YoungPolicy {
 
 /// A workspace younger than [`YOUNG_WORKSPACE`]: when it was created, and how long ago. A creation
 /// time that cannot be read is young with no age: the guard fails closed.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct YoungWorkspace {
     created_at: String,
     age: Option<std::time::Duration>,
 }
 
-#[cfg(target_os = "macos")]
 impl YoungWorkspace {
     fn of(created_at: &str, now: std::time::SystemTime) -> Option<Self> {
         let created = crate::api::dto::UtcTimestamp::new(created_at)
@@ -25482,7 +25263,6 @@ impl YoungWorkspace {
 
 /// What a removal's gates authorized: the commits an abandonment bundles, the ref that keeps a head
 /// the target does not hold, and, when forced, every guard the force overrode, for the deletion log.
-#[cfg(target_os = "macos")]
 struct NativeRemovalAuthority {
     abandoning: Option<NativeLandedState>,
     head_kept_by: Option<crate::api::dto::PushRef>,
@@ -25495,7 +25275,6 @@ struct NativeRemovalAuthority {
 /// and losing the kept directories with the image. `--force` waives none of them: it overrides
 /// only the age floor, which the caller asks last. Answers what the force overrode, for the
 /// deletion log, when the removal was forced.
-#[cfg(target_os = "macos")]
 fn removal_state_gate(
     workspace: &WorkspaceName,
     options: RetireOptions,
@@ -25521,7 +25300,6 @@ fn removal_state_gate(
 }
 
 /// Every guard `--force` overrode: the age floor, when `young` names it.
-#[cfg(target_os = "macos")]
 fn overridden_by_force(
     young: Option<&YoungWorkspace>,
 ) -> Vec<crate::storage::deletion_log::Overridden> {
@@ -25536,7 +25314,6 @@ fn overridden_by_force(
 
 /// A removal refused for youth names the guard and its floor, never the flag that overrides it:
 /// naming the override is what taught coordinator scripts to reach for it by reflex.
-#[cfg(target_os = "macos")]
 fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> CowshedError {
     let floor = YOUNG_WORKSPACE.as_secs() / 60;
     let age = match young.age {
@@ -25566,7 +25343,6 @@ fn removal_young_refusal(workspace: &WorkspaceName, young: &YoungWorkspace) -> C
 /// kept aside in `.cowshed/kept` (16_build_volumes.md, "What a refresh does at each path"). So
 /// `rm` and land refuse while any is there, naming ten and a count of the rest, with the remedy
 /// that loses nothing first; `retry` is the command to run again.
-#[cfg(target_os = "macos")]
 fn kept_build_state_refusal(
     workspace: &WorkspaceName,
     kept: &[PathBuf],
@@ -25600,7 +25376,6 @@ fn kept_build_state_refusal(
         },
     )
 }
-#[cfg(target_os = "macos")]
 /// The dirt refusal names what `git status` reads as work, ten paths and a count of the rest, and
 /// remedies that lose nothing.
 fn removal_dirty_refusal(workspace: &WorkspaceName, dirt: &[PathBuf]) -> CowshedError {
@@ -25625,7 +25400,6 @@ fn removal_dirty_refusal(workspace: &WorkspaceName, dirt: &[PathBuf]) -> Cowshed
 
 /// What the removal gate decided about a session's commits. The refusal is an outcome of the
 /// decision, not a failure to make one, so it is a variant here rather than an `Err`.
-#[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
 enum RemovalLandedDecision {
     /// The head and every other local branch are held: nothing to bundle.
@@ -25644,7 +25418,6 @@ enum RemovalLandedDecision {
 /// caller only turns it into text with [`removal_unlanded_refusal`] — which is the one point
 /// allowed to read more, to explain it. `dirty` says the work tree holds uncommitted work, which an
 /// abandonment commits into its bundle as well, so a landed but dirty workspace still abandons.
-#[cfg(target_os = "macos")]
 fn removal_landed_decision(
     landed: NativeLandedState,
     dirty: bool,
@@ -25661,7 +25434,6 @@ fn removal_landed_decision(
 }
 
 /// Who keeps one tip of a retiring workspace once its image is gone.
-#[cfg(target_os = "macos")]
 #[derive(Debug, Eq, PartialEq)]
 enum TipKeeper<'a> {
     /// The abandon bundle, its only copy: the abandonment kept this tip.
@@ -25679,7 +25451,6 @@ enum TipKeeper<'a> {
 /// passed the gate, which the containment branch answers for. The ref keeps the commit, not a
 /// name, so the checked-out branch, at the head's own tip, is kept by it as `HEAD` is, and a
 /// branch elsewhere never is.
-#[cfg(target_os = "macos")]
 fn tip_keeper<'a>(
     name: &str,
     tip: &GitOid,
@@ -25703,7 +25474,6 @@ fn tip_keeper<'a>(
 /// What a refusal names of each refused tip's commits, keyed by tip: those its target holds
 /// neither by content nor by patch identity, or the reason they could not be read
 /// ([`refused_commits`]).
-#[cfg(target_os = "macos")]
 type UnmatchedCommits =
     std::collections::BTreeMap<GitOid, std::result::Result<Vec<crate::git::CommitSubject>, String>>;
 
@@ -25711,7 +25481,6 @@ type UnmatchedCommits =
 /// (`crate::landing::unmatched_commits`): the head's, and every other branch's that did not
 /// pass. Each is measured at the target head its count was taken at, so the names explain that
 /// count. Read only once the gate has refused, to name what would be lost; it decides nothing.
-#[cfg(target_os = "macos")]
 async fn refused_commits(
     store_root: &std::sync::Arc<Path>,
     target_mount: &Path,
@@ -25757,7 +25526,6 @@ async fn refused_commits(
 /// alone reads as missing work when the work is in fact published and it is local main that has
 /// fallen out of step. It speaks for the head alone, so it joins the head's finding and never a
 /// branch's, and it is silent when the head passed. It explains; the refusal stands either way.
-#[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
     workspace: &WorkspaceName,
     head: &GitOid,
@@ -25876,13 +25644,11 @@ fn removal_unlanded_refusal(
 
 /// A refusal names this many files, and this many commits; the rest are counted, so a wide change
 /// cannot bury the sentence that matters.
-#[cfg(target_os = "macos")]
 const REFUSAL_PATH_LIMIT: usize = 10;
 
 /// The commits of `tip` that `target` holds neither by content nor by patch identity, as a
 /// refusal names them (`REFUSAL_PATH_LIMIT` of them, then a count), or why they could not be
 /// read. `None` when `tip` was not looked up, which names nothing.
-#[cfg(target_os = "macos")]
 fn unmatched_commits_text(
     unmatched: &UnmatchedCommits,
     tip: &GitOid,
@@ -25908,7 +25674,6 @@ fn unmatched_commits_text(
 }
 
 /// The files a refusal names, each with why `target` does not hold its change.
-#[cfg(target_os = "macos")]
 fn unlanded_paths_text(paths: &[crate::api::dto::UnlandedPath], target: &str) -> String {
     use crate::api::dto::UnlandedChange;
 
@@ -25938,7 +25703,6 @@ fn unlanded_paths_text(paths: &[crate::api::dto::UnlandedPath], target: &str) ->
 
 /// A refused slot binding is the caller's problem, not the store's: the slot is taken, or the
 /// workspace already has one. Only genuine record damage becomes an integrity error.
-#[cfg(target_os = "macos")]
 fn slot_binding_error(error: crate::storage::StorageLayoutError) -> CowshedError {
     use crate::metadata::MetadataError;
     use crate::storage::StorageLayoutError;
@@ -25956,7 +25720,6 @@ fn slot_binding_error(error: crate::storage::StorageLayoutError) -> CowshedError
 
 /// A live source is read through its checkout, so a detached one is refused by name before any
 /// Git read or intent: its checkout is not mounted, and `attach` is the verb that mounts it.
-#[cfg(target_os = "macos")]
 fn require_mounted_source(source: &WorkspaceName, current: &NativeWorkspace) -> Result<()> {
     if matches!(
         current.derived.mount_state,
@@ -25970,7 +25733,6 @@ fn require_mounted_source(source: &WorkspaceName, current: &NativeWorkspace) -> 
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn removal_head_moved_refusal(
     workspace: &WorkspaceName,
     from: &GitOid,
@@ -25982,7 +25744,6 @@ fn removal_head_moved_refusal(
     )
 }
 
-#[cfg(target_os = "macos")]
 fn rename_head_moved_refusal(
     source: &WorkspaceName,
     destination: &WorkspaceName,
@@ -25999,7 +25760,6 @@ fn rename_head_moved_refusal(
 
 /// Which retirement a revalidated fence serves. It decides only which head-moved refusal names
 /// the move; every other check of the fence is the same for both.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetirementPurpose<'a> {
     Removal,
@@ -26008,7 +25768,6 @@ enum RetirementPurpose<'a> {
 
 /// Removing main other than by `cowshed unadopt` throws the project's warm image away for good,
 /// so the gate points at the verb that recovers the pre-adoption checkout instead.
-#[cfg(target_os = "macos")]
 fn main_removal_mode_refusal() -> CowshedError {
     CowshedError::conflict(
         "removing main without unadopt destroys this project's warm main image",
@@ -26020,7 +25779,6 @@ fn main_removal_mode_refusal() -> CowshedError {
 ///
 /// Narrowed to `.git`: the workspace needs main's object store and its own administrative
 /// directory, and nothing in main's working tree.
-#[cfg(target_os = "macos")]
 fn git_worktree_repository(
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
     main_mount: PathBuf,
@@ -26034,7 +25792,6 @@ fn git_worktree_repository(
 /// pointer file in the worktree and the `gitdir` file in main's administrative directory from
 /// whichever of the two is still intact, which is what makes it correct whether main moved or the
 /// workspace did.
-#[cfg(target_os = "macos")]
 async fn repair_git_worktree_link(
     store_root: &std::sync::Arc<Path>,
     main_mount: &Path,
@@ -26049,12 +25806,10 @@ async fn repair_git_worktree_link(
 ///
 /// Read from the store-side sidecar, so it answers while the workspace is detached — which is
 /// exactly when retirement and `gc` need it.
-#[cfg(target_os = "macos")]
 fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> bool {
     metadata.info_snapshot.git_worktree
 }
 
-#[cfg(target_os = "macos")]
 fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
     CowshedError::conflict(
         format!("another cowshed process is running a lifecycle operation on {workspace}"),
@@ -26066,7 +25821,6 @@ fn another_process_is_running(workspace: &WorkspaceName) -> CowshedError {
 /// source, otherwise a historical create from main. Older create intents could name a session without recording it here, so it
 /// is retired as a create from main: the source only anchors the pending image's identity checks,
 /// and the retirement's containment check against main still guards the clone's history.
-#[cfg(target_os = "macos")]
 fn abandoned_clone_origin(
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
 ) -> crate::storage::recovery::LifecycleIntent {
@@ -26089,7 +25843,6 @@ fn abandoned_clone_origin(
 /// Whether a process holds `image`'s lifecycle lock right now — the lock a create, fork
 /// or retirement holds on the image for as long as it works on it. A probe that takes the lock
 /// holds it until it is dropped, so it is fenced like every lease (`fork_lock`).
-#[cfg(target_os = "macos")]
 fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -26124,7 +25877,6 @@ fn image_lifecycle_lock_is_held(image: &Path) -> Result<bool> {
 ///
 /// Those are different conditions with different remedies: remounting replaces a stale volume,
 /// but `projectRoot` lives inside the image and is rewritten by `attach`, not by unmounting.
-#[cfg(target_os = "macos")]
 fn diagnose_mounted_marker(
     workspace_name: &WorkspaceName,
     marker: &crate::metadata::WorkspaceMarker,
@@ -26171,7 +25923,6 @@ fn diagnose_mounted_marker(
     findings
 }
 
-#[cfg(target_os = "macos")]
 fn merge_driver_finding(
     workspace_name: &WorkspaceName,
     driver: &crate::git::MergeDriver,
@@ -26207,7 +25958,6 @@ fn merge_driver_finding(
 
 /// A physical image's extent count, for the record: no count warns. A fork warns on its measured
 /// source clone time (`SLOW_SOURCE_CLONE`), which no count predicts.
-#[cfg(target_os = "macos")]
 fn image_extents_finding(
     workspace: &WorkspaceName,
     code: &str,
@@ -26227,7 +25977,6 @@ fn image_extents_finding(
 }
 
 /// Unreadable or concurrently changed physical generations are unknown, not fork-ready.
-#[cfg(target_os = "macos")]
 fn image_extents_unread(
     workspace: &WorkspaceName,
     code: &str,
@@ -26248,7 +25997,6 @@ fn image_extents_unread(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn cowshed_upstream_finding(
     workspace_name: &WorkspaceName,
     upstream: &crate::git::CowshedUpstream,
@@ -26280,7 +26028,6 @@ fn cowshed_upstream_finding(
 /// main's own mount. It is accepted only when it resolves to precisely that mount, and the
 /// identity checks then run against the resolved target. Every other symlink is an unrelated path
 /// standing where the checkout belongs, and stays a conflict — the check narrows, never inverts.
-#[cfg(target_os = "macos")]
 async fn resolve_checkout_identity_path(
     path: &Path,
     path_metadata: &std::fs::Metadata,
@@ -26318,7 +26065,6 @@ async fn resolve_checkout_identity_path(
 }
 
 /// A macOS port block collision a workspace of this project is part of, as doctor reports it.
-#[cfg(target_os = "macos")]
 fn port_collision_finding(
     collision: &crate::gateway_inventory::PortCollision,
 ) -> crate::api::dto::Finding {
@@ -26340,7 +26086,6 @@ fn port_collision_finding(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn native_finding(
     code: &str,
     severity: crate::api::dto::FindingSeverity,
@@ -26357,7 +26102,6 @@ fn native_finding(
 
 /// Every build-state path of the checkout at `checkout` that is not what a refresh leaves it,
 /// against the volume its build link names; none for a checkout that links no volume. Reads only.
-#[cfg(target_os = "macos")]
 fn unsettled_build_links(
     checkout: &Path,
 ) -> Result<Vec<(PathBuf, crate::build_volume::link::Unsettled)>> {
@@ -26387,7 +26131,6 @@ fn unsettled_build_links(
 /// (16_build_volumes.md, "One link per checkout"). A tool that removes the link -- `nx reset`, an
 /// `rm -rf` of the path -- leaves its next run to make a real directory there, off the volume:
 /// nothing it writes reaches a fork, a land or the volume's carry until a refresh relinks it.
-#[cfg(target_os = "macos")]
 fn build_link_finding(
     workspace: &WorkspaceName,
     checkout: &Path,
@@ -26413,7 +26156,6 @@ fn build_link_finding(
 
 /// Every entry of the checkout's kept build-state directory (16_build_volumes.md, "What a
 /// refresh does at each path"). Reads only.
-#[cfg(target_os = "macos")]
 fn kept_build_state(checkout: &Path) -> Result<Vec<crate::build_volume::kept::Kept>> {
     crate::build_volume::kept::list(checkout).map_err(|error| {
         CowshedError::environment_missing(
@@ -26431,7 +26173,6 @@ fn kept_build_state(checkout: &Path) -> Result<Vec<crate::build_volume::kept::Ke
 /// Doctor's report of a directory a refresh moved aside, intact, from a declared build-state
 /// path where it linked the volume. No refresh or `gc` deletes it, and `rm` and `land` refuse the
 /// workspace while it is there, so it is reported until the operator deletes it.
-#[cfg(target_os = "macos")]
 fn kept_build_state_finding(
     workspace: &WorkspaceName,
     kept: crate::build_volume::kept::Kept,
@@ -26461,7 +26202,6 @@ fn kept_build_state_finding(
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn seed_tree_findings(
     store_root: &std::sync::Arc<Path>,
     workspace: &WorkspaceName,
@@ -26546,7 +26286,6 @@ async fn seed_tree_findings(
 /// Doctor's report of a target whose next fork would reseed it (16_build_volumes.md, "Which
 /// volume a seed holds"): the live volume is nearer the target's tree than the seed, or as near
 /// and written since. A seed the fork keeps is no finding.
-#[cfg(target_os = "macos")]
 fn seed_age_finding(
     workspace: &WorkspaceName,
     age: &super::build_volumes::SeedAge,
@@ -26600,7 +26339,6 @@ fn seed_age_finding(
 /// A stopped supervisor is not proof that every process it started has gone. Recovery may keep
 /// groups whose leader it cannot identify. Ordinary admission remains safe, but replacing or
 /// destroying their image would cut the substrate out from under an unaccounted-for writer.
-#[cfg(target_os = "macos")]
 pub(crate) async fn require_lost_groups_released(
     workspace: &WorkspaceName,
     socket: &super::supervisor_socket::BoundSocket,
@@ -26739,7 +26477,6 @@ mod unresolved_retirement_tests {
 /// The groups a lost supervisor left that processes still hold although their leader is gone,
 /// observed now from the workspace's ledger ([`super::job_groups::UnresolvedGroup`]). Read-only:
 /// the workspace's next ledger writer drops the ones nothing holds any more.
-#[cfg(target_os = "macos")]
 async fn unresolved_group_findings(
     workspace: &WorkspaceName,
     ledger: PathBuf,
@@ -26802,7 +26539,6 @@ async fn unresolved_group_findings(
 
 /// The transport move an inspecting open left unrecorded: each remote whose recorded URL Git no
 /// longer uses, and the URL it uses now.
-#[cfg(target_os = "macos")]
 fn binding_move_finding(
     recorded: &RepositoryBinding,
     moved: &RepositoryBinding,
@@ -26833,7 +26569,6 @@ fn binding_move_finding(
 
 /// A lifecycle operation journaled and not completed: either its process is still running it,
 /// or it died and the next opening that may finish it does.
-#[cfg(target_os = "macos")]
 fn unfinished_intent_finding(
     workspace: &WorkspaceName,
     verb: &str,
@@ -26857,7 +26592,6 @@ fn unfinished_intent_finding(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn root_held_finding(
     held: &crate::storage::lifecycle::RootHeldMountpoint,
 ) -> crate::api::dto::Finding {
@@ -26878,7 +26612,6 @@ fn root_held_finding(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn root_held_deferred(
     held: &crate::storage::lifecycle::RootHeldMountpoint,
 ) -> crate::api::dto::GcDeferred {
@@ -26891,7 +26624,6 @@ fn root_held_deferred(
     }
 }
 
-#[cfg(target_os = "macos")]
 fn orphan_session_image_findings(
     candidates: &[crate::storage::lifecycle::StorageGcCandidate],
 ) -> impl Iterator<Item = crate::api::dto::Finding> + '_ {
@@ -26919,7 +26651,6 @@ fn orphan_session_image_findings(
 /// quarantine writer's to evolve, and `doctor` must not misreport a future record. A
 /// tombstone whose workspace name no longer parses is skipped for the same reason — the
 /// rekey hint needs the exact name.
-#[cfg(target_os = "macos")]
 fn quarantine_and_companion_findings_blocking(
     store_root: &Path,
     repo_id: &RepoId,
@@ -26994,7 +26725,6 @@ fn quarantine_and_companion_findings_blocking(
 /// hold on the record, not sickness in the data: quarantine never touches the image, so the
 /// data is intact by construction. The hint names the repair: `rekey` consumes the tombstone
 /// and rebuilds the companion, so a quarantined workspace points at its own fix.
-#[cfg(target_os = "macos")]
 fn quarantined_workspace_finding(
     workspace: &WorkspaceName,
     reason: &str,
@@ -27016,7 +26746,6 @@ fn quarantined_workspace_finding(
 ///
 /// Error: the workspace's CA-gated verbs refuse until the companion is rebuilt, and only
 /// `rekey` rebuilds it — `doctor` merely observes, so the hint must not name it.
-#[cfg(target_os = "macos")]
 fn missing_ca_companion_finding(
     workspace: &WorkspaceName,
     layout: &str,
@@ -27037,7 +26766,6 @@ fn missing_ca_companion_finding(
 }
 
 /// Read the existing successful-install receipt; inspection never runs an installer.
-#[cfg(target_os = "macos")]
 fn node_modules_install_findings(
     workspace: &WorkspaceName,
     checkout: &Path,
@@ -27796,7 +27524,7 @@ mod git_worktree_tests {
     /// runs, citing the include and the rule, rather than failing as an opaque exec denial.
     #[tokio::test]
     async fn a_lane_fetch_under_main_tree_include_grants_is_refused_by_name() {
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let store_root = store.shared();
         let scratch = crate::temp_root::TempRoot::new("cowshed-lane-include");
         let git = |directory: &Path, args: &[&str]| {
@@ -27950,7 +27678,7 @@ mod workspace_origin_tests {
     async fn doctor_names_seed_tree_drift_and_keeps_a_nearer_landed_seed() {
         use super::super::build_volumes::{Frozen, Nearness, Placed, SeedAge};
         use crate::build_volume::BuildVolumeId;
-        let store = crate::temp_root::FixtureStore::new();
+        let store = crate::sandbox::tests::fixture_store();
         let store_root = store.shared();
         let root = temp_directory("seed-tree-doctor");
         let checkout = root.as_path();
@@ -29956,7 +29684,7 @@ mod port_reservation_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod terminal_project_cleanup_tests {
     use super::{
         UnbindCheckpoint, clean_terminal_project_storage, finish_restored_project_unbinding,

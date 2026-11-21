@@ -27,16 +27,12 @@ use crate::api::dto::{
 use crate::api::journal_tail::tail_journals;
 use crate::api::process::JobLeafAttribution;
 use crate::api::process::{JobProcessRetirement, JobProcessTree};
-#[cfg(target_os = "macos")]
 use crate::api::process::{
     JobSubtreeAdmission, JobSubtreeHandle, JobSubtreeRefusal, JobSubtreeRetirement,
 };
-#[cfg(target_os = "macos")]
-use crate::api::resources::UsageReconciliation;
 use crate::api::resources::{
     HostLoadSample, JobAccounting, JobResourceSample, ResidentBytes, SampleInterval,
 };
-#[cfg(target_os = "macos")]
 use crate::error::PriorityFailure;
 use crate::error::{
     AdmissionField, AdmissionRefusal, CowshedError, CpuAdmissionRefusal, Result, StdinRefusal,
@@ -53,7 +49,7 @@ use crate::sandbox::{
 };
 use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
-use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
+use crate::workspace_environment::WORKSPACE_TOKEN_ENV;
 use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
@@ -68,7 +64,6 @@ use crate::runtime::job_resources::{
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
 pub use crate::runtime::nx_daemon::NxDaemonIdle;
 use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
-#[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
 use crate::runtime::retirement_refusal::{AtEnd, Refusal, RetirementRun, at_end};
@@ -83,11 +78,21 @@ use crate::storage::job_artifact::{
 #[cfg(test)]
 mod actor_census;
 mod group_ledger;
+#[cfg(target_os = "linux")]
+mod linux;
 mod liveness;
+#[cfg(target_os = "macos")]
+mod macos;
 mod off_actor;
 use group_ledger::GroupLedgerWriter;
+#[cfg(target_os = "linux")]
+use linux as platform;
 use liveness::{Liveness, LivenessSlot, LivenessWriter};
+#[cfg(target_os = "macos")]
+use macos as platform;
 use off_actor::{InMemory, OffActor};
+pub(super) use platform::CommandPlacement;
+pub use platform::JobMembership;
 #[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
 #[cfg(test)]
@@ -369,7 +374,9 @@ impl Default for WorkspaceSupervisorConfig {
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
                 store_root: PathBuf::from("/tmp/cowshed-store"),
-                port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
+                port_block: Some(
+                    crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
+                ),
                 retained_port_blocks: Vec::new(),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
                 grants: crate::sandbox::SandboxGrants::default(),
@@ -632,17 +639,18 @@ pub struct ProcessSpawnRequest {
     /// Where the command runs: in the workspace's sandbox, or a trusted coordinator's gate at the
     /// host boundary.
     pub scope: ExecScope,
-    /// The job's jobserver and, on macOS, its class nice, which the command alone runs under.
+    /// The job's jobserver and the nice its class is placed at, which the command alone runs
+    /// under.
     pub cpu: CpuPlacement,
-    /// Native Linux admission owns this cgroup before any command can start. Injected sinks
-    /// without native processes have no kernel membership.
-    #[cfg(target_os = "linux")]
-    pub cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
+    /// The kernel membership the job's admission made, which a native spawn places its command
+    /// in before the command can start. `None` where the platform has none, and from an injected
+    /// sink that runs no native process.
+    pub membership: Option<JobMembership>,
 }
 
 /// What a spawn places a job's owned command under (05_gateway.md "Classes", "Parallelism inside
-/// a job"): the jobserver fifo its build tree reads and the count its test threads and Nx tasks are
-/// sized to, and on macOS the nice its class runs at. On Linux the job's cgroup carries its class.
+/// a job"): the jobserver fifo its build tree reads, the count its test threads and Nx tasks are
+/// sized to, and the nice its class is placed at.
 #[derive(Clone, Debug)]
 pub struct CpuPlacement {
     pub fifo: PathBuf,
@@ -655,7 +663,8 @@ pub struct CpuPlacement {
     /// When the job was admitted, in milliseconds since 1970: interactive work names it to mbx,
     /// whose pool decays the job's later asks as it ages ([`super::placement::DecayStep`]).
     pub started_ms: u64,
-    #[cfg(target_os = "macos")]
+    /// The nice the job's class is placed at ([`super::placement::placed_nice`]): on the command
+    /// itself, or on the class cgroup its job's own cgroup sits in.
     pub nice: i32,
 }
 
@@ -770,7 +779,6 @@ mod cpu_placement_tests {
                 class,
                 held,
                 started_ms: 1_700_000_000_000,
-                #[cfg(target_os = "macos")]
                 nice: 10,
             };
             let exported: BTreeMap<OsString, OsString> = placement
@@ -834,7 +842,6 @@ mod cpu_placement_tests {
             class: ExecClass::Background,
             held: false,
             started_ms: 0,
-            #[cfg(target_os = "macos")]
             nice: 10,
         };
         let exported = |caller: &[(&str, &str)]| -> BTreeMap<OsString, OsString> {
@@ -909,7 +916,6 @@ mod cpu_placement_tests {
                 class,
                 held: false,
                 started_ms: 0,
-                #[cfg(target_os = "macos")]
                 nice: 10,
             };
             let output = std::process::Command::new("/bin/sh")
@@ -1018,7 +1024,6 @@ pub enum ProcessEvent {
     /// The cold host's activation for the job ended, however it ended: its interval's cost, read
     /// by the host's parent while it still held the host. The host's later work is not the
     /// job's.
-    #[cfg(target_os = "macos")]
     ActivationEnded {
         job_id: JobId,
         usage: std::result::Result<
@@ -1067,7 +1072,6 @@ impl ProcessEvent {
             Self::StdinPumpFailed { .. } => "stdin-pump-failed",
             Self::Escalate { .. } => "escalate",
             Self::Activating { .. } => "activating",
-            #[cfg(target_os = "macos")]
             Self::ActivationEnded { .. } => "activation-ended",
             Self::Started { .. } => "started",
             Self::LaunchFailed { .. } => "launch-failed",
@@ -1096,9 +1100,9 @@ pub struct OwnedProcess {
 /// job concluded, or when its supervisor goes away -- so the group id names the job's group alone
 /// for as long as signals may be sent, descendants that outlive the leader included.
 pub trait RunningProcess: Send {
-    /// A native Linux spawn's complete kernel membership, retained through terminal accounting.
-    #[cfg(target_os = "linux")]
-    fn cgroup(&self) -> Option<&Arc<super::job_cgroup::JobCgroup>> {
+    /// The kernel membership a native spawn placed its command in, retained through terminal
+    /// accounting. `None` where the platform has none, and for a non-native spawn provider.
+    fn membership(&self) -> Option<&JobMembership> {
         None
     }
     /// The command's process as its parent observed it before anything could reap it. `None`
@@ -1108,7 +1112,6 @@ pub trait RunningProcess: Send {
     /// start, and nice, arrive with [`ProcessEvent::Started`].
     fn nice(&self) -> Option<i32>;
     /// The retained native source this spawn owns, or absence for a non-native spawn provider.
-    #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&ProcessMonitor>;
     /// `Ok(false)` means the bounded process-input lane is full.
     fn try_write_stdin(&mut self, bytes: Bytes) -> Result<bool>;
@@ -1125,15 +1128,15 @@ pub trait RunningProcess: Send {
 
 #[async_trait]
 pub trait SpawnSink: Send {
-    /// Prepare kernel membership before the actor records an admission. A non-native sink
-    /// owns no OS process; the production sink must return a cgroup or refuse.
-    #[cfg(target_os = "linux")]
-    async fn admit_cgroup(
+    /// Prepare the job's kernel membership before the actor records its admission. A non-native
+    /// sink owns no OS process and so none; the production sink returns what its platform holds
+    /// a job's processes in, or refuses.
+    async fn admit_membership(
         &mut self,
         _authority: &WorkspaceAuthoritySnapshot,
         _job_id: JobId,
         _class: ExecClass,
-    ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
+    ) -> Result<Option<JobMembership>> {
         Ok(None)
     }
 
@@ -1576,7 +1579,9 @@ fn one_shot_plan(
 
 /// The installed launcher leads private tool links, never a host toolchain profile.
 /// Manager wrappers and the capability's installed Cargo route precede bootstrap tools;
-/// the exec host re-leads those two routes after project shell activation.
+/// the exec host re-leads those two routes after project shell activation. The host's system
+/// `PATH` ends it ([`crate::host_path::job_directories`]), never the `PATH` that started this
+/// process.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let tools = match sandbox.mode {
         crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools"),
@@ -1596,47 +1601,18 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     }
     paths.push(tools.join("bin"));
     paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
-    if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
-        && !paths.contains(&path)
-    {
-        paths.push(path);
-    }
-    for fixed in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
-        paths.push(PathBuf::from(fixed));
+    let host = crate::host_path::job_directories(&sandbox.home).map_err(|error| {
+        CowshedError::internal(format!(
+            "name the user of the sandbox PATH's per-user directories: {error}"
+        ))
+    })?;
+    for directory in host {
+        if !paths.contains(&directory) {
+            paths.push(directory);
+        }
     }
     std::env::join_paths(paths)
         .map_err(|error| CowshedError::internal(format!("construct sandbox PATH: {error}")))
-}
-
-/// The platform's selected developer directory: a fixed system install, never a value from the
-/// environment that started this process.
-fn developer_directory() -> Option<PathBuf> {
-    [
-        PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
-        PathBuf::from("/Library/Developer/CommandLineTools"),
-    ]
-    .into_iter()
-    .find(|path| path.is_dir())
-}
-
-/// The `HTTP_PROXY` value for a workspace's own gateway endpoint.
-///
-/// The token rides as basic-auth userinfo because that is the only channel a standard client has:
-/// curl, libcurl (so cargo), reqwest, and Go all turn proxy userinfo into `Proxy-Authorization:
-/// Basic` on the first CONNECT, and none of them can be told to send cowshed's `Bearer` spelling.
-/// Without it every CONNECT is rejected, and cargo reads the rejection as a spurious network error
-/// and retries its whole ladder before failing.
-///
-/// The token authenticates against nothing but this workspace's own loopback listener: a sibling
-/// that reads it from this workspace's process environment (`kern.procargs2`, 04_sandbox.md) can
-/// neither connect to that listener nor present it at its own, which answers 407. The username is
-/// a fixed label the gateway does not compare. The token's alphabet is unpadded base64url, which
-/// is userinfo-safe, so the value never needs percent-encoding.
-fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> String {
-    format!(
-        "http://cowshed:{}@127.0.0.1:{port_base}",
-        workspace_token.encode()
-    )
 }
 
 /// The generic directories owned by each exec mode's private environment.
@@ -2098,7 +2074,7 @@ pub struct RunControl<'a> {
 }
 /// What a caller waiting on [`run_in_supervisor`] can say about the run while it runs: the phase
 /// the run itself reached, and once its process exists, that process alone -- its pid, its
-/// kernel run state and (on macOS) its command. A report built from a snapshot names what
+/// kernel run state and its command. A report built from a snapshot names what
 /// was observed of the run itself, never a cause inferred from other processes.
 #[derive(Debug, Default)]
 pub struct JobRunState {
@@ -2138,7 +2114,6 @@ impl JobRunState {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn observed_command(pid: i32) -> Option<String> {
     let arguments = cowshed_os::process::process_arguments(pid).ok()?;
     Some(
@@ -2149,11 +2124,6 @@ fn observed_command(pid: i32) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn observed_command(_pid: i32) -> Option<String> {
-    None
 }
 
 /// Describe a background project-tool command in the workspace's own shell.
@@ -2494,13 +2464,10 @@ pub(super) async fn sandbox_environment(
     // rather than silently borrowing whatever the controller's user happens to be.
     let git_identity = crate::git::workspace_git_identity_config(&sandbox.workspace_mount)?;
     let path = bootstrap_path(sandbox)?;
-    let port_base = sandbox.port_block.base().to_string();
-    let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
-
-    // Local services already have a bounded direct-connect capability. Sending
-    // them through the external gateway incorrectly requires an egress grant.
-    // The sandbox still rejects loopback ports outside this workspace's block.
-    let loopback_no_proxy = "localhost,127.0.0.1,::1";
+    // What the workspace records: a block's base is its gateway and the block is exported; a
+    // workspace with none names its launch's connector and exports no port variable.
+    let gateway =
+        crate::workspace_environment::job_gateway_environment(sandbox.port_block, &workspace_token);
     let mut owned: BTreeMap<OsString, OsString> = BTreeMap::new();
     let mut withheld: Vec<&'static str> = Vec::new();
     let mut own = |name: &str, value: &OsStr| {
@@ -2534,11 +2501,6 @@ pub(super) async fn sandbox_environment(
     own("TMPDIR", sandbox.exec_temp_dir.as_os_str());
     // Short, workspace-owned rendezvous namespace; no host runtime state is inherited.
     own("XDG_RUNTIME_DIR", runtime_link.as_os_str());
-    own(PORT_BASE_ENV, OsStr::new(&port_base));
-    own(
-        PORT_BLOCK_SIZE_ENV,
-        OsStr::new(&sandbox.port_block.size().to_string()),
-    );
     // The bare token is no job's to read: the proxy userinfo carries it where a client presents
     // it, and `.cowshed/workspace.json` marks a workspace. A caller's stale value (a host shell
     // that sourced an older `.cowshed/env`) is withheld, not forwarded.
@@ -2558,7 +2520,9 @@ pub(super) async fn sandbox_environment(
     {
         own(
             crate::workspace_environment::NX_REMOTE_SERVER_ENV,
-            OsStr::new(&format!("http://127.0.0.1:{port_base}/nx")),
+            OsStr::new(&crate::workspace_environment::nx_remote_server(
+                sandbox.port_block,
+            )),
         );
         own(
             crate::workspace_environment::NX_REMOTE_STORE_BOUND_ENV,
@@ -2581,11 +2545,10 @@ pub(super) async fn sandbox_environment(
     ) {
         withheld.push(crate::capabilities::mbx::CARGO_ROUTE_ENV);
     }
-    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-        own(name, OsStr::new(&gateway_http));
+    for (name, value) in &gateway.owned {
+        own(name, OsStr::new(value));
     }
-    own("NO_PROXY", OsStr::new(loopback_no_proxy));
-    own("no_proxy", OsStr::new(loopback_no_proxy));
+    withheld.extend(gateway.withheld);
     // Core Git policy includes only controller-approved routes and never inherits caller config.
     match &git_fetch_config {
         Some(path) => {
@@ -2736,8 +2699,8 @@ fn sandboxed_command(
 #[derive(Default)]
 pub struct SystemSpawnSink {
     shells: Option<super::shell_job::WorkspaceShells>,
-    #[cfg(target_os = "linux")]
-    cgroups: Option<super::job_cgroup::IncarnationCgroups>,
+    /// What the platform admits each job's kernel membership from.
+    memberships: platform::MembershipAdmissions,
 }
 
 impl SystemSpawnSink {
@@ -2748,8 +2711,7 @@ impl SystemSpawnSink {
     ) -> Self {
         Self {
             shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
-            #[cfg(target_os = "linux")]
-            cgroups: None,
+            memberships: platform::MembershipAdmissions::default(),
         }
     }
 }
@@ -2761,83 +2723,33 @@ impl SpawnSink for SystemSpawnSink {
             .as_ref()
             .map(super::shell_job::WorkspaceShells::counts)
     }
-    #[cfg(target_os = "linux")]
-    async fn admit_cgroup(
+    async fn admit_membership(
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
         class: ExecClass,
-    ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
-        let mut cgroups = self.cgroups.take();
-        let incarnation = authority.workspace_incarnation.clone();
-        let (cgroups, admitted) = off_actor::run(move || {
-            let admitted = (|| {
-                if !cgroups
-                    .as_ref()
-                    .is_some_and(|jobs| jobs.incarnation() == &incarnation)
-                {
-                    let delegated =
-                        super::job_cgroup::CgroupAuthority::delegated().map_err(cgroup_error)?;
-                    cgroups = Some(delegated.incarnation(&incarnation).map_err(cgroup_error)?);
-                }
-                cgroups
-                    .as_ref()
-                    .expect("authority was established above")
-                    .admit(job_id, class)
-                    .map(Arc::new)
-                    .map(Some)
-                    .map_err(cgroup_error)
-            })();
-            (cgroups, admitted)
-        })
-        .await;
-        self.cgroups = cgroups;
-        admitted
+    ) -> Result<Option<JobMembership>> {
+        self.memberships.admit(authority, job_id, class).await
     }
     async fn spawn(
         &mut self,
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        #[cfg(target_os = "linux")]
-        let cgroup = request.cgroup.clone().ok_or_else(|| {
-            CowshedError::environment_missing(
-                format!(
-                    "job {} has no admitted cgroup: refusing to run an uncontained command",
-                    request.job_id.get()
-                ),
-                "delegate a writable cgroup v2 subtree and admit the job before spawning it",
-            )
-        })?;
+        let placement = CommandPlacement::of(&request)?;
         // Everything a spawn prepares host-side reads or writes the file system, so it is made
         // on the blocking pool ([`prepare_spawn`]); only the spawn itself is made here.
         let prepared =
             off_actor::drive(prepare_spawn(request.clone(), self.shells.is_some())).await?;
         match prepared {
-            PreparedSpawn::HostGate {
-                command,
-                #[cfg(target_os = "macos")]
-                monitor,
-            } => {
-                spawn_fenced(
-                    command,
-                    request.job_id,
-                    #[cfg(target_os = "macos")]
-                    request.cpu.nice,
-                    #[cfg(target_os = "linux")]
-                    cgroup,
-                    #[cfg(target_os = "macos")]
-                    monitor,
-                    events,
-                )
-                .await
+            PreparedSpawn::HostGate { command, monitor } => {
+                spawn_fenced(command, request.job_id, placement, monitor, events).await
             }
             PreparedSpawn::Warm {
                 command,
                 cwd,
                 policy,
                 environment,
-                #[cfg(target_os = "macos")]
                 monitor,
             } => {
                 let Some(shells) = self.shells.as_mut() else {
@@ -2863,9 +2775,7 @@ impl SpawnSink for SystemSpawnSink {
                             .capabilities
                             .active
                             .contains(&crate::capabilities::CapabilityId::Mbx),
-                        #[cfg(target_os = "linux")]
-                        cgroup,
-                        #[cfg(target_os = "macos")]
+                        placement,
                         monitor,
                     },
                     events,
@@ -2874,17 +2784,12 @@ impl SpawnSink for SystemSpawnSink {
             PreparedSpawn::OneShot {
                 plan,
                 environment,
-                #[cfg(target_os = "macos")]
                 monitor,
             } => {
                 spawn_fenced(
                     tokio::process::Command::from(sandboxed_command(&plan, &environment)),
                     request.job_id,
-                    #[cfg(target_os = "macos")]
-                    request.cpu.nice,
-                    #[cfg(target_os = "linux")]
-                    cgroup,
-                    #[cfg(target_os = "macos")]
+                    placement,
                     monitor,
                     events,
                 )
@@ -2899,7 +2804,6 @@ enum PreparedSpawn {
     /// A trusted coordinator's host-boundary command, exec'd outside every sandbox.
     HostGate {
         command: tokio::process::Command,
-        #[cfg(target_os = "macos")]
         monitor: ProcessMonitor,
     },
     /// A command a warm exec host runs, in the environment the host activates.
@@ -2908,14 +2812,12 @@ enum PreparedSpawn {
         cwd: PathBuf,
         policy: SandboxPolicy,
         environment: SandboxEnvironment,
-        #[cfg(target_os = "macos")]
         monitor: ProcessMonitor,
     },
     /// A one-shot child that enters the workspace shell itself.
     OneShot {
         plan: SpawnPlan,
         environment: BTreeMap<OsString, OsString>,
-        #[cfg(target_os = "macos")]
         monitor: ProcessMonitor,
     },
 }
@@ -2933,7 +2835,6 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
         let command = host_gate_command(&request, &cwd)?;
         return Ok(PreparedSpawn::HostGate {
             command,
-            #[cfg(target_os = "macos")]
             monitor: ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?,
         });
     }
@@ -2945,7 +2846,6 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
         sandbox_environment(sandbox, &request.env),
     )
     .await?;
-    #[cfg(target_os = "macos")]
     let monitor = ProcessMonitor::prepare(super::process_tree::TreeOwner::Job(request.job_id))?;
     let argv = match request.command {
         SpawnCommand::Script(script) => {
@@ -2961,7 +2861,6 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
                 cwd,
                 policy,
                 environment,
-                #[cfg(target_os = "macos")]
                 monitor,
             });
         }
@@ -2979,7 +2878,6 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
             cwd,
             policy,
             environment,
-            #[cfg(target_os = "macos")]
             monitor,
         });
     }
@@ -3005,42 +2903,23 @@ async fn prepare_spawn(request: ProcessSpawnRequest, warm: bool) -> Result<Prepa
     Ok(PreparedSpawn::OneShot {
         plan,
         environment,
-        #[cfg(target_os = "macos")]
         monitor,
     })
 }
 
-#[cfg(target_os = "linux")]
-pub(super) fn cgroup_error(error: super::job_cgroup::CgroupError) -> CowshedError {
-    let hint = match &error {
-        // Retirement's own wait expired: the delegation is fine, a member outlived its kill.
-        super::job_cgroup::CgroupError::Unreaped { .. } => {
-            "a member that outlives SIGKILL is in an uninterruptible kernel wait, which ends only \
-             when that call returns: read its kernel stack (/proc/<pid>/stack, as root) for what \
-             it waits on; the job keeps its claims, and killing it again retires it once the \
-             member has exited"
-        }
-        _ => {
-            "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \
-             cgroup.procs, cgroup.subtree_control and cgroup.kill; Linux 6.5+ is required"
-        }
-    };
-    CowshedError::environment_missing(format!("job cgroup containment: {error}"), hint)
-}
-
-#[cfg(target_os = "linux")]
-/// `refusal`, once the unstarted job's cgroup is removed, on the blocking pool: the removal
-/// reads and writes cgroupfs and joins its members for up to the reap bound.
-async fn refused_cgroup(
+/// `refusal`, once the unstarted job's kernel membership is released, on the blocking pool: the
+/// release reads and writes the kernel's membership and joins its members for up to the reap
+/// bound.
+async fn refused_membership(
     mut refusal: CowshedError,
-    cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
+    membership: Option<JobMembership>,
 ) -> CowshedError {
-    if let Some(cgroup) = cgroup
-        && let Err(cleanup) =
-            off_actor::run(move || cgroup.finish(cowshed_os::deadline::REAP)).await
+    if let Some(membership) = membership
+        && let Err(cleanup) = off_actor::run(move || membership.finish()).await
     {
         refusal.message.push_str(&format!(
-            "; removing the unstarted job's cgroup also failed: {cleanup}"
+            "; releasing the unstarted job's kernel membership also failed: {}",
+            cleanup.message
         ));
     }
     refusal
@@ -3102,15 +2981,14 @@ fn refuse_unstartable(program: &OsStr, cwd: &Path, path: Option<&OsStr>) -> Resu
 }
 
 /// Spawn `command` as a job's one-shot leader: in a process group of its own, reaped only inside
-/// its [`ChildFence`]. On macOS the child is held before exec until its native observer watches it
-/// and this process placed its class's `nice`; on Linux it enters the job's cgroup, which carries
-/// its class, before exec.
+/// its [`ChildFence`]. The child is held before exec until its native observer watches it and
+/// `placement` has placed it: at its class's nice, or in the job's cgroup, which it enters before
+/// the hold.
 async fn spawn_fenced(
     mut command: tokio::process::Command,
     job_id: JobId,
-    #[cfg(target_os = "macos")] nice: i32,
-    #[cfg(target_os = "linux")] cgroup: Arc<super::job_cgroup::JobCgroup>,
-    #[cfg(target_os = "macos")] monitor: ProcessMonitor,
+    placement: CommandPlacement,
+    monitor: ProcessMonitor,
     events: mpsc::Sender<ProcessEvent>,
 ) -> Result<Box<dyn RunningProcess>> {
     command
@@ -3120,11 +2998,7 @@ async fn spawn_fenced(
     prepare_child_descriptors(command.as_std_mut())
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
-    #[cfg(target_os = "linux")]
-    cgroup
-        .placement()
-        .map_err(cgroup_error)?
-        .on_exec(command.as_std_mut());
+    placement.on_exec(command.as_std_mut())?;
     // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
     // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
     // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
@@ -3142,13 +3016,13 @@ async fn spawn_fenced(
         });
     }
     // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
-    // Spawning takes the fork lock; observing the birth reads procfs on Linux. Both stay on
-    // the blocking pool, with the owned child retained until its pipes are ready for adoption.
-    #[cfg(target_os = "macos")]
+    // Spawning takes the fork lock, and observing the birth reads the kernel's process table.
+    // Both stay on the blocking pool, with the owned child retained until its pipes are ready
+    // for adoption.
     let source = monitor.clone();
+    let placing = placement.clone();
     let mut spawned = off_actor::run(move || {
         let mut command = command.into_std();
-        #[cfg(target_os = "macos")]
         let (child, nice) = {
             use std::os::unix::process::CommandExt as _;
             let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
@@ -3162,23 +3036,13 @@ async fn spawn_fenced(
             unsafe {
                 command.pre_exec(move || hold.hold());
             }
-            spawn_observed(command, held, gate, &source, nice)
-                .map(|(child, nice)| (child, Some(nice)))
-                .map_err(|error| match error {
-                    HeldSpawnError::Spawn(error) => {
-                        map_exec_error(ExecError::from(classify_spawn_error(error)))
-                    }
-                    HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
-                })?
+            spawn_observed(command, held, gate, &source, &placing).map_err(|error| match error {
+                HeldSpawnError::Spawn(error) => {
+                    map_exec_error(ExecError::from(classify_spawn_error(error)))
+                }
+                HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
+            })?
         };
-        // The cgroup, entered before exec, carries the child's class on Linux.
-        #[cfg(not(target_os = "macos"))]
-        let (child, nice) = (
-            command
-                .spawn_locked()
-                .map_err(|error| map_exec_error(ExecError::from(classify_spawn_error(error))))?,
-            None,
-        );
         off_actor::Spawned::new(child, nice)
     })
     .await?;
@@ -3248,15 +3112,12 @@ async fn spawn_fenced(
         process,
         stdin: StdinLane::new(stdin_sender),
         nice,
-        #[cfg(target_os = "linux")]
-        cgroup,
-        #[cfg(target_os = "macos")]
+        placement,
         monitor,
     }))
 }
 
 /// Why a held one-shot spawn did not release a command.
-#[cfg(target_os = "macos")]
 enum HeldSpawnError {
     /// The spawn, or the observation fence around it, failed.
     Spawn(io::Error),
@@ -3265,16 +3126,16 @@ enum HeldSpawnError {
 }
 
 /// std::Command waits for exec, so spawn and observation run concurrently while the child
-/// is held. While it is held the observer attaches and its nice is placed; a failed attachment
-/// or placement fails the exec, so no workload is released unobserved or at the wrong nice.
-#[cfg(target_os = "macos")]
+/// is held. While it is held the observer attaches and `placement` places it; a failed attachment
+/// or placement fails the exec, so no workload is released unobserved or misplaced. Answers the
+/// child with the nice it was observed at, where its placement is a nice.
 fn spawn_observed(
     mut command: std::process::Command,
     held: super::process_fence::HeldEnds,
     gate: super::process_fence::LeaderGate,
     monitor: &ProcessMonitor,
-    nice: i32,
-) -> std::result::Result<(std::process::Child, i32), HeldSpawnError> {
+    placement: &CommandPlacement,
+) -> std::result::Result<(std::process::Child, Option<i32>), HeldSpawnError> {
     std::thread::scope(|scope| {
         let spawning = scope.spawn(move || {
             let child = command.spawn_locked();
@@ -3284,7 +3145,7 @@ fn spawn_observed(
         let mut placed = None;
         let observed = gate.observe(|pid| {
             monitor.watch(pid).map_err(io::Error::other)?;
-            let placement = super::placement::macos::place_nice(pid, nice);
+            let placement = placement.place(pid);
             let refused = placement
                 .as_ref()
                 .err()
@@ -3447,19 +3308,16 @@ struct SystemRunningProcess {
     /// The command as this process observed it right after spawning it.
     process: OwnedProcess,
     stdin: StdinLane,
-    /// The nice the command was observed at once placed; none on Linux, where the job's cgroup
-    /// carries its class.
+    /// The nice the command was observed at once placed; none where its placement is no nice.
     nice: Option<i32>,
-    #[cfg(target_os = "linux")]
-    cgroup: Arc<super::job_cgroup::JobCgroup>,
-    #[cfg(target_os = "macos")]
+    /// Where the command was placed, which says where the job's signals go.
+    placement: CommandPlacement,
     monitor: ProcessMonitor,
 }
 
 impl RunningProcess for SystemRunningProcess {
-    #[cfg(target_os = "linux")]
-    fn cgroup(&self) -> Option<&Arc<super::job_cgroup::JobCgroup>> {
-        Some(&self.cgroup)
+    fn membership(&self) -> Option<&JobMembership> {
+        self.placement.membership()
     }
 
     fn process(&self) -> Option<&OwnedProcess> {
@@ -3470,7 +3328,6 @@ impl RunningProcess for SystemRunningProcess {
         self.nice
     }
 
-    #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&ProcessMonitor> {
         Some(&self.monitor)
     }
@@ -3488,21 +3345,7 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            match signal {
-                ProcessSignal::Term => self.cgroup.terminate(),
-                ProcessSignal::Kill => self.cgroup.kill(),
-            }
-            .map_err(cgroup_error)
-        }
-        #[cfg(not(target_os = "linux"))]
-        self.fence
-            .signal(match signal {
-                ProcessSignal::Term => libc::SIGTERM,
-                ProcessSignal::Kill => libc::SIGKILL,
-            })
-            .map_err(crate::runtime::child_fence::NotSignalled::into_error)
+        self.placement.signal(&self.fence, signal)
     }
 }
 
@@ -3887,7 +3730,6 @@ impl WorkspaceSupervisorHandle {
         })
         .await
     }
-    #[cfg(target_os = "macos")]
     pub(super) async fn subtree_handle(
         &self,
         peer: super::job_groups::Process,
@@ -3896,7 +3738,6 @@ impl WorkspaceSupervisorHandle {
             .await
     }
 
-    #[cfg(target_os = "macos")]
     pub(super) async fn retire_descendants(
         &self,
         peer: super::job_groups::Process,
@@ -4110,7 +3951,6 @@ impl WorkspaceSupervisorHandle {
     /// ([`NxDaemonKeeper`]), so no daemon outlives the supervisor that watched it. Only the
     /// process serving a supervisor asks, to retire it; that serving host is the macOS native
     /// project host.
-    #[cfg(target_os = "macos")]
     pub async fn idle(&self) -> Result<bool> {
         self.call(|reply| Command::Idle { reply }).await
     }
@@ -4440,12 +4280,10 @@ pub(super) enum Command {
         every: SampleInterval,
         reply: oneshot::Sender<Result<JobProcessStream>>,
     },
-    #[cfg(target_os = "macos")]
     SubtreeHandle {
         peer: super::job_groups::Process,
         reply: oneshot::Sender<Result<JobSubtreeAdmission>>,
     },
-    #[cfg(target_os = "macos")]
     RetireDescendants {
         peer: super::job_groups::Process,
         handle: JobSubtreeHandle,
@@ -4544,7 +4382,6 @@ pub(super) enum Command {
         reply: oneshot::Sender<Result<WorkspaceAuthoritySnapshot>>,
     },
     /// Whether no named session is open and no job is running.
-    #[cfg(target_os = "macos")]
     Idle {
         reply: oneshot::Sender<Result<bool>>,
     },
@@ -4577,9 +4414,7 @@ impl Command {
             Self::Resources { .. } => "resources",
             Self::Processes { .. } => "processes",
             Self::ProcessEvents { .. } => "process-events",
-            #[cfg(target_os = "macos")]
             Self::SubtreeHandle { .. } => "subtree-handle",
-            #[cfg(target_os = "macos")]
             Self::RetireDescendants { .. } => "retire-descendants",
             Self::AsIs { .. } => "as-is",
             Self::ShellPool { .. } => "shell-pool",
@@ -4598,7 +4433,6 @@ impl Command {
             Self::Retire { .. } => "retire",
             Self::NameBuildVolume { .. } => "name-build-volume",
             Self::CurrentAuthority { .. } => "current-authority",
-            #[cfg(target_os = "macos")]
             Self::Idle { .. } => "idle",
             Self::NxDaemonKeeper { .. } => "nx-daemon-keeper",
             Self::StopNxKeeper { .. } => "stop-nx-keeper",
@@ -4652,7 +4486,6 @@ enum KillReason {
     CpuAdmission,
     /// Ended at critical host memory pressure (05_gateway.md "Memory pressure"); macOS only: on
     /// Linux each job's cgroup ceilings bound its memory.
-    #[cfg(target_os = "macos")]
     Memory,
 }
 
@@ -5042,9 +4875,9 @@ struct JobStateRecord {
     started_at: Instant,
     process: Option<Box<dyn RunningProcess>>,
     retirement: RetirementState,
-    /// Admission owns membership even while the job is queued or its spawn was refused.
-    #[cfg(target_os = "linux")]
-    cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
+    /// The job's kernel membership, where the platform has one. Admission owns it even while the
+    /// job is queued or its spawn was refused.
+    membership: Option<JobMembership>,
     stdout: VecDeque<Bytes>,
     stderr: VecDeque<Bytes>,
     /// Each stream's counts as its chunks were admitted; their bytes are the read cursors.
@@ -5067,10 +4900,8 @@ struct JobStateRecord {
     /// What the job's resource reads answer: nothing before it owns a process, live samples
     /// while it does, its terminal sample -- or why that failed -- once it ended.
     sampling: Sampling,
-    #[cfg(target_os = "macos")]
     monitor: Option<ProcessMonitor>,
     /// The keeper's foreground Nx daemon: its plugin workers end with it (04_sandbox.md).
-    #[cfg(target_os = "macos")]
     kept_nx_daemon: bool,
     /// The job's volumes as its admission found them, immediately before its first process was
     /// dispatched: every sample's volume deltas count from here, activation and command alike.
@@ -5270,7 +5101,6 @@ impl JobStateRecord {
         if self.settled() {
             return Err(self.observation_ended());
         }
-        #[cfg(target_os = "macos")]
         if let Some(monitor) = &self.monitor {
             return monitor.tree();
         }
@@ -5286,7 +5116,6 @@ impl JobStateRecord {
             let _ = reply.send(Err(self.observation_ended()));
             return;
         }
-        #[cfg(target_os = "macos")]
         if let Some(monitor) = &self.monitor {
             let monitor = monitor.clone();
             tokio::spawn(async move {
@@ -5294,8 +5123,6 @@ impl JobStateRecord {
             });
             return;
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = every;
         let _ = reply.send(Err(process_observation_unavailable(self.info.job_id)));
     }
 
@@ -5337,23 +5164,10 @@ fn observation_released(job_id: JobId) -> CowshedError {
 }
 
 fn process_observation_unavailable(job_id: JobId) -> CowshedError {
-    #[cfg(target_os = "macos")]
-    {
-        CowshedError::conflict(
-            format!("job {} has no native process observation yet", job_id.get()),
-            "read its processes once its native command has started",
-        )
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        CowshedError::environment_missing(
-            format!(
-                "job {} has no placed Linux native observer: the selected ptrace source is not wired to this supervisor",
-                job_id.get()
-            ),
-            "use a Linux execution substrate with the selected ptrace source and its source-owned reaper",
-        )
-    }
+    CowshedError::conflict(
+        format!("job {} has no native process observation yet", job_id.get()),
+        "read its processes once its native command has started",
+    )
 }
 
 enum GroupLedgerFinish {
@@ -5517,18 +5331,15 @@ impl Drop for SupervisorActor {
             return;
         }
         let jobs = std::mem::take(&mut self.jobs);
-        #[cfg(target_os = "macos")]
         let observed: Vec<_> = jobs
             .iter()
             .filter_map(|(id, job)| job.monitor.as_ref().map(|monitor| (*id, monitor.clone())))
             .collect();
-        #[cfg(target_os = "linux")]
         let contained: Vec<_> = jobs
             .iter()
-            .filter_map(|(id, job)| job.cgroup.as_ref().map(|cgroup| (*id, Arc::clone(cgroup))))
+            .filter_map(|(id, job)| job.membership.clone().map(|membership| (*id, membership)))
             .collect();
         let report_retained = || {
-            #[cfg(target_os = "macos")]
             for (id, monitor) in &observed {
                 cowshed_os::eprintln!(
                     "cowshed: retained job {} observed lives {:?}",
@@ -5536,14 +5347,8 @@ impl Drop for SupervisorActor {
                     monitor.running_lives()
                 );
             }
-            #[cfg(target_os = "linux")]
-            for (id, cgroup) in &contained {
-                cowshed_os::eprintln!(
-                    "cowshed: retained job {} cgroup {:?} at {}",
-                    id.get(),
-                    cgroup.identity(),
-                    cgroup.path().display()
-                );
+            for (id, membership) in &contained {
+                cowshed_os::eprintln!("cowshed: retained job {} {membership}", id.get());
             }
         };
         let inherited = std::mem::take(&mut self.inherited_groups);
@@ -5628,10 +5433,7 @@ fn job_group_claims(
         .filter(|(_, job)| !job.settled() || job.wait_failure.is_some())
         .filter_map(|(job_id, job)| {
             let leader = job.birth.as_ref()?.leader()?;
-            #[cfg(target_os = "macos")]
             let members = job.monitor.as_ref().map(ProcessMonitor::running_lives);
-            #[cfg(not(target_os = "macos"))]
-            let members = None;
             Some(super::job_groups::JobGroupClaim {
                 job_id: job_id.get(),
                 leader,
@@ -5659,33 +5461,27 @@ fn retire_dropped_jobs(
             }
             continue;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &job.cgroup {
-            let retired = cgroup
-                .retire(grace, cowshed_os::deadline::REAP)
-                .and_then(|_| cgroup.finish(cowshed_os::deadline::REAP));
+        if let Some(membership) = &job.membership {
+            let retired = membership.retire(grace).and_then(|_| membership.finish());
             match retired {
-                Ok(_) => {
+                Ok(()) => {
                     jobs.remove(&id);
                 }
                 Err(error) => {
                     cowshed_os::eprintln!(
-                        "cowshed: job {} membership remains unproven during supervisor drop: {error}; retained cgroup {:?} at {}",
+                        "cowshed: job {} membership remains unproven during supervisor drop: {}; retained {membership}",
                         id.get(),
-                        cgroup.identity(),
-                        cgroup.path().display()
+                        error.message
                     );
                     refused.push(format!(
-                        "job {}: {error} (cgroup {:?} at {})",
+                        "job {}: {} ({membership})",
                         id.get(),
-                        cgroup.identity(),
-                        cgroup.path().display()
+                        error.message
                     ));
                 }
             }
             continue;
         }
-        #[cfg(target_os = "macos")]
         if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
             match monitor.retire(birth.clone(), grace) {
                 Ok(_) => {
@@ -6091,11 +5887,8 @@ impl SupervisorActor {
                     )
                     .await;
                 }
-                #[cfg(target_os = "macos")]
+                // Only a critical level asks this, which a reading without one never reports.
                 Effect::EndForMemory { job, level } => self.end_for_memory(job, level).await,
-                // PSI has no Critical level, so a Linux report never ends a job for memory.
-                #[cfg(not(target_os = "macos"))]
-                Effect::EndForMemory { .. } => {}
             }
         }
     }
@@ -6155,7 +5948,6 @@ impl SupervisorActor {
     /// work nobody waits on gives way before the host swaps every job (measured 2026-10-26: six
     /// acceptance runs of one repository put 5.9 of 7 GB in swap). The job fails `memory`, its
     /// stderr naming the level and its resident memory.
-    #[cfg(target_os = "macos")]
     async fn end_for_memory(
         &mut self,
         job_id: JobId,
@@ -6349,7 +6141,6 @@ impl SupervisorActor {
                 };
                 let _ = reply.send(result);
             }
-            #[cfg(target_os = "macos")]
             Command::SubtreeHandle { peer, reply } => {
                 let monitors: Vec<_> = self
                     .jobs
@@ -6382,7 +6173,6 @@ impl SupervisorActor {
                     let _ = reply.send(outcome);
                 });
             }
-            #[cfg(target_os = "macos")]
             Command::RetireDescendants {
                 peer,
                 handle,
@@ -6710,7 +6500,6 @@ impl SupervisorActor {
             Command::CurrentAuthority { reply } => {
                 let _ = reply.send(Ok(self.authority.clone()));
             }
-            #[cfg(target_os = "macos")]
             Command::Idle { reply } => {
                 let idle = self.named_sessions.is_empty()
                     && !self.has_user_jobs()
@@ -7414,10 +7203,9 @@ impl SupervisorActor {
             .and_then(|value| {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
             })?;
-        #[cfg(target_os = "linux")]
-        let cgroup = self
+        let membership = self
             .spawner
-            .admit_cgroup(&self.authority, job_id, scheduling.class())
+            .admit_membership(&self.authority, job_id, scheduling.class())
             .await?;
         // A caller-owned job is recorded by its caller (11_shell.md, "Caller-owned jobs"): no
         // record batch and no commitment here, only its key, kept in the actor.
@@ -7432,9 +7220,8 @@ impl SupervisorActor {
                         sink.admit(job_id, grant_revision, &recorded, admission, scheduling)
                     })
                     .await;
-                #[cfg(target_os = "linux")]
                 let admitted = match admitted {
-                    Err(error) => Err(refused_cgroup(error, cgroup.clone()).await),
+                    Err(error) => Err(refused_membership(error, membership.clone()).await),
                     recorded => recorded,
                 };
                 admitted?;
@@ -7471,9 +7258,7 @@ impl SupervisorActor {
                     sink.seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy)
                 })
                 .await;
-            #[cfg(target_os = "linux")]
-            let error = refused_cgroup(error, cgroup).await;
-            return Err(error);
+            return Err(refused_membership(error, membership).await);
         }
 
         let stdin_info = stdin_info(&stdin);
@@ -7491,9 +7276,7 @@ impl SupervisorActor {
                         })
                         .await;
                 }
-                #[cfg(target_os = "linux")]
-                let error = refused_cgroup(error, cgroup).await;
-                return Err(error);
+                return Err(refused_membership(error, membership).await);
             }
         };
         let trace = trace.unwrap_or_else(TraceContext::mint);
@@ -7585,8 +7368,7 @@ impl SupervisorActor {
             started_at: Instant::now(),
             process: None,
             retirement: RetirementState::Unstarted,
-            #[cfg(target_os = "linux")]
-            cgroup,
+            membership,
             stdout: VecDeque::new(),
             stderr: VecDeque::new(),
             stdout_tally: StreamTally::default(),
@@ -7601,9 +7383,7 @@ impl SupervisorActor {
             conclusion: None,
             birth: None,
             sampling: Sampling::Unowned,
-            #[cfg(target_os = "macos")]
             monitor: None,
-            #[cfg(target_os = "macos")]
             kept_nx_daemon: false,
             volumes,
             output_limit: None,
@@ -7743,11 +7523,7 @@ impl SupervisorActor {
                     .as_millis(),
             )
             .expect("milliseconds since 1970 fit u64"),
-            #[cfg(target_os = "macos")]
-            nice: super::placement::macos::nice_from(
-                super::placement::macos::own_nice(),
-                job.info.class,
-            ),
+            nice: super::placement::placed_nice(job.info.class),
         };
         job.info.state = JobState::Running;
         job.cpu = CpuStanding::Admitted {
@@ -7774,8 +7550,7 @@ impl SupervisorActor {
                 ProcessSpawnRequest {
                     authority,
                     job_id,
-                    #[cfg(target_os = "linux")]
-                    cgroup: job.cgroup.clone(),
+                    membership: job.membership.clone(),
                     command,
                     cwd,
                     env,
@@ -7822,7 +7597,6 @@ impl SupervisorActor {
                 }
             });
         }
-        #[cfg(target_os = "macos")]
         {
             job.monitor = process.observations().cloned();
             if let Some(monitor) = &job.monitor
@@ -8120,7 +7894,6 @@ impl SupervisorActor {
         match started {
             Ok(job_id) => {
                 keeper.starting = Some(job_id);
-                #[cfg(target_os = "macos")]
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.kept_nx_daemon = true;
                 }
@@ -8710,7 +8483,6 @@ impl SupervisorActor {
                     self.arm_sample_clock();
                 }
             }
-            #[cfg(target_os = "macos")]
             ProcessEvent::ActivationEnded { job_id, usage } => {
                 // An ended job's sampling stays as it ended.
                 if let Some(sampler) = self
@@ -8836,26 +8608,17 @@ impl SupervisorActor {
         let Some(leader) = job.birth.as_ref().and_then(Birth::leader) else {
             return;
         };
-        #[cfg(target_os = "macos")]
-        {
-            let nice = super::placement::macos::nice_from(
-                super::placement::macos::own_nice(),
-                step.class(),
+        // Where a class is a group weight no step moves the job between classes: only mbx's pool
+        // decays its asks then (`placement`).
+        let nice = super::placement::placed_nice(step.class());
+        if let Err(error) = super::placement::decay_group(leader.pgid(), nice) {
+            cowshed_os::eprintln!(
+                "cowshed: job {} did not decay to the {} nice {nice}: {error}",
+                job_id.get(),
+                step.class().as_str()
             );
-            if let Err(error) = super::placement::macos::place_group_nice(leader.pgid(), nice) {
-                cowshed_os::eprintln!(
-                    "cowshed: job {} did not decay to the {} nice {nice}: {error}",
-                    job_id.get(),
-                    step.class().as_str()
-                );
-                return;
-            }
+            return;
         }
-        // WHY: a Linux job's class is its class cgroup, and cgroup v2 cannot move a job cgroup
-        // across class cgroups without migrating its pids, which would break the job cgroup's
-        // accounting. Only mbx's pool decays the job's asks; its kernel weight stays interactive's.
-        #[cfg(target_os = "linux")]
-        let _ = leader;
         if let Some(job_spans) = &self.job_spans
             && job.caller.is_none()
         {
@@ -9051,17 +8814,11 @@ impl SupervisorActor {
             self.admission_event(super::job_admission::Event::Cancelled { job: job_id });
             return Ok(());
         }
-        // A command not yet born -- its warm host still activating outside the job's cgroup, or
-        // its placement pending -- has not entered the cgroup, so an empty membership proves
-        // nothing about it. Its JobControl signals the activation host, or replays the signal
-        // once the command is placed; retirement waits for the birth, as on macOS.
-        #[cfg(target_os = "linux")]
-        if job.cgroup.is_some() && job.birth.is_some() {
-            self.retire_membership(job_id, RetirementRun::Requested);
-            return Ok(());
-        }
-        #[cfg(target_os = "macos")]
-        if job.monitor.is_some() && job.birth.is_some() {
+        // A command not yet born -- its warm host still activating outside the job's kernel
+        // membership, or its placement pending -- has not entered that membership, so an empty
+        // one proves nothing about it. Its JobControl signals the activation host, or replays the
+        // signal once the command is placed; retirement waits for the birth.
+        if (job.membership.is_some() || job.monitor.is_some()) && job.birth.is_some() {
             // Retirement takes the membership snapshot before sending a signal, so a process
             // ended by cancellation cannot disappear from the job's outlived receipt.
             self.retire_membership(job_id, RetirementRun::Requested);
@@ -9092,9 +8849,9 @@ impl SupervisorActor {
             RetirementState::Draining(_) | RetirementState::Refused(_) => return false,
             RetirementState::Unstarted => {}
         }
-        #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &job.cgroup {
-            let cgroup = Arc::clone(cgroup);
+        // A kernel membership holds every member, those that left the leader's group included,
+        // so it is retired in place of the observer's fold.
+        if let Some(membership) = job.membership.clone() {
             let grace = self.term_grace;
             let events = self.events.clone();
             job.retirement = RetirementState::Draining(run);
@@ -9102,34 +8859,15 @@ impl SupervisorActor {
                 job.info.state = JobState::Draining;
             }
             tokio::spawn(async move {
-                let retirement = tokio::task::spawn_blocking(move || {
-                    let members = cgroup
-                        .retire(grace, cowshed_os::deadline::REAP)
-                        .map_err(cgroup_error)?;
-                    Ok(JobProcessRetirement {
-                        containment: crate::api::process::JobContainment::Kernel,
-                        outlived: members
-                            .members
-                            .iter()
-                            .map(|member| crate::api::process::OutlivedProcess {
-                                index: None,
-                                pid: member.pid,
-                                image: member.image.clone(),
-                                signal: member.signal,
-                            })
-                            .collect(),
-                        outlived_incomplete: members.metadata_gap,
-                    })
-                })
-                .await
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+                let retirement = tokio::task::spawn_blocking(move || membership.retire(grace))
+                    .await
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
                 let _ = events
                     .send(ProcessEvent::Retired { job_id, retirement })
                     .await;
             });
             return false;
         }
-        #[cfg(target_os = "macos")]
         if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
             let monitor = monitor.clone();
             let birth = birth.clone();
@@ -9288,7 +9026,6 @@ impl SupervisorActor {
                         | KillReason::ScriptSyntax
                         | KillReason::CpuAdmission,
                     ) => JobState::Failed,
-                    #[cfg(target_os = "macos")]
                     Some(KillReason::Memory) => JobState::Failed,
                     None => match job.exit.as_ref().expect("ready terminal job has exit") {
                         ExitStatus::Exited { .. } => JobState::Exited,
@@ -9303,7 +9040,6 @@ impl SupervisorActor {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        #[cfg(target_os = "macos")]
         if let Some(monitor) = &job.monitor {
             let monitor = monitor.clone();
             if let Err(error) = tokio::task::spawn_blocking(move || monitor.finish())
@@ -9318,7 +9054,6 @@ impl SupervisorActor {
         }
         // The daemon forks each plugin worker detached, outside the job's group, so the job's end
         // ended none of them; its observation followed each from its birth (04_sandbox.md).
-        #[cfg(target_os = "macos")]
         if job.kept_nx_daemon
             && let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth)
         {
@@ -9358,18 +9093,16 @@ impl SupervisorActor {
         job.info.resources = job.sampling.freeze(|_| {
             observed.expect("a sampling is frozen through its sampler only while one was lent")
         });
-        #[cfg(target_os = "linux")]
-        if let Some(cgroup) = job.cgroup.clone() {
-            // Final accounting precedes removing the hierarchy, which reads cgroupfs and joins
-            // the members for up to the reap bound: on the blocking pool. A refused finish
-            // retains all claims and remains nonterminal; only an explicit request retries
-            // retirement.
-            let finished = off_actor::run(move || cgroup.finish(cowshed_os::deadline::REAP)).await;
+        if let Some(membership) = job.membership.clone() {
+            // Final accounting precedes releasing the kernel membership, which joins the members
+            // for up to the reap bound: on the blocking pool. A refused release retains all
+            // claims and remains nonterminal; only an explicit request retries retirement.
+            let finished = off_actor::run(move || membership.finish()).await;
             if let Err(error) = finished {
-                self.refuse_membership(job_id, cgroup_error(error), RetirementRun::Requested);
+                self.refuse_membership(job_id, error, RetirementRun::Requested);
                 return;
             }
-            job.cgroup = None;
+            job.membership = None;
         }
         // State the terminal sample while the admitted build volume is still held. A missing
         // sample stays absent: no fresh boundary read invents host or volume facts for it.
@@ -9542,7 +9275,6 @@ impl SupervisorActor {
         }
         // Likewise its process observation, once the latest cut has captured its end with
         // nothing awaited between its waiters' answers and that record.
-        #[cfg(target_os = "macos")]
         self.release_observation(job_id).await;
         self.forget_if_read(job_id);
     }
@@ -9551,7 +9283,6 @@ impl SupervisorActor {
     /// its lives have all exited and its sealed record is what is read of it from now on. Kept,
     /// the writer -- its thread, kqueue, fold, journal and argv copies -- grew every supervisor
     /// with each job it ran.
-    #[cfg(target_os = "macos")]
     async fn release_observation(&mut self, job_id: JobId) {
         let Some(monitor) = self
             .jobs
@@ -9994,14 +9725,12 @@ async fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: 
             ),
         }
     }
-    #[cfg(target_os = "macos")]
     clock_observation(job);
 }
 
 /// Start the job's process observation on the job's clock once both exist: its monitor, and the
 /// spawn of its first owned process, the origin of `wallUs`. Either may come first; the origin
 /// never changes, so saying it again changes nothing.
-#[cfg(target_os = "macos")]
 fn clock_observation(job: &JobStateRecord) {
     if let (Some(monitor), Some(origin)) = (&job.monitor, job.sampling.origin())
         && let Err(error) = monitor.clock(origin)
@@ -10021,8 +9750,8 @@ struct LentSampler {
     volumes: VolumeBaseline<HostVolume>,
     stdout: StreamTally,
     stderr: StreamTally,
-    #[cfg(target_os = "macos")]
     monitor: Option<ProcessMonitor>,
+    membership: Option<JobMembership>,
 }
 
 impl LentSampler {
@@ -10035,8 +9764,8 @@ impl LentSampler {
             volumes: job.volumes.clone(),
             stdout: job.stdout_tally,
             stderr: job.stderr_tally,
-            #[cfg(target_os = "macos")]
             monitor: job.monitor.clone(),
+            membership: job.membership.clone(),
         })
     }
 
@@ -10051,8 +9780,8 @@ impl LentSampler {
             self.stdout,
             self.stderr,
             boundary,
-            #[cfg(target_os = "macos")]
             self.monitor.as_ref(),
+            self.membership.as_ref(),
         );
         (self.job_id, self.sampler, sample)
     }
@@ -10068,7 +9797,8 @@ fn observe(
     stdout: StreamTally,
     stderr: StreamTally,
     boundary: Boundary,
-    #[cfg(target_os = "macos")] monitor: Option<&super::process_monitor::ProcessMonitor>,
+    monitor: Option<&ProcessMonitor>,
+    membership: Option<&JobMembership>,
 ) -> Result<JobResourceSample> {
     let sampled_at = utc_now()?;
     let leader = sampler.leader().pid();
@@ -10105,12 +9835,7 @@ fn observe(
         })?;
         members.push(Member { pid, resident });
     }
-    let (accounting, leaf) = account(
-        sampler,
-        &processes,
-        #[cfg(target_os = "macos")]
-        monitor,
-    )?;
+    let (accounting, leaf) = account(sampler, &processes, monitor, membership)?;
     let volumes = volumes.sample(&HostVolumeStat);
     sampler.sample(
         Observation {
@@ -10128,14 +9853,16 @@ fn observe(
     )
 }
 
-/// Read the independent job total after the process observation. Native jobs attribute from one
-/// immutable publication of their retained event fold, without resampling or moving its window.
-/// An explicitly supplied spawn sink without that source uses the transitional census in 07_api.md.
-#[cfg(target_os = "macos")]
+/// Read the independent job total after the process observation: the platform's own source
+/// ([`platform::JobTotals`]), which the observed processes are reconciled against. Native jobs
+/// attribute from one immutable publication of their retained event fold, without resampling or
+/// moving its window. An explicitly supplied spawn sink without that source uses the transitional
+/// census in 07_api.md.
 fn account(
     sampler: &mut JobSampler,
     members: &[super::job_groups::Process],
-    monitor: Option<&super::process_monitor::ProcessMonitor>,
+    monitor: Option<&ProcessMonitor>,
+    membership: Option<&JobMembership>,
 ) -> Result<(JobAccounting, JobLeafAttribution)> {
     let leader = sampler.leader().pid();
     if monitor.is_none() {
@@ -10148,69 +9875,20 @@ fn account(
             },
         )?;
     }
-    let cpu = sampler
-        .rusage()
-        .account(super::job_accounting::read_leader)
-        .map_err(|error| unaccounted(leader, error))?;
+    let totals = platform::JobTotals::read(sampler, membership)?;
     let coverage = sampler.coverage();
     let attribution = match monitor {
-        Some(monitor) => monitor.attribution(cpu, coverage)?,
-        None => sampler.census().attribute(cpu, coverage).map_err(|error| {
-            CowshedError::internal(format!(
-                "the CPU of job group {leader} cannot be attributed: {error}"
-            ))
-        })?,
+        Some(monitor) => monitor.attribution(totals.cpu(), coverage)?,
+        None => sampler
+            .census()
+            .attribute(totals.cpu(), coverage)
+            .map_err(|error| {
+                CowshedError::internal(format!(
+                    "the CPU of job group {leader} cannot be attributed: {error}"
+                ))
+            })?,
     };
-    Ok((
-        JobAccounting::MacOsRusageChildren {
-            cpu,
-            io: None,
-            reconciliation: UsageReconciliation {
-                cpu_us: attribution.cpu_us,
-                // The source has no storage bytes to compare.
-                io_read_bytes: None,
-                io_write_bytes: None,
-                coverage: attribution.coverage,
-            },
-        },
-        attribution.leaf,
-    ))
-}
-
-/// This sampler does not yet accept the native cgroup capability as an accounting input.
-/// Membership and retirement still use that capability; an unavailable resource sample must
-/// not claim the contained job lacks a cgroup or invent zero totals.
-#[cfg(not(target_os = "macos"))]
-fn account(
-    sampler: &mut JobSampler,
-    _members: &[super::job_groups::Process],
-) -> Result<(JobAccounting, JobLeafAttribution)> {
-    Err(CowshedError::environment_missing(
-        format!(
-            "job group {} cannot be sampled: the resource sampler has no cgroup accounting input",
-            sampler.leader().pid()
-        ),
-        "job containment and retirement remain active; cgroup accounting is unavailable to this sampler",
-    ))
-}
-
-/// Why job group `leader`'s CPU totals cannot be stated: the kernel would not answer for a
-/// leader, or the readings contradict each other.
-#[cfg(target_os = "macos")]
-fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> CowshedError {
-    use super::job_accounting::AccountingError;
-    match error {
-        AccountingError::Leader(_) => CowshedError::environment_missing(
-            format!("the CPU accounting of job group {leader} is unavailable: {error}"),
-            "the job runs on; its CPU totals cannot be stated",
-        ),
-        AccountingError::OtherLeader { .. }
-        | AccountingError::NoneCharged { .. }
-        | AccountingError::Unclosed { .. }
-        | AccountingError::Inexact(_) => CowshedError::internal(format!(
-            "the CPU accounting of job group {leader} is inconsistent: {error}"
-        )),
-    }
+    Ok((totals.accounting(&attribution), attribution.leaf))
 }
 
 /// A resources read: a running job observed now and kept as its latest sample, an ended job's
@@ -10372,17 +10050,9 @@ fn read_sealed_chunk(
 
 /// How many lives the job's observer holds running now; `None` for a job with no observer.
 fn observed_running(job: &JobStateRecord) -> Option<usize> {
-    #[cfg(target_os = "macos")]
-    {
-        job.monitor
-            .as_ref()
-            .map(|monitor| monitor.running_lives().len())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = job;
-        None
-    }
+    job.monitor
+        .as_ref()
+        .map(|monitor| monitor.running_lives().len())
 }
 
 fn flush_log_waiters(job: &mut JobStateRecord) {
@@ -10614,7 +10284,7 @@ mod workspace_toolchain_tests {
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
             store_root: mount.parent().expect("root").join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            port_block: Some(crate::metadata::PortBlock::new(40_960, 16).expect("port block")),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
@@ -10683,7 +10353,7 @@ mod workspace_toolchain_tests {
             std::fs::write(mount.join(convention), "").expect("project convention");
         }
         let mut sandbox = sandbox_at(&mount);
-        sandbox.port_block = crate::metadata::PortBlock::new(49_104, 16).expect("port block");
+        sandbox.port_block = Some(crate::metadata::PortBlock::new(49_104, 16).expect("port block"));
         sandbox
             .configure_capabilities()
             .expect("detect capabilities");
@@ -11245,9 +10915,9 @@ mod workspace_toolchain_tests {
                 class: ExecClass::Background,
                 held: false,
                 started_ms: 0,
-                #[cfg(target_os = "macos")]
                 nice: 0,
             },
+            membership: None,
         };
         let (events, _received) = mpsc::channel(16);
         let spawned = SystemSpawnSink::default().spawn(request, events).await;
@@ -11309,7 +10979,7 @@ mod workspace_toolchain_tests {
                     capability_env: &configured.capabilities.contribution,
                 },
                 crate::metadata::Platform::Macos,
-                Some(configured.port_block),
+                configured.port_block,
             )
             .expect("publish host environment");
             let environment = sandbox_environment(&configured, &caller)
@@ -11759,14 +11429,8 @@ mod workspace_toolchain_tests {
                 target: target.clone(),
             }];
 
-        let platform = || {
-            let mut tail: Vec<PathBuf> = developer_directory()
-                .map(|directory| directory.join("usr/bin"))
-                .into_iter()
-                .collect();
-            tail.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
-            tail
-        };
+        let platform =
+            crate::host_path::job_directories(&sandbox.home).expect("the host's system PATH");
         for (mode, environment_root) in [
             (RunSandboxMode::ReadWrite, mount.join(".cowshed")),
             (RunSandboxMode::ReadOnly, sandbox.exec_temp_dir.clone()),
@@ -11789,7 +11453,7 @@ mod workspace_toolchain_tests {
                 environment_root.join("tools/bin"),
                 mount.join(".cowshed/bin"),
             ];
-            expected.extend(platform());
+            expected.extend(platform.iter().cloned());
             assert_eq!(
                 std::env::split_paths(&path).collect::<Vec<_>>(),
                 expected,
@@ -12883,14 +12547,32 @@ mod sandbox_environment_tests {
         std::fs::canonicalize(root).unwrap()
     }
 
+    /// A workspace with no capability's route: the installed cowshed, its private tools in the
+    /// place its mode keeps them, the workspace's own bin, then the host's system `PATH` and
+    /// nothing of the `PATH` this process started with.
     #[test]
-    fn proxy_url_carries_the_token_as_basic_auth_userinfo() {
-        let token = WorkspaceToken::from_bytes([7; 32]);
-        let encoded = token.encode();
-        assert_eq!(
-            gateway_proxy_url("40960", &token),
-            format!("http://cowshed:{encoded}@127.0.0.1:40960")
-        );
+    fn a_job_path_is_the_private_tools_then_the_hosts_system_path() {
+        use crate::sandbox::RunSandboxMode;
+
+        for mode in [RunSandboxMode::ReadWrite, RunSandboxMode::ReadOnly] {
+            let sandbox = crate::sandbox::tests::config(mode);
+            let tools = match mode {
+                RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed/tools"),
+                RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools"),
+            };
+            let mut expected = vec![
+                crate::host_dirs::installed_binary_directory(&sandbox.home),
+                tools.join("manager-bin"),
+                tools.join("bin"),
+                sandbox.workspace_mount.join(".cowshed/bin"),
+            ];
+            expected.extend(crate::host_path::job_directories(&sandbox.home).unwrap());
+            assert_eq!(
+                std::env::split_paths(&bootstrap_path(&sandbox).unwrap()).collect::<Vec<_>>(),
+                expected,
+                "{mode:?}"
+            );
+        }
     }
 
     /// A child granted writes inside a shared cache cannot create its parent, so the host
@@ -13169,11 +12851,9 @@ mod sandbox_environment_tests {
                 class: ExecClass::Background,
                 held: false,
                 started_ms: 0,
-                #[cfg(target_os = "macos")]
                 nice: 0,
             },
-            #[cfg(target_os = "linux")]
-            cgroup: None,
+            membership: None,
         };
         let command = host_gate_command(&request, &mount).expect("host gate command");
         let environment: BTreeMap<&OsStr, Option<&OsStr>> = command.as_std().get_envs().collect();
@@ -13812,6 +13492,12 @@ fn prepare_host_daemon_runtime(sandbox: &SandboxConfig) -> Result<()> {
 /// Everything the file names for a daemon exists first ([`prepare_host_daemon_runtime`]).
 fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
     prepare_host_daemon_runtime(sandbox)?;
+    // A sandbox carries its workspace's recorded port wiring and nothing else of its platform:
+    // a block is a macOS workspace's, none a Linux one's (`GrantSet::validate`).
+    let platform = match sandbox.port_block {
+        Some(_) => crate::metadata::Platform::Macos,
+        None => crate::metadata::Platform::Linux,
+    };
     crate::workspace_credentials::publish_workspace_environment(
         crate::workspace_environment::EnvironmentMount::Served {
             workspace_mount: &sandbox.workspace_mount,
@@ -13819,8 +13505,8 @@ fn publish_host_environment(sandbox: &SandboxConfig) -> Result<()> {
             temp_dir: &sandbox.exec_temp_dir,
             capability_env: &sandbox.capabilities.contribution,
         },
-        crate::metadata::Platform::Macos,
-        Some(sandbox.port_block),
+        platform,
+        sandbox.port_block,
     )
     .map_err(|error| {
         CowshedError::integrity(
@@ -13846,7 +13532,6 @@ fn job_sandbox_policy(
     SandboxPolicy::render(sandbox)
 }
 
-#[cfg(target_os = "macos")]
 fn membership_peer(
     peer: &super::job_groups::Process,
 ) -> Result<Option<super::process_tree::ProcessIdentity>> {

@@ -43,6 +43,15 @@ use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceRole;
 use crate::sandbox::SandboxConfig;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// How often a shed's supervisor probes its Nx daemon. Short, because from the daemon's death to
 /// the next probe a host client finds no daemon and starts its own outside the sandbox, and a
 /// probe is one small file read, one process-state query and one local connect. Not shorter,
@@ -154,7 +163,6 @@ pub(crate) fn live_pid(record: &Path) -> Option<libc::pid_t> {
 }
 
 /// A live daemon's record, as the one read that verified it holds it.
-#[cfg(target_os = "macos")]
 pub(crate) struct LiveRecord {
     pub pid: libc::pid_t,
     pub bytes: Vec<u8>,
@@ -162,7 +170,6 @@ pub(crate) struct LiveRecord {
 
 /// The record `record` holds when the daemon it names is live: its bytes and pid, from the one
 /// read that verified the daemon, so a copy of it can only ever name that daemon.
-#[cfg(target_os = "macos")]
 pub(crate) fn live_record(record: &Path) -> Option<LiveRecord> {
     match read_and_probe(record) {
         (Probe::Live, Some((pid, bytes))) => Some(LiveRecord { pid, bytes }),
@@ -172,7 +179,6 @@ pub(crate) fn live_record(record: &Path) -> Option<LiveRecord> {
 
 /// What stopping the daemon a record names may do. The record only nominates a pid: the job's
 /// trusted ledger decides whether that pid is the job's own, and only then is it signalled.
-#[cfg(target_os = "macos")]
 pub(crate) enum DaemonStopPlan {
     /// No process runs the record's pid, or no record exists: there is nothing to stop.
     NotRunning,
@@ -192,7 +198,6 @@ pub(crate) enum DaemonStopPlan {
 /// it names, which a stale record does; that is a supplementary refusal only. Authority is the
 /// ledger's alone: [`super::job_groups::owned_process`]. Unreadable or malformed records or ledgers,
 /// and a pid below one, skip adoption before quiesce without signalling any nominee.
-#[cfg(target_os = "macos")]
 pub(crate) fn prepare_daemon_stop(
     record: &Path,
     ledger: &Path,
@@ -205,7 +210,6 @@ pub(crate) fn prepare_daemon_stop(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopPlan> {
     let record_error = |error: io::Error| {
         io::Error::new(
@@ -278,18 +282,11 @@ fn read_daemon_stop_plan(record: &Path, ledger: &Path) -> io::Result<DaemonStopP
             ),
         });
     }
-    // A job's daemon runs inside its sandbox. Unsandboxed is refused here, but a sandboxed pid
-    // still needs the ledger's proof: this guard only refuses, it never grants.
-    if !cowshed_os::process::sandboxed(pid).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("cannot inspect sandbox of process {pid}: {error}"),
-        )
-    })? {
-        return Ok(DaemonStopPlan::Unproven {
-            pid,
-            reason: format!("process {pid} is not sandboxed, so it is not a job's daemon"),
-        });
+    // A job's daemon runs where its supervisor placed the job. One that provably runs elsewhere
+    // is refused here, but one that may run there still needs the ledger's proof: this guard
+    // only refuses, it never grants.
+    if let Some(reason) = platform::not_a_jobs_daemon(pid)? {
+        return Ok(DaemonStopPlan::Unproven { pid, reason });
     }
     let Some(process) = super::job_groups::owned_process(ledger, pid).map_err(|error| {
         io::Error::new(
@@ -1070,7 +1067,6 @@ pub(crate) async fn next_probe(
 
 /// What stopping one ledger-owned landing daemon did. Every failure is a diagnostic here, never an
 /// error: a failed stop cannot abort a land whose HEAD has already moved.
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub(crate) struct OwnedStopOutcome {
     pub(crate) pid: i32,
@@ -1088,7 +1084,6 @@ pub(crate) struct OwnedStopOutcome {
 /// activation it would enter through, can hold the stop past the grace (16_build_volumes.md,
 /// Land 4). A daemon already gone is stopped: a signal it no longer accepts is said only when it
 /// still runs. Only a join failure of the wait is an error.
-#[cfg(target_os = "macos")]
 pub(crate) async fn stop_owned_daemon(
     process: super::job_groups::OwnedGroupProcess,
     mut watch: super::daemon_watch::DaemonWatch,
@@ -1149,7 +1144,6 @@ pub(crate) async fn stop_owned_daemon(
 #[cfg(test)]
 mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
-    #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::CommandBackstop as _;
     use std::os::unix::net::UnixListener;
 
@@ -1807,10 +1801,9 @@ mod tests {
         assert!(keeper.may_stop(), "the daemon is gone");
     }
 
-    #[cfg(target_os = "macos")]
     fn sleeper() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
-        std::process::Command::new("/bin/cat")
+        std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .spawn_locked()
             .expect("a process reading its stdin")
@@ -1818,7 +1811,6 @@ mod tests {
 
     /// A process whose exit a watch reports only once it has ended, and whose pid observes nothing
     /// once it is reaped. Observing a pid below one is refused rather than read as a group.
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_observed_process_is_watched_to_its_exit_and_a_reaped_pid_observes_nothing() {
         let mut child = sleeper();
@@ -1844,11 +1836,10 @@ mod tests {
 
     /// A process blocked reading its stdin, a pipe the returned child holds, that leads its own
     /// group, as a job's leader does.
-    #[cfg(target_os = "macos")]
     fn group_sleeper() -> std::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::CommandExt as _;
-        std::process::Command::new("/bin/cat")
+        std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
             .process_group(0)
             .spawn_locked()
@@ -1856,7 +1847,6 @@ mod tests {
     }
 
     /// A ledger that names `child`'s group as one admitted job's, the way the supervisor records it.
-    #[cfg(target_os = "macos")]
     fn ledger_naming(scratch: &Path, child: &std::process::Child) -> PathBuf {
         let leader = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
         let ledger = scratch.join("supervisor.groups");
@@ -2170,7 +2160,6 @@ mod tests {
     }
     /// A record written before the process it names started is stale: it names another process
     /// than the one it describes, and is refused even when the ledger proves the pid.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_record_older_than_its_process_is_unproven_even_when_the_ledger_proves_it() {
         let scratch = crate::temp_root::TempRoot::new_in(
@@ -2201,7 +2190,6 @@ mod tests {
 
     /// A reaped leader names no process and proves nothing: its group id may belong to a later
     /// process, so the record is nothing to stop and the ledger no longer owns anything.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_reaped_leader_proves_nothing_and_its_record_names_nothing() {
         let scratch = crate::temp_root::TempRoot::new_in(
@@ -2229,7 +2217,6 @@ mod tests {
     /// A leader reaped while a member of its group still runs leaves the group unidentified: the
     /// ledger proves nothing about the survivor, and the record that names the reaped pid is not
     /// renewed as the job's. The survivor is stopped by its own group id, after the assertions.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_reaped_leader_with_a_live_member_leaves_the_group_unproven() {
         use cowshed_os::fork_lock::Spawn as _;
@@ -2268,7 +2255,7 @@ mod tests {
             prepare_daemon_stop(&record, &ledger).unwrap(),
             DaemonStopPlan::NotRunning
         ));
-        std::process::Command::new("/bin/kill")
+        std::process::Command::new("kill")
             .args(["-KILL", &format!("-{pid}")])
             .status_bounded()
             .expect("kill the survivor's group");

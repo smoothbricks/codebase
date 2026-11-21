@@ -760,6 +760,15 @@ impl Project {
     pub fn git_root(&self, env: Env) -> napi::Result<String> {
         utf8_path(env, self.inner.git_root(), "Git root")
     }
+
+    /// What the project's store keeps each workspace and build volume as, in its wire spelling
+    /// (`apfs`, `zfs`, `directory`); `null` when the controller's build does not say.
+    #[napi(getter)]
+    pub fn substrate(&self) -> Option<&'static str> {
+        self.inner
+            .substrate()
+            .map(cowshed_core::api::StoreSubstrate::as_str)
+    }
 }
 
 /// One workspace incarnation, as the call that resolved it saw it.

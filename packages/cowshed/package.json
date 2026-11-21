@@ -534,15 +534,330 @@
           }
         }
       },
+      "helper-bin-arm64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
+          "{projectRoot}/**/*.rs",
+          "!{projectRoot}/crates/cowshed-cli/tests/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{workspaceRoot}/Cargo.toml",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          {
+            "json": "{projectRoot}/package.json"
+          },
+          {
+            "externalDependencies": [
+              "@napi-rs/cli",
+              "bun-lock-runtime:packages/build-inputs"
+            ]
+          },
+          "cargoToolchain"
+        ],
+        "//": "cowshed-helper, the root binary every ZFS mutation goes through (specs/cowshed/09_substrates.md, Privileged helper), built as cli-arm64-macos builds cowshed. It writes a tree of its own, .cache/helper/<platform>/debug by default and .cache/helper/<platform>/release in production, because an output directory holds one .build-inputs.json and the tree cowshed is built into holds cowshed's; helper-arm64-macos puts the binary beside cowshed.",
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper",
+          "{projectRoot}/{options.outputDir}/.build-inputs.json"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/helper/darwin-arm64/debug",
+          "command": "napi build --bin cowshed-helper --target aarch64-apple-darwin --manifest-path crates/cowshed-helper/Cargo.toml --package cowshed-helper --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-helper/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed-helper.d --output {args.outputDir}"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": ".cache/helper/darwin-arm64/release",
+            "command": "napi build --release --bin cowshed-helper --target aarch64-apple-darwin --manifest-path crates/cowshed-helper/Cargo.toml --package cowshed-helper --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-helper/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed-helper.d --output {args.outputDir}"
+          }
+        }
+      },
+      "helper-bin-x64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
+          "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{workspaceRoot}/Cargo.toml",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "{projectRoot}/package.json",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
+          "cargoToolchain"
+        ],
+        "//": "helper-bin-arm64-macos for the x64 macOS helper.",
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper",
+          "{projectRoot}/{options.outputDir}/.build-inputs.json"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/helper/darwin-x64/debug",
+          "command": "napi build --bin cowshed-helper --target x86_64-apple-darwin --manifest-path crates/cowshed-helper/Cargo.toml --package cowshed-helper --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-helper/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed-helper.d --output {args.outputDir}"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": ".cache/helper/darwin-x64/release",
+            "command": "napi build --release --bin cowshed-helper --target x86_64-apple-darwin --manifest-path crates/cowshed-helper/Cargo.toml --package cowshed-helper --output-dir {args.outputDir} && node \"$(realpath ../../node_modules/@smoothbricks/nx-plugin)/../build-inputs/dist/ts/bin/smoo-nx-build-inputs.js\" --manifest-path crates/cowshed-helper/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed-helper.d --output {args.outputDir}"
+          }
+        }
+      },
+      "helper-bin-arm64-linux": {
+        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{workspaceRoot}/Cargo.toml",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
+          "!{projectRoot}/**/target/**",
+          "{projectRoot}/package.json",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
+          "cargoToolchain"
+        ],
+        "//": "helper-bin-arm64-macos for the arm64 Linux helper, built as cli-arm64-linux builds cowshed. The executor writes .build-inputs.json into the directory of its output, which is why that directory is the helper's own.",
+        "outputs": [
+          "{options.output}",
+          "{options.output}/../.build-inputs.json"
+        ],
+        "options": {
+          "target": "aarch64-unknown-linux-musl",
+          "manifestPath": "{projectRoot}/crates/cowshed-helper/Cargo.toml",
+          "package": "cowshed-helper",
+          "bin": "cowshed-helper",
+          "output": "{projectRoot}/.cache/helper/linux-arm64/debug/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "release": true,
+            "output": "{projectRoot}/.cache/helper/linux-arm64/release/cowshed-helper"
+          }
+        }
+      },
+      "helper-bin-x64-linux": {
+        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{workspaceRoot}/Cargo.toml",
+          {
+            "externalDependencies": [
+              "cargo-lock:packages/cowshed"
+            ]
+          },
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
+          "!{projectRoot}/**/target/**",
+          "{projectRoot}/package.json",
+          {
+            "externalDependencies": [
+              "bun-lock:packages/cowshed"
+            ]
+          },
+          "cargoToolchain"
+        ],
+        "//": "helper-bin-arm64-linux for the x64 Linux helper.",
+        "outputs": [
+          "{options.output}",
+          "{options.output}/../.build-inputs.json"
+        ],
+        "options": {
+          "target": "x86_64-unknown-linux-musl",
+          "manifestPath": "{projectRoot}/crates/cowshed-helper/Cargo.toml",
+          "package": "cowshed-helper",
+          "bin": "cowshed-helper",
+          "output": "{projectRoot}/.cache/helper/linux-x64/debug/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "release": true,
+            "output": "{projectRoot}/.cache/helper/linux-x64/release/cowshed-helper"
+          }
+        }
+      },
+      "helper-arm64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
+        "//": "cowshed-helper beside cli-arm64-macos's binary, <outputDir>/cowshed-helper: a build's distribution carries the helper in the platform directory that holds cowshed, where setup's storage bootstrap finds it and its install copies it from (specs/cowshed/09_substrates.md, Privileged helper). It copies what helper-bin-arm64-macos built in the same configuration, through a name beside the destination, so the path never holds a partial file. cli-record-arm64-macos depends on it, so cli-native, the aggregate build, the publish jobs and the land's install build the helper with the binary.",
+        "dependsOn": [
+          "helper-bin-arm64-macos"
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/cowshed-helper",
+            "transitive": false
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/darwin-arm64",
+          "built": ".cache/helper/darwin-arm64/debug",
+          "command": "mkdir -p {args.outputDir} && cp {args.built}/cowshed-helper {args.outputDir}/cowshed-helper.partial && chmod 0755 {args.outputDir}/cowshed-helper.partial && mv {args.outputDir}/cowshed-helper.partial {args.outputDir}/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/darwin-arm64",
+            "built": ".cache/helper/darwin-arm64/release"
+          }
+        }
+      },
+      "helper-x64-macos": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
+        "//": "helper-arm64-macos for helper-bin-x64-macos.",
+        "dependsOn": [
+          "helper-bin-x64-macos"
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/cowshed-helper",
+            "transitive": false
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/darwin-x64",
+          "built": ".cache/helper/darwin-x64/debug",
+          "command": "mkdir -p {args.outputDir} && cp {args.built}/cowshed-helper {args.outputDir}/cowshed-helper.partial && chmod 0755 {args.outputDir}/cowshed-helper.partial && mv {args.outputDir}/cowshed-helper.partial {args.outputDir}/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/darwin-x64",
+            "built": ".cache/helper/darwin-x64/release"
+          }
+        }
+      },
+      "helper-arm64-linux": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
+        "//": "helper-arm64-macos for helper-bin-arm64-linux.",
+        "dependsOn": [
+          "helper-bin-arm64-linux"
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/cowshed-helper",
+            "transitive": false
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/linux-arm64",
+          "built": ".cache/helper/linux-arm64/debug",
+          "command": "mkdir -p {args.outputDir} && cp {args.built}/cowshed-helper {args.outputDir}/cowshed-helper.partial && chmod 0755 {args.outputDir}/cowshed-helper.partial && mv {args.outputDir}/cowshed-helper.partial {args.outputDir}/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/linux-arm64",
+            "built": ".cache/helper/linux-arm64/release"
+          }
+        }
+      },
+      "helper-x64-linux": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "metadata": {
+          "ownedBy": "cowshed:cli-native"
+        },
+        "//": "helper-arm64-macos for helper-bin-x64-linux.",
+        "dependsOn": [
+          "helper-bin-x64-linux"
+        ],
+        "inputs": [
+          {
+            "dependentTasksOutputFiles": "**/cowshed-helper",
+            "transitive": false
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/{options.outputDir}/cowshed-helper"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "outputDir": ".cache/bin/linux-x64",
+          "built": ".cache/helper/linux-x64/debug",
+          "command": "mkdir -p {args.outputDir} && cp {args.built}/cowshed-helper {args.outputDir}/cowshed-helper.partial && chmod 0755 {args.outputDir}/cowshed-helper.partial && mv {args.outputDir}/cowshed-helper.partial {args.outputDir}/cowshed-helper"
+        },
+        "configurations": {
+          "production": {
+            "outputDir": "dist/bin/linux-x64",
+            "built": ".cache/helper/linux-x64/release"
+          }
+        }
+      },
       "cli-record-arm64-macos": {
         "executor": "nx:run-commands",
         "cache": true,
         "metadata": {
           "ownedBy": "cowshed:cli-native"
         },
-        "//": "The release record beside cli-arm64-macos's binary, <outputDir>/cowshed.build: the commit HEAD names, its commit time and the binary's SHA-256 (scripts/release-record.ts; specs/cowshed/05_gateway.md, Build records and the basis). Keyed on HEAD and on the binary's bytes, so the binary itself stays cached by its sources while every commit gets its own record; it runs in milliseconds. Its name ends in the platform, so cli-native, the aggregate build and the publish jobs run it beside cli-arm64-macos, in the same configuration.",
+        "//": "The release record beside cli-arm64-macos's binary, <outputDir>/cowshed.build: the commit HEAD names, its commit time and the binary's SHA-256 (scripts/release-record.ts; specs/cowshed/05_gateway.md, Build records and the basis). Keyed on HEAD and on the binary's bytes, so the binary itself stays cached by its sources while every commit gets its own record; it runs in milliseconds. Its name ends in the platform, so cli-native, the aggregate build and the publish jobs run it beside cli-arm64-macos, in the same configuration. It depends on helper-arm64-macos as well, which the record does not read: a recorded build is a whole distribution, cowshed with its helper beside it.",
         "dependsOn": [
-          "cli-arm64-macos"
+          "cli-arm64-macos",
+          "helper-arm64-macos"
         ],
         "inputs": [
           "{projectRoot}/scripts/release-record.ts",
@@ -577,7 +892,8 @@
         },
         "//": "cli-record-arm64-macos for cli-x64-macos.",
         "dependsOn": [
-          "cli-x64-macos"
+          "cli-x64-macos",
+          "helper-x64-macos"
         ],
         "inputs": [
           "{projectRoot}/scripts/release-record.ts",
@@ -612,7 +928,8 @@
         },
         "//": "cli-record-arm64-macos for cli-arm64-linux.",
         "dependsOn": [
-          "cli-arm64-linux"
+          "cli-arm64-linux",
+          "helper-arm64-linux"
         ],
         "inputs": [
           "{projectRoot}/scripts/release-record.ts",
@@ -647,7 +964,8 @@
         },
         "//": "cli-record-arm64-macos for cli-x64-linux.",
         "dependsOn": [
-          "cli-x64-linux"
+          "cli-x64-linux",
+          "helper-x64-linux"
         ],
         "inputs": [
           "{projectRoot}/scripts/release-record.ts",
@@ -1197,6 +1515,36 @@
         "options": {
           "cwd": ".",
           "command": "cargo --frozen build -p cowshed-apfs --bin cowshed-test-sweep -Z unstable-options --artifact-dir packages/cowshed/.cache/apfs-test-sweep"
+        }
+      },
+      "sandbox-exec-bin": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "cowshed-sandbox-exec, the sandbox launcher of a program that links cowshed-core and is not the cowshed binary (specs/cowshed/04_sandbox.md, Linux enforcement, The launcher). A Rust test binary is such a program: on Linux its fixtures name this artifact before they launch a sandboxed command (crates/cowshed-core/tests/support/sandbox_launcher.rs), so every cargo-test lane of cowshed-core and cowshed-cli depends on it. It is keyed on the crate closure it is built from, the same sources those lanes compile, because a launcher refuses a profile another build of the sandbox wrote. The cowshed binary is its own launcher and no distribution carries this one.",
+        "inputs": [
+          "cargoClosure",
+          "cargoToolchain",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh rustc -vV"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/.cache/sandbox-exec/cowshed-sandbox-exec"
+        ],
+        "dependsOn": [
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-fetch"
+          }
+        ],
+        "options": {
+          "cwd": ".",
+          "command": "cargo --frozen build -p cowshed-core --bin cowshed-sandbox-exec -Z unstable-options --artifact-dir packages/cowshed/.cache/sandbox-exec"
         }
       },
       "benchmark-apfs": {

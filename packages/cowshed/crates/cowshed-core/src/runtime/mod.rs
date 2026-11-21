@@ -1,17 +1,12 @@
-#[cfg(target_os = "macos")]
 pub(crate) mod build_volumes;
 pub mod child_fence;
 mod command_start;
 pub mod commitment_feed;
-#[cfg(target_os = "macos")]
 pub(crate) mod daemon_watch;
-#[cfg(target_os = "macos")]
 pub(crate) mod held_bundles;
 mod host_hold;
-#[cfg(target_os = "macos")]
 pub mod job_accounting;
 pub mod job_admission;
-#[cfg(target_os = "macos")]
 mod job_attribution;
 #[cfg(target_os = "linux")]
 pub mod job_cgroup;
@@ -24,16 +19,12 @@ pub mod job_spans;
 pub mod job_unattributed;
 pub mod land_lease;
 pub mod live_membership;
-#[cfg(target_os = "macos")]
 pub(crate) mod mount_activity;
 mod nix_builds;
 pub(crate) mod nx_daemon;
 pub mod placement;
-#[cfg(target_os = "macos")]
 pub mod process_events;
-#[cfg(target_os = "macos")]
 pub mod process_fence;
-#[cfg(target_os = "macos")]
 pub mod process_monitor;
 pub mod process_spans;
 pub mod process_stream;
@@ -49,7 +40,6 @@ mod shell_job;
 pub mod shell_pool;
 pub mod shell_watch;
 pub mod stack_sample;
-#[cfg(target_os = "macos")]
 pub(crate) mod storage_host;
 pub mod supervisor;
 pub mod supervisor_manager;
@@ -64,6 +54,7 @@ pub use project::{
     ProjectRuntime, ProjectRuntimeHost, ProjectSnapshots, RecoveryScope, RuntimeLogChunk,
     SEED_COMPACTION_VERB, WorkspaceSnapshot,
 };
+pub use storage_host::{NativeHost, native_host};
 pub use supervisor::{
     CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk, SessionSnapshot,
     SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,

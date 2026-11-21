@@ -108,6 +108,18 @@ pub fn place_group_nice(pgid: i32, nice: i32) -> io::Result<i32> {
     }
 }
 
+/// The nice a job of `class` is placed at: its command's own, its class's offset below the nice
+/// this supervisor runs at now.
+pub fn placed_nice(class: ExecClass) -> i32 {
+    nice_from(own_nice(), class)
+}
+
+/// A step of interactive work's decay: every process of the group `pgid` leads runs on at `nice`
+/// ([`place_group_nice`]).
+pub fn decay_group(pgid: i32, nice: i32) -> io::Result<()> {
+    place_group_nice(pgid, nice).map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

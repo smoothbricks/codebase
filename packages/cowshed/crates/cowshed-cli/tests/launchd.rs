@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use cowshed_cli::agent_cycle::LoadedAgent;
 use cowshed_cli::code_signing::{CODESIGN, CertificateHash, SigningIdentity};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use cowshed_cli::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, CommandStatus, ControlAction,
     ControlExecutionError, ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState,
@@ -20,6 +21,7 @@ use cowshed_cli::launchd::{
     plan_remove, replace_symlink,
 };
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, ReapError, RunError};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
 use cowshed_os::process::RunState;
 #[cfg(target_os = "macos")]
@@ -56,6 +58,7 @@ fn gateway() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(HostNamespace::Production, &cowshed_binary(), &bun()).unwrap()
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     let spec = gateway();
@@ -133,6 +136,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
 
 /// A plist outlives the shell that wrote it and nothing roots a store path for it, so no gateway
 /// agent can name one: after a devenv update and a nix GC it would be gone.
+#[cfg(target_os = "macos")]
 #[test]
 fn bun_directory_refuses_a_store_path() {
     assert_eq!(
@@ -220,6 +224,7 @@ fn bun_on_path_refuses_a_path_without_bun() {
     assert!(refusal.starts_with("no bun on PATH "), "{refusal}");
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
     let spec = LaunchAgentSpec::new_user(
@@ -240,6 +245,7 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
 
 /// A test namespace's agent is its own: its label, its plist path and its plist's `Label` name
 /// the namespace, and nothing in it names production's (01_storage.md, "Host namespace").
+#[cfg(target_os = "macos")]
 #[test]
 fn a_test_namespaces_agents_are_labelled_by_it_and_never_by_production() {
     let namespace = TestNamespace::mint().expect("a test namespace");
@@ -263,6 +269,7 @@ fn a_test_namespaces_agents_are_labelled_by_it_and_never_by_production() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn new_install_plan_is_restrictive_and_atomically_replaces_the_plist() {
     let spec = gateway();
@@ -295,6 +302,7 @@ fn new_install_plan_is_restrictive_and_atomically_replaces_the_plist() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn current_install_is_a_noop_but_bad_permissions_are_repaired() {
     let spec = gateway();
@@ -346,6 +354,7 @@ fn current_install_is_a_noop_but_bad_permissions_are_repaired() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn update_and_remove_plans_are_deterministic_and_filesystem_only() {
     let spec = gateway();
@@ -595,6 +604,7 @@ struct CommandInvocation {
     arguments: Vec<OsString>,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Default)]
 struct FakeCommand {
     invocations: Vec<CommandInvocation>,
@@ -651,6 +661,7 @@ fn temp_path() -> PathBuf {
     PathBuf::from("/Users/cowshed-test/Library/LaunchAgents/.exclusive-no-follow-temp")
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn executor_applies_new_install_in_exact_durable_order_and_reports_noop_idempotently() {
     let spec = gateway();
@@ -816,6 +827,7 @@ fn remove_execution_is_durable_and_absent_remove_is_idempotent() {
 /// Each call runs within its own bound: a bootstrap within launchctl's, a bootout within the loaded
 /// agent's exit timeout and the unload grace (launchd's own deadline for it), and a kickstart
 /// within that and one launchctl call, since `kickstart -k` waits for the old process to go.
+#[cfg(target_os = "macos")]
 #[test]
 fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
     let spec = gateway();
@@ -951,6 +963,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
     ));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
     let spec = gateway();
@@ -1042,6 +1055,7 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
 /// The type is the guarantee: the gateway plist can only be built from a path under
 /// `~/Library/Application Support/dev.cowshed/bin`, so no caller can bake a checkout or a
 /// workspace image into it — the binary installing it may itself be running from anywhere.
+#[cfg(target_os = "macos")]
 #[test]
 fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     let cowshed = cowshed_binary();

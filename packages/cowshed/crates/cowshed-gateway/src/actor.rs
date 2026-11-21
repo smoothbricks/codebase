@@ -204,6 +204,7 @@ impl Gateway {
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
+            crate::session_endpoint::prepare(&config)?;
             config.validate()?;
             config.validate_host_cache_layout()?;
             let connector: Arc<dyn UpstreamConnector> = Arc::new(SystemConnector::new(
@@ -290,6 +291,7 @@ impl Gateway {
         sim_runner: Arc<dyn SimRunner>,
         audit_tail: Option<AuditTailHandle>,
     ) -> Result<Self, GatewayError> {
+        crate::session_endpoint::prepare(&config)?;
         config.validate()?;
         // Before anything binds: a session restored later claims its carried listener rather
         // than racing the connections queued on it with a bind of its own.
@@ -1329,7 +1331,7 @@ impl Actor {
             return Err(GatewayError::Draining);
         }
         session.validate()?;
-        self.config.validate_session_endpoint(&session)?;
+        crate::session_endpoint::validate_session(&self.config, &session)?;
         let signer = CaSigner::parse(&session.ca)?;
         if !self.sessions.contains_key(&session.workspace_id)
             && self.sessions.len() >= self.config.limits.max_sessions
@@ -3253,17 +3255,31 @@ pub(crate) enum BoundListener {
 fn bind_endpoint(endpoint: &WorkspaceEndpoint) -> Result<BoundListener, GatewayError> {
     match endpoint {
         WorkspaceEndpoint::Tcp { address, .. } => Ok(BoundListener::Tcp(bind_tcp(*address)?)),
-        WorkspaceEndpoint::Unix(path) => {
-            remove_stale_socket(path)?;
-            let listener = bind_unix(path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(BoundListener::Unix(listener))
-        }
+        WorkspaceEndpoint::Unix(path) => Ok(BoundListener::Unix(bind_data_socket(path).map_err(
+            |error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot bind the workspace data socket {}: {error}",
+                        path.display()
+                    ),
+                )
+            },
+        )?)),
     }
+}
+
+/// Bind a workspace's data socket for its owner alone, replacing a stale socket of the user's
+/// at `path`.
+fn bind_data_socket(path: &Path) -> std::io::Result<Fenced<UnixListener>> {
+    remove_stale_socket(path)?;
+    let listener = bind_unix(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(listener)
 }
 
 fn remove_stale_socket(path: &Path) -> Result<(), std::io::Error> {

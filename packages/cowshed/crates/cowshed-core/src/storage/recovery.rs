@@ -520,27 +520,6 @@ impl cowshed_apfs::RetainedInputs for ReAdoptSource {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl ReAdoptSource {
-    /// `path` as the retained-input token the disk-image layer's read-only attachment takes: one
-    /// of exactly the images this validated record names.
-    pub(crate) fn retained_input<'a>(
-        &self,
-        path: &'a Path,
-    ) -> CowshedResult<cowshed_apfs::RetainedInput<'a>> {
-        self.validate()?;
-        cowshed_apfs::RetainedInput::named_by(self, path).ok_or_else(|| {
-            CowshedError::integrity(
-                format!(
-                    "{} is not an input named by this re-adoption record",
-                    path.display()
-                ),
-                "keep the source images and repair the replacement record",
-            )
-        })
-    }
-}
-
 /// Where re-adoption retains the images it replaced, under the project directory.
 pub const RETAINED_NAMESPACE: &str = "retained";
 
@@ -1333,7 +1312,6 @@ impl LifecycleIntentJournal {
     /// against the state that attempt recorded. The journaled record must still be exactly
     /// `expected`, unfinished and a missing main's; otherwise the journal moved underneath the
     /// capture and nothing is written. Only `git_before` changes.
-    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn rerecord_missing_main_git(
         &mut self,
         expected: &ReAdoptSource,
@@ -1709,12 +1687,6 @@ fn malformed_identity_intent(message: String) -> CowshedError {
 }
 
 /// The refusal a retained `Prepared` retirement produces when its target state cannot be read.
-///
-/// macOS-only because its sole caller is the APFS lifecycle recovery path, which is itself
-/// `cfg(target_os = "macos")`. Without the gate a Linux `cargo check` of the library alone sees
-/// no caller and `-D dead-code` fails the build, while a local `--all-targets` run hides it
-/// behind the test below.
-#[cfg(target_os = "macos")]
 pub(crate) fn prepared_retirement_unreadable(
     workspace: &WorkspaceName,
     expected_mount: &Path,

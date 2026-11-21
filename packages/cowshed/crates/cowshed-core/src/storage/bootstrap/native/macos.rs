@@ -16,18 +16,20 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod created_volume;
 mod keychain;
+
+use created_volume::{CreatedMountState, attest_created_apfs_info, parse_created_apfs_identifier};
 
 use super::super::{
     APFS_BUILD_CACHE_VOLUME, APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind,
     ApfsVolumeProvision, BUILD_CACHE_MOUNTPOINT, BlockingLane, BootstrapEvidence,
     BootstrapExecutionError, BootstrapHost, BootstrapPlan, BuildCacheAdoption, CanonicalRoots,
-    CreatedMountState, DISKUTIL, ExistingStorage, HostCommand, HostCommandFailure,
-    HostCommandOutput, HostError, HostOperation, MOUNT_SERVICE_PLIST, MountpointState,
-    RETIRED_CACHES_MOUNTPOINT, SelectedSubstrate, StatFsEvidence, SubstrateKind, TokioBlockingLane,
-    VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeMarker, VolumeRole, attest_created_apfs_info,
-    execute_bootstrap_operation, parse_created_apfs_identifier, plan_apfs_build_cache,
-    plan_bootstrap, require_mounted_marker, select_substrate,
+    DISKUTIL, ExistingStorage, HostCommand, HostCommandFailure, HostCommandOutput, HostError,
+    HostOperation, MOUNT_SERVICE_PLIST, MountpointState, RETIRED_CACHES_MOUNTPOINT,
+    SelectedSubstrate, StatFsEvidence, SubstrateKind, TokioBlockingLane, VOLUME_MARKER_FILE,
+    ValidatedHostStorage, VolumeMarker, VolumeRole, execute_bootstrap_operation,
+    plan_apfs_build_cache, plan_bootstrap, require_mounted_marker, select_substrate,
 };
 use super::shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
@@ -40,8 +42,9 @@ use super::shared::{
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
-use crate::storage::host_config::{
-    BUILD_CACHE_PARENT, HostConfig, MACOS_MOUNT_PREFIX, macos_mount_root,
+use crate::storage::host_config::HostConfig;
+use crate::storage::host_config::macos::{
+    BUILD_CACHE_PARENT, MACOS_MOUNT_PREFIX, macos_mount_root,
 };
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::{

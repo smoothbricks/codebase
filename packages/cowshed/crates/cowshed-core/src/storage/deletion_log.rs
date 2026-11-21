@@ -234,7 +234,6 @@ impl Caller {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn parent_process(pid: libc::pid_t) -> Option<CallerProcess> {
     let arguments = cowshed_os::process::process_arguments(pid).ok()?;
     Some(CallerProcess {
@@ -242,19 +241,6 @@ fn parent_process(pid: libc::pid_t) -> Option<CallerProcess> {
         argv: arguments
             .argv
             .iter()
-            .map(|argument| String::from_utf8_lossy(argument).into_owned())
-            .collect(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn parent_process(pid: libc::pid_t) -> Option<CallerProcess> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    Some(CallerProcess {
-        pid: u32::try_from(pid).ok()?,
-        argv: raw
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
             .collect(),
     })

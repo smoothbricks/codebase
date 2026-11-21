@@ -1,59 +1,61 @@
-//! A job's process tree as the macOS kernel reports it (07_api.md, "Process-tree observations").
+//! A job's process tree as the kernel reports it (07_api.md, "Process-tree observations").
 //!
-//! Each member is watched with kqueue `NOTE_FORK`, `NOTE_EXEC` and `NOTE_EXIT`/
-//! `NOTE_EXITSTATUS`. `NOTE_FORK` neither names nor counts the children (xnu `filt_procevent`
-//! ORs the event bits; `NOTE_TRACK` is refused with `ENOTSUP`), so each one is answered by
-//! reading the member's children with `proc_listchildpids`: a child forked and reaped before
-//! that read is never seen. A member that forks therefore makes the tree's coverage a gap
-//! ([`ProcessCoverageGap::UncountedFork`]). The job's CPU totals come from the leader's own and
-//! reaped-children rusage (within that source's named limits), not from this tree.
+//! Each member is registered with the platform's event source, and the observer folds what the
+//! source reports of it: that it forked, that it exec'd, that it exited, with its wait status
+//! where the kernel gives one. The source is the platform's (`macos.rs`: kqueue `EVFILT_PROC`,
+//! which reports all three as events; `linux.rs`: one pidfd per life in an epoll set, which
+//! reports exits as events, and a survey of `/proc` for forks and execs at the observer's
+//! sampling and custody boundaries), selected here and nowhere else. No source names or counts a
+//! fork's children, so each fork is answered by reading the member's children: a child forked
+//! and reaped before that read is never seen. A member that forks therefore makes the tree's
+//! coverage a gap ([`ProcessCoverageGap::UncountedFork`]), and under a source that learns of
+//! forks only by looking, that gap stands from the root's first moment. The job's CPU totals
+//! come from the job's accounting source (within that source's named limits), not from this
+//! tree.
 //!
-//! Identity is the kernel's unique id (`p_uniqueid`), which no other process is given while the
-//! system runs. Every kernel read here names a pid alone, so each is fenced by that id:
+//! Identity is the kernel's id of one life (macOS `p_uniqueid`; Linux the pid's start time),
+//! which no other process holding that pid is given. Every kernel read here names a pid alone,
+//! so each is fenced by that id:
 //!
-//! - A registration carries the life's unique id as its cookie (`EV_UDATA_SPECIFIC`, so two
-//!   lives of one pid are two registrations), and every event names its life by that cookie,
-//!   never by its pid: a late event of an older life lands on that life, not on the one now
-//!   holding its pid. The life is read before the registration and again after it; only the
-//!   same unique id both times proves the registration is that life's, and anything else is
-//!   withdrawn unadopted.
+//! - A registration names one life, and every report names its life, never its pid alone: a
+//!   late report of an older life lands on that life, not on the one now holding its pid. The
+//!   life is read before the registration and again after it; only the same id both times
+//!   proves the registration is that life's, and anything else is withdrawn unadopted.
 //! - An image or a child list is read between two reads of its process's record. Read from a
 //!   life that was no longer running by the second read, it is discarded as a stranger's, and
 //!   the life's image is a gap ([`ProcessCoverageGap::UnreadImage`]).
 //! - An image that could not be read is a gap, and a read that failed is also returned: an
 //!   observation error is an operational value, the observer stays usable, and no errno is
-//!   swallowed into a gap. `KERN_PROCARGS2` answers `EINVAL` alike for a pid it cannot find,
-//!   for a process between two images, and for arguments it refuses this reader (xnu
-//!   `sysctl_procargsx`); it answers `EIO` while the arguments' pages are unmapped (measured
-//!   mid-exec on Darwin 25.6). A refusal is named by the kernel's own credential rule,
-//!   `is_procargs_content_read_permitted`: a reader whose effective uid is neither 0 nor the
-//!   process's is refused ([`ObserveError::ImageNotPermitted`], keeping the `EINVAL`). Every
-//!   other failed read is [`ObserveError::Kernel`] with its call and errno, whether or not the
-//!   life still ran; a child list in particular never fails because its parent exited. A failed
-//!   read of an exec's or adoption's image, or of the children a fork left, leaves the fold as
+//!   swallowed into a gap. The errno the platform's image read answers a reader it refuses may
+//!   have other causes too, so a refusal is named by the kernel's credential rule: a reader
+//!   whose effective uid is neither 0 nor the process's is refused
+//!   ([`ObserveError::ImageNotPermitted`], keeping the errno). Every other failed read is
+//!   [`ObserveError::Kernel`] with its call and errno, whether or not the life still ran; a
+//!   child list in particular never fails because its parent exited. A failed read of an exec's
+//!   or adoption's image, or of the children a fork left, leaves the fold as
 //!   [`ObserveError::Unread`] around that error: the fold recorded the gap
 //!   ([`ProcessCoverageGap::UnreadImage`], [`ProcessCoverageGap::UncountedFork`]), so the tree
 //!   stays a readable answer and only those who follow the failures (the drain's caller, the
 //!   event stream) are told.
-//! - xnu grants `NOTE_EXITSTATUS` only for a child or a life this observer may SIGKILL
-//!   (`filt_procattach`) and refuses any other with `EACCES`: a root command a member ran
-//!   through sudo, for one. The one registration path then watches that life for
-//!   `NOTE_FORK`/`NOTE_EXEC`/`NOTE_EXIT` alone, which the kernel grants for every process, so
-//!   its exit is still joined and only its status is withheld
-//!   ([`ProcessCoverageGap::UnreadExitStatus`]), never guessed and never a refused watch.
-//! - Custody-only admission and retirement fold fork/exit evidence without reading argv or final usage; an exec
-//!   records UnreadImage instead. An exec coalesced with its known exit also skips that useless
-//!   read. Normal observation retains every native image failure above. Identity, lineage,
-//!   registration and signal reads remain strict in both purposes.
-//! - A child is adopted only when its parent's unique id is the member's.
-//! - The kernel hands over a batch of events at once and keeps none of them. Every event of a
-//!   batch, and every bit of each event, is folded even after another failed, so a failed image
-//!   read never drops the exit coalesced beside it; the batch's failures are returned together.
+//! - A kernel gives an exit's wait status only to an observer it permits (macOS: a child, or a
+//!   life the observer may SIGKILL; Linux: any reaped life, and an unreaped one the observer's
+//!   credentials may read). The exit of any other life is still joined and only its status is
+//!   withheld ([`ProcessCoverageGap::UnreadExitStatus`]), never guessed and never a refused
+//!   watch: a root command a member ran through sudo, for one.
+//! - Custody-only admission and retirement fold fork/exit evidence without reading argv or
+//!   final usage; an exec records UnreadImage instead. An exec reported with its known exit
+//!   also skips that useless read. Normal observation retains every native image failure above.
+//!   Identity, lineage, registration and signal reads remain strict in both purposes.
+//! - A child is adopted only when its parent's id is the member's.
+//! - The source hands over a batch of reports at once and keeps none of them. Every report of
+//!   a batch, and everything each one says, is folded even after another failed, so a failed
+//!   image read never drops the exit reported beside it; the batch's failures are returned
+//!   together.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::time::{Duration, Instant};
 
@@ -73,22 +75,42 @@ use crate::runtime::process_usage::{SampleError, Sampled, StartStamp};
 use crate::runtime::supervisor::{process_termination_from_wait, utc_at_second, utc_now};
 use cowshed_os::process::process_arguments;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::{Source, Watch};
+
 /// Custody depends on lives and exit watches, not their current argv.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ObservationPurpose {
     Metadata,
     Custody,
 }
-const WATCHED: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
-/// What the kernel grants for a life it refuses `NOTE_EXITSTATUS` with `EACCES`.
-const WATCHED_WITHOUT_STATUS: u32 = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT;
 
-/// The exit watch the kernel granted one registered life.
+/// What the event source reported of one registered life at once. A source coalesces: one
+/// report may say all of it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExitWatch {
-    /// `NOTE_EXIT` carries the life's wait status.
-    Status,
-    /// `NOTE_EXIT` alone: the exit is joined, its status is withheld from this observer.
+struct Report {
+    process: ProcessIdentity,
+    /// It forked an uncounted number of children.
+    forked: bool,
+    /// It runs another image than it did.
+    exec: bool,
+    exit: Option<ExitReport>,
+}
+
+/// How the event source reported a registered life's exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExitReport {
+    /// With the life's wait status, as wide as the widest source reports it.
+    Status(isize),
+    /// The exit alone: the kernel withheld its status from this observer.
     Withheld,
 }
 
@@ -101,10 +123,11 @@ pub enum ObserveError {
         pid: u32,
         source: io::Error,
     },
-    /// The kernel refuses this observer the arguments of a process running as another user;
-    /// `source` is the call's own `EINVAL`.
+    /// The kernel refuses this observer the image of a process running as another user;
+    /// `source` is the call's own errno.
     #[error(
-        "KERN_PROCARGS2 refuses process {pid}'s arguments: it runs as uid {uid}, this observer as uid {reader}: {source}"
+        "{} refuses process {pid}'s arguments: it runs as uid {uid}, this observer as uid {reader}: {source}",
+        platform::IMAGE
     )]
     ImageNotPermitted {
         pid: u32,
@@ -217,9 +240,12 @@ pub trait ProcessReads {
     /// The effective uid the reads are made as.
     fn reader_uid(&self) -> u32;
     /// A reading fenced to this retained life; missing proof never becomes invented counters.
+    /// `held` is the descriptor the observer's registration holds of the life where the event
+    /// source keeps one (a Linux pidfd), which then is the fence.
     fn usage(
         &self,
         process: ProcessIdentity,
+        held: Option<BorrowedFd<'_>>,
         start: Option<StartStamp>,
         at: Instant,
     ) -> Result<Sampled, SampleError>;
@@ -231,7 +257,7 @@ pub trait ProcessReads {
     fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool>;
 }
 
-/// The running kernel.
+/// The running kernel, whichever the platform's is: the name is the first one it read.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Darwin;
 
@@ -249,23 +275,7 @@ impl ProcessReads for Darwin {
     }
 
     fn children(&self, pid: u32) -> io::Result<Vec<u32>> {
-        let parent = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
-        let mut capacity = 64_usize;
-        loop {
-            let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-            let bytes = libc::c_int::try_from(capacity * size_of::<libc::pid_t>())
-                .map_err(io::Error::other)?;
-            // SAFETY: `pids` is writable for `bytes` bytes.
-            let count = unsafe { list_child_pids(parent, pids.as_mut_ptr().cast(), bytes) }?;
-            if count < capacity {
-                return Ok(pids[..count]
-                    .iter()
-                    .filter_map(|&child| u32::try_from(child).ok())
-                    .filter(|&child| child > 0)
-                    .collect());
-            }
-            capacity *= 2;
-        }
+        platform::children(pid)
     }
 
     fn reader_uid(&self) -> u32 {
@@ -276,10 +286,11 @@ impl ProcessReads for Darwin {
     fn usage(
         &self,
         process: ProcessIdentity,
+        held: Option<BorrowedFd<'_>>,
         start: Option<StartStamp>,
         at: Instant,
     ) -> Result<Sampled, SampleError> {
-        crate::runtime::process_usage::sample(start, process, at)
+        crate::runtime::process_usage::sample(process, held, start, at)
     }
 
     fn group(&self, leader: &Birth) -> io::Result<Vec<ProcessRecord>> {
@@ -291,53 +302,29 @@ impl ProcessReads for Darwin {
     }
 }
 
-/// `proc_listchildpids`, its failure told apart from an empty list. libproc's `proc_listpids`
-/// answers the kernel's -1 with 0 and leaves errno set (libsyscall `libproc.c`), so a 0 is an
-/// empty list only when errno stayed clear across the call.
-///
-/// # Safety
-///
-/// `buffer` is writable for `bytes` bytes.
-unsafe fn list_child_pids(
-    parent: libc::pid_t,
-    buffer: *mut libc::c_void,
-    bytes: libc::c_int,
-) -> io::Result<usize> {
-    // SAFETY: `__error` names this thread's errno.
-    unsafe { *libc::__error() = 0 };
-    // SAFETY: the caller's contract on `buffer`.
-    let count = unsafe { libc::proc_listchildpids(parent, buffer, bytes) };
-    let error = io::Error::last_os_error();
-    match (usize::try_from(count), error.raw_os_error()) {
-        (Ok(count), Some(0)) => Ok(count),
-        (Ok(count), _) if count > 0 => Ok(count),
-        (_, Some(0)) => Err(io::Error::other(format!(
-            "proc_listchildpids returned {count} without an errno"
-        ))),
-        _ => Err(error),
-    }
-}
-
-/// The process tree of one job, observed from before its root could fork or exec.
+/// The process tree of one job, observed from before its root could fork or exec, through the
+/// platform's event source: the name is the first source it had.
 #[derive(Debug)]
 pub struct KqueueObserver<P = Darwin> {
-    queue: OwnedFd,
+    source: Source,
     reads: P,
     fold: JobProcessFold,
     events: Vec<JobProcessEvent>,
-    /// Every life with a registration and the exit watch it holds: its events are the only ones
-    /// the observer folds.
-    registered: HashMap<ProcessIdentity, ExitWatch>,
+    /// Every life with a registration and the watch the source holds of it: its reports are the
+    /// only ones the observer folds.
+    registered: HashMap<ProcessIdentity, Watch>,
     /// Each adoption the observer saw it miss: a fork whose children could not be listed before
     /// its parent's life ended, or a listed child that could not be watched. Such a child may run
     /// on outside every registration; a retirement reports these as its `lost`.
     missed: Vec<ProcessCoverageGap>,
+    /// The batch of reports being folded, kept between batches for its allocation.
+    reports: Vec<Result<Report, ObserveError>>,
 }
 
 impl<P> AsRawFd for KqueueObserver<P> {
     /// Readable when an event waits for [`KqueueObserver::drain`].
     fn as_raw_fd(&self) -> RawFd {
-        self.queue.as_raw_fd()
+        self.source.as_raw_fd()
     }
 }
 
@@ -361,20 +348,14 @@ impl<P: ProcessReads> KqueueObserver<P> {
     }
 
     pub(crate) fn prepare_with(reads: P) -> Result<Self, ObserveError> {
-        // SAFETY: kqueue takes nothing and returns a new descriptor.
-        let queue = unsafe { libc::kqueue() };
-        if queue < 0 {
-            return Err(kernel("kqueue", 0, io::Error::last_os_error()));
-        }
-        // SAFETY: a fresh descriptor this function alone owns.
-        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
         Ok(Self {
-            queue,
+            source: Source::open()?,
             reads,
             fold: JobProcessFold::new(Instant::now()),
             events: Vec::new(),
             registered: HashMap::new(),
             missed: Vec::new(),
+            reports: Vec::new(),
         })
     }
 
@@ -382,7 +363,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
     pub fn watch_root(&mut self, root: u32) -> Result<(), ObserveError> {
         let not_running = || {
             kernel(
-                "proc_pidinfo",
+                platform::RECORD,
                 root,
                 io::Error::new(io::ErrorKind::NotFound, "the held root is not running"),
             )
@@ -397,6 +378,9 @@ impl<P: ProcessReads> KqueueObserver<P> {
             at: utc_at_second(record.started_seconds)?,
             image,
         })?;
+        if let Some(gap) = platform::standing_gap(process.pid) {
+            self.observe(ProcessObservation::Lost(gap))?;
+        }
         self.sample(Instant::now())?;
         Ok(())
     }
@@ -461,9 +445,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
         !self.events.is_empty()
     }
 
-    /// A duplicate queue descriptor wakes the sole writer; it is not an observation reader.
+    /// A duplicate of the source's wake descriptor wakes the sole writer; it is not an
+    /// observation reader.
     pub fn wake_handle(&self) -> io::Result<OwnedFd> {
-        self.queue.try_clone()
+        self.source.wake_handle()
     }
 
     pub fn gap(&mut self, reason: ProcessCoverageGap) -> Result<(), ObserveError> {
@@ -491,16 +476,18 @@ impl<P: ProcessReads> KqueueObserver<P> {
         Ok(())
     }
 
-    /// One supervisor-owned sampling boundary, independent of subscribers and tree readers.
+    /// One supervisor-owned sampling boundary, independent of subscribers and tree readers. It
+    /// is also where a source that reports forks and execs only when asked is asked.
     pub fn sample(&mut self, at: Instant) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        for &process in self.registered.keys() {
+        self.survey_into(&mut failures, ObservationPurpose::Metadata);
+        for (&process, watch) in &self.registered {
             if self.fold.lives().live(process.pid) != Some(process) {
                 continue;
             }
             match self
                 .reads
-                .usage(process, self.fold.usage_start(process), at)
+                .usage(process, watch.held(), self.fold.usage_start(process), at)
             {
                 Ok(Sampled::Read(reading)) => failures.note(
                     self.fold
@@ -533,9 +520,21 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.drain_for(ObservationPurpose::Custody)
     }
 
+    /// Ask the event source now for what it reports only when asked, and fold it: for a caller
+    /// that knows its held root has been released into its exec, whose image no event of such a
+    /// source would report before the next sampling boundary.
+    pub(crate) fn survey(&mut self) -> Result<(), ObserveError> {
+        let mut failures = Failures::default();
+        self.survey_into(&mut failures, ObservationPurpose::Metadata);
+        failures.into_result()
+    }
+
     fn drain_for(&mut self, purpose: ObservationPurpose) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         self.drain_into(&mut failures, purpose);
+        if purpose == ObservationPurpose::Custody {
+            self.survey_into(&mut failures, purpose);
+        }
         failures.into_result()
     }
 
@@ -561,15 +560,14 @@ impl<P: ProcessReads> KqueueObserver<P> {
         purpose: ObservationPurpose,
     ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        let timeout = within.map(|within| libc::timespec {
-            tv_sec: libc::time_t::try_from(within.as_secs()).unwrap_or(libc::time_t::MAX),
-            tv_nsec: libc::c_long::from(within.subsec_nanos()),
-        });
         if self
-            .collect(timeout.as_ref(), &mut failures, purpose)
+            .collect(within, &mut failures, purpose)
             .is_some_and(|ready| ready > 0)
         {
             self.drain_into(&mut failures, purpose);
+        }
+        if purpose == ObservationPurpose::Custody {
+            self.survey_into(&mut failures, purpose);
         }
         failures.into_result()
     }
@@ -585,7 +583,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         let members = self
             .reads
             .group(leader)
-            .map_err(|source| kernel("proc_listpgrppids", leader.pid(), source))?;
+            .map_err(|source| kernel(platform::GROUP, leader.pid(), source))?;
         for member in members {
             if !self.fold.lives().holds(identity(&member)) {
                 self.adopt_member(member)?;
@@ -614,7 +612,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             .find(|life| !self.registered.contains_key(life))
         {
             return Err(kernel(
-                "kevent(EVFILT_PROC)",
+                platform::WATCH,
                 unwatched.pid,
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -657,7 +655,9 @@ impl<P: ProcessReads> KqueueObserver<P> {
             ended_or_failed => {
                 // Its life ended around the read, or the read failed: withdraw the registration
                 // unadopted. A life that still runs is read again by the next membership read.
-                self.withdraw(process)?;
+                if let Some(watch) = self.registered.get(&process) {
+                    self.source.withdraw(process, watch)?;
+                }
                 self.registered.remove(&process);
                 return ended_or_failed.map(|_| ());
             }
@@ -700,7 +700,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         }
         self.reads
             .signal(process, signal)
-            .map_err(|source| kernel("proc_signal_with_audittoken", process.pid, source))
+            .map_err(|source| kernel(platform::SIGNAL, process.pid, source))
     }
 
     /// Every adoption this observer saw it miss, in the order it missed them.
@@ -709,131 +709,101 @@ impl<P: ProcessReads> KqueueObserver<P> {
     }
 
     fn drain_into(&mut self, failures: &mut Failures, purpose: ObservationPurpose) {
-        let zero = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
         while self
-            .collect(Some(&zero), failures, purpose)
+            .collect(Some(Duration::ZERO), failures, purpose)
             .is_some_and(|ready| ready > 0)
         {}
     }
 
-    /// Fold one batch of events: how many there were, or `None` when `kevent` itself failed.
+    /// Fold one batch of the source's reports, waiting up to `within` for the first (`None`:
+    /// until one comes): how many events the kernel handed over, or `None` when the source
+    /// itself failed.
     fn collect(
         &mut self,
-        timeout: Option<&libc::timespec>,
+        within: Option<Duration>,
         failures: &mut Failures,
         purpose: ObservationPurpose,
     ) -> Option<usize> {
-        // SAFETY: an all-zero kevent is a valid value of the plain C struct.
-        let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
-        let capacity = libc::c_int::try_from(events.len()).expect("64 events");
-        let ready = loop {
-            // SAFETY: `events` is writable for `capacity` events; no changes are passed.
-            let ready = unsafe {
-                libc::kevent(
-                    self.queue.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    events.as_mut_ptr(),
-                    capacity,
-                    timeout.map_or(std::ptr::null(), std::ptr::from_ref),
-                )
-            };
-            match usize::try_from(ready) {
-                Ok(ready) => break ready,
-                Err(_) => {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        failures.note(Err(kernel("kevent", 0, error)));
-                        return None;
-                    }
-                }
+        let mut reports = std::mem::take(&mut self.reports);
+        let ready = match self
+            .source
+            .collect(within, &mut self.registered, &mut reports)
+        {
+            Ok(ready) => {
+                failures.note(self.fold_batch(&mut reports, purpose));
+                Some(ready)
+            }
+            Err(error) => {
+                reports.clear();
+                failures.note(Err(error));
+                None
             }
         };
-        failures.note(self.fold_batch(&events[..ready], purpose));
-        Some(ready)
+        self.reports = reports;
+        ready
     }
 
-    /// Fold every event of one batch the kernel handed over, each one even after another
-    /// failed: the kernel keeps none of them. The batch's failures are returned together.
+    /// Ask the source for what it reports only when asked, and fold it: nothing under a source
+    /// that reports every fork and exec as an event.
+    fn survey_into(&mut self, failures: &mut Failures, purpose: ObservationPurpose) {
+        let mut reports = std::mem::take(&mut self.reports);
+        self.source
+            .survey(purpose, &mut self.registered, &mut reports);
+        failures.note(self.fold_batch(&mut reports, purpose));
+        self.reports = reports;
+    }
+
+    /// Fold every report of one batch the source handed over, each one even after another
+    /// failed: the source keeps none of them. The batch's failures are returned together.
     fn fold_batch(
         &mut self,
-        events: &[libc::kevent],
+        reports: &mut Vec<Result<Report, ObserveError>>,
         purpose: ObservationPurpose,
     ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        for event in events {
-            failures.note(self.handle(event, purpose));
+        for report in reports.drain(..) {
+            failures.note(report.and_then(|report| self.fold_report(report, purpose)));
         }
         failures.into_result()
     }
 
-    fn handle(
+    fn fold_report(
         &mut self,
-        event: &libc::kevent,
+        report: Report,
         purpose: ObservationPurpose,
     ) -> Result<(), ObserveError> {
-        if event.filter != libc::EVFILT_PROC {
+        let Report {
+            process,
+            forked,
+            exec,
+            exit,
+        } = report;
+        if !self.registered.contains_key(&process) {
+            // A registration withdrawn unadopted: its queued reports were never this tree's.
             return Ok(());
         }
-        // `struct kevent` is packed on Darwin: copy each field out before using it.
-        let (ident, flags, fflags, data, udata) = (
-            event.ident,
-            event.flags,
-            event.fflags,
-            event.data,
-            event.udata,
-        );
-        let pid = u32::try_from(ident).map_err(|error| {
-            kernel(
-                "kevent",
-                0,
-                io::Error::new(io::ErrorKind::InvalidData, error),
-            )
-        })?;
-        if flags & libc::EV_ERROR != 0 {
-            let errno = i32::try_from(data).unwrap_or(libc::EINVAL);
-            return Err(kernel("kevent", pid, io::Error::from_raw_os_error(errno)));
-        }
-        let cookie = u64::try_from(udata.addr()).map_err(|error| {
-            kernel(
-                "kevent",
-                pid,
-                io::Error::new(io::ErrorKind::InvalidData, error),
-            )
-        })?;
-        let process = ProcessIdentity {
-            pid,
-            birth: BirthToken(cookie),
-        };
-        let Some(&watch) = self.registered.get(&process) else {
-            // A registration withdrawn unadopted: its queued events were never this tree's.
-            return Ok(());
-        };
-        // The bits of one event are coalesced; a fork's children are read while the parent
-        // still runs, before its exec or exit is folded. Each bit is folded even when an
+        // One report coalesces what its life did; a fork's children are read while the parent
+        // still runs, before its exec or exit is folded. Each part is folded even when an
         // earlier one failed.
         let mut failures = Failures::default();
-        if fflags & libc::NOTE_FORK != 0 {
+        if forked {
             failures.note(self.forked(process, purpose));
         }
-        if fflags & libc::NOTE_EXEC != 0 {
-            let purpose = if fflags & libc::NOTE_EXIT != 0 {
+        if exec {
+            let purpose = if exit.is_some() {
                 ObservationPurpose::Custody
             } else {
                 purpose
             };
             failures.note(self.fold_image(process, Seen::Exec, purpose));
         }
-        if fflags & libc::NOTE_EXIT != 0 {
-            failures.note(self.exited(process, watch, data, purpose));
+        if let Some(exit) = exit {
+            failures.note(self.exited(process, exit, purpose));
         }
         failures.into_result()
     }
 
-    /// Fold the image `process` runs now. After a `NOTE_EXEC` it is that exec's image; read
+    /// Fold the image `process` runs now. After a reported exec it is that exec's image; read
     /// at adoption, it is an exec only when it differs from the parent's image the child
     /// started with. An image that could not be read is the `UnreadImage` gap, and a read
     /// that failed is returned beside it with its call and errno.
@@ -870,22 +840,24 @@ impl<P: ProcessReads> KqueueObserver<P> {
         failures.into_result()
     }
 
-    /// Fold `process`'s exit. Its status is the event's wait status under an
-    /// [`ExitWatch::Status`]; under [`ExitWatch::Withheld`] the kernel sent none and the status
-    /// stays unread.
+    /// Fold `process`'s exit. Its status is the wait status the source reported with it
+    /// ([`ExitReport::Status`]); under [`ExitReport::Withheld`] the kernel gave none and the
+    /// status stays unread.
     fn exited(
         &mut self,
         process: ProcessIdentity,
-        watch: ExitWatch,
-        data: isize,
+        exit: ExitReport,
         purpose: ObservationPurpose,
     ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         if purpose == ObservationPurpose::Metadata {
-            match self
-                .reads
-                .usage(process, self.fold.usage_start(process), Instant::now())
-            {
+            let held = self.registered.get(&process).and_then(Watch::held);
+            match self.reads.usage(
+                process,
+                held,
+                self.fold.usage_start(process),
+                Instant::now(),
+            ) {
                 Ok(Sampled::Read(reading)) => failures.note(
                     self.fold
                         .apply(
@@ -898,13 +870,13 @@ impl<P: ProcessReads> KqueueObserver<P> {
                 Err(error) => failures.note(Err(error.into())),
             }
         }
-        // An exit ends the kernel's registration with it.
+        // An exit ends the source's registration with it.
         self.registered.remove(&process);
-        let status = match watch {
-            ExitWatch::Status => {
+        let status = match exit {
+            ExitReport::Status(data) => {
                 let status = i32::try_from(data).map_err(|_| {
                     kernel(
-                        "NOTE_EXITSTATUS",
+                        platform::EXIT_STATUS,
                         process.pid,
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -916,7 +888,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
                     std::process::ExitStatus::from_raw(status),
                 ))?)
             }
-            ExitWatch::Withheld => None,
+            ExitReport::Withheld => None,
         };
         failures.note(self.observe(ProcessObservation::Exited {
             process,
@@ -1019,7 +991,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// when the same unique id still holds the pid: then the registration is that life's.
     fn attach(&mut self, before: ProcessRecord) -> Result<Option<ProcessRecord>, ObserveError> {
         let process = identity(&before);
-        let Some(watch) = self.register(process)? else {
+        let Some(watch) = self.source.register(process)? else {
             return Ok(None);
         };
         match self.record(process.pid)? {
@@ -1030,7 +1002,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             // The pid named another life by the registration, or this one exited: whose
             // registration it is cannot be proven.
             Some(_) | None => {
-                self.withdraw(process)?;
+                self.source.withdraw(process, &watch)?;
                 Ok(None)
             }
         }
@@ -1060,10 +1032,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
             Ok(after) => (after, None),
             Err(fence) => (None, Some(fence)),
         };
-        // `EINVAL` is also the kernel's refusal; its own credential rule, applied to the
-        // life's records around the call, says when it is one.
+        // What the kernel answers a reader it refuses may have other causes too; its own
+        // credential rule, applied to the life's records around the call, says when it is one.
         let reader = self.reads.reader_uid();
-        let refused = (source.raw_os_error() == Some(libc::EINVAL))
+        let refused = platform::image_refused(&source)
             .then(|| {
                 std::iter::once(before)
                     .chain(after)
@@ -1077,7 +1049,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
                 reader,
                 source,
             },
-            None => kernel("KERN_PROCARGS2", process.pid, source),
+            None => kernel(platform::IMAGE, process.pid, source),
         };
         Err(match fence {
             None => failed,
@@ -1099,91 +1071,14 @@ impl<P: ProcessReads> KqueueObserver<P> {
         let children = self
             .reads
             .children(parent.pid)
-            .map_err(|source| kernel("proc_listchildpids", parent.pid, source))?;
+            .map_err(|source| kernel(platform::CHILDREN, parent.pid, source))?;
         Ok(self.current(parent)?.map(|_| children))
     }
 
     fn record(&self, pid: u32) -> Result<Option<ProcessRecord>, ObserveError> {
         self.reads
             .record(pid)
-            .map_err(|source| kernel("proc_pidinfo", pid, source))
-    }
-
-    /// Register `process` for its events, keyed by its unique id: the exit watch the kernel
-    /// granted, or `None` when the pid names no running process (`ESRCH`). A life the kernel
-    /// refuses `NOTE_EXITSTATUS` with `EACCES` is registered without it, which xnu grants for
-    /// every process, so its exit is joined all the same.
-    fn register(&self, process: ProcessIdentity) -> Result<Option<ExitWatch>, ObserveError> {
-        let add = libc::EV_ADD | libc::EV_CLEAR;
-        let (watch, changed) = match self.change(process, add, WATCHED)? {
-            Err(refused) if refused.raw_os_error() == Some(libc::EACCES) => (
-                ExitWatch::Withheld,
-                self.change(process, add, WATCHED_WITHOUT_STATUS)?,
-            ),
-            changed => (ExitWatch::Status, changed),
-        };
-        match changed {
-            Ok(()) => Ok(Some(watch)),
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
-            Err(error) => Err(kernel("kevent(EVFILT_PROC)", process.pid, error)),
-        }
-    }
-
-    /// Withdraw `process`'s registration; `false` when the pid names no running process
-    /// (`ESRCH`).
-    fn withdraw(&self, process: ProcessIdentity) -> Result<bool, ObserveError> {
-        match self.change(process, libc::EV_DELETE, WATCHED)? {
-            Ok(()) => Ok(true),
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
-            Err(error) => Err(kernel("kevent(EVFILT_PROC)", process.pid, error)),
-        }
-    }
-
-    /// Apply one change to `process`'s registration, keyed by its unique id. The outer `Err`
-    /// is an identity the kernel cannot be handed; the inner one is the kernel's own answer.
-    fn change(
-        &self,
-        process: ProcessIdentity,
-        flags: u16,
-        fflags: u32,
-    ) -> Result<io::Result<()>, ObserveError> {
-        let cookie = usize::try_from(process.birth.0).map_err(|error| {
-            kernel(
-                "kevent(EVFILT_PROC)",
-                process.pid,
-                io::Error::new(io::ErrorKind::InvalidData, error),
-            )
-        })?;
-        let change = libc::kevent {
-            ident: usize::try_from(process.pid).map_err(|error| {
-                kernel(
-                    "kevent(EVFILT_PROC)",
-                    process.pid,
-                    io::Error::new(io::ErrorKind::InvalidData, error),
-                )
-            })?,
-            filter: libc::EVFILT_PROC,
-            flags: flags | libc::EV_UDATA_SPECIFIC,
-            fflags,
-            data: 0,
-            udata: std::ptr::without_provenance_mut(cookie),
-        };
-        // SAFETY: one change read from live memory, no event list, on a live queue.
-        let changed = unsafe {
-            libc::kevent(
-                self.queue.as_raw_fd(),
-                &change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        Ok(if changed == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        })
+            .map_err(|source| kernel(platform::RECORD, pid, source))
     }
 }
 
@@ -1201,22 +1096,25 @@ fn identity(record: &ProcessRecord) -> ProcessIdentity {
 #[cfg(test)]
 mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
     use super::*;
     use crate::api::dto::{CommandArg, ExitStatus};
-    use crate::api::process::{ProcessCoverage, ProcessExit};
+    use crate::api::process::ProcessCoverage;
     use cowshed_os::fork_lock::Spawn;
 
-    /// `/bin/bash -c script` (not `/bin/sh`, a stub that execs the selected shell), held before
-    /// its exec until it is watched. The pre-exec hook reports the child's pid, then waits for
-    /// the observer; `extra` becomes the child's fd 3.
-    fn watched(script: &str, extra: Option<OwnedFd>) -> (KqueueObserver, Child) {
+    /// `shell -c script`, held before its exec until it is watched. The pre-exec hook reports
+    /// the child's pid, then waits for the observer; `extra` becomes the child's fd 3.
+    pub(super) fn watched(
+        shell: &str,
+        script: &str,
+        extra: Option<OwnedFd>,
+    ) -> (KqueueObserver, Child) {
         let (ready_read, ready_write) = std::io::pipe().unwrap();
         let (gate_read, mut gate_write) = std::io::pipe().unwrap();
-        let mut command = Command::new("/bin/bash");
+        let mut command = Command::new(shell);
         command.args(["-c", script]).stdout(Stdio::piped());
         let ready = ready_write.as_raw_fd();
         let gate = gate_read.as_raw_fd();
@@ -1271,7 +1169,7 @@ mod tests {
 
     /// Fold until `pid` exits, keeping every failure the observer returned on the way: they
     /// are values the caller checks, never discarded.
-    fn until_exited(observer: &mut KqueueObserver, pid: u32) -> Vec<ObserveError> {
+    pub(super) fn until_exited(observer: &mut KqueueObserver, pid: u32) -> Vec<ObserveError> {
         let mut failures = Vec::new();
         while observer.fold().live(pid).is_some() {
             if let Err(error) = observer.wait() {
@@ -1282,183 +1180,23 @@ mod tests {
     }
 
     /// A file holding `ready`, which a held cat prints only once it runs.
-    fn marker(name: &str) -> String {
+    pub(super) fn marker(name: &str) -> String {
         let marker = std::env::temp_dir().join(format!("cowshed-{name}-{}", std::process::id()));
         std::fs::write(&marker, "ready\n").unwrap();
         marker.to_str().unwrap().to_owned()
     }
 
-    fn argv(bytes: &[&str]) -> Vec<CommandArg> {
+    pub(super) fn argv(bytes: &[&str]) -> Vec<CommandArg> {
         bytes
             .iter()
             .map(|&argument| CommandArg::new(argument))
             .collect()
     }
 
-    /// Two children held on a pipe while they are enumerated: each is retained with its pid,
-    /// parent, exec'd image and exit, and the tree says forks were not counted.
-    #[test]
-    fn held_children_are_retained_with_their_parent_image_and_exit() {
-        // Each child prints the marker only once it runs cat, then blocks reading fd 3.
-        let marker = marker("held");
-        let (hold_read, hold_write) = std::io::pipe().unwrap();
-        let script = format!(
-            "/bin/cat {marker} - <&3 & echo $!\n\
-             /bin/cat {marker} - <&3 & echo $!\n\
-             wait"
-        );
-        let (mut observer, mut child) = watched(&script, Some(hold_read.into()));
-        let root = child.id();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let (mut expected, mut running) = (Vec::new(), 0);
-        while expected.len() < 2 || running < 2 {
-            let mut line = String::new();
-            assert_ne!(
-                stdout.read_line(&mut line).unwrap(),
-                0,
-                "the root's output ended"
-            );
-            match line.trim() {
-                "ready" => running += 1,
-                pid => expected.push(pid.parse::<u32>().expect("child pid")),
-            }
-        }
-        // Both children run cat: the root's fork is queued, and the children read now are
-        // past their exec.
-        observer
-            .drain()
-            .expect("no read fails while both children run cat");
-        for &pid in &expected {
-            let process = observer.fold().live(pid).expect("adopted");
-            assert_eq!(
-                &*observer.fold().image(process).unwrap().program,
-                "/bin/cat"
-            );
-        }
-        drop(hold_write);
-        let failures = until_exited(&mut observer, root);
-        assert!(failures.is_empty(), "{failures:?}");
-        assert!(child.wait_bounded().unwrap().success());
-        std::fs::remove_file(&marker).unwrap();
-
-        let nodes: Vec<_> = observer.fold().nodes().collect();
-        assert_eq!(nodes.len(), 3, "{nodes:?}");
-        assert_eq!(nodes[0].identity.pid, root);
-        assert_eq!(&*nodes[0].image.program, "/bin/bash");
-        assert_eq!(
-            &*nodes[0].image.argv,
-            argv(&["/bin/bash", "-c", &script]).as_slice()
-        );
-        let exited = Some(&ProcessExit {
-            status: Some(ExitStatus::Exited { code: 0 }),
-            exited_at: nodes[0].exit.unwrap().exited_at.clone(),
-        });
-        assert_eq!(nodes[0].exit, exited);
-        let mut children: Vec<u32> = nodes[1..].iter().map(|node| node.identity.pid).collect();
-        children.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(children, expected);
-        for node in &nodes[1..] {
-            assert_eq!(node.parent, Some(nodes[0].identity));
-            assert_eq!(node.ppid, root);
-            assert_eq!(&*node.image.program, "/bin/cat");
-            assert_eq!(
-                &*node.image.argv,
-                argv(&["/bin/cat", &marker, "-"]).as_slice()
-            );
-            assert_eq!(
-                node.exit.and_then(|exit| exit.status.as_ref()),
-                Some(&ExitStatus::Exited { code: 0 })
-            );
-        }
-        assert_eq!(
-            observer.fold().coverage(),
-            &ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::UncountedFork { pid: root }
-            }
-        );
-    }
-
-    /// A process that never forks is the one tree macOS can prove complete. The root execs cat,
-    /// which prints the marker only once it runs and then holds on fd 3, so its exec is folded
-    /// while it runs.
-    #[test]
-    fn a_root_that_only_execs_is_complete() {
-        let marker = marker("exec");
-        let (hold_read, hold_write) = std::io::pipe().unwrap();
-        let (mut observer, mut child) = watched(
-            &format!("exec /bin/cat {marker} - <&3"),
-            Some(hold_read.into()),
-        );
-        let root = child.id();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        stdout.read_line(&mut line).unwrap();
-        assert_eq!(line, "ready\n");
-        observer.drain().expect("the exec, read while cat runs");
-        drop(hold_write);
-        let failures = until_exited(&mut observer, root);
-        assert!(failures.is_empty(), "{failures:?}");
-        assert!(child.wait_bounded().unwrap().success());
-        std::fs::remove_file(&marker).unwrap();
-        let nodes: Vec<_> = observer.fold().nodes().collect();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(&*nodes[0].image.program, "/bin/cat");
-        assert_eq!(
-            &*nodes[0].image.argv,
-            argv(&["/bin/cat", &marker, "-"]).as_slice()
-        );
-        assert_eq!(observer.fold().coverage(), &ProcessCoverage::Complete);
-    }
-
-    /// A burst of children forked and reaped faster than they can be enumerated: every child
-    /// the observer retained is the burst's, and the tree never claims to be complete. The
-    /// number it missed is the measured gap. A child read mid-exec answers `EIO` or `EINVAL`:
-    /// the observer returns each such failure, and the test checks every one.
-    #[test]
-    fn a_burst_reaped_before_enumeration_is_a_gap_never_complete() {
-        let burst = 64;
-        let script =
-            format!("i=0; while [ $i -lt {burst} ]; do /usr/bin/true burst; i=$((i+1)); done");
-        let (mut observer, mut child) = watched(&script, None);
-        let root = child.id();
-        let failures = until_exited(&mut observer, root);
-        assert!(child.wait_bounded().unwrap().success());
-        let nodes: Vec<_> = observer.fold().nodes().collect();
-        let retained = nodes.len() - 1;
-        for node in &nodes[1..] {
-            assert_eq!(node.parent, Some(nodes[0].identity));
-            assert!(
-                &*node.image.program == "/usr/bin/true" || &*node.image.program == "/bin/bash",
-                "{node:?}"
-            );
-        }
-        for failure in &failures {
-            let (call, pid, errno) = failed(failure);
-            assert_eq!(call, "KERN_PROCARGS2", "{failure}");
-            assert!(matches!(errno, Some(libc::EIO | libc::EINVAL)), "{failure}");
-            assert!(
-                nodes[1..].iter().any(|node| node.identity.pid == pid),
-                "{failure}"
-            );
-        }
-        assert!(retained <= burst);
-        assert_eq!(
-            observer.fold().coverage(),
-            &ProcessCoverage::Gap {
-                reason: ProcessCoverageGap::UncountedFork { pid: root }
-            }
-        );
-        println!(
-            "kqueue burst: retained {retained} of {burst} children; {} image reads failed",
-            failures.len()
-        );
-    }
-
     /// Kernel reads answered from a script, one queued answer per read, so a test sets the
     /// identity a pid names at each instant the observer asks. An unscripted read fails the test.
     #[derive(Default)]
-    struct Scripted {
+    pub(super) struct Scripted {
         records: std::cell::RefCell<
             std::collections::HashMap<
                 u32,
@@ -1483,7 +1221,7 @@ mod tests {
     }
 
     impl Scripted {
-        fn record(self, pid: u32, answers: &[Option<ProcessRecord>]) -> Self {
+        pub(super) fn record(self, pid: u32, answers: &[Option<ProcessRecord>]) -> Self {
             self.records
                 .borrow_mut()
                 .entry(pid)
@@ -1561,6 +1299,7 @@ mod tests {
         fn usage(
             &self,
             process: ProcessIdentity,
+            _held: Option<BorrowedFd<'_>>,
             _start: Option<StartStamp>,
             _at: Instant,
         ) -> Result<Sampled, SampleError> {
@@ -1591,7 +1330,7 @@ mod tests {
     /// Every scripted process runs as this uid.
     const OWNER: u32 = 501;
 
-    fn record(pid: u32, unique_id: u64, parent_unique_id: u64) -> ProcessRecord {
+    pub(super) fn record(pid: u32, unique_id: u64, parent_unique_id: u64) -> ProcessRecord {
         ProcessRecord {
             pid,
             ppid: 1,
@@ -1602,7 +1341,7 @@ mod tests {
         }
     }
 
-    fn life(pid: u32, unique_id: u64) -> ProcessIdentity {
+    pub(super) fn life(pid: u32, unique_id: u64) -> ProcessIdentity {
         ProcessIdentity {
             pid,
             birth: BirthToken(unique_id),
@@ -1617,40 +1356,39 @@ mod tests {
         }
     }
 
-    /// An observer over scripted reads and a real, empty kqueue, holding `fold` and the
-    /// registrations named.
-    fn scripted(
+    /// An observer over scripted reads and a real, empty event source, holding `fold` and the
+    /// registrations named, none of which the source will report of.
+    pub(super) fn scripted(
         reads: Scripted,
         fold: TestFold,
         registered: &[ProcessIdentity],
     ) -> KqueueObserver<Scripted> {
-        // SAFETY: kqueue takes nothing and returns a new descriptor.
-        let queue = unsafe { libc::kqueue() };
-        assert!(queue >= 0, "kqueue: {}", io::Error::last_os_error());
         KqueueObserver {
-            // SAFETY: a fresh descriptor this observer owns.
-            queue: unsafe { OwnedFd::from_raw_fd(queue) },
+            source: Source::open().expect("the event source"),
             reads,
             fold: fold.fold,
             events: fold.events,
             registered: registered
                 .iter()
-                .map(|&process| (process, ExitWatch::Status))
+                .map(|&process| (process, Watch::scripted()))
                 .collect(),
             missed: Vec::new(),
+            reports: Vec::new(),
         }
     }
 
-    fn event(process: ProcessIdentity, fflags: u32, data: isize) -> libc::kevent {
-        libc::kevent {
-            ident: usize::try_from(process.pid).unwrap(),
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_UDATA_SPECIFIC,
-            fflags,
-            data,
-            udata: std::ptr::without_provenance_mut(usize::try_from(process.birth.0).unwrap()),
+    /// A report that says nothing of `process`, for a test to say what the source reported.
+    fn report(process: ProcessIdentity) -> Report {
+        Report {
+            process,
+            forked: false,
+            exec: false,
+            exit: None,
         }
     }
+
+    /// An exit reported with the wait status of `exit(0)`.
+    const EXITED: Option<ExitReport> = Some(ExitReport::Status(0));
 
     /// A root, a first life of pid 900, and a second life of pid 900 forked before the first
     /// life's exit was folded.
@@ -1676,7 +1414,7 @@ mod tests {
         (fold, root, old, new)
     }
 
-    /// The older life's late exit and exec land on that life by its cookie; the life now
+    /// The older life's late exit and exec land on that life by its identity; the life now
     /// holding the pid keeps running its own image.
     #[test]
     fn an_older_life_s_queued_events_never_touch_the_life_now_holding_its_pid() {
@@ -1685,14 +1423,20 @@ mod tests {
         let reads = Scripted::default().record(900, &[Some(record(900, 3, 1))]);
         let mut observer = scripted(reads, fold, &[root, old, new]);
         observer
-            .handle(
-                &event(old, libc::NOTE_EXEC, 0),
+            .fold_report(
+                Report {
+                    exec: true,
+                    ..report(old)
+                },
                 ObservationPurpose::Metadata,
             )
             .unwrap();
         observer
-            .handle(
-                &event(old, libc::NOTE_EXIT, 0),
+            .fold_report(
+                Report {
+                    exit: EXITED,
+                    ..report(old)
+                },
                 ObservationPurpose::Metadata,
             )
             .unwrap();
@@ -1717,15 +1461,19 @@ mod tests {
         );
     }
 
-    /// An event of a registration the observer withdrew is not the tree's.
+    /// A report of a registration the observer withdrew is not the tree's.
     #[test]
     fn an_event_of_a_withdrawn_registration_is_ignored() {
         let (fold, root, old, new) = reused_pid_fold();
         let mut observer = scripted(Scripted::default(), fold, &[root, old, new]);
         let stranger = life(900, 77);
         observer
-            .handle(
-                &event(stranger, libc::NOTE_EXIT | libc::NOTE_FORK, 0),
+            .fold_report(
+                Report {
+                    forked: true,
+                    exit: EXITED,
+                    ..report(stranger)
+                },
                 ObservationPurpose::Metadata,
             )
             .unwrap();
@@ -1734,8 +1482,8 @@ mod tests {
     }
 
     /// A running process the test holds, so registrations against its pid succeed.
-    fn held_process() -> (Child, u32) {
-        let child = Command::new("/bin/cat")
+    pub(super) fn held_process() -> (Child, u32) {
+        let child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn_locked()
@@ -1744,38 +1492,9 @@ mod tests {
         (child, pid)
     }
 
-    fn release(mut child: Child) {
+    pub(super) fn release(mut child: Child) {
         drop(child.stdin.take());
         child.wait_bounded().expect("reap");
-    }
-
-    /// The pid named another life after the registration than before it: nothing is adopted,
-    /// and the registration is withdrawn.
-    #[test]
-    fn a_registration_whose_pid_changed_life_is_withdrawn_unadopted() {
-        let (child, pid) = held_process();
-        let before = record(pid, 40, 1);
-        for after in [Some(record(pid, 41, 1)), None] {
-            let reads = Scripted::default().record(pid, &[after]);
-            let mut observer = scripted(reads, TestFold::default(), &[]);
-            assert_eq!(observer.attach(before).unwrap(), None);
-            assert!(observer.registered.is_empty());
-            // Deleting it again finds no registration: the observer already withdrew it.
-            let error = observer
-                .withdraw(life(pid, 40))
-                .expect_err("no registration remains");
-            assert!(
-                matches!(&error, ObserveError::Kernel { source, .. } if source.raw_os_error() == Some(libc::ENOENT)),
-                "{error}"
-            );
-        }
-        // The same life before and after: adopted, and its registration stays.
-        let reads = Scripted::default().record(pid, &[Some(before)]);
-        let mut observer = scripted(reads, TestFold::default(), &[]);
-        assert_eq!(observer.attach(before).unwrap(), Some(before));
-        assert!(observer.registered.contains_key(&life(pid, 40)));
-        assert!(observer.withdraw(life(pid, 40)).unwrap());
-        release(child);
     }
 
     #[test]
@@ -1801,7 +1520,7 @@ mod tests {
         observer.registered.remove(&child);
         assert_eq!(
             failed(&observer.subtree(old).unwrap_err()),
-            ("kevent(EVFILT_PROC)", child.pid, None)
+            (platform::WATCH, child.pid, None)
         );
     }
 
@@ -1829,7 +1548,7 @@ mod tests {
         assert!(observer.retained_live(current).unwrap());
         assert_eq!(
             failed(&observer.retained_live(current).unwrap_err()),
-            ("proc_pidinfo", current.pid, Some(libc::EIO))
+            (platform::RECORD, current.pid, Some(libc::EIO))
         );
         observer.registered.remove(&current);
         assert!(!observer.retained_live(current).unwrap());
@@ -1869,10 +1588,7 @@ mod tests {
         );
         assert!(observer.missed().is_empty(), "{:?}", observer.missed());
         let refused = observer.owned(&leader).expect_err("an unread membership");
-        assert_eq!(
-            failed(&refused),
-            ("proc_listpgrppids", pid, Some(libc::EPERM))
-        );
+        assert_eq!(failed(&refused), (platform::GROUP, pid, Some(libc::EPERM)));
 
         assert!(observer.signal(process, libc::SIGTERM).unwrap());
         observer
@@ -1887,7 +1603,11 @@ mod tests {
             *observer.reads.signalled.borrow(),
             [(process, libc::SIGTERM)]
         );
-        assert!(observer.withdraw(process).unwrap());
+        let watch = observer
+            .registered
+            .remove(&process)
+            .expect("its registration");
+        assert!(observer.source.withdraw(process, &watch).unwrap());
         release(child);
     }
 
@@ -1899,8 +1619,11 @@ mod tests {
         let reads = Scripted::default().record(800, &[None]);
         let mut observer = scripted(reads, fold, &[root]);
         observer
-            .handle(
-                &event(root, libc::NOTE_FORK, 0),
+            .fold_report(
+                Report {
+                    forked: true,
+                    ..report(root)
+                },
                 ObservationPurpose::Metadata,
             )
             .expect("a parent gone before its list is no read failure");
@@ -1917,12 +1640,15 @@ mod tests {
             .record_failure(901, libc::EIO);
         let mut observer = scripted(reads, fold, &[root]);
         let error = observer
-            .handle(
-                &event(root, libc::NOTE_FORK, 0),
+            .fold_report(
+                Report {
+                    forked: true,
+                    ..report(root)
+                },
                 ObservationPurpose::Metadata,
             )
             .expect_err("the child's record read failed");
-        assert_eq!(failed(&error), ("proc_pidinfo", 901, Some(libc::EIO)));
+        assert_eq!(failed(&error), (platform::RECORD, 901, Some(libc::EIO)));
         assert_eq!(
             observer.missed(),
             [ProcessCoverageGap::UnobservedBirth { pid: 901 }]
@@ -1957,12 +1683,9 @@ mod tests {
 
     #[test]
     fn custody_exec_and_coalesced_exit_never_read_an_image() {
-        for (purpose, flags) in [
-            (ObservationPurpose::Custody, libc::NOTE_EXEC),
-            (
-                ObservationPurpose::Metadata,
-                libc::NOTE_EXEC | libc::NOTE_EXIT,
-            ),
+        for (purpose, exit) in [
+            (ObservationPurpose::Custody, None),
+            (ObservationPurpose::Metadata, EXITED),
         ] {
             let current = life(900, 3);
             let mut fold = TestFold::default();
@@ -1975,12 +1698,18 @@ mod tests {
             .unwrap();
             // No image or record read is scripted: either would panic.
             let mut observer = scripted(Scripted::default(), fold, &[current]);
-            observer.handle(&event(current, flags, 0), purpose).unwrap();
+            observer
+                .fold_report(
+                    Report {
+                        exec: true,
+                        exit,
+                        ..report(current)
+                    },
+                    purpose,
+                )
+                .unwrap();
             assert_eq!(observer.fold().image(current), None);
-            assert_eq!(
-                observer.fold().live(current.pid).is_none(),
-                flags & libc::NOTE_EXIT != 0
-            );
+            assert_eq!(observer.fold().live(current.pid).is_none(), exit.is_some());
             assert!(matches!(
                 observer.fold().coverage(),
                 ProcessCoverage::Gap {
@@ -2007,7 +1736,13 @@ mod tests {
                 ..Scripted::default()
             };
             let mut observer = scripted(reads, fold, &[current]);
-            let outcome = observer.handle(&event(current, libc::NOTE_EXIT, 0), purpose);
+            let outcome = observer.fold_report(
+                Report {
+                    exit: EXITED,
+                    ..report(current)
+                },
+                purpose,
+            );
             if purpose == ObservationPurpose::Metadata {
                 let ObserveError::Usage(SampleError::Read { pid, source }) = outcome.unwrap_err()
                 else {
@@ -2032,39 +1767,8 @@ mod tests {
         }
     }
 
-    /// xnu `filt_procattach` refuses `NOTE_EXITSTATUS` for a process this observer may not
-    /// SIGKILL -- launchd, pid 1, is one on every host -- and grants it for its own child. The
-    /// one registration path answers each with the watch the kernel actually granted.
-    #[test]
-    fn registration_falls_back_to_exit_alone_where_the_kernel_withholds_the_status() {
-        let observer = KqueueObserver::prepare_with(Darwin).expect("kqueue");
-        let launchd = identity(
-            &process_record(1)
-                .expect("read launchd")
-                .expect("launchd runs"),
-        );
-        assert_eq!(
-            observer.register(launchd).expect("register launchd"),
-            Some(ExitWatch::Withheld)
-        );
-        assert!(observer.withdraw(launchd).expect("withdraw launchd"));
-        let mut child = Command::new("/bin/cat")
-            .stdin(Stdio::piped())
-            .spawn_locked()
-            .expect("spawn cat");
-        let pid = i32::try_from(child.id()).expect("pid");
-        let own = identity(&process_record(pid).expect("read cat").expect("cat runs"));
-        assert_eq!(
-            observer.register(own).expect("register own child"),
-            Some(ExitWatch::Status)
-        );
-        assert!(observer.withdraw(own).expect("withdraw own child"));
-        drop(child.stdin.take());
-        assert!(child.wait_bounded().expect("reap cat").success());
-    }
-
-    /// An exit under a withheld watch is joined: the life ends, its registration with it, and its
-    /// status is the named gap, never a code read from the event's empty data.
+    /// An exit reported without its status is joined: the life ends, its registration with it,
+    /// and its status is the named gap, never a code the source did not report.
     #[test]
     fn a_withheld_exit_is_joined_with_its_status_as_the_gap() {
         for purpose in [ObservationPurpose::Custody, ObservationPurpose::Metadata] {
@@ -2077,10 +1781,15 @@ mod tests {
                 image: shell_image("/usr/sbin/lsof"),
             })
             .unwrap();
-            let mut observer = scripted(Scripted::default(), fold, &[]);
-            observer.registered.insert(current, ExitWatch::Withheld);
+            let mut observer = scripted(Scripted::default(), fold, &[current]);
             observer
-                .handle(&event(current, libc::NOTE_EXIT, 0), purpose)
+                .fold_report(
+                    Report {
+                        exit: Some(ExitReport::Withheld),
+                        ..report(current)
+                    },
+                    purpose,
+                )
                 .expect("a withheld exit is no failure");
             assert!(observer.fold().live(current.pid).is_none());
             assert!(!observer.registered.contains_key(&current));
@@ -2095,91 +1804,31 @@ mod tests {
         }
     }
 
-    /// A member that runs a root command through `sudo -n` (bounded-exec's hang probe does) has a
-    /// descendant the kernel refuses `NOTE_EXITSTATUS` for. It stays in custody under its
-    /// withheld watch, its exit is joined, and only its status is absent. Needs this host's
-    /// passwordless sudo grant for `/usr/sbin/lsof`; without it the test fails naming sudo's
-    /// refusal. Every cow sandbox denies `/usr/bin/sudo` itself, so it runs in the host lane.
-    #[test]
-    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-    fn host_controller_a_root_command_run_through_sudo_stays_in_custody_with_its_status_withheld() {
-        let script = "/usr/bin/sudo -n /usr/sbin/lsof -nP -r 30 -p $$ & echo $!
-wait $!";
-        let (mut observer, mut child) = watched(script, None);
-        let root = child.id();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("sudo pid");
-        let sudo: u32 = line.trim().parse().expect("sudo pid line");
-        // lsof's first listing is the readiness event: sudo started it and it runs as root.
-        line.clear();
-        assert_ne!(
-            stdout.read_line(&mut line).expect("lsof listing"),
-            0,
-            "sudo -n /usr/sbin/lsof ended before listing; this host must grant it without a password"
-        );
-        observer
-            .drain_custody()
-            .expect("custody registers a root descendant without a refusal");
-        let sudo = observer.fold().live(sudo).expect("sudo adopted");
-        assert_eq!(observer.registered.get(&sudo), Some(&ExitWatch::Status));
-        let lsof = observer
-            .fold()
-            .nodes()
-            .find(|node| node.parent == Some(sudo))
-            .expect("lsof adopted under sudo")
-            .identity;
-        let record = process_record(i32::try_from(lsof.pid).unwrap())
-            .unwrap()
-            .expect("lsof runs");
-        assert_eq!(record.uid, 0, "lsof runs as root");
-        assert_eq!(observer.registered.get(&lsof), Some(&ExitWatch::Withheld));
-        // Signalled itself, sudo relays SIGTERM to its root command and exits after it.
-        // SAFETY: the null-free signal to this test's own grandchild, a same-user sudo.
-        assert_eq!(
-            unsafe { libc::kill(i32::try_from(sudo.pid).unwrap(), libc::SIGTERM) },
-            0
-        );
-        while observer.fold().live(root).is_some() {
-            observer
-                .wait_custody(Duration::from_secs(3600))
-                .expect("custody joins every exit");
-        }
-        child.wait_bounded().expect("reap the root");
-        let exit = |process: ProcessIdentity| {
-            observer
-                .fold()
-                .nodes()
-                .find(|node| node.identity == process)
-                .and_then(|node| node.exit.cloned())
-                .expect("exit joined")
-        };
-        assert_eq!(exit(lsof).status, None, "the kernel withheld lsof's status");
-        assert!(exit(sudo).status.is_some(), "sudo's own status is read");
-    }
-
     #[test]
     fn custody_folding_still_refuses_unknown_lineage_and_missing_exit_watches() {
         let (fold, root, old, current) = reused_pid_fold();
         let reads = Scripted::default().record_failure(root.pid, libc::EPERM);
         let mut observer = scripted(reads, fold, &[root, old, current]);
         let error = observer
-            .handle(
-                &event(root, libc::NOTE_FORK, 0),
+            .fold_report(
+                Report {
+                    forked: true,
+                    ..report(root)
+                },
                 ObservationPurpose::Custody,
             )
             .unwrap_err();
         assert_eq!(
             failed(&error),
-            ("proc_pidinfo", root.pid, Some(libc::EPERM))
+            (platform::RECORD, root.pid, Some(libc::EPERM))
         );
         observer.registered.remove(&current);
         let error = observer.subtree(root).unwrap_err();
-        assert_eq!(failed(&error), ("kevent(EVFILT_PROC)", current.pid, None));
+        assert_eq!(failed(&error), (platform::WATCH, current.pid, None));
         assert!(observer.reads.signalled.borrow().is_empty());
     }
 
-    fn failed(error: &ObserveError) -> (&'static str, u32, Option<i32>) {
+    pub(super) fn failed(error: &ObserveError) -> (&'static str, u32, Option<i32>) {
         match error {
             ObserveError::Kernel { call, pid, source } => (*call, *pid, source.raw_os_error()),
             ObserveError::Unread { cause, .. } => failed(cause),
@@ -2188,13 +1837,13 @@ wait $!";
     }
 
     /// A failed read is the kernel's error with its call and errno, never swallowed into a gap
-    /// or an empty answer, whether or not its life ran on: `EIO` and `EINVAL` included, which
-    /// the kernel also answers between two images.
+    /// or an empty answer, whether or not its life ran on: the errnos a kernel also answers
+    /// between two images, and the one it refuses a reader with, included.
     #[test]
     fn a_failed_read_is_returned_with_call_and_errno_even_after_its_life_ended() {
         let process = life(920, 9);
         let ours = Some(record(920, 9, 1));
-        for errno in [libc::ENOMEM, libc::EIO, libc::EINVAL] {
+        for errno in [libc::ENOMEM, libc::EIO, platform::IMAGE_REFUSAL] {
             for after in [ours, None, Some(record(920, 10, 1))] {
                 let reads = Scripted::default()
                     .record(920, &[ours, after, ours])
@@ -2203,11 +1852,11 @@ wait $!";
                 let observer = scripted(reads, TestFold::default(), &[]);
                 assert_eq!(
                     failed(&observer.image(process).unwrap_err()),
-                    ("KERN_PROCARGS2", 920, Some(errno))
+                    (platform::IMAGE, 920, Some(errno))
                 );
                 assert_eq!(
                     failed(&observer.children(process).unwrap_err()),
-                    ("proc_listchildpids", 920, Some(libc::EFAULT))
+                    (platform::CHILDREN, 920, Some(libc::EFAULT))
                 );
             }
         }
@@ -2230,11 +1879,11 @@ wait $!";
         };
         assert_eq!(
             failed(first.as_ref()),
-            ("KERN_PROCARGS2", 940, Some(libc::EIO))
+            (platform::IMAGE, 940, Some(libc::EIO))
         );
         assert_eq!(
             rest.iter().map(failed).collect::<Vec<_>>(),
-            [("proc_pidinfo", 940, Some(libc::EPERM))]
+            [(platform::RECORD, 940, Some(libc::EPERM))]
         );
         // A read that succeeded is unattributable without its fence: the fence's failure.
         let reads = Scripted::default()
@@ -2244,16 +1893,16 @@ wait $!";
         let error = scripted(reads, TestFold::default(), &[])
             .image(process)
             .unwrap_err();
-        assert_eq!(failed(&error), ("proc_pidinfo", 940, Some(libc::EPERM)));
+        assert_eq!(failed(&error), (platform::RECORD, 940, Some(libc::EPERM)));
     }
 
-    /// `KERN_PROCARGS2`'s `EINVAL` is named a refusal where the kernel's credential rule refuses
-    /// the reader, and keeps that `EINVAL`.
+    /// The image read's refusal errno is named a refusal where the kernel's credential rule
+    /// refuses the reader, and keeps that errno.
     #[test]
-    fn an_einval_image_read_is_a_refusal_only_by_credentials() {
+    fn a_refusal_errno_from_the_image_read_is_a_refusal_only_by_credentials() {
         let process = life(930, 11);
         let ours = Some(record(930, 11, 1));
-        let einval = || Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let einval = || Err(io::Error::from_raw_os_error(platform::IMAGE_REFUSAL));
         let refused =
             |reads: Scripted| match scripted(reads, TestFold::default(), &[]).image(process) {
                 Err(ObserveError::ImageNotPermitted {
@@ -2270,7 +1919,7 @@ wait $!";
             .image(930, einval());
         assert_eq!(
             refused(another_user),
-            (930, OWNER, OWNER + 1, Some(libc::EINVAL))
+            (930, OWNER, OWNER + 1, Some(platform::IMAGE_REFUSAL))
         );
         // A set-id exec between the two reads: the life now runs as root.
         let set_id = Some(ProcessRecord {
@@ -2281,7 +1930,10 @@ wait $!";
             .reading_as(OWNER)
             .record(930, &[ours, set_id])
             .image(930, einval());
-        assert_eq!(refused(exec_set_id), (930, 0, OWNER, Some(libc::EINVAL)));
+        assert_eq!(
+            refused(exec_set_id),
+            (930, 0, OWNER, Some(platform::IMAGE_REFUSAL))
+        );
         // Another user's `EIO` is no refusal: the kernel checked credentials before it.
         let unmapped = Scripted::default()
             .reading_as(OWNER + 1)
@@ -2290,7 +1942,7 @@ wait $!";
         let error = scripted(unmapped, TestFold::default(), &[])
             .image(process)
             .unwrap_err();
-        assert_eq!(failed(&error), ("KERN_PROCARGS2", 930, Some(libc::EIO)));
+        assert_eq!(failed(&error), (platform::IMAGE, 930, Some(libc::EIO)));
     }
 
     /// Failed reads in a batch drop nothing: an exit following a failed exec, and every
@@ -2324,11 +1976,23 @@ wait $!";
         let mut observer = scripted(reads, fold, &[root, first, second]);
         let error = observer
             .fold_batch(
-                &[
-                    event(first, libc::NOTE_EXEC, 0),
-                    event(first, libc::NOTE_EXIT, 0),
-                    event(second, libc::NOTE_EXEC, 0),
-                    event(root, libc::NOTE_EXIT, 0),
+                &mut vec![
+                    Ok(Report {
+                        exec: true,
+                        ..report(first)
+                    }),
+                    Ok(Report {
+                        exit: EXITED,
+                        ..report(first)
+                    }),
+                    Ok(Report {
+                        exec: true,
+                        ..report(second)
+                    }),
+                    Ok(Report {
+                        exit: EXITED,
+                        ..report(root)
+                    }),
                 ],
                 ObservationPurpose::Metadata,
             )
@@ -2338,11 +2002,11 @@ wait $!";
         };
         assert_eq!(
             failed(one.as_ref()),
-            ("KERN_PROCARGS2", 900, Some(libc::ENOMEM))
+            (platform::IMAGE, 900, Some(libc::ENOMEM))
         );
         assert_eq!(
             rest.iter().map(failed).collect::<Vec<_>>(),
-            [("KERN_PROCARGS2", 901, Some(libc::ENOMEM))]
+            [(platform::IMAGE, 901, Some(libc::ENOMEM))]
         );
         let exited = |process| {
             observer
@@ -2365,32 +2029,7 @@ wait $!";
         );
     }
 
-    /// libproc answers a failed child list with 0 and errno: an error, never an empty list.
-    /// An errno left over from before the call never makes an empty list a failure.
-    #[test]
-    fn a_failed_child_list_is_an_error_never_an_empty_list() {
-        let (child, pid) = held_process();
-        let me = libc::pid_t::try_from(std::process::id()).unwrap();
-        // This process has a child, so the kernel copies a pid out to the unwritable address.
-        // SAFETY: the kernel's copyout rejects the address; nothing here writes through it.
-        let unwritable = unsafe { list_child_pids(me, std::ptr::without_provenance_mut(1), 256) };
-        assert_eq!(unwritable.unwrap_err().raw_os_error(), Some(libc::EFAULT));
-        let mut pids = [0_i32; 4];
-        // SAFETY: `__error` names this thread's errno.
-        unsafe { *libc::__error() = libc::EFAULT };
-        // SAFETY: `pids` is writable for 16 bytes.
-        let childless = unsafe {
-            list_child_pids(
-                libc::pid_t::try_from(pid).unwrap(),
-                pids.as_mut_ptr().cast(),
-                16,
-            )
-        };
-        assert_eq!(childless.unwrap(), 0, "cat has no children");
-        release(child);
-    }
-
-    struct TestFold {
+    pub(super) struct TestFold {
         fold: JobProcessFold,
         events: Vec<JobProcessEvent>,
     }

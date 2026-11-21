@@ -53,6 +53,39 @@ fn elevation(owner: u32, mode: u32) -> Elevation {
     }
 }
 
+/// The helper that serves, of the helper files there are in search order (beside cowshed, then
+/// each `PATH` directory) with how each gets its privilege: the first that elevates itself, an
+/// administrator's install that needs nothing more, else the first there is, which `sudo` must
+/// admit (09_substrates.md, "Privileged helper").
+fn choose_helper<P>(candidates: impl IntoIterator<Item = (P, Elevation)>) -> Option<P> {
+    let mut first = None;
+    for (candidate, elevation) in candidates {
+        if elevation == Elevation::Setuid {
+            return Some(candidate);
+        }
+        first.get_or_insert(candidate);
+    }
+    first
+}
+
+/// The helper files in `directories`, in order, each with how it gets its privilege. A relative
+/// directory is passed over: neither `sudo` nor a daemon's working directory resolves it.
+fn helpers_in(
+    directories: impl IntoIterator<Item = PathBuf>,
+) -> impl Iterator<Item = (PathBuf, Elevation)> {
+    directories
+        .into_iter()
+        .filter(|directory| directory.is_absolute())
+        .filter_map(|directory| {
+            let candidate = directory.join(HELPER);
+            let metadata = fs::metadata(&candidate)
+                .ok()
+                .filter(fs::Metadata::is_file)?;
+            let elevation = elevation(metadata.uid(), metadata.permissions().mode());
+            Some((candidate, elevation))
+        })
+}
+
 /// The dataset name of the payload at `project_relative`, below its project's container: the
 /// payload's place in the store, with the store's `sessions` directory named `ws` and no image
 /// extension (01b_zfs.md, "One pool, one root"). `main.dmg` is `main`, `sessions/raven.dmg` is
@@ -113,9 +146,23 @@ impl ZfsPayloads {
     /// The payloads of the store at `store_root`, when that directory is the mounted root of the
     /// `store` dataset of a cowshed root (`<parent>/cowshed/store`; 09_substrates.md, "Fixed
     /// dataset hierarchy"): the kernel's mount table names the root, and nothing else does. The
-    /// helper is the one installed beside this executable, else the first on `PATH`, resolved
-    /// here because `sudo` does not search the caller's `PATH`.
+    /// helper is the one beside this executable or on `PATH` ([`choose_helper`]), resolved here
+    /// because `sudo` does not search the caller's `PATH`.
     pub(super) fn of_store(store_root: &Path) -> Result<Option<Self>, ApfsStorageError> {
+        // Through the links that name it: the helper is installed beside the executable itself.
+        let beside = std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .ok()
+            .and_then(|executable| Some(executable.parent()?.to_owned()));
+        Self::of_store_beside(store_root, beside)
+    }
+
+    /// [`Self::of_store`] for the cowshed whose executable lies in `beside`: the payloads as that
+    /// cowshed reaches them, whichever executable asks.
+    pub(super) fn of_store_beside(
+        store_root: &Path,
+        beside: Option<PathBuf>,
+    ) -> Result<Option<Self>, ApfsStorageError> {
         let opened = File::open(store_root)
             .map_err(|error| io_error("open store root", store_root, error))?;
         let mounted = cowshed_helper::host::mounted_dataset(&opened)
@@ -127,19 +174,11 @@ impl ZfsPayloads {
         else {
             return Ok(None);
         };
-        let beside = std::env::current_exe()
-            .ok()
-            .and_then(|executable| Some(executable.parent()?.join(HELPER)));
-        let searched = std::env::var_os("PATH").into_iter().flat_map(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(HELPER))
-                .collect::<Vec<_>>()
-        });
-        let helper = beside
+        let searched = std::env::var_os("PATH")
             .into_iter()
-            .chain(searched)
-            .find(|candidate| candidate.is_file())
-            .ok_or_else(|| {
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>());
+        let helper =
+            choose_helper(helpers_in(beside.into_iter().chain(searched))).ok_or_else(|| {
                 host(
                     format_args!("the store at {} is a ZFS dataset", store_root.display()),
                     "cowshed-helper is installed neither beside cowshed nor on PATH",
@@ -150,6 +189,16 @@ impl ZfsPayloads {
             store_root: store_root.to_owned(),
             helper,
         }))
+    }
+
+    /// The cowshed root these payloads lie below.
+    pub(super) fn root(&self) -> &Root {
+        &self.root
+    }
+
+    /// The helper every mutation of these payloads goes through.
+    pub(super) fn helper_path(&self) -> &Path {
+        &self.helper
     }
 
     fn run(&self, role: &'static str, mut command: Command) -> Result<String, ApfsStorageError> {
@@ -173,8 +222,9 @@ impl ZfsPayloads {
         self.run("zfs read", command)
     }
 
-    /// One helper verb on this root.
-    fn helper(&self, arguments: &[&str]) -> Result<(), ApfsStorageError> {
+    /// The helper's command line up to its verb, elevated as the helper is installed. `sudo`
+    /// never prompts (`-n`) and takes `sudo_flags` besides.
+    fn elevated(&self, sudo_flags: &[&str]) -> Command {
         let installed = fs::metadata(&self.helper)
             .map(|metadata| elevation(metadata.uid(), metadata.permissions().mode()))
             .unwrap_or(Elevation::Sudo);
@@ -182,12 +232,29 @@ impl ZfsPayloads {
             Elevation::Setuid => Command::new(&self.helper),
             Elevation::Sudo => {
                 let mut sudo = Command::new("sudo");
-                sudo.arg("-n").arg(&self.helper);
+                sudo.arg("-n").args(sudo_flags).arg(&self.helper);
                 sudo
             }
         };
-        command.arg(self.root.dataset().as_str()).args(arguments);
+        command.arg(self.root.dataset().as_str());
+        command
+    }
+
+    /// One helper verb on this root.
+    fn helper(&self, arguments: &[&str]) -> Result<(), ApfsStorageError> {
+        let mut command = self.elevated(&[]);
+        command.args(arguments);
         self.run("cowshed-helper", command).map(drop)
+    }
+
+    /// Prove, changing nothing, that the helper acts as root on this root: its `check` verb
+    /// answers only when it runs as root and the root's `cowshed:owner` names this user. Through
+    /// `sudo` the credentials a terminal cached are set aside (`-k`), so only a standing sudoers
+    /// entry passes: a daemon has no terminal a password was typed at.
+    pub(super) fn prove_helper(&self) -> Result<(), ApfsStorageError> {
+        let mut command = self.elevated(&["-k"]);
+        command.arg("check");
+        self.run("cowshed-helper check", command).map(drop)
     }
 
     fn exists(&self, name: &str) -> bool {
@@ -273,6 +340,29 @@ impl ZfsPayloads {
         Ok(self.mounted_at(directory)?.is_some())
     }
 
+    /// The cap of the payload mounted at `directory`: its dataset's `refquota` in bytes, which
+    /// `statfs` on the mountpoint reports as the filesystem's size. `None` for a dataset an
+    /// operator left uncapped.
+    pub(super) fn capacity(&self, directory: &Path) -> Result<Option<u64>, ApfsStorageError> {
+        let dataset = self.payload_at(directory)?;
+        let quota = self.property(dataset.as_str(), "refquota")?;
+        let bytes = quota
+            .parse::<u64>()
+            .map_err(|error| host(format_args!("refquota {quota:?} of {dataset}"), error))?;
+        Ok((bytes != 0).then_some(bytes))
+    }
+
+    /// Cap the payload mounted at `directory` at `bytes`, in place: a dataset's `refquota`
+    /// changes while it is mounted and in use. ZFS refuses a cap below what the dataset holds.
+    pub(super) fn set_capacity(
+        &self,
+        directory: &Path,
+        bytes: u64,
+    ) -> Result<(), ApfsStorageError> {
+        let dataset = self.payload_at(directory)?;
+        self.helper(&["set", dataset.as_str(), &format!("refquota={bytes}")])
+    }
+
     /// Make an empty payload at `directory`, which must not exist, capped at `refquota` bytes.
     /// The helper hands the new dataset's root to this user.
     pub(super) fn create(
@@ -354,13 +444,8 @@ impl ZfsPayloads {
         Ok(())
     }
 
-    /// Mount the dataset whose `mountpoint` is `directory`, when one of this root's has it and
-    /// is not mounted: a mount lost to a reboot or a pool import that did not mount. Answers
-    /// whether a payload is mounted there afterwards.
-    pub(super) fn remount(&self, directory: &Path) -> Result<bool, ApfsStorageError> {
-        if self.is_mounted(directory)? {
-            return Ok(true);
-        }
+    /// The dataset of this root whose `mountpoint` is `directory`, mounted or not.
+    fn assigned_to(&self, directory: &Path) -> Result<Option<String>, ApfsStorageError> {
         let wanted = path_text(directory)?;
         let listed = self.zfs(&[
             "list",
@@ -373,14 +458,34 @@ impl ZfsPayloads {
             "name,mountpoint",
             self.root.dataset().as_str(),
         ])?;
-        let Some(dataset) = listed
+        Ok(listed
             .lines()
             .filter_map(|line| line.split_once('\t'))
-            .find_map(|(name, mountpoint)| (mountpoint == wanted).then_some(name))
-        else {
+            .find_map(|(name, mountpoint)| (mountpoint == wanted).then(|| name.to_owned())))
+    }
+
+    /// The dataset that lost its mount at `directory`: the one of this root whose `mountpoint`
+    /// is `directory` while nothing of this root is mounted there, as a pool import that mounted
+    /// nothing or a `zfs unmount` leaves it. `None` while a payload is mounted there, and when no
+    /// dataset has that mountpoint. A read: nothing is mounted.
+    pub(super) fn lost_at(&self, directory: &Path) -> Result<Option<String>, ApfsStorageError> {
+        if self.is_mounted(directory)? {
+            return Ok(None);
+        }
+        self.assigned_to(directory)
+    }
+
+    /// Mount the dataset whose `mountpoint` is `directory`, when one of this root's has it and
+    /// is not mounted: a mount lost to a reboot or a pool import that did not mount. Answers
+    /// whether a payload is mounted there afterwards.
+    pub(super) fn remount(&self, directory: &Path) -> Result<bool, ApfsStorageError> {
+        if self.is_mounted(directory)? {
+            return Ok(true);
+        }
+        let Some(dataset) = self.assigned_to(directory)? else {
             return Ok(false);
         };
-        self.helper(&["mount", dataset])?;
+        self.helper(&["mount", &dataset])?;
         self.is_mounted(directory)
     }
 
@@ -409,6 +514,16 @@ impl ZfsPayloads {
                     .collect();
                 (name.to_owned(), clones)
             })
+            .collect())
+    }
+
+    /// The datasets cloned from a snapshot of the payload mounted at `directory`: its forks.
+    pub(super) fn dependents(&self, directory: &Path) -> Result<Vec<String>, ApfsStorageError> {
+        let dataset = self.payload_at(directory)?;
+        Ok(self
+            .snapshots(&dataset)?
+            .into_iter()
+            .flat_map(|(_, clones)| clones)
             .collect())
     }
 
@@ -629,6 +744,32 @@ mod tests {
             (1000, 0o100755, Elevation::Sudo),
         ] {
             assert_eq!(elevation(owner, mode), expected, "{owner} {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_helper_that_elevates_itself_serves_before_one_sudo_must_admit() {
+        use Elevation::{Setuid, Sudo};
+        type Case<'a> = (&'a [(&'a str, Elevation)], Option<&'a str>);
+        let cases: [Case<'_>; 6] = [
+            (&[], None),
+            (&[("beside", Sudo)], Some("beside")),
+            (&[("beside", Setuid)], Some("beside")),
+            // An administrator's setuid install on `PATH` needs no sudoers entry, so it serves
+            // although the user's own install comes first.
+            (&[("beside", Sudo), ("wrappers", Setuid)], Some("wrappers")),
+            (&[("beside", Sudo), ("usr", Sudo)], Some("beside")),
+            (
+                &[("beside", Sudo), ("wrappers", Setuid), ("usr", Setuid)],
+                Some("wrappers"),
+            ),
+        ];
+        for (candidates, expected) in cases {
+            assert_eq!(
+                choose_helper(candidates.iter().copied()),
+                expected,
+                "{candidates:?}"
+            );
         }
     }
 

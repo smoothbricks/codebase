@@ -307,8 +307,9 @@ A ZFS host uses exactly two sibling datasets under the `<pool>/cowshed` root: `<
 `/private/cowshed/store` and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. A `<pool>/cowshed/caches`
 dataset from an earlier release is kept mounted at `/private/cowshed/caches` until `cowshed setup` has moved what it
 holds and `cowshed setup --retire-caches-volume` destroys it. If `statfs` does not locate a suitable delegated ZFS
-dataset, configure `[substrate] kind = "zfs"` and `pool = "<pool>"`; cowshed deliberately refuses to scan pools or
-guess. `cowshed doctor` reports the selected pool and any missing sibling, mountpoint, or delegation.
+dataset, configure `[substrate] kind = "zfs"` and `parent = "<parent>"`, the pool or the dataset whose `cowshed` child
+is the root; cowshed deliberately refuses to scan pools or guess. `cowshed doctor` reports the selected root and any
+missing sibling, mountpoint, or delegation.
 
 ## `cowshed exec` says the cowshed daemon is not reachable
 

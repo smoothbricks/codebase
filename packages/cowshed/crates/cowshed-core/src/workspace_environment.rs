@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::capabilities::{CapabilityContribution, EnvAction};
 
+use cowshed_gateway_types::{LINUX_CONNECTOR_PORT, WorkspaceToken};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -55,6 +56,85 @@ pub const BUILD_CACHE_ENV: &str = "COWSHED_BUILD_CACHE";
 /// Agent harnesses export `CI`; only a real runner may change local Cargo unit identities.
 pub(crate) const DEV_CI_POLICY: &str =
     "if [ \"${GITHUB_ACTIONS:-}\" != true ]; then unset CI; fi\n";
+
+/// The variables through which a standard client finds its proxy.
+pub const PROXY_ENVS: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
+/// The variables naming the hosts a client reaches without its proxy.
+pub const NO_PROXY_ENVS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+/// Local services already have a bounded direct-connect capability; sending them through the
+/// external gateway would require an egress grant for a loopback address.
+pub const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1,::1";
+
+/// The loopback port a workspace's clients reach its gateway on (05_gateway.md, "Endpoints"):
+/// the base of a macOS workspace's port block, where the gateway itself listens; for a Linux
+/// workspace, which holds no block, the port its job's private network namespace has the
+/// connector on, which relays to the workspace's own gateway socket (04_sandbox.md, "Linux
+/// enforcement").
+pub fn gateway_client_port(port_block: Option<PortBlock>) -> u16 {
+    port_block.map_or(LINUX_CONNECTOR_PORT, PortBlock::base)
+}
+
+/// The Nx remote cache server a workspace's Nx names: its gateway's `/nx` route.
+pub fn nx_remote_server(port_block: Option<PortBlock>) -> String {
+    format!("http://127.0.0.1:{}/nx", gateway_client_port(port_block))
+}
+
+/// The proxy URL for a workspace's own gateway endpoint.
+///
+/// The token rides as basic-auth userinfo because that is the only channel a standard client has:
+/// curl, libcurl (so cargo), reqwest, and Go all turn proxy userinfo into `Proxy-Authorization:
+/// Basic` on the first CONNECT, and none of them can be told to send cowshed's `Bearer` spelling.
+/// Without it every CONNECT is rejected, and cargo reads the rejection as a spurious network error
+/// and retries its whole ladder before failing.
+///
+/// The token authenticates against nothing but this workspace's own endpoint: a sibling that
+/// reads it from this workspace's process environment can neither reach that endpoint nor
+/// present it at its own, which answers 407 (05_gateway.md, "What the token proves"). The
+/// username is a fixed label the gateway does not compare. The token's alphabet is unpadded
+/// base64url, which is userinfo-safe, so the value never needs percent-encoding.
+pub fn gateway_proxy_url(
+    port_block: Option<PortBlock>,
+    workspace_token: &WorkspaceToken,
+) -> String {
+    format!(
+        "http://cowshed:{}@127.0.0.1:{}",
+        workspace_token.encode(),
+        gateway_client_port(port_block)
+    )
+}
+
+/// What a job's environment says about its workspace's gateway and ports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobGatewayEnvironment {
+    /// Variables the job owns, whatever its caller's environment carried.
+    pub owned: Vec<(&'static str, String)>,
+    /// Variables no job of this workspace has: a caller's value is withheld, not forwarded.
+    pub withheld: Vec<&'static str>,
+}
+
+/// A job's gateway wiring, from what its workspace records: every proxy variable names the
+/// workspace's gateway endpoint with its token ([`gateway_proxy_url`]) and loopback stays
+/// direct. A workspace with a port block exports it ([`PORT_BASE_ENV`], [`PORT_BLOCK_SIZE_ENV`]);
+/// one without (Linux, whose jobs own a private loopback) has neither variable, so nothing a
+/// caller sourced from another workspace's environment survives into the job.
+pub fn job_gateway_environment(
+    port_block: Option<PortBlock>,
+    workspace_token: &WorkspaceToken,
+) -> JobGatewayEnvironment {
+    let proxy = gateway_proxy_url(port_block, workspace_token);
+    let mut owned = Vec::with_capacity(PROXY_ENVS.len() + NO_PROXY_ENVS.len() + 2);
+    let mut withheld = Vec::new();
+    match port_block {
+        Some(block) => {
+            owned.push((PORT_BASE_ENV, block.base().to_string()));
+            owned.push((PORT_BLOCK_SIZE_ENV, block.size().to_string()));
+        }
+        None => withheld.extend([PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV]),
+    }
+    owned.extend(PROXY_ENVS.map(|name| (name, proxy.clone())));
+    owned.extend(NO_PROXY_ENVS.map(|name| (name, LOOPBACK_NO_PROXY.to_owned())));
+    JobGatewayEnvironment { owned, withheld }
+}
 
 #[derive(Debug, Error)]
 pub enum WorkspaceEnvironmentError {
@@ -240,10 +320,10 @@ pub(crate) fn write_workspace_environment(
         .expect("writing to a String cannot fail");
     }
     if mount.root().join("nx.json").is_file() {
-        let port = port_block.map_or(7_644, |block| block.base());
         writeln!(
             &mut *contents,
-            "export {NX_REMOTE_SERVER_ENV}=http://127.0.0.1:{port}/nx\nexport {NX_REMOTE_STORE_BOUND_ENV}={NX_REMOTE_STORE_SECONDS_PER_MIB}"
+            "export {NX_REMOTE_SERVER_ENV}={}\nexport {NX_REMOTE_STORE_BOUND_ENV}={NX_REMOTE_STORE_SECONDS_PER_MIB}",
+            nx_remote_server(port_block)
         )
         .expect("writing to a String cannot fail");
     }
@@ -439,6 +519,64 @@ mod tests {
         );
     }
 
+    /// A job's clients find their workspace's gateway where its platform serves it: on the base
+    /// of a macOS workspace's block, which the job's environment also exports; on a Linux
+    /// workspace at the connector, `127.0.0.1:7644`, with no block exported and a caller's stale
+    /// one withheld. The token rides every proxy URL and loopback stays direct on both.
+    #[test]
+    fn a_jobs_gateway_wiring_follows_its_workspaces_recorded_block() {
+        let token = WorkspaceToken::from_bytes([7; cowshed_gateway_types::TOKEN_BYTES]);
+        let encoded = token.encode();
+        for (case, port_block, port, exported, withheld) in [
+            (
+                "a new macOS block",
+                Some(PortBlock::new(40_960, 64).unwrap()),
+                40_960_u16,
+                vec![(PORT_BASE_ENV, "40960"), (PORT_BLOCK_SIZE_ENV, "64")],
+                vec![],
+            ),
+            (
+                "a live 16-port macOS block",
+                Some(PortBlock::new(40_976, 16).unwrap()),
+                40_976,
+                vec![(PORT_BASE_ENV, "40976"), (PORT_BLOCK_SIZE_ENV, "16")],
+                vec![],
+            ),
+            (
+                "a Linux workspace",
+                None,
+                7_644,
+                vec![],
+                vec![PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV],
+            ),
+        ] {
+            assert_eq!(gateway_client_port(port_block), port, "{case}");
+            assert_eq!(
+                nx_remote_server(port_block),
+                format!("http://127.0.0.1:{port}/nx"),
+                "{case}"
+            );
+            let proxy = format!("http://cowshed:{encoded}@127.0.0.1:{port}");
+            assert_eq!(gateway_proxy_url(port_block, &token), proxy, "{case}");
+            let mut owned: Vec<(&str, String)> = exported
+                .into_iter()
+                .map(|(name, value)| (name, value.to_owned()))
+                .collect();
+            owned.extend(
+                ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+                    .map(|name| (name, proxy.clone())),
+            );
+            owned.extend(
+                ["NO_PROXY", "no_proxy"].map(|name| (name, "localhost,127.0.0.1,::1".to_owned())),
+            );
+            assert_eq!(
+                job_gateway_environment(port_block, &token),
+                JobGatewayEnvironment { owned, withheld },
+                "{case}"
+            );
+        }
+    }
+
     /// A job's own `NX_PARALLEL` and pool priority survive the shell activation that sources
     /// `.cowshed/env`; a shell no job started keeps its own.
     #[test]
@@ -543,6 +681,9 @@ mod tests {
                 .contains("export NX_SELF_HOSTED_REMOTE_CACHE_SERVER=http://127.0.0.1:7644/nx\n")
         );
         assert!(published.contains("export NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1\n"));
+        // A Linux workspace holds no port block: its environment names none.
+        assert!(!published.contains(PORT_BASE_ENV));
+        assert!(!published.contains(PORT_BLOCK_SIZE_ENV));
         assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_READ_ONLY"));
         assert!(!published.contains("NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN"));
         assert!(!published.contains("--exit-on-stdin-eof"));

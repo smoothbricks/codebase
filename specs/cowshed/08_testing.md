@@ -539,9 +539,28 @@ the fixture. The gateway's land case, `host_controller_a_landed_gate_publishes_a
 backend. Neither grants a broader host bypass.
 
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
-and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the
-`/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. Publication
-fixtures provide the existing `.cowshed` directory that workspace creation owns.
+and worktree metadata grants. On macOS the probe executes Git through the system-selected developer directory, not the
+`/usr/bin/git` launcher: the launcher requires xcrun host-cache writes even for read-only operations. On Linux it
+executes `git` by name on the controller's `PATH`, under the process's sandbox launcher. The fixtures that launch the
+probe are compiled for macOS only and not yet ported, and the probe's environment, command and profile are table-tested
+on both platforms without a launch (04_sandbox.md, "Linux enforcement", "Git discovery probe"). Publication fixtures
+provide the existing `.cowshed` directory that workspace creation owns.
+
+**A test process's sandbox launcher (Linux).** A test binary links `cowshed-core` and is not the cowshed binary, so on
+Linux it launches nothing sandboxed until it names its launcher (04_sandbox.md, "Linux enforcement", "The launcher"). It
+names the real one, `cowshed-sandbox-exec`, built from the sources under test, never a stand-in: a fixture that starts a
+sandboxed command or controller Git calls `tests/support/sandbox_launcher.rs`'s `name` first (`cowshed-core`'s
+`sandbox::tests::fixture_store` and `name_launcher` do, as do `cowshed-cli`'s install-basis fixture and
+`tests/landing.rs`), which is idempotent. In a native Nx lane the launcher is the artifact of
+`cowshed:sandbox-exec-bin`, `packages/cowshed/.cache/sandbox-exec/cowshed-sandbox-exec`, which the `cowshed-core` and
+`cowshed-cli` test targets depend on and which is keyed on the same crate closure they compile. In a direct Cargo run it
+is the nearest `cowshed-sandbox-exec` in a directory above the test executable, where
+`cargo build -p cowshed-core --bin cowshed-sandbox-exec` and any `cargo test -p cowshed-core` that builds every target
+put it. A missing launcher fails the test with both commands; one built from other sandbox sources refuses every launch
+with exit 65 and both builds named, so a stale launcher is never what a test measured. The product reads no environment
+variable for its launcher, and no test runs a command unsandboxed for lack of one. A test binary that reaches a launch
+without naming one fails with `this process has no sandbox launcher`; the fixtures of the other Linux integration test
+binaries that run controller Git or a supervised command still have to make that call.
 
 Some cowshed tests run real Nx installs: cowshed-core's, cowshed-cli's (its real-APFS ones included) and
 cowshed-gateway's (its host-controller ones included) run the repository's own, patched by its carried
@@ -819,10 +838,15 @@ production tree-copy path; atomic filesystem bindings expose them at checkout an
 connections, command supervision, lock contention, publication records and recovery journals remain real. These
 `directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or attaching
 a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume labels,
-physical resizing and read-only mounts remain native-host tests. Their scratch roots use
-`/private/tmp/cowshed-dtest-<pid>-<n>` and name their test in the root's `label` file, not its path, so every Unix
-socket a store binds beneath one fits macOS's 104-byte `sun_path` whatever the test is called. They share process
-cleanup with the image fixtures, but neither their setup nor their cleanup enumerates or releases disk images.
+physical resizing and read-only mounts remain native-host tests. Their scratch roots are short and name their test in
+the root's `label` file, not its path, so every Unix socket a store binds beneath one fits `sun_path` (104 bytes on
+macOS, 108 on Linux) whatever the test is called: `/private/tmp/cowshed-dtest-<pid>-<n>` on macOS, and on Linux
+`/tmp/cowshed-dtest-p<pid and nonce>`, the pid-bearing name the shared-temp sweep claims
+(`cowshed-os::scratch::create_named`). A root's teardown ends every process still working in it, then removes its tree.
+On macOS they share process cleanup with the image fixtures, and a tree the teardown cannot remove is retired under the
+test namespace root minted with it; on Linux the processes are found by procfs working directory and ended through their
+pidfds, and a tree that cannot be removed stays in `/tmp` for the shared-temp sweep. Neither their setup nor their
+cleanup enumerates or releases disk images.
 
 The clone-intent publication-handoff oracle waits for the supervisor hello after the image becomes `Active`, then reads
 its own process's TCP listeners through `cowshed-os::process::listening_ports` and filters them to the published block

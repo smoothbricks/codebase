@@ -17,6 +17,15 @@ use super::{
 };
 use crate::Result;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 pub const DETECTOR: Detector = Detector {
     id: CapabilityId::Go,
     marker_kind: super::MarkerKind::File,
@@ -35,14 +44,10 @@ pub static MODULE_HOME: SharedToolHome = SharedToolHome {
     layout: SharedLayout::Whole,
 };
 
-#[cfg(target_os = "macos")]
-const BUILD_HOME_PATH: &str = "Library/Caches/go-build";
-#[cfg(not(target_os = "macos"))]
-const BUILD_HOME_PATH: &str = ".cache/go-build";
 /// Go's default build cache, `go-build` in the user cache directory.
 pub static BUILD_HOME: SharedToolHome = SharedToolHome {
     variable: Some("GOCACHE"),
-    home: BUILD_HOME_PATH,
+    home: platform::BUILD_HOME_PATH,
     layout: SharedLayout::Whole,
 };
 
@@ -90,7 +95,7 @@ mod tests {
             .expect("detection")
             .expect("go detected");
         let module = fixture.home.join("go/pkg/mod");
-        let build = fixture.home.join(BUILD_HOME_PATH);
+        let build = fixture.home.join(platform::BUILD_HOME_PATH);
         assert_eq!(
             contribution.env,
             BTreeMap::from([

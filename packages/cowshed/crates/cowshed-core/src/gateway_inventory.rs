@@ -14,13 +14,11 @@ use thiserror::Error;
 use crate::api::dto::WorkspaceState;
 use crate::api::dto::{ProjectWorkspaces, UnprovenWorkspace, WorkspaceInfo};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, PortBlock, PublicationState, ReservedPortBlocks,
+    DetachedWorkspaceMetadata, GrantSet, Platform, PortBlock, PublicationState, ReservedPortBlocks,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
 use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
-use crate::storage::apfs::native::{
-    KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
-};
+use crate::runtime::native_host;
 use crate::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, Remount,
 };
@@ -34,8 +32,15 @@ use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
     GatewayWorkspaceCredentials, WorkspaceCredentialError, read_gateway_workspace_credentials,
 };
-use cowshed_apfs::SystemCommandRunner;
-use cowshed_apfs::mounts::KernelMountSnapshot;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
 pub(crate) const MAX_BINDING_BYTES: u64 = 1024 * 1024;
 const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
@@ -95,8 +100,10 @@ impl StartupHealState {
     }
 }
 
-/// Controller-authoritative macOS port-block inventory for one gateway session.
-/// This pure inventory can be inspected off-host; installation still validates the host platform.
+/// Controller-authoritative inventory for one gateway session, as the workspace's metadata
+/// records its platform: a macOS workspace's port block, or a Linux workspace's store, whose
+/// `run/gateway` holds its socket. This pure inventory can be inspected off-host; installation
+/// still validates the host platform.
 pub struct GatewaySessionFact {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
@@ -108,7 +115,11 @@ pub struct GatewaySessionFact {
     pub mount_id: u64,
     pub mount: PathBuf,
     pub grants: GrantSet,
-    pub port_block: PortBlock,
+    /// macOS: the block whose base the gateway listens on. `None` for a Linux workspace, which
+    /// holds no block and is served on its incarnation's socket in `store`.
+    pub port_block: Option<PortBlock>,
+    /// The store that holds the workspace.
+    pub store: PathBuf,
     pub credentials: GatewayWorkspaceCredentials,
 }
 
@@ -259,6 +270,7 @@ impl fmt::Debug for GatewaySessionFact {
             .field("mount", &self.mount)
             .field("grants", &self.grants)
             .field("port_block", &self.port_block)
+            .field("store", &self.store)
             .field("credentials", &self.credentials)
             .finish()
     }
@@ -360,19 +372,30 @@ trait InventorySource: Send + Sync {
     ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata, PathBuf)>, GatewayInventoryError>;
 }
 
+/// One project's storage facts and the mount facts `host` proves from its own records, with
+/// where each workspace mounts.
+fn recorded_facts<H: ApfsExecutionHost>(
+    host: &H,
+    config: &ApfsSubstrateConfig,
+    layout: &StorageLayout,
+    repo: &RepoId,
+) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
+    let storage = host.list(repo)?;
+    let mount_paths = expected_mount_paths(config, layout, &storage)?;
+    let mounts = host.mounts(repo)?;
+    Ok(ProjectInventoryFacts {
+        storage,
+        mounts,
+        mount_paths,
+    })
+}
+
+/// Inventory over the host's native store, read through the platform's native execution host
+/// ([`native_host`]): APFS images on macOS, ZFS datasets or directories on Linux. How one
+/// project's mount facts are read is the platform's (`macos.rs`: one reading of the kernel
+/// mount table; `linux.rs`: the directory host's own records), selected above and nowhere else.
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeInventorySource;
-
-#[derive(Clone)]
-struct CapturedKernelMountSource {
-    mounts: Vec<KernelMountSnapshot>,
-}
-
-impl KernelMountSource for CapturedKernelMountSource {
-    fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
-        Ok(self.mounts.clone())
-    }
-}
 
 impl InventorySource for NativeInventorySource {
     fn project_metadata(
@@ -388,7 +411,7 @@ impl InventorySource for NativeInventorySource {
                 .join(UNRESOLVED_CHECKOUT_PATH),
         );
         // One host for the complete pass, not a mount-registry thread per captured image.
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner::new(config.namespace), config)?;
+        let host = native_host(config)?;
         let published = host.list(repo)?;
         let mut records = Vec::with_capacity(published.len());
         for fact in published {
@@ -407,23 +430,7 @@ impl InventorySource for NativeInventorySource {
         repo: &RepoId,
     ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
         let (layout, config) = project_layout_and_config(storage, repo)?;
-        let captured = SystemKernelMountSource.mounts()?;
-        let host = MacOsApfsExecutionHost::with_mount_source(
-            SystemCommandRunner::new(config.namespace),
-            config.clone(),
-            CapturedKernelMountSource {
-                mounts: captured.clone(),
-            },
-        )?;
-        let storage_facts = host.list(repo)?;
-        let mount_paths = expected_mount_paths(&config, &layout, &storage_facts)?;
-        reject_ambiguous_native_mounts(&captured, &mount_paths)?;
-        let mounts = host.mounts(repo)?;
-        Ok(ProjectInventoryFacts {
-            storage: storage_facts,
-            mounts,
-            mount_paths,
-        })
+        platform::project_facts(&config, &layout, repo)
     }
 
     fn workspace_snapshot(
@@ -453,10 +460,7 @@ impl InventorySource for NativeInventorySource {
                 .join(UNRESOLVED_CHECKOUT_PATH)
         });
         let mount = workspace_mountpoint(&layout, &checkout, workspace)?;
-        let host = MacOsApfsExecutionHost::new(
-            SystemCommandRunner::new(storage.namespace()),
-            project_substrate_config(storage, checkout),
-        )?;
+        let host = native_host(project_substrate_config(storage, checkout))?;
         Ok(host
             .workspace_snapshot(repo, workspace)?
             .map(|(derived, metadata)| (derived, metadata, mount)))
@@ -501,14 +505,7 @@ impl InventorySource for DirectoryInventorySource {
     ) -> Result<ProjectInventoryFacts, GatewayInventoryError> {
         let (layout, config) = project_layout_and_config(storage, repo)?;
         let host = DirectoryExecutionHost::new(config.clone())?;
-        let storage_facts = host.list(repo)?;
-        let mount_paths = expected_mount_paths(&config, &layout, &storage_facts)?;
-        let mounts = host.mounts(repo)?;
-        Ok(ProjectInventoryFacts {
-            storage: storage_facts,
-            mounts,
-            mount_paths,
-        })
+        recorded_facts(&host, &config, &layout, repo)
     }
 
     fn workspace_snapshot(
@@ -611,7 +608,7 @@ trait HealSource: Send + Sync {
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError>;
 }
 
-/// The heal of a store whose workspaces are kernel volumes.
+/// The heal of the host's native store, on the platform's native execution host.
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeHealSource;
 
@@ -622,12 +619,7 @@ impl HealSource for NativeHealSource {
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
-        open_project_mounts(storage, repo, |config| {
-            Ok(MacOsApfsExecutionHost::new(
-                SystemCommandRunner::new(config.namespace),
-                config.clone(),
-            )?)
-        })
+        open_project_mounts(storage, repo, |config| Ok(native_host(config.clone())?))
     }
 }
 
@@ -1000,7 +992,8 @@ pub fn served_sessions(
     attached: Vec<GatewaySessionFact>,
 ) -> (Vec<GatewaySessionFact>, Vec<PortCollision>) {
     let refused = port_collisions(attached.iter().flat_map(|fact| {
-        std::iter::once(fact.port_block)
+        fact.port_block
+            .into_iter()
             .chain(fact.grants.retained_port_blocks.iter().copied())
             .map(|block| PortClaim {
                 repo: fact.repo_id.clone(),
@@ -1073,27 +1066,39 @@ fn sidecar_images(directory: &Path) -> Result<Vec<PathBuf>, GatewayInventoryErro
         .collect())
 }
 
-/// Claims `metadata`'s current and retained blocks for its workspace, refusing a canonical grant
-/// that holds no current block.
+/// The block `metadata` records for its workspace's gateway listener: a macOS workspace holds
+/// one, and a canonical grant without it is refused; a Linux workspace holds none (04_sandbox.md,
+/// "Linux enforcement"). The platform is the one the metadata records, never the host reading it.
+fn recorded_port_block(
+    repo: &RepoId,
+    metadata: &DetachedWorkspaceMetadata,
+) -> Result<Option<PortBlock>, GatewayInventoryError> {
+    match (metadata.platform, metadata.grants.port_block) {
+        (Platform::Macos, None) => Err(GatewayInventoryError::MissingPortBlock {
+            repo: repo.clone(),
+            workspace: metadata.workspace.clone(),
+        }),
+        (Platform::Macos | Platform::Linux, block) => Ok(block),
+    }
+}
+
+/// Claims `metadata`'s current and retained blocks for its workspace, refusing a canonical
+/// macOS grant that holds no current block. A Linux workspace claims none.
 fn claim_granted_blocks(
     claims: &mut Vec<PortClaim>,
     repo: &RepoId,
     metadata: &DetachedWorkspaceMetadata,
     record: &ClaimRecord,
 ) -> Result<(), GatewayInventoryError> {
-    if metadata.grants.port_block.is_none() {
-        return Err(GatewayInventoryError::MissingPortBlock {
-            repo: repo.clone(),
-            workspace: metadata.workspace.clone(),
-        });
-    }
+    recorded_port_block(repo, metadata)?;
     claims.extend(port_claims(repo, metadata, record));
     Ok(())
 }
 
-/// Which store backend an inventory reads, chosen by the caller that opened the store:
-/// native APFS volumes, whose mounts the kernel reports, or directory payloads, whose
-/// mounts are the records the directory host proves. Never inferred from path shapes.
+/// Which store backend an inventory reads, chosen by the caller that opened the store: the
+/// host's native store, read through the platform's native execution host, or a caller-owned
+/// directory store, whose mounts are the records the directory host proves. Never inferred
+/// from path shapes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayStoreBackend {
     Native,
@@ -1108,7 +1113,6 @@ impl NativeGatewayInventory {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn port_allocation(&self) -> crate::metadata::PortAllocation {
         self.storage.port_allocation()
     }
@@ -2388,14 +2392,7 @@ impl NativeGatewayInventory {
             });
         };
         let image_paths = canonical_image_paths(layout, &workspace.workspace)?;
-        let port_block =
-            metadata
-                .grants
-                .port_block
-                .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
-                    repo: workspace.workspace.repo().clone(),
-                    workspace: workspace.workspace.name().clone(),
-                })?;
+        let port_block = recorded_port_block(workspace.workspace.repo(), &metadata)?;
         let credentials = read_gateway_workspace_credentials(
             owned_repo_ids,
             &workspace.workspace,
@@ -2418,6 +2415,7 @@ impl NativeGatewayInventory {
             mount: mount.to_owned(),
             grants,
             port_block,
+            store: self.storage.store().to_owned(),
             credentials,
         })
     }
@@ -2604,11 +2602,6 @@ pub(crate) fn discover_owned_identities(
 /// rename may move onto it. Two live projects claiming one identity is cowshed's own state gone
 /// wrong, and it is raised here rather than from the store-wide scan so that the refusal lands on
 /// the one operation that asked, instead of taking down the whole inventory.
-///
-/// The product caller is macOS-only, but the ownership rule is platform-neutral and its test
-/// should keep running on every host. Test builds therefore retain the function while Linux
-/// library builds omit a product path they cannot reach.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn identity_owner(
     store_root: &Path,
     repo_id: &RepoId,
@@ -2891,45 +2884,6 @@ fn main_mount_defect(
         MountState::Detached => Some(String::from("main's volume is not mounted")),
         MountState::Unproven(refusal) => Some(refusal.to_string()),
     })
-}
-
-fn reject_ambiguous_native_mounts(
-    mounts: &[KernelMountSnapshot],
-    expected: &BTreeMap<String, PathBuf>,
-) -> Result<(), GatewayInventoryError> {
-    let expected_paths = expected.values().collect::<BTreeSet<_>>();
-    let mut sources_at_canonical_path = BTreeSet::new();
-    for mount in mounts {
-        if expected_paths.contains(&mount.mount_point) {
-            if !sources_at_canonical_path.insert(mount.source_device.as_str()) {
-                return Err(GatewayInventoryError::AmbiguousMount(
-                    mount.mount_point.display().to_string(),
-                ));
-            }
-            let source_count = mounts
-                .iter()
-                .filter(|candidate| candidate.source_device == mount.source_device)
-                .count();
-            if source_count != 1 {
-                return Err(GatewayInventoryError::AmbiguousMount(
-                    mount.source_device.clone(),
-                ));
-            }
-        }
-    }
-    for path in expected_paths {
-        if mounts
-            .iter()
-            .filter(|mount| &mount.mount_point == path)
-            .count()
-            > 1
-        {
-            return Err(GatewayInventoryError::AmbiguousMount(
-                path.display().to_string(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn reject_duplicate_mount_facts(mounts: &[MountJoin]) -> Result<(), GatewayInventoryError> {
@@ -3291,6 +3245,8 @@ mod tests {
         root: PathBuf,
         storage: ValidatedHostStorage,
         port_blocks: Cell<FixturePortBlocks>,
+        /// The platform the next workspace's metadata records.
+        platform: Cell<Platform>,
     }
 
     impl Fixture {
@@ -3311,6 +3267,7 @@ mod tests {
                 root,
                 storage: ValidatedHostStorage::new(home, Vec::new(), roots),
                 port_blocks: Cell::new(FixturePortBlocks::Grid(MACOS_PORT_MIN)),
+                platform: Cell::new(Platform::Macos),
             }
         }
 
@@ -3393,8 +3350,13 @@ mod tests {
             } else {
                 layout.workspace_mount(&name).expect("workspace mount")
             };
-            let port_block = self.take_port_block();
-            let mut grants = GrantSet::closed_baseline(Some(port_block)).expect("grants");
+            let platform = self.platform.get();
+            // A Linux workspace holds no block (04_sandbox.md, "Linux enforcement").
+            let port_block = match platform {
+                Platform::Macos => Some(self.take_port_block()),
+                Platform::Linux => None,
+            };
+            let mut grants = GrantSet::closed_baseline(port_block).expect("grants");
             grants.revision = revision;
             let info_snapshot = WorkspaceInfoSnapshot {
                 project_root: if name.is_main() {
@@ -3416,7 +3378,7 @@ mod tests {
                 repo_id: repo.clone(),
                 workspace: name.clone(),
                 workspace_incarnation: workspace.incarnation().clone(),
-                platform: Platform::Macos,
+                platform,
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-14T00:00:00Z".to_owned(),
                 grants,
@@ -3434,8 +3396,8 @@ mod tests {
                 mint_workspace_credentials(
                     &workspace,
                     &mount,
-                    Platform::Macos,
-                    Some(port_block),
+                    platform,
+                    port_block,
                     image.ca_private_key(),
                 )
                 .expect("credentials");
@@ -4561,7 +4523,7 @@ mod tests {
                 .iter()
                 .map(|fact| (&fact.repo_id, fact.port_block))
                 .collect::<Vec<_>>(),
-            [(&repo_a, fresh), (&repo_b, live)],
+            [(&repo_a, Some(fresh)), (&repo_b, Some(live))],
             "every reader but the gateway's session path sees every attached workspace"
         );
         let alpha = crate::gateway_sessions::stable_workspace_id(
@@ -4578,14 +4540,17 @@ mod tests {
                         .endpoint
                         .validate_macos_port_block()
                         .expect("macOS fixture endpoint");
-                    #[cfg(target_os = "linux")]
-                    assert!(
-                        matches!(
-                            session.validate(),
-                            Err(cowshed_gateway_types::ConfigError::ExpectedUnixEndpoint)
-                        ),
-                        "a macOS inventory session must never install on Linux"
-                    );
+                    // A port-block endpoint the platform refuses refuses the whole session:
+                    // the fixture's sessions install only where sessions are TCP.
+                    if session.endpoint.validate_for_current_platform().is_err() {
+                        assert!(
+                            matches!(
+                                session.validate(),
+                                Err(cowshed_gateway_types::ConfigError::ExpectedUnixEndpoint)
+                            ),
+                            "a port-block session must never install where sessions are sockets"
+                        );
+                    }
                     session.workspace_id
                 })
                 .collect::<Vec<_>>()
@@ -5100,7 +5065,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     fn interrupted_restore(fixture: &Fixture, repo: &RepoId, checkout: &Path) -> StorageLayout {
         use crate::storage::recovery::{
             LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
@@ -5152,7 +5116,6 @@ mod tests {
     /// That remount takes no lock the unbinding removed, so the project's directory ends gone,
     /// not recreated holding a `main.dmg.lock` that no verb reaches again. Measured 2026-11-14:
     /// a consumer's scratch project disposal refused on exactly that residue.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_remount_after_the_unbinding_recreates_no_lock_and_no_project_directory() {
         let fixture = Fixture::new("remount-after-unbinding");
@@ -5227,7 +5190,6 @@ mod tests {
         );
     }
     /// A new inventory instance follows the exact lookup used by the original restore command.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_fresh_controller_finds_an_interrupted_unbinding_without_rebinding_it() {
         use crate::storage::recovery::LIFECYCLE_INTENTS_FILE;
@@ -5295,7 +5257,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn unbinding_discovery_requires_mutating_restore_authority_and_refuses_ambiguity() {
         use crate::storage::recovery::{
@@ -5944,5 +5905,76 @@ mod tests {
         assert!(projects.is_empty());
         assert_eq!(checkoutless, vec![repo]);
         assert!(issues.is_empty());
+    }
+
+    /// A Linux workspace's metadata records no port block, and nothing requires one: its
+    /// session fact names the store instead, it reserves no block, and its session is served on
+    /// its incarnation's socket in that store (04_sandbox.md, "Linux enforcement").
+    #[tokio::test]
+    async fn a_linux_workspace_is_served_on_its_incarnations_socket_and_holds_no_block() {
+        use crate::gateway_sessions::SessionInventory as _;
+
+        let fixture = Fixture::new("linux-socket");
+        fixture.platform.set(Platform::Linux);
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let incarnation = "00112233445566778899aabbccddeeff";
+        let (storage, mounted) = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            incarnation,
+            7,
+            true,
+        );
+        let (mount, path) = mounted.expect("mounted fixture");
+        let source = Arc::new(FixtureSource::default());
+        source.projects.lock().expect("source").insert(
+            repo.clone(),
+            ProjectInventoryFacts {
+                storage: vec![storage],
+                mounts: vec![mount.clone().into()],
+                mount_paths: BTreeMap::from([(mount.volume_key, path)]),
+            },
+        );
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let attached = inventory.all_attached().await.expect("attached").attached;
+        assert_eq!(
+            attached
+                .iter()
+                .map(|fact| (fact.port_block, fact.store.as_path()))
+                .collect::<Vec<_>>(),
+            [(None, fixture.storage.store())]
+        );
+        assert_eq!(
+            inventory
+                .all_reserved_port_blocks()
+                .await
+                .expect("reserved blocks")
+                .blocks()
+                .count(),
+            0,
+            "a workspace with no block reserves none, and is not refused for holding none"
+        );
+        let sessions = crate::gateway_sessions::NativeSessionInventory::from_inventory(inventory)
+            .all_sessions()
+            .await
+            .expect("sessions")
+            .serve;
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| &session.endpoint)
+                .collect::<Vec<_>>(),
+            [
+                &cowshed_gateway_types::WorkspaceEndpoint::linux_data_socket(
+                    fixture.storage.store(),
+                    incarnation
+                )
+            ]
+        );
     }
 }

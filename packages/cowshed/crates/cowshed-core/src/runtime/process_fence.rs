@@ -1,6 +1,7 @@
-//! The macOS pre-exec observation fence (07_api.md, "Process-tree observations").
-//! Only async-signal-safe calls run in the child. The supervisor attaches the selected native
-//! source while the child is held, then releases it; a refused attachment fails the exec.
+//! The pre-exec observation fence (07_api.md, "Process-tree observations").
+//! Only async-signal-safe calls run in the child. The supervisor attaches the platform's event
+//! source while the child is held, then releases it; a refused attachment fails the exec. The
+//! fence is two pipes and the calls every Unix has for them, so it holds no platform mechanism.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -166,7 +167,7 @@ mod tests {
     fn a_refused_attachment_fails_the_held_exec() {
         let (gate, held) = leader_gate().expect("the fence's pipes");
         let hold = held.in_process(&gate);
-        let mut command = std::process::Command::new("/usr/bin/true");
+        let mut command = std::process::Command::new("true");
         // SAFETY: the hold calls only close/getpid/write/read, all async-signal-safe.
         unsafe {
             command.pre_exec(move || hold.hold());

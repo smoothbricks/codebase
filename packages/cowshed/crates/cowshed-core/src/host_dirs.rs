@@ -3,24 +3,28 @@
 //! The gateway's mirrors live in cowshed's user cache directory (03_caches.md, layer 1), written
 //! only by cowshed-gateway; the support directory holds the installed service binaries and the
 //! mbx GC root. Neither is ever a sandbox's to write, so no shared cache may reach into one.
+//!
+//! The cache directory and a tool's default config home follow the platform's convention
+//! (`linux.rs`, `macos.rs`). The support directory is the same path on both: the installed
+//! `cowshed` is found on `PATH` by that one path whatever the host.
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
 /// `~/Library/Caches/dev.cowshed` on macOS, `$XDG_CACHE_HOME/cowshed` on Linux.
-pub fn cache_directory(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Caches/dev.cowshed")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".cache"))
-            .join("cowshed")
-    }
-}
+pub use platform::cache_directory;
+
+/// Where a host tool told nothing but its HOME keeps its user settings: `~/Library/Application
+/// Support` on macOS, `~/.config` on Linux.
+pub use platform::default_config_home;
 
 /// The npm metadata and tarball mirror the gateway serves from.
 pub fn gateway_mirror(home: &Path) -> PathBuf {
@@ -35,6 +39,14 @@ pub fn repo_mirrors(home: &Path) -> PathBuf {
 /// `~/Library/Application Support/dev.cowshed`: installed service binaries and GC roots.
 pub fn support_directory(home: &Path) -> PathBuf {
     home.join("Library/Application Support/dev.cowshed")
+}
+
+/// Where a file-backed gateway credential store keeps its records, one file per binding, the
+/// directory 0700 and each record 0600 (05_gateway.md, "Credentials"). The Linux gateway reads
+/// it as its `$CREDENTIALS_DIRECTORY`; macOS keeps the same records in the Keychain and makes
+/// no such directory.
+pub fn credentials_directory(home: &Path) -> PathBuf {
+    support_directory(home).join("credentials")
 }
 
 /// The install slot's lock in the support directory: an install holds it exclusive from before

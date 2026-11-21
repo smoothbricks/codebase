@@ -2,6 +2,10 @@
 //!
 //! Handles and locks remain the execution host's associated types. A directory store does not
 //! own a kernel volume: its controller never configures physical volume labels or counters.
+//!
+//! Which execution host is this host's native one is the platform's (`macos.rs`: the APFS image
+//! host; `linux.rs`: the directory host, over ZFS datasets or plain directories), selected here
+//! and nowhere else.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,7 +13,7 @@ use std::time::SystemTime;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, CapturedBuildVolume, Registration, ReleaseClaim,
 };
-use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
+use crate::metadata::{DetachedWorkspaceMetadata, Platform, WorkspaceName};
 use crate::repository::RepoId;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, CompactedSeed, CompactionSource,
@@ -21,7 +25,20 @@ use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
 
-mod native;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+pub(crate) use platform::require_native_substrate;
+/// The platform's native execution host and its constructor, public (`runtime::{NativeHost,
+/// native_host}`) so a composition root that works from store records alone builds the same
+/// host a project controller runs on.
+pub use platform::{NativeHost, native_host};
 
 /// The controller's storage boundary, shared by native images and real directory stores.
 ///
@@ -30,6 +47,10 @@ mod native;
 /// never a successful disk result. The capability flag keeps optional cosmetic labels and job
 /// volume sampling out of those backends; their resource samples report unconfigured volumes.
 pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
+    /// The platform this host records in the sidecar of every workspace it publishes
+    /// ([`DetachedWorkspaceMetadata::platform`]): what decides, before a workspace exists,
+    /// whether its grants start with a port block (macOS) or with none (Linux).
+    fn sidecar_platform(&self) -> Platform;
     fn canonical_metadata(
         &self,
         repo: &RepoId,

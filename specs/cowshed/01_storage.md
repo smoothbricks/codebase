@@ -42,7 +42,11 @@ Every path below uses the primary `repo_id` through this component-safe mapping.
 
 The store root owns the logical namespaces below. This tree shows the macOS/APFS realization at
 `/private/cowshed/store`; its physical mount, marker and boot ordering are specified in
-[Dedicated store volume](./01a_apfs.md#dedicated-store-volume). There is no intermediate `store/` level:
+[Dedicated store volume](./01a_apfs.md#dedicated-store-volume). On Linux the same path holds the same tree, as the
+`<root>/store` dataset of a ZFS host or as a plain directory of a directory-store host, whose payloads are directories
+under the image names below; its `.cowshed-volume.json` names which (`"substrate": "zfs"` or `"directory"`), and how
+setup provisions either is [09_substrates.md §Linux host paths](./09_substrates.md#linux-host-paths). There is no
+intermediate `store/` level:
 
 ```
 /private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (01a_apfs.md, "Dedicated store volume")
@@ -169,8 +173,11 @@ repository under the mount root. This directory is distinct from the in-image `.
 
 <!-- prettier-ignore -->
 ```
-~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd: gateway is a user agent; boot mounts are system/dev.cowshed.storage
-~/Library/Logs/cowshed/*.log                 # launchd stderr for pre-tracer-init crashes; kept off /private/cowshed/store
+~/Library/LaunchAgents/dev.cowshed.*.plist   # macOS, launchd: gateway is a user agent; boot mounts are system/dev.cowshed.storage
+~/.config/systemd/user/dev.cowshed.*.service # Linux, systemd: gateway is a user unit; no boot mount service exists
+~/Library/Logs/cowshed/*.log                 # the service manager's stderr for pre-tracer-init crashes; kept off /private/cowshed/store
+~/Library/Application Support/dev.cowshed/   # the installed cowshed (bin/), the install slot's lock, and on Linux the
+                                             #   gateway's credential records (credentials/, 0700); the same path on both
 ```
 
 Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository paths are safe because both `repo_id`

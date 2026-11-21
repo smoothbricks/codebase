@@ -16,6 +16,10 @@
 //! supervisor socket's lease, so none can start on it meanwhile, and asks the kernel for an
 //! unforced unmount, which a process that holds the mount refuses. A detached workspace attaches
 //! again on its next use, as any detached workspace does.
+//!
+//! The ceiling is macOS's. Linux has no IOKit and so no match-notification queue: its media
+//! reading answers [`std::io::ErrorKind::Unsupported`], which making room reads as no cap, and
+//! nothing is counted or detached there.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -317,7 +321,6 @@ mod native {
     use std::path::Path;
     use std::time::SystemTime;
 
-    use cowshed_apfs::SystemCommandRunner;
     use cowshed_apfs::media_cap::MediaReading;
 
     use super::{Busy, Candidate, Demand, Key, Made, Occupancy, Plan, plan};
@@ -328,8 +331,8 @@ mod native {
     };
     use crate::runtime::land_lease::{self, Holding};
     use crate::runtime::supervisor_socket;
+    use crate::runtime::{NativeHost, native_host};
     use crate::storage::StorageLayout;
-    use crate::storage::apfs::native::MacOsApfsExecutionHost;
     use crate::storage::apfs::{ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig};
     use crate::storage::bootstrap::ValidatedHostStorage;
     use crate::storage::lifecycle::{
@@ -337,15 +340,13 @@ mod native {
     };
     use crate::{AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result};
 
-    type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
-
     /// One adopted project's handles: its substrate, which detaches a workspace with its build
     /// volume.
     struct Project {
         repo: AdoptedProject,
         /// The project's session directory, where each workspace's land lease lives.
         sessions: std::path::PathBuf,
-        substrate: ApfsSubstrate<Host>,
+        substrate: ApfsSubstrate<NativeHost>,
     }
 
     /// An attached session workspace.
@@ -543,8 +544,7 @@ mod native {
         let config = ApfsSubstrateConfig::for_storage(storage, &repo.project_root);
         let substrate = ApfsSubstrate::new(
             config.clone(),
-            Host::new(SystemCommandRunner::new(config.namespace), config.clone())
-                .map_err(|error| text(&error))?,
+            native_host(config.clone()).map_err(|error| text(&error))?,
         );
         let layout =
             StorageLayout::new(storage.store(), &repo.repo_id).map_err(|error| text(&error))?;

@@ -14,6 +14,17 @@ use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::tree_crosses_device;
+
 use super::{
     DirectoryExecutionHost, MountPointState, allocated_tree_bytes, host_error, mount_point_state,
     observed_mount, read_metadata, require_home,
@@ -156,54 +167,6 @@ fn checked_increment(count: &mut usize) -> Result<(), ApfsStorageError> {
         .checked_add(1)
         .ok_or(ApfsStorageError::InvalidPlan("GC count overflow"))?;
     Ok(())
-}
-
-/// Whether the root or a descendant is mounted independently of the root's parent.
-/// Mount identities, not backing-device numbers, detect a root mount and Linux bind mounts.
-fn tree_crosses_device(root: &Path) -> io::Result<Option<PathBuf>> {
-    #[cfg(target_os = "macos")]
-    {
-        let root = fs::canonicalize(root)?;
-        Ok(cowshed_apfs::mounts::kernel_mounts()?
-            .into_iter()
-            .find(|mount| mount.mount_point.starts_with(&root))
-            .map(|mount| mount.mount_point))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use cowshed_os::fsio::{mount_id, open_directory_nofollow};
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let parent = root.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "owned tree has no parent mount",
-            )
-        })?;
-        let expected = mount_id(&open_directory_nofollow(parent)?)?;
-        let mut pending = vec![root.to_owned()];
-        while let Some(directory) = pending.pop() {
-            let held = open_directory_nofollow(&directory)?;
-            if mount_id(&held)? != expected {
-                return Ok(Some(directory));
-            }
-            for entry in fs::read_dir(&directory)? {
-                let path = entry?.path();
-                // O_PATH pins directory, file and symlink entries without reading or following
-                // their contents. A bind-mounted file must refuse before its siblings disappear.
-                let entry = fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&path)?;
-                if mount_id(&entry)? != expected {
-                    return Ok(Some(path));
-                }
-                if entry.metadata()?.is_dir() {
-                    pending.push(path);
-                }
-            }
-        }
-        Ok(None)
-    }
 }
 
 impl DirectoryExecutionHost {

@@ -424,7 +424,6 @@ impl FileComparison {
 
     /// Compare `length` logical bytes positionally. Callers match lengths and recheck identities.
     /// Its one caller, the land's source-mtime harmonization, runs on macOS.
-    #[cfg(target_os = "macos")]
     pub(crate) fn equal(
         &mut self,
         source: &fs::File,
@@ -515,14 +514,12 @@ struct VerifiedAlias {
 /// Verify the copied namespace, metadata, symlink targets and every regular-file byte before
 /// adoption stamps its own marker and credentials. Reuse the copier's volume-metadata and
 /// runtime-artifact exclusions; never follow a copied symlink while reading file content.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify_tree_blocking(source: &Path, destination: &Path) -> Result<CopyVerification> {
     verify_with_snapshot(source, destination, snapshot)
 }
 
 /// Compare raw Git-listed paths without running attributes or external filters. A listed
 /// directory (a Git link/submodule) includes its complete subtree, including ignored bytes.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify_relative_paths_blocking(
     source: &Path,
     destination: &Path,
@@ -531,7 +528,6 @@ pub(crate) fn verify_relative_paths_blocking(
     verify_with_snapshot(source, destination, |root| selected_snapshot(root, paths)).map(|_| ())
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn selected_snapshot(root: &Path, paths: &[PathBuf]) -> Result<Snapshot> {
     let mut entries = Snapshot::new();
     for relative in paths {
@@ -601,7 +597,6 @@ fn selected_snapshot(root: &Path, paths: &[PathBuf]) -> Result<Snapshot> {
     Ok(entries)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn verify_with_snapshot(
     source: &Path,
     destination: &Path,
@@ -1418,6 +1413,7 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use cowshed_os::test_backstop::CommandBackstop as _;
+
     /// A file's extended ACL as `ls -le` prints it: the lines after the first, `N: <entry>`.
     #[cfg(target_os = "macos")]
     fn acl_entries(path: &Path) -> Vec<String> {
@@ -1889,6 +1885,7 @@ mod tests {
         )
         .expect("set source file mode");
         std::os::unix::fs::symlink("nested/file", source.join("link")).expect("create symlink");
+        // The clone carries extended attributes on macOS.
         #[cfg(target_os = "macos")]
         write_xattr(&source.join("nested/file"), TEST_XATTR, b"warm");
 
@@ -2318,7 +2315,6 @@ mod tests {
             original.digest
         );
 
-        #[cfg(target_os = "macos")]
         {
             fs::remove_file(destination.join("link")).unwrap();
             symlink("changed", destination.join("link")).unwrap();

@@ -63,6 +63,17 @@ use crate::{CowshedError, Result};
 
 pub mod native;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+use platform::rename_noreplace_between;
+
 const RECORD_VERSION: u32 = 1;
 const RECORD_SUFFIX: &str = ".json";
 const SERIALIZATION_SUFFIX: &str = ".lock";
@@ -1387,56 +1398,6 @@ fn publish_at(directory: &File, name: &CStr, bytes: &[u8]) -> io::Result<()> {
     Durability::PowerLoss.sync_new_entry_at(directory)
 }
 
-/// Rename `from_name` beneath `from` to `to_name` beneath `to`, refusing an existing destination
-/// atomically and following neither leaf.
-fn rename_noreplace_between(
-    from: &File,
-    from_name: &CStr,
-    to: &File,
-    to_name: &CStr,
-) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    // SAFETY: both directory fds are held and both leaves are NUL-terminated for the call.
-    // RENAME_EXCL makes the destination check part of the rename.
-    let result = unsafe {
-        libc::renameatx_np(
-            from.as_raw_fd(),
-            from_name.as_ptr(),
-            to.as_raw_fd(),
-            to_name.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    #[cfg(target_os = "linux")]
-    // SAFETY: as above; the raw syscall avoids depending on glibc's renameat2 wrapper.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            from.as_raw_fd(),
-            from_name.as_ptr(),
-            to.as_raw_fd(),
-            to_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (from, from_name, to, to_name);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic create-new rename is unsupported",
-        ))
-    }
-}
-
 /// The names in `directory`, read through its descriptor, skipping `.`, `..` and dot-prefixed
 /// temp residue. A fresh `openat(".")` gives the listing its own offset.
 fn directory_entries(directory: &File) -> io::Result<Vec<CString>> {
@@ -1461,7 +1422,9 @@ fn directory_entries(directory: &File) -> io::Result<Vec<CString>> {
     }
     let mut names = Vec::new();
     let result = loop {
-        clear_errno();
+        // `readdir` leaves errno untouched at the end of a stream, so only a cleared one tells
+        // the end from a failure.
+        crate::runtime::shell_host::clear_errno();
         // SAFETY: the stream is held until closed below.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
@@ -1484,20 +1447,6 @@ fn directory_entries(directory: &File) -> io::Result<Vec<CString>> {
         return Err(close);
     }
     result.map(|()| names)
-}
-
-/// Zero this thread's errno, which `readdir` leaves untouched at the end of a stream.
-fn clear_errno() {
-    #[cfg(target_os = "macos")]
-    // SAFETY: errno is thread-local and always writable.
-    unsafe {
-        *libc::__error() = 0;
-    }
-    #[cfg(target_os = "linux")]
-    // SAFETY: errno is thread-local and always writable.
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
 }
 
 #[cfg(test)]

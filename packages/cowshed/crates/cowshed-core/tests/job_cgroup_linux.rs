@@ -1564,7 +1564,7 @@ async fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
         .expect("an earlier admission");
     let mut sink = SystemSpawnSink::default();
     let refusal = sink
-        .admit_cgroup(&here, job_id(1), ExecClass::Background)
+        .admit_membership(&here, job_id(1), ExecClass::Background)
         .await
         .expect_err("a name in use is refused, never adopted or admitted uncontained");
     assert_eq!(
@@ -1584,18 +1584,10 @@ async fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
         existing.identity(),
         "the refused admission left the earlier one untouched"
     );
-    let admitted = sink
-        .admit_cgroup(&here, job_id(2), ExecClass::Background)
-        .await
-        .expect("admit")
-        .expect("a cgroup");
+    let admitted = native_admission(&mut sink, &here, job_id(2)).await;
     assert_eq!(admitted.path().parent(), existing.path().parent());
     assert_eq!(admitted.identity().job_id(), job_id(2));
-    let elsewhere = sink
-        .admit_cgroup(&there, job_id(1), ExecClass::Background)
-        .await
-        .expect("admit")
-        .expect("a cgroup");
+    let elsewhere = native_admission(&mut sink, &there, job_id(1)).await;
     assert_ne!(elsewhere.path(), existing.path());
     assert_eq!(elsewhere.identity().incarnation(), &second);
     retire_outstanding(&jobs);
@@ -1619,7 +1611,7 @@ async fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
     std::fs::write(&limit, "0").expect("set the descendant limit");
     let library = jobs.admit(job_id(2), ExecClass::Background);
     let native = sink
-        .admit_cgroup(&snapshot, job_id(2), ExecClass::Background)
+        .admit_membership(&snapshot, job_id(2), ExecClass::Background)
         .await;
     let listed = jobs.outstanding();
     // Lifted before anything is judged, so a failed assertion cannot leave the scope refusing.
@@ -3385,15 +3377,16 @@ async fn native_admission(
     id: JobId,
 ) -> Arc<JobCgroup> {
     let admitted = sink
-        .admit_cgroup(authority, id, ExecClass::Background)
+        .admit_membership(authority, id, ExecClass::Background)
         .await
         .unwrap_or_else(|error| panic!("native admission of job {}: {error}", id.get()));
-    admitted.unwrap_or_else(|| {
+    let Some(membership) = admitted else {
         panic!(
             "the production sink admitted job {} without a cgroup",
             id.get()
         )
-    })
+    };
+    Arc::clone(membership.cgroup())
 }
 
 fn test_binary() -> PathBuf {

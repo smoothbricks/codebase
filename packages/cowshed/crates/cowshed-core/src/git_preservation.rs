@@ -16,29 +16,19 @@
 //! source and copy, and the `.git` directory, or a linked worktree's `.git` file and its
 //! shared index, and every tracked or untracked-not-ignored path must match the source.
 
-#[cfg(any(target_os = "macos", test))]
 use std::collections::BTreeMap;
-#[cfg(any(target_os = "macos", test))]
 use std::ffi::OsString;
-#[cfg(any(target_os = "macos", test))]
 use std::fmt;
-#[cfg(any(target_os = "macos", test))]
 use std::fs;
-#[cfg(any(target_os = "macos", test))]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-#[cfg(any(target_os = "macos", test))]
 use std::os::unix::process::ExitStatusExt as _;
-#[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", test))]
 use std::process::Output;
 
 use serde::{Deserialize, Serialize};
 
 use crate::api::{GitOid, Sha256Digest};
-#[cfg(any(target_os = "macos", test))]
 use crate::error::{CowshedError, Result};
-#[cfg(any(target_os = "macos", test))]
 use cowshed_os::fork_lock::Run as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,14 +40,12 @@ struct Probe {
     stderr: Vec<u8>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl Probe {
     fn succeeded(&self) -> bool {
         self.code == Some(0) && self.signal.is_none()
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl From<Output> for Probe {
     fn from(output: Output) -> Self {
         Self {
@@ -73,7 +61,6 @@ impl From<Output> for Probe {
 /// which use file lengths. Reallocation is not object loss. Retain the raw probe, but
 /// compare every byte except a well-formed loose-allocation value; copied object bytes
 /// and fsck are verified independently. Unknown fields and diagnostics remain evidence.
-#[cfg(any(target_os = "macos", test))]
 fn count_objects_equal(expected: &Probe, actual: &Probe) -> bool {
     fn identity_line(line: &[u8]) -> Option<&[u8]> {
         if let Some(size) = line.strip_prefix(b"size: ")
@@ -119,7 +106,6 @@ pub(crate) struct GitPreservationSnapshot {
     fsck: Probe,
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitPreservationComponent {
     Head,
@@ -133,7 +119,6 @@ pub(crate) enum GitPreservationComponent {
     Fsck,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl fmt::Display for GitPreservationComponent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -151,13 +136,11 @@ impl fmt::Display for GitPreservationComponent {
 }
 
 /// All mismatches, in probe order; no first-mismatch-only verdict.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct GitPreservationDiff {
     pub(crate) components: Vec<GitPreservationComponent>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl fmt::Display for GitPreservationDiff {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Git preservation mismatch: ")?;
@@ -171,10 +154,8 @@ impl fmt::Display for GitPreservationDiff {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl std::error::Error for GitPreservationDiff {}
 
-#[cfg(any(target_os = "macos", test))]
 impl GitPreservationSnapshot {
     pub(crate) fn head(&self) -> &GitOid {
         &self.head
@@ -250,13 +231,11 @@ impl GitPreservationSnapshot {
 /// than against what was recorded. Status depends on the worktree and its filters. Resolved config
 /// depends on included files, which can live outside `.git`, even at an absolute path inside the
 /// canonical checkout, which is an empty mountpoint until the copy is published there.
-#[cfg(any(target_os = "macos", test))]
 struct Live {
     status_differs: bool,
     resolved_config_differs: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn absolute(path: &Path, name: &str) -> Result<()> {
     if path.is_absolute() {
         Ok(())
@@ -272,13 +251,11 @@ fn absolute(path: &Path, name: &str) -> Result<()> {
 }
 
 /// Run without index refreshes or ambient Git-directory redirection.
-#[cfg(any(target_os = "macos", test))]
 fn probe(root: &Path, args: &[&str], allowed_codes: &[i32]) -> Result<Probe> {
     probe_with(root, &[], args, allowed_codes)
 }
 
 /// [`probe`] with `env` added to this one invocation's environment, as command-line config.
-#[cfg(any(target_os = "macos", test))]
 fn probe_with(
     root: &Path,
     env: &[(OsString, OsString)],
@@ -330,7 +307,6 @@ fn probe_with(
 }
 
 /// Resolves `path` to its real location; a failure names the checkout role it was asked for.
-#[cfg(any(target_os = "macos", test))]
 fn canonical(path: &Path, name: &str) -> Result<PathBuf> {
     fs::canonicalize(path).map_err(|error| {
         CowshedError::integrity(
@@ -354,7 +330,6 @@ fn canonical(path: &Path, name: &str) -> Result<PathBuf> {
 /// each populated submodule under that submodule's own config, which would run drivers the keys
 /// above cannot reach. Commit-level submodule changes stay visible; submodule bytes are compared
 /// as whole subtrees by `copy::verify_relative_paths_blocking`.
-#[cfg(any(target_os = "macos", test))]
 fn filter_free_status(root: &Path) -> Result<Probe> {
     // Exit 1 means no key matched: no filter driver is configured.
     let keys = probe(
@@ -409,7 +384,6 @@ fn filter_free_status(root: &Path) -> Result<Probe> {
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPreservationSnapshot> {
     absolute(root, "root")?;
     absolute(canonical_checkout, "canonical checkout")?;
@@ -510,7 +484,6 @@ pub(crate) fn capture(root: &Path, canonical_checkout: &Path) -> Result<GitPrese
 }
 
 /// The repository's local config at `root` with its includes resolved, as Git reads it now.
-#[cfg(any(target_os = "macos", test))]
 fn resolved_local_config(root: &Path) -> Result<Probe> {
     probe(
         root,
@@ -519,7 +492,6 @@ fn resolved_local_config(root: &Path) -> Result<Probe> {
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn worktree_field<'a>(
     snapshot: &'a GitPreservationSnapshot,
     field: &'a [u8],
@@ -532,7 +504,6 @@ fn worktree_field<'a>(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn worktrees_equal(expected: &GitPreservationSnapshot, actual: &GitPreservationSnapshot) -> bool {
     if expected.worktrees.code != actual.worktrees.code
         || expected.worktrees.signal != actual.worktrees.signal
@@ -588,7 +559,6 @@ pub(crate) fn verify(
 /// Every raw path Git tracks, plus every untracked path no ignore rule excludes, sorted without
 /// duplicates (unmerged index entries repeat). A submodule or nested repository is listed as its
 /// directory without the trailing slash, so the copy verifier reads it as a whole subtree.
-#[cfg(any(target_os = "macos", test))]
 fn worktree_paths(root: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for args in [
@@ -615,14 +585,12 @@ fn worktree_paths(root: &Path) -> Result<Vec<PathBuf>> {
 /// How a checkout holds its Git state. A standalone `.git` directory is copied and compared as a
 /// tree. A `.git` file is a linked worktree: its administrative directory lives outside the
 /// checkout, is not copied, and is shared by the source and the copy.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GitEntry {
     Directory,
     File,
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn git_entry(checkout: &Path) -> Result<GitEntry> {
     let git = checkout.join(".git");
     let file_type = fs::symlink_metadata(&git)
@@ -649,7 +617,6 @@ fn git_entry(checkout: &Path) -> Result<GitEntry> {
 }
 
 /// [`worktree_paths`], plus a `.git` file: it is not in the index, so its bytes are named here.
-#[cfg(any(target_os = "macos", test))]
 fn checkout_paths(checkout: &Path, entry: GitEntry) -> Result<Vec<PathBuf>> {
     let mut paths = worktree_paths(checkout)?;
     if entry == GitEntry::File {
@@ -660,7 +627,6 @@ fn checkout_paths(checkout: &Path, entry: GitEntry) -> Result<Vec<PathBuf>> {
 }
 
 /// One Git-resolved path of `checkout`, absolute and without the newline `rev-parse` appends.
-#[cfg(any(target_os = "macos", test))]
 fn absolute_git_path(checkout: &Path, selector: &[&str]) -> Result<PathBuf> {
     let mut args = vec!["rev-parse", "--path-format=absolute"];
     args.extend_from_slice(selector);
@@ -672,7 +638,6 @@ fn absolute_git_path(checkout: &Path, selector: &[&str]) -> Result<PathBuf> {
 }
 
 /// The index bytes at `path`, or `None` when no index was ever written there.
-#[cfg(any(target_os = "macos", test))]
 fn index_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -687,7 +652,6 @@ fn index_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
 /// A linked worktree's copy must reach the same administrative directory and index as its
 /// retained source. The index is read in place; no Git command runs against it, so nothing is
 /// refreshed or written.
-#[cfg(any(target_os = "macos", test))]
 fn verify_linked_admin(root: &Path, retained_source: &Path) -> Result<()> {
     let copy_dir = absolute_git_path(root, &["--git-dir"])?;
     let source_dir = absolute_git_path(retained_source, &["--git-dir"])?;
@@ -718,7 +682,6 @@ fn verify_linked_admin(root: &Path, retained_source: &Path) -> Result<()> {
 }
 
 /// Refuses a copy whose own `git fsck` failed, naming the exit status and both output streams.
-#[cfg(any(target_os = "macos", test))]
 fn require_fsck(root: &Path, actual: &GitPreservationSnapshot) -> Result<()> {
     if actual.fsck_succeeded() {
         return Ok(());
@@ -745,7 +708,6 @@ fn require_fsck(root: &Path, actual: &GitPreservationSnapshot) -> Result<()> {
 /// `.git` directory must match the source byte for byte. A linked worktree's `.git` file must
 /// match byte for byte and reach the same administrative directory and index, which are read in
 /// place and never written. Every tracked and untracked-not-ignored path must match too.
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn verify_copy(
     root: &Path,
     canonical_checkout: &Path,

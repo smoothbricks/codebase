@@ -1,4 +1,16 @@
-//! Immutable launchd service definitions, filesystem plans, and native executors.
+//! The service manager: immutable service definitions, filesystem plans, and native executors.
+//!
+//! This is the one interface to the host's per-user service manager, launchd on macOS and
+//! systemd's user manager on Linux. The module and its types keep launchd's names
+//! (`LaunchAgentSpec`, `LaunchAgentTarget`, `ControlPlan`, `LaunchctlCommand`, `LaunchdExecutor`,
+//! `LaunchdServiceStatus`, `plist_path`, …) and mean the neutral thing on every platform: a
+//! service definition, its control target, one call of the manager's control tool, the manager's
+//! word on whether it holds the service. Everything here is the same on both platforms — the
+//! host-stable executables, the install plans, the filesystem adapter, the executor — and the
+//! platform file supplies only the mechanism: where a definition lives and its bytes
+//! (`macos.rs`: a LaunchAgent plist; `linux.rs`: a systemd user unit), the control tool's argv
+//! for each lifecycle step (`launchctl`; `systemctl --user`), how its status answer reads, and
+//! the commands a hint names. No caller branches on the platform.
 //!
 //! The planner is pure. Execution is isolated behind injectable filesystem and
 //! command adapters so callers can keep one mutable, actor-owned executor while
@@ -15,9 +27,30 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+
+/// The manager's control tool: `/bin/launchctl`, or `systemctl` as `PATH` finds it.
+pub use platform::MANAGER_EXECUTABLE as LAUNCHCTL_EXECUTABLE;
+/// What a test's recording runner reads of a control argv and answers a status read with.
+#[cfg(test)]
+pub(crate) use platform::recorded;
+/// What messages call the service manager, its control tool, a service it runs, that service's
+/// definition file, and the two together.
+pub use platform::{AGENT, AGENT_DEFINITION, DEFINITION, MANAGER, TOOL};
+/// The commands a hint names, and how the control tool names a label's service.
+pub use platform::{bootstrap_hint, kickstart_hint, print_hint, service_target};
+
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+/// The mode of a definition file, whatever the platform calls it.
 pub const PRIVATE_PLIST_MODE: u32 = 0o600;
-/// Runnable, and writable only by the user launchd runs the agent as.
+/// Runnable, and writable only by the user the service manager runs the agent as.
 pub const STABLE_BINARY_MODE: u32 = 0o755;
 pub const COWSHED_BINARY_NAME: &str = "cowshed";
 
@@ -37,11 +70,6 @@ pub const LIBRARY_DIRECTORY: &str = "Library";
 pub const APPLICATION_SUPPORT: &str = "Application Support";
 pub const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
 pub const STABLE_BINARY_DIRECTORY: &str = "bin";
-pub const LAUNCH_AGENTS_DIRECTORY: &str = "LaunchAgents";
-
-/// The `PATH` launchd gives an agent that states none, kept behind [`BunDirectory`] in the
-/// gateway's so the daemon's other children resolve as they always did.
-pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The directory of the `bun` the gateway runs its Nx cache server with, named as a place nix or
 /// devenv keeps alive and re-points, never as a `/nix/store` path. A plist outlives the shell that
@@ -90,7 +118,7 @@ impl BunDirectory {
         if directory.starts_with(NIX_STORE) {
             return Err(LaunchdError::InvalidPath {
                 field: "bun-directory",
-                reason: "must not be a /nix/store path, which nothing roots once a plist names it",
+                reason: platform::STORE_PATH_REFUSAL,
             });
         }
         Ok(Self(directory))
@@ -272,7 +300,8 @@ impl fmt::Display for ExecutableDigest {
     }
 }
 
-/// A launchctl control target: the label, and the plist path that defines it.
+/// A control target: the label, and the path of the definition file that defines it
+/// (`~/Library/LaunchAgents/<label>.plist`, or `~/.config/systemd/user/<label>.service`).
 ///
 /// Split out of [`LaunchAgentSpec`] because `stop` and `status` are not definitions. They have to
 /// reach the agent `start` installed even when the program it names is gone, a state `doctor` must
@@ -289,10 +318,7 @@ impl LaunchAgentTarget {
         validate_label(label)?;
         Ok(Self {
             label: label.to_owned(),
-            plist_path: home
-                .join(LIBRARY_DIRECTORY)
-                .join(LAUNCH_AGENTS_DIRECTORY)
-                .join(format!("{label}.plist")),
+            plist_path: platform::definition_path(home, label),
         })
     }
 
@@ -300,10 +326,12 @@ impl LaunchAgentTarget {
         &self.label
     }
 
+    /// The definition file, a plist only on macOS.
     pub fn plist_path(&self) -> &Path {
         &self.plist_path
     }
 
+    /// The directory the manager reads definitions from, `~/Library/LaunchAgents` only on macOS.
     pub fn launch_agents_directory(&self) -> &Path {
         self.plist_path
             .parent()
@@ -319,25 +347,6 @@ pub enum ServiceLifecycle {
     RunAtLoad,
 }
 
-/// launchd `ProcessType` of every cowshed agent: Interactive.
-///
-/// The type is the QoS band the agent *and every descendant* runs in, and a descendant cannot
-/// leave it: launchd applies Background as the process's apptype, so `setpriority(
-/// PRIO_DARWIN_PROCESS, 0, 0)` in a child reports success and changes nothing (probed on macOS 26
-/// with a Background agent: PRI 4 before and after, in the agent and in its children).
-///
-/// Only Interactive runs at parity with the host's own processes. The gateway's supervisor
-/// manager starts every workspace supervisor, which starts every shell host and every
-/// `cowshed exec` job. Probed with a test
-/// agent on macOS 26: Background runs it and its children at PRI 4, Standard at PRI 20 (the
-/// utility band, `taskpolicy -c utility`), Interactive at PRI 31 like a terminal's processes.
-/// Both clamped bands throttle IO behind the host's: under Background on a host at load 80 a
-/// shell loop that takes 0.7 s took 1–30 s, a fresh workspace's supervisor took 115 s to answer,
-/// and its first `cowshed exec` spent 537 s inside `direnv export json`; under the utility clamp
-/// at load 10–47 the first `codegraph status` over a fresh workspace's cold 1 GB SQLite index
-/// took 34.5 s and 54.5 s where the same cold run unclamped took 2.4 s and 2.7 s.
-const PROCESS_TYPE: &str = "Interactive";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentSpec {
     target: LaunchAgentTarget,
@@ -348,9 +357,10 @@ pub struct LaunchAgentSpec {
     standard_error_path: PathBuf,
     /// A finite soft limit with unlimited hard authority, inherited by descendants.
     soft_number_of_files: Option<u64>,
-    /// launchd `ExitTimeOut`: how long launchd lets the program exit after the SIGTERM of a
-    /// bootout or `kickstart -k` before it SIGKILLs it. `None` leaves launchd's default, 5 s
-    /// on macOS 26 (`launchctl print`: "exit timeout = 5").
+    /// How long the manager lets the program exit after the SIGTERM of a stop before it SIGKILLs
+    /// it: launchd `ExitTimeOut` (a bootout or `kickstart -k`), systemd `TimeoutStopSec=`. `None`
+    /// leaves the manager's default: launchd's is 5 s on macOS 26 (`launchctl print`:
+    /// "exit timeout = 5"), systemd's 90 s.
     exit_timeout: Option<std::time::Duration>,
 }
 
@@ -426,26 +436,23 @@ impl LaunchAgentSpec {
     }
 
     /// The gateway agent. Its `PATH` is the directory of the `bun` setup found ([`BunDirectory`])
-    /// ahead of launchd's own default, so the daemon runs its Nx cache server with that `bun`
-    /// and every other child it names resolves exactly as it did under launchd's default.
+    /// ahead of the manager's own default, so the daemon runs its Nx cache server with that `bun`
+    /// and every other child it names resolves exactly as it did under the manager's default.
     ///
     /// The label is `namespace`'s ([`HostNamespace::launchd_label`], 01_storage.md "Host
     /// namespace"): production's `dev.cowshed.gateway`, a test namespace's
     /// `dev.cowshed-test-<ns>.gateway`.
     ///
-    /// launchd runs the gateway host ([`crate::gateway_host`]) from its fixed path, and the host
-    /// runs the stable name's `gateway run` as its child: the daemon runs its own content-addressed
-    /// copy, and every process it starts, every workspace job included, has the host as its
-    /// responsible process.
+    /// The manager runs the gateway host ([`crate::gateway_host`]) from its fixed path, and the
+    /// host runs the stable name's `gateway run` as its child: the daemon runs its own
+    /// content-addressed copy, and on macOS every process it starts, every workspace job included,
+    /// has the host as its responsible process.
     pub fn gateway(
         namespace: HostNamespace,
         executable: &HostStableExecutable,
         bun: &BunDirectory,
     ) -> Result<Self, LaunchdError> {
-        let path = format!(
-            "{}:{LAUNCHD_DEFAULT_PATH}",
-            bun.path().to_str().expect("validated paths are UTF-8")
-        );
+        let environment = platform::gateway_environment(executable.home(), bun);
         let mut spec = Self::assemble(
             executable.home(),
             &executable.gateway_host(),
@@ -461,13 +468,14 @@ impl LaunchAgentSpec {
                     "gateway".into(),
                     "run".into(),
                 ],
-                environment: vec![("PATH".to_owned(), path)],
+                environment,
                 lifecycle: ServiceLifecycle::KeepAlive,
                 standard_error_file: "daemon-stderr.log",
             },
         )?;
         // A finite kernel-sized soft limit keeps sysconf(_SC_OPEN_MAX) usable by fd-closing tools.
-        // Hard authority remains Darwin's RLIM_INFINITY, owned by the service, not child spawns.
+        // Hard authority remains all the manager has (Darwin's RLIM_INFINITY, a systemd user
+        // manager's own hard limit), owned by the service, not child spawns.
         spec.soft_number_of_files = Some(245_760);
         // launchd's 5 s default SIGKILLed a draining gateway mid-drain (measured 2026-10-22), so
         // the agent states the bound the daemon's own drain is sized within.
@@ -492,6 +500,9 @@ impl LaunchAgentSpec {
         &self.arguments
     }
 
+    /// The variables the definition states, each value as it is, unescaped. `PATH` holds what the
+    /// platform's definition leads with: a plist states it whole, launchd's default included,
+    /// and a unit writes the user manager's own default behind it (`linux.rs`).
     pub fn environment(&self) -> &[(String, String)] {
         &self.environment
     }
@@ -521,70 +532,16 @@ impl LaunchAgentSpec {
         .chain(self.arguments.iter().map(String::as_str))
     }
 
+    /// The definition file's bytes, a plist only on macOS.
     pub fn plist_bytes(&self) -> Vec<u8> {
-        let mut plist = String::from(concat!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
-            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
-            "<plist version=\"1.0\">\n",
-            "<dict>\n",
-            "  <key>Label</key>\n",
-            "  ",
-        ));
-        push_xml_string(&mut plist, self.label());
-        plist.push_str("  <key>ProgramArguments</key>\n  <array>\n");
-        for argument in self.program_arguments() {
-            plist.push_str("    ");
-            push_xml_string(&mut plist, argument);
-        }
-        plist.push_str("  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n");
-        match self.lifecycle {
-            ServiceLifecycle::KeepAlive => plist.push_str("  <true/>\n"),
-            ServiceLifecycle::RunAtLoad => plist.push_str("  <false/>\n"),
-        }
-        plist.push_str("  <key>ProcessType</key>\n  <string>");
-        plist.push_str(PROCESS_TYPE);
-        plist.push_str("</string>\n  <key>StandardErrorPath</key>\n  ");
-        push_xml_string(
-            &mut plist,
-            self.standard_error_path
-                .to_str()
-                .expect("validated home paths are UTF-8"),
-        );
-        if !self.environment.is_empty() {
-            plist.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
-            for (name, value) in &self.environment {
-                plist.push_str("    ");
-                push_xml_key(&mut plist, name);
-                plist.push_str("    ");
-                push_xml_string(&mut plist, value);
-            }
-            plist.push_str("  </dict>\n");
-        }
-        if let Some(soft) = self.soft_number_of_files {
-            use std::fmt::Write as _;
-            for (key, limit) in [
-                ("SoftResourceLimits", soft),
-                ("HardResourceLimits", 9_223_372_036_854_775_807),
-            ] {
-                writeln!(
-                    plist,
-                    "  <key>{key}</key>\n  <dict>\n    <key>NumberOfFiles</key>\n    <integer>{limit}</integer>\n  </dict>"
-                )
-                .expect("writing into a String cannot fail");
-            }
-        }
-        if let Some(exit_timeout) = self.exit_timeout {
-            use std::fmt::Write as _;
-            writeln!(
-                plist,
-                "  <key>ExitTimeOut</key>\n  <integer>{}</integer>",
-                exit_timeout.as_secs()
-            )
-            .expect("writing into a String cannot fail");
-        }
-        plist.push_str("</dict>\n</plist>\n");
-        plist.into_bytes()
+        platform::definition_bytes(self)
+    }
+
+    /// The directories besides the definition's own that must exist before the manager can
+    /// start this definition, each with the mode it has to have. None where the manager makes
+    /// what a definition names (launchd).
+    pub fn required_directories(&self) -> Vec<RequiredDirectory> {
+        platform::required_directories(self)
     }
 }
 
@@ -596,7 +553,8 @@ pub struct ExistingPlist<'a> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InstallState<'a> {
-    /// `None` means `~/Library/LaunchAgents` does not exist.
+    /// `None` means the definition directory (`~/Library/LaunchAgents`,
+    /// `~/.config/systemd/user`) does not exist.
     pub launch_agents_directory_mode: Option<u32>,
     pub plist: Option<ExistingPlist<'a>>,
 }
@@ -672,18 +630,23 @@ pub enum Mutation {
     },
 }
 
-fn plan_private_directory(path: &Path, mode: Option<u32>) -> Option<Mutation> {
+/// Plan a directory that has to exist at exactly `wanted`.
+fn plan_directory(path: &Path, mode: Option<u32>, wanted: u32) -> Option<Mutation> {
     match mode {
         None => Some(Mutation::EnsureDirectory {
             path: path.to_path_buf(),
-            mode: PRIVATE_DIRECTORY_MODE,
+            mode: wanted,
         }),
-        Some(mode) if mode != PRIVATE_DIRECTORY_MODE => Some(Mutation::SetPermissions {
+        Some(mode) if mode != wanted => Some(Mutation::SetPermissions {
             path: path.to_path_buf(),
-            mode: PRIVATE_DIRECTORY_MODE,
+            mode: wanted,
         }),
         Some(_) => None,
     }
+}
+
+fn plan_private_directory(path: &Path, mode: Option<u32>) -> Option<Mutation> {
+    plan_directory(path, mode, PRIVATE_DIRECTORY_MODE)
 }
 
 fn plan_remove_file(path: &Path, directory: &Path, installed: bool) -> Vec<Mutation> {
@@ -701,11 +664,16 @@ fn plan_remove_file(path: &Path, directory: &Path, installed: bool) -> Vec<Mutat
     }
 }
 
+/// Plan the definition's install: its directory, as the platform keeps it (launchd's private to
+/// the user, systemd's made when missing and otherwise left alone), and the definition file,
+/// published whole through a temporary file beside it. A definition that is already there with
+/// these bytes and this mode plans nothing.
 pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallPlan {
     let directory = spec.launch_agents_directory().to_path_buf();
     let mut operations = Vec::new();
 
-    if let Some(operation) = plan_private_directory(&directory, state.launch_agents_directory_mode)
+    if let Some(operation) =
+        platform::plan_definition_directory(&directory, state.launch_agents_directory_mode)
     {
         operations.push(operation);
     }
@@ -718,7 +686,7 @@ pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallP
     if !plist_is_current {
         operations.push(Mutation::CreateExclusiveTemporaryFile {
             directory: directory.clone(),
-            name_prefix: format!(".{}.plist.", spec.label()),
+            name_prefix: format!(".{}.{}.", spec.label(), platform::DEFINITION_EXTENSION),
             bytes: desired,
             mode: PRIVATE_PLIST_MODE,
         });
@@ -733,6 +701,28 @@ pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallP
     }
 
     InstallPlan { operations }
+}
+
+/// A directory a definition needs besides its own before the manager can start it
+/// ([`LaunchAgentSpec::required_directories`]), and the mode it has to have.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequiredDirectory {
+    pub path: PathBuf,
+    pub mode: u32,
+}
+
+/// Plan the directories a definition requires: each with the mode observed for it, `None` for
+/// one that does not exist. One that is missing is made, with its parents; one at another mode
+/// is set to its own; one that is as required plans nothing, so a current host plans nothing.
+/// Planned apart from [`plan_install`] because making one never calls for a restart: the manager
+/// retries a service whose directory was missing, and finds it at its next start.
+pub fn plan_required_directories(observed: &[(RequiredDirectory, Option<u32>)]) -> InstallPlan {
+    InstallPlan {
+        operations: observed
+            .iter()
+            .filter_map(|(directory, mode)| plan_directory(&directory.path, *mode, directory.mode))
+            .collect(),
+    }
 }
 
 pub fn plan_remove(target: &LaunchAgentTarget, installed: bool) -> InstallPlan {
@@ -861,23 +851,40 @@ pub fn plan_gateway_host_install(
     source: &Path,
     identity: crate::code_signing::SigningIdentity,
 ) -> InstallPlan {
+    gateway_host_install(executable, source, Some(identity))
+}
+
+/// [`plan_gateway_host_install`] on a host that signs nothing
+/// ([`crate::code_signing::gateway_host_identity`]): the same copy, sync and rename, with no
+/// sign step between them.
+pub fn plan_unsigned_gateway_host_install(
+    executable: &HostStableExecutable,
+    source: &Path,
+) -> InstallPlan {
+    gateway_host_install(executable, source, None)
+}
+
+fn gateway_host_install(
+    executable: &HostStableExecutable,
+    source: &Path,
+    identity: Option<crate::code_signing::SigningIdentity>,
+) -> InstallPlan {
     let directory = executable.directory().to_path_buf();
-    InstallPlan {
-        operations: vec![
-            Mutation::CopyToTemporaryFile {
-                directory: directory.clone(),
-                name_prefix: format!(".{GATEWAY_HOST_NAME}."),
-                source: source.to_path_buf(),
-                mode: STABLE_BINARY_MODE,
-            },
-            Mutation::SignTemporaryFile { identity },
-            Mutation::SyncTemporaryFile,
-            Mutation::RenameTemporaryFile {
-                destination: executable.gateway_host(),
-            },
-            Mutation::SyncDirectory { path: directory },
-        ],
-    }
+    let mut operations = vec![Mutation::CopyToTemporaryFile {
+        directory: directory.clone(),
+        name_prefix: format!(".{GATEWAY_HOST_NAME}."),
+        source: source.to_path_buf(),
+        mode: STABLE_BINARY_MODE,
+    }];
+    operations.extend(identity.map(|identity| Mutation::SignTemporaryFile { identity }));
+    operations.extend([
+        Mutation::SyncTemporaryFile,
+        Mutation::RenameTemporaryFile {
+            destination: executable.gateway_host(),
+        },
+        Mutation::SyncDirectory { path: directory },
+    ]);
+    InstallPlan { operations }
 }
 
 /// Plan the removal of the `cargo` link an earlier install left in the host-stable `directory`.
@@ -914,8 +921,6 @@ pub fn plan_executable_remove(
 
     InstallPlan { operations }
 }
-
-pub const LAUNCHCTL_EXECUTABLE: &str = "/bin/launchctl";
 
 /// Filesystem operations required to execute an [`InstallPlan`].
 ///
@@ -990,7 +995,7 @@ impl NativeFilesystem {
 
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "could not allocate an exclusive launchd temporary symlink",
+            format!("could not allocate an exclusive {MANAGER} temporary symlink"),
         ))
     }
 
@@ -1040,7 +1045,7 @@ impl NativeFilesystem {
 
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "could not allocate an exclusive launchd temporary file",
+            format!("could not allocate an exclusive {MANAGER} temporary file"),
         ))
     }
 
@@ -1146,7 +1151,7 @@ fn set_exact_permissions_no_follow(path: &Path, mode: u32, kind: FileKind) -> io
     use std::os::unix::fs::PermissionsExt;
 
     let file = open_existing_no_follow(path, false)?;
-    require_file_kind(&file, "launchd path", kind)?;
+    require_file_kind(&file, format_args!("{MANAGER} path"), kind)?;
     file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
@@ -1161,7 +1166,11 @@ fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
     options.open(path)
 }
 
-fn require_file_kind(file: &File, subject: &'static str, expected: FileKind) -> io::Result<()> {
+fn require_file_kind(
+    file: &File,
+    subject: impl fmt::Display,
+    expected: FileKind,
+) -> io::Result<()> {
     let actual = file.metadata()?.file_type();
     let matches = match expected {
         FileKind::Directory => actual.is_dir(),
@@ -1174,7 +1183,7 @@ fn require_file_kind(file: &File, subject: &'static str, expected: FileKind) -> 
     }
 }
 
-fn wrong_file_kind(subject: &'static str, expected: FileKind) -> io::Error {
+fn wrong_file_kind(subject: impl fmt::Display, expected: FileKind) -> io::Error {
     let expected = match expected {
         FileKind::Directory => "directory",
         FileKind::RegularFile => "regular file",
@@ -1280,7 +1289,7 @@ impl fmt::Display for InstallExecutionError {
             } => {
                 write!(
                     formatter,
-                    "launchd filesystem operation {operation:?} failed for {}: {source}",
+                    "{MANAGER} filesystem operation {operation:?} failed for {}: {source}",
                     path.display()
                 )?;
                 if let Some(cleanup) = cleanup_failure {
@@ -1294,7 +1303,10 @@ impl fmt::Display for InstallExecutionError {
                 Ok(())
             }
             Self::InvalidPlan { operation, reason } => {
-                write!(formatter, "invalid launchd plan at {operation:?}: {reason}")
+                write!(
+                    formatter,
+                    "invalid {MANAGER} plan at {operation:?}: {reason}"
+                )
             }
         }
     }
@@ -1336,18 +1348,16 @@ pub enum ControlAction {
 }
 
 impl ControlAction {
-    /// The op a call of this action is bounded and named under (05_gateway.md "Deadlines").
+    /// The op a call of this action is bounded and named under (05_gateway.md "Deadlines"):
+    /// the control tool and its verb, `launchctl bootstrap` or `systemctl enable`.
     pub const fn op(self) -> &'static str {
-        match self {
-            Self::Bootstrap => "launchctl bootstrap",
-            Self::Bootout => "launchctl bootout",
-            Self::Kickstart => "launchctl kickstart",
-            Self::Print => "launchctl print",
-        }
+        platform::op(self)
     }
 }
 
-/// One `launchctl` call and the bound it runs to its end within (05_gateway.md "Deadlines", ffi).
+/// One call of the manager's control tool (`launchctl`, `systemctl --user`) and the bound it
+/// runs to its end within (05_gateway.md "Deadlines", ffi). The platform gives the argv; the
+/// bounds are the same for both.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPlan {
     action: ControlAction,
@@ -1356,45 +1366,36 @@ pub struct ControlPlan {
 }
 
 impl ControlPlan {
-    /// launchd answers a bootstrap from its own state, within [`deadline::LAUNCHCTL`].
+    /// Load the agent from its definition and start it. The manager answers from its own state,
+    /// within [`deadline::LAUNCHCTL`].
     pub fn bootstrap(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Bootstrap,
-            arguments: vec![
-                OsString::from("bootstrap"),
-                OsString::from(gui_domain(uid)),
-                target.plist_path().as_os_str().to_owned(),
-            ],
+            arguments: platform::control_arguments(ControlAction::Bootstrap, uid, target),
             bound: deadline::LAUNCHCTL,
         }
     }
 
-    /// A bootout of `agent`, as `launchctl print` read it. The call may wait for the agent's
-    /// process up to its exit timeout, so it is bounded by launchd's own deadline for the bootout
-    /// ([`agent_cycle::bootout_deadline`]), never by a number of its own.
+    /// A bootout of `agent`, as the manager's status read it. The call may wait for the agent's
+    /// process up to its exit timeout, so it is bounded by the manager's own deadline for the
+    /// bootout ([`agent_cycle::bootout_deadline`]), never by a number of its own.
     pub fn bootout(uid: u32, target: &LaunchAgentTarget, agent: LoadedAgent) -> Self {
         Self {
             action: ControlAction::Bootout,
-            arguments: vec![
-                OsString::from("bootout"),
-                OsString::from(service_target(uid, target.label())),
-            ],
+            arguments: platform::control_arguments(ControlAction::Bootout, uid, target),
             bound: Bound::new(LatencyClass::Ffi, agent_cycle::bootout_deadline(agent)),
         }
     }
 
-    /// A `kickstart -k` of `agent`, as `launchctl print` read it. It returns only once the old
-    /// process has gone and the new one has started: 9.03 s at an exit timeout of 2 s (launchd's
-    /// 10 s respawn throttle from the old start) and 12.02 s at one of 12 s. So it is bounded as
-    /// the bootout of the old process and then one launchctl call.
+    /// A restart of `agent`, as the manager's status read it: `kickstart -k`, or `restart`. It
+    /// returns only once the old process has gone and the new one has started: under launchd
+    /// 9.03 s at an exit timeout of 2 s (its 10 s respawn throttle from the old start) and
+    /// 12.02 s at one of 12 s. So it is bounded as the bootout of the old process and then one
+    /// more call.
     pub fn kickstart(uid: u32, target: &LaunchAgentTarget, agent: LoadedAgent) -> Self {
         Self {
             action: ControlAction::Kickstart,
-            arguments: vec![
-                OsString::from("kickstart"),
-                OsString::from("-k"),
-                OsString::from(service_target(uid, target.label())),
-            ],
+            arguments: platform::control_arguments(ControlAction::Kickstart, uid, target),
             bound: Bound::new(
                 LatencyClass::Ffi,
                 agent_cycle::bootout_deadline(agent).saturating_add(deadline::LAUNCHCTL.within),
@@ -1402,14 +1403,11 @@ impl ControlPlan {
         }
     }
 
-    /// launchd answers a print from its own state, within [`deadline::LAUNCHCTL`].
+    /// The manager answers a status read from its own state, within [`deadline::LAUNCHCTL`].
     pub fn print(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Print,
-            arguments: vec![
-                OsString::from("print"),
-                OsString::from(service_target(uid, target.label())),
-            ],
+            arguments: platform::control_arguments(ControlAction::Print, uid, target),
             bound: deadline::LAUNCHCTL,
         }
     }
@@ -1430,30 +1428,6 @@ impl ControlPlan {
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
-}
-
-fn gui_domain(uid: u32) -> String {
-    format!("gui/{uid}")
-}
-
-pub fn service_target(uid: u32, label: &str) -> String {
-    format!("{}/{label}", gui_domain(uid))
-}
-
-/// User-facing `launchctl kickstart -k` guidance for a per-user agent that is loaded.
-pub fn kickstart_hint(uid: u32, label: &str) -> String {
-    format!("launchctl kickstart -k {}", service_target(uid, label))
-}
-
-/// User-facing guidance that loads a per-user agent launchd does not hold: `kickstart` answers
-/// such an agent "Could not find service" (exit 113), so only a bootstrap of its plist brings it
-/// back.
-pub fn bootstrap_hint(uid: u32, target: &LaunchAgentTarget) -> String {
-    format!(
-        "launchctl bootstrap {} '{}'",
-        gui_domain(uid),
-        target.plist_path().display()
-    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1480,8 +1454,9 @@ impl LaunchctlOutput {
     }
 }
 
-/// Runs one system tool (`launchctl`, `codesign`) to its end within `deadline`, its output
-/// collected (05_gateway.md "Deadlines", ffi). The deadline's op names the call: `<tool> <verb>`.
+/// Runs one system tool (`launchctl` or `systemctl`, `codesign`) to its end within `deadline`,
+/// its output collected (05_gateway.md "Deadlines", ffi). The deadline's op names the call:
+/// `<tool> <verb>`.
 pub trait LaunchctlCommand {
     fn run(
         &mut self,
@@ -1531,6 +1506,9 @@ pub struct ControlOutcome {
     pub stderr: Vec<u8>,
 }
 
+/// The manager's word on whether it holds a service: `Loaded` while it runs it or will start it
+/// (launchd: bootstrapped; systemd: active, in transition, or enabled). How its answer says so
+/// is the platform's to read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchdServiceStatus {
     Loaded {
@@ -1538,6 +1516,8 @@ pub enum LaunchdServiceStatus {
         stderr: Vec<u8>,
     },
     NotLoaded {
+        /// What the tool exited with: launchctl's non-zero "no such service", 0 from a tool
+        /// that says it in its output.
         exit_code: i32,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -1546,8 +1526,8 @@ pub enum LaunchdServiceStatus {
 
 #[derive(Debug)]
 pub enum ControlExecutionError {
-    /// launchctl did not run to its end: it could not start, outlived its bound, or its output
-    /// could not be read. Its message names the call.
+    /// The control tool did not run to its end: it could not start, outlived its bound, or its
+    /// output could not be read. Its message names the call.
     Unavailable {
         action: ControlAction,
         source: RunError,
@@ -1561,6 +1541,11 @@ pub enum ControlExecutionError {
     InvalidStatusPlan {
         action: ControlAction,
     },
+    /// The control tool answered a status plan and its answer states no status.
+    UnreadableStatus {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
 }
 
 impl fmt::Display for ControlExecutionError {
@@ -1570,12 +1555,16 @@ impl fmt::Display for ControlExecutionError {
                 write!(formatter, "{source}")
             }
             Self::Rejected { action, status, .. } => {
-                write!(formatter, "launchctl {action:?} failed with {status:?}")
+                write!(formatter, "{TOOL} {action:?} failed with {status:?}")
             }
             Self::InvalidStatusPlan { action } => {
+                write!(formatter, "{TOOL} {action:?} is not a service status plan")
+            }
+            Self::UnreadableStatus { stdout, .. } => {
                 write!(
                     formatter,
-                    "launchctl {action:?} is not a service status plan"
+                    "{TOOL} answered a status read with no state: {}",
+                    String::from_utf8_lossy(stdout).trim()
                 )
             }
         }
@@ -1586,12 +1575,14 @@ impl Error for ControlExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Unavailable { source, .. } => Some(source),
-            Self::Rejected { .. } | Self::InvalidStatusPlan { .. } => None,
+            Self::Rejected { .. }
+            | Self::InvalidStatusPlan { .. }
+            | Self::UnreadableStatus { .. } => None,
         }
     }
 }
 
-/// Single-owner executor for install plans and launchctl control plans.
+/// Single-owner executor for install plans and control plans.
 ///
 /// All methods require `&mut self`; callers should keep this value inside their
 /// coordinator actor rather than sharing it through a lock.
@@ -1872,9 +1863,10 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
         }
     }
 
-    /// Executes a `launchctl print` plan and classifies the idempotent loaded
-    /// state. A normal non-zero exit means the service is absent; failure to
-    /// spawn or signal termination remains an operational error.
+    /// Executes a status plan and classifies the idempotent loaded state, as the platform
+    /// reads the tool's answer (launchctl: a normal non-zero exit means the service is absent;
+    /// systemctl: the properties say). Failure to spawn or signal termination remains an
+    /// operational error.
     pub fn execute_status(
         &mut self,
         plan: &ControlPlan,
@@ -1895,23 +1887,7 @@ impl<F, C: LaunchctlCommand> LaunchdExecutor<F, C> {
                 action: ControlAction::Print,
                 source,
             })?;
-        match output.status {
-            CommandStatus::Success => Ok(LaunchdServiceStatus::Loaded {
-                stdout: output.stdout,
-                stderr: output.stderr,
-            }),
-            CommandStatus::ExitCode(exit_code) => Ok(LaunchdServiceStatus::NotLoaded {
-                exit_code,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            }),
-            CommandStatus::Terminated => Err(ControlExecutionError::Rejected {
-                action: ControlAction::Print,
-                status: CommandStatus::Terminated,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            }),
-        }
+        platform::service_status(output)
     }
 }
 
@@ -1939,15 +1915,17 @@ impl fmt::Display for LaunchdError {
             Self::InvalidPath { field, reason } => {
                 write!(formatter, "invalid {field} path: {reason}")
             }
-            Self::InvalidLabel => formatter.write_str("invalid launchd label"),
+            Self::InvalidLabel => write!(formatter, "invalid {MANAGER} label"),
             Self::InvalidArgument { index, reason } => {
                 write!(formatter, "invalid service argument {index}: {reason}")
             }
             Self::InvalidEnvironmentVariable { name, reason } => {
                 write!(formatter, "invalid environment variable {name:?}: {reason}")
             }
-            Self::PrivilegedProvisioning => formatter
-                .write_str("launchd services may not create host storage in the foreground"),
+            Self::PrivilegedProvisioning => write!(
+                formatter,
+                "{MANAGER} services may not create host storage in the foreground"
+            ),
         }
     }
 }
@@ -1971,7 +1949,7 @@ fn validate_canonical_absolute_path(field: &'static str, path: &Path) -> Result<
             reason: "must not be the filesystem root",
         });
     }
-    if value.chars().any(is_unsafe_xml_control) {
+    if value.chars().any(platform::is_unsafe_in_path) {
         return Err(LaunchdError::InvalidPath {
             field,
             reason: "contains a control character",
@@ -2085,35 +2063,4 @@ fn validate_environment(environment: &[(String, String)]) -> Result<(), LaunchdE
 
 fn is_unsafe_xml_control(character: char) -> bool {
     matches!(character, '\0'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}')
-}
-
-fn write_escaped(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\'' => output.push_str("&apos;"),
-            '"' => output.push_str("&quot;"),
-            _ => output.push(character),
-        }
-    }
-}
-
-fn push_xml_text(output: &mut String, tag: &str, value: &str) {
-    output.push('<');
-    output.push_str(tag);
-    output.push('>');
-    write_escaped(output, value);
-    output.push_str("</");
-    output.push_str(tag);
-    output.push_str(">\n");
-}
-
-fn push_xml_string(output: &mut String, value: &str) {
-    push_xml_text(output, "string", value);
-}
-
-fn push_xml_key(output: &mut String, value: &str) {
-    push_xml_text(output, "key", value);
 }

@@ -15,12 +15,14 @@ fn apfs_evidence() -> StatFsEvidence {
     }
 }
 
-fn explicit_zfs(pool: &str) -> SubstrateConfig {
-    parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n"))
-        .unwrap()
-        .substrate()
-        .unwrap()
-        .clone()
+fn explicit_zfs(parent: &str) -> SubstrateConfig {
+    parse_cowshed_config(&format!(
+        "[substrate]\nkind = \"zfs\"\nparent = \"{parent}\"\n"
+    ))
+    .unwrap()
+    .substrate()
+    .unwrap()
+    .clone()
 }
 
 fn absent_apfs_storage() -> BootstrapEvidence {
@@ -30,9 +32,10 @@ fn absent_apfs_storage() -> BootstrapEvidence {
     }
 }
 
+/// The root `tank/cowshed` as its administrator made it, with nothing of cowshed's below it yet.
 fn absent_zfs_storage() -> BootstrapEvidence {
     BootstrapEvidence::Zfs {
-        root: ExistingStorage::Absent,
+        root: ExistingStorage::mounted_valid("tank/cowshed"),
         store: ExistingStorage::Absent,
         caches: ExistingStorage::Absent,
         projects: Box::new(ExistingStorage::Absent),
@@ -103,10 +106,10 @@ fn command_line(operation: &HostOperation) -> Option<String> {
 #[test]
 fn cowshed_config_parser_accepts_only_complete_known_sections() {
     let config = parse_cowshed_config(
-        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n",
+        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\nparent = \"tank/dev\" # no scan\n",
     )
     .unwrap();
-    assert_eq!(config.substrate().unwrap().pool(), "tank");
+    assert_eq!(config.substrate().unwrap().parent(), "tank/dev");
 
     for section in ["repository", "devenv"] {
         // Cowshed has no devenv backend: a project activates devenv through its own `.envrc`.
@@ -121,30 +124,30 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
         );
     }
     let invalid = [
-        ("[substrate]\npool = \"tank\"\n", "missing field `kind`"),
-        ("[substrate]\nkind = \"zfs\"\n", "missing field `pool`"),
+        ("[substrate]\nparent = \"tank\"\n", "missing field `kind`"),
+        ("[substrate]\nkind = \"zfs\"\n", "missing field `parent`"),
         (
-            "[substrate]\nkind = \"apfs\"\npool = \"tank\"\n",
+            "[substrate]\nkind = \"apfs\"\nparent = \"tank\"\n",
             "at line 2: unknown variant `apfs`, expected `zfs`",
         ),
         (
-            "[substrate]\nkind = \"zfs\"\npool = \"tank/child\"\n",
-            "invalid ZFS pool",
+            "[substrate]\nkind = \"zfs\"\nparent = \"tank/child dataset\"\n",
+            "invalid ZFS parent dataset",
         ),
         (
-            "[substrate]\nkind = \"zfs\"\npool = \"tank\"\nextra = \"x\"\n",
-            "at line 4: unknown field `extra`",
+            "[substrate]\nkind = \"zfs\"\nparent = \"tank\"\npool = \"tank\"\n",
+            "at line 4: unknown field `pool`",
         ),
         (
-            "[substrate]\nkind = \"zfs\"\nkind = \"zfs\"\npool = \"tank\"\n",
+            "[substrate]\nkind = \"zfs\"\nkind = \"zfs\"\nparent = \"tank\"\n",
             "at line 3: duplicate key",
         ),
         (
-            "[substrate]\nkind = \"zfs\"\npool = tank\n",
+            "[substrate]\nkind = \"zfs\"\nparent = tank\n",
             "malformed configuration at line 3",
         ),
         (
-            "[substrate]\nkind = \"zfs\"\npool = \"tank\"\n[substrate]\nkind = \"zfs\"\npool = \"tank\"\n",
+            "[substrate]\nkind = \"zfs\"\nparent = \"tank\"\n[substrate]\nkind = \"zfs\"\nparent = \"tank\"\n",
             "at line 4: duplicate key",
         ),
         ("top = \"level\"\n", "at line 1: unknown field `top`"),
@@ -155,8 +158,8 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
     }
     for source in [
         "[substrate]\nmalformed\n",
-        "[substrate]\nkind = \"zfs\npool = \"tank\"\n",
-        "[substrate]\nkind = zfs\"\npool = \"tank\"\n",
+        "[substrate]\nkind = \"zfs\nparent = \"tank\"\n",
+        "[substrate]\nkind = zfs\"\nparent = \"tank\"\n",
     ] {
         assert!(
             matches!(
@@ -169,13 +172,13 @@ fn cowshed_config_parser_accepts_only_complete_known_sections() {
     // A `#` inside a string is part of it, not a comment.
     for (source, kind) in [
         (
-            "[substrate]\nkind = \"z#fs\" # outside comment\npool = \"tank\"\n",
+            "[substrate]\nkind = \"z#fs\" # outside comment\nparent = \"tank\"\n",
             "z#fs",
         ),
         (
             r##"[substrate]
 kind = "z\"#fs" # outside comment
-pool = "tank"
+parent = "tank"
 "##,
             "z\"#fs",
         ),
@@ -188,10 +191,19 @@ pool = "tank"
             "{error}"
         );
     }
-    for pool in ["1tank", "-tank"] {
+    for pool in ["1tank", "-tank", "1tank/dev"] {
         assert!(matches!(
-            parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n")),
-            Err(ConfigError::InvalidPool(PoolNameError::InvalidPool))
+            parse_cowshed_config(&format!(
+                "[substrate]\nkind = \"zfs\"\nparent = \"{pool}\"\n"
+            )),
+            Err(ConfigError::InvalidParent(DatasetNameError::InvalidPool))
+        ));
+    }
+    // The parent is the pool or any dataset in it, in the helper's own grammar.
+    for dataset in ["tank//dev", "tank/..", "tank/dev@snap", "tank/-r", "tank/"] {
+        assert!(matches!(
+            parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\nparent = \"{dataset}\"\n")),
+            Err(ConfigError::InvalidParent(DatasetNameError::InvalidDataset(name))) if name == dataset
         ));
     }
 }
@@ -297,7 +309,7 @@ fn sandbox_deny_is_an_array_of_workspace_relative_paths() {
         [PathBuf::from(".runtime"), PathBuf::from("a/b")]
     );
     assert!(
-        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n")
+        parse_cowshed_config("[substrate]\nkind = \"zfs\"\nparent = \"tank\"\n")
             .unwrap()
             .sandbox_deny()
             .is_empty()
@@ -712,45 +724,69 @@ fn selection_matrix_uses_evidence_without_guessing() {
         );
     }
 
-    let delegated = DelegatedZfsDataset::new("tank/home", true).unwrap();
-    let zfs = select_substrate(
-        StatFsEvidence::Zfs {
-            containing_dataset: Some(delegated),
-        },
-        None,
-    )
-    .unwrap();
-    assert!(matches!(
-        zfs,
-        SelectedSubstrate::Zfs { ref pool, .. } if pool == "tank"
-    ));
-    assert!(matches!(
-        zfs.evidence(),
-        [SelectionEvidence::DelegatedContainingDataset { dataset, pool }]
-            if dataset == "tank/home" && pool == "tank"
-    ));
+    // A root that serves the caller from the dataset chain is selected by its parent, which need
+    // not be the pool.
+    for (parent, containing) in [("tank", "tank/home"), ("tank/home", "tank/home")] {
+        let delegated = DelegatedZfsDataset::new(containing, Some(parent.to_owned())).unwrap();
+        let zfs = select_substrate(
+            StatFsEvidence::Zfs {
+                containing_dataset: Some(delegated),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            zfs,
+            SelectedSubstrate::Zfs { parent: ref selected, .. } if selected == parent
+        ));
+        assert!(matches!(
+            zfs.evidence(),
+            [SelectionEvidence::DelegatedContainingDataset { dataset, parent: selected }]
+                if dataset == containing && selected == parent
+        ));
+    }
+    for outside in ["other", "tank/homestead", "tank/home/deeper"] {
+        assert!(
+            DelegatedZfsDataset::new("tank/home", Some(outside.to_owned())).is_err(),
+            "{outside} is neither tank/home nor above it"
+        );
+    }
 
-    for insufficient in [
-        StatFsEvidence::Zfs {
-            containing_dataset: None,
-        },
-        StatFsEvidence::Zfs {
-            containing_dataset: Some(DelegatedZfsDataset::new("tank/home", false).unwrap()),
-        },
-        StatFsEvidence::Other {
-            fs_type: "ext4".to_owned(),
-        },
+    // Anything else holds a directory store, whatever its filesystem.
+    for (plain, fs_type) in [
+        (
+            StatFsEvidence::Zfs {
+                containing_dataset: None,
+            },
+            "zfs",
+        ),
+        (
+            StatFsEvidence::Zfs {
+                containing_dataset: Some(DelegatedZfsDataset::new("tank/home", None).unwrap()),
+            },
+            "zfs",
+        ),
+        (
+            StatFsEvidence::Other {
+                fs_type: "ext4".to_owned(),
+            },
+            "ext4",
+        ),
     ] {
+        let selected = select_substrate(plain, None).unwrap();
+        assert_eq!(selected.kind(), SubstrateKind::Directory);
         assert_eq!(
-            select_substrate(insufficient, None).unwrap_err(),
-            SelectionError::ExplicitZfsRequired
+            selected.evidence(),
+            [SelectionEvidence::DirectoryStatFs {
+                fs_type: fs_type.to_owned()
+            }]
         );
     }
 }
 
 #[test]
 fn explicit_zfs_is_exact_and_conflicting_evidence_is_ambiguous() {
-    let configured = explicit_zfs("work");
+    let configured = explicit_zfs("work/dev");
     let selected = select_substrate(
         StatFsEvidence::Other {
             fs_type: "ext4".to_owned(),
@@ -760,35 +796,49 @@ fn explicit_zfs_is_exact_and_conflicting_evidence_is_ambiguous() {
     .unwrap();
     assert!(matches!(
         selected,
-        SelectedSubstrate::Zfs { ref pool, .. } if pool == "work"
+        SelectedSubstrate::Zfs { ref parent, .. } if parent == "work/dev"
     ));
     assert_eq!(
         selected.evidence(),
         [SelectionEvidence::ExplicitConfig {
-            pool: "work".to_owned()
+            parent: "work/dev".to_owned()
         }]
     );
 
-    let same_pool = select_substrate(
+    let same_parent = select_substrate(
         StatFsEvidence::Zfs {
-            containing_dataset: Some(DelegatedZfsDataset::new("work/home", true).unwrap()),
+            containing_dataset: Some(
+                DelegatedZfsDataset::new("work/dev/home", Some("work/dev".to_owned())).unwrap(),
+            ),
         },
         Some(&configured),
     )
     .unwrap();
-    assert_eq!(same_pool.evidence().len(), 2);
+    assert_eq!(same_parent.evidence().len(), 2);
+
+    // A containing dataset no root serves from adds no evidence and no conflict.
+    let unserved = select_substrate(
+        StatFsEvidence::Zfs {
+            containing_dataset: Some(DelegatedZfsDataset::new("other/home", None).unwrap()),
+        },
+        Some(&configured),
+    )
+    .unwrap();
+    assert_eq!(unserved.evidence().len(), 1);
 
     assert_eq!(
         select_substrate(
             StatFsEvidence::Zfs {
-                containing_dataset: Some(DelegatedZfsDataset::new("other/home", true).unwrap()),
+                containing_dataset: Some(
+                    DelegatedZfsDataset::new("work/home", Some("work".to_owned())).unwrap()
+                ),
             },
             Some(&configured),
         )
         .unwrap_err(),
-        SelectionError::AmbiguousPools {
-            configured: "work".to_owned(),
-            containing: "other".to_owned(),
+        SelectionError::AmbiguousParents {
+            configured: "work/dev".to_owned(),
+            containing: "work".to_owned(),
         }
     );
 }
@@ -832,22 +882,21 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
 
     assert!(matches!(
         &plan.operations()[0],
-        HostOperation::VerifyZfsDelegation { pool, required_root }
-            if pool == "tank" && required_root == "tank/cowshed"
+        HostOperation::VerifyZfsDelegation { parent, required_root }
+            if parent == "tank" && required_root == "tank/cowshed"
     ));
     let commands: Vec<_> = plan.operations().iter().filter_map(command_line).collect();
+    // Every mutation is one helper run on a dataset below the root; the root itself is never an
+    // argument, and nothing runs `zfs` or names a pool tool.
     assert_eq!(
         commands,
         [
-            "/usr/sbin/zfs create -o mountpoint=none tank/cowshed",
-            "/usr/sbin/zfs create -o mountpoint=/private/cowshed/store tank/cowshed/store",
-            "/usr/sbin/zfs set org.cowshed:version=2 org.cowshed:role=store tank/cowshed/store",
-            "/usr/sbin/zfs create -o mountpoint=none tank/cowshed/projects",
-            "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=projects tank/cowshed/projects",
+            "cowshed-helper tank/cowshed create tank/cowshed/store mountpoint=/private/cowshed/store cowshed:version=2 cowshed:role=store",
+            "cowshed-helper tank/cowshed create tank/cowshed/projects mountpoint=none cowshed:version=1 cowshed:role=projects",
         ]
     );
     assert!(commands.iter().all(|command| !command.contains("zpool")));
-    // The caches dataset is retired: a fresh pool never gets one.
+    // The caches dataset is retired: a fresh root never gets one.
     assert!(commands.iter().all(|command| !command.contains("caches")));
 
     let store_marker = plan
@@ -859,12 +908,49 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
         .operations()
         .iter()
         .position(|operation| {
-            command_line(operation).is_some_and(|command| {
-                command == "/usr/sbin/zfs create -o mountpoint=none tank/cowshed/projects"
-            })
+            command_line(operation)
+                .is_some_and(|command| command.contains(" create tank/cowshed/projects "))
         })
         .unwrap();
     assert!(store_marker < projects_create);
+
+    // The root is `<parent>/cowshed` for any parent dataset, and the administrator's to create.
+    let nested = plan_bootstrap(
+        selected_zfs("tank/dev/zoned"),
+        Path::new("/home/alice"),
+        BootstrapEvidence::Zfs {
+            root: ExistingStorage::mounted_valid("tank/dev/zoned/cowshed"),
+            store: ExistingStorage::Absent,
+            caches: ExistingStorage::Absent,
+            projects: Box::new(ExistingStorage::Absent),
+        },
+    )
+    .unwrap();
+    assert!(
+        nested
+            .operations()
+            .iter()
+            .filter_map(command_line)
+            .all(|command| command.starts_with(
+                "cowshed-helper tank/dev/zoned/cowshed create tank/dev/zoned/cowshed/"
+            ))
+    );
+    assert_eq!(
+        plan_bootstrap(
+            selected_zfs("tank"),
+            Path::new("/home/alice"),
+            BootstrapEvidence::Zfs {
+                root: ExistingStorage::Absent,
+                store: ExistingStorage::Absent,
+                caches: ExistingStorage::Absent,
+                projects: Box::new(ExistingStorage::Absent),
+            },
+        )
+        .unwrap_err(),
+        PlanError::MissingZfsRoot {
+            root: "tank/cowshed".to_owned()
+        }
+    );
 }
 #[test]
 fn create_or_heal_uses_only_exact_existing_storage_evidence() {
@@ -989,10 +1075,9 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
     assert_eq!(
         healed_commands,
         [
-            "/usr/sbin/zfs set mountpoint=/private/cowshed/store tank/cowshed/store",
-            "/usr/sbin/zfs mount tank/cowshed/store",
-            "/usr/sbin/zfs set mountpoint=/private/cowshed/caches tank/cowshed/caches",
-            "/usr/sbin/zfs mount tank/cowshed/caches",
+            "cowshed-helper tank/cowshed set tank/cowshed/store mountpoint=/private/cowshed/store",
+            "cowshed-helper tank/cowshed mount tank/cowshed/store",
+            "cowshed-helper tank/cowshed mount tank/cowshed/caches",
         ]
     );
     assert!(
@@ -1149,7 +1234,7 @@ fn sibling_volume_roots_plan_independently_but_zfs_children_still_require_their_
                 projects: Box::new(ExistingStorage::Absent),
             },
         ),
-        Err(PlanError::ImpossibleStorageTopology(_))
+        Err(PlanError::MissingZfsRoot { root }) if root == "tank/cowshed"
     ));
 }
 
@@ -1163,7 +1248,11 @@ fn role_strategy() -> impl Strategy<Value = VolumeRole> {
 }
 
 fn substrate_strategy() -> impl Strategy<Value = SubstrateKind> {
-    prop_oneof![Just(SubstrateKind::Apfs), Just(SubstrateKind::Zfs)]
+    prop_oneof![
+        Just(SubstrateKind::Apfs),
+        Just(SubstrateKind::Zfs),
+        Just(SubstrateKind::Directory)
+    ]
 }
 
 proptest! {
@@ -1193,6 +1282,7 @@ proptest! {
         let substrate = match substrate {
             SubstrateKind::Apfs => "apfs",
             SubstrateKind::Zfs => "zfs",
+            SubstrateKind::Directory => "directory",
         };
         let bytes = format!(
             r#"{{"version":{version},"role":"{role}","substrate":"{substrate}"}}"#
@@ -1496,7 +1586,7 @@ impl BootstrapHost for TransitionHost {
         } else if line.contains("disk9s11") || line.contains("cowshed/store") {
             self.store_publication.store(sequence, Ordering::SeqCst);
         }
-        if line.contains("org.cowshed:") {
+        if line.contains("cowshed:version") {
             self.relabels.fetch_add(1, Ordering::SeqCst);
         }
         Ok(HostCommandOutput::default())

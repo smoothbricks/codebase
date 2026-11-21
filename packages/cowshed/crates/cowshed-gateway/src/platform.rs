@@ -1,5 +1,11 @@
-#[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
+//! Scoped gateway credentials: what a record is, and the platform store that holds it.
+//!
+//! The record is stated here once for every platform: its binding, its JSON form, the rules a
+//! usable one meets and the account key that names it. Where records are kept differs by
+//! platform and lives in that platform's file: `macos.rs` keeps them as Keychain generic
+//! passwords, `linux.rs` as files in the user's credential directory. Each file defines the
+//! provider the gateway reads through and the three enrolment functions, behind the same
+//! signatures, so nothing here or above this module branches on the platform.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -7,33 +13,22 @@ use zeroize::Zeroizing;
 
 use cowshed_gateway_types::{CanonicalTarget, normalize_path};
 
-use crate::interfaces::{
-    CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
-};
+use crate::interfaces::{CredentialError, CredentialProtocol, CredentialQuery, CredentialRecord};
 
-/// Reads scoped gateway credentials from macOS generic-password items.
-///
-/// Items use service `dev.cowshed.gateway` and account
-/// `v1|<repo_id>|<protocol>|<base64url-exact-origin>`. The password is a
-/// versioned JSON record containing the same binding, methods, normalized path
-/// prefixes, header name, and secret header value. Lookup occurs only after the
-/// gateway actor has admitted the exact request.
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
-#[derive(Clone, Debug, Default)]
-pub struct KeychainCredentialProvider;
-
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
 #[cfg(target_os = "macos")]
-impl KeychainCredentialProvider {
-    pub const SERVICE: &'static str = "dev.cowshed.gateway";
+use macos as platform;
 
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn account_for(query: &CredentialQuery) -> String {
-        account_for(query)
-    }
-}
+pub use platform::{remove_scoped_credential, scoped_credential_scope, store_scoped_credential};
+// The provider each platform alone has, which only that platform's own callers name
+// (`macos.rs`: `KeychainCredentialProvider`; `linux.rs`: `SystemdCredentialProvider`). A
+// platform file's public surface is its provider and the three functions above, nothing else.
+pub use platform::*;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -71,13 +66,8 @@ impl ScopedCredential {
         account_key(&self.repo_id, self.protocol, &self.origin)
     }
 
-    /// The stored record as the platform store holds it.
-    ///
-    /// Encoding exists only where a record is written, which is macOS: the Linux provider reads
-    /// what the service manager placed in `$CREDENTIALS_DIRECTORY` and has no writable side, so
-    /// this is gated exactly like the enrolment that calls it. Decoding stays shared — both
-    /// platforms read the same format.
-    #[cfg(target_os = "macos")]
+    /// The stored record as the platform store holds it: the bytes enrolment writes and
+    /// [`decode_record`] reads back, the same on every platform.
     fn to_json(&self) -> Result<Zeroizing<String>, CredentialError> {
         let stored = StoredCredential {
             version: STORED_CREDENTIAL_VERSION,
@@ -230,39 +220,6 @@ fn validate_origin(origin: &str) -> Result<(), CredentialError> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-#[async_trait::async_trait]
-impl CredentialProvider for KeychainCredentialProvider {
-    async fn lookup(
-        &self,
-        query: &CredentialQuery,
-    ) -> Result<Option<CredentialRecord>, CredentialError> {
-        validate_query(query)?;
-        lookup_keychain(Self::account_for(query)).await
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn lookup_keychain(account: String) -> Result<Option<CredentialRecord>, CredentialError> {
-    tokio::task::spawn_blocking(move || {
-        match security_framework::passwords::get_generic_password(
-            KeychainCredentialProvider::SERVICE,
-            &account,
-        ) {
-            Ok(bytes) => decode_record(bytes).map(Some),
-            Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
-                Ok(None)
-            }
-            Err(error) => Err(CredentialError::Unavailable(format!(
-                "macOS Keychain lookup failed with OSStatus {}",
-                error.code()
-            ))),
-        }
-    })
-    .await
-    .map_err(|error| CredentialError::Unavailable(format!("Keychain task failed: {error}")))?
-}
-
 /// Whether a binding was there, without reading the secret back out.
 ///
 /// What `rm` answers: an absent binding is already the requested state, and saying which of the
@@ -271,254 +228,6 @@ async fn lookup_keychain(account: String) -> Result<Option<CredentialRecord>, Cr
 pub enum CredentialPresence {
     Installed,
     Absent,
-}
-
-/// Install or replace one scoped credential in the host's platform store.
-///
-/// Enrolment is a trusted-host operation: the secret arrives from the operator's environment,
-/// travels in a `Zeroizing` buffer, and is handed to the platform store without passing through
-/// argv, a temporary file, or any workspace-reachable path. Replacing an existing binding is
-/// deliberate — rotation is the common case and a second command to delete first would only
-/// create a window with no credential at all.
-#[cfg(target_os = "macos")]
-pub async fn store_scoped_credential(credential: ScopedCredential) -> Result<(), CredentialError> {
-    validate_scope(&credential)?;
-    let account = credential.account();
-    let payload = credential.to_json()?;
-    tokio::task::spawn_blocking(move || {
-        security_framework::passwords::set_generic_password(
-            KeychainCredentialProvider::SERVICE,
-            &account,
-            payload.as_bytes(),
-        )
-        .map_err(|error| {
-            CredentialError::Unavailable(format!(
-                "macOS Keychain write failed with OSStatus {}",
-                error.code()
-            ))
-        })
-    })
-    .await
-    .map_err(|error| CredentialError::Unavailable(format!("Keychain task failed: {error}")))?
-}
-
-/// Remove one scoped credential. An absent binding is already the requested state.
-#[cfg(target_os = "macos")]
-pub async fn remove_scoped_credential(
-    repo_id: &str,
-    protocol: CredentialProtocol,
-    origin: &str,
-) -> Result<CredentialPresence, CredentialError> {
-    validate_origin(origin)?;
-    let account = account_key(repo_id, protocol, origin);
-    tokio::task::spawn_blocking(
-        move || match security_framework::passwords::delete_generic_password(
-            KeychainCredentialProvider::SERVICE,
-            &account,
-        ) {
-            Ok(()) => Ok(CredentialPresence::Installed),
-            Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
-                Ok(CredentialPresence::Absent)
-            }
-            Err(error) => Err(CredentialError::Unavailable(format!(
-                "macOS Keychain delete failed with OSStatus {}",
-                error.code()
-            ))),
-        },
-    )
-    .await
-    .map_err(|error| CredentialError::Unavailable(format!("Keychain task failed: {error}")))?
-}
-
-/// The scope of the installed binding for this origin, or `None` when nothing is enrolled.
-///
-/// `status` reports what an operator enrolled, and the path prefixes are that answer: they are
-/// the non-secret half of the record, and the half that decides which requests the credential
-/// can ever ride. The decoded record's secret is dropped — and zeroed — right here rather than
-/// travelling into a reporting path.
-#[cfg(target_os = "macos")]
-pub async fn scoped_credential_scope(
-    repo_id: &str,
-    protocol: CredentialProtocol,
-    origin: &str,
-) -> Result<Option<Vec<String>>, CredentialError> {
-    validate_origin(origin)?;
-    let account = account_key(repo_id, protocol, origin);
-    Ok(lookup_keychain(account)
-        .await?
-        .map(|record| record.path_prefixes))
-}
-
-/// Enrolment is not available where the store is read-only by construction.
-///
-/// The Linux provider reads what the service manager placed in `$CREDENTIALS_DIRECTORY`; there
-/// is no writable side to it. Saying so, with the mechanism named, is the honest answer — a
-/// pretend success would leave an operator believing a credential exists.
-#[cfg(not(target_os = "macos"))]
-pub async fn store_scoped_credential(credential: ScopedCredential) -> Result<(), CredentialError> {
-    validate_scope(&credential)?;
-    Err(CredentialError::Unavailable(READ_ONLY_STORE.to_owned()))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub async fn remove_scoped_credential(
-    _repo_id: &str,
-    _protocol: CredentialProtocol,
-    origin: &str,
-) -> Result<CredentialPresence, CredentialError> {
-    validate_origin(origin)?;
-    Err(CredentialError::Unavailable(READ_ONLY_STORE.to_owned()))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub async fn scoped_credential_scope(
-    _repo_id: &str,
-    _protocol: CredentialProtocol,
-    origin: &str,
-) -> Result<Option<Vec<String>>, CredentialError> {
-    validate_origin(origin)?;
-    Err(CredentialError::Unavailable(READ_ONLY_STORE.to_owned()))
-}
-
-#[cfg(not(target_os = "macos"))]
-const READ_ONLY_STORE: &str = "this platform's gateway credential store is read-only: the service manager supplies records \
-     through $CREDENTIALS_DIRECTORY, so enrol the credential in that unit's configuration";
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug)]
-pub struct SystemdCredentialProvider {
-    directory: PathBuf,
-    authorized_uid: u32,
-}
-
-#[cfg(target_os = "linux")]
-impl SystemdCredentialProvider {
-    pub fn from_environment() -> Result<Self, CredentialError> {
-        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                CredentialError::Unavailable(
-                    "CREDENTIALS_DIRECTORY is required for Linux production credentials".to_owned(),
-                )
-            })?;
-        Self::new(directory, unsafe { libc::geteuid() })
-    }
-
-    pub fn new(directory: PathBuf, authorized_uid: u32) -> Result<Self, CredentialError> {
-        validate_directory(&directory, authorized_uid)?;
-        Ok(Self {
-            directory,
-            authorized_uid,
-        })
-    }
-
-    pub fn account_for(query: &CredentialQuery) -> String {
-        account_for(query)
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[async_trait::async_trait]
-impl CredentialProvider for SystemdCredentialProvider {
-    async fn lookup(
-        &self,
-        query: &CredentialQuery,
-    ) -> Result<Option<CredentialRecord>, CredentialError> {
-        validate_query(query)?;
-        let path = self.directory.join(Self::account_for(query));
-        let directory = self.directory.clone();
-        let authorized_uid = self.authorized_uid;
-        tokio::task::spawn_blocking(move || {
-            validate_directory(&directory, authorized_uid)?;
-            read_systemd_credential(&path, authorized_uid)
-        })
-        .await
-        .map_err(|error| {
-            CredentialError::Unavailable(format!("systemd credential task failed: {error}"))
-        })?
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn validate_directory(path: &Path, authorized_uid: u32) -> Result<(), CredentialError> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-    if !path.is_absolute() {
-        return Err(CredentialError::Unavailable(
-            "systemd credential directory must be absolute".to_owned(),
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| {
-        CredentialError::Unavailable("systemd credential directory is unavailable".to_owned())
-    })?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != authorized_uid
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(CredentialError::Unavailable(
-            "systemd credential directory has insecure ownership or mode".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn read_systemd_credential(
-    path: &Path,
-    authorized_uid: u32,
-) -> Result<Option<CredentialRecord>, CredentialError> {
-    use std::{
-        io::Read as _,
-        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
-    };
-
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(CredentialError::Unavailable(
-                "systemd credential file is unavailable".to_owned(),
-            ));
-        }
-    };
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != authorized_uid
-        || !matches!(metadata.permissions().mode() & 0o777, 0o400 | 0o600)
-        || metadata.len() > 1024 * 1024
-    {
-        return Err(CredentialError::Unavailable(
-            "systemd credential file has invalid type, ownership, mode, or size".to_owned(),
-        ));
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| {
-            CredentialError::Unavailable("systemd credential file could not be opened".to_owned())
-        })?;
-    let opened = file.metadata().map_err(|_| {
-        CredentialError::Unavailable("systemd credential file metadata failed".to_owned())
-    })?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        return Err(CredentialError::Unavailable(
-            "systemd credential file changed during lookup".to_owned(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            CredentialError::Unavailable("systemd credential file read failed".to_owned())
-        })?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(CredentialError::Unavailable(
-            "systemd credential file exceeds 1 MiB".to_owned(),
-        ));
-    }
-    decode_record(bytes).map(Some)
 }
 
 const fn protocol_tag(protocol: CredentialProtocol) -> &'static str {
@@ -562,7 +271,8 @@ mod tests {
         assert!(!format!("{record:?}").contains("Bearer secret"));
     }
 
-    fn enrollable() -> ScopedCredential {
+    /// One usable binding, shared with the platform files' own tests.
+    pub(super) fn enrollable() -> ScopedCredential {
         ScopedCredential {
             repo_id: "owner/repo".to_owned(),
             protocol: CredentialProtocol::Generic,
@@ -586,17 +296,13 @@ mod tests {
             )
         );
         // What enrolment writes is what a lookup decodes. The two halves of the record format
-        // have one owner, and this is what holds them to being one. Encoding only exists where
-        // a record can be written, so the round trip is asserted there.
-        #[cfg(target_os = "macos")]
-        {
-            let encoded = credential.to_json().expect("encodable");
-            let decoded =
-                decode_record(encoded.as_bytes().to_vec()).expect("the writer's own bytes decode");
-            assert_eq!(decoded.origin, credential.origin);
-            assert_eq!(decoded.path_prefixes, credential.path_prefixes);
-            assert_eq!(decoded.header_name.as_str(), credential.header_name);
-        }
+        // have one owner, and this is what holds them to being one.
+        let encoded = credential.to_json().expect("encodable");
+        let decoded =
+            decode_record(encoded.as_bytes().to_vec()).expect("the writer's own bytes decode");
+        assert_eq!(decoded.origin, credential.origin);
+        assert_eq!(decoded.path_prefixes, credential.path_prefixes);
+        assert_eq!(decoded.header_name.as_str(), credential.header_name);
     }
 
     #[test]
@@ -697,49 +403,5 @@ mod tests {
         }"#
         .to_vec();
         assert!(decode_record(host_wide).is_err());
-    }
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn systemd_credentials_require_scoped_owned_strict_files() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let directory =
-            std::env::temp_dir().join(format!("cowshed-systemd-creds-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).expect("directory");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("directory mode");
-        let provider =
-            SystemdCredentialProvider::new(directory.clone(), unsafe { libc::geteuid() })
-                .expect("provider");
-        let query = CredentialQuery {
-            workspace_id: "ws".to_owned(),
-            repo_id: "repo".to_owned(),
-            protocol: CredentialProtocol::Generic,
-            origin: "https://example.test:443".to_owned(),
-            method: http::Method::GET,
-            path: "/v1/resource".to_owned(),
-        };
-        let path = directory.join(SystemdCredentialProvider::account_for(&query));
-        std::fs::write(
-            &path,
-            br#"{"version":1,"repoId":"repo","protocol":"generic","origin":"https://example.test:443","methods":["GET"],"pathPrefixes":["/v1"],"headerName":"authorization","headerValue":"Bearer secret"}"#,
-        )
-        .expect("credential");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
-            .expect("credential mode");
-        let record = provider
-            .lookup(&query)
-            .await
-            .expect("lookup")
-            .expect("record");
-        assert!(record.validate_for(&query));
-        assert!(!format!("{record:?}").contains("Bearer secret"));
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("bad mode");
-        assert!(matches!(
-            provider.lookup(&query).await,
-            Err(CredentialError::Unavailable(_))
-        ));
-        let _ = std::fs::remove_dir_all(directory);
     }
 }

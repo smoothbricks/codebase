@@ -8,8 +8,8 @@ use std::{path::PathBuf, sync::LazyLock};
 /// assert against an error they never reached — green on macOS, red on Linux.
 ///
 /// It is a precondition of the probe, never its subject, so one owned 0o700
-/// directory per process is enough: `validate_data_socket_root` requires an
-/// absolute, non-symlink, caller-owned directory with no group or other bits.
+/// directory per process is enough: the gateway requires an absolute,
+/// non-symlink, caller-owned directory with no group or other bits.
 /// A static is never dropped, so the directory outlives the process.
 static DATA_SOCKET_ROOT: LazyLock<FixtureDir> = LazyLock::new(|| secure_root("data"));
 

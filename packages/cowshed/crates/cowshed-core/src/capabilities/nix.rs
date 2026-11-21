@@ -380,6 +380,7 @@ mod tests {
     /// A sandbox for the fixture workspace, carrying a Nix project's contribution as a supervisor
     /// detects it. The mount root is a sibling directory, so its deny never covers the fixture's
     /// host home.
+    #[cfg(target_os = "macos")]
     fn nix_sandbox(fixture: &Fixture) -> crate::sandbox::SandboxConfig {
         fixture.files(&["flake.nix"]);
         let contribution = DETECTOR
@@ -393,7 +394,7 @@ mod tests {
             shed_links: Vec::new(),
             exec_temp_dir: fixture.root.join(".cowshed-tmp"),
             store_root: fixture.root.join("store"),
-            port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            port_block: Some(crate::metadata::PortBlock::new(40_960, 16).unwrap()),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
@@ -414,7 +415,9 @@ mod tests {
 
     /// Nix stats its configuration files before reading them, optional ones included, so a Nix
     /// project reads `/etc/nix` (both spellings: Seatbelt matches the resolved `/private/etc`)
-    /// and traverses `/etc` without reading the rest of it or writing anything there.
+    /// and traverses `/etc` without reading the rest of it or writing anything there. Read off
+    /// the Seatbelt program's own text, which only macOS renders.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_nix_project_reads_its_config_tree_and_nothing_else_in_etc() {
         let fixture = Fixture::new();

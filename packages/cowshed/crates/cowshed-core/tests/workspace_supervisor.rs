@@ -165,7 +165,6 @@ impl RunningProcess for FakeProcess {
         None
     }
 
-    #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
         None
     }
@@ -529,7 +528,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
             store_root: root.join("store"),
-            port_block: PortBlock::new(49_136, 16).unwrap(),
+            port_block: Some(PortBlock::new(49_136, 16).unwrap()),
             retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
@@ -1479,7 +1478,7 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         assert_eq!(granted(&first_spawn, mode), Some(before.clone()));
         assert_eq!(granted(&second_spawn, mode), Some(adopted.clone()));
     }
-    let binding = |volume: &Path| OsString::from(format!("BUILD_VOLUME={}", volume.display()));
+    // What a launch binds as its build volume, beside its file: its identity names both.
     let (_, first_profile) = first_spawn.request.policy.child(RunSandboxMode::ReadWrite);
     let (_, second_profile) = second_spawn.request.policy.child(RunSandboxMode::ReadWrite);
     assert_eq!(
@@ -1487,12 +1486,13 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
         second_profile.text(),
         "a pivot binds the new volume to the same profile"
     );
-    let first_args = first_profile.launch().unwrap().args();
-    let second_args = second_profile.launch().unwrap().args();
-    assert!(first_args.contains(&binding(&before)));
-    assert!(!first_args.contains(&binding(&adopted)));
-    assert!(second_args.contains(&binding(&adopted)));
-    assert!(!second_args.contains(&binding(&before)));
+    let first_launch = first_profile.launch().unwrap();
+    let second_launch = second_profile.launch().unwrap();
+    assert_eq!(first_launch.file(), second_launch.file());
+    assert!(first_launch.identity().contains(&before.as_os_str()));
+    assert!(!first_launch.identity().contains(&adopted.as_os_str()));
+    assert!(second_launch.identity().contains(&adopted.as_os_str()));
+    assert!(!second_launch.identity().contains(&before.as_os_str()));
     // A checkout that links no volume grants none.
     let third = h
         .handle
@@ -6954,7 +6954,6 @@ impl RunningProcess for WarmProcess {
         None
     }
 
-    #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
         None
     }
@@ -9131,7 +9130,6 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
             None
         }
 
-        #[cfg(target_os = "macos")]
         fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
             None
         }
@@ -9752,20 +9750,19 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
         assert_eq!(first_config.build_volume_mount.as_ref(), Some(&before));
         assert_eq!(second_config.build_volume_mount.as_ref(), Some(&adopted));
         assert_eq!(first_profile.text(), second_profile.text());
-        let binding = |volume: &Path| OsString::from(format!("BUILD_VOLUME={}", volume.display()));
         assert!(
             first_profile
                 .launch()
                 .unwrap()
-                .args()
-                .contains(&binding(&before))
+                .identity()
+                .contains(&before.as_os_str())
         );
         assert!(
             second_profile
                 .launch()
                 .unwrap()
-                .args()
-                .contains(&binding(&adopted))
+                .identity()
+                .contains(&adopted.as_os_str())
         );
     }
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
