@@ -60,6 +60,9 @@ function openNxCache(root) {
     cache,
     cacheDir: native.cacheDirectory,
     getLocal: (hash) => native.get(hash),
+    // Nx's own batch lookup (both qualified versions declare `getBatch`): one query, index-aligned with `hashes`,
+    // where `get` commits each key's access time in a transaction of its own.
+    getLocalBatch: (hashes) => native.getBatch(hashes),
     archive: (hash, terminalOutput, code) => nxArchive(path.join(native.cacheDirectory, hash), terminalOutput, code),
   };
 }

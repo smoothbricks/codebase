@@ -116,6 +116,18 @@ local.cache.cache.put("accepted-fixture", "passed", ["result.txt"], 0);
       expect(again.stdout).toBe('{"published":0,"existing":1,"skipped":0}\n');
       expect(puts).toHaveLength(1);
 
+      // Keys are looked up in chunks; a list past the first chunk keeps every key's own result: the one key the
+      // checkout holds, at index 120, is found stored, and the 149 it does not hold are skipped.
+      const spread = Array.from({ length: 150 }, (_, index) =>
+        index === 120 ? 'accepted-fixture' : `absent-${index}`,
+      );
+      const spreadList = join(root, 'spread.json');
+      await writeFile(spreadList, JSON.stringify(spread));
+      const chunked = await run([executable, 'publish', root, spreadList]);
+      expect(chunked.status, chunked.stderr).toBe(0);
+      expect(chunked.stdout).toBe('{"published":0,"existing":1,"skipped":149}\n');
+      expect(puts).toHaveLength(1);
+
       // A key stored between the GET and the PUT answers 409: counted as existing, the store's archive kept.
       answer = 'race';
       const raced = await run([executable, 'publish', root, hashes]);
