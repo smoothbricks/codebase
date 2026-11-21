@@ -16,6 +16,9 @@ mod reclaim;
 mod cleanup;
 use cleanup::reclaim;
 
+#[path = "../../../cowshed-core/tests/support/progress.rs"]
+mod progress;
+
 /// Reclaim dead predecessors once before the lane starts fixtures. The setup process owns the
 /// whole pass synchronously; a killed setup records nothing and starts no tests. Another setup
 /// takes the existing lock and completes the work. No fixture starts or joins this sweep.
@@ -105,10 +108,14 @@ pub(super) fn sweep_dead_runs(namespace: TestNamespace, run: &str) -> std::io::R
                     [path],
                     &unreleased,
                     |path| {
-                        sweeping.phase(
-                            &format!("removing abandoned scratch root {}", path.display()),
-                            || tree::remove(path),
-                        )
+                        sweeping
+                            .phase(
+                                &format!("removing abandoned scratch root {}", path.display()),
+                                || tree::remove(path),
+                            )
+                            .inspect(|()| {
+                                progress::completed_phase(&format!("removed {}", path.display()));
+                            })
                     },
                     |path, error| {
                         cowshed_os::eprintln!(
@@ -158,6 +165,8 @@ fn sweep_dead_roots(sweeping: &SweepLock) -> std::io::Result<usize> {
                         path.display()
                     );
                 })?;
+            // Reported only once the root is gone, never while its removal runs.
+            progress::completed_phase(&format!("removed {}", path.display()));
             removed += 1;
         }
     }

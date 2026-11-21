@@ -983,15 +983,18 @@ keeps moving is never ended for being the last one still running. The CLI's disp
 (`cowshed-core/tests/support/progress.rs`): one record after each lifecycle verb it dispatched completed successfully,
 and one once its Nx checkout is installed, never when a verb starts, fails or is retried and never on a timer, so a
 directory lifecycle test that keeps completing phases on a loaded host runs on, and a phase that does not complete still
-ends the run at the bound. The run's CPU never restarts the bound: a test whose tree gains CPU and reports no progress,
-a compile inside a test, is ended at the bound and named by the snapshot below. There is no count-multiplied outer
-wall-clock budget and no per-test bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test deadline with
-`--timeout=0`, and no test carries one of its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's
-runner carries `--no-tests=fail`, so a filter that selects nothing fails rather than passing a run of no test. The RAM
-host walk and real-process CPU-pool production-wiring proofs run in `test-host`, outside the four pure Bun shards, with
-the existing case bounds, and so do the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a
-stopped FSEvents stream), which `sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the
-host target names each owned host file.
+ends the run at the bound. So is the real-substrate lane's setup sweep (`cowshed-apfs/tests/support/scratch_sweep.rs`):
+one record after each dead directory fixture, template directory or scratch root it removed, never while a removal runs,
+so a sweep of many slow roots runs on, and one root whose removal does not end still ends the setup at the bound. The
+run's CPU never restarts the bound: a test whose tree gains CPU and reports no progress, a compile inside a test, is
+ended at the bound and named by the snapshot below. There is no count-multiplied outer wall-clock budget and no per-test
+bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test carries one of
+its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a
+filter that selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
+production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds, and so do
+the Nx daemon proofs that apply their own Seatbelt profile (a refused daemon stop, a stopped FSEvents stream), which
+`sandbox_apply` refuses inside a cowshed job. The shards exclude `*-host.test.ts`; the host target names each owned host
+file.
 
 Drain fixtures read report publications on native directory-write events and await the serving task and resident's
 completion directly. CPU-admission holders announce readiness on stdout before blocking on their open stdin; consumers
