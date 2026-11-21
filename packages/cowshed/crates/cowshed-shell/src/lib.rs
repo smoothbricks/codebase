@@ -65,13 +65,12 @@ mod script;
 const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Serve as an exec host if this process was started as one, and never return in that case.
-/// Otherwise register this same binary as the program that starts exec hosts, so workspace
-/// supervisors this process starts run commands in warm shells.
 ///
 /// A binary that hosts workspace supervisors calls this first in `main`, before any runtime or
 /// thread exists: the host forks, and a single-threaded process is the one in which that is
-/// unconditionally sound.
-pub fn dispatch() -> io::Result<()> {
+/// unconditionally sound. It binds no host program:
+/// [`register_host`] binds the host program once the invocation owns what its caller handed it.
+pub fn dispatch() {
     match cowshed_core::developer_links::dispatch() {
         Ok(Some(status)) => {
             if let Some(signal) = status.signal() {
@@ -95,6 +94,16 @@ pub fn dispatch() -> io::Result<()> {
     if arguments.next().as_deref() == Some(OsStr::new(SHELL_HOST_ARGUMENT)) {
         std::process::exit(serve());
     }
+}
+
+/// Register this same binary, bound to the file it runs from now, as the program that starts
+/// exec hosts, so workspace supervisors this process starts run commands in warm shells.
+///
+/// Binding opens a descriptor, so it comes after the invocation adopted every descriptor its
+/// caller handed it by number (`lock --state-fd`, `hold --control-fd --state-fd`): the lowest free
+/// number is the one a caller closed, and a descriptor this process opened before the adoption
+/// would be taken for the caller's.
+pub fn register_host() -> io::Result<()> {
     cowshed_core::runtime::shell_host::register(ShellHostProgram::with_arguments(
         std::env::current_exe()?,
         vec![SHELL_HOST_ARGUMENT.into()],

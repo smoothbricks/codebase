@@ -599,6 +599,35 @@ fn a_command_that_cannot_start_fails_the_hold() {
     assert_eq!(hold.wait().code(), Some(104));
 }
 
+/// A control descriptor the caller closed is refused by its number before anything runs: no
+/// descriptor this process opens itself is taken for it, whatever number the kernel hands out.
+#[test]
+fn an_unopened_control_descriptor_cannot_adopt_a_runtime_descriptor() {
+    let dir = Dir::new("unopened-control");
+    let ran = dir.0.join("ran");
+    let state = dir.0.join("state");
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            r#"exec 3>&-; exec "$0" hold --control-fd 3 --state-fd 4 -- sh -c ': > "$1"' step "$1" 4>"$2""#,
+        ])
+        .arg(cowshed())
+        .arg(&ran)
+        .arg(&state)
+        .output_bounded()
+        .expect("run cowshed hold");
+    assert_eq!(output.status.code(), Some(104), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--control-fd 3 is not an open descriptor"),
+        "{stderr}"
+    );
+    assert!(
+        !ran.exists(),
+        "an invalid control descriptor let the command run"
+    );
+}
+
 /// A signal the holder receives is sent to the group as a request is, and answered.
 #[test]
 fn a_signal_the_holder_receives_reaches_the_group() {

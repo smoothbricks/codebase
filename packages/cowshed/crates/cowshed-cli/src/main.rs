@@ -28,17 +28,20 @@ fn main() {
     }
     // Before the runtime starts any thread: this binary is also every workspace's warm
     // exec host, and in that role it never returns from here.
-    if let Err(error) = cowshed_shell::dispatch() {
-        cowshed_os::eprintln!(
-            "cowshed: cannot locate this executable for warm workspace shells: {error}"
-        );
-    }
+    cowshed_shell::dispatch();
     cowshed_os::timing::start_clock();
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let invocation = match prepare(arguments) {
         Ok(invocation) => invocation,
         Err(code) => std::process::exit(code),
     };
+    // Only now that the invocation owns the descriptors its caller handed it by number: binding
+    // the host program opens one, which would otherwise take a number the caller closed.
+    if let Err(error) = cowshed_shell::register_host() {
+        cowshed_os::eprintln!(
+            "cowshed: cannot locate this executable for warm workspace shells: {error}"
+        );
+    }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
