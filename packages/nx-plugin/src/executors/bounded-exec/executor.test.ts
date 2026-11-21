@@ -2297,12 +2297,15 @@ const arrive = (test) => new Promise((resolve, reject) => {
       `const { createConnection } = require('node:net');
 const started = Date.now();
 const event = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
-const arrive = (test) => {
+const arrive = (test, ran) => {
   event({ type: 'test', event: 'started', name: 'pkg::bin$' + test });
   const client = createConnection(process.env.${TEST_GATE_ENV});
   client.setEncoding('utf8');
   client.on('connect', () => client.write(JSON.stringify({ binary: 'pkg::bin', test }) + '\\n'));
-  client.on('data', (line) => console.error('ran ' + test + ' on ' + line.trim()));
+  client.on('data', (line) => {
+    console.error('ran ' + test + ' on ' + line.trim());
+    ran();
+  });
   client.on('error', () => {});
 };
 process.on('SIGTERM', () => {
@@ -2311,9 +2314,9 @@ process.on('SIGTERM', () => {
   event({ type: 'test', event: 'failed', name: 'pkg::bin$queued', exec_time });
   process.exit(1);
 });
-arrive('held');
-setTimeout(() => arrive('queued'), 50);
-setInterval(() => {}, 1000);
+// The queued case arrives once the held one runs, and nothing but the leaf's bound ends either: their open
+// connections keep this process waiting.
+arrive('held', () => arrive('queued', () => {}));
 `,
     );
     await writeFile(join(bin, 'cargo'), `#!/bin/sh\nexec '${process.execPath}' '${cases}'\n`, { mode: 0o755 });
