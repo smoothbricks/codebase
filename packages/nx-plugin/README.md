@@ -1502,7 +1502,9 @@ Concrete targets come from concrete files:
 - Canonical `napi` package metadata provides a host `cargo-napi` target (only when no configured triple is the host's
   own platform) and named release targets for each configured triple. macOS triples run `napi build` with the host's
   toolchain, because a macOS addon needs Apple's SDK, which zig does not carry; the napi CLI also writes the platform
-  `.d.ts`.
+  `.d.ts`. In mbx-managed jobs the addon recipe runs under `mbx prepare-target` so its temporary type-definition
+  directory is placed before Cargo builds, and the managed target stays available through the artifact copy and the
+  dep-info receipt. Outside those jobs the recipe runs napi directly.
 - Linux artifacts reference no build-host path. N-API addons link glibc 2.17 symbol versions and carry no RUNPATH;
   binaries a package builds for Linux, such as a CLI, build the same way. Both are built by devenv's zig through
   cargo-zigbuild, with the same command on every host. Each Linux triple's `napi-<arch>-linux` target runs the

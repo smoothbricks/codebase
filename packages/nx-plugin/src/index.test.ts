@@ -53,6 +53,10 @@ useFixtureCargoHome();
 /** The inferring host's directory under a tool package's dist/bin, the one inferred commands run a tool from. */
 const HOST_TOOLS = `${process.platform === 'darwin' ? 'darwin' : 'linux'}-${process.arch}`;
 
+function managedNapiCommand(manifest: string, command: string): string {
+  return `if [ "\${MBX_TARGET_VIEWS:-0}" = 1 ]; then set -- mbx prepare-target --manifest-path ${manifest} --; else set --; fi; "$@" sh -c '${command}'`;
+}
+
 const [, rawInferTargets] = createNodesV2;
 const inferTargets: typeof rawInferTargets = async (files, options, context) => {
   await prepareCargoFixture(context.workspaceRoot);
@@ -2782,7 +2786,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // the sweep that gives every other cargo target its identity skips it.
       expect(napiInputs).toEqual(expect.arrayContaining(cargoToolchainInputs()));
       const platformBuild = (release: string): string =>
-        `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/{args.outputDir} && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/{args.outputDir}`;
+        managedNapiCommand(
+          'packages/native/crates/native-napi/Cargo.toml',
+          `packages/native/node_modules/.bin/napi build${release} --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/{args.outputDir} && node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path packages/native/crates/native-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libnative_napi.d --output packages/native/{args.outputDir}`,
+        );
       expect(native['napi-arm64-macos']?.options).toMatchObject({
         cwd: '.',
         command: platformBuild(''),
@@ -3358,13 +3365,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputs: ['{projectRoot}/{options.outputDir}/'],
         options: {
           cwd: 'packages/cowshed',
-          command: `napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output {args.outputDir}`,
+          command: managedNapiCommand(
+            'crates/cowshed-napi/Cargo.toml',
+            `napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info debug/libcowshed_napi.d --output {args.outputDir}`,
+          ),
           // A local build never writes where the package ships its addon.
           outputDir: '.cache/native-dev/host',
         },
         configurations: {
           [RELEASE_CONFIGURATION]: {
-            command: `napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output {args.outputDir}`,
+            command: managedNapiCommand(
+              'crates/cowshed-napi/Cargo.toml',
+              `napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ${buildInputs} --manifest-path crates/cowshed-napi/Cargo.toml --dep-info release/libcowshed_napi.d --output {args.outputDir}`,
+            ),
             outputDir: 'dist/native/host',
           },
         },
@@ -3407,8 +3420,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputs: ['{projectRoot}/.cache/native-debug/'],
         options: {
           cwd: 'packages/cowshed',
-          command:
+          command: managedNapiCommand(
+            'crates/cowshed-napi/Cargo.toml',
             'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
+          ),
         },
       });
       //#endregion smoo/nx-plugin!n/debug-addon-staging
@@ -3434,7 +3449,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // Every local build compiles dev into its own directory; only the release configuration ships. The command
       // reads that directory from the option the declared output reads.
       const darwinArm64Build = (release: string): string =>
-        `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output {args.outputDir}`;
+        managedNapiCommand(
+          'crates/cowshed-napi/Cargo.toml',
+          `napi build${release} --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir {args.outputDir} && ../../node_modules/@smoothbricks/nx-plugin/../build-inputs/dist/bin/${HOST_TOOLS}/smoo-nx-build-inputs --manifest-path crates/cowshed-napi/Cargo.toml --dep-info aarch64-apple-darwin/${release === '' ? 'debug' : 'release'}/libcowshed_napi.d --output {args.outputDir}`,
+        );
       expect(targets['napi-arm64-macos']?.options).toMatchObject({ command: darwinArm64Build('') });
       expect(targets['napi-arm64-macos']?.configurations?.[RELEASE_CONFIGURATION]).toEqual({
         command: darwinArm64Build(' --release'),

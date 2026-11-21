@@ -171,12 +171,15 @@ are fixed relative symlinks through it, created by cowshed when it mints the che
 ```
 
 In a project with the mbx capability, `target` is not a build-volume link. mbx creates and owns it at the checkout's
-first Cargo build, `target -> <build-cache>/mbx/targets/v1/<checkout digest>`, and adds its exact path to the
-repository's `info/exclude` itself (mbx docs, "Managed target directories"). Cowshed never creates, discards or relinks
-it, and a refresh that finds it leaves it. The source image carries the link to every fork, where it names the source
-checkout's managed target, so a fork deletes it (Fork step 4) and the fork's first build places its own. The managed
-target never travels: a land leaves the target's managed target where it is, and its next build restores from the store
-what the landing workspace compiled.
+first Cargo build, or before an external build client writes there when it runs under `mbx prepare-target`. The link is
+`target -> <build-cache>/mbx/targets/v1/<checkout digest>`, and mbx itself adds its exact path to the repository's
+`info/exclude` (mbx docs, "Managed target directories"). Cargo metadata discovery creates no link. A client that writes
+ahead of Cargo, such as the N-API addon's type-definition generation, uses that explicit mbx operation through its last
+artifact read. It does not replace an existing unmanaged directory or change an explicit Cargo target. Cowshed never
+creates, discards or relinks the managed target, and a refresh that finds it leaves it. The source image carries the
+link to every fork, where it names the source checkout's managed target, so a fork deletes it (Fork step 4) and the
+fork's first build places its own. The managed target never travels: a land leaves it where it is, and the target's next
+build restores what the landing workspace compiled from the store.
 
 A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new symlink over it. That is atomic: every
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no

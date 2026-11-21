@@ -2920,6 +2920,12 @@ function createNapiTargets(
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
+  // napi writes type-definition scratch before it starts Cargo. On the managed route, mbx must place the target
+  // before that write and keep it through both napi's artifact copy and the dep-info read that follows it.
+  const napiBuild = (options: string, receipt = ''): string => {
+    const command = `${napiCommand} build${options}${receipt}`;
+    return `if [ "\${MBX_TARGET_VIEWS:-0}" = 1 ]; then set -- mbx prepare-target --manifest-path ${shellWord(config.manifestPath)} --; else set --; fi; "$@" sh -c ${shellWord(command)}`;
+  };
   const outputDir = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
   // The directory a run writes into, as its `outputDir` option states it for the run's profile.
   const runOutputDirectory = outputDir(OUTPUT_DIR_ARGUMENT);
@@ -2997,7 +3003,10 @@ function createNapiTargets(
     // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
     // drives the host's own toolchain and writes the platform `.d.ts`.
     const platformBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(triple, profile, runOutputDirectory)}`;
+      napiBuild(
+        `${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${runOutputDirectory}`,
+        recordInputs(triple, profile, runOutputDirectory),
+      );
     targets[targetName] = {
       executor: 'nx:run-commands',
       metadata: CARGO_PRODUCER_METADATA,
@@ -3027,11 +3036,16 @@ function createNapiTargets(
       outputs: [`{projectRoot}/${debugDirectory}/`],
       options: {
         cwd: cargoCwd,
-        command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputDir(debugDirectory)}`,
+        command: napiBuild(
+          ` --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputDir(debugDirectory)}`,
+        ),
       },
     };
     const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${runOutputDirectory}${recordInputs(null, profile, runOutputDirectory)}`;
+      napiBuild(
+        `${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${runOutputDirectory}`,
+        recordInputs(null, profile, runOutputDirectory),
+      );
     const hostOutputs = nativeOutputPaths('host');
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
