@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use super::BuildStateTool;
-use crate::capabilities::{BuildStatePath, RemovedPackageCache};
+use crate::capabilities::BuildStatePath;
 use crate::error::{CowshedError, Result};
 
 /// The one name a checkout reaches its build volume through, relative to the checkout root.
@@ -220,9 +220,10 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
 /// so does every directory above it. It never removes a directory above the package's, anything
 /// the volume holds behind the link, or whatever else holds the path. Returns the paths whose link
 /// it removed.
+#[cfg(target_os = "macos")]
 pub(crate) fn unlink_removed(
     checkout: &Path,
-    removed: &[RemovedPackageCache],
+    removed: &[crate::capabilities::RemovedPackageCache],
 ) -> Result<Vec<PathBuf>> {
     let failed = |path: &Path, error: io::Error| {
         CowshedError::integrity(
@@ -532,13 +533,13 @@ fn mark_made(directory: &Path) -> io::Result<()> {
 
 /// Whether `directory` carries the mark [`contained_parent`] gives each directory it makes. Reads
 /// only; a directory it cannot read the mark of is not proven cowshed's.
+#[cfg(target_os = "macos")]
 fn made_by_cowshed(directory: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(directory.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: the path and name are NUL-terminated and live across the call; a null buffer of
     // size zero asks only for the value's length.
-    #[cfg(target_os = "macos")]
     let length = unsafe {
         libc::getxattr(
             path.as_ptr(),
@@ -547,16 +548,6 @@ fn made_by_cowshed(directory: &Path) -> bool {
             0,
             0,
             libc::XATTR_NOFOLLOW,
-        )
-    };
-    // SAFETY: as above.
-    #[cfg(not(target_os = "macos"))]
-    let length = unsafe {
-        libc::lgetxattr(
-            path.as_ptr(),
-            MADE_BY_COWSHED.as_ptr(),
-            std::ptr::null_mut(),
-            0,
         )
     };
     length >= 0
@@ -928,12 +919,13 @@ mod tests {
     /// stays though empty. The volume keeps what it held. A directory holding anything else stays,
     /// and a link aimed elsewhere or a real directory at the path is left as it is.
     #[test]
+    #[cfg(target_os = "macos")]
     fn unlinking_a_removed_package_s_cache_takes_only_its_exact_link_and_what_it_emptied() {
         let scratch = Scratch::new("removed-package");
         let checkout = scratch.checkout();
         let volume = scratch.volume("volume-a");
         point(&checkout, &volume).unwrap();
-        let removed = |path: &str, package: &str| RemovedPackageCache {
+        let removed = |path: &str, package: &str| crate::capabilities::RemovedPackageCache {
             state: if path.ends_with("node_modules/.cache") {
                 BuildStatePath::new(path, path).unwrap()
             } else {
