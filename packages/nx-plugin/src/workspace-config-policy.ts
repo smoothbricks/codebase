@@ -569,6 +569,16 @@ function retiredCleanEntries(targetDefaults: Record<string, unknown>, targetName
 function isPreciseProductionNamedInput(production: unknown[]): boolean {
   let hasPositiveProjectInput = false;
   for (const input of production) {
+    if (
+      isRecord(input) &&
+      input.json === '{projectRoot}/package.json' &&
+      Array.isArray(input.excludeFields) &&
+      input.excludeFields.every((field) => typeof field === 'string' && field.length > 0) &&
+      Object.keys(input).every((key) => key === 'json' || key === 'excludeFields')
+    ) {
+      hasPositiveProjectInput = true;
+      continue;
+    }
     if (typeof input !== 'string') {
       return false;
     }

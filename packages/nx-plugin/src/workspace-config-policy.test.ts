@@ -577,6 +577,7 @@ describe('pure core: applyWorkspaceConfig', () => {
         production: [
           '{projectRoot}/src/**/*.py',
           '{projectRoot}/pyproject.toml',
+          { json: '{projectRoot}/package.json', excludeFields: ['nx'] },
           '!{projectRoot}/**/*.test.*',
           MARKDOWN,
         ],
