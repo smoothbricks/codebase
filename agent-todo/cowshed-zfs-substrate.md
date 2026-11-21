@@ -9,8 +9,8 @@ On a NixOS container whose datasets are zoned to its user namespace (kernel 6.18
 systemd user daemon), 2026-11-21: `setup`, `gateway start`, `adopt`, `fork`, `exec`, a fork of a fork, `land`, `rm`,
 `rm --abandon`, `gc` and `doctor` run, and the store ends with only `main`. Each workspace is a dataset named for its
 place (`main`, `ws/<name>`, `ws/.trash/<name>-<incarnation>`, `build/<id>`); a job runs under Landlock in private user,
-network and mount namespaces. Host proofs: `cowshed:zfs-helper-test` and `storage::directory::zfs_tests` (both need
-`sudo -n` and `COWSHED_ZFS_TEST_PARENT`).
+network and mount namespaces. Host proofs, run by the real-ZFS live host check (`08_testing.md`, "Real ZFS"): `real_zfs`
+of `cowshed-helper`, and `storage::directory::zfs_tests` (both need `sudo -n` and `COWSHED_ZFS_TEST_PARENT`).
 
 ## Gaps
 

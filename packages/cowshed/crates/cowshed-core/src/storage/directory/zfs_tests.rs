@@ -156,7 +156,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-#[ignore = "host proof: needs sudo, cowshed-helper on PATH and COWSHED_ZFS_TEST_PARENT (nx run cowshed:zfs-test)"]
+#[ignore = "host proof: needs sudo, cowshed-helper on PATH and COWSHED_ZFS_TEST_PARENT (the live host check of specs/cowshed/08_testing.md, Real ZFS)"]
 fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
     let fixture = Fixture::new();
     let (payloads, datasets) = (&fixture.payloads, fixture.datasets());
@@ -279,7 +279,7 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
 /// payload is mounted with a file open, and absent from a dataset made without one. Mounted at
 /// its own root, the dataset is the volume a job's usage samples read.
 #[test]
-#[ignore = "host proof: needs sudo, cowshed-helper on PATH and COWSHED_ZFS_TEST_PARENT (nx run cowshed:zfs-test)"]
+#[ignore = "host proof: needs sudo, cowshed-helper on PATH and COWSHED_ZFS_TEST_PARENT (the live host check of specs/cowshed/08_testing.md, Real ZFS)"]
 fn a_dataset_payloads_capacity_is_its_refquota_raised_in_place() {
     use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeStat as _};
 

@@ -138,7 +138,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-#[ignore = "host proof: needs sudo and COWSHED_ZFS_TEST_PARENT (nx run cowshed:zfs-helper-test)"]
+#[ignore = "host proof: needs sudo and COWSHED_ZFS_TEST_PARENT (the live host check of specs/cowshed/08_testing.md, Real ZFS)"]
 fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
     let fixture = Fixture::new();
     let repo = "projects/acme/widget";

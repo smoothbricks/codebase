@@ -109,7 +109,8 @@ done. They are independent of each other.
 ## cowshed-helper
 
 - Spec: `specs/cowshed/09_substrates.md`, "Privileged helper"; `08_testing.md`, "Real ZFS".
-- Code: `packages/cowshed/crates/cowshed-helper`, proven by `cowshed:zfs-helper-test`. Nothing calls it yet.
+- Code: `packages/cowshed/crates/cowshed-helper`, proven by the real-ZFS live host check (`08_testing.md`, "Real ZFS").
+  Nothing calls it yet.
 - Work: its caller and what remains of the helper (the mountpoint race, macOS) are in `cowshed-zfs-substrate.md`.
 
 ## Workspace-only operator quiesce and retirement

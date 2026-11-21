@@ -746,11 +746,23 @@ fixture's own tree is created and destroyed by root directly, and everything und
 The parent is named, never discovered, for the reason a pool is never guessed (09_substrates.md, selection). A scratch
 pool on a file vdev is not the fixture: `zpool create` is refused to the root of a container whose datasets are zoned to
 its user namespace, which is where the Linux lane runs, while a tree below a zoned parent works there and on a bare host
-alike. Run without the variable, the proof fails naming it; it is never skipped. The Nx target `cowshed:zfs-helper-test`
-runs the helper's proof (`crates/cowshed-helper/tests/real_zfs.rs`): one walk of adopt, fork, `rm` and a land's promote,
-with the refusals only a real host can show (a root whose `cowshed:owner` is not the caller, a mountpoint in root's
-tree, a dataset outside the root). It is uncached, since its verdict is about the host's pool, and outside `gate` until
-the land host provides a parent.
+alike. Run without the variable, the proof fails naming it; it is never skipped. It is two proofs: the helper's
+(`crates/cowshed-helper/tests/real_zfs.rs`), one walk of adopt, fork, `rm` and a land's promote, with the refusals only
+a real host can show (a root whose `cowshed:owner` is not the caller, a mountpoint in root's tree, a dataset outside the
+root); and the dataset payloads' (`storage::directory::zfs_tests` in `cowshed-core`), the store's mount protocol, a
+fork's clone, a reclaim and a capacity, through the real helper. Both are `#[ignore]`d, so an ordinary test run skips
+them.
+
+The real-ZFS proof is a live host check, never an Nx target: no target runs it, so it is neither cached nor part of a
+land's gate, and a land never waits on a host's pool (the owner's ruling, 2026-11-22). Its verdict is about the host it
+ran on, its pool and its helper install at that moment, which no cache key spells. Whoever changes the helper, the
+dataset payloads or a host's OpenZFS runs it on a ZFS host, in a shed through `cowshed exec <ws> --host`, entering the
+checkout's devenv as host targets do. Its test binaries are built first (`cargo test --frozen --no-run` with the
+arguments below), so the run compiles nothing. Then two separate runs, each passing `--ignored` to its own test binary,
+since a test-name filter given to one run of both would select nothing in the helper's binary:
+`cargo test --frozen -p cowshed-helper --test real_zfs -- --ignored`, then
+`cargo test --frozen -p cowshed-core --lib storage::directory::zfs_tests -- --ignored`. Each must report its named tests
+run, one and two; a run that reports none proves nothing.
 
 The Nx target `cowshed:apfs-test-root` (`packages/cowshed/scripts/apfs-test-root.ts`) gives a host `cowshed setup` has
 not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, the three directories of
