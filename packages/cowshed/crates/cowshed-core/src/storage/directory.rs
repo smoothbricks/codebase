@@ -102,28 +102,32 @@ pub enum HelperProof {
     },
 }
 
-/// Prove that the cowshed whose executable lies in `installed` can change the store at
-/// `store_root`: when the store is a cowshed ZFS dataset, run the `check` verb of the helper
-/// that cowshed reaches, as it reaches it, with no credentials a terminal cached. Nothing is
-/// changed. An error is a store that could not be read or a helper that is not installed.
+/// Prove that the cowshed whose executable lies in `installed` can change every ZFS root it
+/// serves from the store at `store_root` (the store's own, or on a store that is no dataset
+/// each root that names this user): run the `check` verb of the helper that cowshed reaches, as
+/// it reaches it, with no credentials a terminal cached. Nothing is changed. The first root
+/// refused is the answer. An error is a store that could not be read or a helper that is not
+/// installed.
 pub fn prove_store_helper(
     store_root: &Path,
     installed: &Path,
 ) -> Result<HelperProof, ApfsStorageError> {
-    let Some(datasets) = zfs::ZfsPayloads::of_store_beside(store_root, Some(installed.to_owned()))?
-    else {
-        return Ok(HelperProof::NoDatasets);
-    };
-    let root = datasets.root().dataset().to_string();
-    let helper = datasets.helper_path().to_owned();
-    Ok(match datasets.prove_helper() {
-        Ok(()) => HelperProof::Proven { root, helper },
-        Err(error) => HelperProof::Refused {
-            root,
-            helper,
-            cause: error.to_string(),
-        },
-    })
+    let mut proof = HelperProof::NoDatasets;
+    for datasets in zfs::ZfsPayloads::serving(store_root, installed)? {
+        let root = datasets.root().dataset().to_string();
+        let helper = datasets.helper_path().to_owned();
+        match datasets.prove_helper() {
+            Ok(()) => proof = HelperProof::Proven { root, helper },
+            Err(error) => {
+                return Ok(HelperProof::Refused {
+                    root,
+                    helper,
+                    cause: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(proof)
 }
 
 /// The lifecycle host of a directory store. It holds no state but its configuration: the

@@ -200,10 +200,11 @@ pub trait HostSetup: Send {
     async fn census(&mut self) -> Result<WorkspaceCensus>;
     /// Which adopted projects have no mounted main, for the readiness sentence.
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
-    /// Prove that the installed cowshed's root helper can change a ZFS store
-    /// ([`crate::zfs_helper::prove`]): the refusal, carrying the one root command that mends it,
-    /// when it cannot. `None` for a store that keeps no datasets, and for a test host, which
-    /// must never run `sudo`.
+    /// Prove that the installed cowshed's root helper can change the ZFS roots this host serves
+    /// ([`crate::zfs_helper::prove`]), writing the root entry that lets it when that is missing
+    /// and a terminal can authorize it: the refusal, carrying the one root command that mends
+    /// it, when it still cannot. `None` for a host with no such root, and for a test host,
+    /// which must never run `sudo`.
     async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
         Ok(None)
     }
@@ -337,8 +338,22 @@ impl HostSetup for NativeHostSetup {
     }
 
     async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
+        use std::io::IsTerminal as _;
         let storage = validate_existing_host_storage(&self.home).await?;
-        crate::zfs_helper::prove(storage.store(), &self.home, effective_uid())
+        let prove = || crate::zfs_helper::prove(storage.store(), &self.home, effective_uid());
+        let Some(unproven) = prove()? else {
+            return Ok(None);
+        };
+        if !std::io::stdin().is_terminal() {
+            return Ok(Some(unproven.refusal));
+        }
+        cowshed_os::eprintln!(
+            "cowshed: the root helper cannot act on this host's ZFS root yet; writing the sudoers entry that admits it (sudo may ask for your password)"
+        );
+        match crate::zfs_helper::mend(&unproven.command) {
+            Ok(true) => Ok(prove()?.map(|still| still.refusal)),
+            Ok(false) | Err(_) => Ok(Some(unproven.refusal)),
+        }
     }
 
     async fn install_skill(&mut self) -> Result<Option<SkillInstallReport>> {

@@ -6,8 +6,9 @@
 //! admit without a password, since the gateway daemon has no terminal to type one at. The entry
 //! names the installed path and pins the helper's SHA-256, because that path lies in a directory
 //! this user can write: an entry naming the path alone would make root of whatever file is put
-//! there. `cowshed setup` proves the entry by the helper's `check` verb and refuses, with the
-//! command that writes it, when the proof fails.
+//! there. `cowshed setup` proves the entry by the helper's `check` verb and, when the proof
+//! fails, writes it: at a terminal it runs the root command itself ([`mend`]), which `sudo`
+//! authorizes, and anywhere else it refuses with that command.
 
 use std::path::Path;
 
@@ -69,7 +70,7 @@ struct Remedy {
 fn remedy(uid: u32, installed: &Path, helper: &Path, sha256: &str) -> Remedy {
     let setuid_install = |destination: &Path| {
         format!(
-            "sudo install -o 0 -g 0 -m 4755 {} {} && cowshed setup",
+            "sudo install -o 0 -g 0 -m 4755 {} {}",
             shell_word(&installed.to_string_lossy()),
             shell_word(&destination.to_string_lossy())
         )
@@ -91,7 +92,7 @@ fn remedy(uid: u32, installed: &Path, helper: &Path, sha256: &str) -> Remedy {
                     "it is reached through sudo, which admits it without a password only by a sudoers entry; the next command, run once per installed helper build, writes the entry that admits exactly these bytes for uid {uid} (a host that reads no {SUDOERS_DROP_INS} takes the entry through its own sudoers configuration: {entry})"
                 ),
                 command: format!(
-                    "printf '%s\\n' {} | sudo sh -c 'umask 227 && cat >{drop_in}.new && visudo -cf {drop_in}.new && mv {drop_in}.new {drop_in}' && cowshed setup",
+                    "printf '%s\\n' {} | sudo sh -c 'umask 227 && cat >{drop_in}.new && visudo -cf {drop_in}.new && mv {drop_in}.new {drop_in}'",
                     shell_word(&entry)
                 ),
             }
@@ -105,12 +106,19 @@ fn remedy(uid: u32, installed: &Path, helper: &Path, sha256: &str) -> Remedy {
     }
 }
 
-/// Prove that the cowshed installed under `home` can change the store at `store_root`, when that
-/// store is a ZFS dataset: the helper it reaches answers `check` as root for `uid`, with no
-/// credentials a terminal cached. `None` is a proven helper, or a store with no datasets; the
-/// error returned inside `Some` is the refusal `cowshed setup` ends with, whose hint is the root
-/// command that mends it.
-pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<CowshedError>> {
+/// A helper that did not act as root: the refusal `cowshed setup` ends with, whose hint is the
+/// root command and the rerun, and that root command alone, for a setup that runs it itself.
+#[derive(Debug)]
+pub struct Unproven {
+    pub refusal: CowshedError,
+    pub command: String,
+}
+
+/// Prove that the cowshed installed under `home` can change every ZFS root it serves from the
+/// store at `store_root` ([`prove_store_helper`]): the helper it reaches answers `check` as root
+/// for `uid`, with no credentials a terminal cached. `None` is a proven helper, or a host with
+/// no root to serve.
+pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<Unproven>> {
     let installed = HostStableExecutable::new(home, HELPER_NAME).map_err(launchd_error)?;
     let proof = prove_store_helper(store_root, installed.directory()).map_err(|error| {
         CowshedError::environment_missing(
@@ -131,13 +139,29 @@ pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<CowshedE
     };
     let sha256 = executable_digest(installed.path())?.to_string();
     let Remedy { why, command } = remedy(uid, installed.path(), &helper, &sha256);
-    Ok(Some(CowshedError::environment_missing(
-        format!(
-            "{} did not act as root for the ZFS root {root}, so nothing can change its datasets: {cause}; {why}",
-            helper.display()
+    Ok(Some(Unproven {
+        refusal: CowshedError::environment_missing(
+            format!(
+                "{} did not act as root for the ZFS root {root}, so nothing can change its datasets: {cause}; {why}",
+                helper.display()
+            ),
+            format!("{command} && cowshed setup"),
         ),
         command,
-    )))
+    }))
+}
+
+/// Run the root command of an [`Unproven`] helper from this terminal; `sudo` asks for what its
+/// policy wants. Whether it succeeded: the proof, run again, is the verdict.
+// WHY unbounded: `sudo` waits for the operator's password at the terminal.
+#[allow(clippy::disallowed_methods)]
+pub fn mend(command: &str) -> std::io::Result<bool> {
+    use cowshed_os::fork_lock::Run as _;
+    Ok(std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .status_locked()?
+        .success())
 }
 
 #[cfg(test)]
@@ -215,7 +239,11 @@ mod tests {
         for (installed, helper, command, why) in cases {
             let remedy = remedy(1000, installed, helper, SHA256);
             let reached = format!("{} reached as {}", installed.display(), helper.display());
-            assert_eq!(remedy.command, command, "{reached}");
+            assert_eq!(
+                format!("{} && cowshed setup", remedy.command),
+                command,
+                "{reached}"
+            );
             assert!(remedy.why.contains(why), "{reached}: {}", remedy.why);
         }
         // The entry itself is in the reason, for a host that keeps its sudoers elsewhere.

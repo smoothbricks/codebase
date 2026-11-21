@@ -368,16 +368,21 @@ privilege is decided per invocation from the file itself:
   `#<uid> ALL=(root) NOPASSWD: sha256:<digest> <installed path, spaces escaped>`, and is written again when an install
   changes those bytes.
 
-`cowshed setup` proves this once the helper is installed, on a store that is a ZFS dataset: it runs the `check` verb of
-the helper the installed cowshed reaches, as it reaches it, and through `sudo` with `-k` besides, so the credentials
-setup's own `sudo -v` cached do not answer for a daemon that has none. When the proof fails setup exits
-`environment-missing`, saying what the attempt answered, and its `next:` line is the one root command that mends it: for
-the installed helper, the entry above written to `/etc/sudoers.d/cowshed-helper-<uid>` (staged as
-`cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by `visudo -cf`, then renamed), with the entry itself in
-the message for a host that keeps its sudoers elsewhere; for a setuid helper that was reached instead, the
-`install -o 0 -g 0 -m 4755` that replaces it with this build's; and for an installed path sudoers cannot spell, the same
-setuid install into `/usr/local/bin`. `gateway stop --purge` and `setup --uninstall` remove the installed helper;
-neither removes a sudoers entry, which is root's.
+`cowshed setup` proves this once the helper is installed, for every ZFS root the host serves: the store's own root on a
+store that is a ZFS dataset, and otherwise (a macOS host, whose store is APFS) each root that names the user, when the
+host has a `zfs`. It runs the `check` verb of the helper the installed cowshed reaches, as it reaches it, and through
+`sudo` with `-k` besides, so the credentials setup's own `sudo -v` cached do not answer for a daemon that has none. When
+the proof fails at a terminal, setup runs the one root command that mends it, which `sudo` authorizes, and proves again.
+Without a terminal, or when the proof still fails, setup exits `environment-missing`, saying what the attempt answered,
+and its `next:` line is that command: for the installed helper, the entry above written to
+`/etc/sudoers.d/cowshed-helper-<uid>` (staged as `cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by
+`visudo -cf`, then renamed), with the entry itself in the message for a host that keeps its sudoers elsewhere; for a
+setuid helper that was reached instead, the `install -o 0 -g 0 -m 4755` that replaces it with this build's; and for an
+installed path sudoers cannot spell, the same setuid install into `/usr/local/bin`. `gateway stop --purge` and
+`setup --uninstall` remove the installed helper; neither removes a sudoers entry, which is root's.
+
+**Open: the digest is checked before the helper is executed.** Where `sudo` cannot execute the file it hashed, a process
+of this user that replaces the helper between the two steps runs as root. The installed directory is the user's.
 
 Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
 

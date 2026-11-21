@@ -165,11 +165,40 @@ fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageEr
     }
 }
 
-/// An unprivileged `zfs` read.
+/// An unprivileged `zfs` read. `zfs` is the one the helper runs
+/// ([`cowshed_helper::host::TRUSTED_PATH`]): a daemon's `PATH` need not hold it.
 fn read_zfs(arguments: &[&str]) -> Result<String, ApfsStorageError> {
     let mut command = Command::new("zfs");
-    command.args(arguments);
+    command
+        .args(arguments)
+        .env("PATH", cowshed_helper::host::TRUSTED_PATH);
     run("zfs read", command)
+}
+
+/// Whether this host has a `zfs` to ask.
+fn zfs_installed() -> bool {
+    std::env::split_paths(cowshed_helper::host::TRUSTED_PATH)
+        .any(|directory| directory.join("zfs").is_file())
+}
+
+/// This process's real uid and the cowshed roots that name it as their owner.
+fn roots_serving_this_user() -> Result<(u32, Vec<String>), ApfsStorageError> {
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
+    let listed = read_zfs(&[
+        "list",
+        "-H",
+        "-o",
+        &format!("name,{property}"),
+        "-t",
+        "filesystem",
+    ])?;
+    let roots = serving_roots(&listed, uid)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    Ok((uid, roots))
 }
 
 /// What `ask` answers of the directory at `place`; a place that does not exist holds nothing.
@@ -269,18 +298,9 @@ impl ZfsPayloads {
                 if !adopt_datasets {
                     return Ok(None);
                 }
-                // SAFETY: reads this process's real uid.
-                let uid = unsafe { libc::getuid() };
                 let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
-                let listed = read_zfs(&[
-                    "list",
-                    "-H",
-                    "-o",
-                    &format!("name,{property}"),
-                    "-t",
-                    "filesystem",
-                ])?;
-                match serving_roots(&listed, uid).as_slice() {
+                let (uid, roots) = roots_serving_this_user()?;
+                match roots.as_slice() {
                     [root] => Root::parse(root).ok(),
                     [] => {
                         return Err(host(
@@ -304,6 +324,25 @@ impl ZfsPayloads {
             Some(root) => Self::with_root(root, store_root, beside_this_executable()).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Every root whose datasets the cowshed installed in `beside` may come to change from the
+    /// store at `store_root`: the store's own root when the store is a dataset, else each root
+    /// that names this user, which a project is adopted onto by asking
+    /// ([`Self::of_project`]). A host with no `zfs` has none.
+    pub(super) fn serving(store_root: &Path, beside: &Path) -> Result<Vec<Self>, ApfsStorageError> {
+        if let Some(own) = Self::of_store_beside(store_root, Some(beside.to_owned()))? {
+            return Ok(vec![own]);
+        }
+        if !zfs_installed() {
+            return Ok(Vec::new());
+        }
+        let (_, roots) = roots_serving_this_user()?;
+        roots
+            .iter()
+            .filter_map(|root| Root::parse(root).ok())
+            .map(|root| Self::with_root(root, store_root, Some(beside.to_owned())))
+            .collect()
     }
 
     /// [`Self::of_store`] for the cowshed whose executable lies in `beside`: the payloads as that
