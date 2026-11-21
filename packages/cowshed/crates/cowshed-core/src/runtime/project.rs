@@ -26366,7 +26366,21 @@ fn unsettled_build_links(
         return Ok(Vec::new());
     };
     let state = BuildVolumeState::read(&volume)?;
-    Ok(link::unsettled(checkout, &volume, &state.paths))
+    let (linked, removed) = crate::capabilities::removed_package_caches(checkout, &state.paths)?;
+    let mut unsettled = link::unsettled(checkout, &volume, &linked);
+    // A removed package's cache link a refresh takes off; its absence is what a refresh leaves.
+    unsettled.extend(
+        removed
+            .into_iter()
+            .filter(|cache| link::is_fixed_link(checkout, &cache.state))
+            .map(|cache| {
+                (
+                    cache.state.checkout.as_path().to_owned(),
+                    link::Unsettled::Foreign,
+                )
+            }),
+    );
+    Ok(unsettled)
 }
 
 /// Doctor's report of a build-state path that is not its link onto the workspace's build volume

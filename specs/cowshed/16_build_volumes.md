@@ -396,7 +396,8 @@ Each declared path is one more `BuildStatePath` contribution, `<path> -> declare
 discovery after the capabilities'. The `declared/` namespace keeps it apart from every tool's own volume names, and
 tells cowshed it is declared rather than a tool's. The list is part of `.cowshed.toml`, which the discovery fingerprint
 already covers, so changing it rediscovers at the next refresh: a new path joins the volume, and a held path keeps its
-link. Validation refuses, before anything is deleted and with the remedy named:
+link, but for a removed package's cache (below). Validation refuses, before anything is deleted and with the remedy
+named:
 
 - an entry that is not a normalized checkout-relative name or pattern, one naming `.git` or inside `.cowshed/`, and one
   spelled inside another (when `.cowshed.toml` is parsed); a pattern match inside another declared path, or around one
@@ -442,6 +443,22 @@ links at once (above); a kept path a land or a fork inherits meets the same haza
 link to what the volume holds is the warm state a land and a fork exist to carry, not an empty directory a tool would
 misread.
 
+**A cache whose package the checkout no longer tracks is the one held path a refresh does not link.** It is a JavaScript
+package's `node_modules/.cache` whose `package.json` the index no longer lists, or a declared cache that a
+`[build] state` pattern the declaration does not keep selects, beneath a directory the index tracks nothing under. Its
+row stays in the volume's state and the volume keeps what it holds, so the package tracked again is linked to it warm. A
+refresh makes nothing at its path: no link, no volume directory, no parent. Where the path holds exactly the fixed link
+its row names, the refresh removes that link, then each directory between it and the package's directory, that one
+included, while it is empty: never a directory above the package's. Anything else at the path, a real directory, a file
+or a link aimed elsewhere, it leaves as it is and refuses nothing. The evidence is the index listings the fingerprint
+already takes. A package only uninstalled (its manifest tracked, no `node_modules`), a kept declared path (above), a
+literal entry, the checkout root's cache, a capability's own path and a row whose pattern the declaration dropped
+therefore keep their link, and a checkout without a Git directory keeps every link. A resident `exec` and
+`cowshed doctor` judge only the links a refresh makes, and count a removed package's link still in place as one the
+refresh changes. **Why**: relinking a removed package's cache made the package's directory again at every refresh, an
+empty workspace member a `packages/*` glob reads as a package without a manifest. After a downstream repository removed
+a package, every `cowshed exec` remade its directory and the workspace lint refused the next commit (2026-11-21).
+
 A tool whose own state records absolute paths sees the volume's: the declared path is a link, and a process that
 resolves its working directory (`getcwd`, `pwd -P`) gets `<mount-root>/.build/<owner>/<repo>/<id>/declared/<path>`. That
 path changes when a land swaps the checkout's volume and differs in every fork, so state keyed on its own absolute
@@ -472,7 +489,13 @@ instead. The swap would therefore be an unmount and a mount, which must skip ado
   held, unlinked kept declared path, and an unlinked declared cache, as ones the refresh changes; a discovery test
   expanding a pattern over tracked packages only, rediscovering when one is added, and one expanding a kept pattern to
   kept paths, merging a literal with a pattern's match kept when either is; and configuration parse tests,
-  `[build] keep` marking the entries it names and refusing one that names no `[build] state` entry.
+  `[build] keep` marking the entries it names and refusing one that names no `[build] state` entry; a discovery test
+  telling a removed package's caches apart from an uninstalled package's, a kept path, a literal, the root's cache, a
+  dropped pattern's and every row of a checkout without Git, and rejoining a package tracked again; `link.rs`'s test
+  taking only a removed package's exact links and the directories they emptied, never one above the package, a foreign
+  link or a real directory; and a refresh test in which a removed package's caches stay unlinked across refreshes with
+  their rows and volume bytes kept, a still-tracked package's missing links are made, a kept path follows its own rule,
+  the resident judgement holds, and the package tracked again is linked warm.
 
 ### Targets and seeds
 

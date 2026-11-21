@@ -19,7 +19,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use super::BuildStateTool;
-use crate::capabilities::BuildStatePath;
+use crate::capabilities::{BuildStatePath, RemovedPackageCache};
 use crate::error::{CowshedError, Result};
 
 /// The one name a checkout reaches its build volume through, relative to the checkout root.
@@ -210,6 +210,49 @@ pub fn is_fixed_link(checkout: &Path, state: &BuildStatePath) -> bool {
     real_parents(checkout, path)
         && fs::read_link(checkout.join(path))
             .is_ok_and(|target| target == relative_target(path, state.volume.as_path()))
+}
+
+/// Take each removed package's cache off the checkout (`removed_package_caches`): its link, only
+/// where the path holds exactly the fixed link its row names ([`is_fixed_link`]), then each
+/// directory from the link's up to the package's own, that one included, while it is empty. It
+/// never removes a directory above the package's, anything the volume holds behind the link, or
+/// whatever else holds the path. Returns the paths whose link it removed.
+pub(crate) fn unlink_removed(
+    checkout: &Path,
+    removed: &[RemovedPackageCache],
+) -> Result<Vec<PathBuf>> {
+    let failed = |path: &Path, error: io::Error| {
+        CowshedError::integrity(
+            format!(
+                "cannot take the build-state link of a package the checkout no longer tracks off \
+                 {}: {error}",
+                path.display()
+            ),
+            "repair the path and retry; `cowshed doctor` reports each checkout's build link",
+        )
+    };
+    let mut unlinked = Vec::new();
+    for cache in removed {
+        if !is_fixed_link(checkout, &cache.state) {
+            continue;
+        }
+        let path = cache.state.checkout.as_path();
+        let at = checkout.join(path);
+        fs::remove_file(&at).map_err(|error| failed(&at, error))?;
+        unlinked.push(path.to_owned());
+        let package = checkout.join(&cache.package);
+        for directory in at.ancestors().skip(1) {
+            if !directory.starts_with(&package) {
+                break;
+            }
+            match fs::remove_dir(directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => return Err(failed(directory, error)),
+            }
+        }
+    }
+    Ok(unlinked)
 }
 
 /// What the build volume holds at a build-state path's volume directory.
@@ -793,5 +836,92 @@ mod tests {
         fs::create_dir_all(checkout.join(BUILD_LINK)).unwrap();
         assert!(linked(&checkout).is_err());
         assert!(point(&checkout, &scratch.volume("volume-a")).is_err());
+    }
+
+    /// A removed package's cache leaves the checkout by its exact link alone: the package's
+    /// directories that link leaves empty go with it, the package's own included and none above
+    /// it, and the volume keeps what it held. A package directory holding anything else stays, and
+    /// a link aimed elsewhere or a real directory at the path is left as it is.
+    #[test]
+    fn unlinking_a_removed_package_s_cache_takes_only_its_exact_link_and_what_it_emptied() {
+        let scratch = Scratch::new("removed-package");
+        let checkout = scratch.checkout();
+        let volume = scratch.volume("volume-a");
+        point(&checkout, &volume).unwrap();
+        let removed = |path: &str, package: &str| RemovedPackageCache {
+            state: if path.ends_with("node_modules/.cache") {
+                BuildStatePath::new(path, path).unwrap()
+            } else {
+                BuildStatePath::declared(path).unwrap()
+            },
+            package: PathBuf::from(package),
+        };
+        let gone = [
+            removed("packages/gone/node_modules/.cache", "packages/gone"),
+            removed("packages/gone/.cache/lmao", "packages/gone"),
+        ];
+        let partial = removed("packages/partial/.cache/lmao", "packages/partial");
+        let foreign = removed("packages/foreign/.cache/lmao", "packages/foreign");
+        let real = removed("packages/real/node_modules/.cache", "packages/real");
+        let mut linked: Vec<BuildStatePath> =
+            gone.iter().map(|cache| cache.state.clone()).collect();
+        linked.push(partial.state.clone());
+        link_paths(&checkout, &volume, &linked).unwrap();
+        for state in &linked {
+            fs::write(
+                volume.join(state.volume.as_path()).join("warm"),
+                b"volume bytes",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(checkout.join("packages/empty")).unwrap();
+        fs::write(checkout.join("packages/partial/notes"), b"not cowshed's").unwrap();
+        fs::create_dir_all(checkout.join("packages/foreign/.cache")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", checkout.join("packages/foreign/.cache/lmao"))
+            .unwrap();
+        fs::create_dir_all(checkout.join("packages/real/node_modules/.cache")).unwrap();
+        fs::write(
+            checkout.join("packages/real/node_modules/.cache/real"),
+            b"not cowshed's",
+        )
+        .unwrap();
+        let mut caches = gone.to_vec();
+        caches.extend([partial, foreign, real]);
+        assert_eq!(
+            unlink_removed(&checkout, &caches).unwrap(),
+            [
+                PathBuf::from("packages/gone/node_modules/.cache"),
+                PathBuf::from("packages/gone/.cache/lmao"),
+                PathBuf::from("packages/partial/.cache/lmao"),
+            ]
+        );
+        assert!(!checkout.join("packages/gone").exists());
+        assert!(
+            checkout.join("packages/empty").is_dir(),
+            "above the package's directory"
+        );
+        assert!(!checkout.join("packages/partial/.cache").exists());
+        assert_eq!(
+            fs::read(checkout.join("packages/partial/notes")).unwrap(),
+            b"not cowshed's"
+        );
+        assert_eq!(
+            fs::read_link(checkout.join("packages/foreign/.cache/lmao")).unwrap(),
+            Path::new("elsewhere")
+        );
+        assert_eq!(
+            fs::read(checkout.join("packages/real/node_modules/.cache/real")).unwrap(),
+            b"not cowshed's"
+        );
+        for state in &linked {
+            assert_eq!(
+                fs::read(volume.join(state.volume.as_path()).join("warm")).unwrap(),
+                b"volume bytes"
+            );
+        }
+        assert!(
+            unlink_removed(&checkout, &caches).unwrap().is_empty(),
+            "nothing is left to take"
+        );
     }
 }

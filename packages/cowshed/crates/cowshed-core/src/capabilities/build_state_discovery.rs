@@ -1497,6 +1497,133 @@ pub(crate) fn tracked_package_directories(workspace: &Path) -> Result<Vec<PathBu
         .collect())
 }
 
+/// A held cache row whose package the checkout no longer tracks: the one exception to a held
+/// path keeping its link (16_build_volumes.md, "Declared build state"). It is a JavaScript
+/// package's `node_modules/.cache` whose `package.json` the index no longer lists, or a declared
+/// cache beneath a directory a `[build] state` pattern selects and whose expansion no longer names
+/// it, since the index tracks nothing under that directory. `package` is that directory,
+/// checkout-relative: the bound of what a refresh removes for the row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovedPackageCache {
+    pub state: BuildStatePath,
+    pub package: PathBuf,
+}
+
+/// `held`, a build volume's recorded rows, split into those a refresh links and the caches of
+/// removed packages ([`RemovedPackageCache`]), which it never links. The evidence is the index
+/// listings the fingerprint already takes, kept while the index keeps its identity. A package
+/// that is only uninstalled (its manifest tracked, no `node_modules`), a kept declared path, a
+/// literal entry, a capability's own path and a row whose pattern the declaration dropped keep
+/// their link. A checkout without a Git directory has no listing to judge by and keeps every link.
+pub(crate) fn removed_package_caches(
+    workspace: &Path,
+    held: &[BuildStatePath],
+) -> Result<(Vec<BuildStatePath>, Vec<RemovedPackageCache>)> {
+    let mut linked = Vec::with_capacity(held.len());
+    let mut removed = Vec::new();
+    if fs::symlink_metadata(workspace.join(".git")).is_err() {
+        linked.extend_from_slice(held);
+        return Ok((linked, removed));
+    }
+    let mut packages: Option<BTreeSet<PathBuf>> = None;
+    let mut declared: Option<(Vec<DeclaredState>, BTreeSet<PathBuf>)> = None;
+    for state in held {
+        let path = state.checkout.as_path();
+        let package = if state.is_declared() {
+            if state.keep {
+                None
+            } else {
+                if declared.is_none() {
+                    let settings = super::workspace_config(workspace)?;
+                    let expanded = expand_declared(workspace, settings.build_state())?
+                        .into_iter()
+                        .map(|path| path.checkout.as_path().to_owned())
+                        .collect();
+                    declared = Some((settings.build_state().to_vec(), expanded));
+                }
+                let (entries, expanded) = declared.as_ref().expect("loaded above");
+                if expanded.contains(path) {
+                    None
+                } else {
+                    selected_package(entries, path)
+                }
+            }
+        } else if let Some(package) = javascript_package(path) {
+            if packages.is_none() {
+                packages = Some(
+                    tracked_package_directories(workspace)?
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            let tracked = packages.as_ref().expect("loaded above");
+            (!tracked.contains(&workspace.join(package))).then(|| package.to_owned())
+        } else {
+            None
+        };
+        match package {
+            Some(package) => removed.push(RemovedPackageCache {
+                state: state.clone(),
+                package,
+            }),
+            None => linked.push(state.clone()),
+        }
+    }
+    Ok((linked, removed))
+}
+
+/// The package directory of a JavaScript package's tool cache, `<package>/node_modules/.cache`;
+/// none for the checkout root's, whose package is the checkout itself.
+fn javascript_package(path: &Path) -> Option<&Path> {
+    if path.file_name()? != ".cache" {
+        return None;
+    }
+    let modules = path.parent()?;
+    if modules.file_name()? != "node_modules" {
+        return None;
+    }
+    modules
+        .parent()
+        .filter(|package| !package.as_os_str().is_empty())
+}
+
+/// The directory that a `[build] state` pattern the declaration does not keep selects for the
+/// declared `path`, each selector component matching one directory level as Git's glob pathspec
+/// reads it; none when no such pattern has `path`'s shape.
+fn selected_package(entries: &[DeclaredState], path: &Path) -> Option<PathBuf> {
+    entries.iter().find_map(|entry| {
+        let DeclaredState::Pattern {
+            selector,
+            state,
+            keep: false,
+        } = entry
+        else {
+            return None;
+        };
+        let depth = selector.components().count();
+        let package: PathBuf = path.components().take(depth).collect();
+        (package.components().count() == depth
+            && path.strip_prefix(&package).ok()? == state.as_path()
+            && selector
+                .components()
+                .zip(package.components())
+                .all(|(pattern, name)| level_matches(pattern.as_os_str(), name.as_os_str())))
+        .then_some(package)
+    })
+}
+
+/// Whether the directory `name` is what the selector component `pattern` reads: itself, or a
+/// match of its `*`, `?` and `[...]` (`fnmatch(3)`).
+fn level_matches(pattern: &OsStr, name: &OsStr) -> bool {
+    let (Ok(pattern), Ok(name)) = (
+        std::ffi::CString::new(pattern.as_bytes()),
+        std::ffi::CString::new(name.as_bytes()),
+    ) else {
+        return false;
+    };
+    // SAFETY: both are NUL-terminated strings that outlive the call, which only reads them.
+    unsafe { libc::fnmatch(pattern.as_ptr(), name.as_ptr(), 0) == 0 }
+}
 fn tracked_manifests(
     workspace: &Path,
     directory: &Path,
@@ -2897,5 +3024,64 @@ printf '%s:%s\n' "$index" "$PWD"
                 "{keep}"
             );
         }
+    }
+
+    /// A held cache is a removed package's on the index's evidence alone. A JavaScript package's
+    /// cache is one once its `package.json` is untracked, but not while the package is only
+    /// uninstalled. A declared cache is one once a pattern the declaration does not keep selects
+    /// its directory and the index tracks nothing under it. A kept path, a literal, the checkout
+    /// root's cache, a capability's own path and a row whose pattern was dropped keep their link,
+    /// and so does every row of a checkout without Git. Tracked again, the package's caches are
+    /// linked again.
+    #[test]
+    fn a_removed_package_s_caches_are_told_apart_by_the_index_alone() {
+        let fixture = Fixture::new();
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[build]\nstate = [\"packages/*/.cache/lmao\", \"packages/*/.pin\", \".cache/ttsc\"]\nkeep = [\"packages/*/.pin\"]\n",
+        );
+        let cache = |path: &str| BuildStatePath::new(path, path).unwrap();
+        let declared = |path: &str| BuildStatePath::declared(path).unwrap();
+        let gone = [
+            cache("packages/gone/node_modules/.cache"),
+            declared("packages/gone/.cache/lmao"),
+        ];
+        let mut held = vec![
+            cache("node_modules/.cache"),
+            cache("packages/a/node_modules/.cache"),
+            BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+            declared("packages/a/.cache/lmao"),
+            declared("packages/gone/.pin").kept(),
+            declared(".cache/ttsc"),
+            declared("dropped/gone/.cache/lmao"),
+        ];
+        held.extend(gone.iter().cloned());
+        let unjudged = removed_package_caches(&fixture.root, &held).unwrap();
+        assert_eq!(unjudged, (held.clone(), Vec::new()), "no Git, no evidence");
+
+        git(&fixture, &["init", "--quiet"]);
+        write(&fixture, "package.json", "{}\n");
+        write(&fixture, "packages/a/package.json", "{}\n");
+        git(&fixture, &["add", "--", "."]);
+        let (linked, removed) = removed_package_caches(&fixture.root, &held).unwrap();
+        assert_eq!(
+            removed,
+            gone.iter()
+                .map(|state| RemovedPackageCache {
+                    state: state.clone(),
+                    package: PathBuf::from("packages/gone"),
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(linked, held[..held.len() - gone.len()]);
+
+        write(&fixture, "packages/gone/package.json", "{}\n");
+        git(&fixture, &["add", "--", "packages/gone/package.json"]);
+        assert_eq!(
+            removed_package_caches(&fixture.root, &held).unwrap(),
+            (held.clone(), Vec::new()),
+            "a package tracked again"
+        );
     }
 }

@@ -1160,16 +1160,28 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 } => held.with_discovered(&paths, &released, mbx, fingerprint, &mount)?,
             };
             release_paths(&checkout, &mount, &released);
+            // The caches of packages the checkout no longer tracks are the held paths a refresh
+            // does not link; their rows and volume bytes stay (16_build_volumes.md, "Declared
+            // build state").
+            let (linked, removed) =
+                crate::capabilities::removed_package_caches(&checkout, &state.paths)?;
             let adopted = match crate::build_volume::migrate::adopt_paths(
                 host.census(),
                 &checkout,
                 &mount,
-                &state.paths,
+                &linked,
                 &held.paths,
             )? {
                 Ok(adopted) => adopted,
                 Err(refusal) => return Ok(Err(refusal)),
             };
+            for path in crate::build_volume::link::unlink_removed(&checkout, &removed)? {
+                cowshed_os::eprintln!(
+                    "cowshed: took the build-state link off {}: the checkout no longer tracks its \
+                     package, and the build volume keeps what it holds",
+                    checkout.join(path).display()
+                );
+            }
             if state != held {
                 state.write(&mount)?;
             }
@@ -6074,6 +6086,156 @@ mod tests {
         }
     }
 
+    /// A held cache whose package the checkout no longer tracks is the one held path a refresh
+    /// does not link (16_build_volumes.md, "Declared build state"). Its exact link goes, with the
+    /// package's directories it leaves empty and none above them, while the volume keeps its bytes
+    /// and the state keeps its row, so the package tracked again is linked to them warm. A package
+    /// still tracked is linked as before, though uninstalled and though its links are missing, as
+    /// after a land; a kept path follows its own rule; and whatever else holds a removed package's
+    /// path, a real directory or a link aimed elsewhere, is left as it is and refuses nothing.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_refresh_leaves_a_removed_package_s_caches_unlinked_until_it_is_tracked_again()
+     {
+        let scratch = Scratch::directory("removed-package");
+        tracked_checkout(
+            scratch.root.path(),
+            "main",
+            "[build]\ncapacity = \"1g\"\nstate = [\"packages/*/.cache/lmao\", \"packages/*/.pin\"]\nkeep = [\"packages/*/.pin\"]\n",
+            &["packages/app/package.json", "packages/gone/package.json"],
+        );
+        let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+        let cache = |package: &str| {
+            let path = format!("packages/{package}/node_modules/.cache");
+            BuildStatePath::new(&path, &path).unwrap()
+        };
+        let lmao = |package: &str| {
+            BuildStatePath::declared(&format!("packages/{package}/.cache/lmao")).unwrap()
+        };
+        let (app, gone) = ([cache("app"), lmao("app")], [cache("gone"), lmao("gone")]);
+        let partial = lmao("partial");
+        let pin = BuildStatePath::declared("packages/pinned/.pin")
+            .unwrap()
+            .kept();
+        let (stray_cache, stray_lmao) = (cache("stray"), lmao("stray"));
+        let mut paths = app.to_vec();
+        paths.extend(gone.iter().cloned());
+        paths.extend([
+            partial.clone(),
+            pin.clone(),
+            stray_cache.clone(),
+            stray_lmao.clone(),
+        ]);
+        let state = BuildVolumeState {
+            paths,
+            fingerprint: Some("fixture".into()),
+            mbx: None,
+        };
+        state.write(&mount).unwrap();
+        let mut linked = gone.to_vec();
+        linked.push(partial.clone());
+        link::link_paths(&checkout, &mount, &linked).unwrap();
+        for path in &state.paths {
+            let directory = mount.join(path.volume.as_path());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("warm"), b"volume bytes").unwrap();
+        }
+        fs::write(checkout.join("packages/partial/notes"), b"not cowshed's").unwrap();
+        fs::create_dir_all(checkout.join("packages/stray/node_modules/.cache")).unwrap();
+        fs::write(
+            checkout.join("packages/stray/node_modules/.cache/real"),
+            b"not cowshed's",
+        )
+        .unwrap();
+        fs::create_dir_all(checkout.join("packages/stray/.cache")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", checkout.join("packages/stray/.cache/lmao"))
+            .unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::git::git_command_at(&checkout)
+                .args(args)
+                .output_bounded()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        // Git removes the package's tracked files and leaves its ignored links behind.
+        git(&[
+            "rm",
+            "--quiet",
+            "--force",
+            "--",
+            "packages/gone/package.json",
+        ]);
+        let refresh = || async {
+            scratch
+                .volumes
+                .refresh(
+                    owner("main", '0'),
+                    checkout.clone(),
+                    Discovered::Unchanged,
+                    Lent::Nothing,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let exact = |path: &BuildStatePath| {
+            let at = checkout.join(path.checkout.as_path());
+            assert_eq!(
+                fs::read_link(&at).unwrap(),
+                link::relative_target(path.checkout.as_path(), path.volume.as_path()),
+                "{}",
+                path.checkout.as_path().display()
+            );
+            assert_eq!(fs::read(at.join("warm")).unwrap(), b"volume bytes");
+        };
+        for _ in 0..2 {
+            assert_eq!(refresh().await.volume, Some(live.clone()));
+            assert!(
+                !checkout.join("packages/gone").exists(),
+                "the removed package is not made again"
+            );
+            assert!(checkout.join("packages").is_dir());
+            assert!(!checkout.join("packages/partial/.cache").exists());
+            assert_eq!(
+                fs::read(checkout.join("packages/partial/notes")).unwrap(),
+                b"not cowshed's"
+            );
+            assert_eq!(
+                fs::read_link(checkout.join("packages/stray/.cache/lmao")).unwrap(),
+                Path::new("elsewhere")
+            );
+            assert_eq!(
+                fs::read(checkout.join("packages/stray/node_modules/.cache/real")).unwrap(),
+                b"not cowshed's"
+            );
+            app.iter().for_each(exact);
+            exact(&pin);
+            assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+            for path in &state.paths {
+                assert_eq!(
+                    fs::read(mount.join(path.volume.as_path()).join("warm")).unwrap(),
+                    b"volume bytes"
+                );
+            }
+        }
+        let mut current = state.clone();
+        current.fingerprint =
+            Some(crate::capabilities::tracked_manifest_fingerprint(&checkout).unwrap());
+        current.write(&mount).unwrap();
+        assert_eq!(
+            crate::resident::build_state_current(&checkout, Some(&mount)),
+            Ok(()),
+            "a removed package's absent caches leave the checkout as a refresh leaves it"
+        );
+        state.write(&mount).unwrap();
+
+        fs::create_dir_all(checkout.join("packages/gone")).unwrap();
+        fs::write(checkout.join("packages/gone/package.json"), "{}\n").unwrap();
+        git(&["add", "--", "packages/gone/package.json"]);
+        refresh().await;
+        gone.iter().for_each(exact);
+        scratch.release_all();
+    }
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_owned_index_refresh_preserves_a_busy_holder_and_fixed_link() {

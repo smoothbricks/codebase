@@ -336,7 +336,13 @@ pub fn build_state_current(mount: &Path, volume: Option<&Path>) -> Result<(), As
         .fingerprint
         .as_deref()
         .ok_or(AsIsDecline::Unrecorded)?;
-    if !link::settled(mount, volume, &state.paths) {
+    let (linked, removed) = crate::capabilities::removed_package_caches(mount, &state.paths)
+        .map_err(|_| AsIsDecline::InputsUnreadable)?;
+    if !link::settled(mount, volume, &linked)
+        || removed
+            .iter()
+            .any(|cache| link::is_fixed_link(mount, &cache.state))
+    {
         return Err(AsIsDecline::LinkDisplaced);
     }
     let fingerprint = crate::capabilities::tracked_manifest_fingerprint(mount)
