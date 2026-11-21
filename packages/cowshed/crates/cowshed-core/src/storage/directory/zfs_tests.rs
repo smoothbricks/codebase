@@ -101,14 +101,14 @@ impl Fixture {
         image
     }
 
-    /// The datasets and snapshots below the project's container `kind`.
-    fn listed(&self, kind: &str) -> Vec<String> {
-        let container = format!("{}/cowshed/projects/acme/widget/{kind}", self.tree);
+    /// Every dataset and snapshot of the project, named relative to its container.
+    fn listed(&self) -> Vec<String> {
+        let container = format!("{}/cowshed/projects/acme/widget", self.tree);
         zfs(&["list", "-H", "-r", "-t", "all", "-o", "name", &container])
             .map(|names| {
                 names
                     .lines()
-                    .filter(|name| *name != container)
+                    .filter_map(|name| name.strip_prefix(&container)?.strip_prefix('/'))
                     .map(str::to_owned)
                     .collect()
             })
@@ -167,7 +167,7 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
     datasets.create(&main, Some(1 << 30)).unwrap();
     assert_eq!(settle(payloads, &main).unwrap(), Payload::Home);
     fs::write(main.join("tracked"), "main").unwrap();
-    assert_eq!(fixture.listed("ws").len(), 1);
+    assert_eq!(fixture.listed(), ["main"]);
 
     // Mounting moves the dataset onto the mountpoint and leaves the directory store's record.
     let checkout = fixture.directory.join("checkout");
@@ -199,7 +199,10 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
         fs::read_to_string(checkout.join("tracked")).unwrap(),
         "main"
     );
-    assert_eq!(fixture.listed("ws").len(), 3, "{:?}", fixture.listed("ws"));
+    assert_eq!(
+        fixture.listed(),
+        ["main", "main@cowshed:fork-raven", "ws", "ws/raven"]
+    );
 
     // A workspace dataset with a live fork is never destroyed or promoted over: it is kept.
     assert_eq!(datasets.destroy(&checkout).unwrap(), None);
@@ -235,11 +238,22 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
         fs::read_to_string(retired.join("tracked")).unwrap(),
         "raven"
     );
+    // The dataset and its origin snapshot carry the retired name, so `raven` is free again.
+    assert_eq!(
+        fixture.listed(),
+        [
+            "main",
+            "main@cowshed:fork-raven-1",
+            "ws",
+            "ws/.trash",
+            "ws/.trash/raven-1"
+        ]
+    );
 
     // Reclaiming destroys the clone and then its origin snapshot, and only those.
     assert!(datasets.destroy(&retired).unwrap().is_some());
     assert!(!retired.exists());
-    assert_eq!(fixture.listed("ws").len(), 1, "{:?}", fixture.listed("ws"));
+    assert_eq!(fixture.listed(), ["main", "ws", "ws/.trash"]);
     assert_eq!(
         fs::read_to_string(checkout.join("tracked")).unwrap(),
         "main"
@@ -256,9 +270,7 @@ fn dataset_payloads_mount_fork_and_reclaim_as_the_store_protocol_says() {
     assert_eq!(fs::read_to_string(live.join("cache")).unwrap(), "warm");
     assert_eq!(fixture.origin(&live), "-");
     assert_eq!(
-        fixture.listed("build").len(),
-        1,
-        "{:?}",
-        fixture.listed("build")
+        fixture.listed(),
+        ["build", "build/2", "main", "ws", "ws/.trash"]
     );
 }

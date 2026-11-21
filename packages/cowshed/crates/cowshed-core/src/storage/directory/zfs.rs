@@ -23,9 +23,10 @@ use cowshed_helper::name::{Dataset, Root};
 use cowshed_os::deadline::{self, Bound, LatencyClass};
 
 use super::{MountPointState, Payload, clear_move_sibling, mount_point_state, move_sibling};
-use crate::build_volume::IMAGES_DIRECTORY;
+use crate::repository::SESSIONS_DIRECTORY;
 use crate::storage::apfs::native::sync_parent_path;
 use crate::storage::apfs::{ApfsStorageError, combine_cleanup};
+use cowshed_apfs::image::IMAGE_EXTENSION;
 
 /// One `zfs` command, or one helper invocation: a metadata transaction on the pool. A destroy
 /// frees its blocks in the background (01b_zfs.md, "Destroy does not stall the pool"), so none of
@@ -52,14 +53,29 @@ fn elevation(owner: u32, mode: u32) -> Elevation {
     }
 }
 
-/// The kind of payload an image path names, which is the container its dataset lives in: a
-/// build volume under `build`, every workspace payload under `ws` (09_substrates.md, "Fixed
-/// dataset hierarchy").
-fn container_of(project_relative: &Path) -> &'static str {
-    match project_relative.components().next() {
-        Some(first) if first.as_os_str() == IMAGES_DIRECTORY => "build",
-        _ => "ws",
+/// The dataset name of the payload at `project_relative`, below its project's container: the
+/// payload's place in the store, with the store's `sessions` directory named `ws` and no image
+/// extension (01b_zfs.md, "One pool, one root"). `main.dmg` is `main`, `sessions/raven.dmg` is
+/// `ws/raven`, `sessions/.trash/raven-<incarnation>.dmg` is `ws/.trash/raven-<incarnation>` and
+/// `build/<id>.dmg` is `build/<id>`. A dataset is therefore found by name from the path that
+/// names its payload, and `zfs list` reads as the store does.
+fn place_name(project_relative: &Path) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = project_relative
+        .components()
+        .map(|part| part.as_os_str().to_str().map(dataset_component))
+        .collect::<Option<_>>()?;
+    let last = parts.pop()?;
+    let stem = last.strip_suffix(&format!(".{IMAGE_EXTENSION}"))?;
+    if stem.is_empty() {
+        return None;
     }
+    if let Some(first) = parts.first_mut()
+        && first == SESSIONS_DIRECTORY
+    {
+        *first = "ws".to_owned();
+    }
+    parts.push(stem.to_owned());
+    Some(parts)
 }
 
 /// A store path component as a dataset name component. The store's encoding escapes with `%`,
@@ -196,9 +212,9 @@ impl ZfsPayloads {
         }
     }
 
-    /// A new dataset name for the payload at `image`:
-    /// `<root>/projects/<owner>/<repo>/<ws|build>/<id>`, its containers made first.
-    fn mint(&self, image: &Path) -> Result<String, ApfsStorageError> {
+    /// The dataset name of the payload at `image`,
+    /// `<root>/projects/<owner>/<repo>/<place>` ([`place_name`]), its containers made first.
+    fn named(&self, image: &Path) -> Result<String, ApfsStorageError> {
         let outside = || host("not a payload of a project in the store", image.display());
         let relative = image
             .strip_prefix(&self.store_root)
@@ -213,18 +229,20 @@ impl ZfsPayloads {
                 .map(dataset_component)
                 .ok_or_else(outside)
         };
+        let mut place = place_name(parts.as_path()).ok_or_else(outside)?;
+        let leaf = place.pop().ok_or_else(outside)?;
         let mut name = self.root.dataset().to_string();
-        for part in [
-            "projects".to_owned(),
-            component(owner)?,
-            component(repo)?,
-            container_of(parts.as_path()).to_owned(),
-        ] {
+        for part in ["projects".to_owned(), component(owner)?, component(repo)?]
+            .into_iter()
+            .chain(place)
+        {
             name = format!("{name}/{part}");
             Dataset::parse(&name).map_err(|error| host(&name, error))?;
             self.ensure_container(&name)?;
         }
-        Ok(format!("{name}/{}", uuid::Uuid::new_v4().simple()))
+        let name = format!("{name}/{leaf}");
+        Dataset::parse(&name).map_err(|error| host(&name, error))?;
+        Ok(name)
     }
 
     /// The dataset mounted at `directory`, when it is one of this root's.
@@ -262,7 +280,7 @@ impl ZfsPayloads {
         directory: &Path,
         refquota: Option<u64>,
     ) -> Result<(), ApfsStorageError> {
-        let name = self.mint(directory)?;
+        let name = self.named(directory)?;
         fs::create_dir(directory).map_err(|error| io_error("create payload", directory, error))?;
         let mountpoint = format!("mountpoint={}", path_text(directory)?);
         let quota = refquota.map(|bytes| format!("refquota={bytes}"));
@@ -283,9 +301,11 @@ impl ZfsPayloads {
         destination: &Path,
     ) -> Result<(), ApfsStorageError> {
         let origin = self.payload_at(source)?;
-        let name = self.mint(destination)?;
-        let id = name.rsplit('/').next().unwrap_or_default();
-        let snapshot = format!("{origin}@cowshed:fork-{id}");
+        let name = self.named(destination)?;
+        // One origin snapshot per clone, named for it (09_substrates.md, "The clone-origin
+        // dependency").
+        let fork = name.rsplit('/').next().unwrap_or_default();
+        let snapshot = format!("{origin}@cowshed:fork-{fork}");
         let quota = self.property(origin.as_str(), "refquota")?;
         fs::create_dir(destination)
             .map_err(|error| io_error("create clone payload", destination, error))?;
@@ -400,7 +420,13 @@ impl ZfsPayloads {
     /// `None`; otherwise it is the bytes the dataset held (`used`), read before it went.
     pub(super) fn destroy(&self, directory: &Path) -> Result<Option<u64>, ApfsStorageError> {
         let dataset = self.payload_at(directory)?;
-        if self.root.holds_build_volume(&dataset) {
+        // Any dataset in the project's `build` container, a released one in `build/.deleting`
+        // included.
+        let build = dataset
+            .as_str()
+            .strip_prefix(self.root.dataset().as_str())
+            .is_some_and(|below| below.split('/').nth(4) == Some("build"));
+        if build {
             // Each promote takes the promoted clone's origin and every older snapshot with it, so
             // one pass per remaining pinned snapshot ends with none.
             while let Some(clone) = self
@@ -565,10 +591,25 @@ impl ZfsPayloads {
     }
 
     /// Move the home payload at `from` to `to`, which must not exist: what a rename is to a
-    /// directory payload.
+    /// directory payload. The dataset takes the name of its new place first, then mounts there.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> Result<(), ApfsStorageError> {
         if fs::symlink_metadata(to).is_ok() {
             return Err(host("a payload's new place already exists", to.display()));
+        }
+        let dataset = self.payload_at(from)?;
+        let renamed = self.named(to)?;
+        if dataset.as_str() != renamed {
+            self.helper(&["rename", dataset.as_str(), &renamed])?;
+            // Its origin snapshot is named for the fork, so it follows the fork's name and
+            // leaves the old one free for the next fork of that name.
+            let leaf = |name: &str| name.rsplit('/').next().unwrap_or_default().to_owned();
+            let origin = self.property(&renamed, "origin")?;
+            if let Some((source, snapshot)) = origin.split_once('@')
+                && snapshot == format!("cowshed:fork-{}", leaf(dataset.as_str()))
+            {
+                let followed = format!("{source}@cowshed:fork-{}", leaf(&renamed));
+                self.helper(&["rename", &origin, &followed])?;
+            }
         }
         self.relocate(from, to, false)?;
         fs::remove_dir(from).map_err(|error| io_error("clear a moved payload's place", from, error))
@@ -592,16 +633,29 @@ mod tests {
     }
 
     #[test]
-    fn a_payloads_container_follows_its_place_in_the_project() {
+    fn a_dataset_is_named_for_its_payloads_place_in_the_project() {
         for (relative, expected) in [
-            ("build/7.dmg", "build"),
-            ("build/.deleting/7.dmg", "build"),
-            ("main.dmg", "ws"),
-            ("sessions/raven.dmg", "ws"),
-            ("sessions/.trash/raven-1.dmg", "ws"),
-            (".staging/main.dmg", "ws"),
+            ("main.dmg", Some("main")),
+            ("sessions/raven.dmg", Some("ws/raven")),
+            ("sessions/.trash/raven-1f.dmg", Some("ws/.trash/raven-1f")),
+            (
+                "sessions/.deleting/reclaimed-2a.dmg",
+                Some("ws/.deleting/reclaimed-2a"),
+            ),
+            (".staging/main.dmg", Some(".staging/main")),
+            ("build/7.dmg", Some("build/7")),
+            ("build/.deleting/7.dmg", Some("build/.deleting/7")),
+            ("sessions/raven", None),
+            ("sessions/.dmg", None),
+            ("", None),
         ] {
-            assert_eq!(container_of(Path::new(relative)), expected, "{relative}");
+            assert_eq!(
+                place_name(Path::new(relative))
+                    .map(|parts| parts.join("/"))
+                    .as_deref(),
+                expected,
+                "{relative}"
+            );
         }
         assert_eq!(dataset_component("acme%2Fwidget"), "acme:2Fwidget");
     }

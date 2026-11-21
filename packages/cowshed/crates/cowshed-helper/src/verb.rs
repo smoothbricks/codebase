@@ -69,7 +69,7 @@ pub const USAGE: &str = "usage: cowshed-helper <root> <verb> …
   clone    <dataset>@<snapshot> <dataset> [<property>=<value>…]
   snapshot <dataset>@<snapshot>
   destroy  <dataset>|<dataset>@<snapshot> [--defer]
-  rename   <dataset> <dataset>
+  rename   <dataset> <dataset> | <dataset>@<snapshot> <dataset>@<snapshot>
   promote  <build dataset>
   mount    <dataset>
   unmount  <dataset> [--force]
@@ -262,6 +262,17 @@ pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
             });
             Ok(plain(zfs))
         }
+        // A snapshot keeps its dataset: only its own name changes, which is how a fork's origin
+        // follows the fork into the trash.
+        ("rename", [from, to]) if from.contains('@') || to.contains('@') => {
+            let (from, to) = (snapshot(root, from)?, snapshot(root, to)?);
+            if from.dataset() != to.dataset() {
+                return Err(Refusal::Usage);
+            }
+            let mut zfs = command(["rename"]);
+            zfs.extend([from.as_str().to_owned(), to.as_str().to_owned()]);
+            Ok(plain(zfs))
+        }
         ("rename", [from, to]) => {
             let mut zfs = command(["rename"]);
             zfs.extend([
@@ -343,6 +354,7 @@ mod tests {
         let fork = format!("{main}@cowshed:fork-raven");
         let build = format!("{REPO}/build/7");
         let seed = format!("{build}@seed-1");
+        let retired_fork = format!("{main}@cowshed:fork-raven-1");
         let cases: Vec<(Vec<&str>, Vec<&str>)> = vec![
             (
                 vec![
@@ -378,6 +390,10 @@ mod tests {
             (
                 vec!["rename", &raven, &trash],
                 vec!["rename", &raven, &trash],
+            ),
+            (
+                vec!["rename", &fork, &retired_fork],
+                vec!["rename", &fork, &retired_fork],
             ),
             (vec!["destroy", &trash], vec!["destroy", &trash]),
             (vec!["destroy", &fork], vec!["destroy", &fork]),
