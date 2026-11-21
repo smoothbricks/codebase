@@ -294,10 +294,8 @@ ${renderYamlList(options.pushBranches.map(yamlScalar), 6)}
   pull_request:
 
 permissions:
-  # actions:write lets the drift step dispatch the managed-files workflow.
-  actions: write
+  actions: read
   contents: read
-${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
 concurrency:
   # One in-flight run per pull request, and per ref for pushes. Pushes to the first
@@ -314,6 +312,11 @@ defaults:
 jobs:
   ${CI_JOB_ID}:
     name: Validate
+    permissions:
+      # Only Validate dispatches managed-file healing and creates PR deployments.
+      actions: write
+      contents: read
+${options.deploy ? '      deployments: write\n' : ''}      statuses: write
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
 ${
@@ -1483,6 +1486,10 @@ function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
   return `
   e2e-deployment:
     name: E2E Tests (Deployed Stage)
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
     needs: main
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 15
@@ -1514,6 +1521,10 @@ function renderProductionDeployJob(options: CiWorkflowDefinitionOptions): string
   return `
   deploy-production:
     name: Deploy Production
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
     needs: ${needs}
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 30
