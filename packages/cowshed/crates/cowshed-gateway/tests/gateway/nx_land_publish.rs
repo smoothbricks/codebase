@@ -261,7 +261,7 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
     )
     .await;
     assert!(absent.starts_with("HTTP/1.1 404 "), "{absent}");
-    assert_eq!(head_events(&audit, hash), [(Some(200), 0)]);
+    assert_eq!(head_events(&audit, hash), [(Some(404), 0), (Some(200), 0)]);
     assert_eq!(head_events(&audit, missing), [(Some(404), 0)]);
     assert!(!visited(&store, hash), "a membership check is not a use");
     // Publishing again finds both results stored and replaces nothing.
@@ -273,6 +273,28 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
             existing: 2,
             skipped: 0
         }
+    );
+    // Both publishes asked for every key by HEAD, never by GET: a membership check, with GET's
+    // statuses (a miss, then a hit) and no body through the gateway, that marks no archive visited.
+    assert_eq!(
+        head_events(&audit, hash),
+        [(Some(404), 0), (Some(200), 0), (Some(200), 0)]
+    );
+    assert_eq!(
+        head_events(&audit, &worthwhile),
+        [(Some(200), 0), (Some(200), 0)]
+    );
+    assert!(
+        nx_events(&audit, hash, "GET")
+            .iter()
+            .all(|lookup| *lookup == (Some(404), None)),
+        "the publishes read no archive: {:?}",
+        nx_events(&audit, hash, "GET")
+    );
+    assert!(!visited(&store, hash), "a membership check is not a use");
+    assert!(
+        !visited(&store, &worthwhile),
+        "a membership check is not a use"
     );
 
     // Shed B, at the same inputs, restores the task from the project's cache and executes nothing.

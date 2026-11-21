@@ -25,13 +25,15 @@ it('the emitted publisher stores a missing key, counts a stored one without arch
   try {
     const puts: { path: string; bytes: number }[] = [];
     const stored = new Set<string>();
-    // The store's protocol (03_caches.md): a stored key answers GET 200 and PUT 409. 'race' is a key stored between the
-    // publisher's GET and its PUT; 'refuse' is a store that declines the upload.
+    const probes: string[] = [];
+    // The store's protocol (03_caches.md): a stored key answers HEAD 200 and PUT 409. 'race' is a key stored between the
+    // publisher's HEAD and its PUT; 'refuse' is a store that declines the upload.
     let answer: 'store' | 'race' | 'refuse' = 'store';
     const server = Bun.serve({
       hostname: '127.0.0.1',
       port: 0,
       async fetch(request) {
+        if (request.method !== 'PUT') probes.push(request.method);
         const key = new URL(request.url).pathname;
         if (request.method === 'PUT') {
           const body = await request.arrayBuffer();
@@ -128,12 +130,14 @@ local.cache.cache.put("accepted-fixture", "passed", ["result.txt"], 0);
       expect(chunked.stdout).toBe('{"published":0,"existing":1,"skipped":149}\n');
       expect(puts).toHaveLength(1);
 
-      // A key stored between the GET and the PUT answers 409: counted as existing, the store's archive kept.
+      // A key stored between the HEAD and the PUT answers 409: counted as existing, the store's archive kept.
       answer = 'race';
       const raced = await run([executable, 'publish', root, hashes]);
       expect(raced.status, raced.stderr).toBe(0);
       expect(raced.stdout).toBe('{"published":0,"existing":1,"skipped":0}\n');
       expect(puts).toHaveLength(2);
+      // Every key was asked for by HEAD, a membership check, never by a GET that reads the archive.
+      expect(new Set(probes)).toEqual(new Set(['HEAD']));
 
       stored.clear();
       answer = 'refuse';
