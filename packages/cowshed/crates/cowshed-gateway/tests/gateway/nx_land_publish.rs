@@ -97,6 +97,39 @@ fn attributed(
     hash.clone()
 }
 
+/// The gateway's audited `(status, bytes)` of each `HEAD` for `hash`: what the proxy put on the wire.
+fn head_events(audit: &super::NxRecordingAudit, hash: &str) -> Vec<(Option<u16>, u64)> {
+    let path = format!("/nx/v1/cache/{hash}");
+    audit
+        .events
+        .lock()
+        .expect("audit events")
+        .iter()
+        .filter(|event| {
+            event.path.as_deref() == Some(path.as_str()) && event.method.as_deref() == Some("HEAD")
+        })
+        .map(|event| (event.http_status, event.bytes))
+        .collect()
+}
+
+/// Whether the store's entry for `hash` carries SIEVE's visited bit (`atime > mtime`, 03_caches.md).
+fn visited(store: &Path, hash: &str) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut pending = vec![store.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("list the Nx store") {
+            let path = entry.expect("a store entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == hash) {
+                let metadata = std::fs::metadata(&path).expect("stat the stored archive");
+                return (metadata.atime(), metadata.atime_nsec())
+                    > (metadata.mtime(), metadata.mtime_nsec());
+            }
+        }
+    }
+    panic!("no stored archive for {hash} under {}", store.display());
+}
 /// The land's publish job for `hashes` of the checkout at `root`: the script on stdin, the
 /// root and the JSON hashes as arguments, the workspace's own Nx environment.
 async fn land_publish(root: &Path, origin: &str, hashes: &[String]) -> Published {
@@ -147,13 +180,14 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
     config.nx_cache = Some(NxCacheServiceConfig {
         script: server_script(),
         path: server_path(),
-        directory: store,
+        directory: store.clone(),
         max_bytes: 64 * 1024 * 1024,
         cap_bytes: 96 * 1024 * 1024,
     });
     let (gateway, audit) = gateway_with(config, UpstreamHealth::Healthy).await;
     let handle = gateway.handle();
     let mut origins = Vec::new();
+    let mut endpoints = Vec::new();
     for (workspace, byte) in [("nx-land-a", 91), ("nx-land-b", 92)] {
         let (installed, _, _) = session(
             workspace,
@@ -165,6 +199,7 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
         );
         let endpoint = install_in_free_block(&handle, installed).await;
         origins.push(format!("http://{endpoint}/nx"));
+        endpoints.push(endpoint);
     }
 
     // Shed A builds a cheap task: its lookup misses, the task executes, and the bound keeps the
@@ -212,6 +247,23 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
     );
     assert_eq!(nx_events(&audit, hash, "PUT"), [(Some(200), None)]);
     assert_eq!(nx_events(&audit, &worthwhile, "PUT"), [(Some(200), None)]);
+    // A HEAD through the gateway is a membership check: the stored key answers 200 with the
+    // archive's length and no body, a key never stored 404, and the archive the publish just
+    // stored, which nothing has read, stays unvisited.
+    let held =
+        super::proxy_request(endpoints[0], super::nx_request(endpoints[0], "HEAD", hash)).await;
+    assert!(held.starts_with("HTTP/1.1 200 "), "{held}");
+    assert!(held.ends_with("\r\n\r\n"), "a HEAD answers no body: {held}");
+    let missing = "404040404040404040";
+    let absent = super::proxy_request(
+        endpoints[0],
+        super::nx_request(endpoints[0], "HEAD", missing),
+    )
+    .await;
+    assert!(absent.starts_with("HTTP/1.1 404 "), "{absent}");
+    assert_eq!(head_events(&audit, hash), [(Some(200), 0)]);
+    assert_eq!(head_events(&audit, missing), [(Some(404), 0)]);
+    assert!(!visited(&store, hash), "a membership check is not a use");
     // Publishing again finds both results stored and replaces nothing.
     let again = land_publish(&shed_a, &origins[0], &hashes).await;
     assert_eq!(
@@ -244,6 +296,10 @@ async fn host_controller_a_landed_gate_publishes_and_another_shed_restores_it() 
         String::from_utf8_lossy(&restored.stdout).contains("remote cache"),
         "{}",
         run_text(&restored)
+    );
+    assert!(
+        visited(&store, hash),
+        "shed B's restore is a use, and marks the archive visited"
     );
     gateway.drain().await.expect("drain the gateway");
 }

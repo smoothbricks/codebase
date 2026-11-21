@@ -90,6 +90,39 @@ describe('artifact round trip', () => {
   });
 });
 
+describe('membership', () => {
+  test('a HEAD answers what a GET answers, with the length and no body', async () => {
+    const { server } = await serve();
+    const artifact = filled(4096, 7);
+    expect((await put(server, KEY, artifact)).status).toBe(200);
+    const held = await fetch(`${server.origin}/v1/cache/${KEY}`, { method: 'HEAD' });
+    expect(held.status).toBe(200);
+    expect(held.headers.get('content-length')).toBe(String(artifact.byteLength));
+    expect((await held.arrayBuffer()).byteLength).toBe(0);
+    for (const missing of ['404040404040404040', 'not.a.key']) {
+      const answer = await fetch(`${server.origin}/v1/cache/${missing}`, { method: 'HEAD' });
+      expect(answer.status).toBe((await get(server, missing)).status);
+      expect(answer.status).toBe(404);
+    }
+  });
+
+  test('a HEAD is possession, not use: it leaves the visited bit clear, where a GET sets it', async () => {
+    const { server, directory } = await serve();
+    expect((await put(server, KEY, filled(4096, 9))).status).toBe(200);
+    const entry = join(directory, KEY);
+    const visited = async () => {
+      const info = await stat(entry);
+      return info.atimeMs > info.mtimeMs;
+    };
+    expect(await visited()).toBe(false);
+    expect((await fetch(`${server.origin}/v1/cache/${KEY}`, { method: 'HEAD' })).status).toBe(200);
+    expect(await visited()).toBe(false);
+    const read = await get(server, KEY);
+    await read.arrayBuffer();
+    expect(await visited()).toBe(true);
+  });
+});
+
 describe('a cache entry is never replaced', () => {
   test('answers 409 and keeps the original bytes', async () => {
     const { server } = await serve();
