@@ -333,6 +333,7 @@ const artifacts = join(root, '.cache', 'statebus-packages');
 mkdirSync(artifacts, { recursive: true });
 // A failed rerun must not leave a previous success report in the uploaded artifact.
 rmSync(join(artifacts, 'validation.json'), { force: true });
+// Compare canonical paths on hosts where the OS temp directory is a symlink.
 const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'statebus-packaged-consumer-')));
 const external = new Map();
 const dependencies = {};
@@ -377,6 +378,9 @@ try {
     assert.ok(existsSync(join(target, packed.exports['.'].types)));
     assert.ok(existsSync(join(target, packed.exports['.'].import)));
     assert.ok(!existsSync(join(target, 'node_modules')));
+    if (name === 'statebus-core')
+      for (const guide of ['CONSUMER.md', 'REPLAY.md', 'EXECUTION.md'])
+        assert.ok(existsSync(join(target, guide)), `Missing published consumer guide: ${guide}`);
     for (const [dep, version] of Object.entries({ ...packed.dependencies, ...packed.peerDependencies })) {
       if (dep.startsWith('@smoothbricks/') && manifests.has(dep.slice('@smoothbricks/'.length))) {
         assert.equal(
@@ -399,6 +403,7 @@ try {
   // workspace/global store, bypassing the consumer's @types/react and hiding
   // dependency-closure problems.
   for (const dep of ['typescript', '@types/node']) external.set(dep, root);
+  external.set('fast-check', join(root, 'packages', 'statebus-data-loader'));
   for (const dep of ['@types/react', '@types/react-dom', 'react-dom', 'happy-dom'])
     external.set(dep, join(root, 'packages', 'statebus-react'));
   const installedRoots = [];
@@ -493,7 +498,21 @@ try {
       stdio: 'inherit',
     });
     // Both runners select built StateBus exports and development React for act/StrictMode.
-    for (const executable of ['scenario', 'edge-cases'])
+    for (const executable of [
+      'scenario',
+      'edge-cases',
+      'capture-scenarios',
+      'execution-scenarios',
+      'support-edges',
+      'journal-edges',
+      'loader-edges',
+      'runtime-edges',
+      'aggregate-edges',
+      'navigation-edges',
+      'bus-api',
+      'api-bindings',
+      'parent-bindings',
+    ])
       for (const runner of ['node', 'bun'])
         run(`${linker}: ${runner} ${executable}`, runner, [join(consumer, 'dist', 'composed', `${executable}.js`)], {
           cwd: consumer,
@@ -528,6 +547,18 @@ try {
           'LMAO Op/Result binding',
           'generated typed codecs',
           'React lifecycle and no-I/O JSON replay',
+          'rolling checkpoint and effect retention',
+          'owned codec migrations and causal positions',
+          'typed execution policies, reactions and awaitable cleanup',
+          'aggregate runtime admission across effects and query loaders',
+          'deny-default support metadata, IDs and portable failures',
+          'fixed journal capacity, atomic checkpoint bounds and pre-materialization refusal',
+          'loader setup rollback, failure handling and transport drain',
+          'bounded effect admission, group-local cancellation and dispatch recovery',
+          'navigation cleanup, completion tracking and boolean React selectors',
+          'unified library/application API, hosted hooks and repeated-library selection',
+          'typed sibling capability bindings, cycle refusal and hosted session admission',
+          'explicit parent capability forwarding across nested and repeated occurrences',
         ],
       },
       null,

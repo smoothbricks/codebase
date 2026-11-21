@@ -1,3 +1,11 @@
+/** A listener cycle exhausted its synchronous turn. Pending publications are retained for explicit recovery. */
+export class DispatchCycleError extends Error {
+  readonly code = 'dispatch-cycle';
+  constructor(readonly limit: number) {
+    super(`StateBus dispatch exceeded ${limit} waves without quiescing.`);
+  }
+}
+
 /** The shared, capacity-retaining dispatcher used by both public StateBus APIs. */
 export class DispatchQueue<Event> {
   private count = 0;
@@ -5,11 +13,20 @@ export class DispatchQueue<Event> {
   private working = new Array<Event | undefined>(32).fill(undefined);
   private active = false;
   private disposed = false;
+  private paused = false;
 
   constructor(
     private readonly wave: (events: readonly (Event | undefined)[], count: number) => void,
     private readonly schedule: () => void,
-  ) {}
+    private readonly maxWavesPerFlush = 1024,
+  ) {
+    if (!Number.isSafeInteger(maxWavesPerFlush) || maxWavesPerFlush < 1)
+      throw new RangeError('maxWavesPerFlush must be a positive safe integer.');
+  }
+
+  get suspended(): boolean {
+    return this.paused;
+  }
 
   get idle(): boolean {
     return !this.active && this.count === 0;
@@ -19,15 +36,22 @@ export class DispatchQueue<Event> {
     if (this.disposed) throw new Error('Cannot publish to a disposed StateBus.');
     const length = ++this.count;
     this.pending[length - 1] = event;
-    if (!this.active) this.schedule();
+    if (!this.active && !this.paused) this.schedule();
     return length;
   }
 
   flush(): void {
     if (this.active || this.disposed) return;
     this.active = true;
+    this.paused = false;
+    let waves = 0;
     try {
       while (this.count > 0 && !this.disposed) {
+        if (waves === this.maxWavesPerFlush) {
+          this.paused = true;
+          throw new DispatchCycleError(this.maxWavesPerFlush);
+        }
+        waves++;
         const events = this.pending;
         const count = this.count;
         this.count = 0;
@@ -42,7 +66,7 @@ export class DispatchQueue<Event> {
       }
     } finally {
       this.active = false;
-      if (this.count > 0 && !this.disposed) this.schedule();
+      if (this.count > 0 && !this.disposed && !this.paused) this.schedule();
     }
   }
 

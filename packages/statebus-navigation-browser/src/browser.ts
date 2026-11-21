@@ -62,8 +62,11 @@ export function createBrowserNavigation(options: { readonly window: Window }): B
   function stop(): void {
     if (!listening) return;
     listening = false;
-    browser.removeEventListener('popstate', onPopState);
-    browser.removeEventListener('hashchange', onHashChange);
+    try {
+      browser.removeEventListener('popstate', onPopState);
+    } finally {
+      browser.removeEventListener('hashchange', onHashChange);
+    }
   }
 
   return {
@@ -78,9 +81,19 @@ export function createBrowserNavigation(options: { readonly window: Window }): B
       listeners.add(forward);
       if (!listening) {
         listening = true;
-        notifiedHref = browser.location.href;
-        browser.addEventListener('popstate', onPopState);
-        browser.addEventListener('hashchange', onHashChange);
+        try {
+          notifiedHref = browser.location.href;
+          browser.addEventListener('popstate', onPopState);
+          browser.addEventListener('hashchange', onHashChange);
+        } catch (cause) {
+          listeners.delete(forward);
+          try {
+            stop();
+          } catch {
+            // All removals were attempted; retain the original setup failure.
+          }
+          throw cause;
+        }
       }
       let released = false;
       return () => {
@@ -126,11 +139,14 @@ export function createBrowserNavigation(options: { readonly window: Window }): B
     dispose() {
       if (disposed) return;
       disposed = true;
-      stop();
-      listeners.clear();
-      location = undefined;
-      lastHref = '';
-      notifiedHref = '';
+      try {
+        stop();
+      } finally {
+        listeners.clear();
+        location = undefined;
+        lastHref = '';
+        notifiedHref = '';
+      }
     },
   };
 }

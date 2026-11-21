@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { Err, Ok } from '@smoothbricks/lmao';
 import {
   bindEffect,
+  CaptureError,
   type ComposedRuntime,
   captureCheckpoint,
   composeLibraries,
@@ -212,7 +213,15 @@ await test('portable JSON envelopes and branded resource codecs replay the same 
             schema: recorded.checkpoint.schema.map((entry) => ({ ...entry, version: 2 })),
           },
         }),
-      /Incompatible/,
+      (error) =>
+        error instanceof CaptureError &&
+        error.issue.code === 'schema' &&
+        error.issue.boundary === 'checkpoint declaration' &&
+        error.issue.owner === 'portable' &&
+        error.issue.declaration === 'selected' &&
+        error.issue.schema === 'inventory.shelf-id' &&
+        error.issue.fromVersion === 2 &&
+        error.issue.toVersion === 1,
     );
   } finally {
     recorder.dispose();
