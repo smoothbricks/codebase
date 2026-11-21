@@ -27,7 +27,7 @@ describe('a reserved nextest leaf whose cases each start on a core', () => {
     expect(gate.arrived('a')).toBe(true);
     expect(gate.arrived('b')).toBe(true);
     expect(said).toEqual(['start a', 'start b']);
-    expect(gate.summary()).toEqual({ own: 2, lent: 0, lentCoreMs: 0, waitedCaseMs: 0 });
+    expect(gate.summary()).toEqual({ own: 2, lent: 0, queued: 0, runningAtEnd: 0, lentCoreMs: 0, waitedCaseMs: 0 });
   });
 
   it('holds one pool request for a case beyond its grant, starts it on the core the pool grants and gives that core back at its end', () => {
@@ -40,7 +40,14 @@ describe('a reserved nextest leaf whose cases each start on a core', () => {
     clock.now = 21_000;
     gate.ended('short');
     expect(said.slice(2)).toEqual(['start short', 'release short']);
-    expect(gate.summary()).toEqual({ own: 1, lent: 1, lentCoreMs: 1_000, waitedCaseMs: 20_000 });
+    expect(gate.summary()).toEqual({
+      own: 1,
+      lent: 1,
+      queued: 0,
+      runningAtEnd: 0,
+      lentCoreMs: 1_000,
+      waitedCaseMs: 20_000,
+    });
   });
 
   it("gives a freed core of its grant to the waiting case with the longest recorded wall and withdraws that case's request", () => {
@@ -92,8 +99,52 @@ describe('a reserved nextest leaf whose cases each start on a core', () => {
     clock.now = 20_000;
     gate.granted('waited');
     // nextest timed the case from its shim's start: 21 s.
-    expect(runWallMs(21_000, gate.waitedMs('waited'))).toBe(1_000);
-    expect(runWallMs(5_000, gate.waitedMs('held'))).toBe(5_000);
+    expect(gate.outcome('waited')).toEqual({ kind: 'ran', waitedMs: 20_000 });
+    expect(gate.outcome('held')).toEqual({ kind: 'ran', waitedMs: 0 });
+    expect(runWallMs(21_000, 20_000)).toBe(1_000);
+  });
+
+  it('takes its state when the run begins to end: the case on the grant ran, the waiting one never starts on the core the teardown frees, and each wait counts once', () => {
+    // A land gate's leaf of 2026-11-21: one core, one case on it for 178.7 s, fifteen waiting; the SIGTERM that ended
+    // the case on the core handed that core to a waiting case, which was recorded as a run of 0.1 s after a 181.6 s wait.
+    const { gate, said, clock } = gateOf(1);
+    gate.arrived('long');
+    clock.now = 1_000;
+    gate.arrived('queued');
+    clock.now = 180_000;
+    gate.ending();
+    clock.now = 181_600;
+    gate.ended('long');
+    gate.granted('queued');
+    gate.ended('queued');
+    gate.arrived('late');
+    gate.ended('late');
+    expect(said).toEqual(['start long', 'reserve queued', 'release queued', 'release queued', 'release late']);
+    expect(gate.outcome('long')).toEqual({ kind: 'ran', waitedMs: 0 });
+    expect(gate.outcome('queued')).toEqual({ kind: 'queued', waitedMs: 179_000 });
+    expect(gate.outcome('late')).toEqual({ kind: 'queued', waitedMs: 0 });
+    expect(gate.summary()).toEqual({
+      own: 1,
+      lent: 0,
+      queued: 2,
+      runningAtEnd: 1,
+      lentCoreMs: 0,
+      waitedCaseMs: 179_000,
+    });
+    // A second end changes nothing.
+    gate.ending();
+    expect(gate.summary().runningAtEnd).toBe(1);
+  });
+
+  it('counts a case that ended while it waited, before the run ended, as never started', () => {
+    const { gate, clock } = gateOf(1);
+    gate.arrived('a');
+    gate.arrived('b');
+    clock.now = 5_000;
+    gate.ended('b');
+    gate.ending();
+    expect(gate.outcome('b')).toEqual({ kind: 'queued', waitedMs: 5_000 });
+    expect(gate.summary()).toMatchObject({ own: 1, queued: 1, runningAtEnd: 1, waitedCaseMs: 5_000 });
   });
 
   /** A shim's side of the gate: connect, name the case, and read what the gate answers until it ends. */

@@ -49,6 +49,7 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import { CPU_TOKENS_ENV } from './runner-sizing.js';
+import { isClosedTestResult, TEST_RESULTS_FILE } from './test-results.js';
 import { readRecord, type TempVolumeSpace, VERDICT_FILE, writeRecord } from './verdict.js';
 
 const workspaces: string[] = [];
@@ -2273,13 +2274,98 @@ const arrive = (test) => new Promise((resolve, reject) => {
     expect(result.terminalOutput).toContain('cargo threads=6\n');
     expect(result.terminalOutput).toContain('ran a on go\n');
     expect(result.terminalOutput).toContain('ran b on go\n');
-    expect(result.terminalOutput).toMatch(/cowshed: mbx reserve cases own=1 lent=1 lent_core_s=0 waited_case_s=0\n/);
+    expect(result.terminalOutput).toMatch(
+      /cowshed: mbx reserve cases own=1 lent=1 queued=0 running_at_end=0 lent_core_s=0 waited_case_s=0\n/,
+    );
     expect(reserves).toEqual([
       { cpus: 6, priority: 'low', name: null },
       { cpus: 1, priority: 'low', name: 'nextest:pkg::bin::b' },
     ]);
   });
 
+  it('records a gated case still waiting when its leaf ends at the no-progress bound as never started, beside the case that ran', async () => {
+    // A land gate's leaf of 2026-11-21: one core, one case on it past the bound, fifteen waiting for a pool core that a
+    // full pool never granted; the teardown then handed the freed core to a waiting case, recorded as a 0.1 s run.
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-cargo');
+    await mkdir(bin);
+    // The leaf's own request is granted one core; a case's request waits, as a full pool keeps it.
+    const endpoint = await standInReservations((heard) => (heard.name === null ? 1 : null));
+    const cases = join(bin, 'cases.cjs');
+    await writeFile(
+      cases,
+      `const { createConnection } = require('node:net');
+const started = Date.now();
+const event = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const arrive = (test) => {
+  event({ type: 'test', event: 'started', name: 'pkg::bin$' + test });
+  const client = createConnection(process.env.${TEST_GATE_ENV});
+  client.setEncoding('utf8');
+  client.on('connect', () => client.write(JSON.stringify({ binary: 'pkg::bin', test }) + '\\n'));
+  client.on('data', (line) => console.error('ran ' + test + ' on ' + line.trim()));
+  client.on('error', () => {});
+};
+process.on('SIGTERM', () => {
+  const exec_time = (Date.now() - started) / 1000;
+  event({ type: 'test', event: 'failed', name: 'pkg::bin$held', exec_time });
+  event({ type: 'test', event: 'failed', name: 'pkg::bin$queued', exec_time });
+  process.exit(1);
+});
+arrive('held');
+setTimeout(() => arrive('queued'), 50);
+setInterval(() => {}, 1000);
+`,
+    );
+    await writeFile(join(bin, 'cargo'), `#!/bin/sh\nexec '${process.execPath}' '${cases}'\n`, { mode: 0o755 });
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+      [TEST_GATE_SERVED_ENV]: process.env[TEST_GATE_SERVED_ENV],
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env[RESERVATIONS_ENV] = endpoint.socket;
+    process.env[TEST_GATE_SERVED_ENV] = '1';
+    const directory = join(workspace.root, 'record');
+    try {
+      const result = await runBoundedExec(
+        {
+          command: 'cargo nextest run --binaries-metadata m.json --message-format libtest-json-plus',
+          idleTimeoutMs: 1_500,
+          killAfterMs: 2_000,
+        },
+        { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory } },
+        createProcessTreeKiller(),
+        null,
+      );
+      expect(result.success, result.terminalOutput).toBe(false);
+      expect(result.terminalOutput).toContain('ran held on go');
+      expect(result.terminalOutput).not.toContain('ran queued on go');
+      expect(result.terminalOutput).toMatch(/cowshed: mbx reserve cases own=1 lent=0 queued=1 running_at_end=1 /);
+      const results = (await readFile(join(directory, TEST_RESULTS_FILE), 'utf8'))
+        .split('\n')
+        .filter((line) => line !== '')
+        .map((line): unknown => JSON.parse(line))
+        .filter(isClosedTestResult);
+      const held = results.find((row) => row.id === 'pkg::bin::held');
+      const queued = results.find((row) => row.id === 'pkg::bin::queued');
+      expect(held?.status).toBe('fail');
+      expect(held?.durationMs).toBeNumber();
+      expect(held?.waitMs).toBeUndefined();
+      expect(queued?.status).toBe('fail');
+      expect(queued?.durationMs, JSON.stringify(results)).toBeNull();
+      expect(queued?.waitMs ?? 0, JSON.stringify(results)).toBeGreaterThanOrEqual(1_000);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await endpoint.close();
+    }
+  });
   it("sizes a nextest leaf to its grant where its run's mbx gates no cases, and names it no gate", async () => {
     const { result, reserves } = await gatedNextest(false);
     expect(result.success, result.terminalOutput).toBe(true);
@@ -2354,7 +2440,9 @@ const arrive = (test) => new Promise((resolve, reject) => {
       expect(result.terminalOutput).toContain(`cargo threads=${nextestWant}\n`);
       expect(result.terminalOutput).toContain('ran a on go\n');
       expect(result.terminalOutput).toContain('ran b on go\n');
-      expect(result.terminalOutput).toMatch(/cowshed: cpu-pool cases own=1 lent=1 lent_core_s=0 waited_case_s=\d+\n/);
+      expect(result.terminalOutput).toMatch(
+        /cowshed: cpu-pool cases own=1 lent=1 queued=0 running_at_end=0 lent_core_s=0 waited_case_s=\d+\n/,
+      );
     } finally {
       for (const [name, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[name];

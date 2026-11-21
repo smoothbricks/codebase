@@ -51,11 +51,20 @@ export interface CaseGateSummary {
   /** Cases that ran on the leaf's grant, and on a core of their own. */
   readonly own: number;
   readonly lent: number;
+  /** Cases that never started: still waiting when the run began to end, or ended while they waited. */
+  readonly queued: number;
+  /** Cases running, on the grant or a core of their own, when the run began to end; zero for a run that ended whole. */
+  readonly runningAtEnd: number;
   /** How long the cases on a core of their own held it, summed. */
   readonly lentCoreMs: number;
-  /** How long the cases waited at the gate, summed. */
+  /** How long the cases waited at the gate, summed: each case's wait once, a case that never started's included. */
   readonly waitedCaseMs: number;
 }
+
+/** How one case left its gate: it ran after waiting `waitedMs`, or it never started and waited `waitedMs`. */
+export type CaseOutcome =
+  | { readonly kind: 'ran'; readonly waitedMs: number }
+  | { readonly kind: 'queued'; readonly waitedMs: number };
 
 type CaseState =
   | { readonly kind: 'waiting'; readonly since: number }
@@ -63,19 +72,24 @@ type CaseState =
   | { readonly kind: 'lent'; readonly since: number };
 
 /**
- * The gate's decisions, as a state machine over three events: a case arrived, the pool granted a case's request, a
- * case ended. `own` is the leaf's granted cores; `wall` a case's last recorded wall, by which a freed core of the
- * grant picks the longest waiting case, so the cores the pool gives go to the shorter ones and come back soonest.
+ * The gate's decisions, as a state machine over four events: a case arrived, the pool granted a case's request, a
+ * case ended, and the run began to end. `own` is the leaf's granted cores; `wall` a case's last recorded wall, by which
+ * a freed core of the grant picks the longest waiting case, so the cores the pool gives go to the shorter ones and
+ * come back soonest. Once the run is ending no case starts: the cores its teardown frees go back, never to a case that
+ * waited, so what was executing and what was queued is what it was when the run's end began.
  */
 export class CaseGate {
   readonly #cases = new Map<string, CaseState>();
   readonly #waited = new Map<string, number>();
+  readonly #queued = new Map<string, number>();
   #ownRunning = 0;
   #own = 0;
   #lent = 0;
   #lentCoreMs = 0;
   #waitedCaseMs = 0;
   #ranWallMs = 0;
+  #endingAt: number | null = null;
+  #runningAtEnd = 0;
 
   constructor(
     private readonly own: number,
@@ -87,6 +101,12 @@ export class CaseGate {
   /** A case's shim connected. False for a case already at the gate, which its second connection may not join. */
   arrived(id: string): boolean {
     if (this.#cases.has(id)) return false;
+    if (this.#endingAt !== null) {
+      // An ending run starts nothing: the case waits unanswered until its connection ends, never having started.
+      this.#cases.set(id, { kind: 'waiting', since: this.now() });
+      this.#queue(id, 0);
+      return true;
+    }
     if (this.#ownRunning < this.own) {
       this.#startOwn(id, 0);
       return true;
@@ -96,10 +116,10 @@ export class CaseGate {
     return true;
   }
 
-  /** The pool granted the case's request. One whose case no longer waits gives the core straight back. */
+  /** The pool granted the case's request. One whose case no longer waits, or whose run is ending, gives it back. */
   granted(id: string): void {
     const state = this.#cases.get(id);
-    if (state?.kind !== 'waiting') {
+    if (state?.kind !== 'waiting' || this.#endingAt !== null) {
       this.effects.release(id);
       return;
     }
@@ -118,6 +138,8 @@ export class CaseGate {
     if (state.kind !== 'waiting') this.#ranWallMs += this.wall(id);
     switch (state.kind) {
       case 'waiting':
+        // A case that ended while it waited never started; its wait was recorded already if the run was ending.
+        if (!this.#queued.has(id)) this.#queue(id, this.now() - state.since);
         this.effects.release(id);
         return;
       case 'lent':
@@ -126,6 +148,7 @@ export class CaseGate {
         return;
       case 'own': {
         this.#ownRunning -= 1;
+        if (this.#endingAt !== null) return;
         let longest: { id: string; since: number } | null = null;
         for (const [waiting, other] of this.#cases) {
           if (other.kind !== 'waiting') continue;
@@ -141,9 +164,27 @@ export class CaseGate {
     }
   }
 
-  /** How long the case waited at the gate before it started, in ms; zero for one that never did. */
-  waitedMs(id: string): number {
-    return this.#waited.get(id) ?? 0;
+  /**
+   * The run began to end (its command is being stopped, or has exited): from now no case starts. Each case still
+   * waiting has waited until now and never started; each one running is counted as running at the end. Later calls do
+   * nothing, so the first, taken before the teardown frees any core, is the one that counts.
+   */
+  ending(): void {
+    if (this.#endingAt !== null) return;
+    const at = this.now();
+    this.#endingAt = at;
+    for (const [id, state] of this.#cases) {
+      if (state.kind === 'waiting') this.#queue(id, at - state.since);
+      else this.#runningAtEnd += 1;
+    }
+  }
+
+  /** How the case left the gate; null for a case the gate never saw. */
+  outcome(id: string): CaseOutcome | null {
+    const ran = this.#waited.get(id);
+    if (ran !== undefined) return { kind: 'ran', waitedMs: ran };
+    const queued = this.#queued.get(id);
+    return queued === undefined ? null : { kind: 'queued', waitedMs: queued };
   }
 
   /** The last recorded walls of the cases that ran and ended, summed. */
@@ -152,7 +193,14 @@ export class CaseGate {
   }
 
   summary(): CaseGateSummary {
-    return { own: this.#own, lent: this.#lent, lentCoreMs: this.#lentCoreMs, waitedCaseMs: this.#waitedCaseMs };
+    return {
+      own: this.#own,
+      lent: this.#lent,
+      queued: this.#queued.size,
+      runningAtEnd: this.#runningAtEnd,
+      lentCoreMs: this.#lentCoreMs,
+      waitedCaseMs: this.#waitedCaseMs,
+    };
   }
 
   #startOwn(id: string, waitedMs: number): void {
@@ -165,6 +213,11 @@ export class CaseGate {
 
   #startedAfter(id: string, waitedMs: number): void {
     this.#waited.set(id, waitedMs);
+    this.#waitedCaseMs += waitedMs;
+  }
+
+  #queue(id: string, waitedMs: number): void {
+    this.#queued.set(id, waitedMs);
     this.#waitedCaseMs += waitedMs;
   }
 }

@@ -731,10 +731,12 @@ async function runCommand(
       if (left !== null) appendStderr(`bounded-exec: ${left}\n`);
       const decided = gated;
       if (decided === null) return;
+      // A run that ended whole is ending now; one stopped early began to end before its teardown (`terminate`).
+      decided.cases.ending();
       decided.releaseAll();
-      const { own, lent, lentCoreMs, waitedCaseMs } = decided.cases.summary();
+      const { own, lent, queued, runningAtEnd, lentCoreMs, waitedCaseMs } = decided.cases.summary();
       tell(
-        `cowshed: ${grant !== null ? 'cpu-pool' : 'mbx reserve'} cases own=${own} lent=${lent} lent_core_s=${Math.round(lentCoreMs / 1000)} waited_case_s=${Math.round(waitedCaseMs / 1000)}\n`,
+        `cowshed: ${grant !== null ? 'cpu-pool' : 'mbx reserve'} cases own=${own} lent=${lent} queued=${queued} running_at_end=${runningAtEnd} lent_core_s=${Math.round(lentCoreMs / 1000)} waited_case_s=${Math.round(waitedCaseMs / 1000)}\n`,
       );
     })();
     return caseGateClosed;
@@ -1093,11 +1095,19 @@ async function runCommand(
       ? undefined
       : (closed) => {
           // nextest times a case from its shim's start: the wait at the gate is taken off its wall and named beside it.
-          const waitMs = gated?.cases.waitedMs(closed.id) ?? 0;
+          // A case that never started ran nothing: its result names its wait and no wall, so no later run reads that
+          // time as the case's own (suite-minimum.ts, `readLastWalls`).
+          const outcome = gated?.cases.outcome(closed.id) ?? null;
           const result =
-            closed.durationMs === null || waitMs === 0
+            outcome === null || (outcome.kind === 'ran' && (closed.durationMs === null || outcome.waitedMs === 0))
               ? closed
-              : { ...closed, durationMs: runWallMs(closed.durationMs, waitMs), waitMs };
+              : outcome.kind === 'queued'
+                ? { ...closed, durationMs: null, waitMs: outcome.waitedMs }
+                : {
+                    ...closed,
+                    durationMs: runWallMs(closed.durationMs ?? 0, outcome.waitedMs),
+                    waitMs: outcome.waitedMs,
+                  };
           const error = resultWriter?.append(result) ?? null;
           if (error !== null && resultFailure === null) {
             resultFailure = error;
@@ -1475,6 +1485,9 @@ async function runCommand(
     }
   };
   const terminate = async (): Promise<void> => {
+    // The gate's state is taken before the teardown frees a core: a case running now ran, one waiting never starts.
+    gated?.cases.ending();
+    // The gate's state is taken before the teardown frees a core: a case running now ran, one waiting never starts.
     await killChildTree();
     if (!state.settled && killAfterMs > 0) {
       await settledWithin(exitPromise, killAfterMs);

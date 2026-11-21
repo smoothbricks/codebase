@@ -2192,6 +2192,12 @@ core before it runs:
 - **A case's wall is its run.** nextest times a case from the shim's start, so its own duration includes the wait. The
   result bounded-exec records for the case (`test-results.jsonl`) subtracts the wait its gate measured and names it as
   `waitMs`; the walls that order the cases above, and a suite's minimum, are therefore runs alone.
+- **A run that ends early ends its gate first.** When the leaf's run begins to end before its cases have (a bound, a
+  failure, a stop), the gate takes its state before the teardown frees any core: a case running then ran, and a case
+  still waiting never starts, so no core the teardown frees is handed to it. Its result names its whole wait as `waitMs`
+  and no wall (`durationMs` null), so it is never read as a run of the case. Measured 2026-11-21: a land gate's leaf of
+  one core ended at its bound with one case on that core and fifteen waiting; the SIGTERM's freed core went to a waiting
+  case, recorded as a run of 0.1 s after a 181.6 s wait, and the fifteen others as runs of 180-184 s.
 - **Progress.** A case waiting at the gate is not progress and stops no clock: the leaf's no-progress bound runs while
   any case holds a core, as it does for a leaf without a gate, and at least one always does while any waits.
 - **Without a gate.** A run whose endpoint does not answer `{"type":"capabilities"}` with `test_gate` (an mbx whose shim
@@ -2213,9 +2219,10 @@ core before it runs:
   `MBX_SCHED_DIR`, asks `{"type":"capabilities"}`, and ends it; nothing is reserved through it. A run with no mbx, or
   one whose mbx does not answer `test_gate`, sizes the leaf to its grant.
 - **What the caller sees.** At its end the leaf says
-  `cowshed: mbx reserve cases own=<n> lent=<n> lent_core_s=<s> waited_case_s=<s>`, or `cowshed: cpu-pool cases …` with
-  the same fields for a leaf of a run pool: the cases that ran on its grant and on a core of their own, the core-seconds
-  those held, and the seconds its cases waited at the gate.
+  `cowshed: mbx reserve cases own=<n> lent=<n> queued=<n> running_at_end=<n> lent_core_s=<s> waited_case_s=<s>`, or
+  `cowshed: cpu-pool cases …` with the same fields for a leaf of a run pool: the cases that ran on its grant and on a
+  core of their own, those that never started, those running when its run began to end, the core-seconds the cases on a
+  core of their own held, and the seconds its cases waited at the gate, each case's wait counted once.
 - **Enforced by** `case-gate.test.ts` (the gate's decisions and its socket), the gated-leaf cases of `executor.test.ts`
   (a leaf granted one of six cores starts six threads, its second case on a core reserved in its name; without the
   capability it is sized to its grant; a leaf granted one of a run pool's eight tokens starts a second case on a lent

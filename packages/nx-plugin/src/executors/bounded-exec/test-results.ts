@@ -13,11 +13,15 @@ export interface ClosedTestResult {
   readonly source: 'native' | 'progress' | 'junit';
   /** Set only on a terminal JUnit correction of a provisional progress observation. */
   readonly contradictsCursor?: ByteOffset;
-  /** Null when the native runner reports no duration (for example a skipped test). */
+  /**
+   * Null when the native runner reports no duration (for example a skipped test), and for a case that never started at
+   * its leaf's gate, which ran nothing: its `waitMs` is then its whole time there.
+   */
   readonly durationMs: (number & tags.Minimum<0>) | null;
   /**
-   * How long the case waited for a core at its leaf's gate before it ran (specs/cowshed/05_gateway.md, "A case starts
-   * on a core"), which `durationMs` leaves out; absent for a case that did not wait.
+   * How long the case waited for a core at its leaf's gate (specs/cowshed/05_gateway.md, "A case starts on a core"):
+   * before it ran, which `durationMs` leaves out, or until its run ended for one that never started; absent for a case
+   * that did not wait.
    */
   readonly waitMs?: number & tags.Minimum<0>;
   /** Native file:line, never a location inferred from human output. */
