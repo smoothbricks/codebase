@@ -663,6 +663,7 @@ pub struct RebaseArgs {
     pub expected_source_head: Option<OsString>,
     pub expected_onto_head: Option<OsString>,
     pub resume: Option<RebaseResume>,
+    pub expected_head: Option<OsString>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1066,6 +1067,8 @@ pub fn cli_command() -> ClapCommand {
             value("expected-onto-head"),
             flag("continue"),
             flag("abort"),
+            flag("finalize"),
+            value("expected-head"),
         ]))
         .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
             value("into"),
@@ -3896,6 +3899,14 @@ const REBASE: CommandSpec = CommandSpec {
             spelling: "--abort",
             meaning: "after a conflict, put the branch back at the head the stopped rebase started from; takes no other option",
         },
+        Opt {
+            spelling: "--finalize",
+            meaning: "close a stopped rebase that git finished in the workspace: removes only cowshed's record of it, staging and replaying nothing; needs --expected-workspace-incarnation, --expected-source-head, --expected-onto-head and --expected-head",
+        },
+        Opt {
+            spelling: "--expected-head <oid>",
+            meaning: "with --finalize: refuse unless the rebased branch stands at this commit, the head the finished replay left",
+        },
     ],
 };
 
@@ -3909,24 +3920,44 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
     let expected_workspace_incarnation = os(matches, "expected-workspace-incarnation");
     let expected_source_head = os(matches, "expected-source-head");
     let expected_onto_head = os(matches, "expected-onto-head");
-    let resume = match (flagged(matches, "continue"), flagged(matches, "abort")) {
-        (true, true) => return Err(UsageError::new("--continue conflicts with --abort", USAGE)),
-        (true, false) => Some((RebaseResume::Continue, "continue")),
-        (false, true) => Some((RebaseResume::Abort, "abort")),
-        (false, false) => None,
-    };
-    if let Some((_, verb)) = resume {
-        let other = into.is_some()
-            || onto.is_some()
-            || expected_workspace_incarnation.is_some()
-            || expected_source_head.is_some()
-            || expected_onto_head.is_some();
-        if other {
+    let expected_head = os(matches, "expected-head");
+    let resume = match (
+        flagged(matches, "continue"),
+        flagged(matches, "abort"),
+        flagged(matches, "finalize"),
+    ) {
+        (false, false, false) => None,
+        (true, false, false) => Some(RebaseResume::Continue),
+        (false, true, false) => Some(RebaseResume::Abort),
+        (false, false, true) => Some(RebaseResume::Finalize),
+        _ => {
             return Err(UsageError::new(
-                format!("--{verb} takes no other option"),
+                "--continue, --abort and --finalize conflict with each other",
                 USAGE,
             ));
         }
+    };
+    match resume {
+        Some(RebaseResume::Continue | RebaseResume::Abort)
+            if into.is_some()
+                || onto.is_some()
+                || expected_workspace_incarnation.is_some()
+                || expected_source_head.is_some()
+                || expected_onto_head.is_some()
+                || expected_head.is_some() =>
+        {
+            return Err(UsageError::new(
+                "--continue and --abort take no other option",
+                USAGE,
+            ));
+        }
+        Some(RebaseResume::Finalize) if into.is_some() || onto.is_some() => {
+            return Err(UsageError::new(
+                "--finalize names the rebase it closes by its expected heads; it takes no --into or --onto",
+                USAGE,
+            ));
+        }
+        _ => {}
     }
     Ok(Command::Rebase(RebaseArgs {
         workspace: optional_workspace(matches, "workspace", false, USAGE)?,
@@ -3935,7 +3966,8 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_workspace_incarnation,
         expected_source_head,
         expected_onto_head,
-        resume: resume.map(|(resume, _)| resume),
+        resume,
+        expected_head,
     }))
 }
 
@@ -5967,9 +5999,28 @@ mod tests {
             rebase(&["rebase", "--abort"]).resume,
             Some(RebaseResume::Abort)
         );
+        let finalize = rebase(&[
+            "rebase",
+            "raven",
+            "--finalize",
+            "--expected-head",
+            "0123456789abcdef0123456789abcdef01234567",
+        ]);
+        assert_eq!(finalize.resume, Some(RebaseResume::Finalize));
+        assert_eq!(
+            finalize.expected_head.as_deref(),
+            Some(std::ffi::OsStr::new(
+                "0123456789abcdef0123456789abcdef01234567"
+            ))
+        );
         for argv in [
             &["rebase", "raven", "--continue", "--abort"][..],
             &["rebase", "raven", "--abort", "--onto", "main"],
+            &["rebase", "raven", "--continue", "--finalize"],
+            &["rebase", "raven", "--abort", "--finalize"],
+            &["rebase", "raven", "--continue", "--expected-head", "0123"],
+            &["rebase", "raven", "--finalize", "--onto", "main"],
+            &["rebase", "raven", "--finalize", "--into", "lane"],
         ] {
             assert!(parse_args(argv.iter().copied()).is_err(), "{argv:?}");
         }

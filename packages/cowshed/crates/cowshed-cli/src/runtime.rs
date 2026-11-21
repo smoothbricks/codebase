@@ -2179,6 +2179,7 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
                 resume: args.resume,
+                expected_head: args.expected_head.map(os_git_oid).transpose()?,
             };
             let report = service
                 .rebase(&workspace, args.into.as_deref(), options)

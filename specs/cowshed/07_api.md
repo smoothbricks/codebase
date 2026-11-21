@@ -534,7 +534,8 @@ pub struct RebaseOptions {
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
-    pub resume: Option<RebaseResume>,    // Continue | Abort the rebase this verb stopped at a conflict
+    pub resume: Option<RebaseResume>,    // Continue | Abort | Finalize the rebase this verb stopped at a conflict
+    pub expected_head: Option<GitOid>,   // Finalize only: the head the finished replay left
 }
 
 pub enum RebaseReport {                  // tagged `kind`

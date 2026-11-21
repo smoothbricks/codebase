@@ -3691,9 +3691,13 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_onto_head: Option<GitOid>,
-    /// Finish or undo the rebase this verb stopped at a conflict (`--continue`, `--abort`).
+    /// Finish, undo or close the rebase this verb stopped at a conflict (`--continue`, `--abort`,
+    /// `--finalize`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume: Option<RebaseResume>,
+    /// The head the finished replay left, which `resume: finalize` requires the branch to stand at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_head: Option<GitOid>,
 }
 
 /// The rebase a conflict stopped, carried on (02_workspaces.md, "`cowshed rebase`").
@@ -3704,6 +3708,11 @@ pub enum RebaseResume {
     Continue,
     /// Put the branch back at the head the rebase started from.
     Abort,
+    /// Close a stopped rebase that was finished in the workspace: only cowshed's record of it is
+    /// removed, and only when that record names `expected_source_head` and `expected_onto_head`,
+    /// no Git operation is in progress, no path is unmerged and the branch the rebase started on
+    /// stands at `expected_head`. It stages nothing and continues nothing.
+    Finalize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

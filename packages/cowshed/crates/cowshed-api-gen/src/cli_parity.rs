@@ -293,6 +293,8 @@ pub const PARITY: &[Row] = &[
     row("rebase", "expected-onto-head", field(&[("coordinator.rebase", "options.expectedOntoHead")], &[argument("Coordinator.rebase", 1, "expectedOntoHead")])),
     row("rebase", "continue", field(&[("coordinator.rebase", "options.resume")], &[argument("Coordinator.rebase", 1, "resume")])),
     row("rebase", "abort", field(&[("coordinator.rebase", "options.resume")], &[argument("Coordinator.rebase", 1, "resume")])),
+    row("rebase", "finalize", field(&[("coordinator.rebase", "options.resume")], &[argument("Coordinator.rebase", 1, "resume")])),
+    row("rebase", "expected-head", field(&[("coordinator.rebase", "options.expectedHead")], &[argument("Coordinator.rebase", 1, "expectedHead")])),
     
 
     row("land", "", field(&[("coordinator.land", "")], &[member("Coordinator.land")])),

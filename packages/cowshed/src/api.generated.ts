@@ -2833,9 +2833,14 @@ export type RebaseOptions = {
   readonly expectedSourceHead?: GitOid;
   readonly expectedOntoHead?: GitOid;
   /**
-   * Finish or undo the rebase this verb stopped at a conflict (`--continue`, `--abort`).
+   * Finish, undo or close the rebase this verb stopped at a conflict (`--continue`, `--abort`,
+   * `--finalize`).
    */
   readonly resume?: RebaseResume;
+  /**
+   * The head the finished replay left, which `resume: finalize` requires the branch to stand at.
+   */
+  readonly expectedHead?: GitOid;
 };
 
 /**
@@ -2863,7 +2868,7 @@ export type RebaseRequest = {
 /**
  * The rebase a conflict stopped, carried on (02_workspaces.md, "`cowshed rebase`").
  */
-export type RebaseResume = 'continue' | 'abort';
+export type RebaseResume = 'continue' | 'abort' | 'finalize';
 
 /**
  * The absolute host path of the lock file that orders every move of a land target's branch: the

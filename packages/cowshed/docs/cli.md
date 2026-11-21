@@ -1266,9 +1266,13 @@ tree is refused before anything moves (exit 4: commit or discard the uncommitted
 when the repository's config turns it on, because a stash re-apply that conflicts leaves unmerged paths behind and still
 exits 0. A conflict stops the replay in progress and exits 4 naming the commit and its conflicted paths: resolve them,
 then `cowshed rebase <name> --continue` stages them and lets git replay the rest, or `cowshed rebase <name> --abort`
-puts the branch back where it started. The rebase is Git alone: it fetches and replays, and runs no job. The new head
-prints on stdout and `cowshed: rebased <name> onto <commit>` on stderr; `--json` gives the `rebased` report with the
-head and the destination it sits on.
+puts the branch back where it started. `cowshed rebase <name> --finalize` is for a caller that finished the stopped
+replay with git in the workspace itself: named by `--expected-workspace-incarnation`, `--expected-source-head`,
+`--expected-onto-head` and `--expected-head` (the head the finished replay left), it removes cowshed's record of that
+rebase and nothing else, staging and replaying nothing, and refuses (exit 4) while any git operation is in progress, a
+path is unmerged, or the rebased branch does not stand at that head. The rebase is Git alone: it fetches and replays,
+and runs no job. The new head prints on stdout and `cowshed: rebased <name> onto <commit>` on stderr; `--json` gives the
+`rebased` report with the head and the destination it sits on.
 
 ### `cowshed land <name> [--into <lane> [--ungated]] [--check <cmd>] [--ref-lock <file> | --ref-turn <queue>]`
 

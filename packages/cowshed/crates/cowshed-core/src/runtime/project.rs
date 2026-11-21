@@ -13960,7 +13960,7 @@ mod rebase_recovery_tests {
             store_root,
             &unit,
             &Lane::name("stop-unit"),
-            crate::api::dto::RebaseResume::Continue,
+            Resume::Continue,
         )
         .await
         .expect_err("the markers are still there");
@@ -13976,7 +13976,7 @@ mod rebase_recovery_tests {
             store_root,
             &unit,
             &Lane::name("stop-unit"),
-            crate::api::dto::RebaseResume::Continue,
+            Resume::Continue,
         )
         .await
         .expect("continue finishes the replay") else {
@@ -14004,14 +14004,9 @@ mod rebase_recovery_tests {
             .await
             .expect_err("mine conflicts with the lane");
         assert_eq!(
-            resume_rebase(
-                store_root,
-                &unit,
-                &Lane::name("abort-unit"),
-                crate::api::dto::RebaseResume::Abort,
-            )
-            .await
-            .expect("abort"),
+            resume_rebase(store_root, &unit, &Lane::name("abort-unit"), Resume::Abort,)
+                .await
+                .expect("abort"),
             RebaseReport::Aborted { oid: head.clone() }
         );
         assert_eq!(git_oid(store_root, &unit).await.expect("head"), head);
@@ -14022,6 +14017,321 @@ mod rebase_recovery_tests {
                 .trim(),
             "cowshed/abort-unit"
         );
+    }
+
+    /// The stopped replay of [`a_unit_with_its_own_and_a_conflicting_commit`], resolved and finished
+    /// by Git in the workspace, as its worker does: answers the head the replay left.
+    async fn finished_in_the_workspace(store_root: &std::sync::Arc<Path>, unit: &Path) -> GitOid {
+        std::fs::write(unit.join("shared.txt"), "a\n1\nlane\nmine\n2\nb\n")
+            .expect("resolve the conflict");
+        run_git(unit, &["add", "shared.txt"]);
+        run_git(unit, &["-c", "core.editor=true", "rebase", "--continue"]);
+        assert!(!unit.join(".git/rebase-merge").exists());
+        git_oid(store_root, unit).await.expect("finished head")
+    }
+
+    fn finalize(source: &GitOid, onto: &GitOid, head: &GitOid) -> Resume {
+        Resume::Finalize {
+            source: source.clone(),
+            onto: onto.clone(),
+            head: head.clone(),
+        }
+    }
+
+    /// Everything a resume could move in `unit`: HEAD and the ref it is attached to, every index
+    /// entry with its stage, the worktree's status, the operations in progress and cowshed's record
+    /// of the rebase it stopped.
+    fn git_state(unit: &Path) -> Vec<Vec<u8>> {
+        let mut state: Vec<Vec<u8>> = [
+            &["rev-parse", "HEAD"][..],
+            &["symbolic-ref", "--quiet", "HEAD"],
+            &["ls-files", "--stage", "-z"],
+            &["--no-optional-locks", "status", "--porcelain=v2", "-z"],
+        ]
+        .into_iter()
+        .map(|args| git(unit, args).stdout)
+        .collect();
+        for held in [
+            "rebase-merge/stopped-sha",
+            "rebase-merge/msgnum",
+            "rebase-apply/next",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            STOPPED_REBASE,
+        ] {
+            state.push(std::fs::read(unit.join(".git").join(held)).unwrap_or_default());
+        }
+        state
+    }
+
+    /// A finalize that `resume` refuses with nothing in `unit` moved: no path staged, no commit
+    /// replayed, no ref or record touched. Answers the refusal.
+    async fn refused_with_nothing_moved(
+        store_root: &std::sync::Arc<Path>,
+        unit: &Path,
+        workspace: &WorkspaceName,
+        resume: Resume,
+        what: &str,
+    ) -> CowshedError {
+        let before = git_state(unit);
+        let refused = resume_rebase(store_root, unit, workspace, resume)
+            .await
+            .expect_err(what);
+        assert_eq!(refused.code, ErrorCode::Conflict, "{what}: {refused:?}");
+        assert!(
+            git_state(unit) == before,
+            "{what}: a refused finalize moved the workspace"
+        );
+        refused
+    }
+
+    /// `--finalize` closes exactly the rebase it names, finished at the head it names: another
+    /// source, destination or head is refused with the record kept, the named one answers that head
+    /// and removes only the record, and asked again nothing names a stopped rebase any more.
+    #[tokio::test]
+    async fn finalize_closes_only_the_finished_rebase_it_names() {
+        let (lane, unit, tip, head, onto) =
+            a_unit_with_its_own_and_a_conflicting_commit("finalize").await;
+        let store_root = lane.store.shared();
+        let workspace = Lane::name("finalize-unit");
+        replay(store_root, &unit, &onto, &head, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        let finished = finished_in_the_workspace(store_root, &unit).await;
+
+        for (what, resume) in [
+            ("another source head", finalize(&tip, &tip, &finished)),
+            ("another destination", finalize(&head, &head, &finished)),
+            ("another finished head", finalize(&head, &tip, &head)),
+        ] {
+            refused_with_nothing_moved(store_root, &unit, &workspace, resume, what).await;
+        }
+        assert_eq!(
+            resume_rebase(
+                store_root,
+                &unit,
+                &workspace,
+                finalize(&head, &tip, &finished)
+            )
+            .await
+            .expect("the finished rebase it names"),
+            RebaseReport::Rebased {
+                oid: finished.clone(),
+                onto: tip.clone(),
+            }
+        );
+        assert!(!unit.join(".git").join(STOPPED_REBASE).exists());
+        assert_eq!(git_oid(store_root, &unit).await.expect("head"), finished);
+
+        let again = refused_with_nothing_moved(
+            store_root,
+            &unit,
+            &workspace,
+            finalize(&head, &tip, &finished),
+            "no record names a stopped rebase any more",
+        )
+        .await;
+        assert!(
+            again.message.contains("no rebase cowshed stopped"),
+            "{}",
+            again.message
+        );
+    }
+
+    /// `--finalize` never carries a replay on. With the stop's path resolved in the worktree, where
+    /// `--continue` would stage it and replay the rest, it refuses and the sequencer, the unmerged
+    /// index and HEAD stay as Git left them; so does a rebase cowshed did not start that stops
+    /// after the one it did was finished.
+    #[tokio::test]
+    async fn finalize_never_stages_or_continues_a_rebase_in_progress() {
+        let (lane, unit, tip, head, onto) =
+            a_unit_with_its_own_and_a_conflicting_commit("held").await;
+        let store_root = lane.store.shared();
+        let workspace = Lane::name("held-unit");
+        replay(store_root, &unit, &onto, &head, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        std::fs::write(unit.join("shared.txt"), "a\n1\nlane\nmine\n2\nb\n")
+            .expect("resolve the conflict, staging nothing");
+        let at = git_oid(store_root, &unit).await.expect("stopped head");
+        let refused = refused_with_nothing_moved(
+            store_root,
+            &unit,
+            &workspace,
+            finalize(&head, &tip, &at),
+            "its own replay is still stopped",
+        )
+        .await;
+        assert!(
+            refused.message.contains("rebase-merge"),
+            "{}",
+            refused.message
+        );
+        assert!(unit.join(".git/rebase-merge").exists());
+
+        let finished = finished_in_the_workspace(store_root, &unit).await;
+        // A rebase by hand back onto the old head stops on the lane's commit; its path is resolved
+        // in the worktree, so only the fence keeps it from being staged and continued.
+        assert!(!git(&unit, &["rebase", head.as_str()]).status.success());
+        assert!(unit.join(".git/rebase-merge").exists());
+        std::fs::write(unit.join("shared.txt"), "a\n1\nlane\nmine\n2\nb\n")
+            .expect("resolve the foreign stop, staging nothing");
+        refused_with_nothing_moved(
+            store_root,
+            &unit,
+            &workspace,
+            finalize(&head, &tip, &finished),
+            "a rebase cowshed did not start is in progress",
+        )
+        .await;
+        assert!(unit.join(".git").join(STOPPED_REBASE).exists());
+    }
+
+    /// A merge, a cherry-pick or a revert in progress refuses `--finalize` as a rebase does, and is
+    /// left exactly as it stood.
+    #[tokio::test]
+    async fn finalize_refuses_under_a_merge_a_cherry_pick_or_a_revert() {
+        let (lane, unit, tip, head, onto) =
+            a_unit_with_its_own_and_a_conflicting_commit("busy").await;
+        let store_root = lane.store.shared();
+        let workspace = Lane::name("busy-unit");
+        replay(store_root, &unit, &onto, &head, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        let finished = finished_in_the_workspace(store_root, &unit).await;
+        for (start, state, abort) in [
+            (&["merge", head.as_str()][..], "MERGE_HEAD", "merge"),
+            (
+                &["cherry-pick", head.as_str()],
+                "CHERRY_PICK_HEAD",
+                "cherry-pick",
+            ),
+            (
+                &["revert", "--no-edit", tip.as_str()],
+                "REVERT_HEAD",
+                "revert",
+            ),
+        ] {
+            assert!(!git(&unit, start).status.success(), "{start:?} conflicts");
+            assert!(unit.join(".git").join(state).exists(), "{state}");
+            let refused = refused_with_nothing_moved(
+                store_root,
+                &unit,
+                &workspace,
+                finalize(&head, &tip, &finished),
+                state,
+            )
+            .await;
+            assert!(refused.message.contains(state), "{}", refused.message);
+            run_git(&unit, &[abort, "--abort"]);
+        }
+        resume_rebase(
+            store_root,
+            &unit,
+            &workspace,
+            finalize(&head, &tip, &finished),
+        )
+        .await
+        .expect("nothing is in progress any more");
+    }
+
+    /// The finished head counts only on the branch the rebase started on: HEAD attached to another
+    /// ref at that very commit, or detached at it, refuses `--finalize`.
+    #[tokio::test]
+    async fn finalize_refuses_a_head_that_is_not_the_rebased_branch() {
+        let (lane, unit, tip, head, onto) =
+            a_unit_with_its_own_and_a_conflicting_commit("ref").await;
+        let store_root = lane.store.shared();
+        let workspace = Lane::name("ref-unit");
+        replay(store_root, &unit, &onto, &head, ConflictEnd::Stop)
+            .await
+            .expect_err("mine conflicts with the lane");
+        let finished = finished_in_the_workspace(store_root, &unit).await;
+        for (checkout, what) in [
+            (&["checkout", "-q", "-b", "elsewhere"][..], "another branch"),
+            (&["checkout", "-q", "--detach"], "a detached HEAD"),
+        ] {
+            run_git(&unit, checkout);
+            let refused = refused_with_nothing_moved(
+                store_root,
+                &unit,
+                &workspace,
+                finalize(&head, &tip, &finished),
+                what,
+            )
+            .await;
+            assert!(
+                refused.message.contains("refs/heads/cowshed/ref-unit"),
+                "{}",
+                refused.message
+            );
+        }
+        run_git(&unit, &["checkout", "-q", "cowshed/ref-unit"]);
+        resume_rebase(
+            store_root,
+            &unit,
+            &workspace,
+            finalize(&head, &tip, &finished),
+        )
+        .await
+        .expect("back on the rebased branch");
+    }
+
+    /// A finalize that does not name the whole move is a usage error before anything is read, and
+    /// so is the finished head on any other rebase.
+    #[test]
+    fn finalize_names_the_incarnation_and_all_three_heads() {
+        use crate::api::dto::{RebaseResume, WorkspaceIncarnation};
+
+        let oid = |digit: char| GitOid::new(digit.to_string().repeat(40)).expect("an object id");
+        let whole = RebaseOptions {
+            expected_workspace_incarnation: Some(
+                WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef".to_owned())
+                    .expect("an incarnation"),
+            ),
+            expected_source_head: Some(oid('a')),
+            expected_onto_head: Some(oid('b')),
+            expected_head: Some(oid('c')),
+            resume: Some(RebaseResume::Finalize),
+            ..RebaseOptions::default()
+        };
+        assert_eq!(
+            Resume::of(&whole).expect("the whole move"),
+            Some(finalize(&oid('a'), &oid('b'), &oid('c')))
+        );
+        for partial in [
+            RebaseOptions {
+                expected_workspace_incarnation: None,
+                ..whole.clone()
+            },
+            RebaseOptions {
+                expected_source_head: None,
+                ..whole.clone()
+            },
+            RebaseOptions {
+                expected_onto_head: None,
+                ..whole.clone()
+            },
+            RebaseOptions {
+                expected_head: None,
+                ..whole.clone()
+            },
+            RebaseOptions {
+                resume: Some(RebaseResume::Continue),
+                ..whole.clone()
+            },
+            RebaseOptions {
+                resume: None,
+                ..whole.clone()
+            },
+        ] {
+            assert_eq!(
+                Resume::of(&partial).expect_err("usage").code,
+                ErrorCode::Usage,
+                "{partial:?}"
+            );
+        }
     }
     /// `cowshed land unit --into lane --ungated` with the lane base moved past the unit's base
     /// (02_workspaces.md "`cowshed land`", `--ungated`): the land's rebase replays the unit onto
@@ -17093,7 +17403,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
-        if let Some(resume) = options.resume {
+        if let Some(resume) = Resume::of(&options)? {
             let root = current_snapshot_mount(self, &current)?;
             return resume_rebase(store_root, &root, &workspace, resume).await;
         }
@@ -22665,15 +22975,68 @@ fn rebase_in_progress(git_dir: &Path) -> CowshedError {
     }
 }
 
-/// `--continue` or `--abort` of the rebase cowshed stopped at a conflict in the workspace at
-/// `root` (02_workspaces.md, "`cowshed rebase`"). Only a stopped rebase this verb started, which
-/// its [`STOPPED_REBASE`] file names, is carried on.
+/// How a stopped rebase is carried on, with the fences the closing of a finished one names.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Resume {
+    Continue,
+    Abort,
+    /// Close the record of the replay of `source` onto `onto` that Git finished at `head`.
+    Finalize {
+        source: GitOid,
+        onto: GitOid,
+        head: GitOid,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl Resume {
+    /// What `options` resume, if anything. A finalize names the whole move it closes, and no other
+    /// rebase names the head a finished replay left.
+    fn of(options: &RebaseOptions) -> Result<Option<Self>> {
+        use crate::api::dto::RebaseResume;
+
+        let finalize = options.resume == Some(RebaseResume::Finalize);
+        if options.expected_head.is_some() && !finalize {
+            return Err(CowshedError::usage(
+                "--expected-head names the head a finished replay left, which only --finalize reads",
+                "pass it with --finalize, or leave it out",
+            ));
+        }
+        Ok(match options.resume {
+            None => None,
+            Some(RebaseResume::Continue) => Some(Self::Continue),
+            Some(RebaseResume::Abort) => Some(Self::Abort),
+            Some(RebaseResume::Finalize) => {
+                let (Some(_), Some(source), Some(onto), Some(head)) = (
+                    options.expected_workspace_incarnation.as_ref(),
+                    options.expected_source_head.as_ref(),
+                    options.expected_onto_head.as_ref(),
+                    options.expected_head.as_ref(),
+                ) else {
+                    return Err(CowshedError::usage(
+                        "--finalize closes one exact rebase: it names the workspace incarnation, the head the rebase started from, the head it replayed onto and the head the finished replay left",
+                        "pass --expected-workspace-incarnation, --expected-source-head, --expected-onto-head and --expected-head",
+                    ));
+                };
+                Some(Self::Finalize {
+                    source: source.clone(),
+                    onto: onto.clone(),
+                    head: head.clone(),
+                })
+            }
+        })
+    }
+}
+/// `--continue`, `--abort` or `--finalize` of the rebase cowshed stopped at a conflict in the
+/// workspace at `root` (02_workspaces.md, "`cowshed rebase`"). Only a stopped rebase this verb
+/// started, which its [`STOPPED_REBASE`] file names, is carried on.
 #[cfg(target_os = "macos")]
 async fn resume_rebase(
     store_root: &std::sync::Arc<Path>,
     root: &Path,
     workspace: &WorkspaceName,
-    resume: crate::api::dto::RebaseResume,
+    resume: Resume,
 ) -> Result<RebaseReport> {
     use self::invoke_git as invoke;
 
@@ -22705,7 +23068,7 @@ async fn resume_rebase(
     let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
     let in_progress = rebase_state.iter().any(|path| path.exists());
     match resume {
-        crate::api::dto::RebaseResume::Abort => {
+        Resume::Abort => {
             if in_progress {
                 let failures = roll_back(
                     store_root,
@@ -22727,7 +23090,80 @@ async fn resume_rebase(
                 oid: git_oid(store_root, root).await?,
             })
         }
-        crate::api::dto::RebaseResume::Continue => {
+        Resume::Finalize { source, onto, head } => {
+            // Every fence is a read, and the one write is the removal of cowshed's own record:
+            // nothing here stages a path or runs `git rebase`, so no operation that begins while
+            // the fences are read can be carried on by this verb.
+            if stopped.source_head != source || stopped.onto != onto {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "the rebase cowshed stopped in {workspace} replays {} from {} onto {}, not the rebase from {source} onto {onto} this names",
+                        stopped.source_ref, stopped.source_head, stopped.onto
+                    ),
+                    "name the heads of the rebase that stopped; cowshed's record of it is kept",
+                ));
+            }
+            let repository = crate::git::GitRepository::from_root(store_root, root);
+            if let Some(state) = repository.in_progress_operation().await? {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "workspace {workspace} has an in-progress {state} Git operation, so the rebase from {source} onto {onto} is not finished there"
+                    ),
+                    "finish or abort it in the workspace (`git status` names it), then finalize again: --finalize never carries a Git operation on",
+                ));
+            }
+            let unmerged = invoke(store_root, root, &["ls-files", "--unmerged", "-z"]).await?;
+            require_git_success("list unmerged paths", &unmerged)?;
+            if !unmerged.stdout.is_empty() {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "workspace {workspace} holds unmerged paths, so the rebase from {source} onto {onto} is not finished there"
+                    ),
+                    "resolve them in the workspace, then finalize again: --finalize stages nothing",
+                ));
+            }
+            let attached = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+            if !attached.status.success()
+                || String::from_utf8_lossy(&attached.stdout).trim_end() != stopped.source_ref
+            {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "HEAD of {workspace} is not attached to {}, the branch its stopped rebase started on",
+                        stopped.source_ref
+                    ),
+                    "check that branch out again, then finalize",
+                ));
+            }
+            let observed = git_oid(store_root, root).await?;
+            if observed != head {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "{} of {workspace} stands at {observed}, not at {head}, the head the finished replay is named by",
+                        stopped.source_ref
+                    ),
+                    "name the head the finished replay left; cowshed's record of the rebase is kept",
+                ));
+            }
+            if !repository
+                .commit_is_ancestor(onto.as_str(), head.as_str())
+                .await?
+            {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "{head} does not descend from {onto}, so it is not what a replay onto {onto} left in {workspace}"
+                    ),
+                    "the rebase was put back or redone elsewhere: abort it with `cowshed rebase --abort`, or start it again",
+                ));
+            }
+            tokio::fs::remove_file(&marker).await.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot remove {}: {error}", marker.display()),
+                    "check the workspace's git directory, then finalize again",
+                )
+            })?;
+            Ok(RebaseReport::Rebased { oid: head, onto })
+        }
+        Resume::Continue => {
             if in_progress {
                 let unmerged = unmerged_paths(store_root, root).await?;
                 let marked: Vec<&String> = unmerged

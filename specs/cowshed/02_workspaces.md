@@ -1030,6 +1030,16 @@ rebase and are refused together (exit 2).
   conflict. `cowshed rebase <ws> --abort` puts the branch back at the head it started from. Both carry on only a rebase
   this verb started (`<git dir>/cowshed-rebase.json` names it); a rebase in progress that cowshed did not start refuses
   the verb, and cowshed never aborts or deletes it.
+- `cowshed rebase <ws> --finalize` closes a stopped rebase whose replay Git finished in the workspace, for a caller that
+  proves each continuation against its own witness of the stop and runs `git rebase --continue` there itself. It names
+  the exact rebase: `--expected-workspace-incarnation`, `--expected-source-head`, `--expected-onto-head` and
+  `--expected-head`, the head the finished replay left; without all four it is a usage error (exit 2). It removes
+  cowshed's record of that rebase and nothing else: it stages no path and runs no `git rebase`, so it can never carry on
+  a rebase that began after its caller looked. It refuses (exit 4), leaving the record and the repository as they were,
+  unless the record names that source head and destination, no rebase, merge, cherry-pick or revert is in progress, no
+  path is unmerged, HEAD is attached to the branch the rebase started on and stands at `--expected-head`, and that head
+  descends from the destination. With no record there is nothing to close and it refuses: where a branch stands does not
+  say which rebase put it there.
 - `--fresh`: divergence-shedding rebase. Create a new clone from the selected current host revision, replay the branch
   onto it (`git format-patch`/`am`, or cherry-pick range), then **transplant identity** — the new clone inherits the
   workspace's name, canonical mount path, token, and grant-file binding; the old clone is destroyed (11_shell.md
