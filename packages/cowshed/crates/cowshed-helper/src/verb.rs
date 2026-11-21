@@ -4,7 +4,7 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::name::{Dataset, NameError, Root, Snapshot};
+use cowshed_helper::name::{Dataset, NameError, Root, Snapshot};
 
 /// The user property on a root dataset that names the uid cowshed serves there. Only whoever
 /// administers the root's parent can set it, so no verb accepts it.

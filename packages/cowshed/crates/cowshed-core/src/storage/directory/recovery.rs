@@ -671,7 +671,7 @@ impl DirectoryExecutionHost {
             .image()
             .to_path_buf();
         self.require_store_image(&canonical)?;
-        require_home(&canonical)?;
+        require_home(&self.payloads, &canonical)?;
         if metadata_workspace_ref(&read_metadata(&canonical)?)? != *workspace {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "workspace release identity changed: {}",

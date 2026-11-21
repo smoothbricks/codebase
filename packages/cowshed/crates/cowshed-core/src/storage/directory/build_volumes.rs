@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DirectoryExecutionHost, MountPointState, bind, host_error, mount_point_state, observed_mount,
-    observed_payload_root, unbind, unsupported,
+    DirectoryExecutionHost, MountPointState, Payloads, bind, confirmed_tree_holders, host_error,
+    mount_point_state, observed_mount, observed_payload_root, unbind, unsupported,
 };
 use crate::build_volume::{
     BuildVolumeHold, BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole,
@@ -25,6 +25,7 @@ use crate::build_volume::{
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::ApfsStorageError;
+use crate::storage::apfs::native::read_dir_paths;
 use crate::storage::apfs::native::{
     BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease, io_error, path_exists,
     sync_parent_path,
@@ -323,13 +324,13 @@ impl DirectoryExecutionHost {
     /// answered exclusive claim ([`BuildVolumeLayout::register_claiming`]) and left registered
     /// until the caller publishes it; the caller keeps the claim through the seed it captures from
     /// the volume (16_build_volumes.md, "Targets and seeds"). A mint that fails releases what it
-    /// registered under that claim. A directory has no capacity; `capacity` bounds nothing here,
-    /// the store's filesystem does.
+    /// registered under that claim. A directory payload has no capacity, so `capacity` bounds
+    /// only a dataset payload; a directory is bounded by the store's filesystem.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         id: &BuildVolumeId,
-        _capacity: ImageCapacity,
+        capacity: ImageCapacity,
         registration: &Registration,
     ) -> Result<(PathBuf, ReleaseClaim), ApfsStorageError> {
         let image = layout.image(id);
@@ -339,11 +340,10 @@ impl DirectoryExecutionHost {
             .register_claiming(id, registration)
             .map_err(host_error)?;
         let made = (|| {
-            fs::create_dir(&image)
-                .map_err(|error| io_error("create build volume payload", &image, error))?;
+            self.create_payload(&image, capacity)?;
             sync_parent_path(&image)?;
             let mount = layout.mount(id);
-            bind(&image, &mount)?;
+            bind(&self.payloads, &image, &mount)?;
             Ok(mount)
         })();
         match made {
@@ -366,7 +366,7 @@ impl DirectoryExecutionHost {
         &self,
         layout: &BuildVolumeLayout,
         claim: &ReleaseClaim,
-        _capacity: ImageCapacity,
+        capacity: ImageCapacity,
         registration: &Registration,
     ) -> Result<PathBuf, ApfsStorageError> {
         let id = claim.id();
@@ -376,11 +376,10 @@ impl DirectoryExecutionHost {
         layout
             .register_claimed(claim, registration)
             .map_err(host_error)?;
-        fs::create_dir(&image)
-            .map_err(|error| io_error("create claimed build volume payload", &image, error))?;
+        self.create_payload(&image, capacity)?;
         sync_parent_path(&image)?;
         let mount = layout.mount(id);
-        bind(&image, &mount)?;
+        bind(&self.payloads, &image, &mount)?;
         Ok(mount)
     }
 
@@ -711,7 +710,7 @@ impl DirectoryExecutionHost {
         let image = layout.image(id);
         self.require_store_image(&image)?;
         let mount = layout.mount(id);
-        bind(&image, &mount)?;
+        bind(&self.payloads, &image, &mount)?;
         Ok(mount)
     }
 
@@ -790,6 +789,7 @@ impl DirectoryExecutionHost {
             });
         }
         match unbind(
+            &self.payloads,
             &self.census,
             &image,
             &mount,
@@ -799,7 +799,7 @@ impl DirectoryExecutionHost {
             Err(primary) if was_bound => crate::storage::apfs::combine_cleanup(
                 "detach and restore claimed build volume",
                 primary,
-                bind(&image, &mount),
+                bind(&self.payloads, &image, &mount),
             ),
             Err(primary) => Err(primary),
         }
@@ -833,6 +833,7 @@ impl DirectoryExecutionHost {
         // made, and otherwise its record alone is retired, said as such.
         let committed = if present {
             unbind(
+                &self.payloads,
                 &self.census,
                 &image,
                 &mount,
@@ -887,15 +888,26 @@ impl DirectoryExecutionHost {
                     error,
                 )
             })?;
-        let name = leaf(&entry)?;
-        cowshed_os::fsio::rename_noreplace(images.as_raw_fd(), &name, journal.as_raw_fd(), &name)
-            .map_err(|error| {
-            io_error(
-                "commit a build volume release to build/.deleting",
-                &entry,
-                error,
-            )
-        })?;
+        match &self.payloads {
+            // A mounted dataset's directory cannot be renamed; its dataset moves instead.
+            Payloads::Datasets(datasets) => datasets.rename(&layout.image(id), &entry)?,
+            Payloads::Directories => {
+                let name = leaf(&entry)?;
+                cowshed_os::fsio::rename_noreplace(
+                    images.as_raw_fd(),
+                    &name,
+                    journal.as_raw_fd(),
+                    &name,
+                )
+                .map_err(|error| {
+                    io_error(
+                        "commit a build volume release to build/.deleting",
+                        &entry,
+                        error,
+                    )
+                })?;
+            }
+        }
         let synced = |directory: &File, path: &Path| {
             cowshed_os::fsio::sync_held_directory(directory)
                 .map_err(|error| io_error("sync the build deleting directory", path, error))
@@ -971,6 +983,28 @@ impl DirectoryExecutionHost {
     ) -> Result<Drained, ApfsStorageError> {
         let journal = layout.deleting();
         let mut drained = Drained::default();
+        if let Payloads::Datasets(datasets) = &self.payloads {
+            // A released dataset is destroyed, never unlinked leaf by leaf: one whose snapshot a
+            // live clone still depends on stays for a later pass (01b_zfs.md, "Retiring a build
+            // dataset").
+            let entries = read_dir_paths(&journal, "enumerate the build deleting directory")?;
+            for entry in entries {
+                let named = entry
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(crate::build_volume::is_image_name);
+                if !named {
+                    continue;
+                }
+                if !confirmed_tree_holders(&self.census, &entry)?.is_empty() {
+                    continue;
+                }
+                if let Some(bytes) = datasets.destroy(&entry)? {
+                    drained.add(Drained { images: 1, bytes });
+                }
+            }
+            return Ok(drained);
+        }
         held.visit_entries(|name| {
             let entry = journal.join(OsStr::from_bytes(name.to_bytes()));
             let named = name.to_str().ok().is_some_and(crate::build_volume::is_image_name);
@@ -1472,6 +1506,7 @@ mod detach_tests {
         // Exercise the unbind's own census too: a holder arriving after the first census
         // must have the same typed refusal, without parsing a host-error string.
         let late = unbind(
+            &Payloads::Directories,
             &crate::census::this_test(),
             &image,
             &mount,

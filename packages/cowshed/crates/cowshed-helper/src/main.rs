@@ -11,9 +11,7 @@
 //!
 //! Reads (`zfs list`, `zfs get`) need no privilege and never come here.
 
-mod host;
 mod mountpoint;
-mod name;
 mod verb;
 
 use std::fmt;
@@ -21,7 +19,8 @@ use std::fs::File;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, ExitCode, Output, Stdio};
 
-use name::{Dataset, Root};
+use cowshed_helper::host;
+use cowshed_helper::name::{Dataset, Root};
 use verb::{OWNER_PROPERTY, Plan};
 
 /// The exit status of a refusal: nothing ran. A failed `zfs` exits with `zfs`'s own status.

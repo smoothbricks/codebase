@@ -28,6 +28,7 @@ mod build_volumes;
 mod recovery;
 #[cfg(target_os = "macos")]
 mod runtime_host;
+mod zfs;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -86,12 +87,22 @@ fn host_error(error: impl std::fmt::Display) -> ApfsStorageError {
     ApfsStorageError::Host(error.to_string())
 }
 
+/// What a payload of the store is made of.
+#[derive(Clone, Debug)]
+pub(crate) enum Payloads {
+    /// A real directory, moved by rename and cloned leaf by leaf.
+    Directories,
+    /// A ZFS dataset, mounted wherever its directory is and cloned from a snapshot.
+    Datasets(zfs::ZfsPayloads),
+}
+
 /// The lifecycle host of a directory store. It holds no state but its configuration: the
 /// filesystem - payload directories, their records and their bindings - is the whole truth.
 #[derive(Debug)]
 pub struct DirectoryExecutionHost {
     config: ApfsSubstrateConfig,
     census: crate::census::CensusScope,
+    payloads: Payloads,
 }
 
 /// A payload directory the executor holds, and where this handle has bound it, if anywhere.
@@ -202,7 +213,10 @@ fn clear_move_sibling(sibling: &Path) -> Result<(), ApfsStorageError> {
 ///
 /// A mount record whose mountpoint holds no directory, with no payload waiting beside it, names
 /// a payload that is gone: refused, never repaired by guessing.
-fn settle(image: &Path) -> Result<Payload, ApfsStorageError> {
+fn settle(payloads: &Payloads, image: &Path) -> Result<Payload, ApfsStorageError> {
+    if let Payloads::Datasets(datasets) = payloads {
+        return datasets.settle(image);
+    }
     let metadata =
         fs::symlink_metadata(image).map_err(|error| io_error("inspect payload", image, error))?;
     let sibling = move_sibling(image);
@@ -258,8 +272,8 @@ fn settle(image: &Path) -> Result<Payload, ApfsStorageError> {
 }
 
 /// The directory `image`'s payload is at now: the image path, or the mountpoint it is mounted at.
-fn payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
-    Ok(match settle(image)? {
+fn payload_root(payloads: &Payloads, image: &Path) -> Result<PathBuf, ApfsStorageError> {
+    Ok(match settle(payloads, image)? {
         Payload::Home => image.to_owned(),
         Payload::Mounted(mount_point) => mount_point,
     })
@@ -301,8 +315,8 @@ fn observed_payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
 
 /// Refuse unless `image`'s payload is at its image path: renaming a mount record into the
 /// trash would move a symlink and leave the payload behind.
-fn require_home(image: &Path) -> Result<(), ApfsStorageError> {
-    match settle(image)? {
+fn require_home(payloads: &Payloads, image: &Path) -> Result<(), ApfsStorageError> {
+    match settle(payloads, image)? {
         Payload::Home => Ok(()),
         Payload::Mounted(mount_point) => Err(ApfsStorageError::Host(format!(
             "{} is still mounted at {}",
@@ -314,11 +328,11 @@ fn require_home(image: &Path) -> Result<(), ApfsStorageError> {
 
 /// Mount `image`'s payload at `mount_point`. Idempotent where it is already mounted; refuses a
 /// payload mounted elsewhere, an occupied mountpoint and a mountpoint on another filesystem.
-fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
+fn bind(payloads: &Payloads, image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
     if !mount_point.is_absolute() {
         return Err(ApfsStorageError::InvalidPlan("mountpoint is not absolute"));
     }
-    match settle(image)? {
+    match settle(payloads, image)? {
         Payload::Mounted(current) if current == mount_point => return Ok(()),
         Payload::Mounted(current) => {
             return Err(ApfsStorageError::Host(format!(
@@ -348,6 +362,9 @@ fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
                 mount_point.display()
             )));
         }
+    }
+    if let Payloads::Datasets(datasets) = payloads {
+        return datasets.bind(image, mount_point);
     }
     let store_device = fs::symlink_metadata(image)
         .map_err(|error| io_error("inspect payload", image, error))?
@@ -392,12 +409,13 @@ fn bind(image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
 /// Unmount `image`'s payload from `mount_point`. Not mounted is nothing to do; mounted
 /// elsewhere refuses.
 fn unbind(
+    payloads: &Payloads,
     census: &crate::census::CensusScope,
     image: &Path,
     mount_point: &Path,
     intent: DetachIntent,
 ) -> Result<(), ApfsStorageError> {
-    match settle(image)? {
+    match settle(payloads, image)? {
         Payload::Home => Ok(()),
         Payload::Mounted(current) if current != mount_point => {
             Err(ApfsStorageError::Host(format!(
@@ -407,19 +425,20 @@ fn unbind(
                 current.display()
             )))
         }
-        Payload::Mounted(_) => move_home(census, image, mount_point, intent),
+        Payload::Mounted(_) => move_home(payloads, census, image, mount_point, intent),
     }
 }
 
 /// Unmount `image`'s payload from wherever it is mounted.
 fn release_mount(
+    payloads: &Payloads,
     census: &crate::census::CensusScope,
     image: &Path,
     intent: DetachIntent,
 ) -> Result<(), ApfsStorageError> {
-    match settle(image)? {
+    match settle(payloads, image)? {
         Payload::Home => Ok(()),
-        Payload::Mounted(mount_point) => move_home(census, image, &mount_point, intent),
+        Payload::Mounted(mount_point) => move_home(payloads, census, image, &mount_point, intent),
     }
 }
 
@@ -452,6 +471,7 @@ pub(super) fn confirmed_tree_holders(
 /// moves with it. So `WhenIdle` refuses, naming them, while any process holds anything in the
 /// tree - the refusal an unforced unmount of a busy volume gives - and `Release` goes ahead.
 fn move_home(
+    payloads: &Payloads,
     census: &crate::census::CensusScope,
     image: &Path,
     mount_point: &Path,
@@ -467,6 +487,9 @@ fn move_home(
                 open,
             });
         }
+    }
+    if let Payloads::Datasets(datasets) = payloads {
+        return datasets.move_home(image, mount_point, intent == DetachIntent::Release);
     }
     let sibling = move_sibling(image);
     clear_move_sibling(&sibling)?;
@@ -602,12 +625,20 @@ impl DirectoryExecutionHost {
             }
             Err(error) => return Err(io_error("inspect directory store root", root, error)),
         }
+        // A store that is the `store` dataset of a cowshed root keeps its payloads as datasets
+        // of that root (09_substrates.md, "Fixed dataset hierarchy"); any other directory keeps
+        // them as directories. The kernel's mount table says which, so nothing configures it.
+        let payloads = match zfs::ZfsPayloads::of_store(root)? {
+            Some(datasets) => Payloads::Datasets(datasets),
+            None => Payloads::Directories,
+        };
         Ok(Self {
             census: crate::census::CensusScope::new(
                 config.namespace,
                 std::sync::Arc::from(config.store_root.as_path()),
             ),
             config,
+            payloads,
         })
     }
 
@@ -956,7 +987,7 @@ impl DirectoryExecutionHost {
     /// `destination`: every leaf by `clonefile` (or a reflink, or a copy where neither exists),
     /// until a pass observes the source unchanged. A failed clone leaves no destination.
     fn clone_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
-        let source = payload_root(source)?;
+        let source = payload_root(&self.payloads, source)?;
         let source = source.as_path();
         if path_exists(destination)? {
             return Err(ApfsStorageError::Host(format!(
@@ -965,6 +996,9 @@ impl DirectoryExecutionHost {
             )));
         }
         ensure_parent(destination)?;
+        if let Payloads::Datasets(datasets) = &self.payloads {
+            return datasets.clone_to(source, destination);
+        }
         fs::create_dir(destination)
             .map_err(|error| io_error("create clone payload", destination, error))?;
         match crate::copy::copy_until_quiescent_blocking(source, destination) {
@@ -972,7 +1006,7 @@ impl DirectoryExecutionHost {
             Err(error) => combine_cleanup(
                 "clone payload",
                 host_error(error),
-                remove_payload_tree(destination),
+                self.remove_payload_tree(destination),
             ),
         }
     }
@@ -1023,15 +1057,24 @@ impl DirectoryExecutionHost {
         self.require_store_image(image)?;
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
-                release_mount(&self.census, image, DetachIntent::Release)?;
+                release_mount(&self.payloads, &self.census, image, DetachIntent::Release)?;
+                if let Payloads::Datasets(datasets) = &self.payloads
+                    && datasets.destroy(image)?.is_some()
+                {
+                    return Ok(true);
+                }
                 let entry = self.deleting_entry(image)?;
                 let deleting = entry
                     .parent()
                     .expect("an entry lies in its deleting directory");
                 fs::create_dir_all(deleting)
                     .map_err(|error| io_error("create the deleting directory", deleting, error))?;
-                fs::rename(image, &entry)
-                    .map_err(|error| io_error("release a payload to .deleting", image, error))?;
+                self.rename_payload(image, &entry).map_err(|error| {
+                    ApfsStorageError::Host(format!(
+                        "release the payload {} to .deleting: {error}",
+                        image.display()
+                    ))
+                })?;
                 sync_parent_path(image)?;
                 sync_parent_path(&entry)?;
                 static SAID: std::sync::Once = std::sync::Once::new();
@@ -1083,14 +1126,41 @@ impl DirectoryExecutionHost {
             &incarnation,
         ))
     }
-}
 
-/// Remove a payload tree, read-only directories included; symlinks inside are unlinked, never
-/// followed.
-fn remove_payload_tree(image: &Path) -> Result<(), ApfsStorageError> {
-    cowshed_os::fsio::remove_owned_tree(image)
-        .map_err(|error| io_error("remove payload tree", image, error))?;
-    sync_parent_path(image)
+    /// Move the home payload at `from` to `to`.
+    pub(super) fn rename_payload(&self, from: &Path, to: &Path) -> Result<(), ApfsStorageError> {
+        match &self.payloads {
+            Payloads::Directories => {
+                fs::rename(from, to).map_err(|error| io_error("move payload", to, error))
+            }
+            Payloads::Datasets(datasets) => datasets.rename(from, to),
+        }
+    }
+
+    /// Make the empty home payload `image`, capped at `capacity` where a payload has a cap.
+    pub(super) fn create_payload(
+        &self,
+        image: &Path,
+        capacity: ImageCapacity,
+    ) -> Result<(), ApfsStorageError> {
+        match &self.payloads {
+            Payloads::Directories => {
+                fs::create_dir(image).map_err(|error| io_error("create payload", image, error))
+            }
+            Payloads::Datasets(datasets) => datasets.create(image, Some(capacity.bytes())),
+        }
+    }
+
+    /// Remove a payload a failed creation left, read-only directories included; symlinks inside
+    /// are unlinked, never followed.
+    fn remove_payload_tree(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        if let Payloads::Datasets(datasets) = &self.payloads {
+            return datasets.destroy(image).map(drop);
+        }
+        cowshed_os::fsio::remove_owned_tree(image)
+            .map_err(|error| io_error("remove payload tree", image, error))?;
+        sync_parent_path(image)
+    }
 }
 
 impl ApfsExecutionHost for DirectoryExecutionHost {
@@ -1190,11 +1260,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .collect()
     }
 
-    /// A new empty payload directory at `image`, bound to `mount_point`. A directory has no
-    /// capacity: it grows within its filesystem, so `capacity` describes nothing here.
+    /// A new empty payload at `image`, bound to `mount_point`. A directory payload has no
+    /// capacity: it grows within its filesystem, so `capacity` caps only a dataset payload.
     fn create_attached(
         &self,
-        _capacity: ImageCapacity,
+        capacity: ImageCapacity,
         image: &Path,
         mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
@@ -1208,7 +1278,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             )));
         }
         ensure_parent(image)?;
-        fs::create_dir(image).map_err(|error| io_error("create payload", image, error))?;
+        self.create_payload(image, capacity)?;
         sync_parent_path(image)?;
         let attachment = DirectoryAttachment::new(image.to_owned());
         self.mount(&attachment, mount_point, MountAccess::ReadWrite, false)?;
@@ -1378,7 +1448,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError> {
         self.require_store_image(image)?;
         if path_exists(image)? {
-            release_mount(&self.census, image, DetachIntent::Release)?;
+            release_mount(&self.payloads, &self.census, image, DetachIntent::Release)?;
         }
         self.reclaim_image(image)
     }
@@ -1386,6 +1456,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError> {
         if let Some(mount_point) = attachment.bound() {
             unbind(
+                &self.payloads,
                 &self.census,
                 &attachment.image,
                 &mount_point,
@@ -1422,7 +1493,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         {
             return Err(ApfsStorageError::PendingPublication(image.to_owned()));
         }
-        payload_root(image)?;
+        payload_root(&self.payloads, image)?;
         Ok(DirectoryAttachment::new(image.to_owned()))
     }
 
@@ -1461,7 +1532,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                 bound.display()
             )));
         }
-        bind(&attachment.image, mount_point)?;
+        bind(&self.payloads, &attachment.image, mount_point)?;
         attachment.set_bound(Some(mount_point.to_owned()));
         Ok(())
     }
@@ -1476,11 +1547,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         self.require_store_image(image)?;
         self.verify_controller_path(mount_point)?;
         // A directory payload is either home or bound: there is no attached-but-unmounted state.
-        let found = match settle(image)? {
+        let found = match settle(&self.payloads, image)? {
             Payload::Mounted(current) if current == mount_point => FoundMount::Mounted,
             Payload::Mounted(_) | Payload::Home => FoundMount::Detached,
         };
-        bind(image, mount_point)?;
+        bind(&self.payloads, image, mount_point)?;
         let attachment = DirectoryAttachment::new(image.to_owned());
         attachment.set_bound(Some(mount_point.to_owned()));
         Ok(ResumedMount {
@@ -1643,7 +1714,13 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         if let Some(mount_point) = attachment.bound() {
-            unbind(&self.census, &attachment.image, &mount_point, intent)?;
+            unbind(
+                &self.payloads,
+                &self.census,
+                &attachment.image,
+                &mount_point,
+                intent,
+            )?;
         }
         Ok(())
     }
@@ -1746,7 +1823,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .to_owned();
         if attachment.image != canonical
             || attachment.bound().as_deref() != Some(expected.as_path())
-            || settle(&canonical)? != Payload::Mounted(expected.clone())
+            || settle(&self.payloads, &canonical)? != Payload::Mounted(expected.clone())
         {
             return Err(ApfsStorageError::Host(format!(
                 "retained attachment of {} is not mounted at {}'s mountpoint {}",
@@ -1771,7 +1848,13 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             return Ok(());
         }
         let mount_point = main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
-        unbind(&self.census, &canonical, &mount_point, intent)
+        unbind(
+            &self.payloads,
+            &self.census,
+            &canonical,
+            &mount_point,
+            intent,
+        )
     }
 
     fn ensure_linked_build_volume(
@@ -2010,10 +2093,10 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         self.require_store_image(canonical)?;
         self.require_store_image(trash)?;
         // Retirement moves the payload, never its mounted binding record.
-        require_home(canonical)?;
+        require_home(&self.payloads, canonical)?;
         ensure_parent(trash)?;
         self.validate_staged_companion(&companion_path(canonical))?;
-        retire_payload(canonical, trash)
+        retire_payload(canonical, trash, |from, to| self.rename_payload(from, to))
     }
 
     fn release_workspace(
@@ -2188,3 +2271,5 @@ impl DirectoryExecutionHost {
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod zfs_tests;

@@ -920,6 +920,7 @@ dependencies = [
  "bytes",
  "cowshed-apfs",
  "cowshed-gateway-types",
+ "cowshed-helper",
  "cowshed-os",
  "getrandom 0.3.4",
  "libc",

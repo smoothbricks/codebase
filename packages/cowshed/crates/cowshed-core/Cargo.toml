@@ -41,6 +41,9 @@ cowshed-apfs = { path = "../cowshed-apfs" }
 # inventory is a pure function of these values, so the controller has no reason to link the
 # daemon's hyper/rustls closure; `cowshed-cli` owns the wiring to the running daemon.
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
+# Dataset names with their containment rule, and the kernel's mount-source answer, shared with
+# the root helper every ZFS mutation goes through (specs/cowshed/09_substrates.md).
+cowshed-helper = { path = "../cowshed-helper" }
 cowshed-os = { path = "../cowshed-os" }
 getrandom = "0.3"
 libc = "0.2"

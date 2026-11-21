@@ -64,11 +64,13 @@ pub use build_volumes::{
 use cowshed_apfs::mounts::{KernelMountSnapshot, kernel_mounts};
 use cowshed_apfs::store_lock::{ImageLockGuard, acquire_existing_image_locks, acquire_image_locks};
 
-/// One payload rename commits retirement for both physical images and directory payloads.
-/// Callers prove store authority, unmounted payload state and the private CA companion first.
+/// One payload move commits retirement for both physical images and directory payloads: `moved`
+/// is the host's rename of a payload. Callers prove store authority, unmounted payload state and
+/// the private CA companion first.
 pub(in crate::storage) fn retire_payload(
     canonical: &Path,
     trash: &Path,
+    moved: impl FnOnce(&Path, &Path) -> Result<(), ApfsStorageError>,
 ) -> Result<(), ApfsStorageError> {
     if path_exists(trash)? {
         return Err(ApfsStorageError::Host(format!(
@@ -112,9 +114,7 @@ pub(in crate::storage) fn retire_payload(
                 .map_err(|error| io_error("record retirement CA key", &trash_companion, error))
         })
         .and_then(|()| sync_parent_path(trash))
-        .and_then(|()| {
-            fs::rename(canonical, trash).map_err(|error| io_error("retire image", trash, error))
-        });
+        .and_then(|()| moved(canonical, trash));
     if let Err(primary) = committed {
         return super::combine_cleanup("retire image", primary, discard_prepared_retirement(trash));
     }
@@ -4888,7 +4888,11 @@ where
                     before: canonical,
                     after: trash,
                 }],
-                || retire_payload(canonical, trash),
+                || {
+                    retire_payload(canonical, trash, |from, to| {
+                        fs::rename(from, to).map_err(|error| io_error("retire image", to, error))
+                    })
+                },
             )
             .0
     }
