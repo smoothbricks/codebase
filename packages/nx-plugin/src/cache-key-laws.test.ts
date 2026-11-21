@@ -70,6 +70,14 @@ const RUNTIME_READS: readonly RuntimeRead[] = [
     evidence: 'cowshed-apfs/tests/support/scratch_apfs.rs keeper_executable and scripts/apfs-test-sweep.ts',
   },
   {
+    crates: ['cowshed-core', 'cowshed-cli'],
+    producer: { project: 'cowshed', target: 'sandbox-exec-bin' },
+    glob: '**/sandbox-exec/cowshed-sandbox-exec',
+    evidence:
+      'cowshed-core/tests/support/sandbox_launcher.rs:29-63 runs the lane artifact .cache/sandbox-exec/cowshed-sandbox-exec; ' +
+      'cowshed-core/src/sandbox.rs:1131, tests/landing.rs:53 and cowshed-cli/src/install_basis.rs:350 name it',
+  },
+  {
     crates: ['cowshed-napi'],
     producer: { project: 'cowshed', target: 'wire-fixtures' },
     glob: 'packages/cowshed/src/wire-fixtures.json',
