@@ -106,8 +106,10 @@ describe('the per-user mount root the real-APFS tests need', () => {
   it("matches the paths and modes of cowshed's own mount root and scratch parent", () => {
     const crates = fileURLToPath(new URL('../crates/', import.meta.url));
     const read = (path: string): string => readFileSync(join(crates, path), 'utf8');
-    expect(read('cowshed-core/src/storage/host_config.rs')).toContain(`MACOS_MOUNT_PREFIX: &str = "${MOUNT_PREFIX}"`);
-    expect(read('cowshed-core/src/storage/host_config.rs')).toMatch(/fn macos_mount_root[^}]*\.join\("mnt"\)/);
+    expect(read('cowshed-core/src/storage/host_config/macos.rs')).toContain(
+      `MACOS_MOUNT_PREFIX: &str = "${MOUNT_PREFIX}"`,
+    );
+    expect(read('cowshed-core/src/storage/host_config/macos.rs')).toMatch(/fn macos_mount_root[^}]*\.join\("mnt"\)/);
     // The fixtures make `t` inside the per-user root this provisions, and refuse it when it is missing.
     expect(read('cowshed-os/src/scratch.rs')).toContain(`"${MOUNT_PREFIX}/{euid}/t"`);
     // setup's own operations: the prefix is root's 0755, the per-user root and `mnt` are the user's 0700, and the
