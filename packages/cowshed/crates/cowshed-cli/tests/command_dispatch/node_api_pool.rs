@@ -31,7 +31,8 @@ async fn host_controller_a_node_api_exec_reaches_the_warm_pool() {
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     // Only a workspace with an `.envrc` runs its commands in warm hosts.
     let mut fixture = Fixture::directory();

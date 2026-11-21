@@ -98,7 +98,7 @@ pub fn dispatch() -> io::Result<()> {
     cowshed_core::runtime::shell_host::register(ShellHostProgram::with_arguments(
         std::env::current_exe()?,
         vec![SHELL_HOST_ARGUMENT.into()],
-    ));
+    )?);
     Ok(())
 }
 

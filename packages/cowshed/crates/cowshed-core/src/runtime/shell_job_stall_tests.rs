@@ -85,7 +85,7 @@ impl Workspace {
 
     fn activator(&self, gate: ActivationGate) -> Arc<HostActivator> {
         Arc::new(HostActivator {
-            program: ShellHostProgram::dedicated("/usr/bin/false"),
+            program: ShellHostProgram::dedicated("/usr/bin/false").expect("/usr/bin/false"),
             workspace_mount: self.0.clone(),
             profile: crate::runtime::supervisor::ChildProfile::unbound(
                 "",

@@ -189,7 +189,10 @@ impl Workspace {
     }
 
     fn supervisor(&self, prewarm: bool) -> WorkspaceSupervisorHandle {
-        self.supervisor_hosted_by(ShellHostProgram::dedicated(shell_host()), prewarm)
+        self.supervisor_hosted_by(
+            ShellHostProgram::dedicated(shell_host()).expect("the shell host binary"),
+            prewarm,
+        )
     }
 
     fn supervisor_hosted_by(
@@ -1758,7 +1761,11 @@ async fn host_controller_a_host_that_breaks_while_activating_fails_the_job_with_
     std::fs::write(&broken, "#!/bin/sh\nexit 3\n").expect("broken host");
     std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("executable");
-    let handle = workspace.supervisor_hosted_by(ShellHostProgram::dedicated(&broken), false);
+
+    let handle = workspace.supervisor_hosted_by(
+        ShellHostProgram::dedicated(&broken).expect("broken host"),
+        false,
+    );
     let ran = run(&handle, sh("printf never")).await;
     assert_eq!(
         ran.info.state,

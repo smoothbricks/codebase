@@ -86,6 +86,8 @@ fn pool_key(
     }
     field(&grant_revision.to_le_bytes());
     field(program.executable().as_os_str().as_bytes());
+    field(&program.identity().0.to_le_bytes());
+    field(&program.identity().1.to_le_bytes());
     for argument in program.arguments() {
         field(argument.as_bytes());
     }
@@ -1715,8 +1717,81 @@ impl Activator for HostActivator {
     }
 }
 
+/// Write the first `length` bytes of the bound program `source` to a new file at `destination`:
+/// a clone of the descriptor's file where its volume allows (`fclonefileat` on macOS), else
+/// [`copy_at_offsets`]. Neither reads the descriptor's offset, which every staging of the program
+/// shares, so concurrent stagings each copy the whole file.
+fn copy_bound(source: &std::fs::File, length: u64, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a staged program is a file in a directory",
+            ));
+        };
+        let directory = std::fs::File::open(parent)?;
+        let name = std::ffi::CString::new(name.as_bytes())?;
+        // SAFETY: both descriptors stay open across the call, and the name is NUL-terminated.
+        let cloned = unsafe {
+            libc::fclonefileat(source.as_raw_fd(), directory.as_raw_fd(), name.as_ptr(), 0)
+        };
+        if cloned == 0 {
+            let copied = std::fs::symlink_metadata(destination)?.len();
+            if copied != length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the clone holds {copied} bytes of the program's {length}"),
+                ));
+            }
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // Another volume, or one that cannot clone: copy the bytes instead.
+        if !matches!(error.raw_os_error(), Some(libc::EXDEV | libc::ENOTSUP)) {
+            return Err(error);
+        }
+    }
+    copy_at_offsets(source, length, destination)
+}
+
+/// Write the first `length` bytes of `source` to a new file at `destination` by positioned reads
+/// (`pread`), which leave the descriptor's shared offset alone. A file that ends short of
+/// `length` fails the copy.
+fn copy_at_offsets(source: &std::fs::File, length: u64, destination: &Path) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::FileExt as _;
+    let mut written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut offset = 0_u64;
+    while offset < length {
+        let want = usize::try_from(length - offset)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = match source.read_at(&mut buffer[..want], offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("the program ended after {offset} of its {length} bytes"),
+                ));
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        written.write_all(&buffer[..read])?;
+        offset += read as u64;
+    }
+    Ok(())
+}
+
 /// Copy the host program into the workspace's protected host directory, content-addressed by
-/// the source file's identity, and drop every other version there.
+/// the bound file's identity, and drop every other version there. The bytes come from the file
+/// the program was bound to ([`ShellHostProgram`]), never from its path, which a build or an
+/// install may have unlinked or published another file at since.
 ///
 /// The program is copied rather than run in place because the executed-child profile may deny
 /// reading where the controller's binary lives (the project root and every workspace mount are
@@ -1729,8 +1804,10 @@ pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) ->
             "check the controller's cowshed binary and the workspace metadata directory",
         )
     };
-    let source = program.executable();
-    let metadata = std::fs::metadata(source).map_err(|error| staging_error("inspect", error))?;
+    let source = program.file();
+    let metadata = source
+        .metadata()
+        .map_err(|error| staging_error("inspect", error))?;
     let name = staged_name(&metadata);
     let directory = mount.join(SHELL_HOST_DIRECTORY);
     crate::storage::verify_no_symlinks(mount, &mount.join(".cowshed")).map_err(|error| {
@@ -1747,7 +1824,7 @@ pub(super) fn stage_host_executable(mount: &Path, program: &ShellHostProgram) ->
         return Ok(target);
     }
     let temporary = directory.join(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
-    std::fs::copy(source, &temporary).map_err(|error| staging_error("copy", error))?;
+    copy_bound(source, metadata.len(), &temporary).map_err(|error| staging_error("copy", error))?;
     std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555))
         .map_err(|error| staging_error("mode", error))?;
     std::fs::rename(&temporary, &target).map_err(|error| staging_error("publish", error))?;
@@ -1995,11 +2072,13 @@ mod tests {
         std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
         let program = root.join("host");
         std::fs::write(&program, b"first").unwrap();
-        let first = stage_host_executable(&mount, &ShellHostProgram::dedicated(&program)).unwrap();
+        let first =
+            stage_host_executable(&mount, &ShellHostProgram::dedicated(&program).unwrap()).unwrap();
         std::fs::write(mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE), b"{}").unwrap();
         std::fs::remove_file(&program).unwrap();
         std::fs::write(&program, b"second build").unwrap();
-        let second = stage_host_executable(&mount, &ShellHostProgram::dedicated(&program)).unwrap();
+        let second =
+            stage_host_executable(&mount, &ShellHostProgram::dedicated(&program).unwrap()).unwrap();
         assert_ne!(first, second);
         assert!(!first.exists(), "the superseded program is swept");
         assert!(second.exists());
@@ -2007,6 +2086,94 @@ mod tests {
             mount.join(SHELL_HOST_DIRECTORY).join(RECORD_FILE).exists(),
             "the activation record survives staging"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A scratch mount with its `.cowshed` directory, and the path a host program is written at.
+    fn staging_fixture(
+        label: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-stage-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mount = root.join("mount");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        let program = root.join("host");
+        (root, mount, program)
+    }
+
+    /// The host program is the file its registration named: staging copies that file though its
+    /// path has since been removed, as a build that re-links its output removes it for a moment
+    /// (11_shell.md, "Exec hosts").
+    #[test]
+    fn staging_copies_the_registered_program_after_its_path_is_removed() {
+        use super::super::shell_host::ShellHostProgram;
+        use super::stage_host_executable;
+        let (root, mount, program) = staging_fixture("removed");
+        std::fs::write(&program, b"registered bytes").unwrap();
+        let registered = ShellHostProgram::dedicated(&program).unwrap();
+        std::fs::remove_file(&program).unwrap();
+        let staged = stage_host_executable(&mount, &registered).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"registered bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Another file published over the registered program's path, by rename as an install or a
+    /// build does, is not the host: staging still copies the file the registration named.
+    #[test]
+    fn staging_copies_the_registered_program_after_another_replaces_its_path() {
+        use super::super::shell_host::ShellHostProgram;
+        use super::stage_host_executable;
+        let (root, mount, program) = staging_fixture("replaced");
+        std::fs::write(&program, b"registered bytes").unwrap();
+        let registered = ShellHostProgram::dedicated(&program).unwrap();
+        let next = root.join("host.next");
+        std::fs::write(&next, b"another build").unwrap();
+        std::fs::rename(&next, &program).unwrap();
+        let staged = stage_host_executable(&mount, &registered).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"registered bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Concurrent stagings of one program each publish the whole of it, and so do concurrent
+    /// positioned copies of its one descriptor: none reads an offset another moves.
+    #[test]
+    fn concurrent_stagings_of_one_program_each_copy_all_of_it() {
+        use super::super::shell_host::ShellHostProgram;
+        use super::{copy_at_offsets, stage_host_executable};
+        let (root, _, program) = staging_fixture("concurrent");
+        // Several reads' worth, so an interleaving would show.
+        let bytes: Vec<u8> = (0..3_u32 << 20).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&program, &bytes).unwrap();
+        let registered = ShellHostProgram::dedicated(&program).unwrap();
+        let length = u64::try_from(bytes.len()).unwrap();
+        let copies: Vec<std::path::PathBuf> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for index in 0..8 {
+                let registered = &registered;
+                let mount = root.join(format!("mount-{index}"));
+                std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+                handles
+                    .push(scope.spawn(move || stage_host_executable(&mount, registered).unwrap()));
+                let destination = root.join(format!("copy-{index}"));
+                handles.push(scope.spawn(move || {
+                    copy_at_offsets(registered.file(), length, &destination).unwrap();
+                    destination
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for copy in copies {
+            assert!(
+                std::fs::read(&copy).unwrap() == bytes,
+                "{} is the whole program",
+                copy.display()
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -2061,7 +2228,12 @@ mod identity_tests {
             &identity.environment,
             envrc.as_deref(),
             identity.grant_revision,
-            &ShellHostProgram::dedicated(format!("/bin/host-{}", identity.program)),
+            &ShellHostProgram::dedicated(if identity.program == 0 {
+                PathBuf::from("/bin/sh")
+            } else {
+                std::env::current_exe().unwrap()
+            })
+            .unwrap(),
         )
     }
 

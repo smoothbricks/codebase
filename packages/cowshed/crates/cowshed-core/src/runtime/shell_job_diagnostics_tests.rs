@@ -187,7 +187,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
             Arc::new(HostActivator {
                 program: ShellHostProgram::dedicated(
                     std::env::current_exe().expect("test executable"),
-                ),
+                )
+                .expect("the test executable as host program"),
                 workspace_mount: PathBuf::from("/"),
                 profile: crate::runtime::supervisor::ChildProfile::unbound(
                     "",

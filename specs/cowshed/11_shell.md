@@ -23,12 +23,17 @@ control socket (`SCM_RIGHTS`), forks the argv into a new process group with the 
 environment laid over the activated one, and reports the raw `waitpid` status. Nothing a command does — `cd`, `export`,
 a changed umask — reaches the host or a later command: every command is a fresh process from the same activated
 environment. The host program is staged under `.cowshed/shell-host/`, which every profile denies writes to, so no job
-can replace the parent of later commands. A workspace with no `.envrc` above the command's cwd gets hosts that skip
-activation and hold the sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those
-hosts. A devenv project activates through `use devenv` in its own `.envrc`. A caller without an exec host can activate
-read-write argv commands in a one-shot executed child (`direnv allow` then `direnv exec`); controller-owned work after
-supervisor retirement uses this path, including land's Nx socket cleanup (04_sandbox.md, lifecycle signal authority). It
-is never a read-only backend: a selected shell without an exec host refuses `EnvironmentMissing` with
+can replace the parent of later commands. It is staged from the file the program was bound to when it was registered,
+held open, never from its path again: a file published at that path afterwards, by an install's or a build's rename or
+by unlinking and creating it, is not the host, and removing the path takes nothing from it. The open file pins the file,
+not its bytes; a publisher that rewrote the same file in place would change what a later staging copies, and the staged
+name with it. Copies read the file by clone or by positioned reads, never its shared offset, so concurrent stagings each
+copy all of it. A workspace with no `.envrc` above the command's cwd gets hosts that skip activation and hold the
+sandbox environment itself; its argv jobs keep one-shot spawns, its script jobs run in those hosts. A devenv project
+activates through `use devenv` in its own `.envrc`. A caller without an exec host can activate read-write argv commands
+in a one-shot executed child (`direnv allow` then `direnv exec`); controller-owned work after supervisor retirement uses
+this path, including land's Nx socket cleanup (04_sandbox.md, lifecycle signal authority). It is never a read-only
+backend: a selected shell without an exec host refuses `EnvironmentMissing` with
 `read-only shell entry requires an exec host`, without approval or evaluation. Plain-workspace argv needs no host.
 
 **A host never spins once its mount is gone.** A host runs its program from the workspace mount, so once that mount is

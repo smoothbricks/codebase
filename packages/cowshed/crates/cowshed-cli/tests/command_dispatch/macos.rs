@@ -1215,7 +1215,8 @@ async fn directory_source_shell_records_follow_adopt_and_every_gated_land() {
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     let mut fixture = Fixture::directory();
     fs::write(fixture.checkout.join(".envrc"),
@@ -1365,7 +1366,8 @@ async fn directory_an_ungated_fold_returns_without_activating_its_lane_base_shel
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     let mut fixture = Fixture::directory();
     fs::write(fixture.checkout.join(".envrc"),
@@ -8701,7 +8703,8 @@ async fn directory_managed_bun_runs_the_declared_bun_and_refuses_another_naming_
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     // No released Bun has this version, so only the declared program can answer it.
     let declared = "0.0.0-declared";
@@ -8831,7 +8834,8 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     let (repository, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
@@ -9073,7 +9077,8 @@ async fn directory_killed_covered_install_restores_links_its_postinstall_removed
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
             cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
-        ),
+        )
+        .expect("the cowshed binary as host program"),
     );
     let (repository, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {

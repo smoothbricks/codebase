@@ -556,32 +556,85 @@ pub fn read_frame(socket: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedF
 // Host
 
 /// The command that starts an exec host: a binary that serves the protocol and the arguments
-/// that select its host mode.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// that select its host mode. Making one opens the file its path names, and every staging copies
+/// that open file, never the path again (11_shell.md, "Exec hosts"): a file published at the path
+/// afterwards, by an install's or a build's rename or by unlinking and creating it, is not this
+/// program, and removing the path takes nothing from it. The descriptor pins the file, not its
+/// bytes: a publisher that rewrote the same file in place would change what a later staging
+/// copies, and the staged name with it.
+#[derive(Clone, Debug)]
 pub struct ShellHostProgram {
     executable: PathBuf,
+    file: std::sync::Arc<std::fs::File>,
+    /// The bound file's device and inode, which name it among every file the path ever named.
+    identity: (u64, u64),
     arguments: Vec<OsString>,
 }
 
+impl PartialEq for ShellHostProgram {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.executable == other.executable
+            && self.arguments == other.arguments
+    }
+}
+
+impl Eq for ShellHostProgram {}
+
 impl ShellHostProgram {
-    /// A binary whose `main` is exactly `cowshed_shell::serve`.
-    pub fn dedicated(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
-            arguments: Vec::new(),
-        }
+    /// A binary whose `main` is exactly `cowshed_shell::serve`, bound to the file `executable`
+    /// names now.
+    pub fn dedicated(executable: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::with_arguments(executable, Vec::new())
     }
 
-    /// A binary that serves as a host when started with `arguments`.
-    pub fn with_arguments(executable: impl Into<PathBuf>, arguments: Vec<OsString>) -> Self {
-        Self {
-            executable: executable.into(),
+    /// A binary that serves as a host when started with `arguments`, bound to the file
+    /// `executable` names now. A path that names no readable regular file is refused here, naming
+    /// it, rather than at the first staging.
+    pub fn with_arguments(
+        executable: impl Into<PathBuf>,
+        arguments: Vec<OsString>,
+    ) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let executable = executable.into();
+        let refused = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot bind the exec host program {}: {error}",
+                    executable.display()
+                ),
+            )
+        };
+        let file = std::fs::File::open(&executable).map_err(refused)?;
+        let metadata = file.metadata().map_err(refused)?;
+        if !metadata.is_file() {
+            return Err(refused(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "it is not a regular file",
+            )));
+        }
+        Ok(Self {
+            identity: (metadata.dev(), metadata.ino()),
+            file: std::sync::Arc::new(file),
+            executable,
             arguments,
-        }
+        })
     }
 
+    /// The path the program was bound from, as it was spelled then.
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    /// The file the program was bound to: what every staging copies.
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// The bound file's device and inode.
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        self.identity
     }
 
     pub fn arguments(&self) -> &[OsString] {
