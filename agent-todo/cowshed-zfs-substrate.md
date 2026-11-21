@@ -1,51 +1,52 @@
-# cowshed: the ZFS substrate
+# cowshed: Linux host and the ZFS substrate
 
-Target: `specs/cowshed/01b_zfs.md`, `specs/cowshed/09_substrates.md` ("ZFS substrate"), `16_build_volumes.md`. This
+Target: `specs/cowshed/01b_zfs.md`, `09_substrates.md` ("ZFS substrate"), `04_sandbox.md` ("Linux enforcement"). This
 brief holds what stands between the tree and that target, with the evidence for each gap.
 
-## Landed
+## Proven
 
-- **`cowshed-helper`** (`packages/cowshed/crates/cowshed-helper`): the fixed verb set, containment below one root that
-  names its caller (`cowshed:owner`), the property allow-list, the mountpoint rule and the handover of a created
-  dataset's root. Proven against real ZFS by `cowshed:zfs-helper-test` (08_testing.md, "Real ZFS"). The macOS arm
-  (`src/host/macos.rs`) is written from the `fstatfs` contract and has never been compiled: this host has no Apple
-  target installed.
+On a NixOS container whose datasets are zoned to its user namespace (kernel 6.18, OpenZFS 2.4.3, musl release build,
+systemd user daemon), 2026-11-21: `setup`, `gateway start`, `adopt`, `fork`, `exec`, a fork of a fork, `land`, `rm`,
+`rm --abandon`, `gc` and `doctor` run, and the store ends with only `main`. Each workspace is a dataset named for its
+place (`main`, `ws/<name>`, `ws/.trash/<name>-<incarnation>`, `build/<id>`); a job runs under Landlock in private user,
+network and mount namespaces. Host proofs: `cowshed:zfs-helper-test` and `storage::directory::zfs_tests` (both need
+`sudo -n` and `COWSHED_ZFS_TEST_PARENT`).
 
-## Gaps, in dependency order
+## Gaps
 
-1. **Nothing calls the helper.** No production code spawns `cowshed-helper`; its only caller is its own host proof. The
-   client (spawn through the bounded runner, map exit status 2 and `zfs` failures into `ApfsStorageError`) belongs to
-   the storage host of gap 3.
-2. **The root is still `<pool>/cowshed` in selection and bootstrap.** `storage/bootstrap.rs` builds the root as
-   `zfs_name(pool, ZFS_COWSHED_ROOT)` in `plan_zfs`, `SubstrateConfig` holds only a pool, and `.cowshed.toml`
-   `[substrate]` accepts only `pool`. The helper and 09_substrates.md already take `<parent>/cowshed`; a host whose only
-   writable tree is a delegated or zoned dataset cannot be selected until the configuration names the parent dataset.
-   `ZFS_CACHES_CHILD` is still planned where 09 specifies `build-cache`, and the tool is spawned as `/usr/sbin/zfs`, a
-   path NixOS does not have (AGENTS.md rule 12: spawn by PATH name).
-3. **There is no ZFS storage host.** `ApfsExecutionHost` (`storage/apfs.rs`) has two implementations,
-   `MacOsApfsExecutionHost` and `DirectoryExecutionHost`. A `ZfsExecutionHost` follows the directory host's shape (the
-   layout's image path stands for each payload, with its sidecar, lock and trash grammar beside it) with a dataset as
-   the payload: `clone_image` is snapshot plus clone, `retire_image` is unmount, `canmount=off` and rename into
-   `.trash`, `reclaim_image` is destroy of the clone then its origin, `resize` is `refquota`, `list` is `zfs list`
-   joined with the mount table.
-4. **The project runtime does not exist off macOS.** `runtime/mod.rs` compiles `storage_host`, `build_volumes`,
-   `daemon_watch`, `held_bundles`, `job_accounting`, `job_attribution`, `mount_activity`, `process_events`,
-   `process_fence` and `process_monitor` for macOS only; `ProjectRuntime::open_native` and `open_directory`
-   (`runtime/project.rs`) answer `environment_missing` elsewhere, and `storage/bootstrap/native/linux.rs` answers
-   `UnsupportedPlatform` for setup. So `adopt`, `fork`, `exec`, `land`, `rm` and `gc` reach no storage on Linux whatever
-   the substrate. This is the largest part of "ZFS on Linux" and is not ZFS work: each gated module needs its Linux
-   mechanism (several exist: `job_cgroup`, `host_pressure/linux.rs`, `exec/linux.rs`) behind the interface the macOS one
-   already serves.
-5. **Platform mechanism still sits inline.** 1,904 `cfg(target_os)` occurrences in 138 files lie outside files named for
-   a platform (`rg -c 'cfg\(.*target_os' --glob '*.rs' packages/cowshed/crates`, excluding `linux.rs`, `macos.rs` and
-   `cowshed-apfs`). Most gate tests or macOS-only features of gap 4. Real mechanism inline, to move behind
-   `linux.rs`/`macos.rs` as `host_pressure/mod.rs` does: `build_volume/nx.rs` (procfs census beside `libc::vinfo_stat`),
-   `cowshed-os/src/process.rs` (`KERN_PROCARGS2` parsing beside the Linux `running`), `runtime/job_groups.rs`
-   (`proc_pidinfo` identity), `runtime/supervisor.rs` (`observed_command`, `spawn_observed`, the paired
-   `cgroup`/`observations` methods), and `cowshed-os/src/{deadline,fsio}.rs`. Nothing checks the rule: there is no lint
-   for it.
-6. **The helper's mountpoint race** (09_substrates.md, "Privileged helper", Open). Until the helper mounts by
-   descriptor, installing it setuid or by sudoers on a host where the caller is not already root-equivalent is an
-   escalation.
-7. **macOS is unmeasured.** No macOS host with OpenZFS has run any of this: the `com.apple.*` properties, the
-   no-`IOMedia` claim, and whether mounting needs the helper there (01b_zfs.md, "Open questions").
+1. **`01b_zfs.md` describes a design the code does not follow.** A seed is its own `build/<id>` dataset, not a
+   `@seed-<n>` snapshot, and freshness is the shared write mark, not `written@`. Mountpoints are set per dataset, since
+   a payload moves between its store path and its mountpoint, rather than inherited from `ws` and `build`. The spec's
+   "Seed", "Behind" and layout diagram need rewriting to the dataset design.
+2. **Tests that are not green on Linux.**
+   - Three `git::tests` (`unregistering_one_worktree_spares_a_detached_sibling`,
+     `rename_preserves_linked_source_index_wip_and_branch_across_resumed_handoff`,
+     `fork_carry_clean_and_ref_preserve_source_bytes_and_index`): `git worktree repair` reads every sibling worktree's
+     `.git` pointer, which the controller-git policy gives no rule (`04_sandbox.md`, Open item 9).
+   - Eleven `runtime::build_volumes` `directory_*` tests and `land_lease::a_second_taker_is_refused_naming_the_first`
+     fail only when run as threads of one process, and
+     `exec::profile_file::tests::gc_removes_a_profile_only_when_every_live_supervisor_started_after_its_last_launch`
+     failed once in a combined run. Unverified reading: a forked child holds a copy of a lock or listener descriptor
+     until its exec.
+   - `tests/project_runtime.rs` and `tests/workspace_supervisor.rs` compile on Linux and have not been run; fixtures
+     that reach a launch must name the launcher (`sandbox::name_launcher`).
+   - About 190 tests in `sandbox.rs`, `runtime/supervisor.rs` and those two files are still macOS-gated and unaudited.
+   - `directory_adoption_copies_nothing_from_the_target` needs `sqlite3` on PATH;
+     `a_host_daemon_whose_record_is_handed_over_serves_on_across_the_move` asserts a daemon reads unsandboxed, which a
+     session under a seccomp filter cannot show.
+3. **Sandbox gaps** (`04_sandbox.md`, "Linux enforcement", Open): pathname Unix sockets outside the two masked
+   directories are reachable; nothing is write-protected inside the workspace mount (marker, token, CA); `/proc` shows
+   host command lines; namespaces and the connector are per launch, not per workspace.
+4. **The helper's mountpoint check and the mount are two steps** (`09_substrates.md`, "Privileged helper", Open).
+5. **Residue seen in the real run.** `<name>.dmg.lock`, `.intent.lock` and `.land.lock` stay in `sessions/` after a
+   workspace is landed or removed; whether macOS leaves the same is unchecked. Messages on a ZFS store still say "apfs"
+   and "image" (`apfs staging/unmount`, "image stayed attached as <dataset>").
+6. **Host-side PATH lists that still retype FHS directories:** `cowshed-cli/src/capabilities/mbx.rs` (runs `mbx setup`)
+   and `declared_land.rs::bootstrap_path`. The owner is `cowshed-core/src/host_path.rs`.
+7. **`bootstrap/native/linux.rs::locate_helper`** prefers the helper beside the executable; the runtime's
+   `choose_helper` prefers a setuid one on PATH. One rule should serve both.
+8. **macOS is compile-checked only.** `cargo check -Zbuild-std --target aarch64-apple-darwin` is clean for every crate;
+   nothing was run on a Mac, so every moved `macos.rs`, the ZFS substrate on macOS and the `com.apple.*` properties of
+   `01b_zfs.md` are unproven there.
+9. **mbx on NixOS** needs the `nix-command` and `flakes` features; without them `setup` exits 5 after everything else
+   succeeded.
