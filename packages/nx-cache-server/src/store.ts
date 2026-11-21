@@ -19,7 +19,7 @@
  * and reclaims nothing until the first store is closed or its process dies.
  */
 
-import { link, mkdir, open, readdir, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { logLine, logValue } from './log.js';
@@ -106,6 +106,20 @@ export type ReadOutcome =
 
 const MISSING: ReadOutcome = { kind: 'missing' };
 
+export type MemberOutcome =
+  | { readonly kind: 'found'; readonly bytes: number }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'failed'; readonly reason: string };
+
+/** Whether `key` is stored, by its metadata alone: no open, no read, and SIEVE's visited bit left as it is. */
+export async function memberEntry(store: CacheStore, key: string): Promise<MemberOutcome> {
+  try {
+    const stats = await lstat(entryPath(store, key));
+    return stats.isFile() && stats.size > 0 ? { kind: 'found', bytes: stats.size } : { kind: 'missing' };
+  } catch (cause) {
+    return errnoOf(cause) === 'ENOENT' ? { kind: 'missing' } : { kind: 'failed', reason: describe(cause) };
+  }
+}
 /** Pin an opened inode before answering: a concurrent sweep may unlink its path, not truncate GET. */
 export async function readEntry(store: CacheStore, key: string): Promise<ReadOutcome> {
   try {

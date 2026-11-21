@@ -632,16 +632,18 @@ count; graceful stop drains requests, and hard death leaves only reclaimable sta
 Retention reuses filesystem SIEVE: insertion order is mtime, `atime > mtime` is the visited bit, clearing restores atime
 to mtime, and a sibling `sieve.hand` persists the cursor. Mount access-clock behavior is not relied on; a successful GET
 explicitly marks the opened inode's visited bit when clear so SIEVE does not degrade to FIFO, preserving its
-modification-time cursor through `utimes`; it never retimes a path that could name a replacement inode. No shared live
-cache database is introduced. Streaming stages proceed in parallel. Complete staged values enter one serialized
-publication section: never-replace hard link, then SIEVE sweep, then successful completion. No publication interleaves a
-sweep's cap enforcement. A sweep also runs before listening, and it is the one that lists the store: the ring it reads
-(each archive's path, mtime and length in insertion order, their sum, and the hand) is held in the backend's memory
-under the store lease, which excludes every other writer of the directory. A publication adds its one archive to the
-ring and lists nothing. Only when the sum exceeds `capBytes` does its sweep walk from the hand, and it reads the visited
-bit from the inode of each archive it examines, so the filesystem stays the only record of a read and the work of a
-commit is bounded by the archives it evicts or spares. A sweep that fails discards the ring; the next commit lists the
-store again. The ring is derived state, never persisted: a restart rebuilds it from the directory and `sieve.hand`. Each
+modification-time cursor through `utimes`; it never retimes a path that could name a replacement inode. A `HEAD` is
+possession, not use: it answers from the entry's metadata (an lstat of the key's path, the same miss rule as a read) and
+neither opens the archive nor marks it visited, so asking whether a key is held never keeps it. No shared live cache
+database is introduced. Streaming stages proceed in parallel. Complete staged values enter one serialized publication
+section: never-replace hard link, then SIEVE sweep, then successful completion. No publication interleaves a sweep's cap
+enforcement. A sweep also runs before listening, and it is the one that lists the store: the ring it reads (each
+archive's path, mtime and length in insertion order, their sum, and the hand) is held in the backend's memory under the
+store lease, which excludes every other writer of the directory. A publication adds its one archive to the ring and
+lists nothing. Only when the sum exceeds `capBytes` does its sweep walk from the hand, and it reads the visited bit from
+the inode of each archive it examines, so the filesystem stays the only record of a read and the work of a commit is
+bounded by the archives it evicts or spares. A sweep that fails discards the ring; the next commit lists the store
+again. The ring is derived state, never persisted: a restart rebuilds it from the directory and `sieve.hand`. Each
 successful commit restores the configured `capBytes` sum of published archive lengths before replying 200. `maxBytes`
 independently bounds one upload and cannot exceed `capBytes`.
 

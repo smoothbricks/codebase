@@ -2071,7 +2071,7 @@ impl Actor {
             return;
         }
         let repo_id = session.repo_id.clone();
-        if is_nx && intent.method != Method::GET && intent.method != Method::PUT {
+        if is_nx && !crate::nx_cache::serves(&intent.method) {
             self.refuse_nx(
                 &workspace_id,
                 &intent,
@@ -2079,7 +2079,7 @@ impl Actor {
                     status: AuditStatus::Denied,
                     classification: "nx-method-denied",
                     detail: None,
-                    message: "Nx cache accepts only GET and PUT",
+                    message: "Nx cache accepts only GET, HEAD and PUT",
                 },
                 reply,
             )
@@ -3024,8 +3024,8 @@ fn build_seed(
                     .ok_or(("Nx cache path is invalid", None))?;
                 let backend =
                     nx_backend.ok_or(("project Nx cache backend is unavailable", None))?;
-                if intent.method != Method::GET && intent.method != Method::PUT {
-                    return Err(("Nx cache accepts only GET and PUT", None));
+                if !crate::nx_cache::serves(&intent.method) {
+                    return Err(("Nx cache accepts only GET, HEAD and PUT", None));
                 }
                 (
                     backend.target(),
@@ -4389,7 +4389,7 @@ mod tests {
         let root = TestRoot::new("method-order");
         let mut fixture = TestActor::new(&root).await;
         let token = fixture.install("nx-method", "owner/nx-method", 95, 1).await;
-        for method in [Method::HEAD, Method::POST, Method::DELETE] {
+        for method in [Method::POST, Method::DELETE, Method::PATCH] {
             let (reply, mut receive) = oneshot::channel();
             let (_cancel, cancelled) = oneshot::channel();
             fixture
@@ -4574,6 +4574,7 @@ mod tests {
         ));
         for (method, status) in [
             (Method::GET, StatusCode::NOT_FOUND),
+            (Method::HEAD, StatusCode::NOT_FOUND),
             (Method::PUT, StatusCode::FORBIDDEN),
         ] {
             let (reply, mut receive) = oneshot::channel();

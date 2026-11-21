@@ -786,8 +786,10 @@ archive. A hash is one validated Nx task key: 1-128 characters of `[A-Za-z0-9_-]
 uses a task's hash verbatim as its cache key, so this admits stock Nx's decimal hash and any hex, decimal or base64url
 value an executor's custom hasher returns; it excludes `/`, `\`, `.` and `%`, so a key is never a filesystem path or an
 escaped one. A final segment outside it does not name this route and is a 400 `invalid-target`. The gateway forwards
-`GET` and `PUT` to the selected project's backend as `GET`/`PUT /v1/cache/{hash}`; any other method is denied before a
-backend starts or is waited for.
+`GET`, `HEAD` and `PUT` to the selected project's backend as the same method on `/v1/cache/{hash}`; any other method is
+denied before a backend starts or is waited for. `GET` reads an archive, a use; `HEAD` asks only whether one is held,
+possession, which the backend answers from the entry's metadata without reading it or counting it as a use
+(03_caches.md, "Nx accepted-task artifact service"). Stock Nx sends only `GET` and `PUT`.
 
 **Publication.** `cowshed land`'s own `--check` publishes after every check passes: it attributes each passed check's Nx
 run from the run summary the check's Nx wrote (16_build_volumes.md, "Land step 7 source capture"), then runs
@@ -827,28 +829,30 @@ and unavailable FFI has no fallback. A second process must refuse before staging
 proofs pin exclusion and lifetime. Report native macOS proof separately from Linux compile/typecheck coverage.
 
 The gateway preserves the existing self-hosted cache protocol and artifact bytes. `GET` returns 200 for a complete
-artifact or 404 for a miss; `PUT` returns 200 for a stored archive, 409 for an existing key, or 403 for a refusal (the
-backend's full staging budget, or an outage below). An incomplete, interrupted, or evicted artifact is never a
-successful empty restore. Project backend lifecycle and bounded eviction belong to 03_caches.md.
+artifact or 404 for a miss; `HEAD` returns the same 200 (with the archive's length and no body) or 404, and an
+unavailable backend's `HEAD` is a miss as its `GET` is; `PUT` returns 200 for a stored archive, 409 for an existing key,
+or 403 for a refusal (the backend's full staging budget, or an outage below). An incomplete, interrupted, or evicted
+artifact is never a successful empty restore. Project backend lifecycle and bounded eviction belong to 03_caches.md.
 
 **Backend outage.** Before committing a response head, the gateway maps a project's backend startup, health, connect,
-handshake or response-head failure, and any upstream status Nx cannot read (5xx, or anything but `GET` 200/404 and `PUT`
-200/403/409), to a miss (404) for `GET` and a refusal (403) for `PUT`. It audits each as `failed` with classification
-`nx-backend-unavailable` and logs the cause loudly, naming the upstream status. A startup or connection refusal forwards
-no artifact, but an upstream status may arrive after request bytes have already been sent. An outage is never a
-successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
+handshake or response-head failure, and any upstream status the client cannot read (5xx, or anything but `GET`/`HEAD`
+200/404 and `PUT` 200/403/409), to a miss (404) for `GET` and `HEAD` and a refusal (403) for `PUT`. It audits each as
+`failed` with classification `nx-backend-unavailable` and logs the cause loudly, naming the upstream status. A startup
+or connection refusal forwards no artifact, but an upstream status may arrive after request bytes have already been
+sent. An outage is never a successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
 
 **Busy gateway.** Nx requests wait under the gateway's queued-request bounds whether their backend is starting or
 `Ready`. A full queue is an audited `limited` `nx-queue-limited` 404/403 and an expired queue wait an audited
 `timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 24.0.3 retries no `GET`, ignores `Retry-After`, and
-reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfiguration (`native/cache/errors.rs`
-`convert_response_to_error`). The carried patch reads only a 5xx among them as the client's own outage ("The client
-half", above); every other status stays fatal. So a busy gateway answers what a cache may always answer, not served now,
-and records why in its audit. Like an outage, that 404 is not evidence of absence and never counts as a hit. The price
-is work, not failure: a lookup wave wider than the queue re-runs its refused tasks, even ones the cache holds, and a
-refused `PUT` is not stored. That extra work is the designed cost of a busy gateway, not a regression. Drain and audit
-fail-closed keep their own audit status and classification, not a backend outage's, but answer the same 404/403.
-Unsupported Nx methods are denied before starting or waiting for a backend.
+reads every status but `GET` 200/404 and `PUT` 200/403/409 (a land's publish reads `HEAD` as `GET`) as a fatal
+misconfiguration (`native/cache/errors.rs` `convert_response_to_error`). The carried patch reads only a 5xx among them
+as the client's own outage ("The client half", above); every other status stays fatal. So a busy gateway answers what a
+cache may always answer, not served now, and records why in its audit. Like an outage, that 404 is not evidence of
+absence and never counts as a hit. The price is work, not failure: a lookup wave wider than the queue re-runs its
+refused tasks, even ones the cache holds, and a refused `PUT` is not stored. That extra work is the designed cost of a
+busy gateway, not a regression. Drain and audit fail-closed keep their own audit status and classification, not a
+backend outage's, but answer the same 404/403. Unsupported Nx methods are denied before starting or waiting for a
+backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
 (`Starting`, `Ready`, `Failed { retry_after }`, or `Clearing`) held by the actor; backend startup, readiness waiting and

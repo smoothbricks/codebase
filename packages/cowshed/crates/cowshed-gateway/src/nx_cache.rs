@@ -54,21 +54,39 @@ pub(crate) fn route_hash(path: &str) -> Option<&str> {
         .filter(|hash| is_task_hash(hash))
 }
 
-/// The status an unavailable Nx backend answers with, before any response head: a read is a miss
-/// and a write is refused. Nothing is staged or sent to a backend that cannot take it.
+/// The methods the route serves (05_gateway.md "`/nx/v1/cache/{hash}`"): `GET` reads an artifact,
+/// a use the backend records as SIEVE's visit; `HEAD` asks whether one is held, which is possession
+/// and records nothing (a land's publish asks this way); `PUT` stores one. Any other is denied
+/// before a backend starts or is waited for.
+pub(crate) fn serves(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::GET | http::Method::HEAD | http::Method::PUT
+    )
+}
+
+/// Whether `method` only asks about an artifact (`GET`, `HEAD`): its refusals are a miss.
+fn asks(method: &http::Method) -> bool {
+    matches!(*method, http::Method::GET | http::Method::HEAD)
+}
+
+/// The status an unavailable Nx backend answers with, before any response head: a read or a
+/// membership check is a miss and a write is refused. Nothing is staged or sent to a backend that
+/// cannot take it.
 pub(crate) fn unavailable_status(method: &http::Method) -> http::StatusCode {
-    if *method == http::Method::GET {
+    if asks(method) {
         http::StatusCode::NOT_FOUND
     } else {
         http::StatusCode::FORBIDDEN
     }
 }
 
-/// Whether stock Nx 24.0.3 reads `status` for `method` without failing the task
-/// (`native/cache/http_remote_cache.rs`): `GET` 200/404, `PUT` 200/403/409. Every other status is
-/// its fatal "misconfigured remote cache", so the gateway never forwards one.
+/// Whether the client reads `status` for `method` without failing: stock Nx 24.0.3
+/// (`native/cache/http_remote_cache.rs`) reads `GET` 200/404 and `PUT` 200/403/409, and a land's
+/// publish reads `HEAD` as `GET`. Every other status is Nx's fatal "misconfigured remote cache",
+/// so the gateway never forwards one.
 pub(crate) fn client_reads(method: &http::Method, status: http::StatusCode) -> bool {
-    if *method == http::Method::GET {
+    if asks(method) {
         matches!(status, http::StatusCode::OK | http::StatusCode::NOT_FOUND)
     } else {
         matches!(
@@ -556,6 +574,42 @@ pub(crate) fn clear_store(project: &Path) -> Result<u64, NxCacheClearRefusal> {
     Ok(deleted)
 }
 
+#[cfg(test)]
+mod method_tests {
+    use super::{client_reads, serves, unavailable_status};
+    use http::{Method, StatusCode};
+
+    #[test]
+    fn head_is_a_membership_check_with_gets_statuses() {
+        assert!(serves(&Method::HEAD));
+        assert_eq!(unavailable_status(&Method::HEAD), StatusCode::NOT_FOUND);
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            assert!(client_reads(&Method::HEAD, status), "{status}");
+            assert_eq!(
+                client_reads(&Method::HEAD, status),
+                client_reads(&Method::GET, status)
+            );
+        }
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!client_reads(&Method::HEAD, status), "{status}");
+        }
+    }
+
+    #[test]
+    fn only_get_head_and_put_are_served() {
+        for method in [Method::GET, Method::HEAD, Method::PUT] {
+            assert!(serves(&method), "{method}");
+        }
+        for method in [Method::POST, Method::DELETE, Method::PATCH, Method::OPTIONS] {
+            assert!(!serves(&method), "{method}");
+        }
+        assert_eq!(unavailable_status(&Method::PUT), StatusCode::FORBIDDEN);
+    }
+}
 #[cfg(test)]
 mod startup_wire_tests {
     use super::Startup;
