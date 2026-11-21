@@ -72,6 +72,10 @@
       "type": "string",
       "description": "A shell command that prints one line per unit command runs (a test, a file), run at the end of the fixture segment, under its ceiling; refused without fixtureCommand. A leaf mbx's pool reserves for asks for no more cores than it prints lines, at least one. Its failure fails the run before anything is reserved."
     },
+    "templateClones": {
+      "type": "boolean",
+      "description": "The command's tests clone templates into fixtures under the system temporary directory: the executor makes the task's template directory there, names it in BOUNDED_EXEC_TEMPLATE_DIR, and removes it when the task ends, as it does the fixture scratch. Refused without fixtureCommand."
+    },
     "parallelism": {
       "type": "integer",
       "minimum": 1,

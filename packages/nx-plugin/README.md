@@ -1401,6 +1401,11 @@ Concrete targets come from concrete files:
   is an input to another task remains a declared artifact of its own producer. The Cargo version input runs in the same
   directory as the fixture, after Nx resolves any `cwd` tokens.
 
+  A target with `options.templateClones` (refused without a fixture) also gets `BOUNDED_EXEC_TEMPLATE_DIR`: a directory
+  the executor makes in `/tmp` (`/private/tmp` on Darwin), where fixtures are cloned, so its test templates clone within
+  one volume. It is named `cowshed-dtest-<executor pid>-templates-…`, the form cowshed's lane sweep reads the owner's
+  pid from, and removed with the fixture scratch when the task ends, once the command subtree is retired.
+
   Cargo sources are keyed from each selected package's locked closure, including its test dev-dependencies but not the
   dependency crates' dev-dependencies, and the Cargo and nextest settings it uses. Cargo-derived filesets are anchored
   at `{workspaceRoot}` because a member's source can belong to a different Nx project. Generated source prerequisites

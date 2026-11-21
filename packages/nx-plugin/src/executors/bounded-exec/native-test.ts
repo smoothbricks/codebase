@@ -5,6 +5,24 @@ import type { NativeBoundedExecOptions, ShellBoundedExecOptions } from './schema
 
 /** Set by bounded-exec, never by a target: metadata belongs to one invocation, even for concurrent runs of a target. */
 export const FIXTURE_DIRECTORY_ENV = 'BOUNDED_EXEC_FIXTURE_DIR';
+/**
+ * Set by bounded-exec for a fixture target that opts into same-volume clones (`templateClones`): the task's test
+ * template directory, made under {@link TEMPLATE_PARENT} and removed when the task ends, after its command subtree.
+ */
+export const TEMPLATE_DIRECTORY_ENV = 'BOUNDED_EXEC_TEMPLATE_DIR';
+/**
+ * Where fixtures are cloned (cowshed-os `test_template.rs`, `TEMPORARY`): `/tmp`, which is `/private/tmp` on Darwin. A
+ * template clones only within its volume, so its directory is made there and not in the task's TMPDIR, which a RAM
+ * lease puts on another volume.
+ */
+export const TEMPLATE_PARENT = process.platform === 'darwin' ? '/private/tmp' : '/tmp';
+/**
+ * The short-directory form a task's template directory is named in, `cowshed-dtest-<executor pid>-templates-…`
+ * (cowshed-os `test_template.rs`, `ROOT_PREFIX`): the executor removes it when the task ends, and one a killed executor
+ * left is taken by the lane setup's sweep, which reads the pid such a name records and takes it once no process holds
+ * that pid.
+ */
+export const TEMPLATE_PREFIX = 'cowshed-dtest-';
 
 const FIXTURE_TIMEOUT_MS = 3_600_000;
 const BINARIES = `"$${FIXTURE_DIRECTORY_ENV}/binaries-metadata.json"`;

@@ -407,6 +407,39 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     });
   });
 
+  it('removes an opted-in template directory when the runner is stopped mid-command', async () => {
+    const root = await createRoot();
+    await withPool(1, async (pool) => {
+      const run = await startRunner(
+        root,
+        'stopped-templates',
+        {
+          command: `sh -c 'echo "template-dir=$BOUNDED_EXEC_TEMPLATE_DIR"; mkdir "$BOUNDED_EXEC_TEMPLATE_DIR/repository"; exec sleep 600'`,
+          fixtureCommand: 'true',
+          fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          templateClones: true,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+          parallelism: 1,
+        },
+        join(root, 'stopped-templates'),
+        // Outside mbx's pool: a fixture leaf there reserves through its Nx run's endpoint, which this proof has none of.
+        childEnv({ ...pool.environment, MBX_SCHEDULER: '0' }),
+      );
+      await run.printed('template-dir=').catch(async (error: unknown) => {
+        const verdict = await readFile(join(root, 'stopped-templates', VERDICT_FILE), 'utf8').catch(String);
+        throw new Error(
+          `${String(error)}\nexit ${String(await run.exited)}; verdict ${verdict}; stdout:\n${run.stdout()}`,
+        );
+      });
+      const directory = /template-dir=(\S+)/.exec(run.stdout())?.[1] ?? '';
+      // Named for the runner's pid, so a sweep takes it should the runner itself be killed.
+      expect(basename(directory)).toMatch(/^cowshed-dtest-\d+-templates-/);
+      expect((await stat(directory)).isDirectory()).toBe(true);
+      await run.stop();
+      await expect(stat(directory)).rejects.toThrow();
+    });
+  });
   it('fails a run whose sub-pool does not close cleanly, even when its command exits 0', async () => {
     const root = await createRoot();
     let stuck = '';

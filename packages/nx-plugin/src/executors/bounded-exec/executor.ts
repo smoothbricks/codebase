@@ -54,7 +54,13 @@ import {
   openCapture,
   TASK_ARTIFACTS_ENV,
 } from './mutation-report.js';
-import { FIXTURE_DIRECTORY_ENV, nativeTestPhases } from './native-test.js';
+import {
+  FIXTURE_DIRECTORY_ENV,
+  nativeTestPhases,
+  TEMPLATE_DIRECTORY_ENV,
+  TEMPLATE_PARENT,
+  TEMPLATE_PREFIX,
+} from './native-test.js';
 import { createNoSpaceWatch } from './no-space.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -449,11 +455,11 @@ async function runCommand(
   // target that does not say what it runs, so it does not run. Units are counted at the end of that segment.
   if (
     (options.fixtureCommand === undefined) !== (options.fixtureTimeoutMs === undefined) ||
-    (options.unitsCommand !== undefined && options.fixtureCommand === undefined) ||
+    ((options.unitsCommand !== undefined || options.templateClones === true) && options.fixtureCommand === undefined) ||
     (fixture !== null && !(fixture.timeoutMs > 0))
   ) {
     return refuseUnstarted(
-      'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together, and unitsCommand only with them; refusing to run the command\n',
+      'bounded-exec: fixtureCommand and a positive fixtureTimeoutMs must be named together, and unitsCommand and templateClones only with them; refusing to run the command\\n',
     );
   }
 
@@ -483,6 +489,7 @@ async function runCommand(
   let ordinaryTemp: string | null = null;
   let fixtureDirectory: string | undefined;
   let mutationCapture: Capture | undefined;
+  let templateDirectory: string | undefined;
   // Before spawn there is nothing to retire. Once started, only the owner's terminal retirement permits deletion.
   let subtreeRetired = true;
   // A lease is removed when its command ends, so it is taken only where whatever the command leaves
@@ -605,16 +612,22 @@ async function runCommand(
         }
         closeCapture(capture);
       }
-      if (fixtureDirectory !== undefined) {
-        const path = fixtureDirectory;
-        fixtureDirectory = undefined;
+      // What the executor made for the command goes once its subtree is retired; a subtree still running keeps it.
+      const owned = [
+        { path: fixtureDirectory, what: 'fixture scratch' },
+        { path: templateDirectory, what: 'test template directory' },
+      ];
+      fixtureDirectory = undefined;
+      templateDirectory = undefined;
+      for (const { path, what } of owned) {
+        if (path === undefined) continue;
         if (owner !== null && !subtreeRetired) {
-          tell(`bounded-exec: fixture scratch retained at ${path}: the command subtree was not retired\n`);
+          tell(`bounded-exec: ${what} retained at ${path}: the command subtree was not retired\n`);
         } else {
           try {
             await rm(path, { recursive: true, force: true });
           } catch (error) {
-            tell(`bounded-exec: could not remove fixture scratch at ${path}: ${String(error)}\n`);
+            tell(`bounded-exec: could not remove ${what} at ${path}: ${String(error)}\n`);
           }
         }
       }
@@ -993,6 +1006,14 @@ async function runCommand(
       env[FIXTURE_DIRECTORY_ENV] = fixtureDirectory;
     } catch (error) {
       return refuse(`bounded-exec: could not create fixture scratch: ${String(error)}\n`);
+    }
+    if (options.templateClones === true) {
+      try {
+        templateDirectory = await mkdtemp(join(TEMPLATE_PARENT, `${TEMPLATE_PREFIX}${process.pid}-templates-`));
+        env[TEMPLATE_DIRECTORY_ENV] = templateDirectory;
+      } catch (error) {
+        return refuse(`bounded-exec: could not create the test template directory: ${String(error)}\n`);
+      }
     }
   }
   if (options.mutationReport !== undefined) {

@@ -80,6 +80,12 @@ export interface BoundedExecCommand {
    */
   unitsCommand?: string;
   /**
+   * The command's tests clone templates into fixtures under the system temporary directory: the executor makes the
+   * task's template directory there, names it in `BOUNDED_EXEC_TEMPLATE_DIR`, and removes it when the task ends, as it
+   * does the fixture scratch, so no run's templates are left for a sweep. Refused without `fixtureCommand`.
+   */
+  templateClones?: boolean;
+  /**
    * The most threads or processes the command runs at once, which is how many CPU tokens it asks
    * its live parent pool for. Absent, the runner in the command decides:
    * nextest and cargo one per core, `bun test --parallel=N` N, anything else one. The actual grant

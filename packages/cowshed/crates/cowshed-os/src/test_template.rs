@@ -6,7 +6,9 @@
 //! loaded gate each git process took 0.8 s against 75 ms alone. A template holds no path of the
 //! scratch it is cloned under, so one per run serves every test of the run. It lives in the run's
 //! template directory ([`directory`]) and is written aside and moved in whole ([`materialized`]),
-//! so a writer killed halfway leaves no template.
+//! so a writer killed halfway leaves no template. Under bounded-exec that directory is the task's
+//! own, removed when the task ends; a run outside it leaves its directory to the lane setup's
+//! sweep.
 //!
 //! Always compiled, as [`crate::test_backstop`] is: a dependant's tests take it through a plain
 //! dependency, and a binary that calls none of it never links it.
@@ -26,10 +28,38 @@ const TEMPORARY: &str = "/private/tmp";
 #[cfg(not(target_os = "macos"))]
 const TEMPORARY: &str = "/tmp";
 
-/// This run's template directory, named for the run's process ([`run_process`]): every test
-/// process of the run writes and clones its templates there, and the lane setup's template sweep
-/// takes it by that pid, so only once the run has ended.
+/// The variable bounded-exec names its task's template directory in: made in [`TEMPORARY`], the
+/// volume every fixture is cloned onto, and removed by the executor once the task's command
+/// subtree is retired (smoothbricks nx-plugin `executor.ts`, `releaseLease`).
+pub const DIRECTORY_ENV: &str = "BOUNDED_EXEC_TEMPLATE_DIR";
+
+/// This run's template directory: under bounded-exec the task's ([`DIRECTORY_ENV`]), which its
+/// owner removes when the task ends; otherwise one named for the run's process ([`run_process`]),
+/// which every test process of the run writes and clones its templates in, and which the lane
+/// setup's template sweep takes by that pid, so only once the run has ended. A template is cloned
+/// onto the fixtures' volume, so a directory on another volume is refused by name: no clone could
+/// leave it.
 pub fn directory() -> io::Result<PathBuf> {
+    if let Some(directory) = std::env::var_os(DIRECTORY_ENV) {
+        let directory = PathBuf::from(directory);
+        use std::os::unix::fs::MetadataExt as _;
+        let device = |path: &Path| {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.dev())
+                .map_err(|error| on_path(error, "read the volume of", path))
+        };
+        if device(&directory)? != device(Path::new(TEMPORARY))? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the task's template directory {} ({DIRECTORY_ENV}) is not on the volume of \
+                     {TEMPORARY}, where its templates are cloned",
+                    directory.display()
+                ),
+            ));
+        }
+        return Ok(directory);
+    }
     let directory = PathBuf::from(format!(
         "{TEMPORARY}/{ROOT_PREFIX}{}-templates",
         run_process()?
@@ -160,7 +190,7 @@ fn on_path(error: io::Error, step: &str, path: &Path) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use crate::test_backstop::CommandBackstop as _;
@@ -195,6 +225,7 @@ mod tests {
                 .arg(std::env::current_exe().expect("test executable"))
                 .arg("test_template::tests::templates_are_one_directory_per_run_whatever_wraps_each_test")
                 .env(PROBE, "1")
+                .env_remove(super::DIRECTORY_ENV)
                 .env("NEXTEST_RUN_ID", "one-run-two-wrapped-tests")
                 .process_group(0)
                 .output_bounded()
@@ -226,5 +257,66 @@ mod tests {
             )),
             "the directory is named for the run's process, which outlives every test of the run"
         );
+    }
+
+    /// Under bounded-exec the task's directory is the run's, on the fixtures' volume; one on
+    /// another volume, which no clone could leave, is refused by name.
+    #[test]
+    fn a_tasks_template_directory_is_used_only_on_the_fixtures_volume() {
+        const PROBE: &str = "COWSHED_TEST_TEMPLATE_TASK_PROBE";
+        if let Some(expect) = std::env::var_os(PROBE) {
+            let answer = super::directory();
+            match expect.to_str() {
+                Some("same") => println!(
+                    "answer={}",
+                    answer.expect("the task's template directory").display()
+                ),
+                _ => println!("refused={}", answer.expect_err("another volume is refused")),
+            }
+            return;
+        }
+        let task = tempfile_dir();
+        let probe = |directory: &Path, expect: &str| {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "test_template::tests::a_tasks_template_directory_is_used_only_on_the_fixtures_volume",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env(PROBE, expect)
+                .env(super::DIRECTORY_ENV, directory)
+                .output_bounded()
+                .expect("run a template directory probe");
+            let stdout = String::from_utf8(output.stdout).expect("probe stdout");
+            assert!(
+                output.status.success(),
+                "the probe failed\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+        };
+        assert!(
+            probe(&task, "same").contains(&format!("answer={}", task.display())),
+            "the task's directory on the fixtures' volume is the run's"
+        );
+        // devfs is a volume of its own on every Unix this runs on.
+        let refused = probe(Path::new("/dev"), "other");
+        assert!(
+            refused.contains("refused=") && refused.contains("is not on the volume of"),
+            "{refused}"
+        );
+        std::fs::remove_dir(&task).expect("remove the probe's task directory");
+    }
+
+    /// A fresh directory in the fixtures' temporary directory, as the executor makes one.
+    fn tempfile_dir() -> PathBuf {
+        let directory = PathBuf::from(format!(
+            "{}/cs-template-task-{}",
+            super::TEMPORARY,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("make the probe's task directory");
+        directory
     }
 }

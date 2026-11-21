@@ -424,8 +424,14 @@ first test of the run to ask writes the template aside, under the template's loc
 renames it in whole, so a writer killed halfway leaves no template. Every other test clones it, by one `clonefile` on
 Darwin and by a file-by-file copy elsewhere, and starts no git. A template holds no path of the scratch it is cloned
 under: the lane base's `origin` is the relative `../main`, its own fixture's main. The templates live in the run's
-template directory (below, "Host-controller authority"), which the lane setup's template sweep takes after the run;
-Linux has no such sweep, and the directory goes with the CI job's workspace.
+template directory. Under bounded-exec that is the task's own: a target that opts in (`templateClones`; the
+`cowshed-core`, `cowshed-cli` and real-APFS host test targets do, in `nx.json`) gets a directory the executor makes in
+`/tmp` (`/private/tmp` on Darwin), the volume every fixture is cloned onto, as
+`cowshed-dtest-<executor pid>-templates-…`, names in `BOUNDED_EXEC_TEMPLATE_DIR`, and removes when the task ends, after
+its command subtree is retired, as it does the fixture scratch; a template directory on another volume is refused by
+name, since no clone could leave it. A run outside bounded-exec names its directory for the run's process (below,
+"Host-controller authority"), which the lane setup's template sweep takes after the run, as it takes one a crashed task
+left. Linux has no such sweep, and the directory goes with the CI job's workspace.
 
 The fork lock counts each thread's spawns by program under `test-hooks` (`cowshed_os::fork_lock::spawn_count`). Each
 templated fixture has one regression that builds it twice on one thread and requires the second build to start no git

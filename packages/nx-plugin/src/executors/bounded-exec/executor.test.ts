@@ -392,6 +392,51 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput.indexOf('main-done')).toBeGreaterThan(result.terminalOutput.indexOf('fixture-done'));
   });
 
+  it("gives an opted-in fixture run a template directory on the fixtures' volume and removes it with the task", async () => {
+    const workspace = await createWorkspace();
+    // The command writes a template there and says where it is; the task's end takes the directory.
+    const result = await runBoundedExec(
+      {
+        command:
+          "node -e \"const fs = require('fs'); const d = process.env.BOUNDED_EXEC_TEMPLATE_DIR; fs.mkdirSync(d + '/repository'); fs.writeFileSync(d + '/repository/HEAD', 'x'); console.log('template-dir=' + d)\"",
+        fixtureCommand: 'node -e "console.log(\'fixture-done\')"',
+        fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        templateClones: true,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success, result.terminalOutput).toBe(true);
+    const directory = /template-dir=(\S+)/.exec(result.terminalOutput)?.[1];
+    expect(directory, result.terminalOutput).toBeDefined();
+    const temporary = process.platform === 'darwin' ? '/private/tmp' : '/tmp';
+    expect(directory?.startsWith(`${temporary}/`)).toBe(true);
+    expect(existsSync(directory ?? '')).toBe(false);
+  });
+
+  it('makes no template directory for a fixture run that does not opt in', async () => {
+    const workspace = await createWorkspace();
+    const result = await runBoundedExec(
+      {
+        command: "node -e \"console.log('template-dir=' + (process.env.BOUNDED_EXEC_TEMPLATE_DIR ?? 'none'))\"",
+        fixtureCommand: 'node -e "console.log(\'fixture-done\')"',
+        fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        killAfterMs: 0,
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+    );
+
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain('template-dir=none');
+  });
+
   it('runs the fixture outside the progress bound: only its own ceiling ends a silent fixture', async () => {
     const workspace = await createWorkspace();
     const stdout = process.stdout.write;
