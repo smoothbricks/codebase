@@ -410,13 +410,16 @@ install waits in order once more, and a second refusal is classified by a fresh 
 or another install holding the slot. Every outcome is one line on stdout,
 `<UTC time> <commit> install attended|unverified|deferred|installed|failed|skipped`, and the first three carry the exact
 command, which enters that devenv too: to run by hand (`attended`, `unverified`) or to rerun once the named work has
-ended (`deferred`). An install is deferred only for another install holding the slot or a status it cannot read; it
-waits for the land turns in order, before the slot and never under it; the operator's land-status record holds a
-deferred install for whoever watches that record. An install the after-step makes is said in the land's own `lands.log`
-as well: the after-land job reads the stable name it runs as before and after each after command, and records an
-`installed` line carrying the new copy's SHA-256 and its build record's commit (02_workspaces.md "A declared land", step
-6), through the writer of the land's other events. Recorded 2026-11-10 03:14:20Z: a land's after-step installed cowshed
-and restarted the gateway, and only that after-step's own log said so.
+ended (`deferred`); a `failed` setup names the same rerun, whose stage is already whole. The script exits 1 after a
+`failed` line and 0 after every other, so the after-land job's `after-exited` record (02_workspaces.md "A declared
+land", step 6) says a failed install as failed beside the landed head, which stays landed, and the job runs its next
+command and push as it would anyway. An install is deferred only for another install holding the slot or a status it
+cannot read; it waits for the land turns in order, before the slot and never under it; the operator's land-status record
+holds a deferred install for whoever watches that record. An install the after-step makes is said in the land's own
+`lands.log` as well: the after-land job reads the stable name it runs as before and after each after command, and
+records an `installed` line carrying the new copy's SHA-256 and its build record's commit (02_workspaces.md "A declared
+land", step 6), through the writer of the land's other events. Recorded 2026-11-10 03:14:20Z: a land's after-step
+installed cowshed and restarted the gateway, and only that after-step's own log said so.
 
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an

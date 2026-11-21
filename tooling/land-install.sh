@@ -47,6 +47,9 @@
 # for the land turns, which a busy land queue cannot starve: no land that asks after it is numbered before it is fenced.
 # An install it cannot take now, another install holding the slot, is deferred with the command to rerun, and whoever
 # sees that install end reruns it. The other wait is the release lock, which orders installs as the install slot does.
+# The script exits 1 after a 'failed' line and 0 after every other: the after-land job records each command's exit in
+# lands.log beside the landed head, so a failed install is said there as failed, while the land, already recorded
+# 'landed', and the after commands and push that follow it are untouched (the job runs each whatever the last one did).
 # Nx and setup run through 'direnv exec <main>', whatever environment started the script: setup installs the PATH of the
 # shell it runs in and its build-state discovery runs cargo, neither of which a pure environment has.
 set -eu
@@ -283,10 +286,11 @@ else
     lock_status=$?
   case $lock_status in
   0) ;;
-  3) exit 0 ;;
+  # The re-entry said why in a 'failed' line of its own.
+  3) exit 1 ;;
   *)
     record failed "the build under the release lock exited $lock_status"
-    exit 0
+    exit 1
     ;;
   esac
 fi
@@ -347,8 +351,14 @@ refused\ *)
   gateway_blockers "$binary"
   case $readiness in
   busy\ *) record deferred "${readiness#busy }" "$command" ;;
-  *) record failed "${outcome#refused }" ;;
+  *)
+    record failed "${outcome#refused }, then rerun $rerun"
+    exit 1
+    ;;
   esac
   ;;
-*) record failed "${outcome#failed }" ;;
+*)
+  record failed "${outcome#failed }, then rerun $rerun"
+  exit 1
+  ;;
 esac

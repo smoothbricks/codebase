@@ -1130,12 +1130,25 @@ describe('land-install.sh', () => {
     );
     install.set('setup.exit', '4');
     const run = install.run();
-    expect(run.status, run.stderr).toBe(0);
-    expect(onlyLine(run.stdout).text).toBe('failed: setup exited 4: conflict: the build lacks an installed commit');
+    expect(run.status, run.stderr).toBe(1);
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: setup exited 4: conflict: the build lacks an installed commit, then rerun ${RERUN(install)}`,
+    );
     // Refused twice, each after its own wait in order, then classified by a fresh status.
     expect(install.log('staged.log')).toHaveLength(7);
   });
 
+  it('fails the install when the setup child exits without an answer, naming the rerun its whole stage resumes at', () => {
+    const install = fixture();
+    // As cb32b5431a's install: the devenv that runs setup exits 1 before setup answers anything.
+    install.set('setup.json', '');
+    install.set('setup.exit', '1');
+    const run = install.run();
+    expect(run.status, run.stderr).toBe(1);
+    expect(onlyLine(run.stdout).text).toBe(
+      `failed: setup exited 1 without an error envelope, then rerun ${RERUN(install)}`,
+    );
+  });
   it('records a failure that is not a refusal as failed, and reads no second status', () => {
     const install = fixture();
     install.set(
@@ -1147,9 +1160,9 @@ describe('land-install.sh', () => {
     );
     install.set('setup.exit', '6');
     const run = install.run();
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe(
-      'failed: setup exited 6: sandbox-denied: administrator authorization was declined',
+      `failed: setup exited 6: sandbox-denied: administrator authorization was declined, then rerun ${RERUN(install)}`,
     );
     expect(install.log('staged.log')).toHaveLength(4);
   });
@@ -1212,7 +1225,7 @@ describe('land-install.sh', () => {
     const install = fixture();
     install.set('build-fails', '');
     const run = install.run();
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
     expect(existsSync(join(install.main, '.cache', 'cowshed-release'))).toBe(false);
     expect(install.log('staged.log')).toEqual([]);
@@ -1234,7 +1247,7 @@ describe('land-install.sh', () => {
     const install = fixture();
     install.set('bundle-fails', '');
     const run = install.run();
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe('failed: the production build of cowshed:cli-record-arm64-macos exited 1');
     expect(install.log('nx.log')).toEqual([NX_SHOW(install), NX_BUNDLE(install)]);
     const calls = cowshedCalls(install);
@@ -1254,7 +1267,7 @@ describe('land-install.sh', () => {
     const install = fixture();
     install.set('fork-fails', '');
     const run = install.run();
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe(`failed: cowshed fork ${install.shed} --ref ${install.head} exited 5`);
     const calls = cowshedCalls(install);
     expect(install.log('cowshed.log')).toEqual([
@@ -1311,7 +1324,7 @@ describe('land-install.sh', () => {
     const built = install.log('nx.log').length;
     const second = landAnother(install);
     const run = install.run({ args: [install.head, second] });
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe(
       `failed: the shed ${install.shed} cannot be re-pointed to ${second} (cowshed rebase exited 4): ` +
         `cowshed: workspace ${install.shed} has uncommitted work: stray.txt`,
@@ -1339,7 +1352,7 @@ describe('land-install.sh', () => {
     const built = install.log('nx.log').length;
     const second = landAnother(install);
     const run = install.run({ args: [install.head, second] });
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe(
       `failed: the shed ${install.shed} cannot be re-pointed to ${second} (cowshed rebase exited 4): ` +
         `cowshed: the replay onto ${second} conflicts`,
@@ -1355,6 +1368,7 @@ describe('land-install.sh', () => {
     const newer = install.run({ args: [install.head, second] });
     expect(newer.status, newer.stderr).toBe(0);
     const run = install.run();
+    expect(run.status, run.stderr).toBe(1);
     expect(onlyLine(run.stdout).text).toBe(
       `failed: the shed ${install.shed} stands at ${second} after cowshed rebase --onto ${install.head}: ` +
         'it is never moved back to an older commit',
@@ -1401,7 +1415,7 @@ describe('land-install.sh', () => {
     const asked = install.log('direnv.log').length;
     const built = install.log('nx.log').length;
     const run = install.run({ args: [install.head, second] });
-    expect(run.status, run.stderr).toBe(0);
+    expect(run.status, run.stderr).toBe(1);
     const refusal = `${shed}/.envrc differs from main's approved .envrc; review it and run 'direnv allow ${shed}'`;
     expect(onlyLine(run.stdout).text).toBe(
       `failed: ${refusal}, then rerun direnv exec ${install.main} sh ${install.main}/tooling/land-install.sh ${install.head} ${second}`,
