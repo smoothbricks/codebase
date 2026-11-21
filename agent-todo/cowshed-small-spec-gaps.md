@@ -108,16 +108,9 @@ done. They are independent of each other.
 
 ## cowshed-helper
 
-- Spec: `specs/cowshed/09_substrates.md`, "Privileged helper (Linux)", `00_overview.md:137`, `08_testing.md:177`,
-  `10_ci.md`, "Runner host": Linux ZFS mutations go through `cowshed-helper`, a minimal root binary with a fixed verb
-  set that refuses any dataset outside `<pool>/cowshed/`. CI uses the ordinary target lifecycle, not a separate
-  promotion verb.
-- Code: no crate; an argument parser was started and removed (`29f212088`).
-- Work: the crate, its fixed verbs, and dataset validation; part of the Linux substrate. Keep the constrained restore
-  clone-swap and ordinary origin/dependent cleanup from `09_substrates.md`; no CI-refresh-only verb is required.
-- Acceptance: the helper refuses a dataset outside `<pool>/cowshed/` and any verb outside its set. Removing a workspace
-  destroys its clone before its origin snapshot, and live dependents still refuse reclamation. Restore retains its
-  constrained clone-swap.
+- Spec: `specs/cowshed/09_substrates.md`, "Privileged helper"; `08_testing.md`, "Real ZFS".
+- Code: `packages/cowshed/crates/cowshed-helper`, proven by `cowshed:zfs-helper-test`. Nothing calls it yet.
+- Work: its caller and what remains of the helper (the mountpoint race, macOS) are in `cowshed-zfs-substrate.md`.
 
 ## Workspace-only operator quiesce and retirement
 

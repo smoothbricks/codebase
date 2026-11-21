@@ -253,17 +253,68 @@ it**:
   can be destroyed (01b_zfs.md, "Land swaps the build dataset"). CI uses the ordinary target/build-volume lifecycle
   (10_ci.md, "Keeping the host main warm").
 
-### Privileged helper (Linux)
+### Privileged helper
 
-`zfs allow` delegation covers create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN`
-regardless of delegation. Substrate mutations therefore go through `cowshed-helper`: a minimal root binary (installed by
-the package, auditable in one sitting) that accepts a fixed verb set
-(`create|clone|snapshot|destroy|rename|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
-namespace, `promote` accepts only a build dataset (`…/<repo>/build/<id>`), and cowshed calls it only for an adoption: at
-land, or when collection completes an adoption whose pending promote the build volume's sidecar records and the link of
-the target it names confirms (01b_zfs.md, "Retiring a build dataset") — and refuses, on every verb, any dataset argument
-outside `<pool>/cowshed/`. Constrained sudoers entries are the supported alternative for hosts that forbid setuid
-helpers. Everything else — Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs unprivileged.
+Every substrate mutation goes through `cowshed-helper`, a root binary that links only libc and is auditable in one
+sitting (`packages/cowshed/crates/cowshed-helper`). Delegation cannot replace it: `zfs allow` covers
+create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN` regardless of delegation, and
+in a container whose dataset tree is zoned to its user namespace (`zfs zone`) delegation grants nothing at all: measured
+2026-11-21 on OpenZFS 2.4.3, a user holding `create,snapshot,clone,destroy,mount,rename,promote,userprop` on a zoned
+dataset is still refused `zfs create` and `zfs snapshot` there, while the namespace's root may do all of them. Reads
+(`zfs list`, `zfs get`) need no privilege and never go through the helper.
+
+`cowshed-helper <root> <verb> …` runs exactly one `zfs` command per invocation:
+
+| Verb       | Arguments                                              | `zfs` command                 |
+| ---------- | ------------------------------------------------------ | ----------------------------- |
+| `create`   | `<dataset> [<property>=<value>…]`                      | `create -o … <dataset>`       |
+| `clone`    | `<dataset>@<snapshot> <dataset> [<property>=<value>…]` | `clone -o … <origin> <clone>` |
+| `snapshot` | `<dataset>@<snapshot>`                                 | `snapshot`                    |
+| `destroy`  | `<dataset>` or `<dataset>@<snapshot> [--defer]`        | `destroy`, `destroy -d`       |
+| `rename`   | `<dataset> <dataset>`                                  | `rename`                      |
+| `promote`  | `<build dataset>`                                      | `promote`                     |
+| `mount`    | `<dataset>`                                            | `mount`                       |
+| `unmount`  | `<dataset> [--force]`                                  | `unmount`, `unmount -f`       |
+| `set`      | `<dataset> <property>=<value>…`                        | `set … <dataset>`             |
+
+`rename` serves retire's trash namespace. `set` carries the mountpoint, the `canmount=off` of a retirement, a resize's
+`refquota` and a `--browse` workspace's property; it replaces a `set-mountpoint` verb. No verb passes `-r`, `-R`, `-p`
+or a destroy's `-f`: an invocation touches the datasets it names and no other, so a dataset whose snapshot still has a
+clone is refused by ZFS rather than taking the clone with it. The helper refuses, before anything runs and with exit
+status 2:
+
+- **A root that does not name the caller.** `<root>` is `<parent>/cowshed`, where `<parent>` is the pool or any dataset
+  in it, and it carries the user property `cowshed:owner=<uid>` with source `local`. Whoever administers `<parent>` sets
+  it once; that property, on the dataset itself, is the whole authorization, so there is no helper configuration file.
+  The caller is the real user of a setuid run and the invoking user of a `sudo` run.
+- **A dataset outside the root.** Every dataset argument, a snapshot's dataset included, lies strictly below `<root>`:
+  the root itself, its parents and its siblings are never an argument. A name component is ASCII letters, digits and
+  `._:-`, never `.`, `..` or a leading `-`.
+- **A promote of anything but a build dataset** (`<root>/projects/<owner>/<repo>/build/<id>`). cowshed calls it only for
+  an adoption: at land, or when collection completes an adoption whose pending promote the build volume's sidecar
+  records and the link of the target it names confirms (01b_zfs.md, "Retiring a build dataset").
+- **A property outside the allow-list.** `mountpoint`, `canmount`, `refquota`, `compression`, `recordsize`, `sync`,
+  `atime`, `xattr`, `dnodesize`, `dedup`, the four `com.apple.*` properties of 01b_zfs.md, and user properties
+  `cowshed:<name>` other than `cowshed:owner`. `zoned`, `sharenfs`, `overlay`, `setuid`, `devices`, `exec` and the
+  encryption properties are never cowshed's to change.
+- **A mountpoint outside the caller's tree.** A mountpoint is `none`, one of the fixed host paths below ("Linux host
+  paths"), or an absolute path of normal components whose every existing component is not a symlink and whose deepest
+  existing component belongs to the caller. `legacy` is refused.
+
+A new dataset's root directory belongs to root, so `create` hands it to the caller: it opens the mountpoint once and
+changes its owner only when the kernel says that descriptor is the mounted root of the dataset it just created
+(`/proc/self/mountinfo` on Linux, `fstatfs` on macOS). A clone needs no handover, its root carries its origin's owner.
+`zfs` runs with an empty environment and a fixed system `PATH`, never the caller's.
+
+The helper is installed setuid root, or reached through `sudo` by a sudoers entry naming it, on hosts that forbid setuid
+helpers. Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
+
+**Open: the mountpoint check and the mount are two steps.** Between the helper's ownership walk and ZFS's mount, a
+caller who owns the parent directory can replace a component with a symlink, and the dataset then mounts over a
+directory that is not the caller's. On a host where the caller is not already root-equivalent this is an escalation.
+Closing it means the helper mounts by a descriptor it holds (`mount(2)` onto `/proc/self/fd/<n>` with the `zfsutil`
+option on Linux) instead of by the `mountpoint` string; whether a zoned namespace's root may issue that mount, and the
+macOS equivalent, are unmeasured.
 
 ### Linux host paths
 

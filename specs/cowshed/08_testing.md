@@ -718,10 +718,20 @@ working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, wh
 `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started
 detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted
 root. Successful cleanup removes the root, and every run first ends the processes working under, then reclaims the roots
-and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev
-(`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
-`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
-same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+and attachments of, runs whose owner pid is gone. The same flow table runs on both substrates; substrate-specific
+assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+
+**Real ZFS.** A real-ZFS proof makes everything in one scratch tree of its own, `<parent>/cowshed-itest-<pid>`, below a
+dataset the host names in `COWSHED_ZFS_TEST_PARENT`, and destroys that tree on every exit path. It needs `sudo -n`: the
+fixture's own tree is created and destroyed by root directly, and everything under test goes through `cowshed-helper`.
+The parent is named, never discovered, for the reason a pool is never guessed (09_substrates.md, selection). A scratch
+pool on a file vdev is not the fixture: `zpool create` is refused to the root of a container whose datasets are zoned to
+its user namespace, which is where the Linux lane runs, while a tree below a zoned parent works there and on a bare host
+alike. Run without the variable, the proof fails naming it; it is never skipped. The Nx target `cowshed:zfs-helper-test`
+runs the helper's proof (`crates/cowshed-helper/tests/real_zfs.rs`): one walk of adopt, fork, `rm` and a land's promote,
+with the refusals only a real host can show (a root whose `cowshed:owner` is not the caller, a mountpoint in root's
+tree, a dataset outside the root). It is uncached, since its verdict is about the host's pool, and outside `gate` until
+the land host provides a parent.
 
 The Nx target `cowshed:apfs-test-root` (`packages/cowshed/scripts/apfs-test-root.ts`) gives a host `cowshed setup` has
 not run on, such as a CI runner that cannot answer setup's interactive authorization prompt, the three directories of

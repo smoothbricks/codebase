@@ -1,0 +1,17 @@
+[package]
+name = "cowshed-helper"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# The root binary through which every ZFS substrate mutation goes (specs/cowshed/09_substrates.md,
+# "Privileged helper"). It links nothing of cowshed and only libc, so the whole of what runs as
+# root is this crate: the fixed verb set, the containment of every dataset argument below one
+# cowshed root, the property allow-list and the mountpoint rule.
+
+[[bin]]
+name = "cowshed-helper"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

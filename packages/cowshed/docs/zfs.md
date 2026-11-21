@@ -44,18 +44,19 @@ candidates but never silently selects or mints one; local-only repositories requ
 
 ## Setup
 
-One dataset delegation, once, as root:
+One root dataset, once, as root. It is named `cowshed` and may sit directly in the pool or below any dataset of it, and
+`cowshed:owner` names the uid cowshed serves there:
 
 ```sh
-zfs create -o mountpoint=none rpool/cowshed
-zfs allow <user> create,snapshot,clone,destroy,send,receive,userprop rpool/cowshed
+zfs create -o mountpoint=none -o cowshed:owner=$(id -u <user>) rpool/cowshed
 ```
 
-Linux ignores ZFS _mount_ delegation (`mount(2)` wants `CAP_SYS_ADMIN`), so cowshed ships a minimal root helper for
-exactly the mount/unmount calls — installed by the NixOS module (`services.cowshed-runner` or `programs.cowshed`) or
-`cowshed doctor` prints the manual install line. The helper refuses anything outside `<pool>/cowshed`; every other
-cowshed operation is unprivileged. If the helper is missing, commands that need it exit 5 with the install hint on
-stderr.
+Every change cowshed makes below it goes through `cowshed-helper`, a small root binary with a fixed verb set (`create`,
+`clone`, `snapshot`, `destroy`, `rename`, `promote`, `mount`, `unmount`, `set`). `zfs allow` cannot stand in for it:
+Linux ignores ZFS _mount_ delegation (`mount(2)` wants `CAP_SYS_ADMIN`), and inside a container whose datasets are zoned
+to its user namespace delegation grants nothing. The helper refuses any dataset outside the root, any root whose
+`cowshed:owner` is not you, and any mountpoint outside a directory you own; reads (`zfs list`, `zfs get`) are
+unprivileged. Install it setuid root, or allow it through `sudo`.
 
 Then, from your checkout:
 

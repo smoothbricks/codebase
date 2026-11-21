@@ -111,6 +111,30 @@
           "killAfterMs": 10000
         }
       },
+      "zfs-helper-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": false,
+        "metadata": {
+          "ungated": {
+            "kind": "platform-run"
+          }
+        },
+        "dependsOn": [
+          {
+            "target": "cargo-fetch",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
+        ],
+        "//": "Host proof of cowshed-helper against real ZFS (specs/cowshed/08_testing.md, \"Real ZFS\"): needs `sudo -n` and COWSHED_ZFS_TEST_PARENT, the dataset it may create below. Never cached: its verdict is about this host's pool.",
+        "options": {
+          "command": "cargo test --frozen -p cowshed-helper --test real_zfs -- --ignored",
+          "cwd": ".",
+          "idleTimeoutMs": 180000,
+          "killAfterMs": 10000
+        }
+      },
       "ram-fixture": {
         "executor": "nx:run-commands",
         "cache": true,
