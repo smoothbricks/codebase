@@ -891,6 +891,7 @@ dependencies = [
  "cowshed-core",
  "cowshed-gateway",
  "cowshed-gateway-types",
+ "cowshed-helper",
  "cowshed-os",
  "cowshed-shell",
  "libc",

@@ -1424,15 +1424,15 @@ impl EvidenceSource for SystemEvidence {
     }
 }
 
-/// The helper beside the running executable, else the first on `path`.
+/// The helper setup installed as root's ([`cowshed_helper::host::SYSTEM_DIRECTORY`]), else the
+/// one beside the running executable, else the first on `path`.
 fn locate_helper(
     beside: Option<&Path>,
     path: &OsStr,
     is_file: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    beside
-        .map(Path::to_path_buf)
-        .into_iter()
+    std::iter::once(PathBuf::from(cowshed_helper::host::SYSTEM_DIRECTORY))
+        .chain(beside.map(Path::to_path_buf))
         .chain(std::env::split_paths(path))
         .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join(ZFS_HELPER))

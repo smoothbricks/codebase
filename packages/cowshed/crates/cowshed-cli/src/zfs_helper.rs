@@ -1,14 +1,15 @@
 //! Proof that the installed root helper can act for a ZFS store, and the root command that makes
 //! it so (specs/cowshed/09_substrates.md, "Privileged helper").
 //!
-//! An install is this user's: it writes `cowshed-helper` beside the installed cowshed and cannot
-//! make it root's. cowshed therefore reaches it through `sudo -n`, which a sudoers entry must
-//! admit without a password, since the gateway daemon has no terminal to type one at. The entry
-//! names the installed path and pins the helper's SHA-256, because that path lies in a directory
-//! this user can write: an entry naming the path alone would make root of whatever file is put
-//! there. `cowshed setup` proves the entry by the helper's `check` verb and, when the proof
-//! fails, writes it: at a terminal it runs the root command itself ([`mend`]), which `sudo`
-//! authorizes, and anywhere else it refuses with that command.
+//! An install is this user's: it writes `cowshed-helper` beside the installed cowshed, in a
+//! directory this user can write, where whatever replaced the file would run as root. So the
+//! helper cowshed runs is a copy root owns, read-only, in a root-owned directory
+//! ([`cowshed_helper::host::SYSTEM_DIRECTORY`]), reached through `sudo -n`: a sudoers entry
+//! admits it without a password, since the gateway daemon has no terminal to type one at, and
+//! pins its SHA-256. `cowshed setup` proves that by the helper's `check` verb and, when the
+//! proof fails or the copy is not this build's, installs it: at a terminal it runs the root
+//! command itself ([`mend`]), which `sudo` authorizes, and anywhere else it refuses with that
+//! command.
 
 use std::path::Path;
 
@@ -59,50 +60,47 @@ struct Remedy {
     command: String,
 }
 
-/// The remedy for `helper`, the helper cowshed reaches, not acting as root for `uid`.
-/// `installed` is the helper this install wrote, whose bytes hash to `sha256`.
+/// The remedy for `helper`, the helper cowshed reaches, not being this build's helper acting as
+/// root for `uid` from `system`, the root-owned path. `installed` is the helper this install
+/// wrote, whose bytes hash to `sha256`.
 ///
-/// The installed helper is reached through `sudo`, so it needs its sudoers entry: written as
-/// `uid`'s drop-in, staged under a name `sudo` passes over (it holds a `.`), checked by `visudo`
-/// and only then given the name `sudo` reads, so a malformed entry never reaches the sudoers in
-/// force. Any other helper was reached because it is root's and setuid, and is replaced by this
-/// build's. A path sudoers cannot spell gets the setuid install instead of an entry.
-fn remedy(uid: u32, installed: &Path, helper: &Path, sha256: &str) -> Remedy {
-    let setuid_install = |destination: &Path| {
-        format!(
-            "sudo install -o 0 -g 0 -m 4755 {} {}",
-            shell_word(&installed.to_string_lossy()),
-            shell_word(&destination.to_string_lossy())
-        )
-    };
-    if helper != installed {
+/// One root command copies the installed helper to `system` as root's, read-only, and writes
+/// its sudoers entry as `uid`'s drop-in: staged under a name `sudo` passes over (it holds a
+/// `.`), checked by `visudo` and only then given the name `sudo` reads, so a malformed entry
+/// never reaches the sudoers in force. A helper reached anywhere else was reached because it is
+/// root's and setuid, and is replaced by this build's.
+fn remedy(uid: u32, installed: &Path, helper: &Path, system: &Path, sha256: &str) -> Remedy {
+    let installed_word = shell_word(&installed.to_string_lossy());
+    if helper != installed && helper != system {
         return Remedy {
             why: format!(
-                "it is root's and setuid, so cowshed runs it before the installed {}; the next command replaces it with this build's helper",
-                installed.display()
+                "it is root's and setuid, so cowshed runs it before {}; the next command replaces it with this build's helper",
+                system.display()
             ),
-            command: setuid_install(helper),
+            command: format!(
+                "sudo install -o 0 -g 0 -m 4755 {installed_word} {}",
+                shell_word(&helper.to_string_lossy())
+            ),
         };
     }
-    match sudoers_entry(uid, sha256, installed) {
-        Some(entry) => {
-            let drop_in = format!("{SUDOERS_DROP_INS}/{HELPER_NAME}-{uid}");
-            Remedy {
-                why: format!(
-                    "it is reached through sudo, which admits it without a password only by a sudoers entry; the next command, run once per installed helper build, writes the entry that admits exactly these bytes for uid {uid} (a host that reads no {SUDOERS_DROP_INS} takes the entry through its own sudoers configuration: {entry})"
-                ),
-                command: format!(
-                    "printf '%s\\n' {} | sudo sh -c 'umask 227 && cat >{drop_in}.new && visudo -cf {drop_in}.new && mv {drop_in}.new {drop_in}'",
-                    shell_word(&entry)
-                ),
-            }
-        }
-        None => Remedy {
-            why: String::from(
-                "it is reached through sudo, and sudoers cannot spell its path; the next command installs it setuid root in /usr/local/bin, where cowshed runs it before the installed one once that directory is on PATH",
-            ),
-            command: setuid_install(&Path::new("/usr/local/bin").join(HELPER_NAME)),
-        },
+    let entry = sudoers_entry(uid, sha256, system)
+        .expect("the system helper path holds no character sudoers cannot spell");
+    let drop_in = format!("{SUDOERS_DROP_INS}/{HELPER_NAME}-{uid}");
+    let directory = system
+        .parent()
+        .expect("the system helper lies in a directory");
+    let script = format!(
+        "install -d -o 0 -g 0 -m 755 {directory} && install -o 0 -g 0 -m 555 {installed_word} {system} && umask 227 && printf '%s\\n' {entry} >{drop_in}.new && visudo -cf {drop_in}.new && mv {drop_in}.new {drop_in}",
+        directory = shell_word(&directory.to_string_lossy()),
+        system = shell_word(&system.to_string_lossy()),
+        entry = shell_word(&entry),
+    );
+    Remedy {
+        why: format!(
+            "cowshed runs the helper root owns at {}, which no user can replace, through sudo, which admits it without a password only by a sudoers entry; the next command, run once per helper build, installs this build's helper there and writes the entry that admits exactly those bytes for uid {uid} (a host that reads no {SUDOERS_DROP_INS} takes the entry through its own sudoers configuration: {entry})",
+            system.display()
+        ),
+        command: format!("sudo sh -c {}", shell_word(&script)),
     }
 }
 
@@ -129,20 +127,35 @@ pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<Unproven
             "cowshed setup",
         )
     })?;
-    let HelperProof::Refused {
-        root,
-        helper,
-        cause,
-    } = proof
-    else {
-        return Ok(None);
-    };
+    let system = Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join(HELPER_NAME);
     let sha256 = executable_digest(installed.path())?.to_string();
-    let Remedy { why, command } = remedy(uid, installed.path(), &helper, &sha256);
+    let (root, helper, cause) = match proof {
+        HelperProof::NoDatasets => return Ok(None),
+        HelperProof::Refused {
+            root,
+            helper,
+            cause,
+        } => (root, helper, cause),
+        // The helper that acted is the installed one, which this user can replace.
+        HelperProof::Proven { root, helper } if helper == installed.path() => (
+            root,
+            helper,
+            String::from("it lies in a directory this user can write"),
+        ),
+        HelperProof::Proven { root, helper } if helper == system => {
+            if executable_digest(&system)?.to_string() == sha256 {
+                return Ok(None);
+            }
+            (root, helper, String::from("it is another build's helper"))
+        }
+        // An administrator's setuid helper acted.
+        HelperProof::Proven { .. } => return Ok(None),
+    };
+    let Remedy { why, command } = remedy(uid, installed.path(), &helper, &system, &sha256);
     Ok(Some(Unproven {
         refusal: CowshedError::environment_missing(
             format!(
-                "{} did not act as root for the ZFS root {root}, so nothing can change its datasets: {cause}; {why}",
+                "{} is not this build's helper acting as root from a root-owned place for the ZFS root {root}: {cause}; {why}",
                 helper.display()
             ),
             format!("{command} && cowshed setup"),
@@ -201,54 +214,38 @@ mod tests {
     fn the_remedy_is_the_one_root_command_for_the_helper_that_is_reached() {
         let installed =
             Path::new("/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper");
+        let system = Path::new("/usr/local/libexec/cowshed/cowshed-helper");
         let entry = format!(
-            "#1000 ALL=(root) NOPASSWD: sha256:{SHA256} /home/u/Library/Application\\ Support/dev.cowshed/bin/cowshed-helper"
+            "#1000 ALL=(root) NOPASSWD: sha256:{SHA256} /usr/local/libexec/cowshed/cowshed-helper"
         );
         assert_eq!(
-            sudoers_entry(1000, SHA256, installed).as_deref(),
+            sudoers_entry(1000, SHA256, system).as_deref(),
             Some(entry.as_str())
         );
-        let unspellable = Path::new("/home/a*b/bin/cowshed-helper");
+        // The helper goes to the root-owned path as root's, read-only, and its entry is checked
+        // before it is in force, under a drop-in name that is this uid's.
+        let install = format!(
+            "sudo sh -c 'install -d -o 0 -g 0 -m 755 /usr/local/libexec/cowshed && install -o 0 -g 0 -m 555 '\\''/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper'\\'' /usr/local/libexec/cowshed/cowshed-helper && umask 227 && printf '\\''%s\\n'\\'' '\\''{entry}'\\'' >/etc/sudoers.d/cowshed-helper-1000.new && visudo -cf /etc/sudoers.d/cowshed-helper-1000.new && mv /etc/sudoers.d/cowshed-helper-1000.new /etc/sudoers.d/cowshed-helper-1000'"
+        );
         let cases = [
-            // The installed helper, reached through sudo: its entry, checked before it is in
-            // force, under a drop-in name that is this uid's.
-            (
-                installed,
-                installed,
-                format!(
-                    "printf '%s\\n' '{entry}' | sudo sh -c 'umask 227 && cat >/etc/sudoers.d/cowshed-helper-1000.new && visudo -cf /etc/sudoers.d/cowshed-helper-1000.new && mv /etc/sudoers.d/cowshed-helper-1000.new /etc/sudoers.d/cowshed-helper-1000' && cowshed setup"
-                ),
-                "sudoers entry",
-            ),
+            (installed, install.clone(), "which no user can replace"),
+            (system, install, "which no user can replace"),
             // A setuid helper elsewhere is reached first, so no entry would be consulted: it is
             // the one replaced.
             (
-                installed,
                 Path::new("/usr/local/bin/cowshed-helper"),
-                "sudo install -o 0 -g 0 -m 4755 '/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper' /usr/local/bin/cowshed-helper && cowshed setup".to_owned(),
+                "sudo install -o 0 -g 0 -m 4755 '/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper' /usr/local/bin/cowshed-helper".to_owned(),
                 "replaces it with this build's helper",
             ),
-            // A path sudoers cannot spell: the helper goes where no entry is needed.
-            (
-                unspellable,
-                unspellable,
-                "sudo install -o 0 -g 0 -m 4755 '/home/a*b/bin/cowshed-helper' /usr/local/bin/cowshed-helper && cowshed setup".to_owned(),
-                "sudoers cannot spell its path",
-            ),
         ];
-        for (installed, helper, command, why) in cases {
-            let remedy = remedy(1000, installed, helper, SHA256);
-            let reached = format!("{} reached as {}", installed.display(), helper.display());
-            assert_eq!(
-                format!("{} && cowshed setup", remedy.command),
-                command,
-                "{reached}"
-            );
-            assert!(remedy.why.contains(why), "{reached}: {}", remedy.why);
+        for (helper, command, why) in cases {
+            let remedy = remedy(1000, installed, helper, system, SHA256);
+            assert_eq!(remedy.command, command, "reached as {}", helper.display());
+            assert!(remedy.why.contains(why), "{}", remedy.why);
         }
         // The entry itself is in the reason, for a host that keeps its sudoers elsewhere.
         assert!(
-            remedy(1000, installed, installed, SHA256)
+            remedy(1000, installed, installed, system, SHA256)
                 .why
                 .contains(&entry)
         );

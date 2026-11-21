@@ -7,6 +7,9 @@ use std::os::unix::fs::MetadataExt;
 /// NixOS's system profile, then the FHS administrator directories.
 pub const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/sbin:/sbin:/usr/bin:/bin";
 
+/// The administrator's own program directory, which no package manager writes.
+pub const SYSTEM_DIRECTORY: &str = "/usr/local/libexec/cowshed";
+
 /// The source of the ZFS mount whose device is `directory`'s and whose root is that
 /// filesystem's own root.
 pub fn zfs_mount_source(directory: &File) -> io::Result<Option<String>> {

@@ -355,34 +355,32 @@ distribution's helper from there, before anything is installed.
 `cowshed setup` and `gateway start` install it beside the installed cowshed exactly as the Nx cache server is installed
 (05_gateway.md, "The installed cowshed"): a copy named for its digest and the stable name `cowshed-helper` as a link to
 it, in `~/Library/Application Support/dev.cowshed/bin`. A build with no `cowshed-helper` beside it is refused by name
-and installs nothing. The install is the user's own and cannot make the copy root's, so how the helper gets its
-privilege is decided per invocation from the file itself:
+and installs nothing. That copy is the user's own, in a directory the user can write, so it is never the helper that
+runs as root. Which helper serves, and how it gets its privilege, is decided per invocation from the files themselves,
+searched in the root-owned system directory (`/usr/local/libexec/cowshed` on Linux,
+`/Library/PrivilegedHelperTools/dev.cowshed` on macOS), beside cowshed, then each absolute `PATH` directory:
 
 - **A helper that is root's and setuid runs directly.** That is an administrator's install (a setuid copy in a
-  root-owned directory on `PATH`, or a NixOS `security.wrappers` entry). Of the helper files beside cowshed and then in
-  each absolute `PATH` directory, the first such one serves, before the installed one.
-- **Any other helper runs through `sudo -n`**, the first there is in that order, which is the installed one. A sudoers
-  entry must admit it without a password, because the gateway daemon has no terminal to type one at. The installed path
-  lies in a directory the user can write, so an entry naming the path alone would make root of whatever file is put
-  there: the entry pins the helper's bytes,
-  `#<uid> ALL=(root) NOPASSWD: sha256:<digest> <installed path, spaces escaped>`, and is written again when an install
-  changes those bytes.
+  root-owned directory on `PATH`, or a NixOS `security.wrappers` entry). The first such one serves.
+- **Any other helper runs through `sudo -n`**, the first there is in that order: the copy in the system directory, which
+  root owns, read-only, in a directory only root writes, so no user can replace what `sudo` runs. A sudoers entry must
+  admit it without a password, because the gateway daemon has no terminal to type one at. The entry pins the helper's
+  bytes, `#<uid> ALL=(root) NOPASSWD: sha256:<digest> <system path>`, and is written again when the helper changes,
+  which only a change to the helper's own source does.
 
 `cowshed setup` proves this once the helper is installed, for every ZFS root the host serves: the store's own root on a
 store that is a ZFS dataset, and otherwise (a macOS host, whose store is APFS) each root that names the user, when the
 host has a `zfs`. It runs the `check` verb of the helper the installed cowshed reaches, as it reaches it, and through
-`sudo` with `-k` besides, so the credentials setup's own `sudo -v` cached do not answer for a daemon that has none. When
-the proof fails at a terminal, setup runs the one root command that mends it, which `sudo` authorizes, and proves again.
-Without a terminal, or when the proof still fails, setup exits `environment-missing`, saying what the attempt answered,
-and its `next:` line is that command: for the installed helper, the entry above written to
-`/etc/sudoers.d/cowshed-helper-<uid>` (staged as `cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by
-`visudo -cf`, then renamed), with the entry itself in the message for a host that keeps its sudoers elsewhere; for a
-setuid helper that was reached instead, the `install -o 0 -g 0 -m 4755` that replaces it with this build's; and for an
-installed path sudoers cannot spell, the same setuid install into `/usr/local/bin`. `gateway stop --purge` and
-`setup --uninstall` remove the installed helper; neither removes a sudoers entry, which is root's.
-
-**Open: the digest is checked before the helper is executed.** Where `sudo` cannot execute the file it hashed, a process
-of this user that replaces the helper between the two steps runs as root. The installed directory is the user's.
+`sudo` with `-k` besides, so the credentials setup's own `sudo -v` cached do not answer for a daemon that has none. The
+proof holds when the helper that answered is the system directory's and has this build's bytes, or is an administrator's
+setuid one. Otherwise, at a terminal, setup runs the one root command that mends it, which `sudo` authorizes, and proves
+again; without a terminal, or when the proof still fails, it exits `environment-missing`, saying what the attempt
+answered, with that command as its `next:` line. The command copies the installed helper into the system directory
+(`install -o 0 -g 0 -m 555`, the directory `-m 755`) and writes the entry above to `/etc/sudoers.d/cowshed-helper-<uid>`
+(staged as `cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by `visudo -cf`, then renamed), with the entry
+itself in the message for a host that keeps its sudoers elsewhere; for a setuid helper that was reached instead, it is
+the `install -o 0 -g 0 -m 4755` that replaces it with this build's. `gateway stop --purge` and `setup --uninstall`
+remove the installed helper; neither removes the system copy or a sudoers entry, which are root's.
 
 Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
 

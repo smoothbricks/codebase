@@ -53,10 +53,11 @@ fn elevation(owner: u32, mode: u32) -> Elevation {
     }
 }
 
-/// The helper that serves, of the helper files there are in search order (beside cowshed, then
-/// each `PATH` directory) with how each gets its privilege: the first that elevates itself, an
-/// administrator's install that needs nothing more, else the first there is, which `sudo` must
-/// admit (09_substrates.md, "Privileged helper").
+/// The helper that serves, of the helper files there are in search order (the root-owned
+/// system directory, beside cowshed, then each `PATH` directory) with how each gets its
+/// privilege: the first that elevates itself, an administrator's install that needs nothing
+/// more, else the first there is, which `sudo` must admit (09_substrates.md, "Privileged
+/// helper").
 fn choose_helper<P>(candidates: impl IntoIterator<Item = (P, Elevation)>) -> Option<P> {
     let mut first = None;
     for (candidate, elevation) in candidates {
@@ -373,13 +374,16 @@ impl ZfsPayloads {
         let searched = std::env::var_os("PATH")
             .into_iter()
             .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>());
-        let helper =
-            choose_helper(helpers_in(beside.into_iter().chain(searched))).ok_or_else(|| {
-                host(
-                    format_args!("{} is a cowshed ZFS root", root.dataset().as_str()),
-                    "cowshed-helper is installed neither beside cowshed nor on PATH",
-                )
-            })?;
+        let system = PathBuf::from(cowshed_helper::host::SYSTEM_DIRECTORY);
+        let helper = choose_helper(helpers_in(
+            std::iter::once(system).chain(beside).chain(searched),
+        ))
+        .ok_or_else(|| {
+            host(
+                format_args!("{} is a cowshed ZFS root", root.dataset().as_str()),
+                "cowshed-helper is installed neither by cowshed setup, beside cowshed nor on PATH",
+            )
+        })?;
         Ok(Self {
             root,
             store_root: store_root.to_owned(),

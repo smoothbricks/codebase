@@ -8,6 +8,9 @@ use std::os::fd::AsRawFd;
 /// OpenZFS on macOS installs under `/usr/local/zfs`; the rest is the system's own.
 pub const TRUSTED_PATH: &str = "/usr/local/zfs/bin:/usr/sbin:/sbin:/usr/bin:/bin";
 
+/// Where macOS keeps the root-owned helpers of user applications.
+pub const SYSTEM_DIRECTORY: &str = "/Library/PrivilegedHelperTools/dev.cowshed";
+
 /// `f_mntfromname` of `directory`'s filesystem when its type is `zfs`. With
 /// `com.apple.devdisk=off` and `com.apple.mimic=off` (01b_zfs.md, "No disk per dataset") that is
 /// the dataset name; a dataset mounted through a proxy disk reports `/dev/disk…` and so never

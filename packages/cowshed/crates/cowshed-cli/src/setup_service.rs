@@ -348,7 +348,7 @@ impl HostSetup for NativeHostSetup {
             return Ok(Some(unproven.refusal));
         }
         cowshed_os::eprintln!(
-            "cowshed: the root helper cannot act on this host's ZFS root yet; writing the sudoers entry that admits it (sudo may ask for your password)"
+            "cowshed: installing the root helper where no user can replace it, with the sudoers entry that admits it (sudo may ask for your password)"
         );
         match crate::zfs_helper::mend(&unproven.command) {
             Ok(true) => Ok(prove()?.map(|still| still.refusal)),

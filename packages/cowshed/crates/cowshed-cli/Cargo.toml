@@ -22,6 +22,8 @@ base64 = "0.22"
 bytes = "1"
 cowshed-apfs = { path = "../cowshed-apfs" }
 cowshed-os = { path = "../cowshed-os" }
+# The root-owned directory `cowshed setup` installs the ZFS helper in.
+cowshed-helper = { path = "../cowshed-helper" }
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-core.workspace = true
 cowshed-shell = { path = "../cowshed-shell" }

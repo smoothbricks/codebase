@@ -19,6 +19,10 @@ use macos as platform;
 /// The `PATH` the helper gives `zfs`: system directories only, never the caller's.
 pub use platform::TRUSTED_PATH;
 
+/// The root-owned directory `cowshed setup` installs the helper in, read-only and root's: no
+/// user can replace what `sudo` admits there (09_substrates.md, "Privileged helper").
+pub use platform::SYSTEM_DIRECTORY;
+
 /// The ZFS dataset `directory` is the mounted root of, when it is one.
 pub fn mounted_dataset(directory: &File) -> io::Result<Option<String>> {
     let here = directory.metadata()?;
