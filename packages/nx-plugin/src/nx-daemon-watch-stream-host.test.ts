@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DAEMON_GLOB_PLUGIN, fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the watch-probe hunk of `patches/nx@24.0.3.patch` (`daemon/server/file-watching/watch-probe.js`). A daemon's
+ * Guards the watch-probe hunk of `patches/nx@24.0.6.patch` (`daemon/server/file-watching/watch-probe.js`). A daemon's
  * file watch can stop delivering without a word: an FSEventStream that fseventsd stopped serving (a restarted
  * fseventsd, a stream that never started) reports nothing, and Nx 24's watch settles by time, not by an event it waited
  * for (Nx 23.2.1's native watcher also dropped FSEvents' rescan flags; Nx 24 turns them into a rescan marker). The

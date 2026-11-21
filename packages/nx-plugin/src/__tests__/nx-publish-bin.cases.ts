@@ -157,7 +157,7 @@ local.cache.cache.put("accepted-fixture", "passed", ["result.txt"], 0);
 /** Each Nx version the cache adapter declares, as the repository installs it (packages/nx-23.2.1 holds 23.2.1). */
 const DECLARED_NX = [
   ['23.2.1', join(repository, 'packages/nx-23.2.1/node_modules/nx-23.2.1')],
-  ['24.0.3', join(repository, 'node_modules/nx')],
+  ['24.0.6', join(repository, 'node_modules/nx')],
 ] as const;
 
 /** A fixture of the store's protocol (03_caches.md): a key is stored once, a stored key is served whole. */

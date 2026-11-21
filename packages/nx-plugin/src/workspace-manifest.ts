@@ -400,7 +400,7 @@ export interface NxDependsOnObject {
   dependencies?: boolean;
   /**
    * The configuration the dependency runs in, which it passes on to its own dependencies; without it, the one the run
-   * asked for (the dependsOn-configuration hunk of `patches/nx@24.0.3.patch`).
+   * asked for (the dependsOn-configuration hunk of `patches/nx@24.0.6.patch`).
    */
   configuration?: string;
 }

@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { nxFixtureRoot } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the installed Nx patch's run-commands drain (`patches/README.md`, "A command's output is read to its end"):
+ * Guards the installed Nx's run-commands drain (`patches/README.md`, "A command's output is read to its end"):
  * a `nx:run-commands` task run without a terminal takes its result once the command's stdout and stderr have closed,
- * never at the command's 'exit', when its last chunks can still be unread. Upstream nrwl/nx 5d440a5fe6 (#37762).
+ * never at the command's 'exit', when its last chunks can still be unread. Upstream nrwl/nx 5d440a5fe6 (#37762),
+ * shipped by Nx 24.0.6 and carried as a patch hunk before it.
  *
  * The command's last line is written by a process it leaves behind, released only once the command's own 'exit' was
  * emitted to the listeners Nx registered before this program's: whatever Nx joins in its 'exit' handler cannot hold

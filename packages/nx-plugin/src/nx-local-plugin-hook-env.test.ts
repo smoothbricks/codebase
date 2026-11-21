@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the plugin-worker hunks of `patches/nx@24.0.3.patch`. This package's `preTasksExecution` publishes the run's
+ * Guards the plugin-worker hunks of `patches/nx@24.0.6.patch`. This package's `preTasksExecution` publishes the run's
  * endpoints (`MBX_RESERVATIONS_SOCKET`, the CPU pool's socket) by setting `process.env`, and Nx carries those writes to
  * the run's task processes: it wraps a hook's `process.env` in a proxy that records them and returns them to the
  * client, which applies them. Stock Nx installs that proxy when plugin isolation is on or a daemon is enabled. The

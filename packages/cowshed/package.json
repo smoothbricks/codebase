@@ -1559,7 +1559,7 @@
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "catalog:",
-    "nx": "24.0.3",
+    "nx": "24.0.6",
     "typescript": "^6.0.3"
   },
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)",

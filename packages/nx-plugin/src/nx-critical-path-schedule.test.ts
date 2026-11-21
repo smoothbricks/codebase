@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the critical-path hunks of `patches/nx@24.0.3.patch` (tasks-schedule.js and
+ * Guards the critical-path hunks of `patches/nx@24.0.6.patch` (tasks-schedule.js and
  * task-orchestrator.js). Stock Nx orders ready tasks by how many tasks depend on them directly and
  * starts no task while every slot is held, so a gate's critical chain started behind short leaves
  * and then waited for slots held by tests running at a tenth of a core. The patched scheduler

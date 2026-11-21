@@ -4,7 +4,7 @@ import type { TargetConfiguration } from 'nx/src/config/workspace-json-project-j
 import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 
 /**
- * Guards the dependsOn-configuration hunk of `patches/nx@24.0.3.patch`. Stock Nx 24.0.3 runs every dependency in the
+ * Guards the dependsOn-configuration hunk of `patches/nx@24.0.6.patch`. Stock Nx 24.0.3 runs every dependency in the
  * configuration the run asked for, so a graph run in the default configuration could not hold a production build:
  * the land gate built the host's production CLI and addon in a second, sequential Nx run. A dependsOn entry now names
  * the configuration its dependency runs in, and that dependency passes it on to its own dependencies; an entry that

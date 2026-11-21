@@ -5,7 +5,7 @@ import type * as NxProjectGraphRecomputation from 'nx/src/daemon/server/project-
 import type * as NxSyncGenerators from 'nx/src/daemon/server/sync-generators';
 
 /**
- * Guards the sync-schedule hunk of `patches/nx@24.0.3.patch` in `daemon/server/sync-generators.js`
+ * Guards the sync-schedule hunk of `patches/nx@24.0.6.patch` in `daemon/server/sync-generators.js`
  * (`patches/README.md`, "Sync generators run when a client asks"). Stock 24.0.3's daemon runs every registered sync
  * generator 100 ms after each project-graph recomputation (`collectAndScheduleSyncGenerators`), ahead of any request
  * for its changes. A generator is synchronous work on the daemon's one event loop, so the client that caused the

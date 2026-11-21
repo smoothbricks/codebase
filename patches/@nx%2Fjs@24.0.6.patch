@@ -1,5 +1,5 @@
 diff --git a/package.json b/package.json
-index 12c7ae8692273df7a82ade09e3bcbf43d3a6cd0f..8feb4617d2e95e678e32301d5d5b078c39fdda36 100644
+index 5731699d3573d0fa8caec78da88bc1bc693f9720..4e1ac7f3a117e2a38a60359213beccd15bae8493 100644
 --- a/package.json
 +++ b/package.json
 @@ -194,7 +194,8 @@
@@ -8,7 +8,7 @@ index 12c7ae8692273df7a82ade09e3bcbf43d3a6cd0f..8feb4617d2e95e678e32301d5d5b078c
      "@swc/cli": ">=0.6.0 <0.9.0",
 -    "verdaccio": "^6.0.5"
 +    "verdaccio": "^6.0.5",
-+    "nx": "24.0.3"
++    "nx": "24.0.6"
    },
    "peerDependenciesMeta": {
      "@swc/cli": {

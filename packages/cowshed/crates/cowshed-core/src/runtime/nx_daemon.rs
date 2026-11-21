@@ -1079,7 +1079,7 @@ pub(crate) struct OwnedStopOutcome {
 /// take the forks it made since the plan while it still runs, `SIGTERM` the exact identity the
 /// ledger proved, then wait on the exit watch registered before any signal for the shared grace
 /// and end the plugin workers it forked ([`super::daemon_watch::Orphans::end`]). The daemon's own
-/// `SIGTERM` handler closes its socket and deletes its record (pinned Nx 24.0.3,
+/// `SIGTERM` handler closes its socket and deletes its record (pinned Nx 24.0.6,
 /// `daemon/server/shutdown-utils.js`), so nothing is left to clean, and no command, nor the shell
 /// activation it would enter through, can hold the stop past the grace (16_build_volumes.md,
 /// Land 4). A daemon already gone is stopped: a signal it no longer accepts is said only when it

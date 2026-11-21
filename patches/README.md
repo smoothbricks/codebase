@@ -1,10 +1,10 @@
 # Patches
 
 Patches this repository applies to its dependencies. `bun install` applies the root `package.json`'s
-`patchedDependencies`, including `nx@24.0.3.patch`. The root `overrides.nx` pins the registry version `24.0.3`;
+`patchedDependencies`, including `nx@24.0.6.patch`. The root `overrides.nx` pins the registry version `24.0.6`;
 `bun.lock` is written by Bun and records that version, registry integrity and patch path. The root `overrides["@nx/js"]`
-likewise pins `24.0.3`, the version its patch applies to: `@nx/js` 24.0.3 still imports `nx` without declaring it
-([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)), and `@nx%2Fjs@24.0.3.patch` declares the peer.
+likewise pins `24.0.6`, the version its patch applies to: `@nx/js` 24.0.6 still imports `nx` without declaring it
+([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)), and `@nx%2Fjs@24.0.6.patch` declares the peer.
 
 ## Flechette factory declarations
 
@@ -61,10 +61,10 @@ Retire each when typia or scriptc removes its cause; bump both with typia.
 
 ## Activating a patch change
 
-Prepare Nx changes with `bun patch nx@24.0.3`, then use the registry-index regeneration flow:
+Prepare Nx changes with `bun patch nx@24.0.6`, then use the registry-index regeneration flow:
 
 ```sh
-bun patch nx@24.0.3
+bun patch nx@24.0.6
 python3 tooling/nx_patch.py --check
 # Edit the Bun-prepared node_modules/nx package only after the no-op check passes.
 python3 tooling/nx_patch.py
@@ -97,7 +97,7 @@ installed-product regression runs `node --check` on every patched JavaScript fil
 inactivity policy.
 
 The nx-plugin managed files distribute the same Nx patch to consumers. The root monorepo policy maintains
-`overrides.nx = "24.0.3"` and `patchedDependencies["nx@24.0.3"] = "patches/nx@24.0.3.patch"`. Run `smoo monorepo update`
+`overrides.nx = "24.0.6"` and `patchedDependencies["nx@24.0.6"] = "patches/nx@24.0.6.patch"`. Run `smoo monorepo update`
 and ordinary `bun install` in a consumer to adopt it. Tests import the actual installed Nx package, so a source gate
 covers the currently maintained patch without publishing anything. Drop a carried hunk only when the installed upstream
 version contains its repair, retaining its regression test.
@@ -108,6 +108,12 @@ below. Point the `nx` and `@nx/*` pins and `overrides` at the new version and le
 hunks onto the prepared package, add the entry back naming `patches/nx@<version>.patch`, run
 `python3 tooling/nx_patch.py`, retire the prepared copy and `bun install` as above, and delete the previous version's
 patch and its managed copy. The no-op `--check` then reproduces the new patch byte-identically.
+
+The hunks carry as a three-way merge of the registry packages: commit the pristine old package, the old package with the
+current patch applied and the pristine new package in one scratch Git repository, cherry-pick the patch commit onto the
+new package, and resolve each conflict by its section below. A file the cherry-pick leaves equal to the new package's is
+a repair the new version ships; its section says so and its test stays. The resolved tree is the `--source` of
+`tooling/nx_patch.py`, and the installed `node_modules/nx` must then equal it file for file.
 
 ### Known Bun 1.4.2 deletion-patch bug
 
@@ -204,7 +210,10 @@ and a generator beside it. Neither task reads that command, and both rebuilt byt
 (`hashPlans`, `hashPlansUpfront` and `hashPlansFor`):
 
 - **The task's own project** hashes its root, tags, the task's own target's executor, outputs, options, configurations
-  and parallelism, and the named inputs its `inputs` reach.
+  and parallelism, and the named inputs its `inputs` reach. An `nx:run-script` target's options are hashed with the
+  package.json script it runs (`metadata.scriptContent`), as Nx 24.0.6's native node hashes them
+  ([nrwl/nx#37704](https://github.com/nrwl/nx/pull/37704)): a target whose inputs leave `package.json` out still re-keys
+  when its script changes.
 - **A project its `^` inputs reach** hashes its root, tags and the same named inputs, through which those inputs
   resolve.
 
@@ -231,10 +240,11 @@ A test that reads its own package's targets keys that `package.json` as a file.
 published methods. A sibling target's edit and a reached project's target keep the key. The task's own command,
 executor, outputs, configurations and parallelism, and its project's tags, each re-key it, as does a named input its
 inputs reach, directly or through another named input (a named input no input of the task reaches keeps it, in the
-project and in a reached project), and all three native calls key alike. Upstream:
-[nrwl/nx#37802](https://github.com/nrwl/nx/issues/37802) and [nrwl/nx#37803](https://github.com/nrwl/nx/pull/37803),
-which plans the task's own target into the instruction. Drop the hunk, and keep the test, once the installed Nx keys a
-task's own target only.
+project and in a reached project), and all three native calls key alike. An `nx:run-script` task re-keys when its own
+script body changes, with `package.json` outside its inputs; a sibling script's body and `metadata.scriptContent` on
+another executor keep the key. Upstream: [nrwl/nx#37802](https://github.com/nrwl/nx/issues/37802) and
+[nrwl/nx#37803](https://github.com/nrwl/nx/pull/37803), which plans the task's own target into the instruction. Drop the
+hunk, and keep the test, once the installed Nx keys a task's own target only.
 
 ## Cross-client task output ownership
 
@@ -774,6 +784,12 @@ some (`shouldCopyOutputsFromCacheBatch`), as the stamps already answer without a
 `packages/nx-plugin/src/nx-cache-linked-output.test.ts` removes such a link outside Nx and runs again, with and without
 a daemon, and then removes its directory too: each time the link comes back and the run says `[local cache]`.
 
+Nx 24.0.6 discards a remote cache result whose entry holds a link that leaves the declared output it sits in
+([nrwl/nx#37661](https://github.com/nrwl/nx/pull/37661)), and `applyRemoteCacheResults` (`tasks-runner/cache.js`) then
+answers a miss, before any restore step of this section runs. A linked output such as `.runtime/bun` is one, so a task
+that declares it runs again instead of restoring it from a remote cache; a local hit restores it as above. The carried
+hunks never restore what Nx refuses.
+
 ## A cache hit keeps the outputs a run left, without a daemon
 
 Stock Nx keeps a cache hit's on-disk outputs only when its daemon recorded them (`outputsHashesMatchBatch`); a client
@@ -796,21 +812,21 @@ Drop the hunk, and keep the test, once the Nx in use verifies on-disk outputs wi
 
 ## Bun's runtime modules are builtins in every runtime
 
-Nx tells a runtime module from a package with `node:module`'s `isBuiltin` (`isBuiltinModuleImport`,
-`plugins/js/project-graph/build-dependencies/target-project-locator.js`). Under Bun that is true for `bun` and `bun:*`;
-under Node, the runtime of an Nx daemon an editor's Nx language server starts, it is false. Such a daemon took every
-`bun:test` import of every test file for a package and resolved it from the importing directory through the external
-package lookup, TypeScript resolution and `require.resolve`: one large Bun workspace's daemon's graph recompute looked
-up `bun:test`, `bun:test.js`, `bun:test.json` and `bun:test.node` 3,738 times each and probed 41,382 missing
-`node_modules` directories in 11 s. The patched `isBuiltinModuleImport` also answers true for `bun` and `bun:*`, as it
-already did for `node:sqlite`. Measured under Node with the installed Nx, one `bun:test` import from a file in
-`packages/nx-plugin/src` took 10 file-system calls and 10 `require.resolve` attempts (90–218 ms) before and none (0.1
-ms) after.
+Nx tells a runtime module from a package with `isBuiltinModuleImport`
+(`plugins/js/project-graph/build-dependencies/target-project-locator.js`). Before Nx 24.0.6 it asked `node:module`'s
+`isBuiltin`, which under Bun is true for `bun` and `bun:*` and under Node, the runtime of an Nx daemon an editor's Nx
+language server starts, false. Such a daemon took every `bun:test` import of every test file for a package and resolved
+it from the importing directory through the external package lookup, TypeScript resolution and `require.resolve`: one
+large Bun workspace's daemon's graph recompute looked up `bun:test`, `bun:test.js`, `bun:test.json` and `bun:test.node`
+3,738 times each and probed 41,382 missing `node_modules` directories in 11 s. Measured under Node with Nx 24.0.3, one
+`bun:test` import from a file in `packages/nx-plugin/src` took 10 file-system calls and 10 `require.resolve` attempts
+(90–218 ms) before this repository's hunk and none (0.1 ms) after.
 
-`nx-bun-builtin-imports.test.ts` asks the installed Nx in Node: `bun` and `bun:*` are builtins, resolve to no project
-and take no package lookup, and `bunyan`, `bun-types`, `@types/bun` and `bun/x` stay packages. Upstream:
-[nrwl/nx#37809](https://github.com/nrwl/nx/issues/37809). Drop the hunk, and keep the test, once the Nx in use knows
-Bun's modules.
+Nx 24.0.6 ships the repair ([nrwl/nx#37810](https://github.com/nrwl/nx/pull/37810), fixing
+[nrwl/nx#37809](https://github.com/nrwl/nx/issues/37809)): its `isBuiltinModuleImport` answers true for `bun` and
+`bun:*` in every runtime, as the hunk did, so no hunk carries it. `nx-bun-builtin-imports.test.ts` still asks the
+installed Nx in Node: `bun` and `bun:*` are builtins, resolve to no project and take no package lookup, and `bunyan`,
+`bun-types`, `@types/bun` and `bun/x` stay packages.
 
 ## The longest chain starts first, past a full slot count
 
@@ -1058,7 +1074,7 @@ lines (`P:727`, `P:766`). A job whose daemon stops would then fail its command, 
 
 Every changed line (+3,133 −676, in 79 files) is counted once, under the purpose that decides whether it can go; a hunk
 that mixes purposes is split by function. `P:n` is line n of `patches/nx@23.2.1.patch` as last changed by `446e01de66`
-(`git show 446e01de66:patches/nx@23.2.1.patch`); the counts are that patch's. `patches/nx@24.0.3.patch` carries the same
+(`git show 446e01de66:patches/nx@23.2.1.patch`); the counts are that patch's. `patches/nx@24.0.6.patch` carries the same
 purposes on Nx 24's modules (the stopped-watcher probe in `daemon/server/file-watching/watch-probe.js`, the validity
 checks merged into Nx 24's own `restart-checks.js`), without the hunks Nx 24 carries itself.
 
@@ -1184,23 +1200,24 @@ log line and no editor run. Stock Nx logs the check and runs all four probes.
 
 ## A command's output is read to its end
 
-Without a terminal, stock Nx 24.0.3 runs an `nx:run-commands` command as a child process and takes its result in the
+Without a terminal, stock Nx 24.0.3 ran an `nx:run-commands` command as a child process and took its result in the
 child's `'exit'` handler, joining the output chunks read so far. Node and Bun can emit `'exit'` before they have read
-the command's last stdout and stderr chunks, so those chunks are missing from the task's terminal output, its cache
+the command's last stdout and stderr chunks, so those chunks were missing from the task's terminal output, its cache
 entry and its output file. A test runner prints its summary last: a consumer workspace's gate read a passing shard as a
 run without a summary this way, under load.
 
-The run-commands hunks backport upstream nrwl/nx 5d440a5fe6 ("keep run-commands output written right before a command
-exits", #37762, fixing #37452): a command's result waits for its stdout and stderr to close, at most 1 second past its
-exit, since a process the command leaves behind can hold the pipes open (`whenStdioClosed` and `hasExited` in
-`utils/child-process.js`). The same commit drains the `nx:run-script` executor's output and a crashed batch worker's,
-stops a serial task killed while a command's output drains, stops parallel siblings at a failed command's exit, and
-keeps ready text from hiding a sibling's failure. Output a leftover process writes more than 1 second after the command
-exits is still not captured; nrwl/nx#36863 tracks that case.
+Nx 24.0.6 contains upstream nrwl/nx 5d440a5fe6 ("keep run-commands output written right before a command exits", #37762,
+fixing #37452), which this repository carried as hunks on 24.0.3: a command's result waits for its stdout and stderr to
+close, at most 1 second past its exit, since a process the command leaves behind can hold the pipes open
+(`whenStdioClosed` and `hasExited` in `utils/child-process.js`). The same commit drains the `nx:run-script` executor's
+output and a crashed batch worker's, stops a serial task killed while a command's output drains, stops parallel siblings
+at a failed command's exit, and keeps ready text from hiding a sibling's failure. The carried files equal 24.0.6's, so
+no hunk carries them. Output a leftover process writes more than 1 second after the command exits is still not captured;
+nrwl/nx#36863 tracks that case.
 
 `packages/nx-plugin/src/nx-run-commands-output-drain.test.ts` drives the installed `SeriallyRunningTasks` under Node and
 Bun with a command whose last line a leftover process writes only once the command's `'exit'` reached the listeners Nx
-registered first. Drop these hunks when the installed upstream version contains 5d440a5fe6, retaining the regression.
+registered first.
 
 ## Run information after a pre-start failure
 
@@ -1293,7 +1310,7 @@ ignore file existed. Drop this section once upstream reads only regular files.
 
 Status: drafted, not opened. Written against nrwl/nx `master` at `a37b5ca4c6630bb9ea5df9ac0546edc3a186bc2f`, whose
 `findCycles`, `filterDummyTasks` and `getNonDummyDeps` have the logic of Nx 23.2.1's. This repository carries the fix as
-the `task-graph-utils` hunk of `nx@24.0.3.patch` (Nx 24's edges are objects, read by `edgeId`);
+the `task-graph-utils` hunk of `nx@24.0.6.patch` (Nx 24's edges are objects, read by `edgeId`);
 `packages/nx-plugin/src/nx-task-graph-cycles.test.ts` guards it here. Drop that patch hunk once the installed Nx
 contains the fix, retaining the regression.
 

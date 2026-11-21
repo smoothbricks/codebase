@@ -77,11 +77,11 @@ export const managedTtscPatch = {
   path: 'patches/ttsc@0.37.1.patch',
 } as const;
 
-/** Maintained Nx 24.0.3 repairs, applied as an ordinary Bun patchedDependency over the registry release. */
+/** Maintained Nx 24.0.6 repairs, applied as an ordinary Bun patchedDependency over the registry release. */
 export const managedNxPatch = {
-  version: '24.0.3',
-  key: 'nx@24.0.3',
-  path: 'patches/nx@24.0.3.patch',
+  version: '24.0.6',
+  key: 'nx@24.0.6',
+  path: 'patches/nx@24.0.6.patch',
 } as const;
 
 const managedFiles: ManagedFileDescriptor[] = [

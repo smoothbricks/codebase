@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the linked-output hunks of `patches/nx@24.0.3.patch` (patches/README.md, "A restore keeps a linked output").
+ * Guards the linked-output hunks of `patches/nx@24.0.6.patch` (patches/README.md, "A restore keeps a linked output").
  * A task whose declared output is a relative link to a file outside its outputs (a consumer's runtime Bun,
  * `.runtime/bun -> ../.cache/runtime-bun/bun`) is cached as the link. The native restore removed the workspace's link
  * and copied nothing back: it follows the link inside the entry, where its target is not. The daemon then recorded the

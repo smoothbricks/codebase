@@ -11,7 +11,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
  * whose daemon socket died in the middle claimed success over the tasks it never ran. Nx 24.0.3 prints success only
  * when every discrete task was reported, as this repository's 23.2.1 hunk did, and lists the others as not run because
  * their dependencies failed, --nx-bail=true, or their batch ended before reaching them. The hunk of
- * `patches/nx@24.0.3.patch` keeps the rest: with no failure, nothing skipped them, so the summary names them as tasks the
+ * `patches/nx@24.0.6.patch` keeps the rest: with no failure, nothing skipped them, so the summary names them as tasks the
  * run ended without finishing.
  *
  * Here the orchestrator throws while it hashes the second task, after the first finished: the second's inputs name an

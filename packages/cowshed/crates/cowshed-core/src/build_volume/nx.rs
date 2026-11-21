@@ -17,12 +17,12 @@ use serde::Deserialize;
 use super::BuildVolumeState;
 use crate::api::dto::UnattributedRun;
 
-/// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 24.0.3,
+/// Where Nx keeps its daemon's record inside `workspace-data` (pinned Nx 24.0.6,
 /// `daemon/tmp-dir.js`). It names one checkout's process and socket, so it never travels.
 pub const DAEMON_DIRECTORY: &str = "d";
 const DAEMON_RECORD: &str = "server-process.json";
 /// The run summary Nx's `StoreRunInformationLifeCycle` writes into its cache directory after
-/// every `run`/`run-many` (pinned Nx 24.0.3, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
+/// every `run`/`run-many` (pinned Nx 24.0.6, `tasks-runner/life-cycles/store-run-information-life-cycle.js`).
 pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
@@ -321,7 +321,7 @@ pub fn held(
 /// Nx's open locks on a volume's task databases, held by this process until dropped. Stock Nx
 /// opens a task database only while it holds that database's open lock: the database's path
 /// with the `lock` extension, locked exclusively (`flock`) before the database is opened and let
-/// go once it is (pinned Nx 24.0.3, `native/db/mod.rs` `connect_to_nx_db`,
+/// go once it is (pinned Nx 24.0.6, `native/db/mod.rs` `connect_to_nx_db`,
 /// `native/db/initialize.rs` `create_lock_file`). So while these are held no Nx process opens
 /// one of the databases: an opener waits on the lock, then opens the database by its path, so
 /// through whatever the checkout's build link names once they are let go. Fenced (`fork_lock`):
@@ -875,7 +875,7 @@ pub(crate) fn spelled_by(check: &str, command: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
-/// What `nx show target inputs <task> --json` prints (pinned Nx 24.0.3,
+/// What `nx show target inputs <task> --json` prints (pinned Nx 24.0.6,
 /// `command-line/show/show-target/inputs.js` `renderInputs`): the task's project and target and
 /// the raw hash inputs of its plan, by category. Its `printJson` (show-target/utils.js) leaves out
 /// every empty list, so a category the task has nothing in is absent, not `[]`: a task with no
@@ -1977,10 +1977,10 @@ mod tests {
         );
     }
 
-    /// Nx 24.0.3 lists a task's dependency as an edge naming it in `id`.
+    /// Nx 24.0.6 lists a task's dependency as an edge naming it in `id`.
     #[test]
-    fn restore_outputs_restores_a_dependency_under_nx_24_0_3() {
-        restore_outputs_restores_a_dependency_under("24.0.3", "node_modules/nx");
+    fn restore_outputs_restores_a_dependency_under_nx_24_0_6() {
+        restore_outputs_restores_a_dependency_under("24.0.6", "node_modules/nx");
     }
 
     /// A root whose Nx is a version `restore_outputs.js` does not declare is refused by name before

@@ -15,7 +15,7 @@ index ac51bea65cfbf2de2cb15ff1783ee5495112d4bb..9464e9febe94a2040ca4f90083307739
                  await ensureNxConsoleInstalledViaDaemon();
              }
 diff --git a/dist/bin/nx.js b/dist/bin/nx.js
-index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3efb01c3f9 100755
+index 64ff769b951345f150f6984ade1d2b674cb11d99..9cbd346d8cfd92fc2f3eaa0b533ef5abebe8e9fc 100755
 --- a/dist/bin/nx.js
 +++ b/dist/bin/nx.js
 @@ -9,9 +9,15 @@ if (process.env.FORCE_COLOR === '0') {
@@ -34,7 +34,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3e
  const pc = tslib_1.__importStar(require("picocolors"));
  const output_1 = require("../src/utils/output");
  const installation_directory_1 = require("../src/utils/installation-directory");
-@@ -35,6 +41,10 @@ async function main() {
+@@ -36,6 +42,10 @@ async function main() {
      // user's command line.
      if (process.env.NX_COMPLETE) {
          try {
@@ -45,7 +45,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3e
              perf_hooks_1.performance.mark('init-local');
              const { tryValueCompletion } = await import('nx/src/command-line/completion/value-completions');
              if (tryValueCompletion())
-@@ -51,6 +61,13 @@ async function main() {
+@@ -52,6 +62,13 @@ async function main() {
          }
          return;
      }
@@ -59,7 +59,7 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3e
      if (process.argv[2] !== 'report' &&
          process.argv[2] !== '--version' &&
          process.argv[2] !== '--help' &&
-@@ -154,6 +171,23 @@ async function main() {
+@@ -148,6 +165,23 @@ async function main() {
          }
      }
  }
@@ -421,10 +421,10 @@ index d7ee773807a7d25214be89c5536c86a8e6589a44..fa08b44690e853ae7ff829115e75fd78
      setNxConsolePreferenceAndInstall(preference: boolean): Promise<SetNxConsolePreferenceAndInstallResponse>;
      getConfigureAiAgentsStatus(): Promise<ConfigureAiAgentsStatusResponse>;
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d09697f6a 100644
+index 506026f3b4cc57e6ebc7df150fdf254eca503f57..95c89046414997a78dee8627859d5b3e140021b7 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
-@@ -41,9 +41,7 @@ const get_sync_generator_changes_1 = require("../message-types/get-sync-generato
+@@ -40,9 +40,7 @@ const get_sync_generator_changes_1 = require("../message-types/get-sync-generato
  const hash_glob_1 = require("../message-types/hash-glob");
  const nx_console_1 = require("../message-types/nx-console");
  const register_project_graph_listener_1 = require("../message-types/register-project-graph-listener");
@@ -433,7 +433,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
 -const task_history_1 = require("../message-types/task-history");
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
- const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
+ const socket_utils_1 = require("../socket-utils");
 @@ -56,6 +54,8 @@ var DaemonStatus;
      DaemonStatus[DaemonStatus["DISCONNECTED"] = 1] = "DISCONNECTED";
      DaemonStatus[DaemonStatus["CONNECTED"] = 2] = "CONNECTED";
@@ -796,7 +796,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
              throw err;
          }
      }
-@@ -1137,14 +1255,31 @@ class DaemonClient {
+@@ -1138,14 +1256,31 @@ class DaemonClient {
          return { available: false, refusal };
      }
      async sendMessageToDaemon(message) {
@@ -828,7 +828,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
          return new Promise((resolve, reject) => {
              perf_hooks_1.performance.mark('sendMessageToDaemon-start');
              // An open promise isn't enough to keep the event loop
-@@ -1155,12 +1290,25 @@ class DaemonClient {
+@@ -1156,12 +1291,25 @@ class DaemonClient {
              keepAlive = setTimeout(() => {
                  reject(new Error('The daemon timed out while processing ' + message.type));
              }, 20 * 60 * 1000);
@@ -854,7 +854,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
          });
      }
      async registerDaemonProcessWithMetricsService(daemonPid) {
-@@ -1194,7 +1342,13 @@ class DaemonClient {
+@@ -1195,7 +1343,13 @@ class DaemonClient {
                  console[parsedResult.level](parsedResult.message);
                  return;
              }
@@ -869,7 +869,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
                  this.currentReject(parsedResult.error);
              }
              else {
-@@ -1271,8 +1425,11 @@ class DaemonClient {
+@@ -1272,8 +1426,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -883,7 +883,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
-@@ -1300,19 +1457,31 @@ class DaemonClient {
+@@ -1301,19 +1458,31 @@ class DaemonClient {
              ].join('\n'));
          }
      }
@@ -925,7 +925,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
              }
          }
          (0, tmp_dir_1.removeSocketDir)();
-@@ -1339,6 +1508,59 @@ function isDocker() {
+@@ -1340,6 +1509,59 @@ function isDocker() {
  function nxJsonIsNotPresent() {
      return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
  }
@@ -986,7 +986,7 @@ index af7da5654b807f8e9d8693cd45aad32a162a4765..6bdfade7ca1d18fa7c9fc072ad1a924d
   * The operating system refused the connection. Most often the socket belongs to
   * another user, which is the guarantee the owner-only socket directory buys —
 diff --git a/dist/src/daemon/client/daemon-environment.d.ts b/dist/src/daemon/client/daemon-environment.d.ts
-index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..7e79adfe9efef8a58674757be0380f6e9c34f043 100644
+index 8e26fabee0312a273db08607758b25a8773e7660..ef5fd6f5fb1d94793db68ac5d1423df796718500 100644
 --- a/dist/src/daemon/client/daemon-environment.d.ts
 +++ b/dist/src/daemon/client/daemon-environment.d.ts
 @@ -3,7 +3,9 @@
@@ -1000,22 +1000,24 @@ index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..7e79adfe9efef8a58674757be0380f6e
   */
  export declare function hashDaemonClientEnv(): string;
  export declare function getDaemonEnv(): NodeJS.ProcessEnv & {
-@@ -63,12 +65,32 @@ export declare function getAppliedDaemonClientEnv(): {
+@@ -62,12 +64,34 @@ export declare function getAppliedDaemonClientEnv(): {
   */
  export declare function applyDaemonEnvFromClient(newEnv: NodeJS.ProcessEnv): string[];
  /**
 - * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
-- * first on PATH. The wrappers inside are runtime state the daemon and workers
-- * must receive, but the folder's random name is not project-graph identity:
-- * two invocations whose environments differ only by it would compute the same
-- * graph. Strips the folder from PATH and pins the var to a sentinel so such
+- * first on PATH. Plugin workers, and the daemon's own PATH when it runs plugins
+- * itself, get its wrappers only while a connected client carries it. Its random name is not
+- * project-graph identity: two invocations whose environments differ only by it
+- * would compute the same graph. Strips the folder from PATH and pins the var to a sentinel so such
 - * environments compare equal. Returns a copy; never mutates runtime env.
 + * An env as project-graph identity: the env without what a package manager
 + * adds to run one command in this workspace. The daemon and its workers still
 + * receive all of it, but two clients whose envs differ only by it compute the
 + * same graph, so a switch between them keeps the cached graph:
 + * - Yarn Berry's BERRY_BIN_FOLDER, fresh for every invocation and first on
-+ *   PATH: the folder leaves PATH and the var is pinned to a sentinel.
++ *   PATH: the folder leaves PATH and the var is pinned to a sentinel. Its
++ *   wrappers reach the daemon and its workers only while a connected client
++ *   carries them.
 + * - The `node_modules/.bin` directories `bun run`, `npm run`, pnpm and Yarn
 + *   put in front of PATH for the run's directory and each of its ancestors:
 + *   one that lies in the workspace, whose packages its lockfile identifies,
@@ -1040,21 +1042,22 @@ index 65ae9cfd686c3c676cf321cf402bbbf03fc87dab..7e79adfe9efef8a58674757be0380f6e
  export declare function normalizeDaemonEnvironmentForGraph(env: NodeJS.ProcessEnv, platform?: NodeJS.Platform): NodeJS.ProcessEnv;
  export declare function getChangedEnvKeys(before: NodeJS.ProcessEnv, after: NodeJS.ProcessEnv): string[];
 diff --git a/dist/src/daemon/client/daemon-environment.js b/dist/src/daemon/client/daemon-environment.js
-index 427ced7822fb05ba966d0543c224c5760b016572..4f07a52210d000864d12dcc4a5bdff55b5ee5bcb 100644
+index 19295c8b71ab433f35b959ded9b92e97bc40c724..fb248c72156ca81d87874a78340f08cf1b0eccb4 100644
 --- a/dist/src/daemon/client/daemon-environment.js
 +++ b/dist/src/daemon/client/daemon-environment.js
-@@ -8,7 +8,10 @@ exports.getAppliedDaemonClientEnv = getAppliedDaemonClientEnv;
- exports.applyDaemonEnvFromClient = applyDaemonEnvFromClient;
- exports.normalizeDaemonEnvironmentForGraph = normalizeDaemonEnvironmentForGraph;
- exports.getChangedEnvKeys = getChangedEnvKeys;
+@@ -18,8 +18,11 @@ exports.getLiveClientBerryEnv = getLiveClientBerryEnv;
+ exports.adoptBerryBinFoldersOnPath = adoptBerryBinFoldersOnPath;
+ const node_fs_1 = require("node:fs");
+ const node_path_1 = require("node:path");
 +const fs_1 = require("fs");
 +const path_1 = require("path");
  const file_hasher_1 = require("../../hasher/file-hasher");
+ const owned_private_dir_1 = require("../../utils/owned-private-dir");
 +const workspace_root_1 = require("../../utils/workspace-root");
  const DAEMON_ENV_REQUIRED_SETTINGS = {
      NX_PROJECT_GLOB_CACHE: 'false',
      NX_CACHE_PROJECTS_CONFIG: 'false',
-@@ -243,7 +246,9 @@ function isExcludedEnvVar(key) {
+@@ -257,7 +260,9 @@ function isExcludedEnvVar(key) {
   * `getDaemonEnv` would send, minus the required settings the daemon pins
   * itself. Skipping those yields the same digest whether the process is a
   * daemon plugin worker (which has them set) or a daemonless one (which
@@ -1065,7 +1068,7 @@ index 427ced7822fb05ba966d0543c224c5760b016572..4f07a52210d000864d12dcc4a5bdff55
   */
  function hashDaemonClientEnv() {
      const env = {};
-@@ -254,7 +259,7 @@ function hashDaemonClientEnv() {
+@@ -268,7 +273,7 @@ function hashDaemonClientEnv() {
          }
      }
      env.NX_LOAD_DOT_ENV_FILES = normalizedLoadDotEnvFiles();
@@ -1074,15 +1077,15 @@ index 427ced7822fb05ba966d0543c224c5760b016572..4f07a52210d000864d12dcc4a5bdff55
  }
  /**
   * `NX_LOAD_DOT_ENV_FILES` as its meaning rather than its spelling. `run-command`
-@@ -380,35 +385,185 @@ function applyDaemonEnvFromClient(newEnv) {
+@@ -403,35 +408,187 @@ function applyDaemonEnvFromClient(newEnv) {
  }
  const BERRY_BIN_FOLDER_GRAPH_IDENTITY = '<YARN_BERRY_BIN_FOLDER>';
  /**
 - * Yarn Berry creates a fresh BERRY_BIN_FOLDER for every invocation and puts it
-- * first on PATH. The wrappers inside are runtime state the daemon and workers
-- * must receive, but the folder's random name is not project-graph identity:
-- * two invocations whose environments differ only by it would compute the same
-- * graph. Strips the folder from PATH and pins the var to a sentinel so such
+- * first on PATH. Plugin workers, and the daemon's own PATH when it runs plugins
+- * itself, get its wrappers only while a connected client carries it. Its random name is not
+- * project-graph identity: two invocations whose environments differ only by it
+- * would compute the same graph. Strips the folder from PATH and pins the var to a sentinel so such
 - * environments compare equal. Returns a copy; never mutates runtime env.
 + * What a run's task hooks publish for its tasks: the endpoint of the run's mbx
 + * reservations, or why it has none. Fresh for each run, and read by no plugin.
@@ -1176,7 +1179,9 @@ index 427ced7822fb05ba966d0543c224c5760b016572..4f07a52210d000864d12dcc4a5bdff55
 + * receive all of it, but two clients whose envs differ only by it compute the
 + * same graph, so a switch between them keeps the cached graph:
 + * - Yarn Berry's BERRY_BIN_FOLDER, fresh for every invocation and first on
-+ *   PATH: the folder leaves PATH and the var is pinned to a sentinel.
++ *   PATH: the folder leaves PATH and the var is pinned to a sentinel. Its
++ *   wrappers reach the daemon and its workers only while a connected client
++ *   carries them.
 + * - The `node_modules/.bin` directories `bun run`, `npm run`, pnpm and Yarn
 + *   put in front of PATH for the run's directory and each of its ancestors:
 + *   one that lies in the workspace, whose packages its lockfile identifies,
@@ -1787,10 +1792,10 @@ index 2d5c114ed5c9b2b55acd614d8c306fabc362b408..00000000000000000000000000000000
 -    }
 -}
 diff --git a/dist/src/daemon/server/latest-nx.js b/dist/src/daemon/server/latest-nx.js
-index ef00ae3212498e75d6bb6371aec4b113970c0c68..06eb2bf7436cc20dad1d646be44ba99064395f3d 100644
+index b21223c93a06eb340c2421fbe6a96c74e86b55eb..9bb31df25e9bf67a5bd6e311fb0ae6bc37dd8174 100644
 --- a/dist/src/daemon/server/latest-nx.js
 +++ b/dist/src/daemon/server/latest-nx.js
-@@ -20,6 +20,11 @@ let installPromise = null;
+@@ -21,6 +21,11 @@ let installPromise = null;
   * Guards against concurrent callers by reusing the in-flight promise.
   */
  async function getLatestNxTmpPath() {
@@ -2568,7 +2573,7 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c0901766
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets, notice });
  }
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index 5989aac4d2d8d860033f93d369efb54133a4d715..9064121a456494d96f611ac8043b8fdf265a4ad5 100644
+index 3e15e9d3501ace3fc8ace1125bc3cd71695d683c..ca54475c729461ca8683511cc994e2ec963a0b84 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -8,16 +8,12 @@ const fs_1 = require("fs");
@@ -2648,7 +2653,7 @@ index 5989aac4d2d8d860033f93d369efb54133a4d715..9064121a456494d96f611ac8043b8fdf
 +        return;
 +    }
      if ((0, daemon_message_1.isDaemonMessage)(payload) && payload.env) {
-         await (0, handle_client_env_1.handleClientEnv)(payload.env);
+         await (0, handle_client_env_1.handleClientEnv)(payload.env, socket);
      }
 +    // The first request on a connection that is answered from the workspace's
 +    // files waits until every write made before it has reached the daemon: an
@@ -3186,12 +3191,12 @@ index 731ba638ab39ae3babe35db7d98ee9e66995b62f..78c9296b4322cfd8fc024a8c26aa6fe0
  async function getCachedRegisteredSyncGenerators() {
      log('get registered sync generators');
 diff --git a/dist/src/daemon/socket-utils.d.ts b/dist/src/daemon/socket-utils.d.ts
-index fb36b09efa216204d5148f5e6c1fc68f462a4929..ad6409689f42cd37e00acb2488972005a9d9f667 100644
+index 7190339d342bee98caf679bf8f1409e5f5b92f1d..174abd340bcf707bca03837de4b0b61789238ab2 100644
 --- a/dist/src/daemon/socket-utils.d.ts
 +++ b/dist/src/daemon/socket-utils.d.ts
-@@ -16,6 +16,21 @@ export declare const getFullOsSocketPath: () => string;
- export declare const getForkedProcessOsSocketPath: (id: string) => string;
- export declare const getPluginOsSocketPath: (id: string) => string;
+@@ -24,6 +24,21 @@ export declare const getPluginOsSocketPath: (id: string) => string;
+  */
+ export declare function connectToDaemonSocket(socketPath: string, onConnect?: () => void): Socket;
  export declare function killSocketOrPath(): void;
 +/**
 + * Notes which socket file this daemon's server bound at `socketPath`, so that it
@@ -3212,19 +3217,19 @@ index fb36b09efa216204d5148f5e6c1fc68f462a4929..ad6409689f42cd37e00acb2488972005
  /**
   * Serialize using `preferred`, falling back to the other format when it throws.
 diff --git a/dist/src/daemon/socket-utils.js b/dist/src/daemon/socket-utils.js
-index 3aed2d0e8233491ed17cf2659fc44bd3ed74eac9..cc914c2dd0755a3ee555805b4ed085ebcc594f56 100644
+index ecc2282deee2fc24ead6b822aae8cc660a38d808..ac4c04e5f3ed440b7dee67c7ce20d5137d25790d 100644
 --- a/dist/src/daemon/socket-utils.js
 +++ b/dist/src/daemon/socket-utils.js
-@@ -2,6 +2,8 @@
- Object.defineProperty(exports, "__esModule", { value: true });
+@@ -3,6 +3,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
  exports.getPluginOsSocketPath = exports.getForkedProcessOsSocketPath = exports.getFullOsSocketPath = exports.isWindows = void 0;
+ exports.connectToDaemonSocket = connectToDaemonSocket;
  exports.killSocketOrPath = killSocketOrPath;
 +exports.recordOwnSocket = recordOwnSocket;
 +exports.ownSocketState = ownSocketState;
  exports.serializeResult = serializeResult;
  exports.serializeWithFallback = serializeWithFallback;
  exports.serialize = serialize;
-@@ -38,6 +40,46 @@ function killSocketOrPath() {
+@@ -63,6 +65,46 @@ function killSocketOrPath() {
      }
      catch { }
  }
@@ -3322,89 +3327,11 @@ index 400e96394bbef2f44ca626a1d9445bd539674068..f31f54daa6b87d595fdf6384778313e8
              recursive: true,
              force: true,
          });
-diff --git a/dist/src/executors/run-commands/running-tasks.d.ts b/dist/src/executors/run-commands/running-tasks.d.ts
-index 9813a098eb17d9e799e1583a848f4e2fce945b6f..3d5dfcfc981cac0540758d15fd3fc7a600a2d1a6 100644
---- a/dist/src/executors/run-commands/running-tasks.d.ts
-+++ b/dist/src/executors/run-commands/running-tasks.d.ts
-@@ -36,6 +36,7 @@ export declare class SeriallyRunningTasks implements RunningTask {
-     private code;
-     private error;
-     private outputCallbacks;
-+    private killSignal;
-     private exited;
-     private exitTerminalOutput;
-     constructor(options: NormalizedRunCommandsOptions, context: ExecutorContext, tuiEnabled: boolean, task: Pick<Task, 'id' | 'ultracache'>, baseEnv?: NodeJS.ProcessEnv);
 diff --git a/dist/src/executors/run-commands/running-tasks.js b/dist/src/executors/run-commands/running-tasks.js
-index be662a6ea68d9df1a606795b2b39934740467d54..17f40095c4eb0963d704d6fdb16fc5951e0e3b4e 100644
+index 59cc12ebd8c7920ea6568d797a841c58668c3242..dd441984469cb0fe9a37ad1a0480c980c91ce976 100644
 --- a/dist/src/executors/run-commands/running-tasks.js
 +++ b/dist/src/executors/run-commands/running-tasks.js
-@@ -14,6 +14,7 @@ const pseudo_terminal_1 = require("../../tasks-runner/pseudo-terminal");
- const task_env_1 = require("../../tasks-runner/task-env");
- const tokens_1 = require("../../tasks-runner/tokens");
- const task_io_service_1 = require("../../tasks-runner/task-io-service");
-+const child_process_2 = require("../../utils/child-process");
- const exit_codes_1 = require("../../utils/exit-codes");
- const output_1 = require("../../utils/output");
- /**
-@@ -110,6 +111,12 @@ class ParallelRunningTasks {
-                         }
-                     });
-                     childProcess.onExit((code, terminalOutput) => {
-+                        // A failed command reports only once its output is read, so
-+                        // readyWhen text a sibling prints meanwhile must not hide it.
-+                        if (code === 0 &&
-+                            this.childProcesses.some((p) => p !== childProcess && p.exitedWithFailure)) {
-+                            return;
-+                        }
-                         res({
-                             childProcess,
-                             result: { code, terminalOutput },
-@@ -137,9 +144,14 @@ class ParallelRunningTasks {
-         }
-         else {
-             const runningProcesses = new Set();
--            let hasFailure = false;
--            let failureDetails = null;
-+            let failedProcess = null;
-             const terminalOutputs = new Map();
-+            const failFast = (childProcess) => {
-+                if (failedProcess)
-+                    return;
-+                failedProcess = childProcess;
-+                this.terminateRemainingProcesses(runningProcesses, childProcess);
-+            };
-             await Promise.allSettled(this.childProcesses.map(async (childProcess) => {
-                 runningProcesses.add(childProcess);
-                 childProcess.onOutput((terminalOutput) => {
-@@ -147,20 +159,20 @@ class ParallelRunningTasks {
-                         cb(terminalOutput);
-                     }
-                 });
-+                // Results wait for the output to drain, which a descendant holding
-+                // the pipes can stretch to a second.
-+                childProcess.onFailedExit(() => failFast(childProcess));
-                 const { code, terminalOutput } = await childProcess.getResults();
-                 terminalOutputs.set(childProcess, terminalOutput);
--                if (code !== 0 && !hasFailure) {
--                    hasFailure = true;
--                    failureDetails = { childProcess, code, terminalOutput };
--                    // Immediately terminate all other running processes
--                    this.terminateRemainingProcesses(runningProcesses, childProcess);
-+                if (code !== 0) {
-+                    failFast(childProcess);
-                 }
-                 runningProcesses.delete(childProcess);
-             }));
-             let terminalOutput = Array.from(terminalOutputs.values()).join('\r\n');
--            if (hasFailure && failureDetails) {
-+            if (failedProcess) {
-                 // Add failure message
--                const warning = commandExitedNonZeroWarning(failureDetails.childProcess.command);
-+                const warning = commandExitedNonZeroWarning(failedProcess.command);
-                 terminalOutput += warning;
-                 streamChunk(warning, this.streamOutput, process.stderr);
-                 this.emitExit(1, terminalOutput);
-@@ -186,6 +198,9 @@ class SeriallyRunningTasks {
+@@ -198,6 +198,9 @@ class SeriallyRunningTasks {
          this.baseEnv = baseEnv;
          this.terminalOutputChunks = [];
          this.currentProcess = null;
@@ -3414,187 +3341,6 @@ index be662a6ea68d9df1a606795b2b39934740467d54..17f40095c4eb0963d704d6fdb16fc595
          this.exitCallbacks = [];
          this.code = 0;
          this.outputCallbacks = [];
-@@ -253,10 +268,15 @@ class SeriallyRunningTasks {
-         throw new Error('Not implemented');
-     }
-     kill(signal) {
-+        this.killSignal = signal ?? 'SIGTERM';
-         return this.currentProcess?.kill(signal);
-     }
-     async run(options, context) {
-         for (const c of options.commands) {
-+            if (this.killSignal) {
-+                this.code = (0, exit_codes_1.signalToCode)(this.killSignal);
-+                break;
-+            }
-             const childProcess = await this.createProcess(c, options.color, calculateCwd(options.cwd, context), options.processEnv ?? options.env ?? {}, this.task, options.usePty, options.streamOutput, options.tty, options.envFile, this.baseEnv);
-             this.currentProcess = childProcess;
-             childProcess.onOutput((output, isCommandHeader) => {
-@@ -349,7 +369,10 @@ class RunningNodeProcess {
-         this.terminalOutputChunks = [];
-         this.exitCallbacks = [];
-         this.outputCallbacks = [];
-+        this.failedExitCallbacks = [];
-         this.killPromise = null;
-+        // Set at 'exit', while the output may still be unread.
-+        this.exitedWithFailure = false;
-         // Memoized exit so late getResults()/onExit() callers don't hang.
-         this.exited = false;
-         this.exitCode = 0;
-@@ -367,6 +390,7 @@ class RunningNodeProcess {
-             windowsHide: true,
-             stdio: ['inherit', 'pipe', 'pipe'],
-         });
-+        this.stdioClosed = (0, child_process_2.whenStdioClosed)(this.childProcess);
-         this.closedPromise = new Promise((resolve) => {
-             this.childProcess.on('close', resolve);
-         });
-@@ -402,6 +426,10 @@ class RunningNodeProcess {
-         }
-         this.exitCallbacks.push(cb);
-     }
-+    /** Runs at a non-zero 'exit', before the rest of the output is read. */
-+    onFailedExit(cb) {
-+        this.failedExitCallbacks.push(cb);
-+    }
-     send(message) {
-         this.childProcess.send(message);
-     }
-@@ -424,10 +452,15 @@ class RunningNodeProcess {
-             return this.killPromise;
-         if (!this.childProcess.pid)
-             return Promise.resolve();
-+        // An exited child's pid is free for reuse, so signalling it could reach an
-+        // unrelated process.
-+        const signalled = (0, child_process_2.hasExited)(this.childProcess)
-+            ? Promise.resolve()
-+            : (0, native_1.killProcessTreeGraceful)(this.childProcess.pid, signal);
-         // Cache the promise so concurrent callers (e.g. cleanup() after a
-         // fire-and-forget kill from cleanUpUnneededContinuousTasks) await the
-         // same in-progress operation instead of no-oping.
--        this.killPromise = (0, native_1.killProcessTreeGraceful)(this.childProcess.pid, signal).then(() => 
-+        this.killPromise = signalled.then(() => 
-         // Wait for stdio drain and close events before the orchestrator
-         // tears down the event loop via process.exit().
-         Promise.race([
-@@ -451,9 +484,10 @@ class RunningNodeProcess {
-     addListeners(commandConfig) {
-         this.childProcess.stdout.setEncoding('utf8');
-         this.childProcess.stderr.setEncoding('utf8');
-+        const exitedWithFailure = () => this.exitedWithFailure;
-         // Separate matchers, so a ready string never spans stdout and stderr
--        const stdoutReady = readyWhenMatcher(this.readyWhenStatus);
--        const stderrReady = readyWhenMatcher(this.readyWhenStatus);
-+        const stdoutReady = readyWhenMatcher(this.readyWhenStatus, exitedWithFailure);
-+        const stderrReady = readyWhenMatcher(this.readyWhenStatus, exitedWithFailure);
-         this.childProcess.stdout.on('data', (data) => {
-             const output = addColorAndPrefix(data, commandConfig);
-             this.terminalOutputChunks.push(output);
-@@ -485,11 +519,19 @@ class RunningNodeProcess {
-             untrackRunningNodeProcess(this);
-             this.emitExit(1, terminalOutput);
-         });
--        this.childProcess.on('exit', (code, signal) => {
-+        this.childProcess.on('exit', async (code, signal) => {
-             if (code === null) {
-                 code = (0, exit_codes_1.signalToCode)(signal);
-             }
-             untrackRunningNodeProcess(this);
-+            this.exitedWithFailure = code !== 0;
-+            if (this.exitedWithFailure) {
-+                for (const cb of this.failedExitCallbacks) {
-+                    cb();
-+                }
-+            }
-+            // The last stdout and stderr chunks can still be unread at 'exit'.
-+            await this.stdioClosed;
-             if (code === 0 &&
-                 this.readyWhenStatus.length &&
-                 !isReady(this.readyWhenStatus)) {
-@@ -591,23 +633,33 @@ function isReady(readyWhenStatus) {
- // The output as printed, kept across chunks, matches strings that hold escape
- // sequences. LogMatcher, absent from the WASM binding, matches text with
- // escapes inside it.
--function readyWhenMatcher(readyWhenStatus) {
-+function readyWhenMatcher(readyWhenStatus, exitedWithFailure) {
-     const matchers = readyWhenStatus.map((status) => ({
-         status,
-         matcher: native_1.IS_WASM ? null : new native_1.LogMatcher([status.stringToMatch]),
-         tail: '',
-+        matched: false,
-     }));
-     return (chunk) => {
-+        // The status is shared, so only a chunk with this command's own match
-+        // reports ready. Once ready, only a failed command can change the result.
-+        if (isReady(readyWhenStatus) && !exitedWithFailure())
-+            return false;
-+        let matchedNow = false;
-         for (const entry of matchers) {
-             const { status, matcher } = entry;
--            if (status.found)
-+            if (entry.matched)
-                 continue;
-             const printed = entry.tail + chunk;
--            status.found =
-+            entry.matched =
-                 printed.includes(status.stringToMatch) || !!matcher?.feed(chunk);
-             entry.tail = printed.slice(Math.max(0, printed.length - status.stringToMatch.length + 1));
-+            if (entry.matched) {
-+                status.found = true;
-+                matchedNow = true;
-+            }
-         }
--        return isReady(readyWhenStatus);
-+        return matchedNow && isReady(readyWhenStatus);
-     };
- }
- function loadEnvVarsFile(path, env = {}) {
-diff --git a/dist/src/executors/run-script/run-script.impl.js b/dist/src/executors/run-script/run-script.impl.js
-index 196ee42030c875ceb3d734d9e26ed3b64b47c9b7..4ed3d5227987b9e1531cfed4fb42045b023c4544 100644
---- a/dist/src/executors/run-script/run-script.impl.js
-+++ b/dist/src/executors/run-script/run-script.impl.js
-@@ -6,6 +6,7 @@ const child_process_1 = require("child_process");
- const path = tslib_1.__importStar(require("path"));
- const native_1 = require("../../native");
- const pseudo_terminal_1 = require("../../tasks-runner/pseudo-terminal");
-+const child_process_2 = require("../../utils/child-process");
- const package_manager_1 = require("../../utils/package-manager");
- async function default_1(options, context) {
-     const pm = (0, package_manager_1.getPackageManagerCommand)();
-@@ -40,13 +41,16 @@ function nodeProcess(command, cwd, env) {
-             env,
-             windowsHide: true,
-         });
-+        const stdioClosed = (0, child_process_2.whenStdioClosed)(cp);
-         // Forward stdout/stderr to parent process
-         cp.stdout.pipe(process.stdout);
-         cp.stderr.pipe(process.stderr);
-         cp.on('error', (error) => {
-             rej(error);
-         });
--        cp.on('exit', (code) => {
-+        cp.on('exit', async (code) => {
-+            // The last stdout and stderr chunks can still be unread at 'exit'.
-+            await stdioClosed;
-             if (code === 0) {
-                 res();
-             }
-@@ -55,9 +59,13 @@ function nodeProcess(command, cwd, env) {
-             }
-         });
-         const exitHandler = (signal) => {
--            if (cp && cp.pid && !cp.killed) {
-+            // An exited child's pid is free for reuse, and its exit code decides
-+            // the result, also when the kill is what made it exit.
-+            if (cp && cp.pid && !cp.killed && !(0, child_process_2.hasExited)(cp)) {
-                 (0, native_1.killProcessTreeGraceful)(cp.pid, signal).finally(() => {
--                    res();
-+                    if (!(0, child_process_2.hasExited)(cp)) {
-+                        res();
-+                    }
-                 });
-             }
-         };
 diff --git a/dist/src/hasher/check-task-files.js b/dist/src/hasher/check-task-files.js
 index b027c02a6df7532cce64ae9684bfb76e56bf975b..ce045a0e126de3d349a10d0f367a0bdbbaad820a 100644
 --- a/dist/src/hasher/check-task-files.js
@@ -3686,10 +3432,10 @@ index 57d1ce513dfb13aa98579dd4929aaef84a758bf6..2e40f2aa2cf7a01e1f0b31435526c486
      planner: HashPlanner;
      projectGraphRef: ExternalObject<NativeProjectGraph>;
 diff --git a/dist/src/hasher/native-task-hasher-impl.js b/dist/src/hasher/native-task-hasher-impl.js
-index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878ee1faac3 100644
+index c63e87221bcfbe9ca6b69690e621aabfb4ec197a..085c882f31a7250f6d03e8cbc9cac0a16f870608 100644
 --- a/dist/src/hasher/native-task-hasher-impl.js
 +++ b/dist/src/hasher/native-task-hasher-impl.js
-@@ -10,6 +10,7 @@ const overrides_1 = require("../ultracache/overrides");
+@@ -11,6 +11,7 @@ const overrides_1 = require("../ultracache/overrides");
  class NativeTaskHasherImpl {
      constructor(workspaceRoot, nxJson, projectGraph, externals, options, planningContext) {
          this.projectGraph = projectGraph;
@@ -3697,7 +3443,7 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878
          /**
           * Plans of the last up-front batch and the task graph they were built for.
           * The tasks that batch deferred hash from them later without planning again.
-@@ -50,12 +51,13 @@ class NativeTaskHasherImpl {
+@@ -51,12 +52,13 @@ class NativeTaskHasherImpl {
              unplanned.some((id) => this.upfrontPlans.taskIds.has(id)) &&
              this.upfrontPlans.fingerprint ===
                  taskGraphFingerprint(taskGraph, ultracacheConfigurations)) {
@@ -3713,8 +3459,8 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878
          }
          return tasks.map((t) => hashes[t.id]);
      }
-@@ -71,14 +73,15 @@ class NativeTaskHasherImpl {
-         return this.planner.getPlansReference(taskIds, taskGraph, ultracacheConfigurations, (0, overrides_1.ultracacheEligibilityOptions)(this.projectGraph, taskGraph));
+@@ -74,14 +76,15 @@ class NativeTaskHasherImpl {
+         return this.planner.getPlansReference(taskIds, prunedGraph, ultracacheConfigurations, (0, overrides_1.ultracacheEligibilityOptions)(this.projectGraph, taskGraph));
      }
      async hashTasksUpfront(tasks, taskGraph, perTaskEnvs, cwd, collectInputs, ultracacheConfigurations) {
 -        const plans = this.plan(tasks.map((t) => t.id), taskGraph, ultracacheConfigurations);
@@ -3732,7 +3478,7 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878
      }
  }
  exports.NativeTaskHasherImpl = NativeTaskHasherImpl;
-@@ -104,3 +107,202 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
+@@ -107,3 +110,213 @@ function taskGraphFingerprint(taskGraph, ultracacheConfigurations) {
      }
      return (0, native_1.hashArray)(parts);
  }
@@ -3791,8 +3537,19 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878
 +    return hashes;
 +}
 +/**
++ * A target's options as the native ProjectConfiguration node hashes them: an `nx:run-script` target's together with
++ * the package.json script it runs (`metadata.scriptContent`, nrwl/nx#37704), which its inputs may leave out.
++ */
++function hashedOptions(configured) {
++    const options = configured.options ?? {};
++    const script = configured.metadata?.scriptContent;
++    return configured.executor === 'nx:run-script' && typeof script === 'string' && script !== ''
++        ? [options, script]
++        : options;
++}
++/**
 + * A project's root, tags and the named inputs in `reached` (every one when it is null), and `target`'s executor,
-+ * outputs, options, configurations and parallelism.
++ * outputs, options (hashedOptions), configurations and parallelism.
 + */
 +function projectConfigurationHash(projectGraph, project, target, reached) {
 +    const node = projectGraph.nodes[project];
@@ -3810,7 +3567,7 @@ index 5812bc2b6c931a98193985115a15d3050e2d1020..af2205ff9a7ff94d490012ceb4c49878
 +            target,
 +            configured.executor ?? null,
 +            configured.outputs ?? [],
-+            configured.options ?? {},
++            hashedOptions(configured),
 +            configured.configurations ?? {},
 +            configured.parallelism ?? null,
 +        ];
@@ -4202,34 +3959,8 @@ index e9bc3673ce7e3ecb71e74c26633d88a4e6d9aa67..7810678810f73a20b15333c1481c653b
              ? (0, fileutils_1.readJsonFile)((0, node_path_1.join)(context.workspaceRoot, 'package.json'))
              : undefined;
          return getLockFileNodesForName(lockFile, contents, lockFileHash, packageJson);
-diff --git a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js b/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
-index 5c2bcfaa11caef956fc906f2693586cb647b1382..1eeccd1ba61ce8391596f06aafeb0452cb49cf2a 100644
---- a/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
-+++ b/dist/src/plugins/js/project-graph/build-dependencies/target-project-locator.js
-@@ -21,7 +21,20 @@ const defaultPackageJsonResolutionCache = new Map();
- const experimentalNodeModules = new Set(['node:sqlite']);
- function isBuiltinModuleImport(importExpr) {
-     const packageName = (0, get_package_name_from_import_path_1.getPackageNameFromImportPath)(importExpr);
--    return (0, node_module_1.isBuiltin)(packageName) || experimentalNodeModules.has(packageName);
-+    return ((0, node_module_1.isBuiltin)(packageName) ||
-+        experimentalNodeModules.has(packageName) ||
-+        isBunModuleImport(importExpr));
-+}
-+/**
-+ * Bun's runtime modules: `bun` and `bun:*` (`bun:test`, `bun:sqlite`, ...).
-+ * `isBuiltin` knows them only when Nx itself runs under Bun. A daemon under
-+ * Node (one an editor's Nx language server starts) took each `bun:test`
-+ * import for a package and looked it up through npm, TypeScript and
-+ * `require.resolve` from the importing directory: thousands of failed
-+ * `node_modules` probes per graph recompute. Upstream: nrwl/nx#37809.
-+ */
-+function isBunModuleImport(importExpr) {
-+    return importExpr === 'bun' || importExpr.startsWith('bun:');
- }
- // TypeScript matches the `${configDir}` template case-insensitively and only as a
- // prefix (commandLineParser.ts `startsWithConfigDirTemplate`).
 diff --git a/dist/src/project-graph/affected/affected-tasks.js b/dist/src/project-graph/affected/affected-tasks.js
-index 63d31ac684db1ae64d396771733f07fb2e562eb7..b79292b2b642e07f0092f2eb26c104bcb0fc8fb6 100644
+index 19b09f5280ada68bf98e026459a1a612f0905f72..d5a6c6d5853017698e83545bbaaafecc98124836 100644
 --- a/dist/src/project-graph/affected/affected-tasks.js
 +++ b/dist/src/project-graph/affected/affected-tasks.js
 @@ -76,16 +76,20 @@ async function computeAffectedTasks(opts) {
@@ -4456,12 +4187,12 @@ index cea3155a8314ffec1eab979cfc2d5ac438725bc7..d42128bf57c250c99a409ff69c7b9803
      })) {
          return true;
 diff --git a/dist/src/project-graph/plugins/get-plugins.d.ts b/dist/src/project-graph/plugins/get-plugins.d.ts
-index 93f05fdfa622883efbb45dba383fd419938a605c..34ec5d92356d4262c233dfbef88804a0fb918ea8 100644
+index 4e1947cb272eca219e3289ddba59cb2f3e3f49bb..577f0929016700403184f4b3e88945ca6b9c573e 100644
 --- a/dist/src/project-graph/plugins/get-plugins.d.ts
 +++ b/dist/src/project-graph/plugins/get-plugins.d.ts
-@@ -8,11 +8,11 @@ export interface SeparatedPlugins {
- /** Exported for tests: the fallback latch is process-scoped by design. */
- export declare function resetIsolationFallbackForTesting(): void;
+@@ -10,11 +10,11 @@ export declare function resetIsolationFallbackForTesting(): void;
+ /** Whether this daemon has loaded a plugin into its own process. */
+ export declare function daemonHostsPluginsInProcess(): boolean;
  /**
 - * Loads a plugin in a worker, falling back to this process when the worker's
 - * socket was refused.
@@ -4475,7 +4206,7 @@ index 93f05fdfa622883efbb45dba383fd419938a605c..34ec5d92356d4262c233dfbef88804a0
   * been told about the Nx socket root refuses the worker's socket, and failing
   * the whole command over that is worse than running the plugins here. The
   * fallback is narrow on purpose. It needs a failure to start or reach the
-@@ -28,6 +28,11 @@ export declare const loadingMethod: (plugin: PluginConfiguration, root: string,
+@@ -30,6 +30,11 @@ export declare const loadingMethod: (plugin: PluginConfiguration, root: string,
   * Specified plugins come first, followed by default plugins.
   */
  export declare function getPlugins(nxJson: NxJsonConfiguration, root?: string): Promise<LoadedNxPlugin[]>;
@@ -4488,18 +4219,18 @@ index 93f05fdfa622883efbb45dba383fd419938a605c..34ec5d92356d4262c233dfbef88804a0
   * Returns specified plugins (from nx.json) and default plugins (project.json,
   * package.json, etc.) as separate arrays. This separation is needed for
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddda3152a6b 100644
+index a3ae2488b3c6d8e15a3651c3ff4b7f19d0afe470..8544e18afd6bd3b727226b92f4e69baa0d55f354 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
-@@ -4,6 +4,7 @@ exports.loadingMethod = void 0;
- exports.resetIsolationFallbackForTesting = resetIsolationFallbackForTesting;
+@@ -5,6 +5,7 @@ exports.resetIsolationFallbackForTesting = resetIsolationFallbackForTesting;
+ exports.daemonHostsPluginsInProcess = daemonHostsPluginsInProcess;
  exports.getPlugins = getPlugins;
  exports.getPluginsSeparated = getPluginsSeparated;
 +exports.getPluginsConfigurationHash = getPluginsConfigurationHash;
  exports.getOnlyDefaultPlugins = getOnlyDefaultPlugins;
  exports.getPluginsIfLoadedOrLoading = getPluginsIfLoadedOrLoading;
  exports.cleanupPlugins = cleanupPlugins;
-@@ -26,6 +27,9 @@ const is_sandbox_1 = require("../../utils/is-sandbox");
+@@ -28,6 +29,9 @@ const is_sandbox_1 = require("../../utils/is-sandbox");
  const native_1 = require("../../native");
  const output_1 = require("../../utils/output");
  const transpiler_1 = require("./transpiler");
@@ -4509,8 +4240,8 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
  /**
   * Stuff for specified NX Plugins.
   */
-@@ -65,11 +69,13 @@ function resetIsolationFallbackForTesting() {
-     isolationRefusedInThisProcess = false;
+@@ -80,11 +84,13 @@ function loadNxPluginInProcess(plugin, root, index) {
+     return (0, in_process_loader_1.loadNxPlugin)(plugin, root, index);
  }
  /**
 - * Loads a plugin in a worker, falling back to this process when the worker's
@@ -4527,7 +4258,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
   * been told about the Nx socket root refuses the worker's socket, and failing
   * the whole command over that is worse than running the plugins here. The
   * fallback is narrow on purpose. It needs a failure to start or reach the
-@@ -80,15 +86,34 @@ function resetIsolationFallbackForTesting() {
+@@ -95,15 +101,34 @@ function loadNxPluginInProcess(plugin, root, index) {
   * error.
   */
  const loadingMethod = async (plugin, root, index) => {
@@ -4542,13 +4273,13 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
 +    }
 +    const local = (0, local_plugin_source_1.localPluginPath)(root, resolved.pluginPath) !== null;
 +    if (!local && (!(0, enabled_1.isIsolationEnabled)() || isolationRefusedInThisProcess)) {
-         return (0, in_process_loader_1.loadNxPlugin)(plugin, root, index);
+         return loadNxPluginInProcess(plugin, root, index);
      }
 +    // ESM modules cannot be evicted in-process. A daemon with isolation off
 +    // holds local source itself and restarts when it changes; every other
 +    // process needs a restartable worker.
 +    if (local && !(0, enabled_1.isIsolationEnabled)() && (0, local_plugin_source_1.canHoldLocalPlugins)()) {
-+        return (0, local_plugin_source_1.holdLocalPlugin)(root, () => (0, in_process_loader_1.loadNxPlugin)(plugin, root, index), () => require('../../daemon/server/restart-checks').restartDaemonForLocalPlugins());
++        return (0, local_plugin_source_1.holdLocalPlugin)(root, () => loadNxPluginInProcess(plugin, root, index), () => require('../../daemon/server/restart-checks').restartDaemonForLocalPlugins());
 +    }
      // Awaited here rather than handed on, because the worker failure surfaces on
      // this promise and the fallback has to happen before the caller sees it.
@@ -4564,7 +4295,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
          // Proof, kept separate from policy. The errno the worker saw is what makes
          // the message certain; whether that errno is also grounds for degrading is a
          // different question, and conflating them made the warning assert a sandbox
-@@ -127,6 +152,13 @@ const loadingMethod = async (plugin, root, index) => {
+@@ -142,6 +167,13 @@ const loadingMethod = async (plugin, root, index) => {
      }
  };
  exports.loadingMethod = loadingMethod;
@@ -4578,7 +4309,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
  /**
   * Returns all plugins (specified + default) as a flat list.
   * Specified plugins come first, followed by default plugins.
-@@ -147,8 +179,8 @@ async function getPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
+@@ -162,8 +194,8 @@ async function getPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
   */
  async function getPluginsSeparated(nxJson, root = workspace_root_1.workspaceRoot) {
      const pluginsConfiguration = nxJson.plugins ?? [];
@@ -4589,7 +4320,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
      if (cachedSeparatedPlugins &&
          pluginsConfigurationHash === currentPluginsConfigurationHash) {
          return cachedSeparatedPlugins;
-@@ -281,7 +313,9 @@ async function loadPlugins(loader, pluginConfigurations, root, assignIndexes) {
+@@ -296,7 +328,9 @@ async function loadPlugins(loader, pluginConfigurations, root, assignIndexes) {
  }
  async function capabilitiesOfConfiguredPlugins(nxJson, root = workspace_root_1.workspaceRoot) {
      if (!(0, is_on_daemon_1.isOnDaemon)() && (0, client_1.isDaemonEnabled)()) {
@@ -4600,7 +4331,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
      }
      const recorded = (0, nx_plugin_capabilities_1.capabilitiesOfNxPluginsReadFromCache)();
      if (recorded) {
-@@ -311,7 +345,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+@@ -326,7 +360,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
          // Cleared so the next call retries instead of re-awaiting this rejection.
          pendingDefaultPluginPromise = undefined;
          const errorMessage = errors
@@ -4609,7 +4340,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
      }
-@@ -348,7 +382,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+@@ -363,7 +397,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
      if (errors.length > 0) {
          // Wants are not retracted: a newer load may own the declaration by now.
          const errorMessage = errors
@@ -4618,7 +4349,7 @@ index b5f180eb7c517d26c2bf8ca6377c1aeb9f69d0e7..109b9d9a2fe169ea8a70314dca68dddd
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
      }
-@@ -363,6 +397,12 @@ function reasonToError(reason) {
+@@ -378,6 +412,12 @@ function reasonToError(reason) {
          if ('stack' in reason) {
              error.stack = String(reason.stack);
          }
@@ -4662,18 +4393,18 @@ index cee2fea3af0b5fb6d588d5e02496ec8768e34f23..48282a721df9324de8bb5c8568c39a67
  }
  export declare function getPluginWorkerSocketId(): string;
 diff --git a/dist/src/project-graph/plugins/isolation/isolated-plugin.js b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
-index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5b5daafca 100644
+index 4686cfe948abf459a00424abcb5804a29b69ed00..d3b1c817084be38754f3d56022e70399ed063e81 100644
 --- a/dist/src/project-graph/plugins/isolation/isolated-plugin.js
 +++ b/dist/src/project-graph/plugins/isolation/isolated-plugin.js
-@@ -11,6 +11,7 @@ const crypto_1 = require("crypto");
- const net_1 = require("net");
+@@ -12,6 +12,7 @@ const net_1 = require("net");
  const path = require("path");
+ const daemon_environment_1 = require("../../../daemon/client/daemon-environment");
  const logger_1 = require("../../../daemon/logger");
 +const is_on_daemon_1 = require("../../../daemon/is-on-daemon");
  const sandbox_socket_hint_1 = require("../../../daemon/sandbox-socket-hint");
  const socket_refused_exit_code_1 = require("../../../utils/socket-refused-exit-code");
  const socket_utils_1 = require("../../../daemon/socket-utils");
-@@ -24,6 +25,7 @@ const task_results_stub_1 = require("../task-results-stub");
+@@ -25,6 +26,7 @@ const task_results_stub_1 = require("../task-results-stub");
  const wait_for_socket_connection_1 = require("../../../utils/wait-for-socket-connection");
  const workspace_root_1 = require("../../../utils/workspace-root");
  const resolve_plugin_1 = require("../resolve-plugin");
@@ -4681,7 +4412,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
  const messaging_1 = require("./messaging");
  const plugin_lifecycle_manager_1 = require("./plugin-lifecycle-manager");
  const PLUGIN_TIMEOUT_HINT_TEXT = 'As a last resort, you can set NX_PLUGIN_NO_TIMEOUTS=true to bypass this timeout.';
-@@ -40,10 +42,11 @@ class IsolatedPlugin {
+@@ -41,10 +43,11 @@ class IsolatedPlugin {
      /**
       * Creates and loads an isolated plugin worker.
       */
@@ -4695,7 +4426,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
          try {
              const loadResult = await instance.spawnAndConnect();
              instance.setupHooks(loadResult);
-@@ -89,6 +92,14 @@ class IsolatedPlugin {
+@@ -90,6 +93,14 @@ class IsolatedPlugin {
              }
              const pending = this.responseHandlers.get(message.tx);
              if (pending) {
@@ -4710,7 +4441,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
                  this.responseHandlers.delete(message.tx);
                  pending.onMessage(message);
              }
-@@ -109,7 +120,7 @@ class IsolatedPlugin {
+@@ -110,7 +121,7 @@ class IsolatedPlugin {
          };
      }
      async spawnAndConnect() {
@@ -4719,7 +4450,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
          this.worker = worker;
          this.socket = socket;
          this.registerProcessMetrics();
-@@ -167,6 +178,8 @@ class IsolatedPlugin {
+@@ -168,6 +179,8 @@ class IsolatedPlugin {
       * so that only one worker is ever spawned at a time.
       */
      async ensureAlive() {
@@ -4728,7 +4459,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
          if (this._alive) {
              return;
          }
-@@ -217,6 +230,7 @@ class IsolatedPlugin {
+@@ -218,6 +231,7 @@ class IsolatedPlugin {
                      name: this.name,
                      pluginPath: this.pluginPath,
                      shouldRegisterTSTranspiler: this.shouldRegisterTSTranspiler,
@@ -4736,7 +4467,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
                  },
                  tx,
              });
-@@ -228,7 +242,7 @@ class IsolatedPlugin {
+@@ -229,7 +243,7 @@ class IsolatedPlugin {
          this.include = loadResult.include;
          this.exclude = loadResult.exclude;
          const registeredHooks = hooks(loadResult.createNodesPattern && 'createNodes', loadResult.hasCreateDependencies && 'createDependencies', loadResult.hasCreateMetadata && 'createMetadata', loadResult.hasPreTasksExecution && 'preTasksExecution', loadResult.hasPostTasksExecution && 'postTasksExecution');
@@ -4745,7 +4476,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
          const shutdown = (hookName) => this.shutdownIfInactive(hookName);
          const wrap = (hook, hookFn) => this.lifecycle.wrapHook(hook, async (...args) => {
              await this.ensureAlive();
-@@ -317,12 +331,16 @@ class IsolatedPlugin {
+@@ -318,12 +332,16 @@ class IsolatedPlugin {
              const timeout = setTimeout(() => {
                  this.responseHandlers.delete(tx);
                  this.pendingCount--;
@@ -4762,7 +4493,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
                      if (msg.type !== expectedResultType) {
                          reject(new Error(`Expected ${expectedResultType}, got ${msg.type}`));
                          return;
-@@ -332,6 +350,8 @@ class IsolatedPlugin {
+@@ -333,6 +351,8 @@ class IsolatedPlugin {
                  onError: (error) => {
                      clearTimeout(timeout);
                      this.pendingCount--;
@@ -4771,7 +4502,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
                      reject(error);
                  },
              });
-@@ -379,6 +399,15 @@ class IsolatedPlugin {
+@@ -380,6 +400,15 @@ class IsolatedPlugin {
          this._released = true;
          this.shutdown();
      }
@@ -4787,7 +4518,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
      shutdown() {
          // Not `_alive`: that is only set once the worker answers a load, so gating
          // on it would leave a worker that never got that far running.
-@@ -428,7 +457,7 @@ function getPluginWorkerSocketId() {
+@@ -429,7 +458,7 @@ function getPluginWorkerSocketId() {
      const counter = global.nxPluginWorkerCount++;
      return `${process.pid}-${counter.toString(36)}-${(0, crypto_1.randomBytes)(4).toString('hex')}`;
  }
@@ -4796,7 +4527,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
      performance.mark(`start-plugin-worker:${name}`);
      const isWorkerTypescript = path.extname(__filename) === '.ts';
      const workerPath = path.join(__dirname, isWorkerTypescript ? 'plugin-worker.ts' : 'plugin-worker.js');
-@@ -448,7 +477,7 @@ async function startPluginWorker(name) {
+@@ -450,7 +479,7 @@ async function startPluginWorker(name) {
      // keeps the socket path inside the 95-character budget `assertValidSocketPath`
      // enforces.
      const ipcPath = (0, socket_utils_1.getPluginOsSocketPath)(getPluginWorkerSocketId());
@@ -4805,7 +4536,7 @@ index 52d98fce12324b79c6f4c619dfdd72e0f9aed4d1..f36a8caefe6d104f20ef5758a850fae5
          // Spawn the worker with the same resolve conditions Nx uses for plugin
          // entries so the plugin's transitive workspace imports resolve to source.
          ...(0, typescript_1.getPluginResolveConditionNodeArgs)(),
-@@ -492,6 +521,12 @@ async function startPluginWorker(name) {
+@@ -494,6 +523,12 @@ async function startPluginWorker(name) {
  async function connectToWorker(worker, ipcPath, name) {
      const abortController = new AbortController();
      let earlyExitError = null;
@@ -5542,7 +5273,7 @@ index 3ab406eee377e39ebd9229a1d07b7b11c94413b2..1f14ec608e0386ce0918db7ca14f29a6
                  // Deliberately not disabled: unlike the inotify limit above, a socket
                  // owned by someone else stops being there when it is removed or the
 diff --git a/dist/src/tasks-runner/cache.js b/dist/src/tasks-runner/cache.js
-index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..6bcd68317df2271cf013701d1a54651eab7ebbb2 100644
+index 2682544b9e9c1378363f3570bd93e3b3909975f2..4fb3fde3fc90bde4737b0fe0a6c6260c371d7af4 100644
 --- a/dist/src/tasks-runner/cache.js
 +++ b/dist/src/tasks-runner/cache.js
 @@ -28,6 +28,8 @@ const workspace_root_1 = require("../utils/workspace-root");
@@ -5554,42 +5285,50 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..6bcd68317df2271cf013701d1a54651e
  // This function is called once during tasks runner initialization. It checks if the db cache is enabled and logs a warning if it is not.
  function dbCacheEnabled() {
      // ...but if on wasm and the the db cache isnt supported we shouldn't warn
-@@ -175,15 +177,31 @@ class DbCache {
-         return this.cache.getCacheSize();
-     }
-     applyRemoteCacheResults(hash, res, outputs) {
--        return this.cache.applyRemoteCacheResults(hash, res, outputs);
-+        this.cache.applyRemoteCacheResults(hash, res, outputs);
+@@ -181,10 +183,22 @@ class DbCache {
+                     'Its outputs contain a symlink that points outside the output it is in.',
+                 ],
+             });
++            return applied;
++        }
 +        // The native call restores the outputs itself, under this same condition:
 +        // it removes each output the artifact holds and copies it whole. It also
 +        // records the entry's size as the bytes it copies, so it cannot be handed
 +        // only the outputs that differ (restoreChangedOutputs) without
 +        // undercounting the entry against maxCacheSize.
++        const outputs = task.outputs;
 +        if (outputs?.length > 0 && res.code === 0) {
 +            const relativeOutputs = workspaceRelativeOutputs(outputs);
 +            removeAbsentOutputs(workspace_root_1.workspaceRoot, res.outputsPath, relativeOutputs);
 +            stampRestoredOutputs(workspace_root_1.workspaceRoot, res.outputsPath, (0, native_1.expandOutputs)(res.outputsPath, relativeOutputs));
-+        }
+         }
+         return applied;
      }
 -    async put(task, terminalOutput, outputs, code) {
 +    async put(task, terminalOutput, outputs, code, artifacts) {
          return tryAndRetry(async () => {
-             const { expandedOutputs, files } = this.cache.put(task.hash, terminalOutput, outputs, code);
+             const { expandedOutputs, files, outputsBelowALink } = this.cache.put(task.hash, terminalOutput, outputs, code);
              // Notify TaskIOService of actual output files
-             (0, task_io_service_1.getTaskIOService)().notifyTaskOutputs(task.id, expandedOutputs);
-+            // A declaring task's artifacts enter the entry before any remote store archives it. The native put above
-+            // replaced the entry's directory, so no earlier sidecar is left to clear, and a task with none costs nothing.
-+            if (artifacts !== undefined)
-+                (0, task_artifacts_1.writeTaskArtifacts)((0, path_1.join)(this.cache.cacheDirectory, task.hash), artifacts);
-             if (this.remoteCache) {
+@@ -198,8 +212,16 @@ class DbCache {
+                     ],
+                 });
+             }
+-            else if (this.remoteCache) {
 -                await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code);
-+                // A store policy (NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB) decides on how long the task
-+                // ran, before any archive is built. The orchestrator sets both times before it calls put.
-+                await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code, task.endTime - task.startTime);
++            else {
++                // A declaring task's artifacts enter the entry before any remote store archives it. The native put above
++                // replaced the entry's directory, so no earlier sidecar is left to clear, and a task with none costs nothing.
++                if (artifacts !== undefined)
++                    (0, task_artifacts_1.writeTaskArtifacts)((0, path_1.join)(this.cache.cacheDirectory, task.hash), artifacts);
++                if (this.remoteCache) {
++                    // A store policy (NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB) decides on how long the task
++                    // ran, before any archive is built. The orchestrator sets both times before it calls put.
++                    await this.remoteCache.store(task.hash, this.cache.cacheDirectory, terminalOutput, code, task.endTime - task.startTime);
++                }
              }
              return files;
          });
-@@ -198,7 +216,7 @@ class DbCache {
+@@ -214,7 +236,7 @@ class DbCache {
          this.cache.recordTerminalOutputs(records);
      }
      copyFilesFromCache(_, cachedResult, outputs) {
@@ -5598,7 +5337,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..6bcd68317df2271cf013701d1a54651e
      }
      removeOldCacheRecords() {
          return this.cache.removeOldCacheRecords();
-@@ -293,7 +311,9 @@ class DbCache {
+@@ -309,7 +331,9 @@ class DbCache {
              if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
                  process.emitWarning("Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.");
              }
@@ -5609,7 +5348,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..6bcd68317df2271cf013701d1a54651e
          }
          return null;
      }
-@@ -452,6 +472,7 @@ class Cache {
+@@ -468,6 +492,7 @@ class Cache {
                      await this.copy(cached, src);
                  }
              }));
@@ -5617,7 +5356,7 @@ index 02b4d14fca9314d8f4f277aa0aa1cb5b3c9736c8..6bcd68317df2271cf013701d1a54651e
          });
      }
      temporaryOutputPath(task) {
-@@ -557,6 +578,213 @@ class Cache {
+@@ -573,6 +598,213 @@ class Cache {
      }
  }
  exports.Cache = Cache;
@@ -6516,7 +6255,7 @@ index 0000000000000000000000000000000000000000..85a6d257c34dd84bb2acc85b62f4e0e9
 +    }
 +}
 diff --git a/dist/src/tasks-runner/run-command.js b/dist/src/tasks-runner/run-command.js
-index b068c8bb203fd47d11e0d5cdc411b4444fc244fd..851d4428983a7e32aafd059580cfbc821e70af80 100644
+index 3ef22d34dba3df708dde09523ef4268a290c69c0..f8feb94426f24f3abfd2182bd6c1ee11ab8a3303 100644
 --- a/dist/src/tasks-runner/run-command.js
 +++ b/dist/src/tasks-runner/run-command.js
 @@ -359,6 +359,8 @@ async function runCommand(taskSelection, currentProjectGraph, { nxJson }, nxArgs
@@ -6528,7 +6267,7 @@ index b068c8bb203fd47d11e0d5cdc411b4444fc244fd..851d4428983a7e32aafd059580cfbc82
              argv: process.argv,
          });
          const startTime = Date.now();
-@@ -442,7 +444,10 @@ async function printConfigureAiAgentsDisclaimer() {
+@@ -443,7 +445,10 @@ async function printConfigureAiAgentsDisclaimer() {
          if ((0, is_ci_1.isCI)()) {
              return;
          }
@@ -6540,48 +6279,6 @@ index b068c8bb203fd47d11e0d5cdc411b4444fc244fd..851d4428983a7e32aafd059580cfbc82
              return;
          }
          const { outdatedAgents } = await client_1.daemonClient.getConfigureAiAgentsStatus();
-diff --git a/dist/src/tasks-runner/running-tasks/batch-process.js b/dist/src/tasks-runner/running-tasks/batch-process.js
-index 4c56ddede1856427cf936950e2771bf8f9322e92..9c3b57391a002f29a4f5a72c1d925050a8efe31a 100644
---- a/dist/src/tasks-runner/running-tasks/batch-process.js
-+++ b/dist/src/tasks-runner/running-tasks/batch-process.js
-@@ -6,6 +6,7 @@ const crypto_1 = require("crypto");
- const path_1 = require("path");
- const native_1 = require("../../native");
- const cache_1 = require("../cache");
-+const child_process_1 = require("../../utils/child-process");
- const exit_codes_1 = require("../../utils/exit-codes");
- const output_1 = require("../../utils/output");
- const batch_messages_1 = require("../batch/batch-messages");
-@@ -68,6 +69,7 @@ class BatchProcess {
-          * summary is still pointing at.
-          */
-         this.captureNonce = (0, crypto_1.randomBytes)(4).toString('hex');
-+        this.stdioClosed = (0, child_process_1.whenStdioClosed)(this.childProcess);
-         this.childProcess.on('message', (message) => {
-             switch (message.type) {
-                 case batch_messages_1.BatchMessageType.CompleteTask: {
-@@ -294,8 +296,8 @@ class BatchProcess {
-      * batch as one fold, so output no task claimed is not lost.
-      *
-      * Not valid to read before `flushCapturedOutput`; that flush ends the stream,
--     * so a chunk arriving afterwards - a worker's stdout can deliver past the
--     * exit event `getResults()` settles on - is dropped rather than appended.
-+     * so a chunk arriving afterwards - a worker can still write after the
-+     * results message `getResults()` settles on - is dropped rather than appended.
-      */
-     getCapturedOutputPath() {
-         return this.capturedOutputPath;
-@@ -341,7 +343,9 @@ class BatchProcess {
-             new Promise((_, rej) => {
-                 this.onExit((code) => {
-                     if (code !== 0) {
--                        rej(new Error(`"${this.executorName}" exited unexpectedly with code: ${code}`));
-+                        // A rejection makes the caller flush the capture, which drops
-+                        // whatever the crashed worker wrote that has not been read yet.
-+                        this.stdioClosed.then(() => rej(new Error(`"${this.executorName}" exited unexpectedly with code: ${code}`)));
-                     }
-                 });
-             }),
 diff --git a/dist/src/tasks-runner/task-artifacts.d.ts b/dist/src/tasks-runner/task-artifacts.d.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..1b86c767d0011f95c334b360d667f27450887b3a
@@ -6999,7 +6696,7 @@ index f9f93ce62eab9448a72ad9d95b962067de113f1c..8657ded47a3b9df09d7a7ee8ed04490e
      }
      return cycles.size ? cycles : null;
 diff --git a/dist/src/tasks-runner/task-orchestrator.d.ts b/dist/src/tasks-runner/task-orchestrator.d.ts
-index b0d3c985bc330a54b43df557d3e247e1bf64e060..ff7cd099c7a2092bdba5d1232ee7357028e63ab9 100644
+index 6661a4e8547ed108c65712dbc7b45bd80d3101a3..b3bcf0a51fd16f3a5f8b492e82fdb57a12bf6a0b 100644
 --- a/dist/src/tasks-runner/task-orchestrator.d.ts
 +++ b/dist/src/tasks-runner/task-orchestrator.d.ts
 @@ -42,6 +42,7 @@ export declare class TaskOrchestrator {
@@ -7111,7 +6808,7 @@ index b0d3c985bc330a54b43df557d3e247e1bf64e060..ff7cd099c7a2092bdba5d1232ee73570
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<NoopChildProcess | RunningTask | SharedRunningTask>;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 9a17f88be6502a302c5f5eab71df646a2f87851c..95544ba1ed14d3431e0e29ff74c2f6076f245adf 100644
+index 744f58d2a545daa574ea0f86ec3c2d549b0a0224..bb2b3b0f029d5ac264edfecee686b3f77c457c11 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -20,6 +20,7 @@ const params_1 = require("../utils/params");
@@ -7569,7 +7266,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..95544ba1ed14d3431e0e29ff74c2f607
          }
      }
      // endregion utils
-@@ -2208,6 +2329,8 @@ class TaskOrchestrator {
+@@ -2217,6 +2338,8 @@ class TaskOrchestrator {
          // Waiters must not sit out a probe once the run is stopping
          this.abortAllReadiness();
          this.readySignal?.close();
@@ -7578,7 +7275,7 @@ index 9a17f88be6502a302c5f5eab71df646a2f87851c..95544ba1ed14d3431e0e29ff74c2f607
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
-@@ -2277,6 +2400,7 @@ class TaskOrchestrator {
+@@ -2286,6 +2409,7 @@ class TaskOrchestrator {
              if (this.stopRequested)
                  return;
              this.stopRequested = true;
@@ -7988,72 +7685,6 @@ index e654d8c832c5275a2aaa5015887db9167392a694..3e8af252980e6fa141a4af35a51b0681
 +    }
 +    return paths;
 +}
-diff --git a/dist/src/utils/child-process.d.ts b/dist/src/utils/child-process.d.ts
-index d68999b0b603795bbbc4eb6ef916a8ae008e59ce..4ec8ff6292f811b2d12091250d275e6fa68062a8 100644
---- a/dist/src/utils/child-process.d.ts
-+++ b/dist/src/utils/child-process.d.ts
-@@ -1,4 +1,4 @@
--import { type ExecOptions, type ExecSyncOptions, type SpawnSyncOptions } from 'child_process';
-+import { type ChildProcess as NodeChildProcess, type ExecOptions, type ExecSyncOptions, type SpawnSyncOptions } from 'child_process';
- import { PackageManagerCommands } from './package-manager';
- import { ChildProcess } from '../native';
- export declare function getRunNxBaseCommand(packageManagerCommand?: PackageManagerCommands, cwd?: string): string;
-@@ -41,6 +41,13 @@ export declare function runNxAsync(cmd: string, options?: ExecOptions & {
-     silent?: boolean;
-     packageManagerCommand?: PackageManagerCommands;
- }): Promise<void>;
-+export declare function hasExited(child: NodeChildProcess): boolean;
-+/**
-+ * Settles once `child`'s stdio has closed, which Node reports after 'exit'.
-+ * Call it at spawn time: a 'close' emitted before the call is missed. Gives up
-+ * 1s after 'exit', since a descendant can keep the pipes open indefinitely.
-+ */
-+export declare function whenStdioClosed(child: NodeChildProcess): Promise<void>;
- export declare class PseudoTtyProcess {
-     private childProcess;
-     isAlive: boolean;
-diff --git a/dist/src/utils/child-process.js b/dist/src/utils/child-process.js
-index fc523cf236b7973e2f4e3f65d042a40f5fda40b3..6eb3daf7dc6640b8b7c45cea97d62aee2163c0b7 100644
---- a/dist/src/utils/child-process.js
-+++ b/dist/src/utils/child-process.js
-@@ -7,6 +7,8 @@ exports.readInstalledNxBin = readInstalledNxBin;
- exports.runNxArgvSync = runNxArgvSync;
- exports.runNxSync = runNxSync;
- exports.runNxAsync = runNxAsync;
-+exports.hasExited = hasExited;
-+exports.whenStdioClosed = whenStdioClosed;
- const child_process_1 = require("child_process");
- const fs_1 = require("fs");
- const path_1 = require("path");
-@@ -160,6 +162,28 @@ async function runNxAsync(cmd, options) {
-         }
-     });
- }
-+function hasExited(child) {
-+    return child.exitCode !== null || child.signalCode !== null;
-+}
-+/**
-+ * Settles once `child`'s stdio has closed, which Node reports after 'exit'.
-+ * Call it at spawn time: a 'close' emitted before the call is missed. Gives up
-+ * 1s after 'exit', since a descendant can keep the pipes open indefinitely.
-+ */
-+function whenStdioClosed(child) {
-+    return new Promise((resolve) => {
-+        let timeout;
-+        child.once('close', () => {
-+            clearTimeout(timeout);
-+            resolve();
-+        });
-+        child.once('exit', () => {
-+            // Node runs expired timers before it reads the pipes, so a blocked event
-+            // loop would otherwise give up on output that is already there.
-+            timeout = setTimeout(() => setImmediate(resolve), 1000);
-+        });
-+    });
-+}
- class PseudoTtyProcess {
-     constructor(childProcess) {
-         this.childProcess = childProcess;
 diff --git a/dist/src/utils/installed-nx-version.js b/dist/src/utils/installed-nx-version.js
 index 15a5d36aa9116f7b5ddcadbbeca9dccb7cc7fe45..70cd1b78afb4c54e257c7eec99014a9b139c1293 100644
 --- a/dist/src/utils/installed-nx-version.js

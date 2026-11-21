@@ -21,7 +21,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { bindListener, claimRefusingPort } from './testing.js';
 
 /**
- * Guards the remote-cache outage hunk of `patches/nx@24.0.3.patch` (`patches/README.md`, "A remote cache outage is a
+ * Guards the remote-cache outage hunk of `patches/nx@24.0.6.patch` (`patches/README.md`, "A remote cache outage is a
  * miss"). Stock Nx 24.0.3's native self-hosted cache client rejects when its server cannot be reached
  * (`Failed to send request …`), and the rejection failed the whole run; a server that accepts and never answers held
  * the run forever, since the client sets no timeout. The patched client reads either as an outage: the lookup misses,
@@ -365,7 +365,7 @@ describe('a run against an unreachable remote cache', () => {
 });
 
 /**
- * Guards the store-bound hunk of `patches/nx@24.0.3.patch` (`patches/README.md`, "A shed stores what is worth its
+ * Guards the store-bound hunk of `patches/nx@24.0.6.patch` (`patches/README.md`, "A shed stores what is worth its
  * bytes"). Cowshed's workspaces carry `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB`, so Nx's own client stores
  * each result it executed whose task took at least that many seconds per MiB of outputs, counting at least one MiB.
  * Every other client of the patched Nx, with the variable unset, stores as stock Nx does.

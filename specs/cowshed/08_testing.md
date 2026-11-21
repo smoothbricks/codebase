@@ -567,14 +567,14 @@ cowshed-gateway's (its host-controller ones included) run the repository's own, 
 `patches/nx@*.patch`, and cowshed-core's also each other version a cowshed Nx boundary declares (`packages/nx-23.2.1`).
 The cache keys of the targets that run them name the Nx they run: nx.json `targetDefaults` `cargo-test-cowshed-core-*`,
 `cargo-test-cowshed-cli-*`, `cargo-test-cowshed-gateway` and `cargo-test-group-real-apfs-host` add the lockfile node
-`npm:nx@24.0.3`, and for cowshed-core `npm:nx@23.2.1`, with every package each reaches in bun.lock, and the carried
+`npm:nx@24.0.6`, and for cowshed-core `npm:nx@23.2.1`, with every package each reaches in bun.lock, and the carried
 patch files; `cowshed:host-controller-test` already keys every lockfile package and adds the carried patch files. A
 change to either, a patch-only one included, reruns those targets (the real-APFS host group and the host-controller lane
 whole, each one target) while every other cowshed cargo test target keeps its cache. The cli and gateway keys repeat
 `cargo-test-cowshed-*`'s `dependsOn`, as Nx applies one `targetDefaults` entry to a target, and the gateway's names its
 single unsharded target exactly: sharding that crate renames it and needs the key to follow. After an Nx bump that
 leaves a name in the list uninstalled, every run that hashes these targets fails with Nx's "The externalDependency
-'nx@24.0.3' … could not be found" until the list follows. <a id="smoo/cowshed!n/patch-bytes-in-keys"></a> An Nx task
+'nx@24.0.6' … could not be found" until the list follows. <a id="smoo/cowshed!n/patch-bytes-in-keys"></a> An Nx task
 that reaches a registered Bun patch through the external package it keys also keys the patch's bytes, not its path. No
 package edge changes when its patch changes. A task that cannot reach that installed version keeps its key. A target
 that already keys the actual outputs in place of a package's version continues to key those outputs. The regression uses

@@ -7,7 +7,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 /**
  * Guards the project-graph error causes against the actual Bun-installed Nx: a createNodes failure names itself and its
  * cause chain without --verbose. Nx 24.0.3 carries nrwl/nx#37103 (this repository carried it on 23.2.1); the hunks of
- * `patches/nx@24.0.3.patch` add the cause chains. Before, `nx run-many` printed only "Failed to process project graph."
+ * `patches/nx@24.0.6.patch` add the cause chains. Before, `nx run-many` printed only "Failed to process project graph."
  * and a consumer's CI could not say which plugin refused or why.
  */
 const repositoryRoot = join(import.meta.dir, '../../..');

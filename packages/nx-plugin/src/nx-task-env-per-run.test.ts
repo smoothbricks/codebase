@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the task-environment hunk of `patches/nx@24.0.3.patch` (patches/README.md, "A task's environment lives for
+ * Guards the task-environment hunk of `patches/nx@24.0.6.patch` (patches/README.md, "A task's environment lives for
  * one run"). A long-lived client runs one Nx invocation after another in one process: a consumer's Nx worker answers
  * each gate request with `runPreTasksExecution`, `invokeTasksRunner` and `runPostTasksExecution`. This package's pre
  * hook publishes the run's own endpoints (`MBX_RESERVATIONS_SOCKET`, the CPU pool's socket) in `process.env`, and the

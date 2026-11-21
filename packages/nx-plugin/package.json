@@ -749,7 +749,7 @@
     "directory": "packages/nx-plugin"
   },
   "dependencies": {
-    "@nx/js": "24.0.3",
+    "@nx/js": "24.0.6",
     "@smoothbricks/build-inputs": "workspace:*",
     "@smoothbricks/cargo-retain": "workspace:*",
     "@smoothbricks/cowshed": "workspace:*",

@@ -5,7 +5,7 @@ import type * as NxDaemonEnvironment from 'nx/src/daemon/client/daemon-environme
 import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './executors/bounded-exec/mbx-reservations.js';
 
 /**
- * Guards the run-endpoint hunk of `patches/nx@24.0.3.patch` in `daemon-environment.js` (`patches/README.md`, "A run's
+ * Guards the run-endpoint hunk of `patches/nx@24.0.6.patch` in `daemon-environment.js` (`patches/README.md`, "A run's
  * reservation endpoint is no graph identity"). This package's `preTasksExecution` publishes the run's mbx reservation
  * endpoint in the environment every task inherits: `MBX_RESERVATIONS_SOCKET`, a fresh socket directory per run, or
  * `BOUNDED_EXEC_RESERVATIONS_UNSERVED` when the endpoint did not start (`executors/bounded-exec/mbx-reservations.ts`).

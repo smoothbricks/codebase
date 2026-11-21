@@ -18,12 +18,12 @@ import {
 
 const registryVersions: Record<string, string[]> = {
   '@biomejs/biome': ['2.3.5'],
-  '@nx/js': ['24.0.3'],
+  '@nx/js': ['24.0.6'],
   '@smoothbricks/cli': ['0.10.3', '0.10.4'],
   '@smoothbricks/nx-plugin': ['0.3.0'],
   eslint: ['9.39.1'],
   'eslint-stdout': ['1.1.1', '1.1.2'],
-  nx: ['24.0.3'],
+  nx: ['24.0.6'],
   prettier: ['3.6.1'],
   ttsc: ['0.25.0'],
   typescript: ['6.0.3'],
@@ -87,7 +87,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/cli']).toBeUndefined();
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
-      expect(rootPackage.devDependencies.nx).toBe('24.0.3');
+      expect(rootPackage.devDependencies.nx).toBe('24.0.6');
       expect(rootPackage.devDependencies.ttsc).toBe('9.9.9');
       expect(rootPackage.devDependencies.typescript).toBe('^6.0.3');
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
@@ -273,7 +273,7 @@ ${extra}  ];
         workspaces: ['packages/*', 'tooling'],
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '24.0.3',
+          '@nx/js': '24.0.6',
           '@smoothbricks/nx-plugin': '^0.4.0',
           '@types/bun': '1.3.99',
           eslint: '^10.0.0',
@@ -336,7 +336,7 @@ ${extra}  ];
         workspaces: ['packages/*', 'tooling'],
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '24.0.3',
+          '@nx/js': '24.0.6',
           '@smoothbricks/nx-plugin': '^0.4.0',
           '@types/bun': '1.3.99',
           eslint: '^10.0.0',
@@ -409,7 +409,7 @@ ${extra}  ];
         },
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '24.0.3',
+          '@nx/js': '24.0.6',
           '@smoothbricks/nx-plugin': '^0.4.0',
           eslint: '^10.0.0',
           'eslint-stdout': await currentEslintStdoutRange(),
@@ -445,7 +445,7 @@ ${extra}  ];
       });
       expect(rootPackage.workspaces).toEqual({
         packages: ['packages/*', 'tooling'],
-        catalog: { nx: '24.0.3', prettier: '^3.6.1', ttsc: '0.25.0', typescript: '^6.0.0' },
+        catalog: { nx: '24.0.6', prettier: '^3.6.1', ttsc: '0.25.0', typescript: '^6.0.0' },
       });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -551,7 +551,7 @@ ${extra}  ];
         workspaces: ['packages/*', 'tooling'],
         devDependencies: {
           '@biomejs/biome': '^3.0.0',
-          '@nx/js': '24.0.3',
+          '@nx/js': '24.0.6',
           eslint: '^10.0.0',
           nx: '24.1.0',
           prettier: '^3.7.0',

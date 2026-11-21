@@ -4,7 +4,7 @@ import { createTaskGraph } from 'nx/src/tasks-runner/create-task-graph.js';
 import { findCycles } from 'nx/src/tasks-runner/task-graph-utils.js';
 
 /**
- * Guards the task-graph hunk of `patches/nx@24.0.3.patch`. A target that depends on `^build` through a project with
+ * Guards the task-graph hunk of `patches/nx@24.0.6.patch`. A target that depends on `^build` through a project with
  * no `build` target of its own gets a dummy task for that project, and Nx flattens each dummy into the real tasks
  * behind it, except a dummy it believes sits in a cycle, which contributes nothing. Nx 24.0.3 believes that of every
  * task on the depth-first path that first reached a cycle, and only of cycles that traversal reached before another

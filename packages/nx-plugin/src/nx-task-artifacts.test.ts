@@ -22,7 +22,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { bindListener } from './testing.js';
 
 /**
- * Guards the task-result artifact hunk of `patches/nx@24.0.3.patch` (`tasks-runner/task-artifacts.js`): each discrete
+ * Guards the task-result artifact hunk of `patches/nx@24.0.6.patch` (`tasks-runner/task-artifacts.js`): each discrete
  * execution gets a private `NX_TASK_ARTIFACTS_DIR` in its own spawn environment; what it leaves there rides its result
  * to the lifecycle and into its cache entry's `.nx-task-artifacts` sidecar, digest-checked when read, so every
  * transport that moves the entry moves them; a target that names `artifacts` treats an entry without one as no hit.

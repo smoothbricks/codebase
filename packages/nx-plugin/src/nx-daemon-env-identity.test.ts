@@ -9,7 +9,7 @@ import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
 import { fixtureNxEnv, nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the run-scaffolding hunk of `patches/nx@24.0.3.patch` in `daemon-environment.js`. A client that a package
+ * Guards the run-scaffolding hunk of `patches/nx@24.0.6.patch` in `daemon-environment.js`. A client that a package
  * manager runs (`bun nx`, `bun run`, `npm run` …) sends its daemon a PATH with `node_modules/.bin` directories in front
  * and, from Bun, NODE; a plain `nx` client of the same shell sends neither. Stock 24.0.3 counts both as project-graph
  * identity, so every switch between the two kinds of client discarded the daemon's graph and computed it again: on

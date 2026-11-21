@@ -6,7 +6,7 @@ import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
- * Guards the resident-worker hunk of `patches/nx@24.0.3.patch`, the local build
+ * Guards the resident-worker hunk of `patches/nx@24.0.6.patch`, the local build
  * of nrwl/nx#37271. Nx 24.0.3's `PluginLifecycleManager` stops each isolated
  * plugin worker after the last phase it has hooks for, which for the built-in
  * graph plugins is the graph itself. In a one-shot client that frees the

@@ -830,7 +830,7 @@ or the checksum database and verifies the database's signed tree.
 
 **This cache is an optimization for cross-shed reuse and never blocks a build.** Every refusal or failure on this route
 reaches the client as a miss (`GET` 404) or not-stored (`PUT` 403). The task then runs, or keeps the result it already
-produced, exactly as it would with no cache. Stock Nx 24.0.3 fails a task on any other status (Busy gateway, below), so
+produced, exactly as it would with no cache. Stock Nx 24.0.6 fails a task on any other status (Busy gateway, below), so
 the gateway never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout
 and a backend response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
 
@@ -854,7 +854,7 @@ results, during ordinary iteration as well as adoption, and stores each result i
 keeps its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares
 neither path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`,
 without a trailing slash, beside `NX_SELF_HOSTED_REMOTE_CACHE_STORE_SECONDS_PER_MIB=1`, in `.cowshed/env` and in every
-job's environment (03_caches.md), and no access token. The bound is configuration, not authority: the carried Nx 24.0.3
+job's environment (03_caches.md), and no access token. The bound is configuration, not authority: the carried Nx 24.0.6
 patch makes the client answer a store `false`, before it builds an archive, unless the task took at least that many
 seconds per MiB of its outputs, counting at least one MiB (patches/README.md, "A shed stores what is worth its bytes";
 03_caches.md, "What a checkout stores"). A client without that change does not read the variable and stores every result
@@ -895,10 +895,10 @@ service"). The plugin's cached asset producer packages unchanged bytes from the 
 `build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint runtime output. A failed publication is a
 distinct diagnostic with the cause, never a claim that results were stored. `cache_adapter.js` is the one boundary to
 the checkout's local Nx cache, whose `DbCache` and native cache are Nx internals: it declares each Nx version it was
-read against (23.2.1 and 24.0.3) with the layout it relies on — the checkout's `.nx/workspace-data` and `.nx/cache`, and
-the archive its native `HttpRemoteCache` stores and restores — opens the cache through the installed version's entry and
-checks Nx resolved that layout, and refuses any other version by name before it loads Nx. So a land publishes from a
-repository on either version, and an upgrade requalifies the adapter first.
+read against (23.2.1, 24.0.3 and 24.0.6) with the layout it relies on — the checkout's `.nx/workspace-data` and
+`.nx/cache`, and the archive its native `HttpRemoteCache` stores and restores — opens the cache through the installed
+version's entry and checks Nx resolved that layout, and refuses any other version by name before it loads Nx. So a land
+publishes from a repository on either version, and an upgrade requalifies the adapter first.
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes
@@ -928,7 +928,7 @@ sent. An outage is never a successful read: its 404 is not evidence that a hash 
 
 **Busy gateway.** Nx requests wait under the gateway's queued-request bounds whether their backend is starting or
 `Ready`. A full queue is an audited `limited` `nx-queue-limited` 404/403 and an expired queue wait an audited
-`timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 24.0.3 retries no `GET`, ignores `Retry-After`, and
+`timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 24.0.6 retries no `GET`, ignores `Retry-After`, and
 reads every status but `GET` 200/404 and `PUT` 200/403/409 (a land's publish reads `HEAD` as `GET`) as a fatal
 misconfiguration (`native/cache/errors.rs` `convert_response_to_error`). The carried patch reads only a 5xx among them
 as the client's own outage ("The client half", above); every other status stays fatal. So a busy gateway answers what a
@@ -966,7 +966,7 @@ commits a success head, the gateway keeps `200` and cannot change it. A body tha
 ends early, and its audit event is `failed` with classification `nx-transfer-failed`, never a hit or a completed read. A
 client must treat a short body as a failed read; the gateway stages and buffers nothing to hide the cut.
 
-**A shed uploads only what is worth its bytes.** Stock Nx 24.0.3's `native/cache/http_remote_cache.rs` has no store
+**A shed uploads only what is worth its bytes.** Stock Nx 24.0.6's `native/cache/http_remote_cache.rs` has no store
 policy: its `store` first builds an in-memory gzip tar archive, then attempts `PUT`, and `skipRemoteCache` disables
 reads too. The carried patch's bounded client (Every checkout reads and stores, above) answers a store it refuses before
 that archive exists, so a shed's run costs its project cache lookups and one archive and `PUT` per result the bound

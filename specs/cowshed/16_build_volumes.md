@@ -1085,7 +1085,7 @@ unit's export.
    watched first (04_sandbox.md). After retirement it attempts `SIGTERM` through that identity, waits up to the shared
    10 s grace, and then ends the plugin workers the daemon forked; a signal the identity no longer accepts is reported
    only when the process still runs, since a daemon already gone is stopped. It runs no Nx command: the daemon's own
-   `SIGTERM` handler closes its socket and deletes its record (Nx 24.0.3 `daemon/server/shutdown-utils.js`), and the
+   `SIGTERM` handler closes its socket and deletes its record (Nx 24.0.6 `daemon/server/shutdown-utils.js`), and the
    next daemon unlinks a stale socket path before it binds, so `nx daemon --stop` would add only the shed's shell it
    enters through. That shell held a land 259 s on 2026-11-10: the one-shot stop's `direnv exec` sat in a cold
    `devenv direnv-export` waiting on the Nix daemon, for a daemon already gone. A daemon the ledger does not prove the
@@ -1181,7 +1181,7 @@ unit's export.
 6. **Adopt the build volume.** Under the Nx open locks and the target's image lock:
    1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
       `lock` extension; every Nx process locks it exclusively before it opens the database and lets go once it has,
-      pinned Nx 24.0.3 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,
+      pinned Nx 24.0.6 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,
       and name it. Held, the locks keep every Nx process from opening a database until the rename is done; one that
       starts meanwhile waits, then opens the database by its path, so through the moved link;
    2. query the target's task database once more: a holder that opened it since 5.2 means skip;
@@ -1225,8 +1225,8 @@ unit's export.
    different graph refuses restoration and is reported, never expanded. Hash and restore dependencies before their
    consumers, using only successful entries in the adopted local Nx cache. The graph is stock Nx's internal one, shaped
    by the installed Nx version: the helper declares each version it was read against (23.2.1 lists a task's dependencies
-   by task id, 24.0.3 as edges naming the task in `id`) and refuses any other by name before it loads Nx, a helper
-   failure the land reports.
+   by task id, 24.0.3 and 24.0.6 as edges naming the task in `id`) and refuses any other by name before it loads Nx, a
+   helper failure the land reports.
 
    Each recomputed hash must equal the source check's captured hash; a different input identity is a miss, never a
    different cached result silently substituted for the validated one. Declared outputs live on the source volume, so
@@ -1266,7 +1266,7 @@ publishes its checks' attributed runs to it, and every shed reads it (05_gateway
 Git alone (02_workspaces.md, "`cowshed rebase`"): it computes no task hash, stops no Nx daemon and copies no cache
 entry, and the workspace's next gate reads what its target ran from the same cache.
 
-**Why the local Nx cache is not shared between checkouts.** Pinned Nx 24.0.3 finds a cached task only through a row in
+**Why the local Nx cache is not shared between checkouts.** Pinned Nx 24.0.6 finds a cached task only through a row in
 the checkout's own task database (`NxCache::get` is `UPDATE cache_outputs … WHERE hash = ?1 RETURNING`), so an entry
 another checkout wrote into a shared directory, with no row here, is a miss. Its `put` removes the task's directory
 before writing it again, so two checkouts writing one hash, or one writing while another restores it, destroy each
@@ -1639,7 +1639,7 @@ second build cache: no task executes and scratch is removed after success or fai
 - **Enforced by**: a capability test asserting every job environment of an Nx project names the checkout's own
   `.nx/cache` and `.nx/workspace-data` and nothing else, and a check that a host shell's Nx, with no `NX_*` variable
   set, resolves its cache to `<checkout>/.nx/cache` and its task database to `<checkout>/.nx/workspace-data`: the pinned
-  Nx 24.0.3 otherwise moves both to a per-user `~/.nx/<id>` unless `nx.json` names `cacheDirectory`. Smoo's workspace
+  Nx 24.0.6 otherwise moves both to a per-user `~/.nx/<id>` unless `nx.json` names `cacheDirectory`. Smoo's workspace
   policy writes `"cacheDirectory": ".nx/cache"` into every managed `nx.json` (`smoo monorepo update`), and
   `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it; and a shell-entry test in which a
   stale plugin rebuild removes Nx's daemon record and persisted project graph through the link and keeps every other
@@ -1662,7 +1662,7 @@ map, and the probe's bookkeeping must not reach either candidate image.
   them on every run.
 - **Enforced by**: the same capability test; a lint over cowshed and managed shell files refuses the string.
 - The daemon's record lives in `.nx/workspace-data/d`, the directory that also holds the task database (pinned Nx
-  24.0.3, `daemon/tmp-dir.js`), so the record would travel with a build volume. Fork and land delete it from the volume
+  24.0.6, `daemon/tmp-dir.js`), so the record would travel with a build volume. Fork and land delete it from the volume
   (above); a daemon is per checkout. A land then gives the adopted volume the target's own record of a live host daemon
   (Land 6.3), so the swap does not end it: the daemon exits as soon as it finds no record that names it, and a client
   writing to it then fails with `write EPIPE`. A sandboxed daemon's grant names the previous volume alone, so its record
@@ -1702,7 +1702,7 @@ map, and the probe's bookkeeping must not reach either candidate image.
   The acceptance ends where a checkout holds real secrets in its environment.
 - **Runtime inputs read only the checkout.** The same adoption runs a host client's runtime hash inputs inside the
   sandbox with the host's `HOME` and without the job's git isolation. An input that reads the operator's home (git's
-  global configuration, for one) then fails there, and Nx 24.0.3 would hash the failure's text as the key. 04_sandbox.md
+  global configuration, for one) then fails there, and Nx 24.0.6 would hash the failure's text as the key. 04_sandbox.md
   states the contract that keeps one tree's key identical from every client: inputs are hermetic, and every input runs
   through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which makes a failed input an Nx error.
   - **Enforced by**: `packages/nx-plugin/src/runtime-input.test.ts`, which plants a failing input through real Nx, with
@@ -1710,7 +1710,7 @@ map, and the probe's bookkeeping must not reach either candidate image.
     - **Runtime inputs run only declared programs.** Nx hashes on a developer's Mac, on a NixOS runner and in the
       sandbox; only devenv's Nix profile and the checkout's own programs are the same in all three, with `/bin/sh` and
       `/usr/bin/env`, which NixOS keeps. A host-shipped program such as macOS's `shasum` (Perl, not coreutils) hashes on
-      a Mac and exits 127 on NixOS, which Nx 24.0.3's native hasher reports only as
+      a Mac and exits 127 on NixOS, which Nx 24.0.6's native hasher reports only as
       `invalid utf-8 sequence of 1 bytes from index 0`; the carried Nx patch adds the tasks it was hashing and their
       runtime inputs. `smoo github-ci` prints the reports runtime-input.sh retained after a failed Nx run, which name
       the failed command and its cause.
@@ -1901,7 +1901,7 @@ An Nx task hash must not change between checkouts of the same tree.
   must not re-inject a CI global. Custom non-CI globals and named inputs used explicitly by workflow targets are
   preserved.
 - A runtime input (a command whose output Nx hashes) prints only its value or a fixed sentinel. Nx hashes the command's
-  stdout and stderr and ignores its exit code (pinned Nx 24.0.3, `hash_runtime`), so an error message that names an
+  stdout and stderr and ignores its exit code (pinned Nx 24.0.6, `hash_runtime`), so an error message that names an
   absolute path becomes a checkout-specific key that silently splits the cache. The input's consumer fails instead.
 - Nx hashes the whole target configuration of the owning project into every task of that project (`hash_planner.rs`
   `gather_self_inputs` adds the project configuration; `hash_project_config.rs` hashes every target's executor, options,

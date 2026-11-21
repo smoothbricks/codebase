@@ -23,7 +23,7 @@ inference.
    `@nx/devkit` publishes). A plugin carries no traversal of its own and no second `dependsOn` parser, and checks what
    Nx already ships before adding a dependency. `dependsOn` takes `^`, wildcards such as `^*-js`, `project:target` and
    object forms; a copy answers for the spellings its author thought of and drifts from the Nx that schedules the task,
-   and it never receives a repair of the pinned Nx ([Nx 24.0.3 Runtime Patch](#nx-2403-runtime-patch)).
+   and it never receives a repair of the pinned Nx ([Nx 24.0.6 Runtime Patch](#nx-2406-runtime-patch)).
 2. **Put each decision in the hook that sees its data.** `createNodesV2` infers targets for each project file it
    matches, before any graph exists. `createDependencies` adds project edges and has no dependency graph yet.
    `createMetadata` runs after both, with every project's merged targets and the edges the plugins added (Nx adds a
@@ -1877,15 +1877,15 @@ smoo-nx-exec my-cli:build --workspace-root "$root"
 A hit prints nothing, where `nx run` would replay every task's cached log. A miss prints Nx's run of the target on
 stderr.
 
-## Nx 24.0.3 Runtime Patch
+## Nx 24.0.6 Runtime Patch
 
-The repository installs Nx 24.0.3 as an ordinary Bun `patchedDependencies` entry: the root `package.json` lists
-`nx@24.0.3` and `@nx/js@24.0.3`, and applies [`patches/nx@24.0.3.patch`](../../patches/nx@24.0.3.patch) to the registry
+The repository installs Nx 24.0.6 as an ordinary Bun `patchedDependencies` entry: the root `package.json` lists
+`nx@24.0.6` and `@nx/js@24.0.6`, and applies [`patches/nx@24.0.6.patch`](../../patches/nx@24.0.6.patch) to the registry
 `nx` package. Bun installs a patched package project-local under `node_modules/.bun/`, so the `nx` the repository runs
 is the patched one.
 
-`@nx/js` 24.0.3 still imports `nx` (`nx/release`, `nx/src/…`) without declaring it
-([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)). `patches/@nx%2Fjs@24.0.3.patch` declares the peer, so Bun
+`@nx/js` 24.0.6 still imports `nx` (`nx/release`, `nx/src/…`) without declaring it
+([nrwl/nx#34087](https://github.com/nrwl/nx/issues/34087)). `patches/@nx%2Fjs@24.0.6.patch` declares the peer, so Bun
 binds the same pinned Nx through the package's normal dependency namespace.
 
 Native APFS fixtures install this same pinned package and patch offline into their own checkout, using Bun's local
@@ -2072,19 +2072,19 @@ build-volume capacity divided by ten for host shells and jobs; the hosted setup 
 `20GB` ceiling.
 
 Publishing or installing `@smoothbricks/nx-plugin` alone does **not** change a consumer's Nx. `smoo monorepo update`
-distributes the managed `patches/nx@24.0.3.patch` and maintains the root registry override `nx = "24.0.3"` plus its
+distributes the managed `patches/nx@24.0.6.patch` and maintains the root registry override `nx = "24.0.6"` plus its
 matching `patchedDependencies` entry. Run ordinary `bun install`, commit its lock changes, then prove a frozen install
 and the affected normal Nx gates. Do not replace the registry dependency with a local link or hide a failure by
 resetting the database or disabling the daemon.
 
-The patch is keyed to `nx@24.0.3`; a different Nx version needs its own patch file, carried as
+The patch is keyed to `nx@24.0.6`; a different Nx version needs its own patch file, carried as
 [Activating a patch change](../../patches/README.md#activating-a-patch-change) describes. On an Nx upgrade, remove each
 hunk only when the installed upstream release contains that repair and the task-history namespace, cache-bound,
 resident-worker, store-resolution, task-graph, restore-time, racy-archive, skipped-task exit, daemon-claim,
 incomplete-run summary, foreign-environment, ignore-file and run-information regressions pass; preserve any repair not
 yet released. The restore-time regression fails without its hunk only on macOS, where the copy clones (on Linux
 `std::fs::copy` writes a fresh mtime), so run it on macOS before dropping the hunk. When every hunk is upstream, remove
-the `nx@24.0.3` and `@nx/js@24.0.3` entries from `patchedDependencies` and delete their patch files.
+the `nx@24.0.6` and `@nx/js@24.0.6` entries from `patchedDependencies` and delete their patch files.
 
 ## Bun Test Tracing Generator
 

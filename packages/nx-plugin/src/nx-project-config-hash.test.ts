@@ -8,7 +8,7 @@ import { NativeTaskHasherImpl } from 'nx/src/hasher/native-task-hasher-impl';
 import type { HashDetails } from 'nx/src/native';
 
 /**
- * Guards the project-configuration hunk of `patches/nx@24.0.3.patch`. Nx 24.0.3 adds a `<project>:ProjectConfiguration`
+ * Guards the project-configuration hunk of `patches/nx@24.0.6.patch`. Nx 24.0.3 adds a `<project>:ProjectConfiguration`
  * node to a task's key for its own project and every project its `^` inputs reach (`hash_planner.rs`
  * `gather_self_inputs`), and `hash_project_config.rs` hashes the executor, outputs, options, configurations and
  * parallelism of every target of that project: one target's edit re-keyed every task of the project. The patched
@@ -264,6 +264,28 @@ describe("a task's ProjectConfiguration node", () => {
       return (await hashed(graph)).value;
     };
     expect(await keyed('{projectRoot}/a/**/*')).not.toBe(await keyed('{projectRoot}/b/**/*'));
+  });
+  it("keys an nx:run-script task's own script body and no other", async () => {
+    const scripted = (build: string, refresh: string, executor = 'nx:run-script'): ProjectGraph =>
+      edited((g) => {
+        app(g).targets!.build = {
+          executor,
+          options: { script: 'build' },
+          inputs: ['production', '!{projectRoot}/package.json'],
+          metadata: { scriptContent: build },
+        };
+        app(g).targets!.refresh = {
+          executor: 'nx:run-script',
+          options: { script: 'refresh' },
+          metadata: { scriptContent: refresh },
+        };
+      });
+    const key = async (graph: ProjectGraph): Promise<string> => (await hashed(graph)).value;
+    const base = await key(scripted('bun build.ts', 'bash refresh.sh'));
+    expect(await key(scripted('bun build.ts --minify', 'bash refresh.sh'))).not.toBe(base);
+    expect(await key(scripted('bun build.ts', 'bash refresh.sh --all'))).toBe(base);
+    const commands = await key(scripted('bun build.ts', 'bash refresh.sh', 'nx:run-commands'));
+    expect(await key(scripted('bun build.ts --minify', 'bash refresh.sh', 'nx:run-commands'))).toBe(commands);
   });
   it('replaces only ProjectConfiguration nodes and folds the details in key order', async () => {
     const result = await hashed(workspace());

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import typia from 'typia';
 
 /**
- * Guards the Bun-builtin hunk of `patches/nx@24.0.3.patch`. Nx 24.0.3 tells a
+ * Guards Bun's runtime modules in the installed Nx. Nx 24.0.3 told a
  * runtime module from a package with `node:module`'s `isBuiltin`. Under Node,
  * the runtime of an Nx daemon an editor's Nx language server starts, that is
  * false for Bun's `bun` and `bun:*` modules (under Bun it is true), so every
@@ -12,12 +12,12 @@ import typia from 'typia';
  * resolution and Node's `require.resolve` from its directory: in one graph
  * recompute of such a daemon serving a large Bun workspace, 3,738 lookups of each of `bun:test`,
  * `bun:test.js`, `bun:test.json` and `bun:test.node` and 41,382 missing
- * `node_modules` directories in 11 s. The patched `isBuiltinModuleImport`
- * knows them in every runtime.
+ * `node_modules` directories in 11 s. The installed `isBuiltinModuleImport`
+ * must know them in every runtime.
  *
  * The installed Nx is loaded in Node, as that daemon runs it.
  *
- * Drop the hunk, and keep this test, once the Nx in use knows Bun's modules.
+ * Nx 24.0.6 ships the repair (nrwl/nx#37810), so no patch hunk carries it; this test stays.
  */
 
 const repoRoot = dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url)))));

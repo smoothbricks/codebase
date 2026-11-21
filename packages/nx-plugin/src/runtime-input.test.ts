@@ -234,7 +234,7 @@ describe('a planted runtime input failure through real Nx', () => {
 });
 
 /**
- * Guards the hash-failure hunk of patches/nx@24.0.3.patch. Nx 24.0.3's native hasher fails a runtime input whose output
+ * Guards the hash-failure hunk of patches/nx@24.0.6.patch. Nx 24.0.3's native hasher fails a runtime input whose output
  * is not UTF-8 with `invalid utf-8 sequence of 1 bytes from index 0`, naming no task and no input. The patched hasher
  * rethrows a failure of each native hash call (`hashPlans`, Nx 24's up-front `hashPlansUpfront`, and `hashPlansFor`
  * over the plans that pass kept) naming the tasks (ten, the rest counted) and the runtime inputs their plans hold, read

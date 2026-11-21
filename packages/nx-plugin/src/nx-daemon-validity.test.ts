@@ -18,7 +18,7 @@ import { whenFound } from './__tests__/path-change.js';
 import { awaitExit, isRunning, type ProcessEntry, processesOf, processTree, terminate } from './testing.js';
 
 /**
- * Guards the event-driven validity hunk of `patches/nx@24.0.3.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
+ * Guards the event-driven validity hunk of `patches/nx@24.0.6.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
  * The installed daemon judged its root lockfiles and installed nx version on a 20 ms timer. These regressions preserve
  * the existing socket and process ownership guards while moving lockfile checks to applied watcher events, request
  * boundaries, and a 5 s safety poll for events the watcher ignores or drops.
@@ -1639,7 +1639,8 @@ it('fails every later request at once once the daemon is lost under a request an
       await fixtureWorkspace(workspace);
       // Where the fixture's own daemon would bind: the job profile admits Unix sockets by literal path.
       const socketPath = join(socketDirectory, 'd.sock');
-      await mkdir(socketDirectory, { recursive: true });
+      // Owner-only, as Nx makes its own leaf: Nx 24.0.6 dials a recorded socket only in a private directory (#37660).
+      await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
       // Stands in for a daemon stopped under the client's first request: it ends that request's connection and closes
       // its socket. What binds the path next refuses the client (EACCES), which ends the client's wait for a successor
       // at once rather than after its 60 s.
@@ -1723,7 +1724,8 @@ it('fails a request naming the pid and socket when the recorded daemon is gone a
     async ({ socketDirectory, workspace }) => {
       await fixtureWorkspace(workspace);
       const socketPath = join(socketDirectory, 'd.sock');
-      await mkdir(socketDirectory, { recursive: true });
+      // Owner-only, as Nx makes its own leaf: Nx 24.0.6 dials a recorded socket only in a private directory (#37660).
+      await mkdir(socketDirectory, { recursive: true, mode: 0o700 });
       // The listener a surviving process kept: it takes every connection and never answers.
       const closeLeftover = await listenInProcess(socketPath);
       // The daemon the record names: a process that has ended.

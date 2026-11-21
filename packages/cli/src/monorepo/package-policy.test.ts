@@ -222,8 +222,8 @@ describe('root smoo monorepo policy', () => {
         postinstall: 'bun tooling/direnv/developer-links.ts',
       });
       expect(rootPackage).toMatchObject({ nx: { includedScripts: [] } });
-      expect(rootPackage.overrides).toEqual({ nx: '24.0.3' });
-      expect(rootPackage.patchedDependencies).toEqual({ 'nx@24.0.3': 'patches/nx@24.0.3.patch' });
+      expect(rootPackage.overrides).toEqual({ nx: '24.0.6' });
+      expect(rootPackage.patchedDependencies).toEqual({ 'nx@24.0.6': 'patches/nx@24.0.6.patch' });
       expect(nxJson.namedInputs).toEqual(validNamedInputs());
       expect(nxJson.targetDefaults).toEqual(validTargetDefaults());
       expect(nxJson.plugins).toEqual(['@smoothbricks/nx-plugin']);
@@ -271,16 +271,16 @@ describe('root smoo monorepo policy', () => {
       const errors = captureConsoleErrors();
 
       validateRootPackagePolicy(root);
-      expect(errors).toContain('package.json overrides.nx must be 24.0.3; run smoo monorepo update');
+      expect(errors).toContain('package.json overrides.nx must be 24.0.6; run smoo monorepo update');
       expect(errors).toContain(
-        'package.json patchedDependencies.nx@24.0.3 must be patches/nx@24.0.3.patch; run smoo monorepo update',
+        'package.json patchedDependencies.nx@24.0.6 must be patches/nx@24.0.6.patch; run smoo monorepo update',
       );
 
       applyNxPatchDefaults(root);
 
       const rootPackage = await readJson(join(root, 'package.json'));
-      expect(rootPackage.overrides).toEqual({ nx: '24.0.3' });
-      expect(rootPackage.patchedDependencies).toEqual({ 'nx@24.0.3': 'patches/nx@24.0.3.patch' });
+      expect(rootPackage.overrides).toEqual({ nx: '24.0.6' });
+      expect(rootPackage.patchedDependencies).toEqual({ 'nx@24.0.6': 'patches/nx@24.0.6.patch' });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -294,8 +294,8 @@ describe('root smoo monorepo policy', () => {
         validRootPackage({
           overrides: {
             typia: '14.0.6',
-            '@nx/js': '24.0.3',
-            nx: 'https://example.com/releases/nx-24.0.3.tgz',
+            '@nx/js': '24.0.6',
+            nx: 'https://example.com/releases/nx-24.0.6.tgz',
           },
           smoo: {
             developerLinks: {
@@ -304,20 +304,20 @@ describe('root smoo monorepo policy', () => {
             },
           },
           patchedDependencies: {
-            '@nx/js@24.0.3': 'patches/@nx%2Fjs@24.0.3.patch',
-            'nx@23.1.0': 'patches/nx@23.1.0.patch',
-            'nx@24.0.3': 'patches/nx@24.0.3.old.patch',
+            '@nx/js@24.0.6': 'patches/@nx%2Fjs@24.0.6.patch',
+            'nx@24.0.3': 'patches/nx@24.0.3.patch',
+            'nx@24.0.6': 'patches/nx@24.0.6.old.patch',
           },
         }),
       );
       const errors = captureConsoleErrors();
 
       validateRootPackagePolicy(root);
-      expect(errors).toContain('package.json overrides.nx must be 24.0.3; run smoo monorepo update');
+      expect(errors).toContain('package.json overrides.nx must be 24.0.6; run smoo monorepo update');
       expect(errors).toContain(
-        'package.json patchedDependencies.nx@24.0.3 must be patches/nx@24.0.3.patch; run smoo monorepo update',
+        'package.json patchedDependencies.nx@24.0.6 must be patches/nx@24.0.6.patch; run smoo monorepo update',
       );
-      expect(errors).toContain('package.json patchedDependencies.nx@23.1.0 is obsolete; run smoo monorepo update');
+      expect(errors).toContain('package.json patchedDependencies.nx@24.0.3 is obsolete; run smoo monorepo update');
       expect(errors).toContain(
         'package.json smoo.developerLinks.nx is obsolete: the consumer lockfile and patch own Nx; run smoo monorepo update',
       );
@@ -325,13 +325,13 @@ describe('root smoo monorepo policy', () => {
       applyNxPatchDefaults(root);
 
       const rootPackage = await readJson(join(root, 'package.json'));
-      expect(rootPackage.overrides).toEqual({ typia: '14.0.6', '@nx/js': '24.0.3', nx: '24.0.3' });
+      expect(rootPackage.overrides).toEqual({ typia: '14.0.6', '@nx/js': '24.0.6', nx: '24.0.6' });
       expect(rootPackage.smoo).toEqual({
         developerLinks: { '@smoothbricks/lmao': '../provider/packages/lmao' },
       });
       expect(rootPackage.patchedDependencies).toEqual({
-        '@nx/js@24.0.3': 'patches/@nx%2Fjs@24.0.3.patch',
-        'nx@24.0.3': 'patches/nx@24.0.3.patch',
+        '@nx/js@24.0.6': 'patches/@nx%2Fjs@24.0.6.patch',
+        'nx@24.0.6': 'patches/nx@24.0.6.patch',
       });
     } finally {
       await rm(root, { recursive: true, force: true });
