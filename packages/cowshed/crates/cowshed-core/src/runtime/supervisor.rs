@@ -5993,8 +5993,28 @@ impl SupervisorActor {
 
     /// Tell the admission `event`; its answers are carried out at the top of the actor's loop.
     fn admission_event(&mut self, event: super::job_admission::Event) {
+        let requested = match &event {
+            super::job_admission::Event::Requested { job, .. } => Some(*job),
+            _ => None,
+        };
         self.admission_effects
             .extend(self.admission.step(Instant::now(), event));
+        if self.job_spans.is_some()
+            && let Some(job) = requested
+            && let Some(observed) = self.admission.request_observation(job)
+        {
+            self.observe_admission(job, observed);
+        }
+    }
+
+    fn observe_admission(&self, job: JobId, phase: super::job_admission::AdmissionObservation) {
+        if let Some(publisher) = &self.job_spans
+            && let Some(job) = self.jobs.get(&job)
+            && job.caller.is_none()
+            && !job.terminal()
+        {
+            publisher.record_admission(&job.info, phase);
+        }
     }
 
     /// Carry out what the admission answered, in order ([`super::job_admission::Effect`]). An
@@ -6003,6 +6023,11 @@ impl SupervisorActor {
     async fn carry_out_admission(&mut self) {
         use super::job_admission::Effect;
         while let Some(effect) = self.admission_effects.pop_front() {
+            if self.job_spans.is_some()
+                && let Some((job, observed)) = effect.admission_observation()
+            {
+                self.observe_admission(job, observed);
+            }
             match effect {
                 Effect::Admit { job } => self.spawn_admitted(job).await,
                 Effect::WaitStarted { job, pressure } => {
@@ -7680,6 +7705,10 @@ impl SupervisorActor {
         else {
             return;
         };
+        self.observe_admission(
+            job_id,
+            super::job_admission::AdmissionObservation::JobserverSetup,
+        );
         let PendingSpawn {
             want,
             held,

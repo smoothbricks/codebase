@@ -66,6 +66,10 @@ fn spec_job_columns() -> Vec<Column> {
         ("unattributed_source", "S.enum", true),
         ("unattributed_coverage", "S.enum", true),
         ("unattributed_gap_pid", "u32", true),
+        ("admission_psi_avg10_centi", "u16", true),
+        ("admission_pool_cpus", "u64", true),
+        ("admission_pool_priority", "utf8", true),
+        ("admission_pool_ahead", "u64", true),
     ]
 }
 

@@ -161,6 +161,53 @@ pub enum Effect {
     RefuseHold { job: JobId, error: String },
 }
 
+/// A job's observed state before the supervisor dispatches its first process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionObservation {
+    AwaitingPressure,
+    MemoryHeld(MemoryPressure),
+    PoolPending {
+        cpus: NonZeroUsize,
+        priority: PoolPriority,
+        ahead: usize,
+    },
+    PoolReserving {
+        cpus: NonZeroUsize,
+        priority: PoolPriority,
+    },
+    JobserverSetup,
+}
+
+impl Effect {
+    /// A transition into a wait, never a repeated report of the same wait.
+    pub(crate) fn admission_observation(&self) -> Option<(JobId, AdmissionObservation)> {
+        match *self {
+            Self::WaitStarted { job, pressure } => {
+                Some((job, AdmissionObservation::MemoryHeld(pressure)))
+            }
+            Self::HoldWaitStarted {
+                job,
+                cpus,
+                priority,
+                ahead,
+            } if ahead != 0 => Some((
+                job,
+                AdmissionObservation::PoolPending {
+                    cpus,
+                    priority,
+                    ahead,
+                },
+            )),
+            Self::Reserve {
+                job,
+                cpus,
+                priority,
+            } => Some((job, AdmissionObservation::PoolReserving { cpus, priority })),
+            _ => None,
+        }
+    }
+}
+
 /// Where a job stands. A concluded job is no longer in the ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -225,6 +272,11 @@ impl Admission {
     /// Where `job` stands, or `None` once it concluded.
     pub fn phase(&self, job: JobId) -> Option<Phase> {
         self.jobs.get(&job).map(|entry| entry.phase)
+    }
+
+    /// A request can enter the ledger before the host has said whether it may start.
+    pub(crate) fn request_observation(&self, job: JobId) -> Option<AdmissionObservation> {
+        (self.phase(job) == Some(Phase::Queued)).then_some(AdmissionObservation::AwaitingPressure)
     }
 
     /// Apply one event observed at `now`; the answer is what the supervisor does, in order.
@@ -662,7 +714,12 @@ mod tests {
             let answered = run(&mut admission, at, vec![ask(1, Background, Jobservers)]);
             assert_eq!(answered[0], []);
             assert_eq!(admission.phase(id(1)), Some(Phase::Queued));
+            assert_eq!(
+                admission.request_observation(id(1)),
+                Some(AdmissionObservation::AwaitingPressure)
+            );
             assert_eq!(admission.step(at, first), expected);
+            assert_eq!(admission.request_observation(id(1)), None);
         }
     }
 

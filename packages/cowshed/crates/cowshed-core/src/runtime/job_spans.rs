@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
+use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -54,6 +55,7 @@ use crate::api::resources::{ChargedMemoryUsage, HostLoadSample, VolumeUsedBytesD
 use crate::error::CowshedError;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
+use crate::runtime::job_admission::AdmissionObservation;
 use crate::runtime::job_span_facts::{HostColumnError, HostColumns, SpanFacts};
 use crate::runtime::job_unattributed::{
     AccountingSource, CoverageKind, JOB_UNATTRIBUTED_MESSAGE, UnattributedUsage,
@@ -211,21 +213,21 @@ impl JobSpanEdge {
     }
 }
 
-/// What one sealed row of a job's span records: one of its edges; the unattributed usage its
-/// terminal sample states, which its end edge brings with it so that no caller records the one
-/// beside the other; or a step of interactive work's decay.
+/// What a job's span records: an edge, unattributed terminal usage, a step of interactive
+/// work's decay, or an observed phase before dispatching its first process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowKind {
     Edge(JobSpanEdge),
     Unattributed(UnattributedUsage),
     Decayed(DecayStep),
+    Admission(AdmissionObservation),
 }
 
 impl RowKind {
     fn entry_type(self) -> EntryType {
         match self {
             Self::Edge(edge) => edge.entry_type(),
-            Self::Unattributed(_) | Self::Decayed(_) => EntryType::Info,
+            Self::Unattributed(_) | Self::Decayed(_) | Self::Admission(_) => EntryType::Info,
         }
     }
 
@@ -235,19 +237,39 @@ impl RowKind {
             Self::Unattributed(_) => JOB_UNATTRIBUTED_MESSAGE,
             Self::Decayed(DecayStep::ToGate) => JOB_DECAYED_TO_GATE_MESSAGE,
             Self::Decayed(DecayStep::ToBackground) => JOB_DECAYED_TO_BACKGROUND_MESSAGE,
+            Self::Admission(AdmissionObservation::AwaitingPressure) => {
+                "job.admission.awaiting-pressure"
+            }
+            Self::Admission(AdmissionObservation::MemoryHeld(pressure)) => match pressure {
+                MemoryPressure::Darwin { level } => match level {
+                    DarwinPressureLevel::Normal => "job.admission.memory.darwin.normal",
+                    DarwinPressureLevel::Warning => "job.admission.memory.darwin.warning",
+                    DarwinPressureLevel::Critical => "job.admission.memory.darwin.critical",
+                },
+                MemoryPressure::Psi { .. } => "job.admission.memory.psi",
+            },
+            Self::Admission(AdmissionObservation::PoolPending { .. }) => {
+                "job.admission.pool-pending"
+            }
+            Self::Admission(AdmissionObservation::PoolReserving { .. }) => {
+                "job.admission.pool-reserving"
+            }
+            Self::Admission(AdmissionObservation::JobserverSetup) => {
+                "job.admission.jobserver-setup"
+            }
         }
     }
 
     fn state(self) -> Option<JobState> {
         match self {
             Self::Edge(edge) => edge.state(),
-            Self::Unattributed(_) | Self::Decayed(_) => None,
+            Self::Unattributed(_) | Self::Decayed(_) | Self::Admission(_) => None,
         }
     }
 
     fn unattributed(self) -> Option<UnattributedUsage> {
         match self {
-            Self::Edge(_) | Self::Decayed(_) => None,
+            Self::Edge(_) | Self::Decayed(_) | Self::Admission(_) => None,
             Self::Unattributed(usage) => Some(usage),
         }
     }
@@ -280,7 +302,8 @@ fn charged_memory_at(kind: RowKind, info: &JobInfo) -> Option<ChargedMemoryUsage
             .and_then(|sample| sample.accounting.charged_memory().copied()),
         RowKind::Edge(JobSpanEdge::Start { .. })
         | RowKind::Unattributed(_)
-        | RowKind::Decayed(_) => None,
+        | RowKind::Decayed(_)
+        | RowKind::Admission(_) => None,
     }
 }
 
@@ -318,6 +341,8 @@ enum JobSpanError {
     BeyondNanoseconds,
     #[error("a job segment holds no rows")]
     NoRows,
+    #[error("admission request count exceeds its telemetry column")]
+    AdmissionCount,
     #[error(transparent)]
     Segment(#[from] TraceSegmentError),
     #[error(transparent)]
@@ -379,6 +404,11 @@ impl JobSpanPublisher {
         self.enqueue(info, RowKind::Decayed(step));
     }
 
+    /// Queue one admitted phase change under the job's existing span and durable identity.
+    pub(crate) fn record_admission(&self, info: &JobInfo, phase: AdmissionObservation) {
+        self.enqueue(info, RowKind::Admission(phase));
+    }
+
     fn enqueue(&self, info: &JobInfo, kind: RowKind) {
         let Some(permit) = self.reserve() else {
             return;
@@ -386,7 +416,9 @@ impl JobSpanPublisher {
         let facts = match kind {
             RowKind::Edge(JobSpanEdge::Start { host }) => SpanFacts::start(host),
             RowKind::Edge(JobSpanEdge::End { .. }) => SpanFacts::end(info.resources.as_ref()),
-            RowKind::Unattributed(_) | RowKind::Decayed(_) => SpanFacts::default(),
+            RowKind::Unattributed(_) | RowKind::Decayed(_) | RowKind::Admission(_) => {
+                SpanFacts::default()
+            }
         };
         permit.send(Request::Job(Box::new(JobSpanRow {
             at: SystemTime::now(),
@@ -733,6 +765,13 @@ trace_columns! {
     unattributed_coverage: Optional<Enum<CoverageKind>>,
     /// The process a coverage gap's evidence names, null for a complete tree and for lost events.
     unattributed_gap_pid: Optional<U32>,
+    /// Observed Linux memory PSI `some avg10`, in hundredths of a percent, on a memory-hold row.
+    admission_psi_avg10_centi: Optional<U16>,
+    /// The actual request (not a grant) on either host-pool wait row.
+    admission_pool_cpus: Optional<U64>,
+    admission_pool_priority: Optional<Utf8>,
+    /// The known count ahead in the checkout's priority lane, on a pool-pending row.
+    admission_pool_ahead: Optional<U64>,
 }
 
 /// A gathered job row as the cells its segment holds. The writer encodes each row as it gathers
@@ -763,6 +802,29 @@ impl JobCells {
         let reconciliation = usage.map(|usage| usage.reconciliation);
         let coverage =
             reconciliation.map(|reconciliation| CoverageKind::of(reconciliation.coverage));
+        let count = |value| u64::try_from(value).map_err(|_| JobSpanError::AdmissionCount);
+        let (psi, cpus, priority, ahead) = match row.kind {
+            RowKind::Admission(AdmissionObservation::MemoryHeld(MemoryPressure::Psi {
+                some_avg10,
+            })) => (Some(some_avg10.get()), None, None, None),
+            RowKind::Admission(AdmissionObservation::PoolPending {
+                cpus,
+                priority,
+                ahead,
+            }) => (
+                None,
+                Some(count(cpus.get())?),
+                Some(priority.as_str().to_owned()),
+                Some(count(ahead)?),
+            ),
+            RowKind::Admission(AdmissionObservation::PoolReserving { cpus, priority }) => (
+                None,
+                Some(count(cpus.get())?),
+                Some(priority.as_str().to_owned()),
+                None,
+            ),
+            _ => (None, None, None, None),
+        };
         let span = SpanAddress {
             thread_id: job_span_thread(&row.repo_id, &row.workspace_incarnation, row.job_id),
             span_id: JOB_SPAN_ID,
@@ -793,6 +855,10 @@ impl JobCells {
             unattributed_source: usage.map(|usage| usage.source),
             unattributed_coverage: coverage.map(|(kind, _)| kind),
             unattributed_gap_pid: coverage.and_then(|(_, pid)| pid),
+            admission_psi_avg10_centi: psi,
+            admission_pool_cpus: cpus,
+            admission_pool_priority: priority,
+            admission_pool_ahead: ahead,
         };
         Ok(Self {
             timestamp_ns,

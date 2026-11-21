@@ -47,6 +47,16 @@ handle reads, in process or over its socket, and never fails or delays the job. 
 `process.run` spans parent from. The terminal row carries the job's `env_hash` (the same environment identity as the job
 record's `envHash`, 11_shell.md).
 
+**Job admission notes.** `Queued` alone does not name a cause. The supervisor writes an `info` row on the existing job
+span when a request first waits for a pressure observation (`job.admission.awaiting-pressure`), starts a memory hold
+(`job.admission.memory.darwin.<level>` or `job.admission.memory.psi`), enters its checkout's pool queue
+(`job.admission.pool-pending`), asks the host pool (`job.admission.pool-reserving`), or begins post-admission jobserver
+setup (`job.admission.jobserver-setup`). The PSI row carries `admission_psi_avg10_centi` (`u16`); pool rows carry the
+requested `admission_pool_cpus` (`u64`) and `admission_pool_priority` (the pool's priority name), with
+`admission_pool_ahead` (`u64`) on the checkout queue row only. These columns are null elsewhere. The notes share the
+span's durable job identity, do not claim a process or an exit, and describe transitions, never polls or periodic
+keepalives. Caller-owned jobs keep the same exclusion as their job spans.
+
 <a id="smoo/cowshed!n/unsynced-seals"></a>**Unsynced seals.** Every segment this module seals (job, process, wait, verb,
 native image and gateway segments) is a create-new `0600` temporary renamed without replace to its sealed name, with no
 sync. Telemetry, like a job's own records (11_shell.md, "Durability of a job's own records"), must survive its writer's

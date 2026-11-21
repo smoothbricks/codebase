@@ -1672,9 +1672,12 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
     let level = |level| Reading::Known(MemoryPressure::Darwin { level });
     let (pressure, reports) = tokio::sync::watch::channel(level(DarwinPressureLevel::Warning));
     let root = workspace_root(&temp_parent::scratch_parent(), "test-workspace");
+    let telemetry = root.join("telemetry");
+    std::fs::create_dir(&telemetry).expect("create the pressure fixture's observation directory");
     let mut h = harness_with_config(
         WorkspaceSupervisorConfig {
             memory_pressure: Source::Driven(reports),
+            telemetry_root: Some(telemetry.clone()),
             ..config(&root)
         },
         1,
@@ -1729,6 +1732,24 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
             && stderr.contains("cowshed: jobserver wait done elapsed=")
             && stderr.ends_with(" status=ok\n"),
         "{stderr}"
+    );
+    h.handle
+        .trace_health()
+        .await
+        .expect("seal the pressure wait's job span");
+    let notes = admission_notes(&telemetry, held);
+    let names: Vec<_> = notes.iter().map(|(name, _)| name.as_str()).collect();
+    let memory = "job.admission.memory.darwin.warning";
+    let setup = "job.admission.jobserver-setup";
+    assert!(
+        names == [memory, setup] || names == ["job.admission.awaiting-pressure", memory, setup],
+        "one real Warning hold before jobserver setup, with at most one wait for the first report: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .all(|(_, facts)| *facts == AdmissionFacts::default()),
+        "a Darwin hold and its setup carry no PSI or pool request: {notes:?}"
     );
 }
 
@@ -2087,6 +2108,9 @@ async fn finish(h: &Harness, spawned: &Spawned) {
 async fn a_held_exec_waits_for_its_grant() {
     let (mut supervisor_config, _root) =
         isolated_config(&temp_parent::scratch_parent(), "held-exec");
+    let telemetry = supervisor_config.workspace_root.join("telemetry");
+    std::fs::create_dir(&telemetry).expect("create the pool fixture's observation directory");
+    supervisor_config.telemetry_root = Some(telemetry.clone());
     let mut mbx = TestMbx::install(&mut supervisor_config);
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     // A hold asks for `min(want, cores)` and mbx grants as many as are free, so on any host the
@@ -2206,6 +2230,35 @@ async fn a_held_exec_waits_for_its_grant() {
         mbx.log(),
         mbx.heard,
         "the program logged exactly what the test heard"
+    );
+    h.handle
+        .trace_health()
+        .await
+        .expect("seal the pool wait's job spans");
+    let reserve = AdmissionFacts {
+        pool_cpus: Some(
+            u64::try_from(asked_b).expect("the requested cores fit their trace column"),
+        ),
+        pool_priority: Some("low".to_owned()),
+        ..AdmissionFacts::default()
+    };
+    assert_eq!(
+        admission_notes(&telemetry, b),
+        [
+            (
+                "job.admission.pool-pending".to_owned(),
+                AdmissionFacts {
+                    pool_ahead: Some(1),
+                    ..reserve.clone()
+                },
+            ),
+            ("job.admission.pool-reserving".to_owned(), reserve),
+            (
+                "job.admission.jobserver-setup".to_owned(),
+                AdmissionFacts::default()
+            ),
+        ],
+        "the second hold was queued in checkout, then at the pool, then admitted once"
     );
 }
 
@@ -9754,6 +9807,14 @@ struct Unattributed {
     gap_pid: Option<u32>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AdmissionFacts {
+    psi_avg10_centi: Option<u16>,
+    pool_cpus: Option<u64>,
+    pool_priority: Option<String>,
+    pool_ahead: Option<u64>,
+}
+
 /// One row of a sealed job-span segment, decoded from the columns a reader of lmao's trace
 /// schema sees.
 #[derive(Debug, Eq, PartialEq)]
@@ -9771,6 +9832,7 @@ struct JobSpanRow {
     w3c_span_id: u64,
     job_state: Option<String>,
     unattributed: Unattributed,
+    admission: AdmissionFacts,
 }
 
 /// Every job-span segment under `telemetry`, in the order its writer sealed them: its name and its
@@ -9822,6 +9884,11 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
             };
             let number =
                 |name: &str, row: usize| column(name).as_primitive::<UInt64Type>().value(row);
+            let optional_number = |name: &str, row: usize| {
+                let column = column(name);
+                let values = column.as_primitive::<UInt64Type>();
+                values.is_valid(row).then(|| values.value(row))
+            };
             let entry_types = column("entry_type");
             let entry_types = entry_types.as_dictionary::<UInt8Type>();
             let span_ids = column("span_id");
@@ -9845,6 +9912,9 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
             };
             let gap_pid = column("unattributed_gap_pid");
             let gap_pid = gap_pid.as_primitive::<UInt32Type>();
+            let admission_psi = column("admission_psi_avg10_centi");
+            let admission_psi = admission_psi.as_primitive::<UInt16Type>();
+            let admission_priority = column("admission_pool_priority");
             (0..batch.num_rows())
                 .map(|row| {
                     let span = JobSpanRow {
@@ -9872,10 +9942,31 @@ fn job_spans(telemetry: &Path) -> Vec<(String, JobSpanRow)> {
                             coverage: enum_text("unattributed_coverage", row),
                             gap_pid: gap_pid.is_valid(row).then(|| gap_pid.value(row)),
                         },
+                        admission: AdmissionFacts {
+                            psi_avg10_centi: admission_psi
+                                .is_valid(row)
+                                .then(|| admission_psi.value(row)),
+                            pool_cpus: optional_number("admission_pool_cpus", row),
+                            pool_priority: admission_priority
+                                .is_valid(row)
+                                .then(|| text("admission_pool_priority", row)),
+                            pool_ahead: optional_number("admission_pool_ahead", row),
+                        },
                     };
                     (name.clone(), span)
                 })
                 .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn admission_notes(telemetry: &Path, job: JobId) -> Vec<(String, AdmissionFacts)> {
+    job_spans(telemetry)
+        .into_iter()
+        .filter(|(_, row)| row.job_id == job.get() && row.message.starts_with("job.admission."))
+        .map(|(_, row)| {
+            assert_eq!((row.entry_type.as_str(), row.job_state), ("info", None));
+            (row.message, row.admission)
         })
         .collect()
 }
@@ -9946,6 +10037,7 @@ fn expected_span(
         w3c_span_id: u64::from_str_radix(job.trace.span_id.as_str(), 16).unwrap(),
         job_state: job_state.map(str::to_owned),
         unattributed: Unattributed::default(),
+        admission: AdmissionFacts::default(),
     };
     let unattributed = job
         .resources
@@ -9957,6 +10049,7 @@ fn expected_span(
         });
     [
         Some(row("span-start", "cowshed.job", None)),
+        Some(row("info", "job.admission.jobserver-setup", None)),
         unattributed,
         Some(row(entry_type, "cowshed.job", Some(state))),
     ]
