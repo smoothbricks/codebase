@@ -3522,10 +3522,25 @@ fn clone_or_copy_tree(source: &Path, destination: &Path) {
 /// default inputs include it). `declared` says whether `a:build` declares that output. Written,
 /// not committed: the caller commits once it has written all it adds.
 fn write_nx_project(checkout: &Path, node: &Path, declared: bool) {
-    // A command a workspace runs by name, as a land's publish job runs `node`,
-    // resolves through its shim directory, which travels with every clone (03_caches.md).
-    fs::create_dir_all(checkout.join(".cowshed/bin")).unwrap();
-    std::os::unix::fs::symlink(node, checkout.join(".cowshed/bin/node")).unwrap();
+    // A command a workspace runs by name, as a land's publish job and adoption check run `node`,
+    // resolves through its shim directory, which travels with every clone (03_caches.md). This
+    // repository declares its Node with the module compile cache off, as a repository's own
+    // wrapper may: every fixture checkout is cloned at a fresh scratch path and Node keys the
+    // cache by absolute module path, so a fixture's cache would only ever be written, never read.
+    // A cold real Nx graph wrote and renamed 487 entries (28-165 s under gate load, against
+    // 0.6-1.5 s with the cache off); Nx's plugin workers inherit the setting. The real Node is the
+    // shim's sibling link `node.real`, so no shell text carries its path, and Node reports the
+    // same resolved executable as before.
+    let bin = checkout.join(".cowshed/bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(node, bin.join("node.real")).unwrap();
+    let shim = bin.join("node");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nNODE_DISABLE_COMPILE_CACHE=1 exec \"$0.real\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     let node = node.display();
     let outputs = if declared {
         r#"["{projectRoot}/generated.txt"]"#
@@ -3623,12 +3638,10 @@ fn controller_commitments(telemetry: &Path) -> Vec<cowshed_core::api::dto::Contr
     found
 }
 
-/// The fixture's check running `targets` across its projects with the repository's Nx and Node.
-fn nx_run_many(node: &Path, targets: &str) -> String {
-    format!(
-        "{} node_modules/nx/dist/bin/nx.js run-many -t {targets}",
-        node.display()
-    )
+/// The fixture's check running `targets` across its projects with the repository's Nx and the
+/// Node its shim directory declares ([`write_nx_project`]).
+fn nx_run_many(targets: &str) -> String {
+    format!("node node_modules/nx/dist/bin/nx.js run-many -t {targets}")
 }
 
 fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionCommitment> {
@@ -3712,8 +3725,8 @@ async fn land_nx_project(
     .unwrap()
     .trim()
     .to_owned();
-    let build = nx_run_many(&node, "build");
-    let test = nx_run_many(&node, "test");
+    let build = nx_run_many("build");
+    let test = nx_run_many("test");
     // The undeclared output is untracked work in the topic, which a retire refuses.
     let report = land(&mut service, "topic", false, &[&build, &test]).await;
     cowshed_os::eprintln!("land report: {report:?}");
@@ -3837,8 +3850,8 @@ async fn directory_adoption_never_reexecutes_shell_checks_or_uncacheable_tasks_s
     fs::write(topic.join("a/src.txt"), b"landed input\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change input"]);
     let shell = "printf 'once\\n' >> .cowshed/shell-runs";
-    let test = format!("{} node_modules/nx/dist/bin/nx.js test a", node.display());
-    let report = land(&mut service, "topic", false, &[shell, &test]).await;
+    let test = "node node_modules/nx/dist/bin/nx.js test a";
+    let report = land(&mut service, "topic", false, &[shell, test]).await;
     let Adoption::Adopted { check, .. } = &report.build_volume.adoption else {
         panic!("the build volume was not adopted: {report:?}");
     };
@@ -5230,7 +5243,7 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
     assert_target_on_build_volume(&fixture.checkout);
-    let nx_check = nx_run_many(&node, "build test");
+    let nx_check = nx_run_many("build test");
 
     let w1 = new_workspace(&mut service, "w1").await;
     fs::write(w1.join("a/src.txt"), b"src, changed\n").unwrap();
@@ -5505,7 +5518,7 @@ fn cached(checkout: &Path, name: &str) -> Option<Vec<u8>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
-    let (mut fixture, mut service, _, node) = build_nx_project().await;
+    let (mut fixture, mut service, _, _) = build_nx_project().await;
     let layout = build_volumes(&fixture);
     let previous = linked_volume(&layout, &fixture.checkout);
     let main = fixture.checkout.clone();
@@ -5547,7 +5560,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     );
 
     let marker_check = cache_entry("landed");
-    let nx_check = nx_run_many(&node, "build test");
+    let nx_check = nx_run_many("build test");
     let report = land(&mut service, "topic", true, &[&marker_check, &nx_check]).await;
     let Adoption::Adopted { check, .. } = &report.build_volume.adoption else {
         panic!("an exempt cache reader skipped adoption: {report:?}");
@@ -6035,8 +6048,8 @@ async fn an_ungated_fold_into_a_lane_base_is_git_alone(
 async fn a_topic_beside_main_s_nx_database(
     change: &[u8],
 ) -> (Fixture, ActorBridge, String, PathBuf) {
-    let (fixture, mut service, _, node) = build_nx_project().await;
-    let nx_check = nx_run_many(&node, "build test");
+    let (fixture, mut service, _, _) = build_nx_project().await;
+    let nx_check = nx_run_many("build test");
     let topic = new_workspace(&mut service, "topic").await;
     fs::write(topic.join("a/src.txt"), change).unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
@@ -8157,7 +8170,7 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many("build")).await;
     // The keeper started the shed's daemon at the run's admission (04_sandbox.md, the kept
     // daemon), so its record may follow the run's end. The patched Nx
     // daemon claims the record when it starts and replaces one of another workspace root as
@@ -8273,11 +8286,11 @@ async fn directory_land_leaves_a_stock_detached_landing_daemon_running_and_skips
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_default_land_never_signals_a_foreign_nominee_during_retirement_substrate_lifecycle()
  {
-    let (mut fixture, mut service, node) = emit_producer_project().await;
+    let (mut fixture, mut service) = emit_producer_project().await;
     let topic = new_workspace(&mut service, "outputs").await;
     fs::write(topic.join("a/src.txt"), "changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(&mut service, "outputs", &nx_run_many(&node, "build")).await;
+    sh(&mut service, "outputs", &nx_run_many("build")).await;
     // The run put the shed in use at its admission, and the keeper started its daemon alongside
     // it (04_sandbox.md, the kept daemon), so its record may follow the
     // run's end. The patched Nx daemon claims the record when it starts and replaces one that
@@ -8351,7 +8364,7 @@ async fn directory_default_land_never_signals_a_foreign_nominee_during_retiremen
 /// one project, the malformed, unreadable and forged walks were still landing the third when a slow
 /// CI runner reached the 180 s the run allows without a finished test, the longest any one test may
 /// run (08_testing.md, "Integration tests (real substrate)").
-async fn emit_producer_project() -> (Fixture, ActorBridge, PathBuf) {
+async fn emit_producer_project() -> (Fixture, ActorBridge) {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -8365,16 +8378,15 @@ async fn emit_producer_project() -> (Fixture, ActorBridge, PathBuf) {
     );
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let service = serve_project(&mut fixture, &nx_reads).await;
-    (fixture, service, node)
+    (fixture, service)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_land_skips_a_malformed_daemon_record_before_quiesce_substrate_lifecycle() {
-    let (mut fixture, mut service, node) = emit_producer_project().await;
+    let (mut fixture, mut service) = emit_producer_project().await;
     land_skips_an_unverifiable_daemon_record_before_quiesce(
         &fixture,
         &mut service,
-        &node,
         UnverifiableRecord::Malformed,
     )
     .await;
@@ -8384,11 +8396,10 @@ async fn directory_land_skips_a_malformed_daemon_record_before_quiesce_substrate
 
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_land_skips_an_unreadable_daemon_record_before_quiesce_substrate_lifecycle() {
-    let (mut fixture, mut service, node) = emit_producer_project().await;
+    let (mut fixture, mut service) = emit_producer_project().await;
     land_skips_an_unverifiable_daemon_record_before_quiesce(
         &fixture,
         &mut service,
-        &node,
         UnverifiableRecord::Unreadable,
     )
     .await;
@@ -8425,7 +8436,6 @@ enum UnverifiableRecord {
 async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
     fixture: &Fixture,
     service: &mut ActorBridge,
-    node: &Path,
     shape: UnverifiableRecord,
 ) {
     let workspace = match shape {
@@ -8435,7 +8445,7 @@ async fn land_skips_an_unverifiable_daemon_record_before_quiesce(
     let topic = new_workspace(service, workspace).await;
     fs::write(topic.join("a/src.txt"), format!("{workspace}\n")).unwrap();
     git(&topic, &["commit", "-q", "-am", "change output input"]);
-    sh(service, workspace, &nx_run_many(node, "build")).await;
+    sh(service, workspace, &nx_run_many("build")).await;
     let record = topic.join(".nx/workspace-data/d/server-process.json");
     // The run put the shed in use at its admission, and the keeper started its daemon alongside
     // it; a supervisor's own start is no use (04_sandbox.md, the kept daemon), so the record
