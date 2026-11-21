@@ -619,8 +619,8 @@ declared land's gate stores them whether it passes or is red (the owner's ruling
 task's hash, which names every input, so a sibling task's failure says nothing about it, and the next gate of the same
 tree replays it instead of running it again; a task that failed is never stored. `cowshed land`'s own `--check` stores
 its attributed results once every check has passed (16_build_volumes.md, "Land"). It asks the store for each key first,
-with a `GET` whose body it cancels at once: a stored key is counted and never archived. Only a missing key is archived,
-by the publisher itself, as the archive the pinned Nx's native `HttpRemoteCache.store` writes
+with a `HEAD`, a membership check: a stored key is counted and never archived. Only a missing key is archived, by the
+publisher itself, as the archive the pinned Nx's native `HttpRemoteCache.store` writes
 (`native/cache/http_remote_cache.rs`: tar 0.4.44 entries for `<cache>/<hash>/`, then `terminalOutput` and a four-byte
 big-endian `code`) byte for byte, but gzipped at level 1 rather than Nx's default 6. The store shares the land's disk,
 so compression time is the cost and archive bytes are not, and Nx's restore gunzips any level. One `PUT` with the

@@ -1,7 +1,8 @@
 // A land's publish (05_gateway.md, "Publication"; 03_caches.md, "Nx accepted-task artifact service"): after the gate
 // passed, every task result the gate's Nx runs named is stored to the project's Nx cache from this checkout's own cache.
-// Each key is looked up in the checkout's cache in chunks of Nx's own getBatch, then asked for in the store: a stored
-// key is counted and never archived. Only a missing key is archived, by
+// Each key is looked up in the checkout's cache in chunks of Nx's own getBatch, then asked for in the store by HEAD: a
+// membership check, which the store does not count as a read of the archive (no SIEVE visit, no body). A stored key is
+// counted and never archived. Only a missing key is archived, by
 // cache_adapter's nxArchive in Nx's own layout at gzip level 1, and sent in one plain PUT. Prefixed once by
 // cache_adapter::script.
 // Usage: node - <absolute Nx root> <JSON array of task hashes>; answers one JSON line on stdout.
@@ -54,14 +55,13 @@ async function publish() {
         continue;
       }
       const url = `${server}/v1/cache/${hash}`;
-      const probe = await fetch(url, { headers: { ...bearer, accept: 'application/octet-stream' } });
-      await probe.body?.cancel();
+      const probe = await fetch(url, { method: 'HEAD', headers: bearer });
       if (probe.status === 200) {
         existing += 1;
         continue;
       }
       if (probe.status !== 404) {
-        throw new Error(`task ${hash} was not stored: the project cache answers GET ${probe.status}`);
+        throw new Error(`task ${hash} was not stored: the project cache answers HEAD ${probe.status}`);
       }
       const { chunks, length } = await archive(hash, result.terminalOutput ?? '', 0);
       const response = await fetch(url, {
@@ -76,7 +76,7 @@ async function publish() {
       if (response.status === 200) {
         published += 1;
       } else if (response.status === 409) {
-        // Stored between the GET and this PUT: the store keeps the archive it holds.
+        // Stored between the HEAD and this PUT: the store keeps the archive it holds.
         existing += 1;
       } else {
         throw new Error(
