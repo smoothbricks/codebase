@@ -23,36 +23,37 @@ gateway's request spans, the supervisor's job spans, the native image observatio
 background verbs' run spans all use that module; none keeps a copy. Nothing in cowshed queries traces with `lmao-query`.
 
 **Job span segments.** The workspace supervisor writes each job's span with the trace context the controller minted or
-adopted for it (`JobInfo.trace`): a `span-start` row at admission, the `job.unattributed` row below when its terminal
-sample states unattributed usage, an `info` row `job.decayed.gate` or `job.decayed.background` at each step of an
-interactive job's decay (05_gateway.md, "Classes"), and a `span-ok`/`span-err` row at its terminal state. The
-supervisor's writer gathers these rows and seals them on the same interval as process rows ("Process segments"): the
-first row of either kind it gathers arms the interval, and when the interval ends, the job rows of every job gathered in
-it seal as one segment `job-<order:020>-<writer>.arrow`, in queue order, under `<host-telemetry-root>/<yyyy-mm-dd>/`
-(the date of its first row), sealed like the gateway's (create-new `0600` temporary, rename, no sync: "Unsynced seals");
-the writer also seals them before answering a trace-health read, and a retiring supervisor has them sealed, and each
-partition its writer wrote flushed once, before it is answered. One segment per interval, not one per row: a job row is
-telemetry, not a durability event (11_shell.md, "Durability of a job's own records"), and sealing each row as its own
-segment, each a full flush of the segment and of its directory, cost 22.9 ms of flushing per exec in a supervisor sample
-of 203 back-to-back execs on 2026-10-30 (load about 10), competing with the job's own record writes. Rows still gathered
-when the writer's process dies are lost, as process rows are. No count of rows seals early: rows past the writer's bound
-in one interval (16,384 job rows, `JOB_GATHER_ROWS`) are refused and counted in the trace health. A row no column can
-state is refused and counted alone; the rest of its interval still seals. The trace health's `recorded` counts segments
-sealed, not rows. The rows carry `repo_id`, `workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id
-and, on the terminal row, its state. The span's lmao address is span 1 of the thread derived from the durable key
-`(repo_id, workspace_incarnation, job_id)` (the first eight bytes of a domain-separated BLAKE3), never the
-workspace-local `job_id` alone: jobs of two workspaces under one adopted trace context stay distinct spans. The writes
-run off the supervisor's actor; a refused write is counted in the supervisor's trace health, which every supervisor
-handle reads, in process or over its socket, and never fails or delays the job. This job span is the anchor
-`process.run` spans parent from. The terminal row carries the job's `env_hash` (the same environment identity as the job
-record's `envHash`, 11_shell.md).
+adopted for it (`JobInfo.trace`): a `span-start` row at admission, the admission notes below, the `job.unattributed` row
+when its terminal sample states unattributed usage, and an `info` row `job.decayed.gate` or `job.decayed.background` at
+each step of an interactive job's decay (05_gateway.md, "Classes"), and a `span-ok`/`span-err` row at its terminal
+state. The supervisor's writer gathers these rows and seals them on the same interval as process rows ("Process
+segments"): the first row of either kind it gathers arms the interval, and when the interval ends, the job rows of every
+job gathered in it seal as one segment `job-<order:020>-<writer>.arrow`, in queue order, under
+`<host-telemetry-root>/<yyyy-mm-dd>/` (the date of its first row), sealed like the gateway's (create-new `0600`
+temporary, rename, no sync: "Unsynced seals"); the writer also seals them before answering a trace-health read, and a
+retiring supervisor has them sealed, and each partition its writer wrote flushed once, before it is answered. One
+segment per interval, not one per row: a job row is telemetry, not a durability event (11_shell.md, "Durability of a
+job's own records"), and sealing each row as its own segment, each a full flush of the segment and of its directory,
+cost 22.9 ms of flushing per exec in a supervisor sample of 203 back-to-back execs on 2026-10-30 (load about 10),
+competing with the job's own record writes. Rows still gathered when the writer's process dies are lost, as process rows
+are. No count of rows seals early: rows past the writer's bound in one interval (16,384 job rows, `JOB_GATHER_ROWS`) are
+refused and counted in the trace health. A row no column can state is refused and counted alone; the rest of its
+interval still seals. The trace health's `recorded` counts segments sealed, not rows. The rows carry `repo_id`,
+`workspace_incarnation`, `job_id`, `grant_revision`, the job's W3C span id and, on the terminal row, its state. The
+span's lmao address is span 1 of the thread derived from the durable key `(repo_id, workspace_incarnation, job_id)` (the
+first eight bytes of a domain-separated BLAKE3), never the workspace-local `job_id` alone: jobs of two workspaces under
+one adopted trace context stay distinct spans. The writes run off the supervisor's actor; a refused write is counted in
+the supervisor's trace health, which every supervisor handle reads, in process or over its socket, and never fails or
+delays the job. This job span is the anchor `process.run` spans parent from. The terminal row carries the job's
+`env_hash` (the same environment identity as the job record's `envHash`, 11_shell.md).
 
-**Job admission notes.** `Queued` alone does not name a cause. The supervisor writes an `info` row on the existing job
-span when a request first waits for a pressure observation (`job.admission.awaiting-pressure`), starts a memory hold
+**Job admission notes.** `Queued` alone does not name a cause. A job span with a start but no admission note has no
+classified transition recorded; this is not evidence of a pressure hold. The supervisor already reads pressure before
+receiving requests. It writes an `info` row on the job span when a job starts a memory hold
 (`job.admission.memory.darwin.<level>` or `job.admission.memory.psi`), enters its checkout's pool queue
 (`job.admission.pool-pending`), asks the host pool (`job.admission.pool-reserving`), or begins post-admission jobserver
 setup (`job.admission.jobserver-setup`). The PSI row carries `admission_psi_avg10_centi` (`u16`); pool rows carry the
-requested `admission_pool_cpus` (`u64`) and `admission_pool_priority` (the pool's priority name), with
+requested `admission_pool_cpus` (`u64`) and `admission_pool_priority` (the pool's priority name, `utf8`), with
 `admission_pool_ahead` (`u64`) on the checkout queue row only. These columns are null elsewhere. The notes share the
 span's durable job identity, do not claim a process or an exit, and describe transitions, never polls or periodic
 keepalives. Caller-owned jobs keep the same exclusion as their job spans.

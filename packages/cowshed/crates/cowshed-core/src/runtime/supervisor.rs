@@ -5993,18 +5993,8 @@ impl SupervisorActor {
 
     /// Tell the admission `event`; its answers are carried out at the top of the actor's loop.
     fn admission_event(&mut self, event: super::job_admission::Event) {
-        let requested = match &event {
-            super::job_admission::Event::Requested { job, .. } => Some(*job),
-            _ => None,
-        };
         self.admission_effects
             .extend(self.admission.step(Instant::now(), event));
-        if self.job_spans.is_some()
-            && let Some(job) = requested
-            && let Some(observed) = self.admission.request_observation(job)
-        {
-            self.observe_admission(job, observed);
-        }
     }
 
     fn observe_admission(&self, job: JobId, phase: super::job_admission::AdmissionObservation) {

@@ -164,7 +164,6 @@ pub enum Effect {
 /// A job's observed state before the supervisor dispatches its first process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionObservation {
-    AwaitingPressure,
     MemoryHeld(MemoryPressure),
     PoolPending {
         cpus: NonZeroUsize,
@@ -272,11 +271,6 @@ impl Admission {
     /// Where `job` stands, or `None` once it concluded.
     pub fn phase(&self, job: JobId) -> Option<Phase> {
         self.jobs.get(&job).map(|entry| entry.phase)
-    }
-
-    /// A request can enter the ledger before the host has said whether it may start.
-    pub(crate) fn request_observation(&self, job: JobId) -> Option<AdmissionObservation> {
-        (self.phase(job) == Some(Phase::Queued)).then_some(AdmissionObservation::AwaitingPressure)
     }
 
     /// Apply one event observed at `now`; the answer is what the supervisor does, in order.
@@ -714,12 +708,7 @@ mod tests {
             let answered = run(&mut admission, at, vec![ask(1, Background, Jobservers)]);
             assert_eq!(answered[0], []);
             assert_eq!(admission.phase(id(1)), Some(Phase::Queued));
-            assert_eq!(
-                admission.request_observation(id(1)),
-                Some(AdmissionObservation::AwaitingPressure)
-            );
             assert_eq!(admission.step(at, first), expected);
-            assert_eq!(admission.request_observation(id(1)), None);
         }
     }
 

@@ -2,8 +2,9 @@
 //! "Process-tree spans").
 //!
 //! Each job is one lmao span carrying the trace context the controller minted or adopted for it
-//! (`JobInfo.trace`): a `span-start` row at admission and a `span-ok`/`span-err` row at its
-//! terminal state. The span's lmao address is thread [`job_span_thread`] of the job's durable key,
+//! (`JobInfo.trace`): a `span-start` row at admission, optional admission notes, and a
+//! `span-ok`/`span-err` row at its terminal state. The span's lmao address is
+//! thread [`job_span_thread`] of the job's durable key,
 //! span 1; the W3C span id rides beside it as `w3c_span_id`. `env_hash` is not computed by the
 //! supervisor yet, so no row carries it. The end row also states what the job's accounting source
 //! charged its cgroup for memory ([`charged_memory_at`]), when that source has such a counter; no
@@ -81,10 +82,8 @@ pub const JOB_SPAN_ID: u32 = 1;
 /// the class whose nice its group runs at from then (05_gateway.md "Classes").
 pub const JOB_DECAYED_TO_GATE_MESSAGE: &str = "job.decayed.gate";
 pub const JOB_DECAYED_TO_BACKGROUND_MESSAGE: &str = "job.decayed.background";
-/// Requests waiting for the writer: one job row or one fold batch each. A job queues up to three
-/// rows, so this covers a burst of concurrent admissions and terminals far beyond what a
-/// workspace's actor queue admits at once. A full queue refuses rows rather than delaying the
-/// actor.
+/// Requests waiting for the writer: one job row or one fold batch each. A full queue counts
+/// refused rows rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
 
 /// How long a writer gathers rows before it seals them: the first row of either kind it gathers
@@ -237,9 +236,6 @@ impl RowKind {
             Self::Unattributed(_) => JOB_UNATTRIBUTED_MESSAGE,
             Self::Decayed(DecayStep::ToGate) => JOB_DECAYED_TO_GATE_MESSAGE,
             Self::Decayed(DecayStep::ToBackground) => JOB_DECAYED_TO_BACKGROUND_MESSAGE,
-            Self::Admission(AdmissionObservation::AwaitingPressure) => {
-                "job.admission.awaiting-pressure"
-            }
             Self::Admission(AdmissionObservation::MemoryHeld(pressure)) => match pressure {
                 MemoryPressure::Darwin { level } => match level {
                     DarwinPressureLevel::Normal => "job.admission.memory.darwin.normal",
@@ -724,8 +720,8 @@ trace_columns! {
     /// One row of a job span's custom columns (13_telemetry.md, "Job span segments", "Process-tree
     /// spans"): the job's durable key and W3C span id, the grant revision it ran under and, on its
     /// end row, its state; then the host's load and cores at the row's boundary and, on the end
-    /// row, the signed change of the job's volumes. A null cell is an absent fact, never zero. The
-    /// unattributed-usage row alone states the six `unattributed_*` cells.
+    /// row, the signed change of the job's volumes. A null cell is an absent fact, never zero.
+    /// Unattributed-usage and admission notes alone state their respective optional cells.
     pub struct JobColumns, fields: job_fields, arrays: job_column_arrays;
     repo_id: Required<Utf8>,
     workspace_incarnation: Required<Utf8>,
@@ -769,6 +765,7 @@ trace_columns! {
     admission_psi_avg10_centi: Optional<U16>,
     /// The actual request (not a grant) on either host-pool wait row.
     admission_pool_cpus: Optional<U64>,
+    /// The priority name in the request to the host pool.
     admission_pool_priority: Optional<Utf8>,
     /// The known count ahead in the checkout's priority lane, on a pool-pending row.
     admission_pool_ahead: Optional<U64>,

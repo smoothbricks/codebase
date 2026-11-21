@@ -1667,10 +1667,41 @@ async fn disconnect_does_not_cancel_background_process() {
 /// reported drop spawns the background job, whose stderr names its wait.
 #[tokio::test]
 async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
+    use cowshed_core::host_pressure::PSI_SOME_AVG10_LIMIT;
+    use cowshed_gateway_types::host_status::{CentiPercent, DarwinPressureLevel, MemoryPressure};
+
+    verify_pressure_hold(
+        MemoryPressure::Darwin {
+            level: DarwinPressureLevel::Warning,
+        },
+        MemoryPressure::Darwin {
+            level: DarwinPressureLevel::Normal,
+        },
+        "job.admission.memory.darwin.warning",
+        None,
+    )
+    .await;
+    let psi = |centi| MemoryPressure::Psi {
+        some_avg10: CentiPercent::new(centi).expect("fixture PSI in hundredths of a percent"),
+    };
+    verify_pressure_hold(
+        psi(PSI_SOME_AVG10_LIMIT + 1),
+        psi(PSI_SOME_AVG10_LIMIT),
+        "job.admission.memory.psi",
+        Some(PSI_SOME_AVG10_LIMIT + 1),
+    )
+    .await;
+}
+
+async fn verify_pressure_hold(
+    held_pressure: cowshed_gateway_types::host_status::MemoryPressure,
+    released_pressure: cowshed_gateway_types::host_status::MemoryPressure,
+    reason: &str,
+    psi_avg10_centi: Option<u16>,
+) {
     use cowshed_core::host_pressure::{Reading, Source};
-    use cowshed_gateway_types::host_status::{DarwinPressureLevel, MemoryPressure};
-    let level = |level| Reading::Known(MemoryPressure::Darwin { level });
-    let (pressure, reports) = tokio::sync::watch::channel(level(DarwinPressureLevel::Warning));
+
+    let (pressure, reports) = tokio::sync::watch::channel(Reading::Known(held_pressure));
     let root = workspace_root(&temp_parent::scratch_parent(), "test-workspace");
     let telemetry = root.join("telemetry");
     std::fs::create_dir(&telemetry).expect("create the pressure fixture's observation directory");
@@ -1715,7 +1746,7 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
         "the background start is held"
     );
 
-    pressure.send_replace(level(DarwinPressureLevel::Normal));
+    pressure.send_replace(Reading::Known(released_pressure));
     let second = h.spawned.recv().await.unwrap();
     assert_eq!(second.request.job_id, held);
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
@@ -1737,19 +1768,22 @@ async fn a_background_start_waits_for_the_reported_drop_and_a_gate_does_not() {
         .trace_health()
         .await
         .expect("seal the pressure wait's job span");
-    let notes = admission_notes(&telemetry, held);
-    let names: Vec<_> = notes.iter().map(|(name, _)| name.as_str()).collect();
-    let memory = "job.admission.memory.darwin.warning";
-    let setup = "job.admission.jobserver-setup";
-    assert!(
-        names == [memory, setup] || names == ["job.admission.awaiting-pressure", memory, setup],
-        "one real Warning hold before jobserver setup, with at most one wait for the first report: {notes:?}"
-    );
-    assert!(
-        notes
-            .iter()
-            .all(|(_, facts)| *facts == AdmissionFacts::default()),
-        "a Darwin hold and its setup carry no PSI or pool request: {notes:?}"
+    assert_eq!(
+        admission_notes(&telemetry, held),
+        [
+            (
+                reason.to_owned(),
+                AdmissionFacts {
+                    psi_avg10_centi,
+                    ..AdmissionFacts::default()
+                },
+            ),
+            (
+                "job.admission.jobserver-setup".to_owned(),
+                AdmissionFacts::default()
+            ),
+        ],
+        "one real hold uses the pressure it evaluated, followed by jobserver setup"
     );
 }
 
@@ -2235,13 +2269,26 @@ async fn a_held_exec_waits_for_its_grant() {
         .trace_health()
         .await
         .expect("seal the pool wait's job spans");
-    let reserve = AdmissionFacts {
-        pool_cpus: Some(
-            u64::try_from(asked_b).expect("the requested cores fit their trace column"),
-        ),
+    let request_facts = |asked| AdmissionFacts {
+        pool_cpus: Some(u64::try_from(asked).expect("the requested cores fit their trace column")),
         pool_priority: Some("low".to_owned()),
         ..AdmissionFacts::default()
     };
+    assert_eq!(
+        admission_notes(&telemetry, a),
+        [
+            (
+                "job.admission.pool-reserving".to_owned(),
+                request_facts(asked_a),
+            ),
+            (
+                "job.admission.jobserver-setup".to_owned(),
+                AdmissionFacts::default()
+            ),
+        ],
+        "an empty checkout lane reserves without a fictitious local queue wait"
+    );
+    let reserve = request_facts(asked_b);
     assert_eq!(
         admission_notes(&telemetry, b),
         [
