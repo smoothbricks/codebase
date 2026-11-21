@@ -346,7 +346,7 @@ impl HostSetup for NativeHostSetup {
         let Some(unproven) = prove()? else {
             return Ok(None);
         };
-        if !std::io::stdin().is_terminal() {
+        if !crate::zfs_helper::TERMINAL_REMEDY || !std::io::stdin().is_terminal() {
             return Ok(Some(unproven.refusal));
         }
         cowshed_os::eprintln!(
@@ -1464,6 +1464,17 @@ fn action_intent(action: &HostAction) -> String {
         } => format!(
             "{name} (UUID {uuid}) at {} holds nothing but its marker and will be deleted; its /etc/fstab pin and mount-service entry are rewritten without it",
             mounted_at.display()
+        ),
+        HostAction::InstallRootHelper {
+            roots,
+            helper,
+            sha256,
+            uid,
+        } => format!(
+            "the ZFS root helper {} (sha256 {sha256}) will be installed as root's, read-only, in {}, and /etc/sudoers.d will admit exactly those bytes for uid {uid}, for {}",
+            helper.display(),
+            cowshed_helper::host::SYSTEM_DIRECTORY,
+            roots.join(", ")
         ),
         HostAction::InstallMountService { label } => format!(
             "system LaunchDaemon {label} and encrypted-volume discovery credentials will be converged; current service files remain unchanged"

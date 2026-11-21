@@ -373,14 +373,27 @@ store that is a ZFS dataset, and otherwise (a macOS host, whose store is APFS) e
 host has a `zfs`. It runs the `check` verb of the helper the installed cowshed reaches, as it reaches it, and through
 `sudo` with `-k` besides, so the credentials setup's own `sudo -v` cached do not answer for a daemon that has none. The
 proof holds when the helper that answered is the system directory's and has this build's bytes, or is an administrator's
-setuid one. Otherwise, at a terminal, setup runs the one root command that mends it, which `sudo` authorizes, and proves
-again; without a terminal, or when the proof still fails, it exits `environment-missing`, saying what the attempt
-answered, with that command as its `next:` line. The command copies the installed helper into the system directory
-(`install -o 0 -g 0 -m 555`, the directory `-m 755`) and writes the entry above to `/etc/sudoers.d/cowshed-helper-<uid>`
-(staged as `cowshed-helper-<uid>.new`, a name `sudo` passes over, checked by `visudo -cf`, then renamed), with the entry
-itself in the message for a host that keeps its sudoers elsewhere; for a setuid helper that was reached instead, it is
-the `install -o 0 -g 0 -m 4755` that replaces it with this build's. `gateway stop --purge` and `setup --uninstall`
-remove the installed helper; neither removes the system copy or a sudoers entry, which are root's.
+setuid one. Otherwise, on Linux at a terminal, setup runs the one root command that mends it, which `sudo` authorizes,
+and proves again; without a terminal, or when the proof still fails, it exits `environment-missing`, saying what the
+attempt answered, with that command, then `setup` of the build that ran it, as its `next:` line. The command copies the
+installed helper into the system directory (`install -o 0 -g 0 -m 555`, the directory `-m 755`) and writes the entry
+above to `/etc/sudoers.d/cowshed-helper-<uid>` (staged as `cowshed-helper-<uid>.new`, a name `sudo` passes over, checked
+by `visudo -cf`, then renamed), with the entry itself in the message for a host that keeps its sudoers elsewhere; for a
+setuid helper that was reached instead, it is the `install -o 0 -g 0 -m 4755` that replaces it with this build's.
+`gateway stop --purge` and `setup --uninstall` remove the installed helper; neither removes the system copy or a sudoers
+entry, which are root's.
+
+<a id="smoo/cowshed!n/macos-root-helper-authorization"></a>On macOS that remedy is not a terminal `sudo`. Setup plans
+the helper's install as one of its host actions whenever the proof above fails for a root that names the user, announces
+it with the others and runs it in its one administrator authorization session (01c_macos.md, "Privileged steps run in
+one authorization session"), so a host whose storage also needs repair sees one dialog and a proven host none. The
+session installs the build's own helper, whose digest the plan took, into the system directory, and the entry into
+`/etc/sudoers.d`, each under a staged name nothing reads. It reads each back once it is root's and removes it unless it
+is exactly the planned helper or entry, checks the entry with `visudo -cf`, and only then renames each into effect, so
+no file a user can write after the dialog is trusted. A declined dialog is refused as declined. The proof after the
+install is the verdict, and an unproven helper's `next:` line is `setup` of that build again. `doctor` reports a planned
+install as `host-root-helper`, a finding `setup` repairs, so an unattended install (05_gateway.md, "The installed
+cowshed") never raises the dialog.
 
 Everything else (Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI) runs unprivileged.
 

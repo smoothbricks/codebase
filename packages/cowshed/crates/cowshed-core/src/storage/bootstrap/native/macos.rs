@@ -61,6 +61,11 @@ const MKDIR: &str = "/bin/mkdir";
 const RM: &str = "/bin/rm";
 const RMDIR: &str = "/bin/rmdir";
 const CHOWN: &str = "/usr/sbin/chown";
+const MV: &str = "/bin/mv";
+const CHMOD: &str = "/bin/chmod";
+const VISUDO: &str = "/usr/sbin/visudo";
+/// The root helper's file name, in the build and in the system directory.
+const ROOT_HELPER: &str = "cowshed-helper";
 const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 const PRIVILEGED_SHELL: &str = "/bin/sh";
 /// POSIX `sh -c` body. `$0` is the absolute tool, `$@` its argv.
@@ -275,7 +280,11 @@ impl BootstrapHost for AuthorizedBootstrapHost {
             // that owned command, never authority to signal a system daemon.
             arbitration_probe(HostNamespace::Production, device)?;
         }
-        if [DISKUTIL, INSTALL, LAUNCHCTL, RM, SECURITY].contains(&command.program()) {
+        if [
+            CHMOD, DISKUTIL, INSTALL, LAUNCHCTL, MV, RM, SECURITY, VISUDO,
+        ]
+        .contains(&command.program())
+        {
             return self.session()?.execute(command);
         }
         SystemBootstrapHost.run_command(command)
@@ -1240,6 +1249,7 @@ fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
             action,
             HostAction::EncryptVolume { .. }
                 | HostAction::InstallMountService { .. }
+                | HostAction::InstallRootHelper { .. }
                 | HostAction::DeleteVolume { .. }
         )
     }) || snapshot
@@ -1272,7 +1282,8 @@ fn action_volume_name(action: &HostAction) -> Option<&str> {
         HostAction::PinFstab { .. }
         | HostAction::EnsureMountRoot { .. }
         | HostAction::ReclaimStubs { .. }
-        | HostAction::InstallMountService { .. } => None,
+        | HostAction::InstallMountService { .. }
+        | HostAction::InstallRootHelper { .. } => None,
     }
 }
 
@@ -1682,6 +1693,284 @@ fn install_mount_service_with(
     result
 }
 
+/// Where the root helper and its sudoers entry are installed, and the owner they must have once
+/// installed: the root-owned system directory, the drop-in directory `sudo` reads, and root.
+struct RootHelperTarget {
+    directory: PathBuf,
+    sudoers: PathBuf,
+    owner: u32,
+    /// Where this user writes the entry before root installs it: root reads it from there.
+    scratch: PathBuf,
+}
+
+impl RootHelperTarget {
+    fn system() -> Self {
+        Self {
+            directory: PathBuf::from(cowshed_helper::host::SYSTEM_DIRECTORY),
+            sudoers: PathBuf::from(crate::storage::directory::SUDOERS_DROP_INS),
+            owner: 0,
+            scratch: PathBuf::from("/private/tmp"),
+        }
+    }
+}
+
+/// The action that installs the build's root helper for the roots in `roots`, when there are any:
+/// a host whose helper is proven plans nothing, so its setup asks for no authorization.
+fn root_helper_action(
+    roots: Vec<String>,
+    helper: PathBuf,
+    sha256: String,
+    uid: u32,
+) -> Option<HostAction> {
+    (!roots.is_empty()).then_some(HostAction::InstallRootHelper {
+        roots,
+        helper,
+        sha256,
+        uid,
+    })
+}
+
+/// Plan the root helper's install (09_substrates.md, "Install and privilege"): only for a build
+/// that carries a helper, and only when a ZFS root that names the user is not yet served by the
+/// system directory's copy of exactly that helper, admitted by `sudo -n -k`. Reads only.
+fn add_root_helper_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
+    let Some(helper) = crate::storage::directory::build_root_helper() else {
+        return Ok(());
+    };
+    let sha256 = crate::storage::directory::file_sha256(&helper).map_err(|source| {
+        NativeBootstrapError::Host(host_io_error(
+            "hash the build's root helper",
+            &helper,
+            source,
+        ))
+    })?;
+    let roots = crate::storage::directory::roots_awaiting_root_helper(&sha256)
+        .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    snapshot
+        .actions
+        .extend(root_helper_action(roots, helper, sha256, uid));
+    Ok(())
+}
+
+/// `path` is a regular file, not a link, owned by `owner` with exactly `mode`: what a root-owned
+/// install leaves, which no user can change after it.
+fn require_installed_file(path: &Path, owner: u32, mode: u32) -> Result<(), HostError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| host_io_error("inspect", path, source))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != owner
+        || metadata.mode() & 0o7777 != mode
+    {
+        return Err(HostError::new(format!(
+            "{} is not a regular file owned by uid {owner} with mode {mode:o} (uid {}, mode {:o})",
+            path.display(),
+            metadata.uid(),
+            metadata.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Install the build's root helper and the sudoers entry that admits exactly its bytes for `uid`
+/// (09_substrates.md, "Install and privilege"), each through `host`'s privileged commands. Nothing
+/// a user can write after the authorization is trusted: each file is staged under a name the
+/// system ignores, read back once it is root's and refused unless it is exactly what was planned
+/// (the helper by `sha256`, the entry byte for byte), and only then renamed into effect. `visudo`
+/// checks the entry's syntax before that rename.
+fn install_root_helper_with(
+    host: &dyn BootstrapHost,
+    target: &RootHelperTarget,
+    helper: &Path,
+    sha256: &str,
+    uid: u32,
+) -> Result<(), HostError> {
+    let directory = path_argument(&target.directory)?;
+    required_host_command(
+        host,
+        HostCommand::new(
+            INSTALL,
+            [
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "755",
+                directory.as_str(),
+            ],
+        ),
+    )?;
+    let installed = target.directory.join(ROOT_HELPER);
+    let staged = target.directory.join(format!("{ROOT_HELPER}.new"));
+    let staged_argument = path_argument(&staged)?;
+    required_host_command(
+        host,
+        HostCommand::new(
+            INSTALL,
+            [
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "555",
+                path_argument(helper)?.as_str(),
+                staged_argument.as_str(),
+            ],
+        ),
+    )?;
+    let verified = require_installed_file(&staged, target.owner, 0o555).and_then(|()| {
+        let digest = crate::storage::directory::file_sha256(&staged)
+            .map_err(|source| host_io_error("hash the staged root helper", &staged, source))?;
+        if digest == sha256 {
+            Ok(())
+        } else {
+            Err(HostError::new(format!(
+                "the root helper staged at {} hashes to {digest}, not the {sha256} setup was authorized for",
+                staged.display()
+            )))
+        }
+    });
+    if let Err(error) = verified {
+        required_host_command(host, HostCommand::new(RM, ["-f", staged_argument.as_str()]))?;
+        return Err(error);
+    }
+    required_host_command(
+        host,
+        HostCommand::new(
+            MV,
+            [
+                "-f",
+                staged_argument.as_str(),
+                path_argument(&installed)?.as_str(),
+            ],
+        ),
+    )?;
+
+    let entry =
+        crate::storage::directory::sudoers_entry(uid, sha256, &installed).ok_or_else(|| {
+            HostError::new(format!(
+                "{} cannot be spelled as a sudoers command",
+                installed.display()
+            ))
+        })?;
+    let entry = format!("{entry}\n");
+    let drop_in = target.sudoers.join(format!("{ROOT_HELPER}-{uid}"));
+    // A name with a `.` is one `sudo` passes over, so the staged entry is in force only once renamed.
+    let staged = target.sudoers.join(format!("{ROOT_HELPER}-{uid}.new"));
+    let staged_argument = path_argument(&staged)?;
+    let temporary = target
+        .scratch
+        .join(format!("cowshed-sudoers-{}", Uuid::new_v4()));
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|source| {
+                host_io_error("create temporary sudoers entry", &temporary, source)
+            })?;
+        file.write_all(entry.as_bytes())
+            .map_err(|source| host_io_error("write temporary sudoers entry", &temporary, source))?;
+        file.sync_all()
+            .map_err(|source| host_io_error("sync temporary sudoers entry", &temporary, source))?;
+        // Readable while staged, so the read-back needs no privilege; 0440 once checked.
+        required_host_command(
+            host,
+            HostCommand::new(
+                INSTALL,
+                [
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "444",
+                    path_argument(&temporary)?.as_str(),
+                    staged_argument.as_str(),
+                ],
+            ),
+        )
+    })();
+    let removed = fs::remove_file(&temporary);
+    written?;
+    removed
+        .map_err(|source| host_io_error("remove temporary sudoers entry", &temporary, source))?;
+    let activated = require_installed_file(&staged, target.owner, 0o444)
+        .and_then(|()| {
+            let staged_bytes = fs::read(&staged).map_err(|source| {
+                host_io_error("read the staged sudoers entry", &staged, source)
+            })?;
+            if staged_bytes == entry.as_bytes() {
+                Ok(())
+            } else {
+                Err(HostError::new(format!(
+                    "the sudoers entry staged at {} is not the one setup was authorized for",
+                    staged.display()
+                )))
+            }
+        })
+        .and_then(|()| {
+            required_host_command(
+                host,
+                HostCommand::new(VISUDO, ["-cf", staged_argument.as_str()]),
+            )
+        })
+        .and_then(|()| {
+            required_host_command(
+                host,
+                HostCommand::new(CHMOD, ["440", staged_argument.as_str()]),
+            )
+        });
+    if let Err(error) = activated {
+        required_host_command(host, HostCommand::new(RM, ["-f", staged_argument.as_str()]))?;
+        return Err(error);
+    }
+    required_host_command(
+        host,
+        HostCommand::new(
+            MV,
+            [
+                "-f",
+                staged_argument.as_str(),
+                path_argument(&drop_in)?.as_str(),
+            ],
+        ),
+    )
+}
+
+async fn install_root_helper(
+    host: Arc<dyn BootstrapHost>,
+    helper: PathBuf,
+    sha256: String,
+    uid: u32,
+) -> Result<(), CowshedError> {
+    tokio::task::spawn_blocking(move || {
+        install_root_helper_with(
+            host.as_ref(),
+            &RootHelperTarget::system(),
+            &helper,
+            &sha256,
+            uid,
+        )
+    })
+    .await
+    .map_err(|error| {
+        setup_execution_error(
+            NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(
+                error.to_string(),
+            )),
+            "cowshed setup",
+        )
+    })?
+    .map_err(NativeBootstrapError::Host)
+    .map_err(|error| setup_execution_error(error, "cowshed setup"))
+}
+
 async fn install_mount_service(
     snapshot: &SetupSnapshot,
     host: Arc<dyn BootstrapHost>,
@@ -1777,6 +2066,12 @@ async fn execute_snapshot_actions(
                     .collect::<Vec<_>>();
                 execute_setup_operations(&operations, Arc::clone(&host)).await
             }
+            HostAction::InstallRootHelper {
+                helper,
+                sha256,
+                uid,
+                ..
+            } => install_root_helper(Arc::clone(&host), helper.clone(), sha256.clone(), *uid).await,
             HostAction::InstallMountService { .. } => {
                 install_mount_service(snapshot, Arc::clone(&host)).await
             }
@@ -1900,6 +2195,7 @@ async fn gather_setup_snapshot(
             prepare_setup_snapshot(&mut source, &home, &existing_fstab, caches_volume)?;
         add_mount_root_action(&mut snapshot)?;
         add_mount_service_action(&mut snapshot)?;
+        add_root_helper_action(&mut snapshot)?;
         Ok(snapshot)
     })
     .await
@@ -8679,6 +8975,346 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert!(!setup_requires_authorization(&snapshot));
         assert!(matches!(snapshot.fstab, PlannedFstab::AlreadyCurrent));
     }
+
+    //#region smoo/cowshed!n/macos-root-helper-authorization
+    /// A host whose root helper is proven plans no helper action, so a second setup asks for no
+    /// authorization; one awaiting the helper plans exactly that action, and it alone asks.
+    #[test]
+    fn the_root_helper_is_planned_and_authorized_only_while_it_is_unproven() {
+        let mut first_source = healthy_existing_source();
+        let first = prepare_setup_snapshot(
+            &mut first_source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("pin plan");
+        let PlannedFstab::NeedsPin(pins) = first.fstab else {
+            panic!("empty fstab must need pins");
+        };
+        let current = build_fstab("", &pins).expect("desired fstab");
+        let mut source = healthy_existing_source();
+        let mut snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            &current,
+            CachesVolume::Keep,
+        )
+        .expect("healthy setup plan");
+        let helper = PathBuf::from("/build/cowshed-helper");
+
+        snapshot.actions.extend(root_helper_action(
+            Vec::new(),
+            helper.clone(),
+            "ab".into(),
+            501,
+        ));
+        assert_eq!(host_setup_actions(&snapshot), Vec::<HostAction>::new());
+        assert!(!setup_requires_authorization(&snapshot));
+
+        let roots = vec![String::from("tank/cowshed")];
+        snapshot.actions.extend(root_helper_action(
+            roots.clone(),
+            helper.clone(),
+            "ab".into(),
+            501,
+        ));
+        assert_eq!(
+            host_setup_actions(&snapshot),
+            vec![HostAction::InstallRootHelper {
+                roots,
+                helper,
+                sha256: "ab".into(),
+                uid: 501,
+            }]
+        );
+        assert!(setup_requires_authorization(&snapshot));
+    }
+
+    /// Runs the helper install's privileged commands as this user in a scratch tree: `install`
+    /// without root's owner and group, `visudo` answering as told, and `tamper` overwriting a
+    /// file the moment `install` puts it at that path, as a writer racing the install would.
+    struct RootHelperInstallHost {
+        commands: Mutex<Vec<HostCommand>>,
+        visudo_accepts: bool,
+        declined: bool,
+        tamper: Option<(PathBuf, Vec<u8>)>,
+    }
+
+    impl RootHelperInstallHost {
+        fn new() -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                visudo_accepts: true,
+                declined: false,
+                tamper: None,
+            }
+        }
+
+        fn programs(&self) -> Vec<String> {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|command| command.program().to_owned())
+                .collect()
+        }
+    }
+
+    impl BootstrapHost for RootHelperInstallHost {
+        fn verify_zfs_delegation(&self, _pool: &str, _root: &str) -> Result<(), HostError> {
+            unreachable!("the helper install reads no dataset")
+        }
+
+        fn inspect_mountpoint(&self, _path: &Path) -> Result<MountpointState, HostError> {
+            unreachable!("the helper install inspects no mountpoint")
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("the helper install makes its directory with privileged install")
+        }
+
+        fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("the helper install reclaims nothing")
+        }
+
+        fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.commands.lock().unwrap().push(command.clone());
+            if self.declined {
+                return Err(HostError::authorization_denied(
+                    "preauthorize privileged execution was declined",
+                ));
+            }
+            if command.program() == VISUDO {
+                return Ok(if self.visudo_accepts {
+                    HostCommandOutput::default()
+                } else {
+                    HostCommandOutput::failure_with_streams(
+                        cowshed_os::process::ProcessStatus::Exit(1),
+                        Vec::new(),
+                        b">>> sudoers: syntax error".to_vec(),
+                    )
+                });
+            }
+            let mut arguments = command.args().to_vec();
+            if command.program() == INSTALL {
+                arguments
+                    .retain(|argument| !["-o", "root", "-g", "wheel"].contains(&argument.as_str()));
+            }
+            use cowshed_os::test_backstop::CommandBackstop as _;
+            let output = Command::new(command.program())
+                .args(&arguments)
+                .output_bounded()
+                .expect("the command runs");
+            if command.program() == INSTALL
+                && let Some((path, bytes)) = &self.tamper
+                && arguments.last().map(PathBuf::from).as_ref() == Some(path)
+            {
+                let mode = fs::metadata(path).unwrap().permissions();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+                fs::write(path, bytes).unwrap();
+                fs::set_permissions(path, mode).unwrap();
+            }
+            Ok(if output.status.success() {
+                HostCommandOutput::success(output.stdout)
+            } else {
+                HostCommandOutput::failure_with_streams(
+                    cowshed_os::process::ProcessStatus::Exit(output.status.code().unwrap_or(1)),
+                    output.stdout,
+                    output.stderr,
+                )
+            })
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            unreachable!("the helper install provisions no volume")
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            unreachable!("the helper install writes through privileged install")
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            unreachable!("the helper install pins nothing")
+        }
+    }
+
+    /// A build's helper and a scratch system directory and drop-in directory owned by this user.
+    struct RootHelperScene {
+        root: PathBuf,
+        helper: PathBuf,
+        sha256: String,
+        target: RootHelperTarget,
+        uid: u32,
+    }
+
+    impl RootHelperScene {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("cowshed-root-helper-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("build")).unwrap();
+            fs::create_dir_all(root.join("sudoers.d")).unwrap();
+            let helper = root.join("build").join(ROOT_HELPER);
+            fs::write(&helper, b"#!/bin/sh\n# the authorized helper\n").unwrap();
+            let sha256 = crate::storage::directory::file_sha256(&helper).unwrap();
+            // SAFETY: reads this process's real uid.
+            let uid = unsafe { libc::getuid() };
+            let target = RootHelperTarget {
+                directory: root.join("system"),
+                sudoers: root.join("sudoers.d"),
+                owner: uid,
+                scratch: root.join("build"),
+            };
+            Self {
+                root,
+                helper,
+                sha256,
+                target,
+                uid,
+            }
+        }
+
+        fn installed(&self) -> PathBuf {
+            self.target.directory.join(ROOT_HELPER)
+        }
+
+        fn drop_in(&self) -> PathBuf {
+            self.target
+                .sudoers
+                .join(format!("{ROOT_HELPER}-{}", self.uid))
+        }
+
+        fn staged_drop_in(&self) -> PathBuf {
+            self.target
+                .sudoers
+                .join(format!("{ROOT_HELPER}-{}.new", self.uid))
+        }
+
+        fn install(&self, host: &RootHelperInstallHost) -> Result<(), HostError> {
+            install_root_helper_with(host, &self.target, &self.helper, &self.sha256, self.uid)
+        }
+    }
+
+    impl Drop for RootHelperScene {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_root_helper_and_its_entry_take_effect_only_as_the_bytes_setup_was_authorized_for() {
+        let scene = RootHelperScene::new("installed");
+        let host = RootHelperInstallHost::new();
+        scene.install(&host).unwrap();
+
+        assert_eq!(
+            fs::read(scene.installed()).unwrap(),
+            fs::read(&scene.helper).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(scene.installed()).unwrap().mode() & 0o7777,
+            0o555
+        );
+        let entry =
+            crate::storage::directory::sudoers_entry(scene.uid, &scene.sha256, &scene.installed())
+                .unwrap();
+        assert_eq!(
+            fs::read_to_string(scene.drop_in()).unwrap(),
+            format!("{entry}\n")
+        );
+        assert_eq!(
+            fs::metadata(scene.drop_in()).unwrap().mode() & 0o7777,
+            0o440
+        );
+        assert!(!scene.staged_drop_in().exists());
+        assert!(
+            !scene
+                .target
+                .directory
+                .join(format!("{ROOT_HELPER}.new"))
+                .exists()
+        );
+        assert_eq!(
+            host.programs(),
+            [INSTALL, INSTALL, MV, INSTALL, VISUDO, CHMOD, MV]
+        );
+    }
+
+    #[test]
+    fn a_helper_swapped_after_the_authorization_never_takes_effect() {
+        let scene = RootHelperScene::new("swapped-helper");
+        fs::write(&scene.helper, b"#!/bin/sh\n# another helper\n").unwrap();
+        let host = RootHelperInstallHost::new();
+        let error = scene.install(&host).unwrap_err();
+
+        assert!(error.to_string().contains("not the"), "{error}");
+        assert!(!scene.installed().exists());
+        assert!(
+            !scene
+                .target
+                .directory
+                .join(format!("{ROOT_HELPER}.new"))
+                .exists()
+        );
+        assert!(!scene.drop_in().exists());
+        assert_eq!(host.programs(), [INSTALL, INSTALL, RM]);
+    }
+
+    #[test]
+    fn a_sudoers_entry_other_than_the_authorized_one_never_takes_effect() {
+        let scene = RootHelperScene::new("swapped-entry");
+        let mut host = RootHelperInstallHost::new();
+        host.tamper = Some((
+            scene.staged_drop_in(),
+            b"ALL ALL=(ALL) NOPASSWD: ALL\n".to_vec(),
+        ));
+        let error = scene.install(&host).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not the one setup was authorized for"),
+            "{error}"
+        );
+        assert!(!scene.drop_in().exists());
+        assert!(!scene.staged_drop_in().exists());
+        assert_eq!(host.programs(), [INSTALL, INSTALL, MV, INSTALL, RM]);
+    }
+
+    #[test]
+    fn an_entry_visudo_refuses_is_removed_and_its_failure_reported() {
+        let scene = RootHelperScene::new("visudo");
+        let mut host = RootHelperInstallHost::new();
+        host.visudo_accepts = false;
+        let error = scene.install(&host).unwrap_err();
+
+        assert!(error.to_string().contains("syntax error"), "{error}");
+        assert!(!scene.drop_in().exists());
+        assert!(!scene.staged_drop_in().exists());
+        assert_eq!(host.programs(), [INSTALL, INSTALL, MV, INSTALL, VISUDO, RM]);
+    }
+
+    #[test]
+    fn a_declined_authorization_installs_nothing_and_says_it_was_declined() {
+        let scene = RootHelperScene::new("declined");
+        let mut host = RootHelperInstallHost::new();
+        host.declined = true;
+        let error = scene.install(&host).unwrap_err();
+
+        assert!(error.is_authorization_denied());
+        assert_eq!(
+            setup_execution_error(NativeBootstrapError::Host(error), "cowshed setup").code,
+            crate::error::ErrorCode::SandboxDenied
+        );
+        assert!(!scene.target.directory.exists());
+        assert!(!scene.drop_in().exists());
+    }
+    //#endregion smoo/cowshed!n/macos-root-helper-authorization
 
     #[tokio::test]
     async fn existing_host_storage_returns_roots_and_queries_only_home_without_mutation() {

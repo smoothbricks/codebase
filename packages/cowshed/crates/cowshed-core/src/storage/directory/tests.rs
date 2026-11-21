@@ -982,3 +982,30 @@ fn directory_fixture_retirement_moves_the_inode_once_for_every_payload_size() {
     assert_eq!(fs::read(source.join("kept")).unwrap(), b"kept");
     retire_directory_tree(&scratch.join("already-gone"), &missing_destination).unwrap();
 }
+
+#[test]
+fn a_command_name_is_spelled_for_sudoers_or_refused() {
+    for (path, expected) in [
+        ("/usr/bin/cowshed-helper", Some("/usr/bin/cowshed-helper")),
+        (
+            "/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper",
+            Some("/home/u/Library/Application\\ Support/dev.cowshed/bin/cowshed-helper"),
+        ),
+        ("/h/a,b:c=d#e/x", Some("/h/a\\,b\\:c\\=d\\#e/x")),
+        ("/h/ü/x", Some("/h/ü/x")),
+        ("/h/a\\b/x", None),
+        ("/h/a\"b/x", None),
+        ("/h/a!b/x", None),
+        ("/h/a*b/x", None),
+        ("/h/a?b/x", None),
+        ("/h/a[b]/x", None),
+        ("/h/a\tb/x", None),
+        ("/h/a\nb/x", None),
+    ] {
+        assert_eq!(
+            super::sudoers_command(Path::new(path)).as_deref(),
+            expected,
+            "{path:?}"
+        );
+    }
+}

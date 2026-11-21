@@ -1,0 +1,15 @@
+//! Linux: setup runs the one root command at a terminal, which `sudo` authorizes
+//! (09_substrates.md, "Install and privilege").
+
+/// Setup runs the root command itself when it has a terminal.
+pub const TERMINAL_REMEDY: bool = true;
+
+/// Why the root command is the step, as [`super::remedy`] says it.
+pub(super) fn why(why: String) -> String {
+    why
+}
+
+/// The `next:` line of an unproven helper: the root command, then setup again.
+pub(super) fn next(command: &str, rerun: String) -> String {
+    format!("{command} && {rerun}")
+}

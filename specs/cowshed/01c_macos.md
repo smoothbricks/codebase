@@ -810,7 +810,8 @@ Find the symptom in the left column and follow the link.
   launched, not how it exited (code comment).
 - **Rule.** `cowshed setup` announces its action on stderr before it raises the one dialog and runs every privileged
   step in that single session through `/bin/sh`, which appends each child's exit status, while a run with nothing to
-  escalate prints no authorization announcement.
+  escalate prints no authorization announcement. The ZFS root helper's install is one of those steps, planned only while
+  its proof fails ([09_substrates.md §Install and privilege](./09_substrates.md#install-and-privilege)).
 - **Owners.** _No spec owner_ for the launch-only status of `AuthorizationExecuteWithPrivileges` and the `/bin/sh`
   wrapper that appends each child's exit status: `macos.rs` states them.
   [06_cli.md §CLI Contract](./06_cli.md#cli-contract) (rule 3);

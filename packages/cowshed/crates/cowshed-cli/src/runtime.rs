@@ -4422,6 +4422,17 @@ fn host_action_evidence(action: &HostAction) -> String {
             "delete the retired {name} ({uuid}) mounted at {}, which holds nothing but its marker",
             mounted_at.display()
         ),
+        HostAction::InstallRootHelper {
+            roots,
+            helper,
+            sha256,
+            uid,
+        } => format!(
+            "install the ZFS root helper {} (sha256 {sha256}) as root's in {}, with the sudoers entry that admits exactly those bytes for uid {uid}, for {}",
+            helper.display(),
+            cowshed_helper::host::SYSTEM_DIRECTORY,
+            roots.join(", ")
+        ),
         HostAction::InstallMountService { label } => platform::mount_service_evidence(label),
         HostAction::ReclaimStubs { paths } => format!(
             "reclaim mountpoint stubs: {}",
@@ -4612,6 +4623,17 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 ),
                 hint: "cowshed setup".into(),
                 path: paths.first().cloned(),
+            }),
+            HostAction::InstallRootHelper { roots, sha256, .. } => findings.push(Finding {
+                code: "host-root-helper".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "the ZFS root helper is not this build's (sha256 {sha256}) acting as root from {} for {}",
+                    cowshed_helper::host::SYSTEM_DIRECTORY,
+                    roots.join(", ")
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(PathBuf::from(cowshed_helper::host::SYSTEM_DIRECTORY)),
             }),
             HostAction::InstallMountService { label } => {
                 findings.push(platform::mount_service_finding(label));

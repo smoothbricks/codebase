@@ -191,6 +191,13 @@ describe('setupPrompt', () => {
     });
   });
 
+  it('needs a prompt when setup would install the ZFS root helper, as doctor reports it', () => {
+    const report = doctor(finding('host-root-helper', 'error', 'cowshed setup'), finding('gateway', 'info'));
+    expect(setupPrompt(report)).toEqual({
+      kind: 'needed',
+      reasons: ['host-root-helper: host-root-helper message'],
+    });
+  });
   const storage = [
     'host-storage',
     'host-volume-absent',

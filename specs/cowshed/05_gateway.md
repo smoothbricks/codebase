@@ -152,9 +152,9 @@ there is refused by name and left untouched.
 **The root helper is installed with the build, never made root's by it.** Every install (`setup`, `gateway start`)
 copies the `cowshed-helper` beside the build into `bin` the same content-addressed way, as the user's own file at mode
 0755, and a build with none beside it is refused by name before the stable name moves. No install sets a setuid bit or
-writes sudoers on any platform: what lets the helper act as root is one command the operator runs as root, which `setup`
-names and proves only on a store that is a ZFS dataset (09_substrates.md, "Install and privilege"). On an APFS store the
-installed helper is never run.
+writes sudoers on any platform: what lets the helper act as root is one root step, which `setup` names and proves for
+every ZFS root the host serves (09_substrates.md, "Install and privilege"): on Linux a command the operator runs as
+root, on macOS an action of setup's own administrator authorization. A host that serves no ZFS root never runs it.
 
 **The Nx cache server is JavaScript run by the shell's `bun`** (the owner's rulings, 2026-10-17 and 2026-10-18). Neither
 `@smoothbricks/cowshed` nor `@smoothbricks/nx-cache-server` ships a compiled server or an interpreter. An install copies

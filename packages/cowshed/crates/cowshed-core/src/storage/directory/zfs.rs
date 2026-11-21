@@ -152,6 +152,42 @@ fn beside_this_executable() -> Option<PathBuf> {
         .and_then(|executable| Some(executable.parent()?.to_owned()))
 }
 
+/// The root helper beside this executable ([`super::build_root_helper`]).
+pub(super) fn build_root_helper() -> Option<PathBuf> {
+    Some(beside_this_executable()?.join(HELPER)).filter(|helper| helper.is_file())
+}
+
+/// [`super::roots_awaiting_root_helper`].
+pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, ApfsStorageError> {
+    if !zfs_installed() {
+        return Ok(Vec::new());
+    }
+    let (_, roots) = roots_serving_this_user()?;
+    if roots.is_empty() {
+        return Ok(roots);
+    }
+    let system = Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join(HELPER);
+    let current = match super::file_sha256(&system) {
+        Ok(digest) => digest == sha256,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_error("hash the system root helper", &system, error)),
+    };
+    Ok(roots
+        .into_iter()
+        .filter(|root| {
+            if !current {
+                return true;
+            }
+            let mut command = Command::new("sudo");
+            command
+                .args(["-n", "-k"])
+                .arg(&system)
+                .args([root.as_str(), "check"]);
+            run("cowshed-helper check", command).is_err()
+        })
+        .collect())
+}
+
 fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageError> {
     let described = format!("{command:?}");
     let output = deadline::output_within(role, &mut command, &deadline::start(role, ZFS))

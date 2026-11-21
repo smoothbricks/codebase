@@ -103,6 +103,17 @@ pub enum HostAction {
     InstallMountService {
         label: String,
     },
+    /// Install this build's ZFS root helper in the root-owned system directory, with the sudoers
+    /// entry that admits exactly its bytes for `uid` (09_substrates.md, "Install and privilege"):
+    /// planned on macOS when a cowshed root names the user and its helper is not yet proven, and
+    /// run in setup's one authorization session. `roots` are the roots it serves; `sha256` is the
+    /// digest of `helper`, the build's own, taken when the plan was made.
+    InstallRootHelper {
+        roots: Vec<String>,
+        helper: PathBuf,
+        sha256: String,
+        uid: u32,
+    },
     /// Delete the retired caches volume, which holds nothing but its marker. Its `/etc/fstab` pin
     /// and its mount-service entry go with it, rewritten without it in the same session.
     DeleteVolume {

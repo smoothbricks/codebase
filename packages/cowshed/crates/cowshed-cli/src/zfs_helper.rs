@@ -7,52 +7,34 @@
 //! ([`cowshed_helper::host::SYSTEM_DIRECTORY`]), reached through `sudo -n`: a sudoers entry
 //! admits it without a password, since the gateway daemon has no terminal to type one at, and
 //! pins its SHA-256. `cowshed setup` proves that by the helper's `check` verb and, when the
-//! proof fails or the copy is not this build's, installs it: at a terminal it runs the root
-//! command itself ([`mend`]), which `sudo` authorizes, and anywhere else it refuses with that
-//! command.
+//! proof fails or the copy is not this build's, installs it. On Linux, at a terminal it runs the
+//! root command itself ([`mend`]), which `sudo` authorizes, and anywhere else it refuses with
+//! that command. On macOS the install is an action of setup's one administrator authorization
+//! session (01c_macos.md, "Privileged steps run in one authorization session"), planned with the
+//! host's storage, so this only proves it and, unproven, names setup as the next step.
 
 use std::path::Path;
 
-use cowshed_core::storage::directory::{HelperProof, prove_store_helper};
+use cowshed_core::storage::directory::{
+    HelperProof, SUDOERS_DROP_INS, prove_store_helper, sudoers_entry,
+};
 use cowshed_core::{CowshedError, Result};
 
 use crate::declared_land::shell_word;
 use crate::gateway_service::{HELPER_NAME, executable_digest, launchd_error};
 use crate::launchd::HostStableExecutable;
 
-/// Where a host's sudoers reads drop-in files from.
-const SUDOERS_DROP_INS: &str = "/etc/sudoers.d";
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 
-/// `path` as sudoers spells a command name, or `None` when it holds a character this spelling
-/// does not cover. Whitespace ends a command name and `,`, `:`, `=` and `#` have a meaning of
-/// their own; a backslash takes each away. A backslash, a quote, `!`, the wildcards `*`, `?`, `[`
-/// and `]`, and every control character are refused rather than guessed at.
-fn sudoers_command(path: &Path) -> Option<String> {
-    let text = path.to_str()?;
-    let mut spelled = String::with_capacity(text.len() + 8);
-    for character in text.chars() {
-        match character {
-            ' ' | ',' | ':' | '=' | '#' => {
-                spelled.push('\\');
-                spelled.push(character);
-            }
-            '\\' | '"' | '!' | '*' | '?' | '[' | ']' => return None,
-            other if other.is_control() => return None,
-            other => spelled.push(other),
-        }
-    }
-    Some(spelled)
-}
-
-/// The sudoers entry that admits `uid` to run as root, without a password, the helper at
-/// `helper` while its bytes hash to `sha256`.
-fn sudoers_entry(uid: u32, sha256: &str, helper: &Path) -> Option<String> {
-    Some(format!(
-        "#{uid} ALL=(root) NOPASSWD: sha256:{sha256} {}",
-        sudoers_command(helper)?
-    ))
-}
-
+/// Whether setup runs the root remedy of an unproven helper itself, at a terminal.
+pub use platform::TERMINAL_REMEDY;
 /// What makes a helper that did not act as root do so: why this is the step, and the command.
 #[derive(Debug, Eq, PartialEq)]
 struct Remedy {
@@ -152,13 +134,14 @@ pub fn prove(store_root: &Path, home: &Path, uid: u32, setup: &Path) -> Result<O
         HelperProof::Proven { .. } => return Ok(None),
     };
     let Remedy { why, command } = remedy(uid, installed.path(), &helper, &system, &sha256);
+    let why = platform::why(why);
     Ok(Some(Unproven {
         refusal: CowshedError::environment_missing(
             format!(
                 "{} is not this build's helper acting as root from a root-owned place for the ZFS root {root}: {cause}; {why}",
                 helper.display()
             ),
-            format!("{command} && {}", rerun(setup)),
+            platform::next(&command, rerun(setup)),
         ),
         command,
     }))
@@ -189,33 +172,6 @@ mod tests {
     use super::*;
 
     const SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-
-    #[test]
-    fn a_command_name_is_spelled_for_sudoers_or_refused() {
-        for (path, expected) in [
-            ("/usr/bin/cowshed-helper", Some("/usr/bin/cowshed-helper")),
-            (
-                "/home/u/Library/Application Support/dev.cowshed/bin/cowshed-helper",
-                Some("/home/u/Library/Application\\ Support/dev.cowshed/bin/cowshed-helper"),
-            ),
-            ("/h/a,b:c=d#e/x", Some("/h/a\\,b\\:c\\=d\\#e/x")),
-            ("/h/ü/x", Some("/h/ü/x")),
-            ("/h/a\\b/x", None),
-            ("/h/a\"b/x", None),
-            ("/h/a!b/x", None),
-            ("/h/a*b/x", None),
-            ("/h/a?b/x", None),
-            ("/h/a[b]/x", None),
-            ("/h/a\tb/x", None),
-            ("/h/a\nb/x", None),
-        ] {
-            assert_eq!(
-                sudoers_command(Path::new(path)).as_deref(),
-                expected,
-                "{path:?}"
-            );
-        }
-    }
 
     #[test]
     fn the_remedy_is_the_one_root_command_for_the_helper_that_is_reached() {

@@ -130,6 +130,76 @@ pub fn prove_store_helper(
     Ok(proof)
 }
 
+/// Where a host's sudoers reads drop-in files from.
+pub const SUDOERS_DROP_INS: &str = "/etc/sudoers.d";
+
+/// `path` as sudoers spells a command name, or `None` when it holds a character this spelling
+/// does not cover. Whitespace ends a command name and `,`, `:`, `=` and `#` have a meaning of
+/// their own; a backslash takes each away. A backslash, a quote, `!`, the wildcards `*`, `?`, `[`
+/// and `]`, and every control character are refused rather than guessed at.
+pub fn sudoers_command(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    let mut spelled = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        match character {
+            ' ' | ',' | ':' | '=' | '#' => {
+                spelled.push('\\');
+                spelled.push(character);
+            }
+            '\\' | '"' | '!' | '*' | '?' | '[' | ']' => return None,
+            other if other.is_control() => return None,
+            other => spelled.push(other),
+        }
+    }
+    Some(spelled)
+}
+
+/// The sudoers entry that admits `uid` to run as root, without a password, the helper at
+/// `helper` while its bytes hash to `sha256`.
+pub fn sudoers_entry(uid: u32, sha256: &str, helper: &Path) -> Option<String> {
+    Some(format!(
+        "#{uid} ALL=(root) NOPASSWD: sha256:{sha256} {}",
+        sudoers_command(helper)?
+    ))
+}
+
+/// The SHA-256 of the file at `path`, as lowercase hex: the spelling a sudoers digest takes. The
+/// file is read once, in fixed chunks.
+pub fn file_sha256(path: &Path) -> io::Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut chunk = vec![0_u8; 1 << 16];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// The root helper of the build this process runs from: `cowshed-helper` beside its executable,
+/// where every distribution carries it (09_substrates.md, "Install and privilege").
+pub fn build_root_helper() -> Option<PathBuf> {
+    zfs::build_root_helper()
+}
+
+/// The ZFS roots that name this user whose root helper is not yet the system directory's copy
+/// of the build whose helper hashes to `sha256`, admitted by `sudo` with no credentials a
+/// terminal cached (09_substrates.md, "Install and privilege"). Empty on a host with no `zfs`
+/// or no such root, and on one whose helper is proven. Only reads, and `check` through `sudo -n
+/// -k`: nothing changes and nothing prompts.
+pub fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, ApfsStorageError> {
+    zfs::roots_awaiting_root_helper(sha256)
+}
+
 /// The lifecycle host of a directory store. It holds no state but its configuration: the
 /// filesystem - payload directories, their records and their bindings - is the whole truth.
 #[derive(Debug)]
