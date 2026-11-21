@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
-use cowshed_cli::capabilities::mbx::{ForkPin, MbxInstall, TargetCollection};
+use cowshed_cli::capabilities::mbx::{ForkPin, MbxInstall, ShippedFlake, TargetCollection};
 use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
@@ -250,14 +250,16 @@ impl HostSetup for FakeHost {
         Ok(self.legacy.clone())
     }
 
-    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+    fn mbx_flake(&mut self) -> Result<Option<ShippedFlake>> {
         match self.mbx_flake_error.take() {
             Some(error) => Err(error),
-            None => Ok(Some(PathBuf::from("/fake/nix/mbx"))),
+            None => Ok(Some(ShippedFlake::Directory(PathBuf::from(
+                "/fake/nix/mbx",
+            )))),
         }
     }
 
-    async fn install_mbx(&mut self, _flake: &std::path::Path) -> Result<Option<MbxInstall>> {
+    async fn install_mbx(&mut self, _flake: &ShippedFlake) -> Result<Option<MbxInstall>> {
         self.events.push(String::from("install-mbx"));
         Ok(self.mbx_install.clone())
     }
@@ -2345,7 +2347,7 @@ async fn an_installed_mbx_keeps_each_main_and_evicts_shed_targets_first() {
 
     let mut host = FakeHost {
         mbx_install: Some(MbxInstall::NixMissing {
-            flake: PathBuf::from("/pkg/nix/mbx"),
+            flake: ShippedFlake::Directory(PathBuf::from("/pkg/nix/mbx")),
             fork: None,
         }),
         ..FakeHost::default()
@@ -2368,7 +2370,7 @@ async fn an_installed_mbx_keeps_each_main_and_evicts_shed_targets_first() {
 async fn a_host_without_nix_keeps_no_mbx_and_still_succeeds() {
     let mut host = FakeHost {
         mbx_install: Some(MbxInstall::NixMissing {
-            flake: PathBuf::from("/opt/cowshed/nix/mbx"),
+            flake: ShippedFlake::Directory(PathBuf::from("/opt/cowshed/nix/mbx")),
             fork: Some(ForkPin {
                 repository: String::from("smoothbricks/mr-boxington"),
                 revision: String::from("1056ab0f"),

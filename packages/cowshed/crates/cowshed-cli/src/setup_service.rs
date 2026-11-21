@@ -20,7 +20,7 @@
 //! is the prompt and `--force` is the answer.
 
 use crate::args::SetupArgs;
-use crate::capabilities::mbx::{MbxInstall, TargetCollection};
+use crate::capabilities::mbx::{MbxInstall, ShippedFlake, TargetCollection};
 use crate::gateway_service::{
     CliInstall, Downgrade, HELPER_NAME, ServiceBinaryRefresh, canonical_home, effective_uid,
     gateway_launch_agent, output_error, remove_host_stable_executable, remove_launch_agent,
@@ -222,7 +222,7 @@ pub trait HostSetup: Send {
     /// a build that cannot install its mbx installs nothing, rather than restarting the gateway on
     /// it and installing it as the CLI before failing. `None` for a test host, which must never
     /// build or link into a real home.
-    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+    fn mbx_flake(&mut self) -> Result<Option<ShippedFlake>> {
         Ok(None)
     }
     /// Install cowshed's pinned mbx beside the installed cowshed (14_nix.md, "mbx"): build the
@@ -230,7 +230,7 @@ pub trait HostSetup: Send {
     ///
     /// `None` for a test host, which must never build or link into a real home; the native host
     /// answers always.
-    async fn install_mbx(&mut self, _flake: &Path) -> Result<Option<MbxInstall>> {
+    async fn install_mbx(&mut self, _flake: &ShippedFlake) -> Result<Option<MbxInstall>> {
         Ok(None)
     }
     /// Name every adopted main in the host mbx's `target.keep` and every shed mount tree in its
@@ -621,11 +621,11 @@ impl HostSetup for NativeHostSetup {
     }
 
     /// Nix's build runs on this task: setup's own work, which the operator's interrupt ends.
-    fn mbx_flake(&mut self) -> Result<Option<PathBuf>> {
+    fn mbx_flake(&mut self) -> Result<Option<ShippedFlake>> {
         crate::capabilities::mbx::flake_directory().map(Some)
     }
 
-    async fn install_mbx(&mut self, flake: &Path) -> Result<Option<MbxInstall>> {
+    async fn install_mbx(&mut self, flake: &ShippedFlake) -> Result<Option<MbxInstall>> {
         crate::capabilities::mbx::install(&self.home, flake).map(Some)
     }
 

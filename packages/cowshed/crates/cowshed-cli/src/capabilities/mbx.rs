@@ -11,6 +11,8 @@
 use cowshed_core::capabilities::mbx::{self, LinkPlan};
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
+use std::ffi::OsStr;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,6 +21,54 @@ const FLAKE_DIRECTORY: [&str; 2] = ["nix", "mbx"];
 
 /// The file that identifies [`FLAKE_DIRECTORY`] as the real thing rather than an empty namesake.
 const FLAKE_MANIFEST: &str = "flake.nix";
+
+/// The lock beside [`FLAKE_MANIFEST`] that decides every input's revision.
+const FLAKE_LOCK: &str = "flake.lock";
+
+/// The flake of the sources this build was compiled from, which the build carries: both files
+/// are compiled in from the crate's own sources and Cargo fingerprints them, so wherever the
+/// checkout that built it is now, these are its bytes, and no build-time path is kept.
+const SOURCE_FLAKE: [(&str, &str); 2] = [
+    (
+        FLAKE_MANIFEST,
+        include_str!("../../../../nix/mbx/flake.nix"),
+    ),
+    (FLAKE_LOCK, include_str!("../../../../nix/mbx/flake.lock")),
+];
+
+/// The flake setup builds mbx from (14_nix.md, "mbx").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShippedFlake {
+    /// The `nix/mbx` above the running executable: a package's.
+    Directory(PathBuf),
+    /// The flake of the sources a build run from its Cargo profile directory was compiled from
+    /// ([`SOURCE_FLAKE`]).
+    Sources,
+}
+
+impl ShippedFlake {
+    /// The pin the flake's `flake.nix` names, read from its own bytes.
+    fn fork(&self) -> Option<ForkPin> {
+        match self {
+            Self::Directory(directory) => std::fs::read_to_string(directory.join(FLAKE_MANIFEST))
+                .ok()
+                .as_deref()
+                .and_then(ForkPin::parse),
+            Self::Sources => ForkPin::parse(SOURCE_FLAKE[0].1),
+        }
+    }
+}
+
+impl std::fmt::Display for ShippedFlake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Directory(directory) => write!(formatter, "{}", directory.display()),
+            Self::Sources => {
+                formatter.write_str("the mbx flake this Cargo build carries from its sources")
+            }
+        }
+    }
+}
 
 /// The flake output setup installs.
 const FLAKE_ATTRIBUTE: &str = "mbx";
@@ -38,7 +88,7 @@ pub enum MbxInstall {
     /// No `nix` on PATH and no `mbx` there either: nothing was built or linked, and the host
     /// keeps no mbx. `fork` is the source `flake` pins, for the operator to install by Cargo.
     NixMissing {
-        flake: PathBuf,
+        flake: ShippedFlake,
         fork: Option<ForkPin>,
     },
     /// `nix build` ran and failed; `stderr` is nix's, verbatim.
@@ -78,8 +128,7 @@ impl MbxInstall {
                     None => String::new(),
                 };
                 format!(
-                    "mbx: nix is not on PATH, so {} could not be built; this host keeps no mbx and schedules Cargo without it{install}",
-                    flake.display()
+                    "mbx: nix is not on PATH, so {flake} could not be built; this host keeps no mbx and schedules Cargo without it{install}"
                 )
             }
             Self::BuildFailed {
@@ -179,7 +228,26 @@ fn exit_phrase(status: Option<i32>) -> String {
 /// the same lock a published package does. With `--no-update-lock-file` the build reads that lock and
 /// never rewrites it: a lock that no longer matches the revision `flake.nix` names fails the build
 /// instead of relocking.
-pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
+pub fn install(home: &Path, flake: &ShippedFlake) -> Result<MbxInstall> {
+    install_searching(home, flake, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// [`install`] with `search` as the `PATH` that finds `nix`, or else an operator's `mbx`.
+fn install_searching(home: &Path, flake: &ShippedFlake, search: &OsStr) -> Result<MbxInstall> {
+    let Some(nix) = program_on(search, NIX_EXECUTABLE) else {
+        // A host without nix runs the mbx its operator installed from the same pin.
+        let Some(program) = mbx_on(search, &mbx::host_link(home)) else {
+            return Ok(MbxInstall::NixMissing {
+                flake: flake.clone(),
+                fork: flake.fork(),
+            });
+        };
+        let installed = link(home, &program)?;
+        if matches!(installed, MbxInstall::Installed { .. }) {
+            install_cargo_route(home)?;
+        }
+        return Ok(installed);
+    };
     let root = mbx::gc_root(home);
     let parent = root
         .parent()
@@ -187,49 +255,43 @@ pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
     std::fs::create_dir_all(parent).map_err(|error| {
         CowshedError::internal(format!("could not create {}: {error}", parent.display()))
     })?;
+    // Nix reads a flake only from a directory: a Cargo build's own is written for this build.
+    let (directory, written) = match flake {
+        ShippedFlake::Directory(directory) => (directory.clone(), false),
+        ShippedFlake::Sources => (write_source_flake(parent)?, true),
+    };
     // WHY unbounded: the nix build is setup's own work, network-bound on a cold host; the
     // operator's interrupt ends it.
     #[allow(clippy::disallowed_methods)]
-    let output = match Command::new(NIX_EXECUTABLE)
+    let output = match Command::new(&nix)
         .arg("build")
         .arg("--no-update-lock-file")
-        .arg(format!("path:{}#{FLAKE_ATTRIBUTE}", flake.display()))
+        .arg(format!("path:{}#{FLAKE_ATTRIBUTE}", directory.display()))
         .arg("--out-link")
         .arg(&root)
         .output_locked()
     {
         Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A host without nix runs the mbx its operator installed from the same pin.
-            let found =
-                std::env::var_os("PATH").and_then(|search| mbx_on(&search, &mbx::host_link(home)));
-            let Some(program) = found else {
-                return Ok(MbxInstall::NixMissing {
-                    flake: flake.to_owned(),
-                    fork: std::fs::read_to_string(flake.join(FLAKE_MANIFEST))
-                        .ok()
-                        .as_deref()
-                        .and_then(ForkPin::parse),
-                });
-            };
-            let installed = link(home, &program)?;
-            if matches!(installed, MbxInstall::Installed { .. }) {
-                install_cargo_route(home)?;
-            }
-            return Ok(installed);
-        }
         Err(error) => {
+            if written {
+                remove_source_flake(&directory)?;
+            }
             return Err(CowshedError::internal(format!(
-                "could not run {NIX_EXECUTABLE} build: {error}"
+                "could not run {} build: {error}",
+                nix.display()
             )));
         }
     };
     if !output.status.success() {
+        // A written flake stays: the retry this failure prints builds it.
         return Ok(MbxInstall::BuildFailed {
-            flake: flake.to_owned(),
+            flake: directory,
             status: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
+    }
+    if written {
+        remove_source_flake(&directory)?;
     }
     let installed = link(home, &rooted_program(&root)?)?;
     if matches!(installed, MbxInstall::Installed { .. }) {
@@ -399,13 +461,54 @@ fn link(home: &Path, program: &Path) -> Result<MbxInstall> {
 /// `target/<triple>/<profile>`): an executable beside one is a build run from where Cargo left it.
 const CARGO_PROFILE_LOCK: &str = ".cargo-lock";
 
-/// The flake directory this build ships (14_nix.md, "mbx"): the first `nix/mbx` that holds a
-/// `flake.nix` above the running executable, which is the package root for a packaged build
+/// `name` in the first absolute directory of `search` that holds it.
+fn program_on(search: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(search)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Write [`SOURCE_FLAKE`] into a fresh directory of this user's alone below `parent`, for one
+/// `nix build`.
+fn write_source_flake(parent: &Path) -> Result<PathBuf> {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let directory = parent.join(format!(".mbx-flake-{}-{started}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|error| {
+            CowshedError::internal(format!("could not create {}: {error}", directory.display()))
+        })?;
+    for (name, bytes) in SOURCE_FLAKE {
+        let file = directory.join(name);
+        if let Err(error) = std::fs::write(&file, bytes) {
+            remove_source_flake(&directory)?;
+            return Err(CowshedError::internal(format!(
+                "could not write {}: {error}",
+                file.display()
+            )));
+        }
+    }
+    Ok(directory)
+}
+
+/// Remove a directory [`write_source_flake`] wrote.
+fn remove_source_flake(directory: &Path) -> Result<()> {
+    std::fs::remove_dir_all(directory).map_err(|error| {
+        CowshedError::internal(format!("could not remove {}: {error}", directory.display()))
+    })
+}
+
+/// The flake this build ships (14_nix.md, "mbx"): the first `nix/mbx` that holds a `flake.nix`
+/// above the running executable, which is the package root for a packaged build
 /// (`dist/bin/<platform>/cowshed`). A build run from its Cargo profile directory has no package
 /// above it, because the target directory is the workspace's, or a link to one outside the
-/// checkout, so it looks next above the crate sources it was compiled from: the flake of the
-/// checkout that built it. An installed package never takes that second walk.
-pub fn flake_directory() -> Result<PathBuf> {
+/// checkout, so it builds the flake of the sources it was compiled from, which it carries
+/// ([`SOURCE_FLAKE`]). An installed package never does.
+pub fn flake_directory() -> Result<ShippedFlake> {
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|error| {
@@ -414,35 +517,26 @@ pub fn flake_directory() -> Result<PathBuf> {
                 "reinstall cowshed",
             )
         })?;
-    flake_directory_from(&executable, Path::new(env!("CARGO_MANIFEST_DIR")))
+    flake_directory_from(&executable)
 }
 
-/// [`flake_directory`] for `executable`, a build of the crate at `manifest_directory`. The
-/// filesystem is read and nothing else: every directory above `executable`, then, only when
-/// `executable` lies in a Cargo profile directory, `manifest_directory` and every directory above
-/// it. The error names every candidate of the walks it took.
-fn flake_directory_from(executable: &Path, manifest_directory: &Path) -> Result<PathBuf> {
+/// [`flake_directory`] for `executable`. The filesystem is read and nothing else: every directory
+/// above `executable`, then whether `executable` lies in a Cargo profile directory. The error
+/// names every candidate the walk took.
+fn flake_directory_from(executable: &Path) -> Result<ShippedFlake> {
     let mut searched = Vec::new();
     if let Some(flake) = flake_above(executable.ancestors().skip(1), &mut searched) {
-        return Ok(flake);
+        return Ok(ShippedFlake::Directory(flake));
     }
-    let cargo_built = executable
+    if executable
         .parent()
-        .is_some_and(|profile| profile.join(CARGO_PROFILE_LOCK).is_file());
-    if cargo_built && let Some(flake) = flake_above(manifest_directory.ancestors(), &mut searched) {
-        return Ok(flake);
+        .is_some_and(|profile| profile.join(CARGO_PROFILE_LOCK).is_file())
+    {
+        return Ok(ShippedFlake::Sources);
     }
-    let sources = if cargo_built {
-        format!(
-            " or above the sources it was built from, {}",
-            manifest_directory.display()
-        )
-    } else {
-        String::new()
-    };
     Err(CowshedError::environment_missing(
         format!(
-            "could not find the mbx flake ({}/{FLAKE_MANIFEST}) above {}{sources}; looked in {}",
+            "could not find the mbx flake ({}/{FLAKE_MANIFEST}) above {}; looked in {}",
             FLAKE_DIRECTORY.join("/"),
             executable.display(),
             searched
@@ -744,16 +838,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Where setup finds its flake, by the layout the executable runs from (14_nix.md, "mbx"):
-    /// above the executable wherever one is there, above the sources the build was compiled from
-    /// only for an executable in a Cargo profile directory, and nowhere else.
+    /// What a Cargo build carries is its own sources' `nix/mbx`, byte for byte.
     #[test]
-    fn the_flake_is_found_above_the_executable_or_above_a_cargo_builds_sources() {
-        /// Which walk answers, or that none does.
+    fn the_carried_flake_is_the_crates_own_sources() {
+        let sources = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets the crate directory"),
+        )
+        .join("../../nix/mbx");
+        for (name, bytes) in SOURCE_FLAKE {
+            assert_eq!(
+                std::fs::read_to_string(sources.join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+    }
+
+    /// Where setup finds its flake, by the layout the executable runs from (14_nix.md, "mbx"):
+    /// above the executable wherever one is there, else, only for an executable in a Cargo
+    /// profile directory, the flake its own sources held, wherever that checkout is now and with
+    /// no Cargo environment; an installed package without one is refused, naming every candidate.
+    #[test]
+    fn the_flake_is_found_above_the_executable_or_carried_by_a_cargo_build() {
+        /// Which flake answers, or that none does.
         enum Found {
             AbovePackage,
-            AboveSources,
-            Nowhere { names_the_source_walk: bool },
+            Carried,
+            Nowhere,
         }
         struct Case {
             name: &'static str,
@@ -763,8 +874,6 @@ mod tests {
             cargo_profile: bool,
             /// Whether the package root above the executable carries the flake.
             package_flake: bool,
-            /// Whether the checkout above the manifest directory carries the flake.
-            source_flake: bool,
             found: Found,
         }
         let cases = [
@@ -773,7 +882,6 @@ mod tests {
                 executable: &["dist", "bin", "linux-x64", "cowshed"],
                 cargo_profile: false,
                 package_flake: true,
-                source_flake: false,
                 found: Found::AbovePackage,
             },
             Case {
@@ -781,7 +889,6 @@ mod tests {
                 executable: &["target", "release", "cowshed"],
                 cargo_profile: true,
                 package_flake: true,
-                source_flake: true,
                 found: Found::AbovePackage,
             },
             Case {
@@ -789,56 +896,28 @@ mod tests {
                 executable: &["target", "debug", "cowshed"],
                 cargo_profile: true,
                 package_flake: false,
-                source_flake: true,
-                found: Found::AboveSources,
+                found: Found::Carried,
             },
             Case {
                 name: "cargo-triple-profile",
                 executable: &["target", "x86_64-unknown-linux-gnu", "release", "cowshed"],
                 cargo_profile: true,
                 package_flake: false,
-                source_flake: true,
-                found: Found::AboveSources,
+                found: Found::Carried,
             },
             Case {
-                name: "cargo-profile-no-flake",
-                executable: &["target", "debug", "cowshed"],
-                cargo_profile: true,
-                package_flake: false,
-                source_flake: false,
-                found: Found::Nowhere {
-                    names_the_source_walk: true,
-                },
-            },
-            Case {
-                name: "installed-beside-sources",
+                name: "installed-without-flake",
                 executable: &["dist", "bin", "linux-x64", "cowshed"],
                 cargo_profile: false,
                 package_flake: false,
-                source_flake: true,
-                found: Found::Nowhere {
-                    names_the_source_walk: false,
-                },
+                found: Found::Nowhere,
             },
         ];
-        let flake_in = |root: &Path, present: bool| {
-            let flake = FLAKE_DIRECTORY
-                .iter()
-                .fold(root.to_path_buf(), |path, part| path.join(part));
-            if present {
-                std::fs::create_dir_all(&flake).unwrap();
-                std::fs::write(flake.join(FLAKE_MANIFEST), b"{}").unwrap();
-            }
-            flake
-        };
         for case in cases {
             let name = case.name;
             let root = scratch(&format!("flake-{name}"));
-            // The executable's tree and the checkout share no ancestor that could carry a flake.
+            // No directory above the executable is a checkout or holds a flake but the package's.
             let package = root.join("built");
-            let checkout = root.join("checkout");
-            let manifest = checkout.join("crates").join("cowshed-cli");
-            std::fs::create_dir_all(&manifest).unwrap();
             let executable = case
                 .executable
                 .iter()
@@ -848,17 +927,25 @@ mod tests {
             if case.cargo_profile {
                 std::fs::write(profile.join(CARGO_PROFILE_LOCK), b"").unwrap();
             }
-            let package_flake = flake_in(&package, case.package_flake);
-            let source_flake = flake_in(&checkout, case.source_flake);
-            let nearest_to_sources = flake_in(&manifest, false);
+            let package_flake = FLAKE_DIRECTORY
+                .iter()
+                .fold(package.clone(), |path, part| path.join(part));
+            if case.package_flake {
+                std::fs::create_dir_all(&package_flake).unwrap();
+                std::fs::write(package_flake.join(FLAKE_MANIFEST), b"{}").unwrap();
+            }
 
-            let found = flake_directory_from(&executable, &manifest);
+            let found = flake_directory_from(&executable);
             match case.found {
-                Found::AbovePackage => assert_eq!(found.unwrap(), package_flake, "{name}"),
-                Found::AboveSources => assert_eq!(found.unwrap(), source_flake, "{name}"),
-                Found::Nowhere {
-                    names_the_source_walk,
-                } => {
+                Found::AbovePackage => {
+                    assert_eq!(
+                        found.unwrap(),
+                        ShippedFlake::Directory(package_flake),
+                        "{name}"
+                    );
+                }
+                Found::Carried => assert_eq!(found.unwrap(), ShippedFlake::Sources, "{name}"),
+                Found::Nowhere => {
                     let error = found.expect_err(name);
                     assert_eq!(
                         error.code,
@@ -876,32 +963,130 @@ mod tests {
                     };
                     assert!(
                         message.starts_with(&format!(
-                            "could not find the mbx flake (nix/mbx/flake.nix) above {}",
+                            "could not find the mbx flake (nix/mbx/flake.nix) above {}; looked in ",
                             executable.display()
                         )),
                         "{name}: {message}"
                     );
                     assert!(looked_in(&package_flake), "{name}: {message}");
+                    let nearest = FLAKE_DIRECTORY
+                        .iter()
+                        .fold(profile.to_path_buf(), |path, part| path.join(part));
                     assert!(
-                        looked_in(&flake_in(profile, false)),
+                        looked_in(&nearest),
                         "{name}: the walk starts at the executable's directory: {message}"
-                    );
-                    for candidate in [&nearest_to_sources, &source_flake] {
-                        assert_eq!(
-                            looked_in(candidate),
-                            names_the_source_walk,
-                            "{name}: {message}"
-                        );
-                    }
-                    assert_eq!(
-                        message.contains(&manifest.display().to_string()),
-                        names_the_source_walk,
-                        "{name}: {message}"
                     );
                 }
             }
-            let _ = std::fs::remove_dir_all(&root);
+            std::fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    /// A Cargo build's carried flake reaches nix as a directory of this user's alone, written only
+    /// when nix runs: removed once the build succeeds, kept when it fails for the retry the
+    /// failure prints, and never written on a host without nix, which is told the carried pin.
+    #[test]
+    fn a_cargo_builds_flake_is_written_only_for_nix_and_kept_only_for_a_failed_builds_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let written = |home: &Path| -> Vec<PathBuf> {
+            let parent = mbx::gc_root(home).parent().unwrap().to_path_buf();
+            std::fs::read_dir(&parent)
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".mbx-flake-")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let script = |path: &Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // No nix and no mbx on PATH: nothing is written, and the pin is the carried flake's.
+        let home = scratch("carried-no-nix");
+        let empty = home.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let outcome = install_searching(&home, &ShippedFlake::Sources, empty.as_os_str()).unwrap();
+        let MbxInstall::NixMissing { flake, fork } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(flake, &ShippedFlake::Sources);
+        assert_eq!(fork, &ForkPin::parse(SOURCE_FLAKE[0].1));
+        assert!(fork.is_some());
+        assert!(
+            !outcome.phrase().contains(".mbx-flake-"),
+            "{}",
+            outcome.phrase()
+        );
+        assert_eq!(written(&home), Vec::<PathBuf>::new());
+        std::fs::remove_dir_all(&home).unwrap();
+
+        // nix fails: the flake it was given stays, private, and the retry names it.
+        let home = scratch("carried-failed");
+        let bin = home.join("bin");
+        script(
+            &bin.join("nix"),
+            "#!/bin/sh\necho 'cannot fetch' >&2\nexit 1\n",
+        );
+        let outcome = install_searching(&home, &ShippedFlake::Sources, bin.as_os_str()).unwrap();
+        let MbxInstall::BuildFailed { flake, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(written(&home), vec![flake.clone()]);
+        assert_eq!(
+            std::fs::metadata(flake).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for (name, bytes) in SOURCE_FLAKE {
+            assert_eq!(
+                std::fs::read_to_string(flake.join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+        let retry = outcome
+            .failure()
+            .expect("a failed build fails the run")
+            .hint;
+        assert!(
+            retry.contains(&format!("path:{}#{FLAKE_ATTRIBUTE}", flake.display())),
+            "{retry:?}"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+
+        // nix succeeds: it read the carried flake from a directory that is gone afterwards.
+        let home = scratch("carried-built");
+        let bin = home.join("bin");
+        let seen = home.join("seen-flake.nix");
+        let store = home.join("store/mbx");
+        script(
+            &store.join("bin/mbx"),
+            "#!/bin/sh\nmkdir -p \"$XDG_DATA_HOME/mbx/bin\" && printf '#!/bin/sh\\n' > \"$XDG_DATA_HOME/mbx/bin/cargo\" && printf 'target\\n' > \"$XDG_DATA_HOME/mbx/bin/mbx-target\"\n",
+        );
+        script(
+            &bin.join("nix"),
+            &format!(
+                "#!/bin/sh\nflake=${{3#path:}}\ncp \"${{flake%#mbx}}/flake.nix\" {seen} && ln -s {store} \"$5\"\n",
+                seen = seen.display(),
+                store = store.display()
+            ),
+        );
+        let outcome = install_searching(&home, &ShippedFlake::Sources, bin.as_os_str()).unwrap();
+        assert!(
+            matches!(outcome, MbxInstall::Installed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), SOURCE_FLAKE[0].1);
+        assert_eq!(written(&home), Vec::<PathBuf>::new());
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

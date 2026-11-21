@@ -198,12 +198,19 @@ holding a `flake.nix` in a directory above the canonical running executable. A b
 (`dist/bin/<platform>/cowshed`) or made by the package's `cli-<arch>-<os>` target, has the package root above it, and
 the package root carries `nix/mbx`. A build run from its Cargo profile directory has no package above it: the Cargo
 target directory is the workspace's, or a link to an mbx-managed target outside the checkout. Cargo marks every profile
-directory it builds into with `.cargo-lock`, so an executable beside that file looks next in the crate directory it was
-compiled from and every directory above it, which is the checkout that built it and therefore the flake of the sources
-it is. The rule is one on every platform, and an executable in no Cargo profile directory never takes the second walk:
-an installed package that lacks `nix/mbx` is refused, the error naming every directory it looked in, and setup has
-changed nothing (`a_build_that_cannot_find_its_mbx_flake_changes_nothing`). Enforced by `cowshed-cli`'s
-`the_flake_is_found_above_the_executable_or_above_a_cargo_builds_sources`.
+directory it builds into with `.cargo-lock`, so an executable beside that file builds the flake of the sources it was
+compiled from, which the build carries: `nix/mbx/flake.nix` and `flake.lock` are compiled in from the crate's own
+sources and Cargo fingerprints both, so they are the bytes of the checkout that built it wherever that checkout is now,
+and no build-time path is kept, which a fork that inherited main's build would read as main's checkout. Nix reads a
+flake only from a directory, so a setup that runs `nix` writes the two files into a fresh directory of the user's alone
+beside the GC root, builds it, and removes it once the build succeeds; a failed build leaves it, because the retry its
+failure prints builds it. Without `nix` nothing is written: the pin is read from the carried `flake.nix`, and the PATH
+`mbx` or the `cargo install` command above applies as for a package. The rule is one on every platform, and an
+executable in no Cargo profile directory never builds a carried flake: an installed package that lacks `nix/mbx` is
+refused, the error naming every directory it looked in, and setup has changed nothing
+(`a_build_that_cannot_find_its_mbx_flake_changes_nothing`). Enforced by `cowshed-cli`'s
+`the_flake_is_found_above_the_executable_or_carried_by_a_cargo_build` and
+`a_cargo_builds_flake_is_written_only_for_nix_and_kept_only_for_a_failed_builds_retry`.
 
 ## Deployment postures
 
