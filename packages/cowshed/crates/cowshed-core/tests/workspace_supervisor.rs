@@ -10254,7 +10254,11 @@ async fn a_refused_job_span_is_counted_and_never_fails_its_job() {
     let info = h.handle.wait(job).await.unwrap();
     assert_eq!(info.state, JobState::Exited);
     let health = h.handle.trace_health().await.unwrap();
-    assert_eq!((health.recorded, health.failed), (0, 2), "{health:?}");
+    assert_eq!(
+        (health.recorded, health.failed),
+        (0, 3),
+        "start, jobserver setup, and end were each refused: {health:?}"
+    );
     assert!(
         health
             .last_failure
@@ -10851,30 +10855,32 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         .iter()
         .flat_map(|(_, batch)| (0..batch.num_rows()).map(move |row| (batch, row)))
         .collect::<Vec<_>>();
-    assert_eq!(
-        rows.len(),
-        3,
-        "a start row, the unattributed usage its terminal sample states -- a polled census never covers the whole tree -- and an end row"
-    );
+    let [start, setup, unattributed, end] = rows.as_slice() else {
+        panic!(
+            "expected the start, jobserver setup, unattributed census usage, and end; got {} rows",
+            rows.len()
+        );
+    };
     // The start row's host lies between independent reads taken around admission.
     let milli = |host| HostColumns::of(host).expect("a host in range");
     let (low, high) = (
         milli(before).load1_milli.min(milli(after).load1_milli),
         milli(before).load1_milli.max(milli(after).load1_milli),
     );
-    let (start_load, start_cores, start_workspace, start_build) = facts(rows[0]);
+    let (start_load, start_cores, start_workspace, start_build) = facts(*start);
     assert!(
         start_load.is_some_and(|load| (low..=high).contains(&load)),
         "start load {start_load:?} outside {low}..={high}"
     );
     assert_eq!(start_cores, Some(before.cores.get()));
     assert_eq!((start_workspace, start_build), (None, None));
-    // The unattributed-usage row states no host or volume fact of its own.
-    assert_eq!(facts(rows[1]), (None, None, None, None));
+    // Neither info row states a host or volume fact of its own.
+    assert_eq!(facts(*setup), (None, None, None, None));
+    assert_eq!(facts(*unattributed), (None, None, None, None));
     // The end row is the terminal sample's host, and no volume change it did not state.
     let host = milli(terminal.host);
     assert_eq!(
-        facts(rows[2]),
+        facts(*end),
         (Some(host.load1_milli), Some(host.cores), None, None)
     );
 }
@@ -10946,7 +10952,11 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
         "the trace health counts the job segments sealed, not their rows"
     );
     let rows = job_spans(&telemetry);
-    let stated = &rows[1].1;
+    let stated = rows
+        .iter()
+        .map(|(_, row)| row)
+        .find(|row| row.message == "job.unattributed")
+        .expect("the exact job span includes its terminal reconciliation row");
     assert_eq!(
         (stated.entry_type.as_str(), stated.message.as_str()),
         ("info", "job.unattributed")
