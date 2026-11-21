@@ -513,6 +513,29 @@ each path they added; an adoption whose write fails is still done, says so and n
 managed target is collected while main's survives an over-budget sweep; and a cowshed garbage-collection run leaves
 every byte under `<bc>/mbx` untouched.
 
+**A retired workspace's mbx state goes with its retirement.** mbx collects a target whose checkout is gone only when the
+checkout's nearest existing ancestor is on the store's filesystem; a checkout absent elsewhere may be an unmounted
+volume, so mbx keeps it until `target.max_age` or a size sweep takes it. A shed's mount tree is never on the build-cache
+volume, so a retired shed is never gone to mbx. Its retirement therefore asks: before a retirement is recorded finished,
+cowshed runs the installed mbx's `mbx clean --under <the workspace's mount by name>` with a cleared environment, `HOME`,
+and `MBX_CACHE_DIR` naming `<bc>/mbx`. Cowshed names only the path its retirement made absent; mbx selects and removes
+the managed targets and learned incremental state it records at or below it, nested worktrees included, and nothing
+else: store objects, cache claims and every other checkout stay, and a target a running command holds is kept and
+reported. Every retirement finishes through that one step, recovery's included, and so does the source a rename retires,
+so a clean that fails (a host link that does not resolve, an mbx that exits non-zero) leaves the retirement journaled
+and its name unusable: a create, fork or rename onto the name first takes the retirement's last step, its clean
+included, and refuses while that clean fails or while any other step of the retirement is unfinished, naming
+`cowshed rm` (`cowshed unadopt` for main's). A land whose unit is gone but whose retirement failed at its clean reports
+the unit retired with its clean pending and still retires its folds. A host without mbx, or without a build-cache volume
+for its store, has nothing to clean. A slot-bound workspace is mounted at its slot's path, so its named path holds no
+record, and its slot's targets stay for the slot's next tenant by design; main is never retired this way. Enforced by
+`a_retired_checkout_is_cleaned_under_its_mount_by_the_installed_mbx_against_the_shared_store`,
+`a_failed_clean_is_an_error_that_names_what_mbx_said`, `a_host_without_mbx_or_its_store_has_nothing_to_clean`,
+`an_unresolved_mbx_link_refuses_the_clean` and
+`directory_a_retirement_mbx_cannot_clean_stays_unfinished_and_holds_its_name_substrate_lifecycle`; which records the
+clean takes, keeps and spares is the pinned mbx's (`cleans_nested_worktrees_and_keeps_a_sibling_with_a_shared_prefix`,
+`an_active_target_is_kept_while_other_targets_are_removed`).
+
 Collecting a live checkout's managed target leaves mbx's `target` link naming the removed directory, and cowshed repairs
 nothing (16_build_volumes.md, "One link per checkout"): mbx places the target again at the checkout's next Cargo build,
 including a build that names its own `--target-dir` at or below `target/`, as the cross-compile lint gate's

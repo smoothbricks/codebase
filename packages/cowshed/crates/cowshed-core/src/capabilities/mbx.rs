@@ -547,6 +547,86 @@ pub fn with_required(
     Ok((list.len() != current.len()).then_some(list))
 }
 
+/// What retiring a workspace asked of the installed mbx.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetiredCheckout {
+    /// No installed mbx, or no build-cache volume for its store: no job of this host could have
+    /// recorded state in cowshed's store, since admission refuses mbx work without one.
+    NoStore,
+    /// mbx cleaned what it records at or below the mount, and said so: every line it printed,
+    /// a target a running command still holds among them.
+    Cleaned { report: String },
+}
+
+/// Ask the installed mbx to remove the managed targets and learned incremental state it records
+/// at or below `mount`, a retired workspace's mount path, nested worktrees included
+/// (`mbx clean --under`): the store's shared objects and every other checkout's state stay, and
+/// a target a running command holds is kept and reported. mbx selects and removes; cowshed names
+/// only the path its retirement made absent. Run as every cowshed call of mbx is, with nothing
+/// of this process's environment but `home`, and the store every job shares
+/// (`MBX_CACHE_DIR`). A link that does not resolve, an executable that cannot run and a clean
+/// that fails are errors: the retirement does not finish on them.
+pub fn clean_retired_checkout(
+    mount: &Path,
+    home: &Path,
+    build_cache: Option<&Path>,
+) -> Result<RetiredCheckout> {
+    use cowshed_os::fork_lock::Run as _;
+    let executable = match observe_host(home) {
+        HostMbx::Absent => return Ok(RetiredCheckout::NoStore),
+        HostMbx::Unresolved { link, cause } => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "mbx-host-unresolved: the mbx link {} does not resolve ({cause}), so the managed targets mbx records under {} cannot be cleaned and their retirement stays unfinished",
+                    link.display(),
+                    mount.display()
+                ),
+                "cowshed setup",
+            ));
+        }
+        HostMbx::Installed(executable) => executable,
+    };
+    // No store volume, no store any job could have written to: nothing to clean.
+    let Some(build_cache) = build_cache else {
+        return Ok(RetiredCheckout::NoStore);
+    };
+    // WHY unbounded: `mbx clean` reads its records and removes the trees they name; it waits on
+    // no other process, and a target a running command holds is kept rather than waited for.
+    #[allow(clippy::disallowed_methods)]
+    let output = std::process::Command::new(&executable)
+        .env_clear()
+        .env("HOME", home)
+        .env("MBX_CACHE_DIR", store(build_cache))
+        .arg("clean")
+        .arg("--under")
+        .arg(mount)
+        .output_locked()
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "mbx-host-missing: the mbx installed beside cowshed, {}, cannot be executed: {error}",
+                    executable.display()
+                ),
+                "cowshed setup",
+            )
+        })?;
+    let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
+    report.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(CowshedError::environment_missing(
+            format!(
+                "mbx-retired-clean-failed: {} clean --under {} exited with {}, so the retirement stays unfinished: {}",
+                executable.display(),
+                mount.display(),
+                output.status,
+                report.trim_end()
+            ),
+            "fix what mbx names, then repeat the command; the retirement finishes when the clean succeeds",
+        ));
+    }
+    Ok(RetiredCheckout::Cleaned { report })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,5 +1156,113 @@ mod tests {
         std::fs::write(&link, b"a copied inode").unwrap();
         assert_eq!(observe_link(&link).unwrap(), LinkFound::Other);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An installed fixture mbx that records each run's arguments and the environment it was given,
+    /// prints `say` on standard output and a warning on standard error, and exits with `status`.
+    fn recording_mbx(
+        fixture: &super::super::test_support::Fixture,
+        say: &str,
+        status: u8,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = install_fixture_mbx(fixture);
+        let record = fixture.root.join("mbx-runs");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n{{ printf 'arg %s\\n' \"$@\"; printf 'HOME=%s\\nMBX_CACHE_DIR=%s\\nCARGO_MANIFEST_DIR=%s\\n' \"$HOME\" \"$MBX_CACHE_DIR\" \"${{CARGO_MANIFEST_DIR-unset}}\"; }} >> '{}'\nprintf '%s\\n' '{say}'\nprintf 'mbx[warn]: kept one\\n' >&2\nexit {status}\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        record
+    }
+
+    /// Retiring a workspace asks the installed mbx to clean what it records under the workspace's
+    /// mount, against the store every job shares and nothing of this process's environment, and
+    /// carries every line mbx printed, a target it kept included.
+    #[test]
+    fn a_retired_checkout_is_cleaned_under_its_mount_by_the_installed_mbx_against_the_shared_store()
+    {
+        let fixture = super::super::test_support::Fixture::new();
+        let record = recording_mbx(&fixture, "removed the managed target", 0);
+        let mount = fixture.root.join("mnt/acme/widget/topic");
+        let build_cache = fixture.root.join("build-cache");
+        let cleaned = clean_retired_checkout(&mount, &fixture.home, Some(&build_cache))
+            .expect("the clean succeeds");
+        assert_eq!(
+            cleaned,
+            RetiredCheckout::Cleaned {
+                report: "removed the managed target\nmbx[warn]: kept one\n".to_owned()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            format!(
+                "arg clean\narg --under\narg {}\nHOME={}\nMBX_CACHE_DIR={}\nCARGO_MANIFEST_DIR=unset\n",
+                mount.display(),
+                fixture.home.display(),
+                store(&build_cache).display()
+            )
+        );
+    }
+
+    /// A clean mbx refuses is an error naming what mbx said, never a finished retirement.
+    #[test]
+    fn a_failed_clean_is_an_error_that_names_what_mbx_said() {
+        let fixture = super::super::test_support::Fixture::new();
+        recording_mbx(&fixture, "could not remove the managed target", 1);
+        let mount = fixture.root.join("mnt/acme/widget/topic");
+        let error = clean_retired_checkout(&mount, &fixture.home, Some(&fixture.root.join("bc")))
+            .expect_err("a failed clean refuses");
+        assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
+        assert!(
+            error.message.contains("mbx-retired-clean-failed")
+                && error
+                    .message
+                    .contains("could not remove the managed target"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// Without an installed mbx, or without the build-cache volume its store lives on, no job of
+    /// this host recorded state in cowshed's store: nothing runs and the retirement finishes.
+    #[test]
+    fn a_host_without_mbx_or_its_store_has_nothing_to_clean() {
+        let fixture = super::super::test_support::Fixture::new();
+        let mount = fixture.root.join("mnt/acme/widget/topic");
+        assert_eq!(
+            clean_retired_checkout(&mount, &fixture.home, Some(&fixture.root.join("bc"))).unwrap(),
+            RetiredCheckout::NoStore
+        );
+        let record = recording_mbx(&fixture, "unused", 0);
+        assert_eq!(
+            clean_retired_checkout(&mount, &fixture.home, None).unwrap(),
+            RetiredCheckout::NoStore
+        );
+        assert!(!record.exists(), "no store, no mbx run");
+    }
+
+    /// A host link that does not resolve cannot clean, so the retirement does not finish on it.
+    #[test]
+    fn an_unresolved_mbx_link_refuses_the_clean() {
+        let fixture = super::super::test_support::Fixture::new();
+        let link = host_link(&fixture.home);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("collected/bin/mbx"), &link).unwrap();
+        let error = clean_retired_checkout(
+            &fixture.root.join("mnt/acme/widget/topic"),
+            &fixture.home,
+            Some(&fixture.root.join("bc")),
+        )
+        .expect_err("an unresolved link refuses");
+        assert!(
+            error.message.contains("mbx-host-unresolved"),
+            "{}",
+            error.message
+        );
     }
 }

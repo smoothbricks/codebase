@@ -173,8 +173,18 @@ impl StorageLayout {
     ) -> Result<PathBuf, StorageLayoutError> {
         match self.slot_bindings()?.slot_of(workspace) {
             Some(slot) => checked_child(&self.project.mount_root, &slot.mount_name()),
-            None => checked_child(&self.project.mount_root, workspace.as_str()),
+            None => self.named_workspace_mount(workspace),
         }
+    }
+
+    /// The path `workspace` mounts at by its own name, whatever slot it holds: where a checkout
+    /// that was never slot-bound recorded its compiler caches, and the path a later workspace of
+    /// the same name mounts at.
+    pub fn named_workspace_mount(
+        &self,
+        workspace: &WorkspaceName,
+    ) -> Result<PathBuf, StorageLayoutError> {
+        checked_child(&self.project.mount_root, workspace.as_str())
     }
 
     /// Where one workspace of one project mounts: main at the adopted checkout itself, every other

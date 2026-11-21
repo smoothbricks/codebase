@@ -4720,13 +4720,68 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// Journals `operation` under this process's intent lease and returns the record it
     /// superseded, for a create or fork refused before its first mutation to put back.
+    ///
+    /// A retirement of the target that has not finished stops `operation`: the journal holds one
+    /// record per name, so beginning another operation would erase the retirement's, and the
+    /// name's new incarnation would mount where the retired one's build state is still uncleaned.
+    /// Open-time recovery replays such a retirement, but a resident controller runs no open before
+    /// a verb. A retirement whose workspace is already gone, with only its finishing step left as
+    /// recovery would find it ([`Self::finish_retire_intent`], the mbx clean among it), takes that
+    /// step here, and its failure refuses `operation` with its cause; any other unfinished
+    /// retirement refuses `operation` and names the verb that finishes it.
     async fn begin_lifecycle_intent(
         &mut self,
         operation: crate::storage::recovery::LifecycleIntent,
     ) -> Result<Option<crate::storage::recovery::LifecycleIntentRecord>> {
+        use crate::storage::recovery::LifecycleIntent;
         let target = operation.target().clone();
         if !self.claim_intent_lease(&target)? {
             return Err(another_process_is_running(&target));
+        }
+        if !matches!(operation, LifecycleIntent::Retire { .. }) {
+            self.reload_lifecycle_intents().await?;
+            let retiring = self
+                .lifecycle_intents
+                .get(&target)
+                .filter(|record| record.completion.is_none())
+                .and_then(|record| match &record.operation {
+                    LifecycleIntent::Retire {
+                        origin, options, ..
+                    } => Some((origin.is_some(), options.restore)),
+                    _ => None,
+                });
+            if let Some((pending, restore)) = retiring {
+                if restore {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "the unadopt retiring {target} has not finished, so the name cannot be used yet"
+                        ),
+                        "cowshed unadopt",
+                    ));
+                }
+                let gone = match self.current(&target).await {
+                    Ok(_) => false,
+                    Err(error) if error.code == ErrorCode::NotFound => true,
+                    Err(error) => return Err(error),
+                };
+                // Recovery's own test of a retirement with nothing left but its finish: the
+                // workspace is gone, and a pending clone's retirement left no clone behind.
+                let clone_left = pending
+                    && self
+                        .pending_metadata()
+                        .await?
+                        .iter()
+                        .any(|(_, metadata)| metadata.workspace == target);
+                if !gone || clone_left {
+                    return Err(CowshedError::conflict(
+                        format!(
+                            "the retirement of {target} has not finished, so the name cannot be used yet"
+                        ),
+                        format!("cowshed rm {target}"),
+                    ));
+                }
+                self.finish_retire_intent(&target).await?;
+            }
         }
         self.update_lifecycle_intents(move |journal| Ok(journal.begin(operation)))
             .await
@@ -4917,11 +4972,59 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Finish `workspace`'s retirement: its record goes in this journal write
-    /// ([`crate::storage::recovery::LifecycleIntentJournal::finish_retirement`]).
+    /// ([`crate::storage::recovery::LifecycleIntentJournal::finish_retirement`]), after
+    /// [`Self::clean_retired_mount`]. Every retirement ends here, recovery's included, so a clean
+    /// that fails leaves the retirement journaled and its name unusable until the clean succeeds.
     async fn finish_retire_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
+        self.clean_retired_mount(workspace, &format!("cowshed rm {workspace}"))
+            .await?;
         let workspace = workspace.clone();
         self.update_lifecycle_intents(move |journal| journal.finish_retirement(&workspace))
             .await
+    }
+
+    /// Ask the installed mbx to remove the managed targets and learned incremental state it
+    /// records at or below the retired `workspace`'s named mount (03_caches.md, "A retired
+    /// workspace's mbx state goes with its retirement"): mbx cannot learn on its own that a
+    /// retired shed is gone, because its mount tree is another filesystem than the store. Taken
+    /// under the name's intent lease, so no other process mints the name at that path while the
+    /// clean runs. A slot-bound workspace is mounted at its slot's path, so its named path holds
+    /// no record, and its slot's targets stay for the slot's next tenant. Main is never retired
+    /// this way.
+    async fn clean_retired_mount(&mut self, workspace: &WorkspaceName, finish: &str) -> Result<()> {
+        if workspace.is_main() {
+            return Ok(());
+        }
+        if !self.claim_intent_lease(workspace)? {
+            return Err(another_process_is_running(workspace));
+        }
+        let mount = self
+            .layout
+            .named_workspace_mount(workspace)
+            .map_err(native_integrity_error)?;
+        let home = self.home.clone();
+        let cleaned = crate::storage::lifecycle::dispatch_blocking(move || {
+            crate::capabilities::mbx::clean_retired_checkout(
+                &mount,
+                &home,
+                crate::storage::bootstrap::native::provisioned_build_cache().as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("mbx clean task failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::new(
+                error.code,
+                error.message,
+                format!("{}; then {finish} finishes the retirement", error.hint),
+            )
+        })?;
+        if let crate::capabilities::mbx::RetiredCheckout::Cleaned { report } = cleaned {
+            for line in report.lines().filter(|line| !line.trim().is_empty()) {
+                cowshed_os::eprintln!("cowshed: mbx: {workspace}: {line}");
+            }
+        }
+        Ok(())
     }
 
     fn completed_workspace_intent(
@@ -15085,6 +15188,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     )
                     .await?;
                 require_lost_groups_released(&source, &stopped, "rename").await?;
+                self.clean_retired_mount(&source, &format!("cowshed mv {source} {destination}"))
+                    .await?;
                 let source_incarnation = self.clone_source_incarnation(&current).await?;
                 self.commitments
                     .record(CommitmentDraft::Fork {
@@ -15414,6 +15519,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .await
                     .map_err(native_storage_error)?;
                 self.finish_retirement(current, CheckoutNxCheck::CloseRecorded, lock)
+                    .await?;
+                // The source is retired, so its mount's mbx state goes with it, as every
+                // retirement's does; a failure leaves the rename journaled for its replay.
+                self.clean_retired_mount(&source, &format!("cowshed mv {source} {destination}"))
                     .await?;
             }
             self.complete_lifecycle_intent(
@@ -17393,6 +17502,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     "cowshed: landed {source_head} on {target_branch}; workspace {workspace} was already gone, so the land had nothing left to retire: {}",
                     gone.message
                 ),
+                // Gone after a failure late in its retirement (the mbx clean, say) is retired: the
+                // journaled retirement finishes at `cowshed rm`, as the folds below are judged.
+                Err(failed)
+                    if self
+                        .current(&workspace)
+                        .await
+                        .is_err_and(|gone| gone.code == ErrorCode::NotFound) =>
+                {
+                    cowshed_os::eprintln!(
+                        "cowshed: landed {source_head} on {target_branch} and retired {workspace}, though its retirement then failed ({}); cowshed rm {workspace} finishes it",
+                        failed.message
+                    );
+                }
                 Err(kept) => {
                     return Err(kept.reworded(|message| {
                         format!(

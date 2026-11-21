@@ -4669,6 +4669,83 @@ async fn directory_an_rm_during_a_land_is_refused_naming_it_substrate_lifecycle(
         .expect("stop the real directory project");
 }
 
+/// A retirement finishes only once the installed mbx has cleaned what it records under the
+/// retired mount (03_caches.md, "Collection is mbx's own"). With a host mbx link that cannot run,
+/// the rm refuses naming it and the retirement stays journaled: a fork of the same name replays
+/// it first and refuses the same way, so no new workspace of that name can take the path while
+/// its targets are uncleaned. Once mbx can clean (here: no mbx at all), that fork finishes the
+/// retirement and mints the name anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_retirement_mbx_cannot_clean_stays_unfinished_and_holds_its_name_substrate_lifecycle()
+ {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    let link = cowshed_core::capabilities::mbx::host_link(fixture.storage.home());
+    fs::create_dir_all(link.parent().expect("the mbx link has a parent")).expect("bin directory");
+    std::os::unix::fs::symlink(fixture.storage.home().join("collected/bin/mbx"), &link)
+        .expect("a collected mbx link");
+
+    let (removed, _, stderr) = run(&mut service, ["rm", "topic", "--force"]).await;
+    let refusal = removed.expect_err("a retirement mbx could not clean finished");
+    assert!(
+        refusal.message.contains("mbx-host-unresolved"),
+        "{refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let (forked, _, stderr) = run(&mut service, ["fork", "topic"]).await;
+    let refusal = forked.expect_err("a fork took the name of an unfinished retirement");
+    assert!(
+        refusal.message.contains("mbx-host-unresolved"),
+        "{refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    fs::remove_file(&link).expect("uninstall mbx");
+    let again = new_workspace(&mut service, "topic").await;
+    assert_eq!(
+        again, topic,
+        "the new incarnation mounts at the retired name's path"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+/// A rename retires its source, and that retirement takes the mbx clean too (03_caches.md, "A
+/// retired workspace's mbx state goes with its retirement"): with a host mbx link that cannot run,
+/// the rename refuses naming it and stays journaled, and once mbx can clean (here: no mbx) the
+/// rename run again completes under its new name.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_rename_cleans_its_retired_source_before_it_completes_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    new_workspace(&mut service, "old-name").await;
+    let link = cowshed_core::capabilities::mbx::host_link(fixture.storage.home());
+    fs::create_dir_all(link.parent().expect("the mbx link has a parent")).expect("bin directory");
+    std::os::unix::fs::symlink(fixture.storage.home().join("collected/bin/mbx"), &link)
+        .expect("a collected mbx link");
+
+    let (renamed, _, stderr) = run(&mut service, ["mv", "old-name", "new-name"]).await;
+    let refusal = renamed.expect_err("a rename whose source mbx could not clean completed");
+    assert!(
+        refusal.message.contains("mbx-host-unresolved"),
+        "{refusal}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    fs::remove_file(&link).expect("uninstall mbx");
+    succeed(&mut service, ["mv", "old-name", "new-name"]).await;
+    service
+        .path("new-name", false)
+        .await
+        .expect("the rename completed under its new name");
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_rm_while_a_land_holds_the_lease_is_refused_substrate_lifecycle() {
     let mut fixture = Fixture::directory();

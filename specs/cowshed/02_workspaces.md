@@ -1631,16 +1631,19 @@ unreadable target — is reported on stderr and superseded: the `rm` journals it
 any standalone `rm`) before its first mutation and reruns every fence under them, so a journaled request's refusal never
 stands between the caller and an explicit removal, and `--abandon` authorizes destroying what main lacks.
 
-The journal write that records a retirement's completion removes its record, since nothing is left to finish, and the
-next journal write drops a finished retirement an earlier build kept. A removal re-issued after a session's retirement
-finished (a client a deadline cut off, a land whose retire a replay finished, an `rm` run again after either) finds the
-name absent and unjournaled, and answers from the evidence the retirement left: the newest `retire-workspace` line
-naming it in the project's `deletion-log.jsonl`, written before that completion. It answers success, whichever options
-either carried, and says on stderr when and by which process the session was retired and, for an abandonment whose
-bundle `sessions/.trash` still holds, that bundle. What the first answer measured beyond that line (the target branch
-and head, the unlanded commit count and paths, the uncommitted-work commit) is not answered again. A name no line names,
-a retirement whose line failed to append included (the log's append is best-effort), answers as any absent name does.
-The answer lives as long as its evidence: `gc --abandoned` deletes a bundle and with it the re-issue's naming of it.
+Before that journal write the installed mbx cleans the retired mount
+([03_caches.md, "A retired workspace's mbx state goes with its retirement"](03_caches.md)); a clean that fails leaves
+the retirement journaled and its name unusable. The journal write that records a retirement's completion removes its
+record, since nothing is left to finish, and the next journal write drops a finished retirement an earlier build kept. A
+removal re-issued after a session's retirement finished (a client a deadline cut off, a land whose retire a replay
+finished, an `rm` run again after either) finds the name absent and unjournaled, and answers from the evidence the
+retirement left: the newest `retire-workspace` line naming it in the project's `deletion-log.jsonl`, written before that
+completion. It answers success, whichever options either carried, and says on stderr when and by which process the
+session was retired and, for an abandonment whose bundle `sessions/.trash` still holds, that bundle. What the first
+answer measured beyond that line (the target branch and head, the unlanded commit count and paths, the uncommitted-work
+commit) is not answered again. A name no line names, a retirement whose line failed to append included (the log's append
+is best-effort), answers as any absent name does. The answer lives as long as its evidence: `gc --abandoned` deletes a
+bundle and with it the re-issue's naming of it.
 
 A named `rm` can retire an unfinished fork without activating it. Its supervisor, if one runs, is stopped first, before
 the clone's image lock is taken, as an active workspace's `rm` stops one: the stop waits for the clone's jobs, and
