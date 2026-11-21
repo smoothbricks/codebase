@@ -18,6 +18,7 @@ use crate::build_volume::{
 use crate::capabilities::BuildStatePath;
 use crate::metadata::append_suffix;
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, COMPANION_SUFFIX};
+use crate::storage::recovery::resume::{self, EmptyStep, Found, ReplacementStep};
 use crate::storage::recovery::{
     MissingMainBuild, ReAdoptBuild, ReAdoptEmptyBuild, ReAdoptMain, ReAdoptSource,
 };
@@ -245,12 +246,12 @@ where
         &self,
         source: &ReAdoptSource,
     ) -> Result<(), ApfsStorageError> {
-        let Some(build) = &source.build else {
-            return Ok(());
-        };
-        if retained_build(source)?.is_none() {
-            return self.discard_staged_build(build);
-        }
+        let build =
+            match resume::copy_step(source.build.as_ref(), retained_build(source)?.is_some()) {
+                resume::CopyStep::Nothing => return Ok(()),
+                resume::CopyStep::Discard(build) => return self.discard_staged_build(build),
+                resume::CopyStep::Copy(build) => build,
+            };
         let (new, old) = self.copy_replacement(
             &build.replacement_image,
             &build.replacement_mount,
@@ -360,47 +361,58 @@ where
         mbx: Option<&Path>,
         retention: &[BuildStatePath],
     ) -> Result<(), ApfsStorageError> {
-        match (&source.main, &source.build, build_claim) {
-            (ReAdoptMain::Missing(missing), None, None) => match &missing.build {
-                Some(MissingMainBuild::Empty(build)) => self.publish_empty_build(
-                    layout,
-                    source,
-                    build,
-                    SeedSource::Unclaimed(&build.id),
-                    mbx,
-                    retention,
-                ),
-                // Main's own volume outlived main's image: preserve it under its own claim.
-                // Non-mbx capture still precedes the live volume's first mount.
-                Some(MissingMainBuild::Kept(build)) => self.seed_replacement(
-                    layout,
-                    source,
-                    SeedSource::Unclaimed(&build.kept),
-                    &build.record,
-                    mbx,
-                    retention,
-                ),
-                None => Ok(()),
-            },
-            (ReAdoptMain::Retained(_), None, None) => Ok(()),
-            (ReAdoptMain::Retained(_), Some(build), Some(claim)) if claim.id() == &build.id => {
+        let main = match &source.main {
+            ReAdoptMain::Missing(missing) => resume::Main::Missing(match &missing.build {
+                None => resume::MissingBuild::None,
+                Some(MissingMainBuild::Empty(build)) => resume::MissingBuild::Empty(build),
+                Some(MissingMainBuild::Kept(build)) => resume::MissingBuild::Kept(build),
+            }),
+            ReAdoptMain::Retained(_) => resume::Main::Retained,
+        };
+        let claim = match (build_claim, &source.build) {
+            (None, _) => resume::Claim::None,
+            (Some(claim), Some(build)) if claim.id() == &build.id => resume::Claim::Naming(claim),
+            (Some(_), _) => resume::Claim::Other,
+        };
+        // Read only for a build the claim names: its retained image, then, once that is gone,
+        // whether an earlier attempt already published its replacement.
+        let (retained, published) = match (&source.build, &claim) {
+            (Some(build), resume::Claim::Naming(_)) => {
+                let retained = retained_build(source)?.is_some();
+                (retained, !retained && replacement_published(layout, build)?)
+            }
+            _ => (false, false),
+        };
+        match resume::publication(main, source.build.as_ref(), claim, retained, published) {
+            resume::Publication::Nothing => Ok(()),
+            resume::Publication::EmptyUnclaimed(build) => self.publish_empty_build(
+                layout,
+                source,
+                build,
+                SeedSource::Unclaimed(&build.id),
+                mbx,
+                retention,
+            ),
+            // Main's own volume outlived main's image: preserve it under its own claim.
+            // Non-mbx capture still precedes the live volume's first mount.
+            resume::Publication::KeptUnclaimed(build) => self.seed_replacement(
+                layout,
+                source,
+                SeedSource::Unclaimed(&build.kept),
+                &build.record,
+                mbx,
+                retention,
+            ),
+            // Once published, the replacement no longer reads its retained input: losing that
+            // image afterwards changes nothing, and the replay converges on what it published.
+            resume::Publication::Replacement(build, claim) => {
                 let seed = SeedSource::Claimed(claim);
-                // Once published, the replacement no longer reads its retained input: losing
-                // that image afterwards changes nothing, and the replay converges on what it
-                // published.
-                if retained_build(source)?.is_some() || replacement_published(layout, build)? {
-                    self.publish_build_replacement(layout, build, seed.claim_of(&build.id))?;
-                    return self.seed_replacement(
-                        layout,
-                        source,
-                        seed,
-                        &build.owner_record,
-                        mbx,
-                        retention,
-                    );
-                }
-                // Lost before publication. Copy is not run again once main is published, so its
-                // staged copy, which nothing can verify any more, is discarded here too.
+                self.publish_build_replacement(layout, build, seed.claim_of(&build.id))?;
+                self.seed_replacement(layout, source, seed, &build.owner_record, mbx, retention)
+            }
+            // Lost before publication. Copy is not run again once main is published, so its
+            // staged copy, which nothing can verify any more, is discarded here too.
+            resume::Publication::LostEmptyClaimed(build, claim) => {
                 self.discard_staged_build(build)?;
                 let lost = ReAdoptEmptyBuild {
                     id: build.id.clone(),
@@ -410,9 +422,16 @@ where
                     },
                     capacity_bytes: build.image.capacity_bytes,
                 };
-                self.publish_empty_build(layout, source, &lost, seed, mbx, retention)
+                self.publish_empty_build(
+                    layout,
+                    source,
+                    &lost,
+                    SeedSource::Claimed(claim),
+                    mbx,
+                    retention,
+                )
             }
-            _ => Err(ApfsStorageError::InvalidPlan(
+            resume::Publication::Invalid => Err(ApfsStorageError::InvalidPlan(
                 "the build claim does not hold the recorded build volume",
             )),
         }
@@ -440,9 +459,6 @@ where
         // The re-adoption's own intent answers for the volume until it completes.
         let registration = Registration::new(build.record.clone(), Registrant::Intent);
         let recorded = layout.read_record_present(&build.id).map_err(host)?;
-        let ours = |found: &BuildVolumeRecord| {
-            found == registration.registered() || *found == registration.published()
-        };
         let create = || match seed.claim_of(&build.id) {
             Some(claim) => self
                 .create_claimed_build_volume(
@@ -461,24 +477,26 @@ where
                 )
                 .map(|(_, creating)| Some(creating)),
         };
-        let created = match (exists(&image)?, recorded) {
-            (false, None) => create()?,
-            (false, Some(found)) if found == *registration.registered() => create()?,
-            (true, Some(found)) if ours(&found) => {
+        let created = match resume::empty_step(
+            exists(&image)?,
+            Found::of(recorded.as_ref(), &registration),
+        ) {
+            EmptyStep::Create => create()?,
+            EmptyStep::Mount => {
                 self.mount_build_volume(layout, &build.id)?;
                 None
             }
-            (true, None) => {
+            EmptyStep::Unrecorded => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "main's build volume image has no owner record: its bytes predate their registration; refusing to publish over it",
                 ));
             }
-            (true, Some(_)) => {
+            EmptyStep::Foreign => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "main's build volume image holds another owner record; refusing to publish over it",
                 ));
             }
-            (false, Some(_)) => {
+            EmptyStep::Imageless => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "main's build volume record names a missing image; refusing to publish over it",
                 ));
@@ -572,13 +590,28 @@ where
         }
         let registration = Registration::new(build.owner_record.clone(), Registrant::Intent);
         let host = |error: crate::CowshedError| ApfsStorageError::Host(error.to_string());
-        match (exists(&build.replacement_image)?, exists(&published)?) {
-            (true, true) => {
+        let staged = exists(&build.replacement_image)?;
+        let placed = exists(&published)?;
+        // The record at the path is read only for an image already placed there, the one state
+        // whose step it decides.
+        let found = if !staged && placed {
+            Found::of(
+                layout
+                    .read_record_present(&build.id)
+                    .map_err(host)?
+                    .as_ref(),
+                &registration,
+            )
+        } else {
+            Found::Absent
+        };
+        match resume::replacement_step(staged, placed, found) {
+            ReplacementStep::Occupied => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "the build image path is occupied while its replacement is unpublished",
                 ));
             }
-            (true, false) => {
+            ReplacementStep::Rename => {
                 // The owner record precedes the bytes at the build image path; the staged
                 // image itself is named by the re-adoption's journaled record until then.
                 // Under the caller's claim on this id when it holds one; a creation hold of its own
@@ -605,23 +638,19 @@ where
                 sync_parent_path(&build.replacement_image)?;
             }
             // Renamed by an earlier attempt, which registered it first.
-            (false, true) => match layout.read_record_present(&build.id).map_err(host)? {
-                Some(found)
-                    if found == *registration.registered() || found == registration.published() => {
-                }
-                Some(_) => {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "the published build image holds another owner record; refusing to publish over it",
-                    ));
-                }
-                None => {
-                    return Err(ApfsStorageError::InvalidPlan(
-                        "the published build image has no owner record: its bytes predate their registration",
-                    ));
-                }
-            },
+            ReplacementStep::Published => {}
+            ReplacementStep::Foreign => {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "the published build image holds another owner record; refusing to publish over it",
+                ));
+            }
+            ReplacementStep::Unrecorded => {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "the published build image has no owner record: its bytes predate their registration",
+                ));
+            }
             // No payload anywhere: never write a record that names nothing.
-            (false, false) => {
+            ReplacementStep::Missing => {
                 return Err(ApfsStorageError::InvalidPlan(
                     "the build replacement is neither staged nor published; nothing was recorded",
                 ));

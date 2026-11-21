@@ -23,6 +23,7 @@ use crate::metadata::WorkspaceName;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::COMPANION_SUFFIX;
 use crate::storage::lifecycle::AdoptHandoff;
+use crate::storage::recovery::resume::{self, Linked, MissingChoice};
 use crate::storage::recovery::{
     LifecycleIntent, LifecycleIntentCompletion, MissingMainBuild, RETAINED_NAMESPACE, ReAdoptBuild,
     ReAdoptEmptyBuild, ReAdoptImage, ReAdoptKeptBuild, ReAdoptMain, ReAdoptMissingMain,
@@ -230,34 +231,41 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // Main's build volume is the project's one build record owned by `Linked main`, whatever
         // its id: an image of its own, it outlives main's image, and every land gives main a new
         // one. Only when none survives is one published empty under the recorded id.
-        let build = match linked_main_volumes(&layout)?.as_slice() {
-            [] => match published_build(completed) {
-                None => None,
-                Some((id, record, capacity_bytes)) => {
-                    for path in [layout.image(&id), layout.record(&id)] {
-                        if present(&path)? {
-                            return Err(CowshedError::conflict(
-                                format!(
-                                    "main's build volume {} is not missing: {} remains; a missing \
-                                     main's re-adoption publishes only a missing build volume",
-                                    id.as_str(),
-                                    path.display()
-                                ),
-                                "cowshed doctor --json",
-                            ));
-                        }
+        let volumes = linked_main_volumes(&layout)?;
+        let linked = match volumes.as_slice() {
+            [] => Linked::None,
+            [one] => Linked::One(one),
+            several => Linked::Many(several),
+        };
+        let recorded = published_build(completed);
+        // What is still at the recorded id, read only when no volume survives: a missing main's
+        // re-adoption publishes only a missing build volume.
+        let occupied = match (&linked, &recorded) {
+            (Linked::None, Some((id, ..))) => {
+                let mut occupant = None;
+                for path in [layout.image(id), layout.record(id)] {
+                    if present(&path)? {
+                        occupant = Some(path);
+                        break;
                     }
-                    Some(MissingMainBuild::Empty(ReAdoptEmptyBuild {
-                        id,
-                        record: crate::build_volume::BuildVolumeRecord {
-                            tree: None,
-                            ..record
-                        },
-                        capacity_bytes,
-                    }))
                 }
-            },
-            [(kept, record)] => {
+                occupant
+            }
+            _ => None,
+        };
+        let build = match resume::missing_choice(linked, recorded, occupied) {
+            MissingChoice::NoBuild => None,
+            MissingChoice::Empty((id, record, capacity_bytes)) => {
+                Some(MissingMainBuild::Empty(ReAdoptEmptyBuild {
+                    id,
+                    record: crate::build_volume::BuildVolumeRecord {
+                        tree: None,
+                        ..record
+                    },
+                    capacity_bytes,
+                }))
+            }
+            MissingChoice::Kept((kept, record)) => {
                 // A volume census of a directory that is no mount point would name every
                 // process on the volume holding it, so only a mounted volume is censused.
                 let mount = layout.mount(kept);
@@ -270,7 +278,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     record: record.clone(),
                 }))
             }
-            several => {
+            MissingChoice::Conflict((id, ..), occupant) => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "main's build volume {} is not missing: {} remains; a missing main's \
+                         re-adoption publishes only a missing build volume",
+                        id.as_str(),
+                        occupant.display()
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+            MissingChoice::Integrity(several) => {
                 return Err(CowshedError::integrity(
                     format!(
                         "main's image is missing, and build volumes {} each record `Linked main`; \

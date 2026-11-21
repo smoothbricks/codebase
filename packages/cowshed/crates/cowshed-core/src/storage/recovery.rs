@@ -1737,6 +1737,7 @@ pub(crate) fn prepared_retirement_unreadable(
 
 #[cfg(test)]
 pub(crate) mod re_adopt_tests;
+pub(crate) mod resume;
 
 #[cfg(all(test, target_os = "macos"))]
 mod prepared_retirement_diagnostic_tests {
