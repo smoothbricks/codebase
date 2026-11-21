@@ -340,7 +340,9 @@ impl HostSetup for NativeHostSetup {
     async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
         use std::io::IsTerminal as _;
         let storage = validate_existing_host_storage(&self.home).await?;
-        let prove = || crate::zfs_helper::prove(storage.store(), &self.home, effective_uid());
+        let setup = crate::gateway_service::running_executable()?;
+        let prove =
+            || crate::zfs_helper::prove(storage.store(), &self.home, effective_uid(), &setup);
         let Some(unproven) = prove()? else {
             return Ok(None);
         };

@@ -1072,7 +1072,7 @@ impl StartProgress {
 }
 
 /// The binary this process is running from.
-fn running_executable() -> Result<PathBuf> {
+pub(crate) fn running_executable() -> Result<PathBuf> {
     let path = std::env::current_exe().map_err(|error| {
         CowshedError::environment_missing(
             format!("could not identify the cowshed executable: {error}"),

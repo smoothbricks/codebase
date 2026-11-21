@@ -115,8 +115,8 @@ pub struct Unproven {
 /// Prove that the cowshed installed under `home` can change every ZFS root it serves from the
 /// store at `store_root` ([`prove_store_helper`]): the helper it reaches answers `check` as root
 /// for `uid`, with no credentials a terminal cached. `None` is a proven helper, or a host with
-/// no root to serve.
-pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<Unproven>> {
+/// no root to serve. `setup` is the executable running this setup: the refusal's rerun is its.
+pub fn prove(store_root: &Path, home: &Path, uid: u32, setup: &Path) -> Result<Option<Unproven>> {
     let installed = HostStableExecutable::new(home, HELPER_NAME).map_err(launchd_error)?;
     let proof = prove_store_helper(store_root, installed.directory()).map_err(|error| {
         CowshedError::environment_missing(
@@ -124,7 +124,7 @@ pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<Unproven
                 "the root helper of the store {} could not be proven: {error}",
                 store_root.display()
             ),
-            "cowshed setup",
+            rerun(setup),
         )
     })?;
     let system = Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join(HELPER_NAME);
@@ -158,10 +158,17 @@ pub fn prove(store_root: &Path, home: &Path, uid: u32) -> Result<Option<Unproven
                 "{} is not this build's helper acting as root from a root-owned place for the ZFS root {root}: {cause}; {why}",
                 helper.display()
             ),
-            format!("{command} && cowshed setup"),
+            format!("{command} && {}", rerun(setup)),
         ),
         command,
     }))
+}
+
+/// The rerun a refusal names: `setup` of the build that ran this one. The installed copy has no
+/// package around it to find its mbx flake in (14_nix.md, "mbx"), so a bare `cowshed setup`,
+/// which runs that copy, is refused before it reaches the helper.
+fn rerun(setup: &Path) -> String {
+    format!("{} setup", shell_word(&setup.to_string_lossy()))
 }
 
 /// Run the root command of an [`Unproven`] helper from this terminal; `sudo` asks for what its
@@ -248,6 +255,22 @@ mod tests {
             remedy(1000, installed, installed, system, SHA256)
                 .why
                 .contains(&entry)
+        );
+    }
+
+    #[test]
+    fn the_rerun_is_setup_of_the_build_that_ran_it() {
+        assert_eq!(
+            rerun(Path::new(
+                "/h/sb/.cache/cowshed-release/c0/dist/bin/darwin-arm64/cowshed"
+            )),
+            "/h/sb/.cache/cowshed-release/c0/dist/bin/darwin-arm64/cowshed setup"
+        );
+        assert_eq!(
+            rerun(Path::new(
+                "/h/My Checkout/packages/cowshed/dist/bin/linux-x64/cowshed"
+            )),
+            "'/h/My Checkout/packages/cowshed/dist/bin/linux-x64/cowshed' setup"
         );
     }
 }
