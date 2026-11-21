@@ -99,7 +99,7 @@ function* cargoBuildDirs(dir: string, depth: number): Generator<string> {
     const path = join(dir, entry.name);
     if (entry.name === 'build' && depth > 0) {
       yield path;
-    } else if (entry.name !== 'deps' && entry.name !== 'incremental' && entry.name !== '.fingerprint') {
+    } else if (!entry.name.startsWith('.') && entry.name !== 'deps' && entry.name !== 'incremental') {
       yield* cargoBuildDirs(path, depth + 1);
     }
   }

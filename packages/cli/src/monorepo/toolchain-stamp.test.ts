@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 
-it('leaves caches and tool probes untouched during capture, then maintains them at final entry', async () => {
+it('leaves caches and tool probes untouched during capture, then maintains only Cargo-owned caches at final entry', async () => {
   const root = await mkdtemp(join(tmpdir(), 'toolchain-stamp-'));
   try {
     const bin = join(root, 'bin');
@@ -23,6 +23,15 @@ it('leaves caches and tool probes untouched during capture, then maintains them 
     const rustcInfo = join(target, '.rustc_info.json');
     await writeFile(stamp, 'previous toolchain');
     await writeFile(rustcInfo, 'previous compiler');
+
+    const ordinary = join(target, 'lane', 'aarch64-apple-darwin', 'debug', 'build', 'fixture-42');
+    const staging = join(target, 'lane', '.cargo-staging', 'debug', 'build', 'fixture-42');
+    const cmake = join('out', 'build', 'CMakeCache.txt');
+    for (const dir of [ordinary, staging]) {
+      await mkdir(join(dir, 'out', 'build'), { recursive: true });
+      await writeFile(join(dir, cmake), 'previous CMake toolchain');
+    }
+
     const enter = async (skipTasks: string) => {
       const child = Bun.spawn([process.execPath, join(managedAssetsRoot, 'raw/tooling/direnv/toolchain-stamp.ts')], {
         env: {
@@ -42,18 +51,24 @@ it('leaves caches and tool probes untouched during capture, then maintains them 
         new Response(child.stdout).text(),
         new Response(child.stderr).text(),
       ]);
-      expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: '', stderr: '' });
+      expect({ exitCode, stdout }).toEqual({ exitCode: 0, stdout: '' });
+      return stderr;
     };
 
-    await enter('1');
+    expect(await enter('1')).toBe('');
     expect(await Bun.file(probes).exists()).toBe(false);
     expect(await readFile(stamp, 'utf8')).toBe('previous toolchain');
     expect(await readFile(rustcInfo, 'utf8')).toBe('previous compiler');
+    expect(await readFile(join(ordinary, cmake), 'utf8')).toBe('previous CMake toolchain');
+    expect(await readFile(join(staging, cmake), 'utf8')).toBe('previous CMake toolchain');
 
-    await enter('');
+    const maintenance = await enter('');
     expect(await readFile(probes, 'utf8')).toBe('rustc\ncc\n');
     expect(await readFile(stamp, 'utf8')).toBe('rustc fixture\nSDKROOT=\nDEVELOPER_DIR=\ncc fixture');
     expect(await Bun.file(rustcInfo).exists()).toBe(false);
+    expect(await Bun.file(join(ordinary, cmake)).exists()).toBe(false);
+    expect(await readFile(join(staging, cmake), 'utf8')).toBe('previous CMake toolchain');
+    expect(maintenance).toContain('removed 1 cmake build-script cache(s)');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
