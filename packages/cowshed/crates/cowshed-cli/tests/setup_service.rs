@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
-use cowshed_cli::capabilities::mbx::{MbxInstall, TargetCollection};
+use cowshed_cli::capabilities::mbx::{ForkPin, MbxInstall, TargetCollection};
 use cowshed_cli::gateway_service::{CliInstall, ServiceBinaryRefresh};
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
@@ -2346,6 +2346,7 @@ async fn an_installed_mbx_keeps_each_main_and_evicts_shed_targets_first() {
     let mut host = FakeHost {
         mbx_install: Some(MbxInstall::NixMissing {
             flake: PathBuf::from("/pkg/nix/mbx"),
+            fork: None,
         }),
         ..FakeHost::default()
     };
@@ -2368,6 +2369,10 @@ async fn a_host_without_nix_keeps_no_mbx_and_still_succeeds() {
     let mut host = FakeHost {
         mbx_install: Some(MbxInstall::NixMissing {
             flake: PathBuf::from("/opt/cowshed/nix/mbx"),
+            fork: Some(ForkPin {
+                repository: String::from("smoothbricks/mr-boxington"),
+                revision: String::from("1056ab0f"),
+            }),
         }),
         ..FakeHost::default()
     };
@@ -2377,7 +2382,10 @@ async fn a_host_without_nix_keeps_no_mbx_and_still_succeeds() {
     assert!(
         streams
             .stderr
-            .contains("nix is not on PATH, so /opt/cowshed/nix/mbx could not be built"),
+            .contains("nix is not on PATH, so /opt/cowshed/nix/mbx could not be built")
+            && streams.stderr.contains(
+                "`cargo install --locked --git https://github.com/smoothbricks/mr-boxington --rev 1056ab0f mbx` and rerun cowshed setup"
+            ),
         "{}",
         streams.stderr
     );

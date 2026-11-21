@@ -177,9 +177,13 @@ the result with `--out-link` at `~/Library/Application Support/dev.cowshed/nix/m
 rooted executable by an atomic rename of a fresh link, and run that installed mbx's own `mbx setup`, which generates the
 Cargo shim and its one-line `mbx-target` sidecar into `dev.cowshed/mbx-shim/`, beside `bin`, so no project provides
 either. A link that already names it is left; one naming another build is retargeted; anything there that is not a link
-is not cowshed's and fails the run untouched. A host without `nix` keeps no mbx, which is the non-mbx scheduling path,
-not a failure (05_gateway.md, "Host scheduling"). `--uninstall` removes the link, the shim directory and the root and
-nothing under the nix store. Enforced by `cowshed-core`'s
+is not cowshed's and fails the run untouched. A host without `nix` (any Linux distribution that is not NixOS and has no
+Nix installed) links the first `mbx` on PATH instead and runs its `mbx setup` the same way; with none there it keeps no
+mbx, which is the non-mbx scheduling path, not a failure (05_gateway.md, "Host scheduling"), and setup prints the
+command that installs cowshed's fork at the revision `nix/mbx/flake.nix` names, read from that file:
+`cargo install --locked --git https://github.com/smoothbricks/mr-boxington --rev <revision> mbx`, then `cowshed setup`
+again. Setup does not check which revision a PATH `mbx` was built from (Open). `--uninstall` removes the link, the shim
+directory and the root and nothing under the nix store. Enforced by `cowshed-core`'s
 `the_host_link_is_made_once_retargeted_to_a_new_pin_and_never_replaces_a_foreign_file` and
 `the_link_is_observed_without_following_it`, `cowshed-cli`'s `the_host_mbx_is_one_link_to_the_rooted_executable` and the
 setup cells `a_repair_links_the_pinned_mbx_after_storage_and_names_it`,

@@ -35,8 +35,12 @@ pub enum MbxInstall {
         link: PathBuf,
         changed: bool,
     },
-    /// No `nix` on PATH: nothing was built, and the host keeps no mbx.
-    NixMissing { flake: PathBuf },
+    /// No `nix` on PATH and no `mbx` there either: nothing was built or linked, and the host
+    /// keeps no mbx. `fork` is the source `flake` pins, for the operator to install by Cargo.
+    NixMissing {
+        flake: PathBuf,
+        fork: Option<ForkPin>,
+    },
     /// `nix build` ran and failed; `stderr` is nix's, verbatim.
     BuildFailed {
         flake: PathBuf,
@@ -65,10 +69,19 @@ impl MbxInstall {
                 link.display(),
                 program.display()
             ),
-            Self::NixMissing { flake } => format!(
-                "mbx: nix is not on PATH, so {} could not be built; this host keeps no mbx and schedules Cargo without it",
-                flake.display()
-            ),
+            Self::NixMissing { flake, fork } => {
+                let install = match fork {
+                    Some(pin) => format!(
+                        "; to use it, install cowshed's mbx fork with `{}` and rerun cowshed setup, which links the mbx on PATH",
+                        pin.cargo_install()
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "mbx: nix is not on PATH, so {} could not be built; this host keeps no mbx and schedules Cargo without it{install}",
+                    flake.display()
+                )
+            }
             Self::BuildFailed {
                 flake,
                 status,
@@ -113,6 +126,45 @@ impl MbxInstall {
     }
 }
 
+/// The mbx source the shipped flake pins: `inputs.mbx.url = "github:<repository>/<revision>"`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkPin {
+    /// `<owner>/<repo>` on GitHub.
+    pub repository: String,
+    pub revision: String,
+}
+
+impl ForkPin {
+    /// The pin `flake_nix` (the text of the flake's `flake.nix`) names, when it names one.
+    pub fn parse(flake_nix: &str) -> Option<Self> {
+        let (_, url) = flake_nix.split_once("inputs.mbx.url")?;
+        let (_, quoted) = url.split_once('"')?;
+        let (url, _) = quoted.split_once('"')?;
+        let (repository, revision) = url.strip_prefix("github:")?.rsplit_once('/')?;
+        let hex = !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+        (hex && repository.split('/').count() == 2).then(|| Self {
+            repository: repository.to_owned(),
+            revision: revision.to_owned(),
+        })
+    }
+
+    /// The command that builds this pin's `mbx` without nix.
+    pub fn cargo_install(&self) -> String {
+        format!(
+            "cargo install --locked --git https://github.com/{} --rev {} mbx",
+            self.repository, self.revision
+        )
+    }
+}
+
+/// The first `mbx` a `search` path (a `PATH` value) holds, other than cowshed's own `link`.
+fn mbx_on(search: &std::ffi::OsStr, link: &Path) -> Option<PathBuf> {
+    std::env::split_paths(search)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join("mbx"))
+        .find(|candidate| candidate != link && candidate.is_file())
+}
+
 /// A process outcome in words; `None` is a signal, which has no exit code.
 fn exit_phrase(status: Option<i32>) -> String {
     match status {
@@ -148,9 +200,23 @@ pub fn install(home: &Path, flake: &Path) -> Result<MbxInstall> {
     {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(MbxInstall::NixMissing {
-                flake: flake.to_owned(),
-            });
+            // A host without nix runs the mbx its operator installed from the same pin.
+            let found =
+                std::env::var_os("PATH").and_then(|search| mbx_on(&search, &mbx::host_link(home)));
+            let Some(program) = found else {
+                return Ok(MbxInstall::NixMissing {
+                    flake: flake.to_owned(),
+                    fork: std::fs::read_to_string(flake.join(FLAKE_MANIFEST))
+                        .ok()
+                        .as_deref()
+                        .and_then(ForkPin::parse),
+                });
+            };
+            let installed = link(home, &program)?;
+            if matches!(installed, MbxInstall::Installed { .. }) {
+                install_cargo_route(home)?;
+            }
+            return Ok(installed);
         }
         Err(error) => {
             return Err(CowshedError::internal(format!(
@@ -576,6 +642,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("scratch root");
         root
+    }
+
+    /// A host without nix is told the Cargo command for the pin the shipped flake itself names,
+    /// and its own `mbx` on PATH is the one linked: never cowshed's link naming itself.
+    #[test]
+    fn a_host_without_nix_installs_the_flakes_pin_by_cargo() {
+        let shipped = include_str!("../../../../nix/mbx/flake.nix");
+        let pin = ForkPin::parse(shipped).expect("the shipped flake names its pin");
+        assert_eq!(pin.repository, "smoothbricks/mr-boxington");
+        assert!(shipped.contains(&format!("github:{}/{}", pin.repository, pin.revision)));
+        assert_eq!(
+            pin.cargo_install(),
+            format!(
+                "cargo install --locked --git https://github.com/smoothbricks/mr-boxington --rev {} mbx",
+                pin.revision
+            )
+        );
+        for unpinned in [
+            "",
+            "inputs.mbx.url = \"github:smoothbricks/mr-boxington\";",
+            "inputs.mbx.url = \"github:smoothbricks/mr-boxington/main\";",
+            "inputs.mbx.url = \"path:/src/mbx\";",
+        ] {
+            assert_eq!(ForkPin::parse(unpinned), None, "{unpinned}");
+        }
+
+        let home = scratch("path-mbx");
+        let (own, cargo) = (home.join("own"), home.join("cargo"));
+        for directory in [&own, &cargo] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("mbx"), b"#!/bin/sh\n").unwrap();
+        }
+        let search =
+            std::env::join_paths([home.join("empty"), own.clone(), cargo.clone()]).unwrap();
+        assert_eq!(mbx_on(&search, &own.join("mbx")), Some(cargo.join("mbx")));
+        let search = std::env::join_paths([own.clone()]).unwrap();
+        assert_eq!(mbx_on(&search, &own.join("mbx")), None);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// The host's `mbx` is a link to the rooted executable, never a copied inode, retargeted to a
