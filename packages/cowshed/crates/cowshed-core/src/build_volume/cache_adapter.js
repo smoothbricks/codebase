@@ -9,16 +9,18 @@ function openNxCache(root) {
     throw new Error(`Nx cache adapter requires an absolute checkout root, got ${JSON.stringify(root)}`);
   }
   // What each qualified Nx version fixes for this adapter, read in nrwl/nx at that tag: the checkout's
-  // task-database and cache directories (`utils/cache-directory.ts`). In both, the task database is
-  // `<machine>-v<DB_VERSION>.db` there (v3 in 23.2.1, v6 in 24.0.3: `native/db/mod.rs`, `initialize.rs`),
+  // task-database and cache directories (`utils/cache-directory.ts`). In each, the task database is
+  // `<machine>-v<DB_VERSION>.db` there (v3 in 23.2.1, v6 in 24.0.3 and 24.0.6: `native/db/mod.rs`, `initialize.rs`),
   // reached only through Nx's own `NxCache.get`; an entry is `<cache>/<hash>/` with its terminal output in
   // `<cache>/terminalOutputs/<hash>` (`native/cache/cache.rs`); `CachedResult` is `{ code, terminalOutput,
   // outputsPath, size }`; and `HttpRemoteCache` stores and restores an entry as the archive nxArchive (below) writes
-  // (`native/cache/http_remote_cache.rs`, the same source at both tags, built with tar 0.4.44 and flate2 1.1.9 in each
-  // tag's Cargo.lock). 23.2.1's `get` answers a row whose entry directory is gone; 24.0.3's does not.
+  // (`native/cache/http_remote_cache.rs`, the same source outside its tests at each tag, built with tar 0.4.44 and
+  // flate2 1.1.9 in each tag's Cargo.lock). 23.2.1's `get` answers a row whose entry directory is gone; 24.0.3's and
+  // 24.0.6's do not.
   const layouts = new Map([
     ['23.2.1', { workspaceData: '.nx/workspace-data', cache: '.nx/cache' }],
     ['24.0.3', { workspaceData: '.nx/workspace-data', cache: '.nx/cache' }],
+    ['24.0.6', { workspaceData: '.nx/workspace-data', cache: '.nx/cache' }],
   ]);
   const requireNx = createRequire(path.join(root, 'package.json'));
   const version = requireNx('nx/package.json').version;

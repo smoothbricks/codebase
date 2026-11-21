@@ -2015,7 +2015,7 @@ mod tests {
         assert!(!refused.status.success(), "{stderr}");
         assert!(
             stderr.contains(
-                "cache-only restoration supports exactly Nx 23.2.1 or 24.0.3, not 24.0.4"
+                "cache-only restoration supports exactly Nx 23.2.1 or 24.0.3 or 24.0.6, not 24.0.4"
             ),
             "{stderr}"
         );
