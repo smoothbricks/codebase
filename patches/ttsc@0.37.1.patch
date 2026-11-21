@@ -823,6 +823,276 @@ index 6bf30f65eb6f046eb2b9d505f6838b330a444df4..abc3485a35c4e380dc6e4c07fbacf255
          // Only the actual `go build` needs ttsc's GOCACHE; read-only metadata spawns
          // (`go mod edit`, `go env`, `go version`) call goBuildEnv with no cache root
          // and inherit ambient GOCACHE rather than receiving the managed build
+diff --git a/lib/plugin/internal/source/NativeSourcePackages.d.ts b/lib/plugin/internal/source/NativeSourcePackages.d.ts
+index 8e0fe14cc74e9ed08439ad682977a72fde65a5d7..eef080d782bc703166b4512557593fc636d5754a 100644
+--- a/lib/plugin/internal/source/NativeSourcePackages.d.ts
++++ b/lib/plugin/internal/source/NativeSourcePackages.d.ts
+@@ -7,12 +7,12 @@ import { SourcePluginWorkspace } from "./SourcePluginWorkspace";
+  * Metadata does not compile dependencies or certify a later build. A cold build
+  * repeats ownership admission in its proven, materialized workspace.
+  *
+- * @evidence contracts/common.md#principled-implementation The selected Go tool, effective environment, shared workspace writer and actual copied package inputs determine package names and errors; Go remains the build-constraint and package-validity authority.
++ * @evidence contracts/common.md#principled-implementation The selected Go tool, effective environment, shared workspace writer and the package inputs as a copy holds them, read in place under a Go overlay or from an actual copy, determine package names and errors; Go remains the build-constraint and package-validity authority.
+  * @evidence contracts/common.md#clear-and-simple-design One namespace separates contextual observation, metadata framing and ownership admission; source-only contributions are observed inside their selected host module.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts No filename exception or partial tag parser classifies packages. Go Error and empty production-file selections are rejected rather than trusting Name from an erroneous package.
+  * @evidence contracts/common.md#meaningful-documentation Native prose distinguishes metadata selection from compilation and later materialized admission.
+  * @evidence contracts/portability.md#os-neutral-implementation Native path/fs operations and the shared Go tool selector preserve environment-name and path identity without blanket case folding; Go itself applies target platform and cgo selection.
+- * @evidence contracts/performance.md#efficient-algorithms One list command observes all distinct package entries in each prepared context. Context materialization traverses and copies admitted host/contributor files; workspace setup delegates manifest commands and list skips dependency loading. Framing and JSON parsing process complete output bytes, and retained results scale with selected packages/files.
++ * @evidence contracts/performance.md#efficient-algorithms One list command observes all distinct package entries in each prepared context. A module its identity proves is read in place, with one overlay entry per contributor file; any other context traverses and copies admitted host/contributor files. Workspace setup delegates manifest commands and list skips dependency loading. Framing and JSON parsing process complete output bytes, and retained results scale with selected packages/files.
+  * @evidence contracts/performance.md#reuse-equivalent-work Entries are deduplicated within a contextual observation; callers group equivalent module contexts for one load. With a record store, a successful selection is answered across loads and processes under an identity built from the content of everything Go reads, so any source, overlay, contributor, manifest, Go variable or toolchain change observes Go again (#1721); erroneous selections are never recorded. Cold admission uses the already prepared real build workspace.
+  * @evidence contracts/performance.md#bound-retention-and-release-resources Each metadata scratch has finally-based retirement-aware cleanup, and capture resources belong to spawnGoTool. Unknown native retirement retains scratch under the existing scope; results and complete output remain caller-owned with no independent byte ceiling.
+  */
+@@ -75,15 +75,17 @@ export declare namespace NativeSourcePackages {
+         overlays?: readonly string[];
+     }
+     /**
+-     * Observe entries together in a private module layout for their context.
++     * Observe entries together in a private module layout for their context: the
++     * module read where it lies when its identity proves it and a Go overlay can
++     * present its contributors exactly, a scratch copy otherwise.
+      *
+      * @evidence contracts/common.md#principled-implementation The original source module pins the selected native Go tool before copying. Actual observations retain their owning manifests; prospective nested observations replace only scratch root manifests with the maintained generic host manifests. Source-only final admissions enter their selected host module.
+-     * @evidence contracts/common.md#clear-and-simple-design Copying, workspace construction and batched reading have separate owners.
++     * @evidence contracts/common.md#clear-and-simple-design Overlay construction, copying, workspace construction and batched reading have separate owners.
+      * @evidence contracts/common.md#prohibited-implementation-shortcuts Go interprets tags, suffixes, cgo and manifests; selected errors are returned for admission, not overwritten by guessed kinds.
+      * @evidence contracts/common.md#meaningful-documentation Native prose states this operation's authority and delegated boundaries; fields retain separate native comments.
+      * @evidence contracts/portability.md#os-neutral-implementation Native copy/path and selected tool/environment owners preserve platform identity; contribution target containment is checked.
+-     * @evidence contracts/performance.md#efficient-algorithms Copies admitted host/contributor bytes and enumerates entries; workspace setup reads manifests and one list command skips dependencies.
+-     * @evidence contracts/performance.md#reuse-equivalent-work All entries share one prepared context; optional readers are scoped to one load and the same selected tool/effective environment. A supplied record store answers an equal selection without copying or running Go, under the content identity of the module, contributors, overlays, proposal manifests, toolchain/environment digest, Go variables, entries and command; an answer is recorded only when the copies matched their keyed digests, no package reported an error and the overlays still held their digests after Go ran.
++     * @evidence contracts/performance.md#efficient-algorithms In place, lists each contributor's files once into the overlay; otherwise copies admitted host/contributor bytes. Either way enumerates entries; workspace setup reads manifests and one list command skips dependencies.
++     * @evidence contracts/performance.md#reuse-equivalent-work All entries share one prepared context; optional readers are scoped to one load and the same selected tool/effective environment. A supplied record store answers an equal selection without copying or running Go, under the content identity of the module, contributors, overlays, proposal manifests, toolchain/environment digest, Go variables, entries and command; an answer is recorded only when the module and contributors still held their keyed digests after Go read them (in place) or the copies matched them, no package reported an error and the overlays still held their digests after Go ran.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources Finally releases owned scratch through retirement authority; unknown native closure defers removal and capture cleanup remains delegated.
+      */
+     function inspect(opts: {
+@@ -168,6 +170,11 @@ export declare namespace NativeSourcePackages {
+         env: NodeJS.ProcessEnv;
+         goBinary: string;
+         pluginName: string;
++        /**
++         * Go `-overlay` file presenting files that are not on disk at their path,
++         * or hiding ones that are; an overlaid package directory need not exist.
++         */
++        overlay?: string;
+     }): Package[];
+     /**
+      * Require a valid production package and agreement with requested ownership.
+diff --git a/lib/plugin/internal/source/NativeSourcePackages.js b/lib/plugin/internal/source/NativeSourcePackages.js
+index e3b72e2fe7fb0ccfc169209726db886c9bfc7689..a8a211058dd2aa9478af64a270500948c022d7ed 100644
+--- a/lib/plugin/internal/source/NativeSourcePackages.js
++++ b/lib/plugin/internal/source/NativeSourcePackages.js
+@@ -18,6 +18,8 @@ const PluginContentIdentities_1 = require("./PluginContentIdentities");
+ const PluginLoadAnswers_1 = require("./PluginLoadAnswers");
+ const SourcePluginAdmission_1 = require("./SourcePluginAdmission");
+ const SourcePluginWorkspace_1 = require("./SourcePluginWorkspace");
++const collectPluginSourceFiles_1 = require("./collectPluginSourceFiles");
++const copiesPluginSourceEntry_1 = require("./copiesPluginSourceEntry");
+ const ensureExecutableGoToolchain_1 = require("./ensureExecutableGoToolchain");
+ const pluginSourceDigest_1 = require("./pluginSourceDigest");
+ const readPluginBuildEnvironment_1 = require("./readPluginBuildEnvironment");
+@@ -30,27 +32,29 @@ const spawnGoTool_1 = require("./spawnGoTool");
+  * Metadata does not compile dependencies or certify a later build. A cold build
+  * repeats ownership admission in its proven, materialized workspace.
+  *
+- * @evidence contracts/common.md#principled-implementation The selected Go tool, effective environment, shared workspace writer and actual copied package inputs determine package names and errors; Go remains the build-constraint and package-validity authority.
++ * @evidence contracts/common.md#principled-implementation The selected Go tool, effective environment, shared workspace writer and the package inputs as a copy holds them, read in place under a Go overlay or from an actual copy, determine package names and errors; Go remains the build-constraint and package-validity authority.
+  * @evidence contracts/common.md#clear-and-simple-design One namespace separates contextual observation, metadata framing and ownership admission; source-only contributions are observed inside their selected host module.
+  * @evidence contracts/common.md#prohibited-implementation-shortcuts No filename exception or partial tag parser classifies packages. Go Error and empty production-file selections are rejected rather than trusting Name from an erroneous package.
+  * @evidence contracts/common.md#meaningful-documentation Native prose distinguishes metadata selection from compilation and later materialized admission.
+  * @evidence contracts/portability.md#os-neutral-implementation Native path/fs operations and the shared Go tool selector preserve environment-name and path identity without blanket case folding; Go itself applies target platform and cgo selection.
+- * @evidence contracts/performance.md#efficient-algorithms One list command observes all distinct package entries in each prepared context. Context materialization traverses and copies admitted host/contributor files; workspace setup delegates manifest commands and list skips dependency loading. Framing and JSON parsing process complete output bytes, and retained results scale with selected packages/files.
++ * @evidence contracts/performance.md#efficient-algorithms One list command observes all distinct package entries in each prepared context. A module its identity proves is read in place, with one overlay entry per contributor file; any other context traverses and copies admitted host/contributor files. Workspace setup delegates manifest commands and list skips dependency loading. Framing and JSON parsing process complete output bytes, and retained results scale with selected packages/files.
+  * @evidence contracts/performance.md#reuse-equivalent-work Entries are deduplicated within a contextual observation; callers group equivalent module contexts for one load. With a record store, a successful selection is answered across loads and processes under an identity built from the content of everything Go reads, so any source, overlay, contributor, manifest, Go variable or toolchain change observes Go again (#1721); erroneous selections are never recorded. Cold admission uses the already prepared real build workspace.
+  * @evidence contracts/performance.md#bound-retention-and-release-resources Each metadata scratch has finally-based retirement-aware cleanup, and capture resources belong to spawnGoTool. Unknown native retirement retains scratch under the existing scope; results and complete output remain caller-owned with no independent byte ceiling.
+  */
+ var NativeSourcePackages;
+ (function (NativeSourcePackages) {
+     /**
+-     * Observe entries together in a private module layout for their context.
++     * Observe entries together in a private module layout for their context: the
++     * module read where it lies when its identity proves it and a Go overlay can
++     * present its contributors exactly, a scratch copy otherwise.
+      *
+      * @evidence contracts/common.md#principled-implementation The original source module pins the selected native Go tool before copying. Actual observations retain their owning manifests; prospective nested observations replace only scratch root manifests with the maintained generic host manifests. Source-only final admissions enter their selected host module.
+-     * @evidence contracts/common.md#clear-and-simple-design Copying, workspace construction and batched reading have separate owners.
++     * @evidence contracts/common.md#clear-and-simple-design Overlay construction, copying, workspace construction and batched reading have separate owners.
+      * @evidence contracts/common.md#prohibited-implementation-shortcuts Go interprets tags, suffixes, cgo and manifests; selected errors are returned for admission, not overwritten by guessed kinds.
+      * @evidence contracts/common.md#meaningful-documentation Native prose states this operation's authority and delegated boundaries; fields retain separate native comments.
+      * @evidence contracts/portability.md#os-neutral-implementation Native copy/path and selected tool/environment owners preserve platform identity; contribution target containment is checked.
+-     * @evidence contracts/performance.md#efficient-algorithms Copies admitted host/contributor bytes and enumerates entries; workspace setup reads manifests and one list command skips dependencies.
+-     * @evidence contracts/performance.md#reuse-equivalent-work All entries share one prepared context; optional readers are scoped to one load and the same selected tool/effective environment. A supplied record store answers an equal selection without copying or running Go, under the content identity of the module, contributors, overlays, proposal manifests, toolchain/environment digest, Go variables, entries and command; an answer is recorded only when the copies matched their keyed digests, no package reported an error and the overlays still held their digests after Go ran.
++     * @evidence contracts/performance.md#efficient-algorithms In place, lists each contributor's files once into the overlay; otherwise copies admitted host/contributor bytes. Either way enumerates entries; workspace setup reads manifests and one list command skips dependencies.
++     * @evidence contracts/performance.md#reuse-equivalent-work All entries share one prepared context; optional readers are scoped to one load and the same selected tool/effective environment. A supplied record store answers an equal selection without copying or running Go, under the content identity of the module, contributors, overlays, proposal manifests, toolchain/environment digest, Go variables, entries and command; an answer is recorded only when the module and contributors still held their keyed digests after Go read them (in place) or the copies matched them, no package reported an error and the overlays still held their digests after Go ran.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources Finally releases owned scratch through retirement authority; unknown native closure defers removal and capture cleanup remains delegated.
+      */
+     function inspect(opts) {
+@@ -78,6 +82,24 @@ var NativeSourcePackages;
+                 fenceRoot: scratch,
+                 retainedPaths: [scratch],
+             });
++            // A module whose content the identity proves is read where it lies: Go
++            // lists it under a generated workspace and an overlay that presents each
++            // contributor at its entry and hides what a copy would leave out, so no
++            // module byte is copied. Anything the overlay cannot present exactly is
++            // observed in a copy, as before.
++            const overlay = identity === undefined || opts.proposal === true
++                ? undefined
++                : inPlaceOverlay(moduleRoot, opts.packages, opts.pluginName);
++            if (overlay !== undefined && identity !== undefined)
++                return observeInPlace({
++                    opts,
++                    env,
++                    goBinary,
++                    moduleRoot,
++                    scratch,
++                    overlay,
++                    identity,
++                });
+             SourcePluginWorkspace_1.SourcePluginWorkspace.materialize(moduleRoot, scratch);
+             // An answer is recorded only for the copy its identity describes: a
+             // module edited between the identity reading and the copy observed
+@@ -254,6 +276,7 @@ var NativeSourcePackages;
+         const result = (0, spawnGoTool_1.spawnGoTool)(opts.goBinary, [
+             "list",
+             ...GoSourceInputs_1.GoSourceInputs.BUILD_FLAGS,
++            ...(opts.overlay === undefined ? [] : [`-overlay=${opts.overlay}`]),
+             "-find",
+             "-e",
+             "-json=Dir,Name,GoFiles,CgoFiles,Error",
+@@ -266,11 +289,11 @@ var NativeSourcePackages;
+             throw new Error(`ttsc: selecting Go packages for plugin "${opts.pluginName}" failed:\n${result.stderr || result.stdout}`);
+         const packages = parse(result.stdout);
+         const selected = new Map(packages.map((input) => [
+-            input.Dir === undefined ? undefined : node_fs_1.default.realpathSync.native(input.Dir),
++            input.Dir === undefined ? undefined : physicalPath(input.Dir),
+             input,
+         ]));
+         return opts.entries.map((entry) => {
+-            const dir = node_fs_1.default.realpathSync.native(node_path_1.default.resolve(opts.cwd, entry));
++            const dir = physicalPath(node_path_1.default.resolve(opts.cwd, entry));
+             const input = selected.get(dir);
+             if (input === undefined)
+                 throw new Error(`ttsc: Go returned no package metadata for ${dir}`);
+@@ -469,4 +492,119 @@ function recallSelection(value, moduleRoot, count) {
+         return undefined;
+     }
+ }
++/**
++ * The Go `-overlay` replacements that make a module read where it lies look as
++ * its copy would to `go list -find`, or `undefined` when they cannot.
++ *
++ * A contributor's files appear at its entry inside the module, exactly the
++ * files its copy would hold (`collectPluginSourceFiles`, the population its
++ * identity digests). A host entry is read in place when every directory from
++ * the module down to it is one a copy keeps (`copiesPluginSourceEntry`): the
++ * files a copy leaves out of a kept directory are workspace, sidecar, archive
++ * and backup names, none of which Go selects. `-find` reads no other package
++ * and no dependency, so Go's selection reads nothing else besides the module's
++ * manifests, which the copy keeps verbatim. A contributor holding its own
++ * `go.mod`, or a host entry under a link or a directory a copy skips, has no
++ * exact in-place presentation and is observed in a copy.
++ */
++function inPlaceOverlay(moduleRoot, packages, pluginName) {
++    const root = node_path_1.default.resolve(moduleRoot);
++    const overlay = {};
++    for (const input of packages) {
++        OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
++        const target = node_path_1.default.resolve(root, input.entry);
++        if (input.source === undefined) {
++            if (node_path_1.default.relative(root, target).startsWith(".."))
++                return undefined;
++            for (let dir = target; dir !== root; dir = node_path_1.default.dirname(dir))
++                if (!(0, copiesPluginSourceEntry_1.copiesPluginSourceEntry)(root, dir))
++                    return undefined;
++            continue;
++        }
++        SourcePluginAdmission_1.SourcePluginAdmission.requireContributorPackage(pluginName, {
++            source: input.source,
++            name: input.name,
++        });
++        if (node_path_1.default.relative(root, target).startsWith("..") || target === root)
++            throw new Error("ttsc: invalid package selection target");
++        if (node_fs_1.default.existsSync(target))
++            throw new Error(`ttsc: package selection target already exists: ${target}`);
++        const files = (0, collectPluginSourceFiles_1.collectPluginSourceFiles)(input.source);
++        if (files.some((file) => node_path_1.default.basename(file) === "go.mod"))
++            return undefined;
++        for (const file of files)
++            overlay[node_path_1.default.join(target, node_path_1.default.relative(input.source, file))] = file;
++    }
++    return overlay;
++}
++/**
++ * Observe a selection over the module where it lies: a generated workspace
++ * whose module is `moduleRoot`, selected through `GOWORK`, and the overlay
++ * `inPlaceOverlay` built, both written in `scratch`, which holds nothing else.
++ *
++ * The answer is recorded only when the module and every contributor still have
++ * the content the identity names after Go ran, as the copy's digest proved its
++ * bytes before. Directories are reported and recorded relative to the module,
++ * as a recalled answer reports them.
++ */
++function observeInPlace(props) {
++    const { opts, env, goBinary, moduleRoot, scratch, identity } = props;
++    const reader = SourcePluginWorkspace_1.SourcePluginWorkspace.createGoModReader(goBinary, opts.pluginName, env, opts.readers, opts.identities);
++    SourcePluginWorkspace_1.SourcePluginWorkspace.writeGoWork(scratch, SourcePluginWorkspace_1.SourcePluginWorkspace.findTtscOverlayDirs(CompilerTarget_1.CompilerTarget.ofEnv(env)), goBinary, opts.pluginName, env, reader, moduleRoot);
++    const overlayFile = node_path_1.default.join(scratch, "overlay.json");
++    node_fs_1.default.writeFileSync(overlayFile, JSON.stringify({ Replace: props.overlay }), "utf8");
++    const observed = NativeSourcePackages.read({
++        cwd: moduleRoot,
++        entries: opts.packages.map((input) => input.entry),
++        env: {
++            ...GoSourceInputs_1.GoSourceInputs.goBuildEnv(goBinary, undefined, env),
++            GOWORK: node_path_1.default.join(scratch, "go.work"),
++        },
++        goBinary,
++        pluginName: opts.pluginName,
++        overlay: overlayFile,
++    });
++    const root = physicalPath(moduleRoot);
++    const relative = observed.map((input) => ({
++        ...input,
++        Dir: input.Dir === undefined
++            ? undefined
++            : node_path_1.default.relative(root, physicalPath(input.Dir)),
++    }));
++    const held = PluginContentIdentities_1.PluginContentIdentities.sourceDirectory(opts.identities, moduleRoot) ===
++        identity.module &&
++        opts.packages.every((input) => input.source === undefined ||
++            PluginContentIdentities_1.PluginContentIdentities.sourceDirectory(opts.identities, input.source) === identity.entries.find((entry) => entry[0] === input.entry)?.[2]);
++    if (held &&
++        observed.every((input) => input.Error === undefined) &&
++        JSON.stringify(overlayDigests(env, opts.identities)) ===
++            JSON.stringify(identity.overlays))
++        PluginLoadAnswers_1.PluginLoadAnswers.write(opts.identities, SELECTION_ANSWER, identity, relative);
++    return relative.map((input) => ({
++        ...input,
++        Dir: input.Dir === undefined ? undefined : node_path_1.default.resolve(moduleRoot, input.Dir),
++    }));
++}
++/**
++ * The physical spelling of `location`: its deepest existing ancestor resolved
++ * through links, with the components below it appended as written, so a
++ * directory only an overlay presents compares with the one Go reports.
++ */
++function physicalPath(location) {
++    const missing = [];
++    let current = node_path_1.default.resolve(location);
++    for (;;) {
++        try {
++            return node_path_1.default.join(node_fs_1.default.realpathSync.native(current), ...missing);
++        }
++        catch (error) {
++            const code = error.code;
++            const parent = node_path_1.default.dirname(current);
++            if ((code !== "ENOENT" && code !== "ENOTDIR") || parent === current)
++                throw error;
++            missing.unshift(node_path_1.default.basename(current));
++            current = parent;
++        }
++    }
++}
+ //# sourceMappingURL=NativeSourcePackages.js.map
+\ No newline at end of file
 diff --git a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js b/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
 index da585c3ce22340d4a7d3c2b2793ae5c951958372..63c842daefa4c15cbc17b778dd382ac038eed69a 100644
 --- a/lib/plugin/internal/source/PluginBuildEnvironmentReadings.js
@@ -851,6 +1121,68 @@ index da585c3ce22340d4a7d3c2b2793ae5c951958372..63c842daefa4c15cbc17b778dd382ac0
          worker = created;
          const retire = () => {
              if (worker === created)
+diff --git a/lib/plugin/internal/source/SourcePluginWorkspace.d.ts b/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
+index b4623b785d56dfd359c0a01e2f048dd624edb857..0011d99bc0699a9487b3ce50c37a3e2f49f83585 100644
+--- a/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
++++ b/lib/plugin/internal/source/SourcePluginWorkspace.d.ts
+@@ -41,6 +41,10 @@ export declare namespace SourcePluginWorkspace {
+      * Write the native builder's generated workspace and let Go select its
+      * version.
+      *
++     * The workspace's own module is `scratchDir` itself (`use .`) unless `root`
++     * names a module read where it lies; the file is written in `scratchDir`
++     * either way, and a caller with a `root` selects it through `GOWORK`.
++     *
+      * @evidence contracts/common.md#principled-implementation Actual manifest records drive managed overlay filtering and replacement admission; Go work use supplies required directives.
+      * @evidence contracts/common.md#clear-and-simple-design The writer shares one reader across source/overlay queries and delegates manifest interpretation to Go.
+      * @evidence contracts/common.md#prohibited-implementation-shortcuts No ancestor workspace or fixed Go version substitutes for this generated workspace; Go errors propagate.
+@@ -50,7 +54,7 @@ export declare namespace SourcePluginWorkspace {
+      * @evidence contracts/performance.md#reuse-equivalent-work A supplied reader shares manifest observations with the same prepared-context caller; otherwise a private reader is allocated.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources Workspace files belong to the caller's scratch; captures are released by spawnGoTool and module records by the reader's enclosing load.
+      */
+-    export function writeGoWork(scratchDir: string, useDirs: readonly string[], goBinary: string, pluginName: string, env: NodeJS.ProcessEnv, goModReader?: GoModReader): void;
++    export function writeGoWork(scratchDir: string, useDirs: readonly string[], goBinary: string, pluginName: string, env: NodeJS.ProcessEnv, goModReader?: GoModReader, root?: string): void;
+     interface GoModReplacement {
+         readonly modulePath: string;
+     }
+diff --git a/lib/plugin/internal/source/SourcePluginWorkspace.js b/lib/plugin/internal/source/SourcePluginWorkspace.js
+index 0c15fff7f0690410e69308f9567977de50a42bf2..02fe6f95e34f135b33296de1241a4819bef171a7 100644
+--- a/lib/plugin/internal/source/SourcePluginWorkspace.js
++++ b/lib/plugin/internal/source/SourcePluginWorkspace.js
+@@ -72,6 +72,10 @@ var SourcePluginWorkspace;
+      * Write the native builder's generated workspace and let Go select its
+      * version.
+      *
++     * The workspace's own module is `scratchDir` itself (`use .`) unless `root`
++     * names a module read where it lies; the file is written in `scratchDir`
++     * either way, and a caller with a `root` selects it through `GOWORK`.
++     *
+      * @evidence contracts/common.md#principled-implementation Actual manifest records drive managed overlay filtering and replacement admission; Go work use supplies required directives.
+      * @evidence contracts/common.md#clear-and-simple-design The writer shares one reader across source/overlay queries and delegates manifest interpretation to Go.
+      * @evidence contracts/common.md#prohibited-implementation-shortcuts No ancestor workspace or fixed Go version substitutes for this generated workspace; Go errors propagate.
+@@ -81,9 +85,10 @@ var SourcePluginWorkspace;
+      * @evidence contracts/performance.md#reuse-equivalent-work A supplied reader shares manifest observations with the same prepared-context caller; otherwise a private reader is allocated.
+      * @evidence contracts/performance.md#bound-retention-and-release-resources Workspace files belong to the caller's scratch; captures are released by spawnGoTool and module records by the reader's enclosing load.
+      */
+-    function writeGoWork(scratchDir, useDirs, goBinary, pluginName, env, goModReader = createGoModReader(goBinary, pluginName, env)) {
+-        validateSourceReplacements(scratchDir, useDirs, goModReader, pluginName);
+-        const sourceInfo = goModReader.read(scratchDir);
++    function writeGoWork(scratchDir, useDirs, goBinary, pluginName, env, goModReader = createGoModReader(goBinary, pluginName, env), root) {
++        const moduleDir = root ?? scratchDir;
++        validateSourceReplacements(moduleDir, useDirs, goModReader, pluginName);
++        const sourceInfo = goModReader.read(moduleDir);
+         // A TypeScript 7.1 target overlays bridges and facades. Each facade shares
+         // its module path with a 7.0 shim that the ttsc module's own go.mod
+         // replaces, so the shims become workspace replacements, which override
+@@ -103,7 +108,7 @@ var SourcePluginWorkspace;
+                 (modulePath !== null &&
+                     !SourcePluginAdmission_1.SourcePluginAdmission.isManagedModule(modulePath)));
+         });
+-        const useLines = ["\t."];
++        const useLines = [`\t${root === undefined ? "." : (0, formatGoWorkPath_1.formatGoWorkPath)(root)}`];
+         for (const dir of effectiveUseDirs) {
+             OwnedSynchronousProcess_1.OwnedSynchronousProcess.checkpoint();
+             useLines.push(`\t${(0, formatGoWorkPath_1.formatGoWorkPath)(dir)}`);
 diff --git a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts b/lib/plugin/internal/source/collectPluginSourceFiles.d.ts
 index bd872710a248aa9bd2dbd0c9bc59f89d9b60970c..46184064f7ba45602b03e99db69291bbbe522675 100644
 --- a/lib/plugin/internal/source/collectPluginSourceFiles.d.ts

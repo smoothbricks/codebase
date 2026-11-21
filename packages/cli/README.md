@@ -439,9 +439,15 @@ transform host fails after printing an error diagnostic of its own, ttsc skips i
 (`PluginFailureDiagnostics.transformHostReported`): that host has reported its program, and the recheck loads no plugin
 and reads each referenced project from its declaration outputs, so it could only add false errors. A host that printed
 none keeps the recheck, which leaves out the refusals a `DiagnosticPlugin` withdrew (`TTSC_WITHDRAWN_DIAGNOSTICS_PATH`).
-The packaged managed asset is the source, so clean managed installs receive the same repairs without a compiler fork or
-edits to the dependency cache. The registration applies only to that exact compiler version; the repository's lockfile
-continues to own its compiler pin.
+A load's package selection for a linked plugin host (`NativeSourcePackages.inspect`) copied the host's whole Go module
+into scratch before one `go list -find`: for the installed `ttsc` module about 2,600 files written, read and removed per
+cold selection, to answer from the manifests and two package directories. When the record store's identity proves the
+module, the patch lists it where it lies, under a generated `go.work` (`GOWORK`) and a Go `-overlay` that presents each
+contributor's files at `contrib/<name>`; the answer is recorded only when the module and contributors still hold their
+keyed digests after Go ran. A proposal, a contributor holding a nested `go.mod`, or a host entry under a link or a
+pruned directory is still observed in a copy. The packaged managed asset is the source, so clean managed installs
+receive the same repairs without a compiler fork or edits to the dependency cache. The registration applies only to that
+exact compiler version; the repository's lockfile continues to own its compiler pin.
 
 Explicit Nx target names must not contain `:`. Nx already uses colon syntax at the CLI boundary:
 `project:target:configuration`. Allowing target names like `build:wasm` makes command parsing and package-script aliases
