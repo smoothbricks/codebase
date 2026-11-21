@@ -1003,6 +1003,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowshed-helper"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cowshed-napi"
 version = "0.1.0"
 dependencies = [
