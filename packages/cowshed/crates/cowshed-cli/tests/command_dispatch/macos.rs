@@ -3896,6 +3896,27 @@ async fn directory_adoption_never_reexecutes_shell_checks_or_uncacheable_tasks_s
         "uncacheable findings retain the checked hash"
     );
     assert_eq!(check.failed, [], "{check:?}");
+    // The checks ran in the topic and the adoption check in main, each through the fixture's Node
+    // shim ([`write_nx_project`]): neither wrote a module compile cache entry where the supervisor
+    // points `NODE_COMPILE_CACHE` (03_caches.md).
+    for checkout in [&topic, &fixture.checkout] {
+        let mut entries = Vec::new();
+        let mut pending = vec![checkout.join(".cowshed/cache/node-compile-cache")];
+        while let Some(directory) = pending.pop() {
+            let Ok(listing) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in listing {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    entries.push(path);
+                }
+            }
+        }
+        assert_eq!(entries, Vec::<PathBuf>::new(), "compile cache entries");
+    }
     assert_eq!(
         check.unattributed.len(),
         1,
