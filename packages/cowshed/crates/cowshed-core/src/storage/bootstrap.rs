@@ -16,6 +16,7 @@ use cowshed_os::process::fmt_command_failure;
 use super::fstab::FstabPin;
 
 pub mod native;
+pub mod zfs_root;
 pub use native::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,

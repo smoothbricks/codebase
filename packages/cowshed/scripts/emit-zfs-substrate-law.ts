@@ -3,8 +3,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { checkBendFile } from '@smoothbricks/bend-emit';
 
-// The ZFS substrate's model (09_substrates.md, "Privileged helper" and selection) binds two crates:
-// the root helper's admission and the store's selection, each through a kernel of its own.
+// The ZFS substrate's model (09_substrates.md, "Privileged helper" and selection; 01b_zfs.md, "One
+// pool, one root") binds three kernels: the root helper's admission, the store's selection, and the
+// root `cowshed setup` serves.
 const modelName = 'specs/cowshed/laws/zfs_substrate.bend';
 const model = new URL(`../../../${modelName}`, import.meta.url);
 const kernels = [
@@ -17,6 +18,11 @@ const kernels = [
     path: new URL('../crates/cowshed-core/src/storage/directory/zfs/laws/model.rs', import.meta.url),
     functions: ['select', 'needs_serving', 'needs_holding', 'root_names'],
     laws: ['a_file_main_check'],
+  },
+  {
+    path: new URL('../crates/cowshed-core/src/storage/bootstrap/zfs_root/laws/model.rs', import.meta.url),
+    functions: ['root_steps', 'reads', 'parent', 'root_names'],
+    laws: ['created_check', 'parent_check'],
   },
 ];
 const cap = 400;

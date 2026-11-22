@@ -45,6 +45,7 @@ pub enum Sel {
     Datasets(Rc<List<u64>>),
     NoRoot,
     Several(Rc<List<R>>),
+    Unserving(R),
 }
 pub fn write_Sel(x: &Sel, out: &mut String) {
     match x {
@@ -58,6 +59,11 @@ pub fn write_Sel(x: &Sel, out: &mut String) {
         Sel::Several(f0) => {
             out.push_str("Several(");
             write_ListR(f0, out);
+            out.push(')');
+        }
+        Sel::Unserving(f0) => {
+            out.push_str("Unserving(");
+            write_R(f0, out);
             out.push(')');
         }
     }
@@ -107,6 +113,27 @@ pub fn write_Found(x: &Found, out: &mut String) {
 pub fn show_Found(x: &Found) -> String {
     let mut s = String::new();
     write_Found(x, &mut s);
+    s
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Named {
+    Unnamed,
+    Name(R),
+}
+pub fn write_Named(x: &Named, out: &mut String) {
+    match x {
+        Named::Unnamed => out.push_str("Unnamed"),
+        Named::Name(f0) => {
+            out.push_str("Name(");
+            write_R(f0, out);
+            out.push(')');
+        }
+    }
+}
+pub fn show_Named(x: &Named) -> String {
+    let mut s = String::new();
+    write_Named(x, &mut s);
     s
 }
 
@@ -188,24 +215,24 @@ pub fn show_ListR(x: &Rc<List<R>>) -> String {
     s
 }
 
-pub fn and(a_4: bool, b_5: bool) -> bool {
-    if a_4 {
-        return b_5;
+pub fn and(a_5: bool, b_6: bool) -> bool {
+    if a_5 {
+        return b_6;
     } else {
         return false;
     }
 }
 
-pub fn not(a_7: bool) -> bool {
-    if a_7 {
+pub fn not(a_8: bool) -> bool {
+    if a_8 {
         return false;
     } else {
         return true;
     }
 }
 
-pub fn is_images(s_8: Sel) -> bool {
-    match &s_8 {
+pub fn is_images(s_9: Sel) -> bool {
+    match &s_9 {
         Sel::Images => {
             return true;
         }
@@ -218,120 +245,123 @@ pub fn is_images(s_8: Sel) -> bool {
         Sel::Several(f0__) => {
             return false;
         }
+        Sel::Unserving(f0__) => {
+            return false;
+        }
     }
 }
 
-pub fn ok_sel(b_31: bool, r_32: Rc<List<u64>>) -> Sel {
-    if b_31 {
-        return Sel::Datasets(r_32.clone());
+pub fn ok_sel(b_36: bool, r_37: Rc<List<u64>>) -> Sel {
+    if b_36 {
+        return Sel::Datasets(r_37.clone());
     } else {
         return Sel::Images;
     }
 }
 
-pub fn same(a_113: u64, b_114: u64) -> bool {
-    return (a_113 == b_114);
+pub fn same(a_105: u64, b_106: u64) -> bool {
+    return (a_105 == b_106);
 }
 
-pub fn last0(t_82: Rc<List<u64>>, h_83: u64) -> bool {
-    match &*t_82 {
+pub fn last0(t_74: Rc<List<u64>>, h_75: u64) -> bool {
+    match &*t_74 {
         List::Nil => {
-            return same(h_83, 0u64);
+            return same(h_75, 0u64);
         }
         List::Con(h__, t__) => {
-            let head_127: u64 = h__.clone();
-            let tail_128: Rc<List<u64>> = t__.clone();
-            return last0(tail_128.clone(), head_127);
+            let head_146: u64 = h__.clone();
+            let tail_147: Rc<List<u64>> = t__.clone();
+            return last0(tail_147.clone(), head_146);
         }
     }
 }
 
-pub fn root_ok(xs_33: Rc<List<u64>>) -> bool {
-    match &*xs_33 {
+pub fn root_ok(xs_38: Rc<List<u64>>) -> bool {
+    match &*xs_38 {
         List::Nil => {
             return false;
         }
         List::Con(h__, t__) => {
-            let head_72: u64 = h__.clone();
-            let tail_73: Rc<List<u64>> = t__.clone();
-            match &*tail_73 {
+            let head_64: u64 = h__.clone();
+            let tail_65: Rc<List<u64>> = t__.clone();
+            match &*tail_65 {
                 List::Nil => {
                     return false;
                 }
                 List::Con(h__, t__) => {
-                    let head_80: u64 = h__.clone();
-                    let tail_81: Rc<List<u64>> = t__.clone();
-                    return last0(tail_81.clone(), head_80);
+                    let head_72: u64 = h__.clone();
+                    let tail_73: Rc<List<u64>> = t__.clone();
+                    return last0(tail_73.clone(), head_72);
                 }
             }
         }
     }
 }
 
-pub fn root_sel(f_15: Found) -> Sel {
-    match &f_15 {
+pub fn root_sel(f_17: Found) -> Sel {
+    match &f_17 {
         Found::Nothing => {
             return Sel::Images;
         }
         Found::Named(f0__) => {
-            let d_30: Rc<List<u64>> = f0__.clone();
-            return ok_sel(root_ok(d_30.clone()), d_30.clone());
+            let d_35: Rc<List<u64>> = f0__.clone();
+            return ok_sel(root_ok(d_35.clone()), d_35.clone());
         }
     }
 }
 
-pub fn pre(h_85: u64, f_86: Found) -> Found {
-    match &f_86 {
+pub fn pre(h_77: u64, f_78: Found) -> Found {
+    match &f_78 {
         Found::Nothing => {
             return Found::Nothing;
         }
         Found::Named(f0__) => {
-            let d_130: Rc<List<u64>> = f0__.clone();
-            return Found::Named(Rc::new(List::Con(h_85, d_130.clone())));
+            let d_149: Rc<List<u64>> = f0__.clone();
+            return Found::Named(Rc::new(List::Con(h_77, d_149.clone())));
         }
     }
 }
 
-pub fn root_of_if(h_42: u64, b_43: bool, f_44: Found) -> Found {
-    if b_43 {
-        return Found::Named(Rc::new(List::Con(h_42, Rc::new(List::Nil))));
+pub fn root_of_if(h_47: u64, b_48: bool, f_49: Found) -> Found {
+    if b_48 {
+        return Found::Named(Rc::new(List::Con(h_47, Rc::new(List::Nil))));
     } else {
-        return pre(h_42, f_44.clone());
+        return pre(h_47, f_49.clone());
     }
 }
 
-pub fn main_tail(xs_45: Rc<List<u64>>) -> bool {
-    match &*xs_45 {
+pub fn main_tail(xs_50: Rc<List<u64>>) -> bool {
+    match &*xs_50 {
         List::Nil => {
             return false;
         }
         List::Con(h__, t__) => {
-            let head_91: u64 = h__.clone();
-            let tail_92: Rc<List<u64>> = t__.clone();
-            match &*tail_92 {
+            let head_83: u64 = h__.clone();
+            let tail_84: Rc<List<u64>> = t__.clone();
+            match &*tail_84 {
                 List::Nil => {
                     return false;
                 }
                 List::Con(h__, t__) => {
-                    let head_97: u64 = h__.clone();
-                    let tail_98: Rc<List<u64>> = t__.clone();
-                    match &*tail_98 {
+                    let head_89: u64 = h__.clone();
+                    let tail_90: Rc<List<u64>> = t__.clone();
+                    match &*tail_90 {
                         List::Nil => {
                             return false;
                         }
                         List::Con(h__, t__) => {
-                            let head_103: u64 = h__.clone();
-                            let tail_104: Rc<List<u64>> = t__.clone();
-                            match &*tail_104 {
+                            let head_95: u64 = h__.clone();
+                            let tail_96: Rc<List<u64>> = t__.clone();
+                            match &*tail_96 {
                                 List::Nil => {
                                     return false;
                                 }
                                 List::Con(h__, t__) => {
-                                    let head_109: u64 = h__.clone();
-                                    let tail_110: Rc<List<u64>> = t__.clone();
-                                    match &*tail_110 {
+                                    let head_101: u64 = h__.clone();
+                                    let tail_102: Rc<List<u64>> = t__.clone();
+                                    match &*tail_102 {
                                         List::Nil => {
-                                            return and(same(head_91, 1u64), same(head_109, 2u64));
+                                            return and(same(head_83, 1u64), same(head_101, 2u64));
                                         }
                                         List::Con(h__, t__) => {
                                             return false;
@@ -347,45 +377,45 @@ pub fn main_tail(xs_45: Rc<List<u64>>) -> bool {
     }
 }
 
-pub fn root_of(d_16: Rc<List<u64>>) -> Found {
-    match &*d_16 {
+pub fn root_of(d_18: Rc<List<u64>>) -> Found {
+    match &*d_18 {
         List::Nil => {
             return Found::Nothing;
         }
         List::Con(h__, t__) => {
-            let head_40: u64 = h__.clone();
-            let tail_41: Rc<List<u64>> = t__.clone();
+            let head_45: u64 = h__.clone();
+            let tail_46: Rc<List<u64>> = t__.clone();
             return root_of_if(
-                head_40,
-                main_tail(tail_41.clone()),
-                root_of(tail_41.clone()),
+                head_45,
+                main_tail(tail_46.clone()),
+                root_of(tail_46.clone()),
             );
         }
     }
 }
 
-pub fn cat(xs_119: Rc<List<u64>>, ys_120: Rc<List<u64>>) -> Rc<List<u64>> {
-    match &*xs_119 {
+pub fn cat(xs_179: Rc<List<u64>>, ys_180: Rc<List<u64>>) -> Rc<List<u64>> {
+    match &*xs_179 {
         List::Nil => {
-            return ys_120.clone();
+            return ys_180.clone();
         }
         List::Con(h__, t__) => {
-            let head_138: u64 = h__.clone();
-            let tail_139: Rc<List<u64>> = t__.clone();
-            return Rc::new(List::Con(head_138, cat(tail_139.clone(), ys_120.clone())));
+            let head_193: u64 = h__.clone();
+            let tail_194: Rc<List<u64>> = t__.clone();
+            return Rc::new(List::Con(head_193, cat(tail_194.clone(), ys_180.clone())));
         }
     }
 }
 
-pub fn root_names(r_57: R) -> Rc<List<u64>> {
-    match &r_57 {
+pub fn root_names(r_108: R) -> Rc<List<u64>> {
+    match &r_108 {
         R::R(f0__, f1__) => {
-            let pool_117: u64 = f0__.clone();
-            let parents_118: Rc<List<u64>> = f1__.clone();
+            let pool_177: u64 = f0__.clone();
+            let parents_178: Rc<List<u64>> = f1__.clone();
             return Rc::new(List::Con(
-                pool_117,
+                pool_177,
                 cat(
-                    parents_118.clone(),
+                    parents_178.clone(),
                     Rc::new(List::Con(0u64, Rc::new(List::Nil))),
                 ),
             ));
@@ -393,24 +423,24 @@ pub fn root_names(r_57: R) -> Rc<List<u64>> {
     }
 }
 
-pub fn one(rs_20: Rc<List<R>>) -> Sel {
-    match &*rs_20 {
+pub fn one(rs_33: Rc<List<R>>) -> Sel {
+    match &*rs_33 {
         List::Nil => {
             return Sel::NoRoot;
         }
         List::Con(h__, t__) => {
-            let head_52: R = h__.clone();
-            let tail_53: Rc<List<R>> = t__.clone();
-            match &*tail_53 {
+            let head_128: R = h__.clone();
+            let tail_129: Rc<List<R>> = t__.clone();
+            match &*tail_129 {
                 List::Nil => {
-                    return Sel::Datasets(root_names(head_52.clone()));
+                    return Sel::Datasets(root_names(head_128.clone()));
                 }
                 List::Con(h__, t__) => {
-                    let head_62: R = h__.clone();
-                    let tail_63: Rc<List<R>> = t__.clone();
+                    let head_137: R = h__.clone();
+                    let tail_138: Rc<List<R>> = t__.clone();
                     return Sel::Several(Rc::new(List::Con(
-                        head_52.clone(),
-                        Rc::new(List::Con(head_62.clone(), tail_63.clone())),
+                        head_128.clone(),
+                        Rc::new(List::Con(head_137.clone(), tail_138.clone())),
                     )));
                 }
             }
@@ -418,47 +448,129 @@ pub fn one(rs_20: Rc<List<R>>) -> Sel {
     }
 }
 
-pub fn held(rs_17: Rc<List<R>>) -> Sel {
-    match &*rs_17 {
+pub fn held(rs_19: Rc<List<R>>) -> Sel {
+    match &*rs_19 {
         List::Nil => {
             return Sel::Images;
         }
         List::Con(h__, t__) => {
-            let head_27: R = h__.clone();
-            let tail_28: Rc<List<R>> = t__.clone();
-            return one(Rc::new(List::Con(head_27.clone(), tail_28.clone())));
+            let head_31: R = h__.clone();
+            let tail_32: Rc<List<R>> = t__.clone();
+            return one(Rc::new(List::Con(head_31.clone(), tail_32.clone())));
         }
     }
 }
 
-pub fn asked(a_18: bool, rs_19: Rc<List<R>>) -> Sel {
-    if a_18 {
-        return one(rs_19.clone());
+pub fn served_if(b_53: bool, r_54: R) -> Sel {
+    if b_53 {
+        return Sel::Datasets(root_names(r_54.clone()));
+    } else {
+        return Sel::Unserving(r_54.clone());
+    }
+}
+
+pub fn or(a_118: bool, b_119: bool) -> bool {
+    if a_118 {
+        return true;
+    } else {
+        return b_119;
+    }
+}
+
+pub fn eq_names(xs_120: Rc<List<u64>>, ys_121: Rc<List<u64>>) -> bool {
+    match &*xs_120 {
+        List::Nil => match &*ys_121 {
+            List::Nil => {
+                return true;
+            }
+            List::Con(h__, t__) => {
+                let head_159: u64 = h__.clone();
+                let tail_160: Rc<List<u64>> = t__.clone();
+                return false;
+            }
+        },
+        List::Con(h__, t__) => {
+            let head_165: u64 = h__.clone();
+            let tail_166: Rc<List<u64>> = t__.clone();
+            match &*ys_121 {
+                List::Nil => {
+                    return false;
+                }
+                List::Con(h__, t__) => {
+                    let head_173: u64 = h__.clone();
+                    let tail_174: Rc<List<u64>> = t__.clone();
+                    return and(
+                        same(head_165, head_173),
+                        eq_names(tail_166.clone(), tail_174.clone()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn member(r_55: R, rs_56: Rc<List<R>>) -> bool {
+    match &*rs_56 {
+        List::Nil => {
+            return false;
+        }
+        List::Con(h__, t__) => {
+            let head_116: R = h__.clone();
+            let tail_117: Rc<List<R>> = t__.clone();
+            return or(
+                eq_names(root_names(r_55.clone()), root_names(head_116.clone())),
+                member(r_55.clone(), tail_117.clone()),
+            );
+        }
+    }
+}
+
+pub fn declared_or_one(d_23: Named, rs_24: Rc<List<R>>) -> Sel {
+    match &d_23 {
+        Named::Unnamed => {
+            return one(rs_24.clone());
+        }
+        Named::Name(f0__) => {
+            let root_52: R = f0__.clone();
+            return served_if(member(root_52.clone(), rs_24.clone()), root_52.clone());
+        }
+    }
+}
+
+pub fn asked(a_20: bool, d_21: Named, rs_22: Rc<List<R>>) -> Sel {
+    if a_20 {
+        return declared_or_one(d_21.clone(), rs_22.clone());
     } else {
         return Sel::Images;
     }
 }
 
-pub fn select(m_9: Main, a_10: bool, serving_11: Rc<List<R>>, holding_12: Rc<List<R>>) -> Sel {
-    match &m_9 {
+pub fn select(
+    m_10: Main,
+    a_11: bool,
+    d_12: Named,
+    serving_13: Rc<List<R>>,
+    holding_14: Rc<List<R>>,
+) -> Sel {
+    match &m_10 {
         Main::MFile => {
             return Sel::Images;
         }
         Main::MPlace(f0__) => {
-            let d_14: Rc<List<u64>> = f0__.clone();
-            return root_sel(root_of(d_14.clone()));
+            let d_16: Rc<List<u64>> = f0__.clone();
+            return root_sel(root_of(d_16.clone()));
         }
         Main::MHome => {
-            return held(holding_12.clone());
+            return held(holding_14.clone());
         }
         Main::MAbsent => {
-            return asked(a_10, serving_11.clone());
+            return asked(a_11, d_12.clone(), serving_13.clone());
         }
     }
 }
 
-pub fn is_file(m_6: Main) -> bool {
-    match &m_6 {
+pub fn is_file(m_7: Main) -> bool {
+    match &m_7 {
         Main::MFile => {
             return true;
         }
@@ -474,8 +586,8 @@ pub fn is_file(m_6: Main) -> bool {
     }
 }
 
-pub fn needs_holding(m_146: Main) -> bool {
-    match &m_146 {
+pub fn needs_holding(m_195: Main) -> bool {
+    match &m_195 {
         Main::MFile => {
             return false;
         }
@@ -491,8 +603,8 @@ pub fn needs_holding(m_146: Main) -> bool {
     }
 }
 
-pub fn needs_serving(m_147: Main, a_148: bool) -> bool {
-    match &m_147 {
+pub fn needs_serving(m_196: Main, a_197: bool) -> bool {
+    match &m_196 {
         Main::MFile => {
             return false;
         }
@@ -503,7 +615,7 @@ pub fn needs_serving(m_147: Main, a_148: bool) -> bool {
             return false;
         }
         Main::MAbsent => {
-            return a_148;
+            return a_197;
         }
     }
 }
@@ -511,16 +623,18 @@ pub fn needs_serving(m_147: Main, a_148: bool) -> bool {
 pub fn law_a_file_main_check(
     m_0: Main,
     a_1: bool,
-    serving_2: Rc<List<R>>,
-    holding_3: Rc<List<R>>,
+    d_2: Named,
+    serving_3: Rc<List<R>>,
+    holding_4: Rc<List<R>>,
 ) -> (bool, String) {
     let a = and(
         is_file(m_0.clone()),
         not(is_images(select(
             m_0.clone(),
             a_1,
-            serving_2.clone(),
-            holding_3.clone(),
+            d_2.clone(),
+            serving_3.clone(),
+            holding_4.clone(),
         ))),
     );
     let b = false;
@@ -569,16 +683,20 @@ pub fn gen_ListR(r: &mut Rng, m: u64) -> Rc<List<R>> {
     l
 }
 pub fn gen_Sel(r: &mut Rng, _m: u64) -> Sel {
-    match r.next() % 4 {
+    match r.next() % 5 {
         0 => Sel::Images,
         1 => {
             let f0 = gen_ListNat(r, 3);
             Sel::Datasets(f0)
         }
         2 => Sel::NoRoot,
-        _ => {
+        3 => {
             let f0 = gen_ListR(r, 3);
             Sel::Several(f0)
+        }
+        _ => {
+            let f0 = gen_R(r, 3);
+            Sel::Unserving(f0)
         }
     }
 }
@@ -600,6 +718,15 @@ pub fn gen_Found(r: &mut Rng, _m: u64) -> Found {
         }
     }
 }
+pub fn gen_Named(r: &mut Rng, _m: u64) -> Named {
+    match r.next() % 2 {
+        0 => Named::Unnamed,
+        _ => {
+            let f0 = gen_R(r, 3);
+            Named::Name(f0)
+        }
+    }
+}
 pub fn gen_Main(r: &mut Rng, _m: u64) -> Main {
     match r.next() % 4 {
         0 => Main::MFile,
@@ -613,69 +740,19 @@ pub fn gen_Main(r: &mut Rng, _m: u64) -> Main {
 }
 
 /// a_file_main_check (proven): 400 enumerated cases.
-pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)> {
+pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Named, Rc<List<R>>, Rc<List<R>>)> {
     vec![
-        (Main::MFile, false, Rc::new(List::Nil), Rc::new(List::Nil)),
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Named::Unnamed,
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
         ),
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -694,69 +771,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -778,72 +793,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -868,75 +818,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -961,78 +843,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1048,75 +859,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1138,78 +881,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -1234,72 +906,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MFile,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -1324,8 +931,16 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -1334,25 +949,85 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
         ),
         (
             Main::MFile,
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -1362,17 +1037,427 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MFile,
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -1381,6 +1466,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -1402,69 +1488,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -1477,72 +1501,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -1564,78 +1523,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1660,72 +1548,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1750,75 +1573,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1843,78 +1598,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -1930,75 +1614,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MFile,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -2020,20 +1636,37 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -2044,204 +1677,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MFile,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Nil),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -2264,80 +1700,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -2351,77 +1716,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -2441,80 +1738,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -2537,10 +1763,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -2550,9 +1900,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -2561,10 +1911,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -2574,9 +2048,31 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -2585,10 +2081,77 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MFile,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -2599,16 +2162,102 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
             false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -2616,33 +2265,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
@@ -2650,58 +2275,11 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -2709,73 +2287,26 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -2783,9 +2314,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -2793,70 +2324,40 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Nil),
             Rc::new(List::Nil),
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -2874,70 +2375,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -2958,73 +2397,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3048,76 +2422,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -3141,79 +2447,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -3228,76 +2463,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -3318,79 +2485,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3414,73 +2510,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Nil)),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3504,64 +2535,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Nil)),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3581,71 +2556,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3656,74 +2569,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -3743,80 +2591,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -3839,74 +2616,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -3929,77 +2641,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4022,80 +2666,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4109,77 +2682,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -4199,71 +2704,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Nil),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
@@ -4280,65 +2723,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4358,71 +2745,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -4445,80 +2770,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -4532,77 +2786,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4622,80 +2808,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4718,10 +2833,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
-            true,
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -4731,9 +2970,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -4742,10 +2981,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -4755,9 +3118,31 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -4766,10 +3151,77 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -4780,12 +3232,145 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -4808,14 +3393,88 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MHome,
+            Main::MPlace(Rc::new(List::Nil)),
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -4824,166 +3483,308 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Nil)),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
         ),
         (
             Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MHome,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (Main::MAbsent, false, Rc::new(List::Nil), Rc::new(List::Nil)),
-        (
-            Main::MAbsent,
             false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -4992,37 +3793,20 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -5031,13 +3815,58 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
                 )),
             )),
             Rc::new(List::Con(
@@ -5049,19 +3878,48 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
                 )),
             )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -5070,29 +3928,158 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
-        ),
-        (
-            Main::MAbsent,
-            false,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5100,25 +4087,19 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                     Rc::new(List::Nil),
                 )),
             )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
                 )),
             )),
             Rc::new(List::Con(
@@ -5133,36 +4114,13 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -5172,7 +4130,89 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -5181,34 +4221,121 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
+            Main::MHome,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
-        ),
-        (
-            Main::MAbsent,
-            false,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
                 )),
             )),
             Rc::new(List::Con(
@@ -5223,55 +4350,74 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
-            false,
+            Main::MHome,
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
         ),
         (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Main::MHome,
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -5283,17 +4429,141 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
         ),
         (
-            Main::MAbsent,
-            false,
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -5316,34 +4586,27 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
-            false,
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Rc::new(List::Nil),
         ),
         (
-            Main::MAbsent,
-            false,
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -5355,7 +4618,76 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -5364,10 +4696,288 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MAbsent,
-            false,
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -5379,7 +4989,80 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MHome,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -5390,6 +5073,57 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -5405,75 +5139,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -5495,78 +5161,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5591,72 +5186,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5681,8 +5211,16 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -5691,25 +5229,85 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
         ),
         (
             Main::MAbsent,
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -5719,17 +5317,427 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MAbsent,
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -5738,6 +5746,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5759,69 +5768,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5834,72 +5781,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -5921,78 +5803,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6017,72 +5828,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6107,75 +5853,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6200,78 +5878,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6287,75 +5894,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MAbsent,
-            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -6377,20 +5916,37 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -6401,204 +5957,7 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MAbsent,
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Nil),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -6621,80 +5980,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -6708,77 +5996,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6798,80 +6018,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -6894,10 +6043,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -6907,9 +6180,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -6918,10 +6191,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -6931,9 +6328,31 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -6942,10 +6361,77 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MAbsent,
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -6956,16 +6442,102 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -6973,33 +6545,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
@@ -7007,58 +6555,11 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -7066,73 +6567,26 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -7140,9 +6594,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -7150,70 +6604,40 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Nil),
             Rc::new(List::Nil),
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -7231,70 +6655,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -7315,73 +6677,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -7405,76 +6702,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -7498,79 +6727,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -7585,76 +6743,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -7675,79 +6765,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -7771,73 +6790,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -7861,64 +6815,8 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -7938,71 +6836,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -8013,74 +6849,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -8100,80 +6871,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8196,74 +6896,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8286,77 +6921,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8379,80 +6946,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8466,77 +6962,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -8556,71 +6984,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            false,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Nil),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
@@ -8637,65 +7003,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Nil),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8715,71 +7025,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Nil),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -8802,80 +7050,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -8889,77 +7066,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Nil),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Nil),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -8979,80 +7088,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                Rc::new(List::Con(
-                    R::R(1u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -9075,10 +7113,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
@@ -9088,9 +7250,9 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
@@ -9099,10 +7261,134 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -9112,9 +7398,31 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 )),
             )),
             Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -9123,10 +7431,77 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
         ),
         (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
@@ -9137,12 +7512,680 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             )),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Nil),
             )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
         ),
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
@@ -9166,11 +8209,305 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         ),
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -9181,6 +8518,72 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            false,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Nil),
                 )),
             )),
@@ -9188,20 +8591,37 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
             true,
+            Named::Unnamed,
             Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
                     )),
                 )),
             )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -9212,22 +8632,23 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
             true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Nil)),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),
@@ -9236,6 +8657,95 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
             true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Unnamed,
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
@@ -9260,58 +8770,59 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
         (
             Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
             true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Nil),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
             Rc::new(List::Con(
                 R::R(1u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
                 )),
             )),
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Nil)),
                 Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
-                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
-                    Rc::new(List::Con(
-                        R::R(1u64, Rc::new(List::Nil)),
-                        Rc::new(List::Nil),
-                    )),
-                )),
-            )),
-        ),
-        (
-            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
-            true,
-            Rc::new(List::Con(
-                R::R(1u64, Rc::new(List::Nil)),
-                Rc::new(List::Con(
                     R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                         Rc::new(List::Nil),
@@ -9321,9 +8832,471 @@ pub fn corpus_a_file_main_check() -> Vec<(Main, bool, Rc<List<R>>, Rc<List<R>>)>
             Rc::new(List::Con(
                 R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
                 Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Nil))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Nil),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Nil),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Nil)),
+                    Rc::new(List::Nil),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
                     R::R(0u64, Rc::new(List::Nil)),
                     Rc::new(List::Con(
                         R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+        ),
+        (
+            Main::MPlace(Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+            true,
+            Named::Name(R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil))))),
+            Rc::new(List::Con(
+                R::R(1u64, Rc::new(List::Nil)),
+                Rc::new(List::Con(
+                    R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                    Rc::new(List::Con(
+                        R::R(0u64, Rc::new(List::Con(0u64, Rc::new(List::Nil)))),
+                        Rc::new(List::Nil),
+                    )),
+                )),
+            )),
+            Rc::new(List::Con(
+                R::R(0u64, Rc::new(List::Con(1u64, Rc::new(List::Nil)))),
+                Rc::new(List::Con(
+                    R::R(1u64, Rc::new(List::Nil)),
+                    Rc::new(List::Con(
+                        R::R(1u64, Rc::new(List::Nil)),
                         Rc::new(List::Nil),
                     )),
                 )),

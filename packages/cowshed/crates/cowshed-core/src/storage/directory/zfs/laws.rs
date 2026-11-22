@@ -1,10 +1,10 @@
 //! `select` bound to its proven model, `specs/cowshed/laws/zfs_substrate.bend` (09_substrates.md,
-//! selection). The model's laws are proven for every main entry, adoption and set of roots; this
-//! driver shows the code is the model. It runs the emitted model and `select` on the same inputs
-//! (the model's enumerated corpus and its seeded draws, each also with the main dataset of every
-//! root it names placed at the main, and a dataset beside one), and compares the root chosen or
-//! the refusal, and that the serving and the holding roots are read exactly when the model's
-//! selection depends on them.
+//! selection). The model's laws are proven for every main entry, adoption, declared root and set
+//! of roots; this driver shows the code is the model. It runs the emitted model and `select` on
+//! the same inputs (the model's enumerated corpus and its seeded draws, each also with the main
+//! dataset of every root it names placed at the main, and a dataset beside one, and with each
+//! serving root declared), and compares the root chosen or the refusal, and that the serving and
+//! the holding roots are read exactly when the model's selection depends on them.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use super::{MainEntry, Unserved, select};
 #[rustfmt::skip]
 mod model;
 
-use model::{List, Main, R, Sel};
+use model::{List, Main, Named, R, Sel};
 
 /// The user every model root names.
 const UID: u32 = 501;
@@ -86,6 +86,7 @@ enum Chosen {
     Root(String),
     NoRoot,
     Several(Vec<String>),
+    Unserving(String),
 }
 
 fn model_chosen(selected: &Sel) -> Chosen {
@@ -94,6 +95,7 @@ fn model_chosen(selected: &Sel) -> Chosen {
         Sel::Datasets(root) => Chosen::Root(name(root)),
         Sel::NoRoot => Chosen::NoRoot,
         Sel::Several(roots) => Chosen::Several(items(roots).iter().map(root_name).collect()),
+        Sel::Unserving(root) => Chosen::Unserving(root_name(root)),
     }
 }
 
@@ -114,6 +116,10 @@ fn code_chosen(selected: Result<Option<Root>, Unserved>) -> Chosen {
                     .collect(),
             )
         }
+        Err(Unserved::DeclaredNotServing { root, uid }) => {
+            assert_eq!(uid, UID, "the refusal names the user");
+            Chosen::Unserving(root.dataset().to_string())
+        }
     }
 }
 
@@ -122,6 +128,7 @@ fn code_chosen(selected: Result<Option<Root>, Unserved>) -> Chosen {
 fn selected_alike(
     main: &Main,
     adopt: bool,
+    declared: &Named,
     serving: &Rc<List<R>>,
     holding: &Rc<List<R>>,
 ) -> Result<Chosen, String> {
@@ -129,6 +136,12 @@ fn selected_alike(
     let code = code_chosen(select(
         entry(main),
         adopt,
+        match declared {
+            Named::Unnamed => None,
+            Named::Name(r) => {
+                Some(Root::parse(&root_name(r)).expect("a model root is a cowshed root"))
+            }
+        },
         || {
             served.set(true);
             Ok((UID, roots(serving)))
@@ -141,6 +154,7 @@ fn selected_alike(
     let model = model_chosen(&model::select(
         main.clone(),
         adopt,
+        declared.clone(),
         serving.clone(),
         holding.clone(),
     ));
@@ -153,21 +167,25 @@ fn selected_alike(
         Ok(code)
     } else {
         Err(format!(
-            "{} adopting {adopt} with serving {} and holding {}: select chooses {code:?} reading \
-             (serving, holding) {reads:?}, the model {model:?} reading {model_reads:?}",
+            "{} adopting {adopt} declaring {} with serving {} and holding {}: select chooses \
+             {code:?} reading (serving, holding) {reads:?}, the model {model:?} reading \
+             {model_reads:?}",
             model::show_Main(main),
+            model::show_Named(declared),
             model::show_ListR(serving),
             model::show_ListR(holding)
         ))
     }
 }
 
-/// The input as drawn, and with the main dataset of every root it names placed at the main, and a
-/// dataset beside that one: the model's draws never reach a main dataset's depth. Answers how
-/// many inputs chose a root.
+/// The input as drawn, with the main dataset of every root it names placed at the main, and a
+/// dataset beside that one: the model's draws never reach a main dataset's depth; and the drawn
+/// main and an absent one with each serving root declared, which the draws rarely reach (a
+/// declaration decides only an absent main). Answers how many inputs chose a root.
 fn selected_alike_placed(
     main: &Main,
     adopt: bool,
+    declared: &Named,
     serving: &Rc<List<R>>,
     holding: &Rc<List<R>>,
 ) -> Result<usize, String> {
@@ -186,8 +204,13 @@ fn selected_alike_placed(
             )));
         }
     }
-    for main in &mains {
-        if let Chosen::Root(_) = selected_alike(main, adopt, serving, holding)? {
+    let declarations = items(serving).into_iter().map(Named::Name);
+    let declared_mains = [main.clone(), Main::MAbsent];
+    let inputs = mains.iter().map(|main| (main, declared.clone())).chain(
+        declarations.flat_map(|named| declared_mains.iter().map(move |main| (main, named.clone()))),
+    );
+    for (main, declared) in inputs {
+        if let Chosen::Root(_) = selected_alike(main, adopt, &declared, serving, holding)? {
             rooted += 1;
         }
     }
@@ -199,15 +222,20 @@ fn selected_alike_placed(
 #[test]
 fn the_store_selects_as_the_model_on_its_corpus() {
     let mut rooted = 0;
-    for (main, adopt, serving, holding) in model::corpus_a_file_main_check() {
-        let (holds, value) =
-            model::law_a_file_main_check(main.clone(), adopt, serving.clone(), holding.clone());
+    for (main, adopt, declared, serving, holding) in model::corpus_a_file_main_check() {
+        let (holds, value) = model::law_a_file_main_check(
+            main.clone(),
+            adopt,
+            declared.clone(),
+            serving.clone(),
+            holding.clone(),
+        );
         assert!(
             holds,
             "the model breaks its own law on {}: {value}",
             model::show_Main(&main)
         );
-        rooted += selected_alike_placed(&main, adopt, &serving, &holding).unwrap();
+        rooted += selected_alike_placed(&main, adopt, &declared, &serving, &holding).unwrap();
     }
     assert!(rooted > 0, "the corpus chooses no root");
 }
@@ -219,9 +247,10 @@ fn the_store_selects_as_the_model_on_seeded_inputs() {
     for _ in 0..model::PROPS_A_FILE_MAIN_CHECK {
         let main = model::gen_Main(&mut rng, model::PROP_LEN_A_FILE_MAIN_CHECK);
         let adopt = model::gen_Bool(&mut rng, model::PROP_LEN_A_FILE_MAIN_CHECK);
+        let declared = model::gen_Named(&mut rng, model::PROP_LEN_A_FILE_MAIN_CHECK);
         let serving = model::gen_ListR(&mut rng, model::PROP_LEN_A_FILE_MAIN_CHECK);
         let holding = model::gen_ListR(&mut rng, model::PROP_LEN_A_FILE_MAIN_CHECK);
-        selected_alike_placed(&main, adopt, &serving, &holding).unwrap();
+        selected_alike_placed(&main, adopt, &declared, &serving, &holding).unwrap();
     }
 }
 //#endregion smoo/cowshed!n/zfs-substrate-selection
