@@ -59,9 +59,8 @@ export function nativeTestPhases({
   const layout = `"$${FIXTURE_DIRECTORY_ENV}/layout.toml"`;
   const prepare =
     `${metadata} > ${CARGO} && mode=$(${shellWord(process.execPath)} ${LAYOUT} "$${FIXTURE_DIRECTORY_ENV}"${args(cargoArgs)}) && ` +
-    `{ [ "$mode" != cold ] || ${list} > /dev/null; } && ` +
     `if [ "$mode" = shared ]; then ${list} > ${BINARIES}; else ` +
-    `${metadata} --config ${layout} > ${CARGO} && ${list} --config ${layout} > ${BINARIES}; fi`;
+    `cargo --frozen nextest show-config version ${config} && ${metadata} --config ${layout} > ${CARGO} && ${list} --config ${layout} > ${BINARIES}; fi`;
   return {
     ...options,
     command: command ?? run,

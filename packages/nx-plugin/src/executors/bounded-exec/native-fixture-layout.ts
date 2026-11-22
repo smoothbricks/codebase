@@ -1,7 +1,7 @@
 /** Select a private Cargo final target only when this native test recipe can promote an executable or library.
  * Runs inside the bounded fixture segment, before any test or custom consumer. The caller runs Cargo and nextest
  * with the same configuration: only they write the metadata describing which artifacts were actually built. */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
 function field(value: unknown, key: string): unknown {
@@ -37,18 +37,13 @@ const selected =
 if (selected.length === 1 && onlySharedTargets(selected[0])) {
   process.stdout.write('shared');
 } else {
-  const target = field(metadata, 'target_directory');
   const build = field(metadata, 'build_directory');
-  if (typeof target !== 'string' || !isAbsolute(target) || typeof build !== 'string' || !isAbsolute(build)) {
-    throw new Error(
-      'private native test exports require Cargo metadata with absolute target_directory and build_directory',
-    );
+  if (typeof build !== 'string' || !isAbsolute(build)) {
+    throw new Error('private native test exports require Cargo metadata with an absolute build_directory');
   }
-  // Neither the cold placement build nor the consumer receives these overrides. No step creates the shared target
-  // before mbx can place it. A shared build view which is relinked or collected never owns the final executable.
   writeFileSync(
     join(fixture, 'layout.toml'),
     `[build]\nbuild-dir = ${JSON.stringify(build)}\ntarget-dir = ${JSON.stringify(join(fixture, 'final'))}\n`,
   );
-  process.stdout.write(existsSync(target) ? 'private' : 'cold');
+  process.stdout.write('private');
 }

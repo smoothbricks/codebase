@@ -1387,12 +1387,13 @@ Concrete targets come from concrete files:
   directory; nothing copies it or scans it for binaries. An invocation that needs Cargo's final artifacts gives Cargo a
   private final target in its existing fixture scratch: another build can replace the shared executable alias without
   unlinking this invocation's selected file. Only final artifacts are exported, not compiled units; Cargo can copy these
-  bytes when the filesystem cannot share them. A cold build first lets mbx place its target. The executor retires the
-  private exports with the invocation, after its command subtree. Repositories that need the same feature resolution as
-  `--workspace` use their existing Cargo workspace feature unification policy. The run feeds the invocation's Cargo and
-  nextest metadata back to nextest without relocation, under the same filter, partition and nextest configuration. Valid
-  inferred empty suites and partitions can pass. Cross archives remain separate: the archive runner receives its
-  binaries from another platform.
+  bytes when the filesystem cannot share them. The ordinary nextest version check lets mbx place this invocation's build
+  view before selecting a private export, even when a warm target link belongs to a different store. The executor
+  retires the private exports with the invocation, after its command subtree. Repositories that need the same feature
+  resolution as `--workspace` use their existing Cargo workspace feature unification policy. The run feeds the
+  invocation's Cargo and nextest metadata back to nextest without relocation, under the same filter, partition and
+  nextest configuration. Valid inferred empty suites and partitions can pass. Cross archives remain separate: the
+  archive runner receives its binaries from another platform.
 
   An explicit `@smoothbricks/nx-plugin:bounded-exec` target supplies `options.nativeTest` with literal argv arrays:
   `cargoArgs` selects packages, binary targets, Cargo profile, target triple and features; `selectionArgs` supplies
