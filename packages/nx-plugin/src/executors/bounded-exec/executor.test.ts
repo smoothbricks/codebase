@@ -491,7 +491,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const result = await runBoundedExec(
       {
         command: "node -e \"console.log('main' + '-ran')\"",
-        fixtureCommand: 'node -e "console.error(\'fixture-broke\'); process.exit(3)"',
+        fixtureCommand:
+          'mkdir "$BOUNDED_EXEC_FIXTURE_DIR/final" && printf "fixture-root=%s\\n" "$BOUNDED_EXEC_FIXTURE_DIR" > fixture-root && echo fixture-broke >&2 && exit 3',
         fixtureTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: 0,
@@ -505,6 +506,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('fixture-broke');
     expect(result.terminalOutput).toContain('Fixture command exited with status 3');
     expect(result.terminalOutput).not.toContain('main-ran');
+    const fixtureRoot = (await readFile(join(workspace.root, 'fixture-root'), 'utf8'))
+      .trim()
+      .slice('fixture-root='.length);
+    expect(fixtureRoot).not.toBe('');
+    await expect(access(fixtureRoot)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('ends a fixture that outlives its own ceiling as a fixture bound, not a wedge', async () => {
@@ -515,7 +521,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const result = await runBoundedExec(
       {
         command: "node -e \"console.log('main' + '-ran')\"",
-        fixtureCommand: 'node -e "console.log(\'test fixture::warm ... ok\'); process.stdin.resume()"',
+        fixtureCommand:
+          'mkdir "$BOUNDED_EXEC_FIXTURE_DIR/final" && printf "fixture-root=%s\\n" "$BOUNDED_EXEC_FIXTURE_DIR" > fixture-root && node -e "console.log(\'test fixture::warm ... ok\'); process.stdin.resume()"',
         fixtureTimeoutMs: 150,
         idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: 0,
@@ -530,6 +537,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('fixtureTimeoutMs=150');
     expect(result.terminalOutput).not.toContain('Command made no progress');
     expect(result.terminalOutput).not.toContain('main-ran');
+    const fixtureRoot = (await readFile(join(workspace.root, 'fixture-root'), 'utf8'))
+      .trim()
+      .slice('fixture-root='.length);
+    expect(fixtureRoot).not.toBe('');
+    await expect(access(fixtureRoot)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('refuses a fixture named without its ceiling, running neither command', async () => {

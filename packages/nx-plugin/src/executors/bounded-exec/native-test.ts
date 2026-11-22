@@ -29,7 +29,16 @@ const BINARIES = `"$${FIXTURE_DIRECTORY_ENV}/binaries-metadata.json"`;
 const CARGO = `"$${FIXTURE_DIRECTORY_ENV}/cargo-metadata.json"`;
 const TOOL_CONFIG = shellWord(`smoo:${fileURLToPath(new URL('../../../nextest.toml', import.meta.url))}`);
 
-/** Native test binaries stay in Cargo's own target directory; only the recipe's two metadata files are private. */
+const LAYOUT = shellWord(
+  fileURLToPath(
+    new URL(
+      import.meta.url.endsWith('.ts') ? './native-fixture-layout.ts' : './native-fixture-layout.js',
+      import.meta.url,
+    ),
+  ),
+);
+
+/** Cargo's compiled units remain shared. Only promoted executables get a private final name for this run. */
 export function nativeTestPhases({
   nativeTest,
   command,
@@ -45,12 +54,18 @@ export function nativeTestPhases({
   const verdict =
     runArgs?.some((arg) => arg === '--no-tests' || arg.startsWith('--no-tests=')) === true ? '' : ' --no-tests=fail';
   const run = `cargo --frozen nextest run ${reuse} ${config}${select}${verdict}${args(runArgs ?? [])}`;
+  const list = `cargo --frozen nextest list${args(cargoArgs)} --list-type binaries-only --message-format json --cargo-metadata ${CARGO} ${config}`;
+  const metadata = 'cargo --frozen metadata --format-version 1 --all-features';
+  const layout = `"$${FIXTURE_DIRECTORY_ENV}/layout.toml"`;
+  const prepare =
+    `${metadata} > ${CARGO} && mode=$(${shellWord(process.execPath)} ${LAYOUT} "$${FIXTURE_DIRECTORY_ENV}"${args(cargoArgs)}) && ` +
+    `{ [ "$mode" != cold ] || ${list} > /dev/null; } && ` +
+    `if [ "$mode" = shared ]; then ${list} > ${BINARIES}; else ` +
+    `${metadata} --config ${layout} > ${CARGO} && ${list} --config ${layout} > ${BINARIES}; fi`;
   return {
     ...options,
     command: command ?? run,
-    fixtureCommand:
-      `cargo --frozen metadata --format-version 1 --all-features > ${CARGO} && ` +
-      `cargo --frozen nextest list${args(cargoArgs)} --list-type binaries-only --message-format json --cargo-metadata ${CARGO} ${config} > ${BINARIES}`,
+    fixtureCommand: prepare,
     fixtureTimeoutMs: FIXTURE_TIMEOUT_MS,
     ...(timeoutMs === undefined
       ? { idleTimeoutMs: idleTimeoutMs ?? BOUNDED_TEST_IDLE_TIMEOUT_MS }

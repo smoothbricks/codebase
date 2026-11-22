@@ -77,7 +77,7 @@ beforeAll(
     await writeFile(join(root, '.gitignore'), 'node_modules/\ntarget/\n.nx/\n*.log\n');
     await writeFile(
       join(root, 'Cargo.toml'),
-      '[workspace]\nresolver = "2"\nmembers = ["feature-enabler", "shared"]\n\n[dependencies]\nshared = { path = "shared" }\n\n[package]\nname = "partition-probe"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+      '[workspace]\nresolver = "2"\nmembers = ["feature-enabler", "shared"]\n\n[features]\nalternate = []\n\n[dependencies]\nshared = { path = "shared" }\n\n[package]\nname = "partition-probe"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
     );
     await mkdir(join(root, '.cargo'));
     await writeFile(
@@ -128,6 +128,15 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
     #[test] #[ignore] fn workspace_feature_and_ignored_inventory() { assert!(shared::ENABLED); }
 }
 `,
+    );
+    await writeFile(
+      join(root, 'src/main.rs'),
+      'fn main() { println!("{}", if cfg!(feature="alternate") {"second"} else {"first"}); }\n',
+    );
+    await mkdir(join(root, 'tests'));
+    await writeFile(
+      join(root, 'tests/fixture_bin.rs'),
+      'use std::process::Command;\n#[test] fn fixture_binary_is_available() { let output = Command::new(std::env::var_os("CARGO_BIN_EXE_partition-probe").unwrap()).output().unwrap(); assert!(output.status.success()); assert_eq!(output.stdout, if cfg!(feature="alternate") { b"second\\n".as_slice() } else { b"first\\n".as_slice() }); }\n',
     );
     await symlink(await installation.nodeModules(), join(root, 'node_modules'), 'dir');
     await run(root, ['git', 'init', '--quiet']);
@@ -442,6 +451,26 @@ it(
       await expect(readdir(path)).rejects.toMatchObject({ code: 'ENOENT' });
     }
     expect(paths.size).toBe(2);
+  }),
+);
+it(
+  'a prepared fixture still executes its own binary after a concurrent Cargo build selects different bytes',
+  caseBody(async () => {
+    const { root, targets } = fixture();
+    const options = nativeOptions(targets, 'cargo-test-partition-probe-shard1');
+    const binary = (file: 'binaries-metadata.json' | 'alternate.json') =>
+      `node -e 'const m=require(process.env.BOUNDED_EXEC_FIXTURE_DIR+"/${file}")["rust-build-meta"]; process.stdout.write(require("node:path").join(m["target-directory"],Object.values(m["non-test-binaries"]).flat().find(x=>x.name==="partition-probe").path))'`;
+    // Prepare the second selection while the first consumer is still alive. Cargo itself reports both executable paths.
+    const command =
+      `set -e; first="$(${binary('binaries-metadata.json')})"; test "$("$first")" = first; ` +
+      `cargo --frozen nextest list -p partition-probe --features alternate --list-type binaries-only --message-format json --user-config-file none > "$BOUNDED_EXEC_FIXTURE_DIR/alternate.json"; ` +
+      `alternate="$(${binary('alternate.json')})"; test "$("$alternate")" = second; printf 'owned binary: %s\\n' "$first"; "$first"`;
+    const result = await runGroupExecutor(root, { ...options, command }, { root });
+    expect(result.code, result.output).toBe(0);
+    expect(result.stdout.split('\n')).toContain('first');
+    const path = /^owned binary: (.+)$/m.exec(result.stdout)?.[1];
+    if (path === undefined) throw new Error('the consumer printed no prepared binary');
+    await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
   }),
 );
 //#endregion smoo/cowshed!n/native-test-verdicts

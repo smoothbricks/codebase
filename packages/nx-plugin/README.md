@@ -1384,7 +1384,11 @@ Concrete targets come from concrete files:
   miss, bounded-exec first uses the Cargo shim to build the crate's test binaries with
   `nextest list -p <package> --list-type binaries-only`. The fixture has its own ceiling, before the reservation and
   180-second test idle bound. Cargo and mbx reuse unchanged units among shards and crates in the workspace's target
-  directory; nothing copies it or scans it for binaries. Repositories that need the same feature resolution as
+  directory; nothing copies it or scans it for binaries. An invocation that needs Cargo's final artifacts gives Cargo a
+  private final target in its existing fixture scratch: another build can replace the shared executable alias without
+  unlinking this invocation's selected file. Only final artifacts are exported, not compiled units; Cargo can copy these
+  bytes when the filesystem cannot share them. A cold build first lets mbx place its target. The executor retires the
+  private exports with the invocation, after its command subtree. Repositories that need the same feature resolution as
   `--workspace` use their existing Cargo workspace feature unification policy. The run feeds the invocation's Cargo and
   nextest metadata back to nextest without relocation, under the same filter, partition and nextest configuration. Valid
   inferred empty suites and partitions can pass. Cross archives remain separate: the archive runner receives its

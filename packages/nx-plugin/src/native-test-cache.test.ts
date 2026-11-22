@@ -70,6 +70,7 @@ it('replays native NX results without binaries and builds only the missed select
         `[package]\nname="${name}"\nversion="0.1.0"\nedition="2021"\n`,
       );
       await writeFile(join(workspace, name, 'src/lib.rs'), testSource(name, ''));
+      await writeFile(join(workspace, name, 'src/main.rs'), 'fn main() {}\n');
     }
     await mkdir(join(workspace, 'unselected', 'src'), { recursive: true });
     await writeFile(
