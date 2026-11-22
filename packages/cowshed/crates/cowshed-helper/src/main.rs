@@ -63,16 +63,27 @@ fn refused(reason: impl fmt::Display) -> Failure {
     Failure::Refused(reason.to_string())
 }
 
-/// Run `zfs <arguments>` with nothing of the caller's environment, and collect it.
+/// `zfs <arguments>` with nothing of the caller's environment: a fixed `PATH`, and OpenZFS for
+/// macOS told not to write its volume icon, `.VolumeIcon.icns`, into the root of each dataset it
+/// mounts (`zfs_mount_seticon` in its `libzfs_mount_os.c` returns when the variable is set), so no
+/// checkout carries a file nobody wrote. Elsewhere the variable means nothing.
+fn zfs_command(arguments: &[String]) -> Command {
+    let mut command = Command::new("zfs");
+    command
+        .args(arguments)
+        .env_clear()
+        .env("PATH", host::TRUSTED_PATH)
+        .env("__ZFS_DISABLE_VOLUME_ICON", "1")
+        .stdin(Stdio::null());
+    command
+}
+
+/// Run `zfs <arguments>`, and collect it.
 fn zfs(arguments: &[String]) -> Result<Output, Failure> {
     // WHY unbounded: one `zfs` command on datasets the caller named; the caller bounds the
     // helper it started, and a root child cut short mid-transaction would leave less than `zfs`
     // itself guarantees.
-    let output = Command::new("zfs")
-        .args(arguments)
-        .env_clear()
-        .env("PATH", host::TRUSTED_PATH)
-        .stdin(Stdio::null())
+    let output = zfs_command(arguments)
         .output()
         .map_err(|source| Failure::Io {
             doing: format!("run zfs from {}", host::TRUSTED_PATH),
@@ -186,5 +197,29 @@ fn main() -> ExitCode {
                 Failure::Io { .. } => ExitCode::FAILURE,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The helper's `zfs` gets an empty environment but a fixed `PATH` and the setting that keeps
+    /// OpenZFS for macOS from writing `.VolumeIcon.icns` into the root of every dataset it mounts.
+    #[test]
+    fn zfs_runs_with_nothing_of_the_callers_environment_and_no_volume_icon() {
+        let command = super::zfs_command(&[String::from("mount")]);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            environment,
+            vec![
+                (
+                    "PATH".into(),
+                    Some(cowshed_helper::host::TRUSTED_PATH.into())
+                ),
+                ("__ZFS_DISABLE_VOLUME_ICON".into(), Some("1".into())),
+            ]
+        );
     }
 }

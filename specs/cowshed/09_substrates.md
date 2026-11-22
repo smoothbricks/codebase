@@ -380,7 +380,9 @@ cowshed-helper's law tests hold `plan` and `admit` to that model on its corpus a
 A new dataset's root directory belongs to root, so `create` hands it to the caller: it opens the mountpoint once and
 changes its owner only when the kernel says that descriptor is the mounted root of the dataset it just created
 (`/proc/self/mountinfo` on Linux, `fstatfs` on macOS). A clone needs no handover, its root carries its origin's owner.
-`zfs` runs with an empty environment and a fixed system `PATH`, never the caller's.
+`zfs` runs with an empty environment and a fixed system `PATH`, never the caller's, and with
+`__ZFS_DISABLE_VOLUME_ICON=1`: OpenZFS for macOS otherwise writes a root-owned `.VolumeIcon.icns` into the root of each
+dataset it mounts, a file in every checkout that nobody wrote.
 
 #### Install and privilege
 

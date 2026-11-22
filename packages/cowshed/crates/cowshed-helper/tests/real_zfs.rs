@@ -244,6 +244,12 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
     let checkout = fixture.path("checkout");
     fixture.run(&["create", &main, &format!("mountpoint={checkout}")]);
     assert_eq!(property(&main, "mounted"), "yes");
+    // OpenZFS for macOS writes no volume icon into what the helper mounts: a checkout holds
+    // only what its user wrote.
+    assert!(
+        !Path::new(&checkout).join(".VolumeIcon.icns").exists(),
+        "the helper's mount wrote .VolumeIcon.icns into {checkout}"
+    );
     // A new dataset's root is root's until the helper hands it over.
     std::fs::write(Path::new(&checkout).join("tracked"), "main").expect("the caller owns main");
 
