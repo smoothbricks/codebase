@@ -91,9 +91,14 @@ export function fixtureNxEnv(workspace: string, socketDirectory: string): Record
  * A fixture root of this package's suite in the temp directory, owned by this
  * test process: the next run's first fixture reclaims it, and whatever still
  * works in it, if this process is killed before the root is retired.
+ *
+ * Never under `/tmp`: Nx shares a checkout's cache and databases under `$HOME/.nx` only when that home lies outside
+ * its shared `/tmp` (`homeDirIsDistinctFromSharedTmp`), and a fixture's `HOME` lives in its root. On Linux
+ * `tmpdir()` is `/tmp`, so the fixtures that prove sharing saw none; `/var/tmp` is the host temp directory beside it.
  */
 export function nxFixtureRoot(prefix: string): Promise<string> {
-  return ownedFixtureRoot(tmpdir(), 'nx-plugin', prefix);
+  const base = tmpdir();
+  return ownedFixtureRoot(base === '/tmp' || base.startsWith('/tmp/') ? '/var/tmp' : base, 'nx-plugin', prefix);
 }
 
 /** A fixture root, the Nx workspace in it whose daemon the fixture owns, and that workspace's published socket directory. */
