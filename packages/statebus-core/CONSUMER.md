@@ -249,8 +249,11 @@ A recorder takes one explicit checkpoint and retains successful event waves up t
 It never clones the whole application state on publication, and never retains the dispatcher's
 recycled queue arrays. Reading defaults is omitted from checkpoints. Once old waves are evicted,
 `complete` becomes false and replay refuses the incomplete history; `reset()` creates a fresh
-checkpoint at an explicit quiescent boundary. This is an **event-count bound**, not a claim that
-arbitrary application payloads have a fixed byte size. Codecs own payload-size limits.
+checkpoint at an explicit quiescent boundary. `maxEvents` is an **event-count bound**, not a claim
+that arbitrary application payloads have a fixed byte size. Each checkpoint and each recorded
+event is also bounded in canonical JSON bytes, 8 MiB by default: `maxCheckpointBytes` and
+`maxEntryBytes` set those bounds. A checkpoint over its bound refuses `recordScenario` or `reset()`
+with a `CaptureError`; an event over its bound makes the recording incomplete.
 
 Recording requires codecs up front rather than silently dropping unsupported declarations.
 `captureCheckpoint` and `replayScenario` check schema/version compatibility. The scenario envelope

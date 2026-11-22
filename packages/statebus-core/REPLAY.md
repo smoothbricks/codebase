@@ -180,8 +180,9 @@ const balanceV2 = evolveCodec(
 Attach the evolved codec to the same declaration in the next library definition. Set that
 definition's `version` and explicitly list supported `previousVersions`. Library-version
 permission alone is insufficient: every old declaration, ID, instruction and outcome codec must
-have a compatible registered conversion. Chaining evolved codecs carries their previous source
-versions forward. Duplicate migration sources are rejected.
+have a compatible registered conversion. An effect that declared no instruction or outcome codec
+retained nothing of that kind and needs no conversion for it. Chaining evolved codecs carries their
+previous source versions forward. Duplicate migration sources are rejected.
 
 `migrateScenario` upgrades the same owned declaration set. `migrateCaptureEnvelope` additionally
 checks library/effect versions and upgrades retained instructions/outcomes:
