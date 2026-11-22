@@ -1952,7 +1952,7 @@ index e99e10b616b35b81b1060b25eeb0acc2351c4776..66d6e21694a0a8607e7841167dd8d31c
 +/** Stops the daemon, naming `reason` in its log: its file watcher stopped delivering. */
 +export declare function stopDaemonForStoppedWatcher(reason: string): void;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
-index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c09017664d71cf3b 100644
+index e692c3cfc73bacf3252e117d4e895b981412f4b9..5be1211d5f00b81cb10bd3dba111a360c9a878b4 100644
 --- a/dist/src/daemon/server/restart-checks.js
 +++ b/dist/src/daemon/server/restart-checks.js
 @@ -1,22 +1,47 @@
@@ -2009,19 +2009,41 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c0901766
  /**
   * The daemon's own process file, workspace-relative. It lives under the
   * hardcoded-ignored .nx/workspace-data, so the watch admits it explicitly;
-@@ -45,6 +70,8 @@ const IGNORE_FILE_NAMES = ['.gitignore', '.nxignore'];
-  * needs a daemon restart to take effect. True when it stopped the daemon.
+@@ -42,36 +67,583 @@ function changedPaths(batch) {
+ const IGNORE_FILE_NAMES = ['.gitignore', '.nxignore'];
+ /**
+  * The watch's ignore rules are fixed when it starts, so an ignore-file edit
+- * needs a daemon restart to take effect. True when it stopped the daemon.
++ * needs a daemon restart to take effect. An applied change to an ignore file
++ * (`paths` are workspace-relative) keeps the daemon when its filter already
++ * holds the file's bytes: the file and its directory entry are unchanged since
++ * just before the watch started, or its bytes are the ones the filter read. A
++ * table hash an adopted files archive proved for older bytes then differs from
++ * the disk with the filter current, and the change only corrects the table.
++ * Any other ignore-file change stops the daemon. True when it stopped.
   */
  function restartDaemonIfIgnoreFilesChanged(paths) {
 +    if (terminating)
 +        return true;
      for (const path of paths) {
-         const basename = path.slice(path.lastIndexOf('/') + 1);
-         if (IGNORE_FILE_NAMES.includes(basename)) {
-@@ -54,24 +81,544 @@ function restartDaemonIfIgnoreFilesChanged(paths) {
-     }
-     return false;
- }
+-        const basename = path.slice(path.lastIndexOf('/') + 1);
+-        if (IGNORE_FILE_NAMES.includes(basename)) {
++        if (!isIgnoreFile(path) || filterHoldsBytesOf(path))
++            continue;
++        stopDaemon('Stopping the daemon the set of ignored files changed (native)');
++        return true;
++    }
++    return false;
++}
++/** Whether the watch's filter holds the bytes the workspace-relative ignore file `file` has now. */
++function filterHoldsBytesOf(file) {
++    const path = (0, path_1.join)(workspace_root_1.workspaceRoot, file);
++    if (unchangedSinceFilterRead(path) && unchangedSinceFilterRead((0, path_1.dirname)(path)))
++        return true;
++    const read = ignoreFilesReadBytes?.get(file);
++    // hashFile answers null for a file that is gone, which no read hash is.
++    return read !== undefined && (0, native_1.hashFile)(path) === read;
++}
 +function isIgnoreFile(path) {
 +    return IGNORE_FILE_NAMES.includes(path.slice(path.lastIndexOf('/') + 1));
 +}
@@ -2060,22 +2082,33 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c0901766
 +}
 +// The ignore files whose bytes the watch's filter is known to hold: each one's
 +// content hash, by workspace-relative path. Nx 24's watch reads its ignore
-+// rules once, when it starts, before the scan, and never again. The scan's hash
-+// is the filter's bytes only if neither the file nor the directory entry naming
-+// it changed since just before the watch started; a file changed in that gap
-+// is left out, as is one the scan never held.
++// rules once, when it starts, before the scan, and never again. A file holds
++// the filter's bytes only if neither it nor the directory entry naming it
++// changed since just before the watch started, so its bytes are hashed from the
++// file itself, and kept only when that still holds after the hash. The scan's
++// hash is not used: Nx reuses an archived hash on an mtime match alone
++// (`files_hashing.rs` `selective_files_hash`), so a files archive adopted from
++// another tree can hold an older file's hash. A file changed in that gap is
++// left out, as is one the scan never held.
 +let ignoreFilesAtStart;
++// The same, once known, for the synchronous judgement of applied changes.
++let ignoreFilesReadBytes;
 +function ignoreFilesFilterRead() {
 +    ignoreFilesAtStart ??= (0, workspace_context_1.getAllFileDataInContext)(workspace_root_1.workspaceRoot).then((files) => {
 +        const read = new Map();
-+        for (const { file, hash } of files) {
++        for (const { file } of files) {
++            if (!isIgnoreFile(file))
++                continue;
 +            const path = (0, path_1.join)(workspace_root_1.workspaceRoot, file);
-+            if (isIgnoreFile(file) &&
-+                unchangedSinceFilterRead(path) &&
-+                unchangedSinceFilterRead((0, path_1.dirname)(path))) {
++            const unchanged = () => unchangedSinceFilterRead(path) && unchangedSinceFilterRead((0, path_1.dirname)(path));
++            if (!unchanged())
++                continue;
++            const hash = (0, native_1.hashFile)(path);
++            if (hash !== null && unchanged()) {
 +                read.set(file, hash);
 +            }
 +        }
++        ignoreFilesReadBytes = read;
 +        return read;
 +    });
 +    return ignoreFilesAtStart;
@@ -2100,12 +2133,12 @@ index e692c3cfc73bacf3252e117d4e895b981412f4b9..80f059225e4beacb4404b248c0901766
 +            ? (0, native_1.hashFile)((0, path_1.join)(workspace_root_1.workspaceRoot, path)) !== read.get(path)
 +            : tracked.has(path);
 +        if (stale) {
-+            stopDaemon('Stopping the daemon the set of ignored files changed (native)');
-+            return true;
-+        }
-+    }
-+    return false;
-+}
+             stopDaemon('Stopping the daemon the set of ignored files changed (native)');
+             return true;
+         }
+     }
+     return false;
+ }
 +const LOCK_FILE_NAMES = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'];
 +const lockFiles = LOCK_FILE_NAMES.map((name) => (0, path_1.join)(workspace_root_1.workspaceRoot, name));
 +let lockFileHash;

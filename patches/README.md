@@ -642,11 +642,19 @@ workspace context starts its watch before its scan itself. That watch reads the 
 content-filtered batches show no change for an ignore file rewritten before the scan read it, so `restart-checks.js`
 stamps the filesystem's clock before the watch starts, keeps the ignore files the scan read that had not changed since,
 and stops the daemon on a watch event for any other ignore file of the workspace or for one whose bytes moved; a
-same-bytes rewrite keeps it. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
-contract and `packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts`
-exercises the installed product's lockfiles, metadata, ownership and socket lifecycle; the existing claim, ignore-file
-and idle-policy regressions remain required. The opt-in `nx-daemon-idle-cpu.test.ts` measures an owned idle daemon using
-the kernel's cumulative CPU time, without a profiler or writes during the 30-second window. Run it through the host-only
+same-bytes rewrite keeps it. The bytes it keeps are hashed from each file itself, never taken from the scan: Nx reuses a
+files-archive hash on a whole-second mtime match alone (`files_hashing.rs` `selective_files_hash`), so an archive
+adopted with a build volume can prove an older file's hash. A change the context applies to an ignore file, from a
+watcher batch or an explicit `UPDATE_WORKSPACE_CONTEXT` (smoo-nx-exec's ensureBuilt reports files whose bytes differ
+from the daemon's table), is judged the same way: it keeps the daemon when the file and its directory entry are
+unchanged since the watch started, or its bytes are the ones the filter read, and the update then only corrects the
+table and is answered; any other ignore-file change stops the daemon as before. `nx-daemon-ignore-files.test.ts` holds
+such an adopted stale hash: the explicit update is answered by the same daemon, a same-bytes rewrite keeps it, and new
+bytes stop it. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout contract and
+`packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts` exercises the
+installed product's lockfiles, metadata, ownership and socket lifecycle; the existing claim, ignore-file and idle-policy
+regressions remain required. The opt-in `nx-daemon-idle-cpu.test.ts` measures an owned idle daemon using the kernel's
+cumulative CPU time, without a profiler or writes during the 30-second window. Run it through the host-only
 process-census lane:
 
 ```sh

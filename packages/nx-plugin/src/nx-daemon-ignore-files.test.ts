@@ -1,7 +1,8 @@
 import { expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
-import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, symlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -32,6 +33,7 @@ const nxEntry = join(repositoryRoot, 'node_modules', '.bin', 'nx');
 const requireNx = createRequire(join(repositoryRoot, 'package.json'));
 const daemonClient = requireNx.resolve('nx/src/daemon/client/client');
 const daemonStart = requireNx.resolve('nx/src/daemon/server/start.js');
+const { hashFile } = requireNx('nx/src/native');
 const IGNORE = 'dist\n';
 
 /**
@@ -203,6 +205,113 @@ it('stops when an ignore file changes after the watcher read it and before the d
         terminate(daemon.pid);
         await exited;
       }
+    }
+  });
+});
+// Asks the workspace's daemon for its `.nxignore` hash, then reports the file as updated (UPDATE_WORKSPACE_CONTEXT, as
+// smoo-nx-exec's ensureBuilt does for a file whose bytes differ from the daemon's table), then asks for the hash again.
+const UPDATE_CLIENT = `
+const { writeSync } = require('node:fs');
+const { daemonClient } = require(process.env.NX_DAEMON_CLIENT);
+const say = (...fields) => writeSync(1, fields.join('\\t') + '\\n');
+const hashOf = async () =>
+  (await daemonClient.getWorkspaceContextFileData()).find(({ file }) => file === '.nxignore')?.hash ?? 'absent';
+(async () => {
+  say('before', await hashOf());
+  await daemonClient.updateWorkspaceContext([], ['.nxignore'], []);
+  say('updated');
+  say('after', await hashOf());
+})().then(
+  () => process.exit(0),
+  (error) => {
+    say('error', String(error?.message ?? error).split('\\n')[0]);
+    process.exit(0);
+  },
+);
+`;
+
+/** Each line the update client printed, by its first field. */
+async function explicitUpdate(workspace: string, env: Record<string, string>): Promise<Map<string, string>> {
+  const child = spawn('node', ['-e', UPDATE_CLIENT], {
+    cwd: workspace,
+    env: { ...env, NX_DAEMON_START: 'never', NX_DAEMON_CLIENT: daemonClient },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let printed = '';
+  child.stdout.setEncoding('utf8').on('data', (text: string) => {
+    printed += text;
+  });
+  child.stderr.setEncoding('utf8').on('data', (text: string) => {
+    printed += text;
+  });
+  await guardEvent(once(child, 'exit'), 'the explicit update client to exit', () => printed);
+  const said = new Map<string, string>();
+  for (const line of printed.split('\n')) {
+    const [kind = '', ...rest] = line.split('\t');
+    if (['before', 'updated', 'after', 'error'].includes(kind)) said.set(kind, rest.join('\t'));
+  }
+  return said;
+}
+
+/**
+ * A workspace whose files archive proves an old hash for `.nxignore`: the archive a gather wrote over `adopted`, then
+ * `current` written with that same whole-second mtime, as a build volume adopted from another checkout carries it. Nx's
+ * native scan reuses an archived hash on an mtime match alone (`files_hashing.rs` `selective_files_hash`), so the
+ * daemon's table holds `adopted`'s hash while its watch's filter reads `current`.
+ */
+async function adoptedStaleIgnore(workspace: string, env: Record<string, string>, adopted: string, current: string) {
+  await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await writeFile(join(workspace, 'nx.json'), '{}\n');
+  await writeFile(join(workspace, 'package.json'), JSON.stringify({ name: 'daemon-ignore-adopted', private: true }));
+  await mkdir(join(workspace, 'p'));
+  await writeFile(join(workspace, 'p', 'project.json'), JSON.stringify({ name: 'p' }));
+  const ignore = join(workspace, '.nxignore');
+  const settled = new Date(Date.now() - 3_600_000);
+  await writeFile(ignore, adopted);
+  await utimes(ignore, settled, settled);
+  // Daemonless: the command's own workspace context gathers the files and writes the archive.
+  const gathered = spawnSync('bun', [nxEntry, 'show', 'projects'], { cwd: workspace, env, encoding: 'utf8' });
+  expect(gathered.status, `${gathered.stdout}${gathered.stderr}`).toBe(0);
+  await writeFile(ignore, current);
+  await utimes(ignore, settled, settled);
+}
+
+it('answers an explicit update for an ignore file whose adopted table hash is stale, its filter holding the current bytes', async () => {
+  await withNxFixture('nx-daemon-ignore-adopted-', async ({ workspace, socketDirectory }) => {
+    const env = fixtureNxEnv(workspace, socketDirectory);
+    await adoptedStaleIgnore(workspace, env, 'dist\n', 'dist\nout\n');
+    const current = hashFile(join(workspace, '.nxignore'));
+    const daemonEnv = { ...env, NX_DAEMON: 'true' };
+    const started = spawnSync('bun', [nxEntry, 'daemon', '--start'], {
+      cwd: workspace,
+      env: daemonEnv,
+      encoding: 'utf8',
+    });
+    expect(started.status, `${started.stdout}${started.stderr}`).toBe(0);
+    const serving = await recordedDaemon(workspace);
+    try {
+      const said = await explicitUpdate(workspace, daemonEnv);
+      // The fixture holds: the daemon's table proves the adopted bytes, not the ones on disk.
+      expect(said.get('before'), JSON.stringify([...said])).not.toBe(current);
+      // Unpatched by this repair, the update stops the daemon before it answers, its filter already holding these bytes.
+      expect(said.has('updated'), JSON.stringify([...said])).toBe(true);
+      expect(said.get('after')).toBe(current);
+      expect(isRunning(serving)).toBe(true);
+      expect(await recordedDaemon(workspace)).toBe(serving);
+
+      // Control: rewritten with the same bytes after the daemon started, it still keeps serving.
+      await writeFile(join(workspace, '.nxignore'), 'dist\nout\n');
+      expect((await explicitUpdate(workspace, daemonEnv)).has('updated')).toBe(true);
+      expect(isRunning(serving)).toBe(true);
+
+      // Control: new bytes are rules the filter never read, so the daemon stops, as on a watch event.
+      await writeFile(join(workspace, '.nxignore'), 'dist\nout\ngen\n');
+      const stale = await explicitUpdate(workspace, daemonEnv);
+      expect(stale.has('updated'), JSON.stringify([...stale])).toBe(false);
+      const log = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
+      expect(log).toContain('Stopping the daemon the set of ignored files changed (native)');
+    } finally {
+      if (isRunning(serving)) terminate(serving);
     }
   });
 });
