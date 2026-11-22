@@ -306,6 +306,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// Delete every `rm --abandon` bundle in the project's trash, answering the paths deleted,
     /// once main's repository keeps every one's tips; none is deleted when any cannot be kept.
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>>;
+    /// Move this process's working directory off main's mount, when it stands there, to the
+    /// retained `<root>.pre-cowshed` tree, which the restore's swap carries back to the checkout
+    /// path: `unadopt` run from the checkout is no hold of the main it retires (02_workspaces.md,
+    /// "Holders cowshed does not run").
+    async fn leave_main(&mut self) -> Result<()>;
     async fn grant(
         &mut self,
         workspace: WorkspaceName,
@@ -2846,6 +2851,7 @@ async fn remove_project(
             .into_iter()
             .filter(|workspace| !workspace.is_main()),
     );
+    host.leave_main().await?;
     let session_removal = RetireOptions::unadopting_session(options.force, options.abandon);
     let mut removed = Vec::with_capacity(sessions.len());
     for workspace in sessions {
@@ -11157,25 +11163,12 @@ self.finish_retire_intent(&workspace).await?;
     /// retires, detaches or moves (02_workspaces.md, "Holders cowshed does not run"). Anything
     /// else of this process's there, an open file, still holds the mount, and the census names it.
     fn leave_mount(&self, workspace: &WorkspaceName, mount: &Path) -> Result<()> {
-        // A working directory the kernel cannot name (removed under it, or unreadable) is left as
-        // it is: the census asks this process like any other and names whatever it holds.
-        let Ok(here) = std::env::current_dir() else {
-            return Ok(());
-        };
-        if !here.starts_with(mount) {
-            return Ok(());
-        }
-        let main = self.workspace_mount_path(&main_name())?;
-        std::env::set_current_dir(&main).map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot move this process's working directory {} off {workspace}'s mount to main's checkout {}: {error}",
-                    here.display(),
-                    main.display()
-                ),
-                format!("run the command from outside {}", mount.display()),
-            )
-        })
+        leave_mount_to(
+            mount,
+            &format!("{workspace}'s mount"),
+            "main's checkout",
+            || self.workspace_mount_path(&main_name()),
+        )
     }
     async fn require_mount_unheld_before_stop(
         &self,
@@ -17195,6 +17188,26 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .collect())
     }
 
+    async fn leave_main(&mut self) -> Result<()> {
+        let main = WorkspaceName::main();
+        let mounted = match self.current(&main).await {
+            Ok(current) => matches!(
+                current.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            ),
+            // A restore's retry once main retired: no mount is left to leave.
+            Err(error) if error.code == ErrorCode::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !mounted {
+            return Ok(());
+        }
+        let checkout = &self.descriptor.git_root;
+        let retained = pre_cowshed_path(checkout)?;
+        leave_mount_to(checkout, "main's mount", "the retained checkout", || {
+            Ok(retained)
+        })
+    }
     /// The purge's last word on the trash: the abandon bundles are the only copy of their commits,
     /// and the purge's `--abandon` authorizes deleting them (01_storage.md, "Retention").
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
@@ -19380,6 +19393,38 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             async move { supervisor.progress(job, every).await },
         ))
     }
+}
+
+/// Move this process's working directory off the mount at `mount` (`what`, in a refusal) when it
+/// stands there, to the directory `to` gives (`to_what`): the directory a verb was invoked from is
+/// no hold of the workspace the verb retires, detaches or moves (02_workspaces.md, "Holders cowshed
+/// does not run"). Anything else of this process's there, an open file, still holds the mount, and
+/// the census names it. A working directory the kernel cannot name (removed under it, or
+/// unreadable) is left as it is: the census asks this process like any other and names whatever it
+/// holds.
+fn leave_mount_to(
+    mount: &Path,
+    what: &str,
+    to_what: &str,
+    to: impl FnOnce() -> Result<PathBuf>,
+) -> Result<()> {
+    let Ok(here) = std::env::current_dir() else {
+        return Ok(());
+    };
+    if !here.starts_with(mount) {
+        return Ok(());
+    }
+    let to = to()?;
+    std::env::set_current_dir(&to).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot move this process's working directory {} off {what} to {to_what} {}: {error}",
+                here.display(),
+                to.display()
+            ),
+            format!("run the command from outside {}", mount.display()),
+        )
+    })
 }
 
 async fn binding_from_git(

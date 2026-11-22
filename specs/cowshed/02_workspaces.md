@@ -1814,12 +1814,13 @@ process has now: a record that names no process, or whose pid another process ha
 positive evidence the holder wrote under its own lock, not a guess from the process tree. Such a process can sit in one
 kernel call for minutes holding one of its descriptors' vnodes (a fork's first mount of its clone, "`cowshed fork`" step
 3), and it is no foreign holder: the operation's own leases and image locks already refuse the operations a census
-guards. The census's own process is always asked, whatever its leases say. A verb that retires, detaches or moves a
-workspace first moves its own working directory off that workspace's mount, to main's checkout, so the directory it was
-invoked from never refuses its own retirement; anything else of its own there, an open file, still holds the mount and
-is named like any other holder, and so is the working directory of the shell that invoked it, a process cowshed does not
-run. Every census on macOS starts from this one list of pids, the volume census included, which walks the processes
-itself rather than through libproc's `proc_listpidspath`. A census serves one store, the one its caller's roots name
+guards. The census's own process is always asked, whatever its leases say.
+<a id="smoo/cowshed!n/a-verb-leaves-the-mount"></a>A verb that retires, detaches or moves a workspace first moves its
+own working directory off that workspace's mount, to main's checkout, so the directory it was invoked from never refuses
+its own retirement; anything else of its own there, an open file, still holds the mount and is named like any other
+holder, and so is the working directory of the shell that invoked it, a process cowshed does not run. Every census on
+macOS starts from this one list of pids, the volume census included, which walks the processes itself rather than
+through libproc's `proc_listpidspath`. A census serves one store, the one its caller's roots name
 (`census::CensusScope`, from `CanonicalRoots::census` or the storage host's), and reads that store's leases
 (`<store>/<owner>/<repo>/sessions`) and no other store's. Which pids it asks follows the store's namespace. The host
 store's census asks every process the kernel lists: what it exists to find is a process cowshed does not run. A test

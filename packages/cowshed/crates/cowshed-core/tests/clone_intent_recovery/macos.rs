@@ -896,6 +896,39 @@ async fn a_bound_project_with_no_remote_is_found_from_its_checkout() {
     );
 }
 //#endregion smoo/cowshed!n/project-root-lookup
+
+//#region smoo/cowshed!n/a-verb-leaves-the-mount
+/// `cowshed unadopt` is run from the checkout (02_workspaces.md, "Checkout layouts"), which is
+/// main's mount until the restore swaps the retained tree back. The census of main's mount asks
+/// this process too, so unadopt first moves its working directory to the retained
+/// `<root>.pre-cowshed` tree, which the swap carries back to the checkout path: the process ends
+/// where it was invoked (02_workspaces.md, "Holders cowshed does not run").
+#[tokio::test]
+async fn unadopt_run_from_the_checkout_leaves_main_first() {
+    let fixture = Fixture::new("unadopt-from-checkout");
+    let runtime = fixture.adopt().await;
+    std::env::set_current_dir(&fixture.checkout).expect("stand in the checkout");
+
+    fixture
+        .call(
+            &runtime,
+            "coordinator.removeProject",
+            json!({ "repoId": fixture.repo, "options": RemoveProjectOptions::default() }),
+        )
+        .await
+        .expect("unadopt run from the checkout restores it");
+    assert!(
+        !fixture.layout().project().repository_binding.exists(),
+        "the project is unbound"
+    );
+    assert_eq!(
+        std::env::current_dir().expect("the working directory after unadopt"),
+        fixture.checkout,
+        "the process stands in the restored checkout"
+    );
+    runtime.shutdown().await.expect("stop runtime");
+}
+//#endregion smoo/cowshed!n/a-verb-leaves-the-mount
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(

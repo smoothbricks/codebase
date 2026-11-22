@@ -1027,6 +1027,9 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(self.removal.unpublished.iter().cloned().collect())
     }
 
+    async fn leave_main(&mut self) -> Result<()> {
+        Ok(())
+    }
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
         Ok(std::mem::take(&mut self.bundles))
     }
