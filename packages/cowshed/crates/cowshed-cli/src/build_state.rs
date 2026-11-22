@@ -170,6 +170,7 @@ mod tests {
             ],
             fingerprint: Some("not part of the lint contract".to_owned()),
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&volume).unwrap();
         let mut output = Output::new(Vec::new(), Vec::new(), false);

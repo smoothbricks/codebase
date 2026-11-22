@@ -1422,11 +1422,14 @@ Covered flows:
   remains explicit in that contract for a project that keeps its Cargo target in the build volume; a project with mbx
   holds no Cargo profile there for it to gap over, and its capture takes no Cargo lock. No fencing of the gap case is
   claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md, fork step 2).
-- **mbx target link at fork**: fork a project with the mbx capability whose source checkout has a `target` link naming
-  the source's managed target on the build-cache volume; the fork starts with that inherited link deleted, its build
-  image otherwise cloned as any other, and cowshed's refresh neither recreates nor retargets the link — the first build
-  through mbx creates the fork's own (16_build_volumes.md). A project without mbx forks with its build-volume `target`
-  exactly as today.
+- **mbx target link at fork**: fork a project with the mbx capability whose source checkout has `target` links naming
+  the source's managed targets on the build-cache volume, at the root and in a nested Cargo workspace; the fork starts
+  with those inherited links deleted and the managed targets untouched, a real `target` directory and a `target` link
+  naming anything else unchanged, its build image otherwise cloned as any other, and cowshed's refresh neither recreates
+  nor retargets the links — the first build through mbx creates the fork's own (16_build_volumes.md). Retiring the
+  source afterwards (`mbx clean --under`) leaves the fork's builds working. A source whose record predates `mbxTargets`
+  is rediscovered once before the fork, and an unchanged one runs no Cargo query. A project without mbx forks with its
+  build-volume `target` exactly as today.
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
   unchanged (01a_apfs.md, "Clone cost follows extents, not size");

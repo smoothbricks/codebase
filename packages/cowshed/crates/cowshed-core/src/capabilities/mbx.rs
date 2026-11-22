@@ -382,8 +382,9 @@ fn installed(context: &DetectionContext<'_>) -> Result<bool> {
 
 /// The canonical mbx environment (11_shell.md, "Canonical mbx environment") and the store grant
 /// (04_sandbox.md): the cache directory on the build-cache volume, managed targets at mbx's
-/// default inside it, no wrapper beside mbx, and the inherited `target` link discarded at mint so
-/// the fork's first build places its own (16_build_volumes.md, "Fork" step 4).
+/// default inside it, and no wrapper beside mbx. The inherited `target` links a mint drops are the
+/// managed targets the source's discovery recorded (16_build_volumes.md, "Fork" step 4;
+/// `build_volume::managed_targets`), not a capability's daemon state.
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = CapabilityContribution::default();
     let HostMbx::Installed(executable) = observe_host(context.home) else {
@@ -492,14 +493,6 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
         .daemon_isolation
         .discard_at_mint
         .push(PathBuf::from(".cowshed/run/mbx"));
-    let project = context
-        .project_root
-        .strip_prefix(context.workspace_root)
-        .unwrap_or_else(|_| Path::new(""));
-    contribution
-        .daemon_isolation
-        .discard_at_mint
-        .push(project.join("target"));
     Ok(contribution)
 }
 
@@ -865,11 +858,14 @@ mod tests {
             );
             if active {
                 assert!(
-                    found
+                    !found
                         .contribution
                         .daemon_isolation
                         .discard_at_mint
-                        .contains(&PathBuf::from("rust/target"))
+                        .iter()
+                        .any(|path| path.ends_with("target")),
+                    "the capability discards no Cargo target at mint: {:?}",
+                    found.contribution.daemon_isolation.discard_at_mint
                 );
             }
         }
@@ -992,7 +988,7 @@ mod tests {
         );
         assert_eq!(
             contribution.daemon_isolation.discard_at_mint,
-            [PathBuf::from(".cowshed/run/mbx"), PathBuf::from("target")]
+            [PathBuf::from(".cowshed/run/mbx")]
         );
     }
 

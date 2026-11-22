@@ -1072,6 +1072,7 @@ mod tests {
             ],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         }
     }
 
@@ -1557,6 +1558,7 @@ mod tests {
                     ],
                     fingerprint: None,
                     mbx: None,
+                    mbx_targets: None,
                 },
             }
         }
@@ -1678,6 +1680,7 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         // The host's lock program takes the lock as Nx does (`flock`), then runs its command.
         let mut opening = crate::lock_program::holding(&lock)
@@ -2036,6 +2039,7 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         let record = stock.record();
         stock.daemon("--start");
@@ -2243,6 +2247,7 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         let mut foreign = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -2307,6 +2312,7 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         // Nx takes the lock with `flock`, which holds it per open: the open `hold_opens` makes
         // waits behind this one as it would behind another process's.

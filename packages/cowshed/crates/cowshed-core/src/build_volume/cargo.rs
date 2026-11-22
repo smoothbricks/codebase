@@ -100,6 +100,7 @@ mod tests {
             ],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         }
     }
 

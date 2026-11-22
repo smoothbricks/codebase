@@ -7255,6 +7255,48 @@ self.finish_retire_intent(&workspace).await?;
         Ok(result)
     }
 
+    /// The Cargo targets mbx manages in the checkout `mount` of `source`, as the checkout's
+    /// build-state discovery recorded them at its current fingerprint: the inherited links a clone
+    /// of the checkout drops (16_build_volumes.md, "Fork" step 4). A record that does not name them
+    /// (none yet, or one written before it could) or names them at another fingerprint is brought
+    /// up to date once through the checkout's own refresh, whose refusal stands; one that still
+    /// does not name them refuses the clone rather than guess which links are inherited.
+    async fn recorded_mbx_targets(
+        &mut self,
+        source: &NativeWorkspace,
+        mount: &Path,
+    ) -> Result<Vec<crate::capabilities::RelPath>> {
+        let read = |volumes: super::build_volumes::BuildVolumes<H>, mount: PathBuf| async move {
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&mount)?;
+                Ok::<_, CowshedError>(
+                    volumes.state_of(&mount)?.and_then(|(_, state)| {
+                        state.mbx_targets_at(&fingerprint).map(<[_]>::to_vec)
+                    }),
+                )
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("build state task failed: {error}")))?
+        };
+        if let Some(targets) = read(self.build_volumes()?, mount.to_owned()).await? {
+            return Ok(targets);
+        }
+        self.refresh_build_state_for(source, mount, super::build_volumes::Lent::Nothing)
+            .await?;
+        read(self.build_volumes()?, mount.to_owned())
+            .await?
+            .ok_or_else(|| {
+                CowshedError::integrity(
+                    format!(
+                        "the build state of {} names no Cargo targets mbx manages at its current \
+                         inputs after its refresh, so a clone cannot tell which inherited target \
+                         links name its managed targets",
+                        mount.display()
+                    ),
+                    format!("cowshed doctor --json, then retry from {}", mount.display()),
+                )
+            })
+    }
     /// Refresh `current`'s build state at its mounted checkout `mount`
     /// ([`ProjectRuntimeHost::refresh_build_state`]). Detection reads the same canonical context
     /// the supervisor's capability admission reads, and Cargo is asked as a job of the workspace
@@ -7285,9 +7327,11 @@ self.finish_retire_intent(&workspace).await?;
                 CowshedError::internal(format!("build state task failed: {error}"))
             })??
         };
+        // A state that never recorded the Cargo targets mbx manages is rediscovered once, its
+        // fingerprint notwithstanding: a fork drops the inherited links among them.
         let unchanged = recorded
             .as_ref()
-            .is_some_and(|(_, state)| state.fingerprint.as_deref() == Some(fingerprint.as_str()));
+            .is_some_and(|(_, state)| state.mbx_targets_at(&fingerprint).is_some());
         let (discovered, findings) = if unchanged {
             (Discovered::Unchanged, Vec::new())
         } else {
@@ -14986,6 +15030,25 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         ),
                     )
                     .await?;
+                    // The adopted copy's root Cargo target link, when it names a managed target: it
+                    // names the pre-cowshed checkout's, and main's first build places its own. Only
+                    // the copy's link goes, never the source checkout's or any payload. Adoption has
+                    // no recorded discovery to name nested Cargo workspaces' links before main's
+                    // first touch, so those stay for now (16_build_volumes.md, "Fork" step 4).
+                    if let Some(cache) =
+                        crate::storage::bootstrap::native::provisioned_build_cache()
+                    {
+                        timed_async(
+                            "adopt",
+                            "mbx-targets",
+                            crate::build_volume::managed_targets::drop_inherited_in(
+                                stage.mount_point.clone(),
+                                vec![crate::capabilities::RelPath::new("target")?],
+                                crate::build_volume::managed_targets::managed_root(&cache),
+                            ),
+                        )
+                        .await?;
+                    }
                     let repository =
                         crate::git::GitRepository::from_root(store_root, &stage.mount_point);
                     // The image's volume is case-sensitive; the tree it was copied from may not be.
@@ -15147,6 +15210,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // It produced every byte the clone inherited, so it is what inherited links and the
             // Git identity resolve against — never main unless main is the source.
             let source_mount = self.workspace_mount_path(&source_name)?;
+            // The source's inherited managed-target links, from its recorded discovery: the clone
+            // drops them at mint so its first build places its own (16_build_volumes.md, "Fork"
+            // step 4). Taken before the capture, so the record is the source checkout's own.
+            let mbx_targets = self.recorded_mbx_targets(&source, &source_mount).await?;
+            let managed_root = crate::storage::bootstrap::native::provisioned_build_cache()
+                .map(|cache| crate::build_volume::managed_targets::managed_root(&cache));
             let repository_shape = if git_worktree {
                 crate::git::WorkspaceRepository::LinkedWorktree
             } else {
@@ -15276,6 +15345,18 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             ),
                         )
                         .await?;
+                        if let Some(managed_root) = managed_root.clone() {
+                            timed_async(
+                                "fork",
+                                "mbx-targets",
+                                crate::build_volume::managed_targets::drop_inherited_in(
+                                    stage.mount_point.clone(),
+                                    mbx_targets.clone(),
+                                    managed_root,
+                                ),
+                            )
+                            .await?;
+                        }
                         timed_async(
                             "fork",
                             "build-volume-seed",
@@ -15586,6 +15667,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             } else {
                 let (grants, reservation) = self.destination_grants(&destination, resuming).await?;
                 let source_mount = self.workspace_mount_path(&source)?;
+                // As a fork's: the source's recorded managed-target links, dropped at mint.
+                let mbx_targets = self.recorded_mbx_targets(&source_fact, &source_mount).await?;
+                let managed_root = crate::storage::bootstrap::native::provisioned_build_cache()
+                    .map(|cache| crate::build_volume::managed_targets::managed_root(&cache));
                 let grants = if reservation.is_some() {
                     inherited_developer_read_grants(source_mount.clone(), crate::developer_links::PackageStores::from_home(&self.home)?, grants).await?
                 } else {
@@ -15696,6 +15781,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 )?,
                             )
                             .await?;
+                            if let Some(managed_root) = managed_root.clone() {
+                                crate::build_volume::managed_targets::drop_inherited_in(
+                                    stage.mount_point.clone(),
+                                    mbx_targets.clone(),
+                                    managed_root,
+                                )
+                                .await?;
+                            }
                             build_volumes
                                 .finish_fork(
                                     prepared?,

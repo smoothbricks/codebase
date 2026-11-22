@@ -1234,6 +1234,7 @@ mod tests {
             paths: retention.clone(),
             fingerprint: Some("tracked-input-fingerprint".to_owned()),
             mbx: None,
+            mbx_targets: None,
         };
         // The canonical contribution resolves legacy policy in the seed value only.
         for path in &mut state.paths {

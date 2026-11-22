@@ -1234,6 +1234,7 @@ mod tests {
                 crate::capabilities::tracked_manifest_fingerprint(checkout).expect("fingerprint"),
             ),
             mbx: None,
+            mbx_targets: None,
         }
         .write(&volume)
         .expect("state");

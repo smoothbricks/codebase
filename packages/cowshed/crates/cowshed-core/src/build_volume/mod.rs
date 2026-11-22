@@ -17,6 +17,7 @@ pub mod cargo;
 pub mod discard;
 pub mod kept;
 pub mod link;
+pub mod managed_targets;
 pub mod migrate;
 pub mod nx;
 #[cfg(target_os = "macos")]
@@ -305,12 +306,18 @@ pub enum ForkNx {
 /// fingerprint of the tracked build inputs they were discovered from
 /// (`capabilities::tracked_manifest_fingerprint`): while it matches, nothing is rediscovered, and
 /// the realpath of mbx reached through the canonical Cargo route, recording target ownership
-/// rather than enabling the capability (15_capabilities.md, "mbx detection").
+/// rather than enabling the capability (15_capabilities.md, "mbx detection"), and the Cargo
+/// target directories mbx manages in the checkout, as that discovery found them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BuildVolumeState {
     pub paths: Vec<BuildStatePath>,
     pub fingerprint: Option<String>,
     pub mbx: Option<PathBuf>,
+    /// Each in-checkout Cargo target directory mbx manages, nested Cargo workspaces included,
+    /// relative to the checkout, from the discovery at `fingerprint` (16_build_volumes.md, "Fork"
+    /// step 4). `None` when no discovery recorded it, which is not the empty set: such a state is
+    /// rediscovered once, whatever its fingerprint.
+    pub mbx_targets: Option<Vec<crate::capabilities::RelPath>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -322,6 +329,8 @@ struct StateWire {
     fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mbx: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mbx_targets: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -367,6 +376,15 @@ impl BuildVolumeState {
             paths,
             fingerprint: wire.fingerprint,
             mbx: wire.mbx,
+            mbx_targets: wire
+                .mbx_targets
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .map(|value| crate::capabilities::RelPath::new(value))
+                        .collect::<crate::Result<Vec<_>>>()
+                })
+                .transpose()?,
         }))
     }
 
@@ -391,12 +409,19 @@ impl BuildVolumeState {
                 .collect(),
             fingerprint: self.fingerprint.clone(),
             mbx: self.mbx.clone(),
+            mbx_targets: self.mbx_targets.as_ref().map(|targets| {
+                targets
+                    .iter()
+                    .map(|path| path.as_path().to_string_lossy().into_owned())
+                    .collect()
+            }),
         };
         write_json(&path, &wire).map_err(|error| record_error(&path, &error))
     }
 
     /// This state with each `discovered` path it does not hold yet added and each `released` path
-    /// dropped, recorded at `fingerprint` with the `mbx` discovery resolved, and the paths added
+    /// dropped, recorded at `fingerprint` with the `mbx` discovery resolved and `released` as the
+    /// Cargo targets mbx manages, and the paths added
     /// and dropped. A path already held keeps its volume name: links are fixed once made
     /// (16_build_volumes.md, "One link per checkout"); only a discovery that found the path's owner
     /// gone off the volume releases it (a Cargo target under mbx). A new path that overlaps a held
@@ -459,12 +484,22 @@ impl BuildVolumeState {
                 paths,
                 fingerprint: Some(fingerprint),
                 mbx,
+                mbx_targets: Some(released.iter().map(|path| path.checkout.clone()).collect()),
             },
             added,
             dropped,
         ))
     }
 
+    /// The Cargo targets mbx manages, as recorded by a discovery at `fingerprint`: `None` when the
+    /// state was discovered at another fingerprint or never recorded them, so a refresh must
+    /// rediscover before anything relies on them.
+    pub fn mbx_targets_at(&self, fingerprint: &str) -> Option<&[crate::capabilities::RelPath]> {
+        if self.fingerprint.as_deref() != Some(fingerprint) {
+            return None;
+        }
+        self.mbx_targets.as_deref()
+    }
     /// Resolve legacy seed metadata from current capability contributions, without changing paths or live bytes.
     pub fn with_seed_retention(&self, policies: &[BuildStatePath]) -> Self {
         let mut state = self.clone();
@@ -2624,6 +2659,7 @@ mod tests {
             ],
             fingerprint: Some("f1".to_owned()),
             mbx: None,
+            mbx_targets: None,
         };
         assert_eq!(
             state.nx_workspace_data().collect::<Vec<_>>(),
@@ -2658,6 +2694,7 @@ mod tests {
             paths: vec![BuildStatePath::new("target", "target").unwrap()],
             fingerprint: Some("old".to_owned()),
             mbx: None,
+            mbx_targets: None,
         };
         let discovered = [
             BuildStatePath::new("target", "elsewhere").unwrap(),
@@ -2688,6 +2725,7 @@ mod tests {
             paths: vec![nx.clone(), target.clone()],
             fingerprint: Some("old".to_owned()),
             mbx: None,
+            mbx_targets: None,
         };
         let pin = PathBuf::from("/pinned/mbx-1.28.0/bin/mbx");
         let (next, added, dropped) = state
@@ -2703,6 +2741,67 @@ mod tests {
         assert_eq!(dropped, [target]);
         assert_eq!(next.paths, [nx]);
         assert_eq!(next.mbx, Some(pin));
+        let recorded = [crate::capabilities::RelPath::new("target").unwrap()];
+        assert_eq!(next.mbx_targets.as_deref(), Some(recorded.as_slice()));
+        assert_eq!(next.mbx_targets_at("new"), Some(recorded.as_slice()));
+        assert_eq!(
+            next.mbx_targets_at("old"),
+            None,
+            "another fingerprint is not current"
+        );
+    }
+
+    /// A record written before the managed targets were recorded reads as never recorded, never as
+    /// none, so it is not current even at its own fingerprint and the next refresh rediscovers; one
+    /// that names them round-trips, the empty set included; and a path that is not relative to the
+    /// checkout is refused on read rather than handed to a fork's unlink.
+    #[test]
+    fn recorded_mbx_targets_are_never_assumed_and_round_trip() {
+        let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-mbx-targets");
+        let volume = root.join("volume");
+        fs::create_dir_all(&volume).unwrap();
+        fs::write(
+            volume.join(STATE_FILE),
+            br#"{"version":1,"paths":[],"fingerprint":"same","mbx":"/pinned/bin/mbx"}"#,
+        )
+        .unwrap();
+        let old = BuildVolumeState::read(&volume).unwrap();
+        assert_eq!(old.mbx_targets, None);
+        assert_eq!(old.mbx_targets_at("same"), None);
+
+        for targets in [
+            vec![],
+            vec![
+                crate::capabilities::RelPath::new("target").unwrap(),
+                crate::capabilities::RelPath::new("crates/fuzz/target").unwrap(),
+            ],
+        ] {
+            let state = BuildVolumeState {
+                mbx_targets: Some(targets.clone()),
+                ..old.clone()
+            };
+            state.write(&volume).unwrap();
+            let read = BuildVolumeState::read(&volume).unwrap();
+            assert_eq!(read, state);
+            assert_eq!(read.mbx_targets_at("same"), Some(targets.as_slice()));
+        }
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(volume.join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            written["mbxTargets"],
+            serde_json::json!(["target", "crates/fuzz/target"])
+        );
+
+        for refused in ["/abs/target", "../outside/target"] {
+            fs::write(
+                volume.join(STATE_FILE),
+                format!(
+                    r#"{{"version":1,"paths":[],"fingerprint":"same","mbxTargets":["{refused}"]}}"#
+                ),
+            )
+            .unwrap();
+            assert!(BuildVolumeState::read(&volume).is_err(), "{refused}");
+        }
     }
 
     /// A land interrupted between moving a target's link and its records leaves a link naming a
@@ -3189,6 +3288,7 @@ mod tests {
             paths: vec![path("target", "target"), compile_cache],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         assert_eq!(
             state.cargo_targets().collect::<Vec<_>>(),

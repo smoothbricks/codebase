@@ -173,10 +173,11 @@ are fixed relative symlinks through it, created by cowshed when it mints the che
 In a project with the mbx capability, `target` is not a build-volume link. mbx creates and owns it at the checkout's
 first Cargo build, `target -> <build-cache>/mbx/targets/v1/<checkout digest>`, and adds its exact path to the
 repository's `info/exclude` itself (mbx docs, "Managed target directories"). Cowshed never creates, discards or relinks
-it, and a refresh that finds it leaves it. The source image carries the link to every fork, where it names the source
-checkout's managed target, so a fork deletes it (Fork step 4) and the fork's first build places its own. The managed
-target never travels: a land leaves the target's managed target where it is, and its next build restores from the store
-what the landing workspace compiled.
+it, and a refresh that finds it leaves it. mbx makes one such link for each Cargo workspace of the checkout it builds,
+nested ones included, and the source image carries every one of them to every fork, where it names the source checkout's
+managed target, so a fork deletes them (Fork step 4) and the fork's first build places its own. The managed target never
+travels: a land leaves the target's managed target where it is, and its next build restores from the store what the
+landing workspace compiled.
 
 A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new symlink over it. That is atomic: every
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no
@@ -936,19 +937,23 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    cache or task databases until the clone is fixed. A holder, or a process opening a database, is said on stderr, and
    the fork starts without them.
 4. Delete `nx/workspace-data/d` in the new build volume: a daemon record names another checkout's process and socket
-   (rule "One Nx state per checkout"). Delete the checkout's inherited `target` link when it names an mbx managed
-   target: it names the source checkout's managed target, and the fork's first build places its own. Move the checkout's
-   inherited `.cowshed/kept` into `.cowshed/discard`, deleted in the background: those are the source's kept
-   directories, which the source still holds ("What a refresh does at each path"), and the fork's `rm` and land would
-   refuse for them. An mbx fork's mount also empties every path that is not retained and drops clone-invalid files: the
-   clone was taken while the target's jobs may have been writing, and only retained state is crash-consistent. Nx state
-   captured under the Nx guards is crash-consistent too and stays: the fork replays every task the target cached, at the
-   hash the target computed, without a rerun or a read of the project's Nx cache. It empties each path with one rename
-   into the volume's own `.cowshed/discard`, deleted in the background ("What a refresh does at each path"), and the
-   workspace supervisor the fork starts resumes that delete, since the fork's own process exits first. Deleting them in
-   the fork held every fork of a large project's main for the delete of its Nx and compile caches, about 99,000 entries:
-   15 to 46 s of each fork's wall time (measured 2026-11-02). Nothing is copied or hashed, and an mbx fork mints no seed
-   of its own.
+   (rule "One Nx state per checkout"). Delete each inherited link at a Cargo target mbx manages when it names an mbx
+   managed target, unlinking the link and never what it names: the targets are those the source's build-state discovery
+   recorded beside its fingerprint (`mbxTargets`, nested Cargo workspaces included), refreshed once through the source's
+   own discovery first when that record is missing or at another fingerprint; a source still without one refuses the
+   fork. A real directory, a link naming anything else and a link reached through a symlinked directory stay. Each names
+   the source checkout's managed target, and the fork's first build places its own. Move the checkout's inherited
+   `.cowshed/kept` into `.cowshed/discard`, deleted in the background: those are the source's kept directories, which
+   the source still holds ("What a refresh does at each path"), and the fork's `rm` and land would refuse for them. An
+   mbx fork's mount also empties every path that is not retained and drops clone-invalid files: the clone was taken
+   while the target's jobs may have been writing, and only retained state is crash-consistent. Nx state captured under
+   the Nx guards is crash-consistent too and stays: the fork replays every task the target cached, at the hash the
+   target computed, without a rerun or a read of the project's Nx cache. It empties each path with one rename into the
+   volume's own `.cowshed/discard`, deleted in the background ("What a refresh does at each path"), and the workspace
+   supervisor the fork starts resumes that delete, since the fork's own process exits first. Deleting them in the fork
+   held every fork of a large project's main for the delete of its Nx and compile caches, about 99,000 entries: 15 to 46
+   s of each fork's wall time (measured 2026-11-02). Nothing is copied or hashed, and an mbx fork mints no seed of its
+   own.
 
 The lock covers what reads the target: the clone of its image, its seed refresh and the capture of its seed, all one
 hold, so the clone's checkout and its build volume come from one state of the target that no land or reseed changes

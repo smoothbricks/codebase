@@ -5383,6 +5383,7 @@ mod tests {
             paths: vec![BuildStatePath::new(".nx/workspace-data", ".nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         }
         .write(&mount)
         .unwrap();
@@ -5804,6 +5805,7 @@ mod tests {
             ],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         }
         .write(&mount)
         .unwrap();
@@ -5918,6 +5920,7 @@ mod tests {
                 paths,
                 fingerprint: Some("fixture".into()),
                 mbx: None,
+                mbx_targets: None,
             };
             let mut held = state.clone();
             if changed {
@@ -6028,6 +6031,7 @@ mod tests {
                 ],
                 fingerprint: Some("fixture".into()),
                 mbx: None,
+                mbx_targets: None,
             };
             state.write(&mount).unwrap();
             link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -6136,6 +6140,7 @@ mod tests {
             paths,
             fingerprint: Some("fixture".into()),
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         let mut linked = gone.to_vec();
@@ -6266,6 +6271,7 @@ mod tests {
             paths: vec![index.clone()],
             fingerprint: Some("fixture".into()),
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -6341,6 +6347,7 @@ mod tests {
             ],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         link::link_paths(&checkout, &mount, &state.paths).unwrap();
@@ -6710,6 +6717,7 @@ fn main() {
             paths: vec![BuildStatePath::new("target", "target").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("target/debug")).unwrap();
@@ -6818,6 +6826,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("lint-cache")).unwrap();
@@ -6871,6 +6880,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
@@ -6971,6 +6981,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
@@ -7030,6 +7041,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
@@ -7118,6 +7130,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");
@@ -7192,6 +7205,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         fs::create_dir_all(mount.join("lint-cache")).unwrap();
@@ -7264,6 +7278,7 @@ fn main() {
                 paths: vec![declared],
                 fingerprint: Some("fixture".into()),
                 mbx: Some(PathBuf::from("/installed/mbx")),
+                mbx_targets: None,
             }
             .write(&mount)
             .unwrap();
@@ -7308,6 +7323,7 @@ fn main() {
             paths: vec![BuildStatePath::declared(".cache/pins").unwrap()],
             fingerprint: Some("fixture".into()),
             mbx: Some(PathBuf::from("/installed/mbx")),
+            mbx_targets: None,
         }
         .write(&mount)
         .unwrap();
@@ -7348,6 +7364,7 @@ fn main() {
             ],
             fingerprint: Some("mbx-fixture".into()),
             mbx: Some(PathBuf::from("/installed/mbx")),
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         for path in &state.paths {
@@ -8612,6 +8629,7 @@ fn main() {
             ],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         let sqlite = |mount: &Path, statement: &str| {
             let output = std::process::Command::new("sqlite3")
@@ -8702,6 +8720,7 @@ fn main() {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         state.write(&mount).unwrap();
         let data = mount.join("nx/workspace-data");

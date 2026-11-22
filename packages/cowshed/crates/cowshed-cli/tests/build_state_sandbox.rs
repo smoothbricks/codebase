@@ -91,6 +91,7 @@ fn installed_cli_fixture(label: &str) -> (Scratch, SandboxConfig, PathBuf) {
         paths: vec![BuildStatePath::new(".nx/cache", "nx/cache").unwrap()],
         fingerprint: None,
         mbx: None,
+        mbx_targets: None,
     };
     state.write(&volume).unwrap();
 

@@ -208,6 +208,7 @@ fn adopt_preflighted(
             paths: source_paths,
             fingerprint: None,
             mbx: None,
+            mbx_targets: None,
         };
         if let Err(busy) = nx::close(census, checkout, &source_state)
             .map_err(|error| io_error("close Nx state before migration", checkout, error))?
