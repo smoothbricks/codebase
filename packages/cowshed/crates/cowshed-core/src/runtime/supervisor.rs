@@ -9417,7 +9417,14 @@ fn launch_stdin_pump(
         }
         StdinSource::Inline(bytes) => {
             tokio::spawn(async move {
-                let delivered = pump_one(job_id, 0, bytes, &events).await;
+                let delivered = async {
+                    for offset in (0..bytes.len()).step_by(PROCESS_IO_CHUNK) {
+                        let frame = bytes.slice(offset..bytes.len().min(offset + PROCESS_IO_CHUNK));
+                        pump_one(job_id, byte_count(offset), frame, &events).await?;
+                    }
+                    Ok(())
+                }
+                .await;
                 finish_stdin_pump(job_id, delivered, &events).await;
             });
         }

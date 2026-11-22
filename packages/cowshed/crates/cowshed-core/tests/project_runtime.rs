@@ -2861,6 +2861,70 @@ fn gated_request(class: ExecClass) -> ExecRequest {
     }
 }
 
+//#region cowshed!n/structured-stdin
+/// 07_api, Structured stdin: a finite byte source reaches the child before the one EOF.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_finite_input_larger_than_the_pipe_budget_reaches_its_child() {
+    use cowshed_core::api::dto::{AdmissionKey, Sha256Digest, StdinKind};
+    use cowshed_core::error::{AdmissionField, AdmissionRefusal};
+    let root = test_root();
+    let supervisor = system_supervisor(&root);
+    let bytes = Bytes::from(
+        (0..414_027)
+            .map(|i| u8::try_from(i % 251).expect("byte"))
+            .collect::<Vec<_>>(),
+    );
+    let digest = Sha256Digest::compute(&bytes);
+    let key = AdmissionKey::new("finite-stdin").expect("key");
+    let request = |stdin| ExecRequest {
+        command: ExecCommand::Argv(vec![CommandArg::from("/bin/cat")]),
+        stdin: StdinSource::Inline(stdin),
+        admission_key: Some(key.clone()),
+        ..gated_request(ExecClass::Background)
+    };
+    let job_id = supervisor
+        .exec(None, None, request(bytes.clone()), AdmissionSource::Worker)
+        .await
+        .expect("admit finite source");
+    let ended = supervisor.wait(job_id).await.expect("cat exits");
+    assert_eq!(
+        ended.stdin.bytes, 414_027,
+        "stdin {:?}, exit {:?}, output {} bytes",
+        ended.stdin, ended.exit, ended.stdout.bytes
+    );
+    assert_eq!(
+        ended.exit,
+        Some(cowshed_core::api::ExitStatus::Exited { code: 0 })
+    );
+    assert_eq!(ended.stdin.kind, StdinKind::Inline);
+    assert!(ended.stdin.complete);
+    assert_eq!(ended.stdout.bytes, ended.stdin.bytes);
+    assert_eq!(ended.stdout.sha256, digest);
+    let same = supervisor
+        .exec(None, None, request(bytes.clone()), AdmissionSource::Worker)
+        .await
+        .expect("identical finite request");
+    assert_eq!(same, job_id);
+    let mut changed = bytes.to_vec();
+    changed[65_536] ^= 1;
+    for other in [Bytes::from(changed), bytes.slice(..bytes.len() - 1)] {
+        let refusal = supervisor
+            .exec(None, None, request(other), AdmissionSource::Worker)
+            .await
+            .expect_err("different stdin conflicts");
+        assert_eq!(
+            refusal.admission_source(),
+            Some(&AdmissionRefusal::KeyConflict {
+                job_id,
+                fields: vec![AdmissionField::Stdin]
+            })
+        );
+    }
+}
+//#endregion cowshed!n/structured-stdin
+
 /// Not a test of its own: the requester process of the drain proofs. Run as this binary with
 /// [`DRAIN_REQUESTER_SOCKET`] set, it admits one gated job of [`DRAIN_REQUESTER_CLASS`] on that
 /// socket, says `job=<id>` on stdout, and exits once its stdin closes, never reading the job.
