@@ -1695,7 +1695,9 @@ impl NativeGatewayInventory {
     }
 
     /// Whether `repo`'s main names `expected` as its checkout: through main's live or retired
-    /// images while one exists, else through the checkout root the store recorded for it.
+    /// entries in the store, whatever each is (a disk image, or a dataset project's mount record
+    /// or home directory: 09_substrates.md, selection), else through the checkout root the store
+    /// recorded for it.
     fn main_claims_root(
         &self,
         repo: &RepoId,
@@ -1716,7 +1718,7 @@ impl NativeGatewayInventory {
             })?
             .image()
             .to_owned();
-        if fs::symlink_metadata(&image).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        if fs::symlink_metadata(&image).is_ok() {
             images.push(image);
         }
         let trash = layout.project().sessions.join(".trash");
@@ -1734,8 +1736,6 @@ impl NativeGatewayInventory {
                                 .and_then(|stem| stem.to_str())
                                 .and_then(crate::storage::apfs::split_retired_stem)
                                 .is_some_and(|(workspace, _)| workspace.is_main())
-                            && fs::symlink_metadata(&path)
-                                .is_ok_and(|metadata| metadata.file_type().is_file())
                             // A retired image without its sidecar has no record left to name a
                             // checkout; it is bytes awaiting reclaim, not a claim on the root.
                             && !fs::symlink_metadata(sidecar_path(&path))
@@ -5048,6 +5048,37 @@ mod tests {
             Err(GatewayInventoryError::InvalidMetadata { .. })
         ));
     }
+    //#region smoo/cowshed!n/project-root-lookup
+    /// A dataset project's main at home is a directory at its image path, beside its sidecar
+    /// (01b_zfs.md, "One pool, one root"): that entry is main's record, and it names the checkout
+    /// as a disk image's sidecar does (09_substrates.md, selection).
+    #[tokio::test]
+    async fn a_dataset_main_at_home_names_its_checkout() {
+        let fixture = Fixture::new("dataset-main-home");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let (storage, _) = fixture.workspace(
+            &repo,
+            WorkspaceName::main(),
+            "00000000000000000000000000000001",
+            4,
+            false,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let image = canonical_image_paths(&layout, &storage.workspace).expect("canonical image");
+        fs::remove_file(image.image()).expect("no disk image");
+        fs::create_dir(image.image()).expect("main's home directory");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        assert_eq!(
+            inventory
+                .repository_for_project_root(&fixture.root.join("checkout-widget"))
+                .await
+                .expect("main's home directory names its checkout"),
+            Some(repo)
+        );
+    }
+    //#endregion smoo/cowshed!n/project-root-lookup
     #[tokio::test]
     async fn a_bound_project_whose_main_images_are_gone_is_found_by_its_recorded_checkout_root() {
         let fixture = Fixture::new("reclaimed-main");

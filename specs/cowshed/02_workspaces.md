@@ -342,36 +342,37 @@ ref is transient and stays. The retained checkout is the repository the user kee
 there, and a later removal of that checkout is what would lose them; unadopt says so on stderr.
 
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
-main's images — the only other record naming it — are retired and then reclaimed. An unadopt interrupted after retiring
-main is finished by the same command from the checkout: the project root lookup matches that record when no main image
-exists, which is what reaches a checkout with no remote. The finishing run reports no abandoned work; the bundle the
-interrupted run wrote stays where it was reported. Unbinding first releases every build volume the project still has:
-with main retired nothing links one, so main's linked volume and its seed go with whatever an earlier collection left
-(16_build_volumes.md, "Garbage collection"), and a volume that stays (a job holds it, its release failed) refuses the
-unbinding while the project is still bound, naming it and why, for the same command to retry. A release only commits,
-and the unbinding is the project's last act, its store tree going with it. Unbinding then discards terminal storage
-(`.staging/`, `sessions/`, `tmp/` and `build/`, and the project root's own `main.dmg.lock` and
-`lifecycle-intents.json.lock`) by the store inventory (`storage/store_inventory.rs`), the one declaration of every entry
-cowshed writes there and what it is. Cowshed's derived state, all of which cowshed regenerates, is discarded: locks,
-leases and holds, sidecars and keys, workspaces' temp dirs, the seed compaction's lock and working images, staged and
-retired images, publication temps a crash cut, and the residue of an abandon bundle's write. Each image among it is
-moved, not freed: into `<store>/.deleting/<fresh id>.dmg`, with a nudge to the gateway for each one (05_gateway.md,
-"Deleting released images"), released images from `build/.deleting` and `sessions/.deleting` included, and a cut in
-progress moves with its entry, held open by the cleanup. User work, the only copy of something (a session workspace
-whose removal kept it, an `rm --abandon` bundle), and anything cowshed does not write refuse, every one named, before
-one entry is moved or removed. The unbinding then removes the empty mount trees (`<owner>/<repo>` and
-`.build/<owner>/<repo>` under the host mount root). It then unlinks the validated binding and syncs its held parent
-directory. Only this durable unbinding authorizes removal of the controller's lifecycle journal, recovery-export proofs,
-deletion log and slot bindings; the checkout-root record goes afterward. An unlink failure or interruption before the
-sync keeps that authority. A retry finding the binding absent still performs the directory durability barrier before
-releasing controller metadata. What the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store
-directory. Once the project is unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes too, and
-with it an owner directory it leaves empty, but only under the lease itself: the unbinding's own shared hold must
-upgrade to exclusive without waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the
-gateway, a command still open on the project), a record or a binding at its project path keeps it, said on stderr, and
-the unbinding keeps its shared hold. Because every holder rechecks the lease's inode after locking (`forget`, below),
-removing it cannot split them. A lease another holder kept goes later by the same rule: at its startup the gateway takes
-each `.retirements/<owner>/<repo>.lease` exclusive without waiting and removes it when no record stands beside it and no
+main's images — the only other record naming it — are retired and then reclaimed.
+<a id="smoo/cowshed!n/project-root-lookup"></a>An unadopt interrupted after retiring main is finished by the same
+command from the checkout: the project root lookup matches that record when no main image exists, which is what reaches
+a checkout with no remote. The finishing run reports no abandoned work; the bundle the interrupted run wrote stays where
+it was reported. Unbinding first releases every build volume the project still has: with main retired nothing links one,
+so main's linked volume and its seed go with whatever an earlier collection left (16_build_volumes.md, "Garbage
+collection"), and a volume that stays (a job holds it, its release failed) refuses the unbinding while the project is
+still bound, naming it and why, for the same command to retry. A release only commits, and the unbinding is the
+project's last act, its store tree going with it. Unbinding then discards terminal storage (`.staging/`, `sessions/`,
+`tmp/` and `build/`, and the project root's own `main.dmg.lock` and `lifecycle-intents.json.lock`) by the store
+inventory (`storage/store_inventory.rs`), the one declaration of every entry cowshed writes there and what it is.
+Cowshed's derived state, all of which cowshed regenerates, is discarded: locks, leases and holds, sidecars and keys,
+workspaces' temp dirs, the seed compaction's lock and working images, staged and retired images, publication temps a
+crash cut, and the residue of an abandon bundle's write. Each image among it is moved, not freed: into
+`<store>/.deleting/<fresh id>.dmg`, with a nudge to the gateway for each one (05_gateway.md, "Deleting released
+images"), released images from `build/.deleting` and `sessions/.deleting` included, and a cut in progress moves with its
+entry, held open by the cleanup. User work, the only copy of something (a session workspace whose removal kept it, an
+`rm --abandon` bundle), and anything cowshed does not write refuse, every one named, before one entry is moved or
+removed. The unbinding then removes the empty mount trees (`<owner>/<repo>` and `.build/<owner>/<repo>` under the host
+mount root). It then unlinks the validated binding and syncs its held parent directory. Only this durable unbinding
+authorizes removal of the controller's lifecycle journal, recovery-export proofs, deletion log and slot bindings; the
+checkout-root record goes afterward. An unlink failure or interruption before the sync keeps that authority. A retry
+finding the binding absent still performs the directory durability barrier before releasing controller metadata. What
+the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store directory. Once the project is
+unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes too, and with it an owner directory it
+leaves empty, but only under the lease itself: the unbinding's own shared hold must upgrade to exclusive without
+waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the gateway, a command still open
+on the project), a record or a binding at its project path keeps it, said on stderr, and the unbinding keeps its shared
+hold. Because every holder rechecks the lease's inode after locking (`forget`, below), removing it cannot split them. A
+lease another holder kept goes later by the same rule: at its startup the gateway takes each
+`.retirements/<owner>/<repo>.lease` exclusive without waiting and removes it when no record stands beside it and no
 binding at its project path, so one a live process holds stays until a later start finds it free. Unadopt checks
 terminal storage before it retires main, by the same inventory, so its refusal leaves main in place: it refuses user
 work and anything cowshed does not write, every one named, and lets cowshed's derived state and the build volumes the

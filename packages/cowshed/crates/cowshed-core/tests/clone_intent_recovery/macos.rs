@@ -866,6 +866,36 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
         "with no store, the ordinary unadopt answers"
     );
 }
+
+//#region smoo/cowshed!n/project-root-lookup
+/// A bound project's main names its checkout by its own entry in the store, whatever that entry
+/// is: a disk image, or a dataset project's mount record or home directory (09_substrates.md,
+/// selection). The directory host keeps main as a mount record, and its checkout has no remote,
+/// so the intent-only discard that `cowshed unadopt` runs before any opening must find the
+/// bound project by that record and leave it to the ordinary unadopt, never derive an identity
+/// from remotes the checkout does not have (02_workspaces.md, "Checkout layouts").
+#[tokio::test]
+async fn a_bound_project_with_no_remote_is_found_from_its_checkout() {
+    let fixture = Fixture::new("unadopt-no-remote");
+    let runtime = fixture.adopt().await;
+    runtime.shutdown().await.expect("stop runtime");
+
+    assert_eq!(
+        ProjectRuntime::discard_intent_only_adoption(
+            &fixture.checkout,
+            Some(fixture.storage.clone()),
+        )
+        .await
+        .expect("main's mount record names the checkout's bound project"),
+        None,
+        "a bound project is the ordinary unadopt's"
+    );
+    assert!(
+        fixture.layout().project().repository_binding.exists(),
+        "the binding stands"
+    );
+}
+//#endregion smoo/cowshed!n/project-root-lookup
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(
