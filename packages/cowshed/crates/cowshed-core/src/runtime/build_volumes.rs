@@ -5985,7 +5985,15 @@ mod tests {
                     .map(|path| (path.checkout.as_path().to_owned(), origin))
                     .collect::<Vec<_>>()
             );
-            assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+            let expected = BuildVolumeState {
+                mbx_targets: if changed {
+                    Some(Vec::new())
+                } else {
+                    state.mbx_targets.clone()
+                },
+                ..state.clone()
+            };
+            assert_eq!(BuildVolumeState::read(&mount).unwrap(), expected);
             for path in &state.paths {
                 let at = checkout.join(path.checkout.as_path());
                 assert_eq!(
@@ -6068,7 +6076,15 @@ mod tests {
             assert_eq!(refreshed.volume, Some(live));
             assert!(refreshed.discarded.is_empty());
             assert!(refreshed.added.is_empty());
-            assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+            let expected = BuildVolumeState {
+                mbx_targets: if changed {
+                    Some(Vec::new())
+                } else {
+                    state.mbx_targets.clone()
+                },
+                ..state.clone()
+            };
+            assert_eq!(BuildVolumeState::read(&mount).unwrap(), expected);
             for (path, (inode, written, bytes_written)) in state.paths.iter().zip(before) {
                 let at = checkout.join(path.checkout.as_path());
                 let metadata = fs::symlink_metadata(&at).unwrap();

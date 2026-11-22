@@ -181,6 +181,13 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// Replaces an adopted main (02_workspaces.md, "Re-adoption"), answering the replacement and
     /// what it kept of what it replaced.
     async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)>;
+    /// Bring `source`'s record of the Cargo targets mbx manages current before a clone of it
+    /// starts (16_build_volumes.md, "Fork" step 4): a host with build volumes refreshes the
+    /// source here, once, at the verb's own level, so the clone only reads the record.
+    async fn prepare_clone_source(&mut self, source: &WorkspaceName) -> Result<()> {
+        let _ = source;
+        Ok(())
+    }
     async fn resume_fork(
         &mut self,
         workspace: WorkspaceName,
@@ -204,12 +211,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
                 "choose a non-main workspace name",
             ));
         }
+        let source = source.unwrap_or_else(WorkspaceName::main);
+        self.prepare_clone_source(&source).await?;
         self.resume_fork(
             workspace,
-            crate::storage::recovery::MintOptions::fork(
-                Some(source.unwrap_or_else(WorkspaceName::main)),
-                options,
-            ),
+            crate::storage::recovery::MintOptions::fork(Some(source), options),
         )
         .await
     }
@@ -3108,6 +3114,10 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     held_bundles: Option<super::held_bundles::HeldBundles>,
     /// Where a background verb's run says what it does ([`RuntimeServices::notes`]).
     notes: super::verb_spans::VerbNotes,
+    /// The managed targets the last refresh's discovery found, for the clone this verb starts next
+    /// when no build volume records them: the checkout mount, the fingerprint discovered at, and
+    /// the targets (set by `refresh_build_state_for`, read by `clone_mbx_targets`).
+    clone_source_targets: Option<(PathBuf, String, Vec<crate::capabilities::RelPath>)>,
 }
 
 /// Who runs a workspace's supervisor.
@@ -4603,6 +4613,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             retirement_lease,
             held_bundles: None,
             notes,
+            clone_source_targets: None,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -7255,66 +7266,64 @@ self.finish_retire_intent(&workspace).await?;
         Ok(result)
     }
 
-    /// The Cargo targets mbx manages in the checkout `mount` of `source`, as the checkout's
-    /// build-state discovery recorded them at its current fingerprint: the inherited links a clone
-    /// of the checkout drops (16_build_volumes.md, "Fork" step 4). A record that does not name them
-    /// (none yet, or one written before it could) or names them at another fingerprint is brought
-    /// up to date once through the checkout's own refresh, whose refusal stands; one that still
-    /// does not name them refuses the clone rather than guess which links are inherited.
-    async fn recorded_mbx_targets(
-        &mut self,
-        source: &NativeWorkspace,
+    /// The Cargo targets mbx manages in the checkout `mount`, when its build volume records them at
+    /// the checkout's current fingerprint ([`crate::build_volume::BuildVolumeState::mbx_targets_at`]):
+    /// a read of the record alone, which no refresh or Cargo query precedes.
+    async fn current_mbx_targets(
+        &self,
         mount: &Path,
-    ) -> Result<Vec<crate::capabilities::RelPath>> {
-        let read = |volumes: super::build_volumes::BuildVolumes<H>, mount: PathBuf| async move {
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&mount)?;
-                Ok::<_, CowshedError>(
-                    volumes.state_of(&mount)?.and_then(|(_, state)| {
-                        state.mbx_targets_at(&fingerprint).map(<[_]>::to_vec)
-                    }),
-                )
-            })
-            .await
-            .map_err(|error| CowshedError::internal(format!("build state task failed: {error}")))?
-        };
-        if let Some(targets) = read(self.build_volumes()?, mount.to_owned()).await? {
-            return Ok(targets);
-        }
-        // The one discovery the refresh runs names them, whether or not a build volume records
-        // them: a checkout whose only build state is mbx's Cargo targets has none to hold the record.
-        let (_, discovered) = self
-            .refresh_build_state_discovering(source, mount, super::build_volumes::Lent::Nothing)
-            .await?;
-        match discovered {
-            Some(targets) => Ok(targets),
-            None => read(self.build_volumes()?, mount.to_owned())
-                .await?
-                .ok_or_else(|| {
-                    CowshedError::integrity(
-                        format!(
-                            "the build state of {} names no Cargo targets mbx manages at its \
-                             current inputs after its refresh, so a clone cannot tell which \
-                             inherited target links name its managed targets",
-                            mount.display()
-                        ),
-                        format!("cowshed doctor --json, then retry from {}", mount.display()),
-                    )
-                }),
-        }
+    ) -> Result<Option<Vec<crate::capabilities::RelPath>>> {
+        let (volumes, mount) = (self.build_volumes()?, mount.to_owned());
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let fingerprint = crate::capabilities::tracked_manifest_fingerprint(&mount)?;
+            Ok::<_, CowshedError>(
+                volumes
+                    .state_of(&mount)?
+                    .and_then(|(_, state)| state.mbx_targets_at(&fingerprint).map(<[_]>::to_vec)),
+            )
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("build state task failed: {error}")))?
     }
 
-    async fn refresh_build_state_for(
+    /// The Cargo targets mbx manages in a clone's source checkout `mount`, the inherited links the
+    /// clone drops (16_build_volumes.md, "Fork" step 4): the source's record when it is current,
+    /// else the answer this verb's [`ProjectRuntimeHost::prepare_clone_source`] kept for a source
+    /// with no build volume to record it, at the same mount and fingerprint. No refresh runs here,
+    /// so a replayed clone never re-enters recovery; one with neither refuses rather than guess.
+    async fn clone_mbx_targets(
         &mut self,
-        current: &NativeWorkspace,
         mount: &Path,
-        lent: super::build_volumes::Lent,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
-        Ok(self
-            .refresh_build_state_discovering(current, mount, lent)
-            .await?
-            .0)
+    ) -> Result<Vec<crate::capabilities::RelPath>> {
+        if let Some(targets) = self.current_mbx_targets(mount).await? {
+            return Ok(targets);
+        }
+        if let Some((at, fingerprint, targets)) = self.clone_source_targets.take() {
+            let checked = at.clone();
+            let current = crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::capabilities::tracked_manifest_fingerprint(&checked)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("build state task failed: {error}"))
+            })??;
+            if at == mount && current == fingerprint {
+                return Ok(targets);
+            }
+        }
+        Err(CowshedError::integrity(
+            format!(
+                "the build state of {} records no Cargo targets mbx manages at its current inputs, \
+                 so a clone of it cannot tell which inherited target links name its managed targets",
+                mount.display()
+            ),
+            format!(
+                "cowshed doctor --json, then retry; a refresh of {} records them",
+                mount.display()
+            ),
+        ))
     }
+
     /// Refresh `current`'s build state at its mounted checkout `mount`
     /// ([`ProjectRuntimeHost::refresh_build_state`]). Detection reads the same canonical context
     /// the supervisor's capability admission reads, and Cargo is asked as a job of the workspace
@@ -7325,15 +7334,12 @@ self.finish_retire_intent(&workspace).await?;
     /// fingerprint moved off the one the volume's state records; otherwise only displaced links
     /// are restored. A first touch takes the volume `lent` names when it fits rather than
     /// minting one of its own ([`super::build_volumes::Lent`]).
-    async fn refresh_build_state_discovering(
+    async fn refresh_build_state_for(
         &mut self,
         current: &NativeWorkspace,
         mount: &Path,
         lent: super::build_volumes::Lent,
-    ) -> Result<(
-        crate::build_volume::BuildStateRefresh,
-        Option<Vec<crate::capabilities::RelPath>>,
-    )> {
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
         use super::build_volumes::Discovered;
         let name = current.derived.workspace.name().clone();
         let volumes = self.build_volumes()?;
@@ -7414,14 +7420,20 @@ self.finish_retire_intent(&workspace).await?;
                 discovery.findings,
             )
         };
-        // What this refresh's discovery found mbx managing, for a clone taking it in memory: the
+        // What this discovery found mbx managing, kept for the clone this verb starts next: the
         // record a volume would hold, or the only answer for a checkout with no volume.
-        let discovered_targets = match &discovered {
-            Discovered::Changed { released, .. } => {
-                Some(released.iter().map(|path| path.checkout.clone()).collect())
-            }
-            Discovered::Unchanged => None,
-        };
+        if let Discovered::Changed {
+            released,
+            fingerprint,
+            ..
+        } = &discovered
+        {
+            self.clone_source_targets = Some((
+                mount.to_owned(),
+                fingerprint.clone(),
+                released.iter().map(|path| path.checkout.clone()).collect(),
+            ));
+        }
         let mut refresh = volumes
             .refresh(
                 super::build_volumes::Owner {
@@ -7459,7 +7471,7 @@ self.finish_retire_intent(&workspace).await?;
         for finding in &refresh.findings {
             cowshed_os::eprintln!("cowshed: {name}: {finding}");
         }
-        Ok((refresh, discovered_targets))
+        Ok(refresh)
     }
 
     /// Core owns gateway preparation after the decoded route and live workspace fences. A
@@ -14764,6 +14776,28 @@ mod rebase_recovery_tests {
 }
 #[async_trait]
 impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> {
+    async fn prepare_clone_source(&mut self, source: &WorkspaceName) -> Result<()> {
+        // A source that does not exist or is not mounted is left for the clone to refuse as it
+        // always has.
+        let Ok(current) = self.current(source).await else {
+            return Ok(());
+        };
+        let Ok(mount) = self.workspace_mount_path(source) else {
+            return Ok(());
+        };
+        if require_mounted_source(source, &current).is_err()
+            || self.current_mbx_targets(&mount).await?.is_some()
+        {
+            return Ok(());
+        }
+        Box::pin(self.refresh_build_state_for(
+            &current,
+            &mount,
+            super::build_volumes::Lent::Nothing,
+        ))
+        .await?;
+        Ok(())
+    }
     fn descriptor(&self) -> &ProjectDescriptor {
         &self.descriptor
     }
@@ -15067,7 +15101,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     if let Some(cache) =
                         crate::storage::bootstrap::native::provisioned_build_cache()
                     {
-                        timed_async(
+                        Box::pin(timed_async(
                             "adopt",
                             "mbx-targets",
                             crate::build_volume::managed_targets::drop_inherited_in(
@@ -15075,7 +15109,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 vec![crate::capabilities::RelPath::new("target")?],
                                 crate::build_volume::managed_targets::managed_root(&cache),
                             ),
-                        )
+                        ))
                         .await?;
                     }
                     let repository =
@@ -15241,8 +15275,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let source_mount = self.workspace_mount_path(&source_name)?;
             // The source's inherited managed-target links, from its recorded discovery: the clone
             // drops them at mint so its first build places its own (16_build_volumes.md, "Fork"
-            // step 4). Taken before the capture, so the record is the source checkout's own.
-            let mbx_targets = self.recorded_mbx_targets(&source, &source_mount).await?;
+            // step 4). Taken before the capture, so the record is the source checkout's own. A
+            // replayed fork reads the record its first attempt refreshed: recovery replays it while
+            // opening the project, and refreshing the source from there re-enters that recovery.
+            let mbx_targets = self.clone_mbx_targets(&source_mount).await?;
             let managed_root = crate::storage::bootstrap::native::provisioned_build_cache()
                 .map(|cache| crate::build_volume::managed_targets::managed_root(&cache));
             let repository_shape = if git_worktree {
@@ -15375,7 +15411,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         )
                         .await?;
                         if let Some(managed_root) = managed_root.clone() {
-                            timed_async(
+                            Box::pin(timed_async(
                                 "fork",
                                 "mbx-targets",
                                 crate::build_volume::managed_targets::drop_inherited_in(
@@ -15383,7 +15419,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     mbx_targets.clone(),
                                     managed_root,
                                 ),
-                            )
+                            ))
                             .await?;
                         }
                         timed_async(
@@ -15697,7 +15733,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 let (grants, reservation) = self.destination_grants(&destination, resuming).await?;
                 let source_mount = self.workspace_mount_path(&source)?;
                 // As a fork's: the source's recorded managed-target links, dropped at mint.
-                let mbx_targets = self.recorded_mbx_targets(&source_fact, &source_mount).await?;
+                let mbx_targets = self.clone_mbx_targets(&source_mount).await?;
                 let managed_root = crate::storage::bootstrap::native::provisioned_build_cache()
                     .map(|cache| crate::build_volume::managed_targets::managed_root(&cache));
                 let grants = if reservation.is_some() {
@@ -15811,11 +15847,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             )
                             .await?;
                             if let Some(managed_root) = managed_root.clone() {
-                                crate::build_volume::managed_targets::drop_inherited_in(
+                                Box::pin(crate::build_volume::managed_targets::drop_inherited_in(
                                     stage.mount_point.clone(),
                                     mbx_targets.clone(),
                                     managed_root,
-                                )
+                                ))
                                 .await?;
                             }
                             build_volumes
@@ -16002,6 +16038,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "choose a different destination name",
             ));
         }
+        self.prepare_clone_source(&source).await?;
         self.clone_for_rename(source, destination, ClonePurpose::Rename)
             .await
     }

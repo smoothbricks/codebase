@@ -492,13 +492,19 @@ impl BuildVolumeState {
     }
 
     /// The Cargo targets mbx manages, as recorded by a discovery at `fingerprint`: `None` when the
-    /// state was discovered at another fingerprint or never recorded them, so a refresh must
-    /// rediscover before anything relies on them.
+    /// state was discovered at another fingerprint, or by a discovery that resolved mbx and wrote no
+    /// targets (a record older than the field), so a refresh must rediscover before anything relies
+    /// on them. A discovery that resolved no mbx released nothing (discovery releases a Cargo
+    /// target only once it resolves mbx), so its record names none.
     pub fn mbx_targets_at(&self, fingerprint: &str) -> Option<&[crate::capabilities::RelPath]> {
         if self.fingerprint.as_deref() != Some(fingerprint) {
             return None;
         }
-        self.mbx_targets.as_deref()
+        match (&self.mbx_targets, &self.mbx) {
+            (Some(targets), _) => Some(targets),
+            (None, None) => Some(&[]),
+            (None, Some(_)) => None,
+        }
     }
     /// Resolve legacy seed metadata from current capability contributions, without changing paths or live bytes.
     pub fn with_seed_retention(&self, policies: &[BuildStatePath]) -> Self {
@@ -2768,6 +2774,15 @@ mod tests {
         let old = BuildVolumeState::read(&volume).unwrap();
         assert_eq!(old.mbx_targets, None);
         assert_eq!(old.mbx_targets_at("same"), None);
+        let without_mbx = BuildVolumeState {
+            mbx: None,
+            ..old.clone()
+        };
+        assert_eq!(
+            without_mbx.mbx_targets_at("same"),
+            Some([].as_slice()),
+            "a discovery that resolved no mbx released nothing"
+        );
 
         for targets in [
             vec![],
