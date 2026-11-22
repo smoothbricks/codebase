@@ -74,6 +74,7 @@ impl Fixture {
         // keeps ownership: a job's temporary directory lies in the store, whose volume ignores it,
         // and the helper refuses a mountpoint whose owner it cannot read as the caller's.
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let parent_name = parent.clone();
         let parent = crate::storage::host_config::canonical_mount_root(&home)
             .parent()
             .expect("the mount root has a parent")
@@ -83,16 +84,23 @@ impl Fixture {
         let store = directory.join("store");
         fs::create_dir_all(store.join(&owner).join("widget")).expect("the scratch store is new");
         let main = store.join(&owner).join("widget/main.dmg");
-        let datasets =
-            match ZfsPayloads::of_project(&store, &main, true, &directory.join("scratch"), None) {
-                Ok(Some(datasets)) if datasets.root().dataset().as_str() == root => datasets,
-                other => {
-                    let _ = fs::remove_dir_all(&directory);
-                    return skip(format!(
-                        "the root this user's adoption selects is not {root}: {other:?}"
-                    ));
-                }
-            };
+        // The parent is declared, as a project's `.cowshed.toml` declares it: a host may hold
+        // several roots that name this user.
+        let datasets = match ZfsPayloads::of_project(
+            &store,
+            &main,
+            true,
+            &directory.join("scratch"),
+            Some(&parent_name),
+        ) {
+            Ok(Some(datasets)) if datasets.root().dataset().as_str() == root => datasets,
+            other => {
+                let _ = fs::remove_dir_all(&directory);
+                return skip(format!(
+                    "the root this user's adoption selects is not {root}: {other:?}"
+                ));
+            }
+        };
         if let Err(error) = datasets.prove_helper() {
             let _ = fs::remove_dir_all(&directory);
             return skip(format!(
@@ -404,9 +412,10 @@ fn a_dataset_payloads_capacity_is_its_refquota_raised_in_place() {
 
 /// Setup's root decision over what [`super::root_evidence`] reads on a real pool
 /// (01b_zfs.md, "One pool, one root"): the root naming this user, as setup made it, is taken on
-/// macOS with its four com.apple properties and elsewhere by its owner; a root below a dataset
-/// that does not exist reads as absent, so the decision would create it, never as an error. Only
-/// reads: nothing changes and nothing asks for privilege.
+/// macOS with its four com.apple properties and elsewhere by its owner; a root that does not exist
+/// below a parent that does reads as absent, so the decision would create it, and one whose parent
+/// does not exist either reads as an orphan, which setup refuses before any dialog; neither is an
+/// error. Only reads: nothing changes and nothing asks for privilege.
 #[test]
 #[ignore = "explicit host check: real ZFS through the installed helper (specs/cowshed/08_testing.md, Real ZFS)"]
 fn setup_reads_and_takes_the_root_that_names_the_user() {
@@ -436,13 +445,20 @@ fn setup_reads_and_takes_the_root_that_names_the_user() {
         }]
     );
 
-    let absent = cowshed_helper::name::Root::parse(&format!(
+    // `<root>/projects` exists below the root setup made; nothing named `cowshed` is below it.
+    let absent =
+        cowshed_helper::name::Root::parse(&format!("{parent}/cowshed/projects/cowshed")).unwrap();
+    assert_eq!(
+        super::root_evidence(&absent, apple).unwrap(),
+        RootEvidence::Absent
+    );
+    let orphan = cowshed_helper::name::Root::parse(&format!(
         "{parent}/cowshed-itest-absent-{}/cowshed",
         std::process::id()
     ))
     .unwrap();
     assert_eq!(
-        super::root_evidence(&absent, apple).unwrap(),
-        RootEvidence::Absent
+        super::root_evidence(&orphan, apple).unwrap(),
+        RootEvidence::Orphan
     );
 }

@@ -235,8 +235,9 @@ fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageEr
 
 /// [`super::root_evidence`]: one `zfs get` of the root's owner and, when `apple`, its four
 /// com.apple properties. Only `zfs` saying the dataset does not exist reads as
-/// [`RootEvidence::Absent`](crate::storage::bootstrap::zfs_root::RootEvidence::Absent); every other
-/// failure is the read's error.
+/// [`RootEvidence::Absent`](crate::storage::bootstrap::zfs_root::RootEvidence::Absent), or as
+/// [`RootEvidence::Orphan`](crate::storage::bootstrap::zfs_root::RootEvidence::Orphan) when it
+/// says so of the root's parent too; every other failure is the read's error.
 pub(super) fn root_evidence(
     root: &Root,
     apple: bool,
@@ -260,8 +261,31 @@ pub(super) fn root_evidence(
             .map_err(|error| host(&described, error))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        return if stderr.contains("dataset does not exist") {
+        if !stderr.contains("dataset does not exist") {
+            return Err(host(
+                format_args!("{described} ended {}", output.status),
+                stderr.trim_end(),
+            ));
+        }
+        let parent = root
+            .dataset()
+            .as_str()
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        let mut command = Command::new("zfs");
+        command
+            .args(["list", "-H", "-o", "name", parent])
+            .env("PATH", cowshed_helper::host::TRUSTED_PATH)
+            .env("LC_ALL", "C");
+        let described = format!("{command:?}");
+        let output =
+            deadline::output_within("zfs read", &mut command, &deadline::start("zfs read", ZFS))
+                .map_err(|error| host(&described, error))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return if output.status.success() {
             Ok(RootEvidence::Absent)
+        } else if stderr.contains("dataset does not exist") {
+            Ok(RootEvidence::Orphan)
         } else {
             Err(host(
                 format_args!("{described} ended {}", output.status),
