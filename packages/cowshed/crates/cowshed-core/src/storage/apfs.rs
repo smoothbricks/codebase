@@ -696,6 +696,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// once the checkout itself is detached: a detached workspace holds none of its images
     /// (02_workspaces.md, "Attach and detach"). Its next mount mounts the volume again
     /// ([`Self::ensure_linked_build_volume`]).
+    /// Remove what project `repo`'s payloads leave of their own once every one is reclaimed, for
+    /// its unbinding: nothing for images or directories; a dataset project's containers
+    /// (01b_zfs.md, "One pool, one root"). Something still in them refuses, named, while the
+    /// project is bound, for the same removal to retry.
+    fn release_project_containers(&self, _repo: &RepoId) -> Result<(), ApfsStorageError> {
+        Ok(())
+    }
     fn detach_owned_build_volumes(
         &self,
         workspace: &LifecycleWorkspace,
@@ -1076,6 +1083,20 @@ fn held_by(holds: &[cowshed_os::process::Holder]) -> String {
     }
 }
 
+/// What the payload at `image` is, by its place in its project's store: `main.dmg` is main, an
+/// image under `sessions` a workspace, and every other one a build volume.
+fn payload_kind(image: &Path) -> &'static str {
+    if image.file_name() == Some(std::ffi::OsStr::new("main.dmg")) {
+        "main"
+    } else if image
+        .components()
+        .any(|part| part.as_os_str() == crate::repository::SESSIONS_DIRECTORY)
+    {
+        "workspace"
+    } else {
+        "build volume"
+    }
+}
 /// [`ApfsStorageError::BuildVolumeHeld`] said by what holds the volume: a job admitted on it
 /// (its hold file's holders), else the processes that have it open, else neither, visibly.
 fn build_volume_held(
@@ -1084,20 +1105,21 @@ fn build_volume_held(
     holds: &[cowshed_os::process::Holder],
     open: &[cowshed_os::process::Holder],
 ) -> String {
+    let kind = payload_kind(image);
     let image = image.display();
     match (holds.is_empty(), open.is_empty()) {
         (false, _) => format!(
-            "build volume {image} is held by a job admitted on it: {} is held by {}{}",
+            "{kind} {image} is held by a job admitted on it: {} is held by {}{}",
             hold.display(),
             crate::build_volume::nx::Holders(holds),
             open_in(open)
         ),
         (true, false) => format!(
-            "build volume {image} is in use: it is open in {}",
+            "{kind} {image} is in use: it is open in {}",
             crate::build_volume::nx::Holders(open)
         ),
         (true, true) => format!(
-            "build volume {image} is in use, but no process of this user holds {} or has the volume open",
+            "{kind} {image} is in use, but no process of this user holds {} or has the volume open",
             hold.display()
         ),
     }
@@ -3911,6 +3933,28 @@ mod tests {
             "end pid 64266 (cat /tmp/fifo) or wait for it to exit, then retry"
         );
         assert!(!hint.contains("repair"), "{hint}");
+        let main_open = ApfsStorageError::BuildVolumeHeld {
+            image: PathBuf::from("/store/acme/widget/main.dmg"),
+            hold: PathBuf::from("/store/acme/widget/main.dmg.hold"),
+            holds: Vec::new(),
+            open: vec![holder(64266, "cat /tmp/fifo")],
+        }
+        .to_string();
+        assert_eq!(
+            main_open,
+            "main /store/acme/widget/main.dmg is in use: it is open in pid 64266 (cat /tmp/fifo)"
+        );
+        let workspace_open = ApfsStorageError::BuildVolumeHeld {
+            image: PathBuf::from("/store/acme/widget/sessions/raven.dmg"),
+            hold: PathBuf::from("/store/acme/widget/sessions/raven.dmg.hold"),
+            holds: Vec::new(),
+            open: vec![holder(64266, "cat /tmp/fifo")],
+        }
+        .to_string();
+        assert!(
+            workspace_open.starts_with("workspace /store/acme/widget/sessions/raven.dmg is in use"),
+            "{workspace_open}"
+        );
     }
 
     fn identity() -> OperationIdentity {

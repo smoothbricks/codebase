@@ -196,8 +196,29 @@ pub fn zfs_installed() -> bool {
     zfs::zfs_installed()
 }
 
-/// The cowshed roots whose `cowshed:owner` names this user, as `zfs list` reads them, with no
-/// privilege; none on a host with no `zfs`.
+/// What setup's root decision refuses among the roots that name this user, with nothing named
+/// (01b_zfs.md, "One pool, one root"): each wrong root with why and the command that mends it.
+/// Doctor reports them; none on a host with no `zfs` or no such root. Only reads.
+pub fn refused_roots()
+-> Result<Vec<crate::storage::bootstrap::zfs_root::RootStep>, ApfsStorageError> {
+    use crate::storage::bootstrap::zfs_root::{RootStep, root_steps};
+    let serving = roots_naming_caller()?;
+    if serving.is_empty() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    let apple = cfg!(target_os = "macos");
+    Ok(root_steps(true, None, &serving, uid, apple, |root| {
+        zfs::root_evidence(root, apple)
+    })?
+    .into_iter()
+    .filter(|step| matches!(step, RootStep::Refuse { .. }))
+    .collect())
+}
+
+/// The cowshed roots whose `cowshed:owner` names this user, set on them locally, as `zfs get`
+/// reads them, with no privilege; none on a host with no `zfs`.
 pub fn roots_naming_caller() -> Result<Vec<cowshed_helper::name::Root>, ApfsStorageError> {
     if !zfs::zfs_installed() {
         return Ok(Vec::new());
@@ -2139,6 +2160,16 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         )
     }
 
+    /// A dataset project's containers go with it; a directory project has none.
+    fn release_project_containers(&self, repo: &RepoId) -> Result<(), ApfsStorageError> {
+        match &self.payloads {
+            Payloads::Datasets(datasets) => {
+                let main = layout(&self.config, repo)?.main_image()?;
+                datasets.destroy_project_containers(main.image())
+            }
+            Payloads::Directories => Ok(()),
+        }
+    }
     /// A directory build volume is a directory: nothing is attached to detach.
     fn detach_owned_build_volumes(&self, _: &LifecycleWorkspace) -> Result<(), ApfsStorageError> {
         Ok(())

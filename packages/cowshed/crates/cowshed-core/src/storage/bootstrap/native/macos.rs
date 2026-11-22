@@ -35,9 +35,10 @@ use super::shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
     PIN_FSTAB_ACTION, SystemBootstrapHost, UninstallFstabOutcome, UninstallReport,
-    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_native_bootstrap_plan,
-    existing_host_storage_error, platform_host_error, provision_volumes_action,
-    setup_execution_error, working_directory_declaration, write_marker_action,
+    UninstallServiceOutcome, VolumeOutcome, VolumeState, ZfsRootSetup,
+    execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
+    provision_volumes_action, setup_execution_error, working_directory_declaration,
+    write_marker_action,
 };
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
@@ -1752,15 +1753,18 @@ fn root_helper_action(
 /// Answers the roots it plans to create.
 fn add_zfs_root_actions(
     snapshot: &mut SetupSnapshot,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> Result<Vec<String>, NativeBootstrapError> {
     use crate::storage::bootstrap::zfs_root::{named_parent, root_steps};
+    let ZfsRootSetup::Setup { parent } = zfs_root else {
+        return Ok(Vec::new());
+    };
     if !crate::storage::directory::zfs_installed() {
         return Ok(Vec::new());
     }
     let declared = working_directory_declaration()?;
     let named = named_parent(
-        zfs_parent,
+        parent.as_deref(),
         declared
             .as_ref()
             .map(crate::storage::bootstrap::SubstrateConfig::parent),
@@ -2333,10 +2337,10 @@ async fn gather_setup_snapshot(
     home: &Path,
     host: Arc<dyn BootstrapHost>,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
     let home = home.to_owned();
-    let zfs_parent = zfs_parent.map(str::to_owned);
+    let zfs_root = zfs_root.clone();
     tokio::task::spawn_blocking(move || {
         let existing_fstab = read_fstab_text().map_err(NativeBootstrapError::Host)?;
         let mut source = SystemEvidenceSource {
@@ -2346,7 +2350,7 @@ async fn gather_setup_snapshot(
             prepare_setup_snapshot(&mut source, &home, &existing_fstab, caches_volume)?;
         add_mount_root_action(&mut snapshot)?;
         add_mount_service_action(&mut snapshot)?;
-        let created = add_zfs_root_actions(&mut snapshot, zfs_parent.as_deref())?;
+        let created = add_zfs_root_actions(&mut snapshot, &zfs_root)?;
         add_root_helper_action(&mut snapshot, &created)?;
         Ok(snapshot)
     })
@@ -2359,17 +2363,13 @@ async fn gather_setup_snapshot(
 pub async fn plan_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> crate::Result<HostSetupPlan> {
     {
-        let snapshot = gather_setup_snapshot(
-            home,
-            Arc::new(SystemBootstrapHost),
-            caches_volume,
-            zfs_parent,
-        )
-        .await
-        .map_err(existing_host_storage_error)?;
+        let snapshot =
+            gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume, zfs_root)
+                .await
+                .map_err(existing_host_storage_error)?;
         Ok(HostSetupPlan::new(
             host_setup_actions(&snapshot),
             snapshot.volumes.clone(),
@@ -2381,17 +2381,13 @@ pub async fn plan_host_setup(
 pub async fn execute_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> crate::Result<HostSetupReport> {
     {
-        let initial = gather_setup_snapshot(
-            home,
-            Arc::new(SystemBootstrapHost),
-            caches_volume,
-            zfs_parent,
-        )
-        .await
-        .map_err(existing_host_storage_error)?;
+        let initial =
+            gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume, zfs_root)
+                .await
+                .map_err(existing_host_storage_error)?;
         let authorized = setup_requires_authorization(&initial);
         let host: Arc<dyn BootstrapHost> = if authorized {
             let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
@@ -2433,30 +2429,26 @@ pub async fn execute_host_setup(
             });
         let fstab = if needs_post_evidence {
             // A retired volume is gone by now; the host is re-read as it stands.
-            let post = match gather_setup_snapshot(
-                home,
-                Arc::clone(&host),
-                CachesVolume::Keep,
-                zfs_parent,
-            )
-            .await
-            {
-                Ok(post) => post,
-                Err(error) => {
-                    let error = setup_execution_error(error, "cowshed setup");
-                    if let Some(last) = action_outcomes.last_mut() {
-                        last.outcome = HostActionResult::Failed {
-                            error: error.clone(),
-                        };
+            let post =
+                match gather_setup_snapshot(home, Arc::clone(&host), CachesVolume::Keep, zfs_root)
+                    .await
+                {
+                    Ok(post) => post,
+                    Err(error) => {
+                        let error = setup_execution_error(error, "cowshed setup");
+                        if let Some(last) = action_outcomes.last_mut() {
+                            last.outcome = HostActionResult::Failed {
+                                error: error.clone(),
+                            };
+                        }
+                        return Ok(HostSetupReport {
+                            action_outcomes,
+                            volumes: initial.volumes,
+                            fstab: FstabOutcome::Skipped(error.message.clone()),
+                            authorized,
+                        });
                     }
-                    return Ok(HostSetupReport {
-                        action_outcomes,
-                        volumes: initial.volumes,
-                        fstab: FstabOutcome::Skipped(error.message.clone()),
-                        authorized,
-                    });
-                }
-            };
+                };
             if post
                 .plan
                 .operations()

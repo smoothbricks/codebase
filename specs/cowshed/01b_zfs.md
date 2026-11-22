@@ -77,7 +77,12 @@ and only then renames it under a `.trash` container (`mountpoint=none`). `canmou
 dataset carries, so main, whose `mountpoint` is set locally to its checkout path and survives a rename, cannot remount
 there; `cowshed unadopt` retires main this way, into `ws/.trash`, before it swaps the retained tree back
 (02_workspaces.md, "Checkout layouts"). Collection sets `canmount=off` on any dataset it finds under a `.trash` without
-it before it decides anything else about that dataset.
+(02_workspaces.md, "Checkout layouts"). Collection sets `canmount=off` on any dataset it finds under a `.trash` without
+it before it decides anything else about that dataset. The project's unbinding, once every payload of it is reclaimed
+and while it is still bound, destroys its containers deepest first (`ws/.trash`, `ws`, `build/.trash`, `build`, then
+`<owner>/<repo>`) and the owner's container when no other project is left in it, so an unadopted project leaves no
+dataset; a dataset there that is no container, a payload or a snapshot, refuses the unbinding, named, and the same
+removal retries it.
 
 ## The datasets of a workspace
 

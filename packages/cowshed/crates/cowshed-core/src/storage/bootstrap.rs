@@ -20,7 +20,7 @@ pub mod zfs_root;
 pub use native::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
-    UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
+    UninstallServiceOutcome, VolumeOutcome, VolumeState, ZfsRootSetup, execute_host_setup,
     execute_host_uninstall, execute_mount_root_provisioning, plan_host_setup, plan_host_uninstall,
 };
 

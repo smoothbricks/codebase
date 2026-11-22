@@ -9963,6 +9963,10 @@ self.finish_retire_intent(&workspace).await?;
     async fn unbind_restored_project(&self) -> Result<()> {
         if self.project_is_bound().await? {
             self.release_build_volumes_for_unbinding().await?;
+            self.substrate
+                .host()
+                .release_project_containers(&self.descriptor.repo_id)
+                .map_err(native_integrity_error)?;
         }
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();

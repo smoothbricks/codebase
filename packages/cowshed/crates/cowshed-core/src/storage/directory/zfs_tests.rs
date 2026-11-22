@@ -462,3 +462,34 @@ fn setup_reads_and_takes_the_root_that_names_the_user() {
         RootEvidence::Orphan
     );
 }
+
+/// A project's unbinding takes its datasets with it (02_workspaces.md, "Checkout layouts"): while
+/// a payload stands, releasing the containers refuses, naming it; once each is reclaimed, the
+/// project's tree goes, and its owner's, which holds no other project.
+#[test]
+#[ignore = "explicit host check: real ZFS through the installed helper (specs/cowshed/08_testing.md, Real ZFS)"]
+fn an_unbound_dataset_project_leaves_no_dataset() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let (payloads, datasets) = (&fixture.payloads, fixture.datasets());
+    let main = fixture.image("main.dmg");
+    datasets.create(&main, None).unwrap();
+    let raven = fixture.image("sessions/raven.dmg");
+    datasets.create(&raven, None).unwrap();
+    let error = datasets.destroy_project_containers(&main).unwrap_err();
+    assert!(error.to_string().contains("/main"), "{error}");
+    assert!(error.to_string().contains("/ws/raven"), "{error}");
+
+    for (image, place) in [(&main, "checkout"), (&raven, "raven")] {
+        let place = fixture.place(place);
+        bind(payloads, image, &place).unwrap();
+        datasets
+            .destroy(&place)
+            .unwrap()
+            .expect("nothing depends on it");
+    }
+    datasets.destroy_project_containers(&main).unwrap();
+    let owner = format!("{}/projects/{}", datasets.root().dataset(), fixture.owner);
+    assert_eq!(zfs(&["list", "-H", "-o", "name", &owner]), None);
+}

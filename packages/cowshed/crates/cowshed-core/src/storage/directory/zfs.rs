@@ -87,6 +87,25 @@ fn helpers_in(
         })
 }
 
+/// Whether `name`, a dataset or snapshot listed below the project container `project`, is one of
+/// the project's containers: the project's own, `ws` and `build`, and the `.`-named ones inside
+/// those (`.trash`, `.deleting`), which no payload is named like ([`place_name`]: a workspace or
+/// build volume never starts with `.`). Snapshots and every payload are not.
+fn is_project_container(project: &str, name: &str) -> bool {
+    if name.contains('@') {
+        return false;
+    }
+    let Some(below) = name.strip_prefix(project) else {
+        return false;
+    };
+    match below.split('/').collect::<Vec<_>>().as_slice() {
+        [""] => true,
+        ["", "ws" | "build"] => true,
+        ["", "ws" | "build", inner] => inner.starts_with('.'),
+        _ => false,
+    }
+}
+
 /// The dataset name of the payload at `project_relative`, below its project's container: the
 /// payload's place in the store, with the store's `sessions` directory named `ws` and no image
 /// extension (01b_zfs.md, "One pool, one root"). `main.dmg` is `main`, `sessions/raven.dmg` is
@@ -337,12 +356,13 @@ pub(super) fn roots_serving_this_user() -> Result<(u32, Vec<Root>), ApfsStorageE
     let uid = unsafe { libc::getuid() };
     let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
     let listed = read_zfs(&[
-        "list",
+        "get",
         "-H",
-        "-o",
-        &format!("name,{property}"),
         "-t",
         "filesystem",
+        "-o",
+        "name,value,source",
+        property,
     ])?;
     Ok((uid, serving_roots(&listed, uid)))
 }
@@ -393,14 +413,19 @@ fn assigned_in<'a>(listed: &'a str, place: &str) -> Option<&'a str> {
         .find_map(|(name, mountpoint)| (mountpoint == place).then_some(name))
 }
 
-/// The cowshed roots in `listed` (`zfs list -H -o name,cowshed:owner`) that name `uid`.
+/// The cowshed roots in `listed` (`zfs get -H -o name,value,source cowshed:owner`) whose owner is
+/// set on them, locally, to `uid`: the property on the root itself is the whole authorization, and
+/// an inherited or received one names no root (09_substrates.md, "Privileged helper").
 fn serving_roots(listed: &str, uid: u32) -> Vec<Root> {
     let uid = uid.to_string();
     listed
         .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter(|(_, owner)| *owner == uid)
-        .filter_map(|(name, _)| Root::parse(name).ok())
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            Some((fields.next()?, fields.next()?, fields.next()?))
+        })
+        .filter(|(_, owner, source)| *owner == uid && *source == "local")
+        .filter_map(|(name, _, _)| Root::parse(name).ok())
         .collect()
 }
 
@@ -1025,6 +1050,43 @@ impl ZfsPayloads {
             .collect())
     }
 
+    /// Destroy the containers of the project whose main payload is `main`, once it is being
+    /// unbound and every payload of it is reclaimed: `ws`, `build` and the `.`-named containers in
+    /// them (`.trash`, `.deleting`), then the project's own, then its owner's when no other
+    /// project is left in it. Deepest first, each with a plain `destroy`, so ZFS itself refuses one
+    /// that still holds anything; a dataset or snapshot below the project that is no container
+    /// refuses before anything goes, named.
+    pub(super) fn destroy_project_containers(&self, main: &Path) -> Result<(), ApfsStorageError> {
+        let (containers, _) = self.placed(main)?;
+        let [.., owner, project] = containers.as_slice() else {
+            return Err(host("no project container above", main.display()));
+        };
+        if !self.exists(project) {
+            return Ok(());
+        }
+        let listed = self.zfs(&["list", "-H", "-r", "-t", "all", "-o", "name", project])?;
+        let mut names = listed.lines().collect::<Vec<_>>();
+        let payloads = names
+            .iter()
+            .filter(|name| !is_project_container(project, name))
+            .copied()
+            .collect::<Vec<_>>();
+        if !payloads.is_empty() {
+            return Err(host(
+                format_args!("{project} still holds what is no container"),
+                payloads.join(", "),
+            ));
+        }
+        names.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
+        for name in names {
+            self.helper(&["destroy", name])?;
+        }
+        let siblings = self.zfs(&["list", "-H", "-d", "1", "-o", "name", owner])?;
+        if siblings.lines().all(|name| name == owner) {
+            self.helper(&["destroy", owner])?;
+        }
+        Ok(())
+    }
     /// Destroy the payload mounted at `directory` and remove the directory: its dataset, the
     /// snapshots it holds and then its origin snapshot, clone before origin (09_substrates.md).
     /// A build dataset whose snapshot is another's origin first hands its lineage to that clone
@@ -1503,8 +1565,13 @@ mod tests {
         );
         assert_eq!(assigned_in(listed, "/Users/u"), None);
         assert_eq!(assigned_in(listed, "none"), Some("tank/cowshed"));
-        let owners = "tank/cowshed\t501\ntank/x/cowshed\t502\ntank/y/cowshed\t-\n\
-                      tank/cowshed/store\t501\ntank/z\t501\n";
+        // `zfs get -H -o name,value,source cowshed:owner`: only an owner set on the root itself
+        // makes it one; a dataset named `cowshed` that inherits its owner from a root above it is a
+        // dataset of that root, never a second root.
+        let owners = "tank/cowshed\t501\tlocal\ntank/x/cowshed\t502\tlocal\ntank/y/cowshed\t-\t-\n\
+                      tank/cowshed/store\t501\tinherited from tank/cowshed\ntank/z\t501\tlocal\n\
+                      tank/cowshed/projects/t/unowned/cowshed\t501\tinherited from tank/cowshed\n\
+                      tank/r/cowshed\t501\treceived\n";
         let names = |uid| {
             serving_roots(owners, uid)
                 .iter()
@@ -1581,6 +1648,44 @@ mod tests {
         }
     }
 
+    /// A project's unbinding destroys its containers and nothing else: no payload, retired or
+    /// not, and no snapshot.
+    #[test]
+    fn only_a_projects_containers_are_released_with_it() {
+        let project = "tank/cowshed/projects/acme/widget";
+        for container in [
+            "",
+            "/ws",
+            "/build",
+            "/ws/.trash",
+            "/build/.trash",
+            "/build/.deleting",
+        ] {
+            assert!(super::is_project_container(
+                project,
+                &format!("{project}{container}")
+            ));
+        }
+        for payload in [
+            "/main",
+            "/ws/raven",
+            "/build/0a1b",
+            "/ws/.trash/raven-1",
+            "/build/.trash/0a1b",
+            "/main@cowshed:fork-raven",
+            "/ws@x",
+            "-other",
+        ] {
+            assert!(!super::is_project_container(
+                project,
+                &format!("{project}{payload}")
+            ));
+        }
+        assert!(!super::is_project_container(
+            project,
+            "tank/cowshed/projects/acme"
+        ));
+    }
     #[test]
     fn a_dataset_is_named_for_its_payloads_place_in_the_project() {
         for (relative, expected) in [

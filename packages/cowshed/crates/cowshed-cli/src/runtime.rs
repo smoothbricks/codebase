@@ -42,7 +42,7 @@ use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IM
 use cowshed_core::storage::bootstrap::{
     BUILD_CACHE_MOUNTPOINT, CachesVolume, CanonicalRoots, HostAction, HostSetupPlan,
     HostSetupReport, RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage,
-    VolumeRole, VolumeState, execute_host_setup, plan_host_setup,
+    VolumeRole, VolumeState, ZfsRootSetup, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, RetiredLayoutRecord, retired_layout_paths,
@@ -4334,11 +4334,11 @@ impl NativeAdoptHostSetup {
 #[async_trait]
 impl AdoptHostSetup for NativeAdoptHostSetup {
     async fn plan(&mut self) -> Result<HostSetupPlan> {
-        plan_host_setup(&self.home, CachesVolume::Keep, None).await
+        plan_host_setup(&self.home, CachesVolume::Keep, &ZfsRootSetup::Leave).await
     }
 
     async fn execute(&mut self) -> Result<HostSetupReport> {
-        execute_host_setup(&self.home, CachesVolume::Keep, None).await
+        execute_host_setup(&self.home, CachesVolume::Keep, &ZfsRootSetup::Leave).await
     }
 }
 
@@ -5057,7 +5057,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     let roots = CanonicalRoots::global();
     let plan = probe("host-storage", async {
         waits_on(format_args!("host-storage"), platform::HOST_STORAGE_PARTIES);
-        plan_host_setup(&home, CachesVolume::Keep, None).await
+        plan_host_setup(&home, CachesVolume::Keep, &ZfsRootSetup::Leave).await
     })
     .await;
     let mut findings = match plan {
@@ -5070,6 +5070,34 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             path: None,
         }],
     };
+    findings.extend(
+        probe_value("zfs-root", async {
+            use cowshed_core::storage::bootstrap::zfs_root::RootStep;
+            match cowshed_core::storage::directory::refused_roots() {
+                Ok(refused) => refused
+                    .into_iter()
+                    .filter_map(|step| match step {
+                        RootStep::Refuse { root, why, remedy } => Some(Finding {
+                            code: "zfs-root".into(),
+                            severity: FindingSeverity::Error,
+                            message: format!("{root}: {why}"),
+                            hint: format!("{remedy} && cowshed setup"),
+                            path: None,
+                        }),
+                        _ => None,
+                    })
+                    .collect(),
+                Err(error) => vec![Finding {
+                    code: "zfs-root".into(),
+                    severity: FindingSeverity::Error,
+                    message: format!("cannot read the ZFS roots that name this user: {error}"),
+                    hint: "cowshed doctor".into(),
+                    path: None,
+                }],
+            }
+        })
+        .await,
+    );
     findings.extend(probe_value("caches-volume", async { caches_volume_finding() }).await);
     findings.extend(probe_value("mbx", mbx_findings(&home)).await);
     let gateway = probe("gateway-status", async {

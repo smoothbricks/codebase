@@ -56,6 +56,24 @@ impl HostSetupPlan {
         }
     }
 }
+/// Whether a host-storage pass sets up the ZFS root (01b_zfs.md, "One pool, one root"). Only
+/// `cowshed setup` does, from the parent its command line names, if any; the passes adopt and
+/// doctor run leave every root as it is, so no root a test or another user left decides them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ZfsRootSetup {
+    Leave,
+    Setup { parent: Option<String> },
+}
+
+impl ZfsRootSetup {
+    /// The parent the command line names, when this pass sets the root up.
+    pub fn parent(&self) -> Option<&str> {
+        match self {
+            Self::Leave => None,
+            Self::Setup { parent } => parent.as_deref(),
+        }
+    }
+}
 
 /// Whether a setup run deletes the retired caches volume (03_caches.md, "Retiring the caches
 /// volume", step 4). Only `cowshed setup --retire-caches-volume` asks: a plain setup keeps an

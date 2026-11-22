@@ -35,7 +35,7 @@ use super::shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
     SystemBootstrapHost, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeState,
-    declared_substrate, execute_native_bootstrap_plan, existing_host_storage_error,
+    ZfsRootSetup, declared_substrate, execute_native_bootstrap_plan, existing_host_storage_error,
     platform_host_error, provision_volumes_action, setup_execution_error,
     working_directory_declaration, write_marker_action,
 };
@@ -1954,10 +1954,10 @@ pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<Valida
 async fn gather_setup(
     home: &Path,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> Result<Setup, NativeBootstrapError> {
     let home = home.to_owned();
-    let zfs_parent = zfs_parent.map(str::to_owned);
+    let zfs_parent = zfs_root.parent().map(str::to_owned);
     blocking(move || {
         let declared = working_directory_declaration()?;
         let named = crate::storage::bootstrap::zfs_root::named_parent(
@@ -1978,9 +1978,9 @@ async fn gather_setup(
 pub async fn plan_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> crate::Result<HostSetupPlan> {
-    let setup = gather_setup(home, caches_volume, zfs_parent)
+    let setup = gather_setup(home, caches_volume, zfs_root)
         .await
         .map_err(existing_host_storage_error)?;
     Ok(HostSetupPlan::new(
@@ -2039,9 +2039,9 @@ async fn execute_step(
 pub async fn execute_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
-    zfs_parent: Option<&str>,
+    zfs_root: &ZfsRootSetup,
 ) -> crate::Result<HostSetupReport> {
-    let setup = gather_setup(home, caches_volume, zfs_parent)
+    let setup = gather_setup(home, caches_volume, zfs_root)
         .await
         .map_err(existing_host_storage_error)?;
     let authorized = setup.requires_authorization;
