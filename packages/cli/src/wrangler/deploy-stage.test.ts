@@ -79,6 +79,8 @@ class FakeRunner implements ProcessRunner {
    * This is the whole point of the fake: Cloudflare accepts the shift before it serves it.
    */
   propagationPolls = 0;
+  /** Stderr for each coming `deploy` to fail with, in order, before deploys succeed again. */
+  deployFailures: string[] = [];
 
   private pendingVersionId: string | null = null;
 
@@ -138,6 +140,8 @@ class FakeRunner implements ProcessRunner {
       if (existing) this.shiftTrafficTo(existing);
     }
     if (args[0] === 'deploy') {
+      const failure = this.deployFailures.shift();
+      if (failure !== undefined) return { exitCode: 1, stdout: '', stderr: failure };
       const tagIndex = args.indexOf('--tag');
       if (tagIndex >= 0) {
         const versionId = `uploaded-${args[tagIndex + 1]}`;
@@ -2017,6 +2021,49 @@ describe('deployStage with a JSONC source config', () => {
     // The committed source is never rewritten, and the derived copy does not outlive the deploy.
     expect(await readFile(join(root, 'wrangler.jsonc'), 'utf8')).toBe(JSONC_FIXTURE);
     expect((await readdir(root)).filter((name) => name.startsWith('.wrangler.smoo-'))).toEqual([]);
+  });
+
+  const WORKER_MISSING = 'This Worker does not exist on your account. [code: 10007]';
+
+  it('retries a 10007 on the first deploy of a pull-request Worker this run creates', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner();
+    runner.deployFailures = [WORKER_MISSING];
+    const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    const result = await deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare));
+
+    expect(result).toMatchObject({ workerName: 'fixture-worker-pr123', action: 'deployed' });
+    expect(runner.calls.filter((call) => call.args[0] === 'deploy')).toHaveLength(2);
+  });
+
+  it('gives up after three tries when a created pull-request Worker stays missing', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner();
+    runner.deployFailures = [WORKER_MISSING, WORKER_MISSING, WORKER_MISSING, WORKER_MISSING];
+    const cloudflare = new FakeCloudflare();
+    cloudflare.scripts = [];
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    await expect(
+      deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare)),
+    ).rejects.toThrow(/^wrangler deploy .* failed with exit code 1$/);
+    expect(runner.calls.filter((call) => call.args[0] === 'deploy')).toHaveLength(3);
+  });
+
+  it('never retries a 10007 for a Worker that already existed, which is really missing', async () => {
+    const root = await fixtureRoot(JSONC_FIXTURE, 'wrangler.jsonc');
+    const runner = new FakeRunner();
+    runner.deployFailures = [WORKER_MISSING];
+    const cloudflare = new FakeCloudflare();
+    cloudflare.zones = [{ id: 'zone-1', name: 'example.test' }];
+
+    await expect(
+      deployStage(root, { stage: 'pr123', repositoryRoot: root }, dependencies(runner, cloudflare)),
+    ).rejects.toThrow(/failed with exit code 1/);
+    expect(runner.calls.filter((call) => call.args[0] === 'deploy')).toHaveLength(1);
   });
 
   it('refuses a project carrying two source configs before it reads either', async () => {
