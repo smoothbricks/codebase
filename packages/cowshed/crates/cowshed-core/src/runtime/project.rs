@@ -181,11 +181,16 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// Replaces an adopted main (02_workspaces.md, "Re-adoption"), answering the replacement and
     /// what it kept of what it replaced.
     async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)>;
-    /// Bring `source`'s record of the Cargo targets mbx manages current before a clone of it
-    /// starts (16_build_volumes.md, "Fork" step 4): a host with build volumes refreshes the
-    /// source here, once, at the verb's own level, so the clone only reads the record.
-    async fn prepare_clone_source(&mut self, source: &WorkspaceName) -> Result<()> {
-        let _ = source;
+    /// Bring `source`'s record of the Cargo targets mbx manages current before a clone of it to
+    /// `destination` starts (16_build_volumes.md, "Fork" step 4): a host with build volumes
+    /// refreshes the source here, once, at the verb's own level, so the clone only reads the
+    /// record. A clone resumed under its unfinished intent refreshes nothing.
+    async fn prepare_clone_source(
+        &mut self,
+        source: &WorkspaceName,
+        destination: &WorkspaceName,
+    ) -> Result<()> {
+        let _ = (source, destination);
         Ok(())
     }
     async fn resume_fork(
@@ -212,7 +217,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
             ));
         }
         let source = source.unwrap_or_else(WorkspaceName::main);
-        self.prepare_clone_source(&source).await?;
+        self.prepare_clone_source(&source, &workspace).await?;
         self.resume_fork(
             workspace,
             crate::storage::recovery::MintOptions::fork(Some(source), options),
@@ -7288,9 +7293,11 @@ self.finish_retire_intent(&workspace).await?;
 
     /// The Cargo targets mbx manages in a clone's source checkout `mount`, the inherited links the
     /// clone drops (16_build_volumes.md, "Fork" step 4): the source's record when it is current,
-    /// else the answer this verb's [`ProjectRuntimeHost::prepare_clone_source`] kept for a source
-    /// with no build volume to record it, at the same mount and fingerprint. No refresh runs here,
-    /// so a replayed clone never re-enters recovery; one with neither refuses rather than guess.
+    /// else the answer the source's last refresh discovered for a checkout with no build volume to
+    /// record it, at the same mount and fingerprint. No refresh runs here, so a replayed clone
+    /// never re-enters recovery. With neither (a replay whose source was never refreshed since the
+    /// record existed), only the root target link is a candidate, as before the record: the gap is
+    /// said, and every candidate still goes only if it names a managed target.
     async fn clone_mbx_targets(
         &mut self,
         mount: &Path,
@@ -7311,17 +7318,12 @@ self.finish_retire_intent(&workspace).await?;
                 return Ok(targets);
             }
         }
-        Err(CowshedError::integrity(
-            format!(
-                "the build state of {} records no Cargo targets mbx manages at its current inputs, \
-                 so a clone of it cannot tell which inherited target links name its managed targets",
-                mount.display()
-            ),
-            format!(
-                "cowshed doctor --json, then retry; a refresh of {} records them",
-                mount.display()
-            ),
-        ))
+        cowshed_os::eprintln!(
+            "cowshed: {} records no Cargo targets mbx manages at its current inputs; this clone drops \
+             only an inherited root target link that names a managed target, and nested ones stay",
+            mount.display()
+        );
+        Ok(vec![crate::capabilities::RelPath::new("target")?])
     }
 
     /// Refresh `current`'s build state at its mounted checkout `mount`
@@ -14776,7 +14778,20 @@ mod rebase_recovery_tests {
 }
 #[async_trait]
 impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> {
-    async fn prepare_clone_source(&mut self, source: &WorkspaceName) -> Result<()> {
+    async fn prepare_clone_source(
+        &mut self,
+        source: &WorkspaceName,
+        destination: &WorkspaceName,
+    ) -> Result<()> {
+        // A clone resumed under its unfinished intent reads what its first attempt left: a
+        // rename's source refuses its own refresh, and recovery must not re-enter itself.
+        if self
+            .lifecycle_intents
+            .get(destination)
+            .is_some_and(|record| record.completion.is_none())
+        {
+            return Ok(());
+        }
         // A source that does not exist or is not mounted is left for the clone to refuse as it
         // always has.
         let Ok(current) = self.current(source).await else {
@@ -16038,7 +16053,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "choose a different destination name",
             ));
         }
-        self.prepare_clone_source(&source).await?;
+        self.prepare_clone_source(&source, &destination).await?;
         self.clone_for_rename(source, destination, ClonePurpose::Rename)
             .await
     }
