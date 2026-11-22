@@ -344,18 +344,23 @@ there, and a later removal of that checkout is what would lose them; unadopt say
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
 main's images — the only other record naming it — are retired and then reclaimed.
 <a id="smoo/cowshed!n/project-root-lookup"></a>An unadopt interrupted after retiring main is finished by the same
-command from the checkout: the project root lookup matches that record when no main image exists, which is what reaches
-a checkout with no remote. The finishing run reports no abandoned work; the bundle the interrupted run wrote stays where
-it was reported. Unbinding first releases every build volume the project still has: with main retired nothing links one,
-so main's linked volume and its seed go with whatever an earlier collection left (16_build_volumes.md, "Garbage
-collection"), and a volume that stays (a job holds it, its release failed) refuses the unbinding while the project is
-still bound, naming it and why, for the same command to retry. A release only commits, and the unbinding is the
-project's last act, its store tree going with it. Unbinding then discards terminal storage (`.staging/`, `sessions/`,
-`tmp/` and `build/`, and the project root's own `main.dmg.lock` and `lifecycle-intents.json.lock`) by the store
-inventory (`storage/store_inventory.rs`), the one declaration of every entry cowshed writes there and what it is.
-Cowshed's derived state, all of which cowshed regenerates, is discarded: locks, leases and holds, sidecars and keys,
-workspaces' temp dirs, the seed compaction's lock and working images, staged and retired images, publication temps a
-crash cut, and the residue of an abandon bundle's write. Each image among it is moved, not freed: into
+command for the checkout, run from outside it or with `--project`: the project root lookup matches that record when no
+main image exists, which is what reaches a checkout with no remote. The finishing run reports no abandoned work; the
+bundle the interrupted run wrote stays where it was reported. <a id="smoo/cowshed!n/unadopt-for-the-checkout"></a>Every
+unadopt runs for the checkout that way: a shell standing inside it holds main's mount ("Holders cowshed does not run"),
+so unadopt, which moves its own working directory off main's mount to the retained tree, takes that census before it
+retires anything and refuses, changing nothing, while another process holds main; when the holder is the shell that
+invoked it, the hint says so: `your shell is inside <checkout>; cd .. and rerun cowshed unadopt --project <checkout>`.
+Unbinding first releases every build volume the project still has: with main retired nothing links one, so main's linked
+volume and its seed go with whatever an earlier collection left (16_build_volumes.md, "Garbage collection"), and a
+volume that stays (a job holds it, its release failed) refuses the unbinding while the project is still bound, naming it
+and why, for the same command to retry. A release only commits, and the unbinding is the project's last act, its store
+tree going with it. Unbinding then discards terminal storage (`.staging/`, `sessions/`, `tmp/` and `build/`, and the
+project root's own `main.dmg.lock` and `lifecycle-intents.json.lock`) by the store inventory
+(`storage/store_inventory.rs`), the one declaration of every entry cowshed writes there and what it is. Cowshed's
+derived state, all of which cowshed regenerates, is discarded: locks, leases and holds, sidecars and keys, workspaces'
+temp dirs, the seed compaction's lock and working images, staged and retired images, publication temps a crash cut, and
+the residue of an abandon bundle's write. Each image among it is moved, not freed: into
 `<store>/.deleting/<fresh id>.dmg`, with a nudge to the gateway for each one (05_gateway.md, "Deleting released
 images"), released images from `build/.deleting` and `sessions/.deleting` included, and a cut in progress moves with its
 entry, held open by the cleanup. User work, the only copy of something (a session workspace whose removal kept it, an

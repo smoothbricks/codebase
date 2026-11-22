@@ -83,6 +83,28 @@ impl MountHeld {
             ),
         )
     }
+
+    /// [`Self::refusal`] of `cowshed unadopt` for the project checked out at `checkout`, main's
+    /// mount. A holder among `invokers` (this process's ancestors, [`invokers`]) by its working
+    /// directory is the shell unadopt was run from inside the checkout: the hint tells it to step
+    /// out and name the checkout instead (02_workspaces.md, "Checkout layouts").
+    pub(crate) fn unadopt_refusal(&self, checkout: &Path, invokers: &[i32]) -> CowshedError {
+        let refusal = self.refusal(&WorkspaceName::main());
+        let shell = self.holders.iter().any(|held| {
+            invokers.contains(&held.holder.pid)
+                && matches!(held.hold, nx::Hold::WorkingDirectory(_))
+        });
+        if !shell {
+            return refusal;
+        }
+        CowshedError::conflict(
+            refusal.message,
+            format!(
+                "your shell is inside {0}; cd .. and rerun `cowshed unadopt --project {0}`",
+                checkout.display()
+            ),
+        )
+    }
 }
 
 /// The holders of `mount` that `accounted` does not cover, or `None` when only cowshed's own
@@ -108,6 +130,27 @@ pub(crate) fn unaccounted(
         mount: mount.to_owned(),
         holders,
     }))
+}
+
+/// This process's ancestors, nearest first, by the parents the kernel records: the shell a verb
+/// was run from, and whatever ran that shell. A parent the kernel will not describe to this user
+/// ends the list, so it is not shown to be an invoker. Bounded as [`descends_from`] is.
+pub(crate) fn invokers() -> Vec<i32> {
+    let mut ancestors = Vec::new();
+    let mut current = std::process::id().cast_signed();
+    for _ in 0..ANCESTRY_BOUND {
+        let Ok(Some(record)) = job_groups::process_record(current) else {
+            break;
+        };
+        match i32::try_from(record.ppid) {
+            Ok(parent) if parent > 1 && parent != current => {
+                ancestors.push(parent);
+                current = parent;
+            }
+            _ => break,
+        }
+    }
+    ancestors
 }
 
 /// Whether `pid` is one of `roots` or descends from one, by the parents the kernel records. A
@@ -342,4 +385,45 @@ mod tests {
             refusal.hint
         );
     }
+
+    //#region smoo/cowshed!n/unadopt-for-the-checkout
+    /// `cowshed unadopt` run from a shell standing in the checkout: that shell, one of this
+    /// process's invokers, holds main by its working directory, and the hint tells it to step out
+    /// and name the checkout. Any other holder keeps the plain refusal.
+    #[test]
+    fn an_unadopt_held_by_its_own_shell_says_cd_out_and_name_the_checkout() {
+        let checkout = PathBuf::from("/src/raven");
+        let held = |pid| MountHeld {
+            mount: checkout.clone(),
+            holders: vec![TreeHold {
+                holder: cowshed_os::process::Holder {
+                    pid,
+                    command: "-zsh".into(),
+                },
+                hold: nx::Hold::WorkingDirectory(checkout.clone()),
+            }],
+        };
+        let invokers = [4242, 4000];
+
+        let shell = held(4242).unadopt_refusal(&checkout, &invokers);
+        assert_eq!(shell.code, crate::error::ErrorCode::Conflict);
+        assert!(
+            shell.message.starts_with(
+                "main is in use: /src/raven is held by 1 process cowshed does not run: \
+                 pid 4242 (-zsh), working directory /src/raven"
+            ),
+            "{}",
+            shell.message
+        );
+        assert_eq!(
+            shell.hint,
+            "your shell is inside /src/raven; cd .. and rerun `cowshed unadopt --project /src/raven`"
+        );
+        let stranger = held(4343);
+        assert_eq!(
+            stranger.unadopt_refusal(&checkout, &invokers).hint,
+            stranger.refusal(&WorkspaceName::main()).hint
+        );
+    }
+    //#endregion smoo/cowshed!n/unadopt-for-the-checkout
 }

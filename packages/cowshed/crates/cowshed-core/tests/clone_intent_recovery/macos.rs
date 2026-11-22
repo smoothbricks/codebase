@@ -929,6 +929,72 @@ async fn unadopt_run_from_the_checkout_leaves_main_first() {
     runtime.shutdown().await.expect("stop runtime");
 }
 //#endregion smoo/cowshed!n/a-verb-leaves-the-mount
+
+//#region smoo/cowshed!n/unadopt-for-the-checkout
+/// `cowshed unadopt` runs for the checkout, from outside it or with `--project`: a process standing
+/// inside the checkout, such as the shell it was invoked from, holds main's mount, so unadopt
+/// refuses naming it before it changes anything. No session is retired and main stays bound
+/// (02_workspaces.md, "Checkout layouts").
+#[tokio::test]
+async fn unadopt_refuses_before_any_change_while_a_process_stands_in_the_checkout() {
+    let fixture = Fixture::new("unadopt-held");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "kept", ForkOptions::default())
+        .await
+        .expect("mint kept");
+    // The adopting runtime serves main's supervisor in this process, and the census exempts that
+    // supervisor's process tree, the holder below included. `cowshed unadopt` opens a runtime of
+    // its own, serving nothing.
+    runtime.shutdown().await.expect("stop the adopting runtime");
+    let runtime = fixture
+        .open_removing("main")
+        .await
+        .expect("open the project as unadopt does");
+    // A host shell sitting in the checkout.
+    let mut shell = Command::new("sleep")
+        .arg("600")
+        .current_dir(&fixture.checkout)
+        .spawn_locked()
+        .expect("hold main's mount");
+
+    let refusal = fixture
+        .call(
+            &runtime,
+            "coordinator.removeProject",
+            json!({ "repoId": fixture.repo, "options": RemoveProjectOptions::default() }),
+        )
+        .await
+        .expect_err("a process in the checkout refuses the unadopt");
+    shell.kill().expect("release main");
+    shell.wait_bounded().expect("reap the holder");
+
+    assert_eq!(
+        refusal.code,
+        cowshed_core::ErrorCode::Conflict,
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.message.starts_with("main is in use")
+            && refusal.message.contains(&format!("pid {}", shell.id())),
+        "the refusal names the holder of main: {refusal:?}"
+    );
+    let listing = fixture
+        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
+        .await
+        .expect("the project is still listed");
+    let mut rows = listing["workspaces"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|view| view["info"]["workspace"].as_str().expect("row name"))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(rows, ["kept", "main"], "nothing was retired: {listing}");
+    assert!(fixture.layout().project().repository_binding.exists());
+    runtime.shutdown().await.expect("stop runtime");
+}
+//#endregion smoo/cowshed!n/unadopt-for-the-checkout
 /// The directory store of the fixture whose scratch root is `scratch`: its `store` directory.
 fn fixture_storage(namespace: TestNamespace, scratch: &Path) -> ValidatedHostStorage {
     ValidatedHostStorage::new(

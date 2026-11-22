@@ -308,9 +308,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>>;
     /// Move this process's working directory off main's mount, when it stands there, to the
     /// retained `<root>.pre-cowshed` tree, which the restore's swap carries back to the checkout
-    /// path: `unadopt` run from the checkout is no hold of the main it retires (02_workspaces.md,
-    /// "Holders cowshed does not run").
-    async fn leave_main(&mut self) -> Result<()>;
+    /// path, then refuse while a process cowshed does not run still holds main: `unadopt` runs for
+    /// the checkout, from outside it or with `--project`, and asks before it changes anything
+    /// (02_workspaces.md, "Checkout layouts", "Holders cowshed does not run").
+    async fn require_main_unheld(&mut self) -> Result<()>;
     async fn grant(
         &mut self,
         workspace: WorkspaceName,
@@ -2851,7 +2852,7 @@ async fn remove_project(
             .into_iter()
             .filter(|workspace| !workspace.is_main()),
     );
-    host.leave_main().await?;
+    host.require_main_unheld().await?;
     let session_removal = RetireOptions::unadopting_session(options.force, options.abandon);
     let mut removed = Vec::with_capacity(sessions.len());
     for workspace in sessions {
@@ -17192,7 +17193,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .collect())
     }
 
-    async fn leave_main(&mut self) -> Result<()> {
+    async fn require_main_unheld(&mut self) -> Result<()> {
         let main = WorkspaceName::main();
         let mounted = match self.current(&main).await {
             Ok(current) => matches!(
@@ -17206,11 +17207,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if !mounted {
             return Ok(());
         }
-        let checkout = &self.descriptor.git_root;
-        let retained = pre_cowshed_path(checkout)?;
-        leave_mount_to(checkout, "main's mount", "the retained checkout", || {
+        let checkout = self.descriptor.git_root.clone();
+        let retained = pre_cowshed_path(&checkout)?;
+        leave_mount_to(&checkout, "main's mount", "the retained checkout", || {
             Ok(retained)
-        })
+        })?;
+        // As every retiring verb asks (`require_mount_unheld_before_stop`): the keeper's starts
+        // stopped first, the serving supervisor exempt.
+        self.stop_nx_keeper(&main).await?;
+        let supervisor = self.serving_supervisor(&main).await?;
+        match self.mount_held(&main, &checkout, supervisor).await? {
+            Some(held) => Err(held.unadopt_refusal(&checkout, &super::mount_activity::invokers())),
+            None => Ok(()),
+        }
     }
     /// The purge's last word on the trash: the abandon bundles are the only copy of their commits,
     /// and the purge's `--abandon` authorizes deleting them (01_storage.md, "Retention").
