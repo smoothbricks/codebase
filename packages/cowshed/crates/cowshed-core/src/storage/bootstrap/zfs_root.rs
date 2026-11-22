@@ -31,7 +31,8 @@ pub struct Read {
     pub source: String,
 }
 
-/// What `zfs get` reads of a root: no such dataset, or its `cowshed:owner` and its com.apple
+/// What `zfs get` reads of a root: no such dataset beneath an existing parent, no such dataset
+/// and no parent either (an orphan: `zfs create` beneath it could only fail), or its `cowshed:owner` and its com.apple
 /// properties in [`ROOT_APPLE_PROPERTIES`] order, each `None` when it is not set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[expect(
@@ -40,6 +41,7 @@ pub struct Read {
 )]
 pub enum RootEvidence {
     Absent,
+    Orphan,
     Present {
         owner: Option<Read>,
         apple: [Option<Read>; 4],
@@ -64,7 +66,8 @@ pub enum RootStep {
     Take { root: String },
     /// The root is wrong: `why` names each wrong property, and `remedy` is the exact admin command
     /// that makes it right, `zfs set <p>=<v> … <root>` setting only the wrong ones. A serving root
-    /// `zfs get` no longer finds is refused too, never created, with the command that creates it.
+    /// `zfs get` no longer finds is refused too, never created, with the command that creates it,
+    /// and so is a root whose parent does not exist, with the one command that makes that parent.
     Refuse {
         root: String,
         why: String,
@@ -139,6 +142,7 @@ pub fn root_steps<E>(
     if let Some(root) = named {
         return Ok(vec![match evidence(root)? {
             RootEvidence::Absent => creation(root, uid, apple),
+            RootEvidence::Orphan => orphan(root),
             RootEvidence::Present { owner, apple: read } => judge(root, uid, apple, owner, read),
         }]);
     }
@@ -150,6 +154,7 @@ pub fn root_steps<E>(
         .map(|root| {
             Ok(match evidence(root)? {
                 RootEvidence::Absent => gone(root, uid, apple),
+                RootEvidence::Orphan => orphan(root),
                 RootEvidence::Present { owner, apple: read } => {
                     judge(root, uid, apple, owner, read)
                 }
@@ -200,6 +205,32 @@ fn creation(root: &Root, uid: u32, apple: bool) -> RootStep {
 }
 
 /// A root the caller's `cowshed:owner` placed among the serving roots, gone when `zfs get` read it.
+/// A root whose parent does not exist: `zfs create` beneath it could only fail, after the
+/// administrator's authorization was spent on it. It is refused with the one command that makes
+/// that parent, the operator's to run: the operator owns the pool, and only the named parent is
+/// touched (01b_zfs.md, "One pool, one root"), so never `zfs create -p`.
+fn orphan(root: &Root) -> RootStep {
+    let name = root.dataset().as_str();
+    let (parent, _) = name
+        .rsplit_once('/')
+        .expect("a root is named <parent>/cowshed");
+    let (why, remedy) = if parent.contains('/') {
+        (
+            format!("the parent {parent} of {name} does not exist"),
+            format!("{ZFS} create -o mountpoint=none {parent}"),
+        )
+    } else {
+        (
+            format!("the pool {parent} is not imported or does not exist"),
+            format!("zpool import {parent}"),
+        )
+    };
+    RootStep::Refuse {
+        root: name.to_owned(),
+        why,
+        remedy,
+    }
+}
 fn gone(root: &Root, uid: u32, apple: bool) -> RootStep {
     let create = create_command(&creation(root, uid, apple))
         .expect("a creation is a Create")

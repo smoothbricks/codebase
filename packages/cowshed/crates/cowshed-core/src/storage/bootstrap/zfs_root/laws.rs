@@ -21,7 +21,7 @@ use crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
 #[rustfmt::skip]
 mod model;
 
-use model::{Ev, List, Named, Owner, Parent, R, Step, Wrong};
+use model::{Ev, Fix, List, Named, Owner, Parent, R, Step, Wrong};
 
 fn items<T: Clone>(list: &Rc<List<T>>) -> Vec<T> {
     match &**list {
@@ -104,6 +104,7 @@ fn apple_value(n: u64) -> String {
 fn evidence(ev: &Ev) -> RootEvidence {
     match ev {
         Ev::Absent => RootEvidence::Absent,
+        Ev::Orphan => RootEvidence::Orphan,
         Ev::Present(owner, devdisk, browse, mimic, ignoreowner) => RootEvidence::Present {
             owner: read(owner, |n| n.to_string()),
             apple: [devdisk, browse, mimic, ignoreowner].map(|p| read(p, apple_value)),
@@ -184,6 +185,18 @@ fn model_stated(step: &Step, uid: u32, apple: bool) -> Stated {
             wrong: Vec::new(),
             remedy: creation_argv(&name(r), uid, apple).join(" "),
         },
+        // A root whose parent does not exist: refused, naming no property, with the one command
+        // that makes its parent.
+        Step::SOrphan(r, fix) => Stated::Refuse {
+            root: name(r),
+            wrong: Vec::new(),
+            remedy: match fix {
+                Fix::Import(pool) => format!("zpool import {}", component(*pool)),
+                Fix::MakeParent(parent) => {
+                    format!("zfs create -o mountpoint=none {}", name(parent))
+                }
+            },
+        },
     }
 }
 
@@ -196,7 +209,14 @@ fn code_stated(step: &RootStep) -> Stated {
         },
         RootStep::Take { root } => Stated::Take(root.clone()),
         RootStep::Refuse { root, why, remedy } => {
-            assert!(why.contains(root.as_str()), "{why:?} names {root}");
+            let acted_on = remedy
+                .rsplit(' ')
+                .next()
+                .expect("a remedy names what it acts on");
+            assert!(
+                why.contains(acted_on),
+                "{why:?} names {acted_on}, which {remedy:?} acts on"
+            );
             Stated::Refuse {
                 root: root.clone(),
                 wrong: properties()
@@ -245,6 +265,7 @@ struct Reached {
     created: usize,
     taken: usize,
     refused: usize,
+    orphaned: usize,
 }
 
 /// Hold `root_steps` to the model on one input: the same steps; the evidence read for exactly the
@@ -333,6 +354,21 @@ fn stepped_alike(
                     ));
                 }
             }
+            // Once the remedy makes its parent, the root is absent beneath an existing parent:
+            // named, setup creates it.
+            (RootStep::Refuse { remedy, .. }, RootEvidence::Orphan) => {
+                reached.orphaned += 1;
+                let after = root_steps(true, Some(root), &[], caller, apple, |_| {
+                    Ok::<_, ()>(RootEvidence::Absent)
+                })
+                .expect("the evidence reads");
+                if !matches!(after.as_slice(), [RootStep::Create { root: created, .. }] if *created == root.dataset().to_string())
+                {
+                    return Err(format!(
+                        "{remedy:?} for {root:?} leaves {after:?}, not the root created"
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -360,7 +396,11 @@ fn variants(read: &Rc<List<Ev>>, reads: usize, u: u64) -> Vec<Rc<List<Ev>>> {
             reads.max(1)
         ])
     };
-    let mut all = vec![read.clone(), present(right(u))];
+    let mut all = vec![
+        read.clone(),
+        present(right(u)),
+        list(vec![Ev::Orphan; reads.max(1)]),
+    ];
     for index in 0..5 {
         for wrong in [Owner::Read(if index == 0 { u + 1 } else { 1 }, true), {
             let Owner::Read(value, _) = right(u)[index].clone() else {
@@ -437,11 +477,12 @@ fn setup_serves_the_root_as_the_model_on_its_corpus() {
         stepped_alike_varied(zfs, &named, &serving, u, apple, &read, &mut reached).unwrap();
     }
     assert!(
-        reached.created > 0 && reached.taken > 0 && reached.refused > 0,
-        "the corpus creates {}, takes {} and refuses {} roots",
+        reached.created > 0 && reached.taken > 0 && reached.refused > 0 && reached.orphaned > 0,
+        "the corpus creates {}, takes {}, refuses {} and finds orphaned {} roots",
         reached.created,
         reached.taken,
-        reached.refused
+        reached.refused,
+        reached.orphaned
     );
 }
 

@@ -20,9 +20,10 @@
 # parent named on the command line and one `.cowshed.toml` declares must agree. Without zfs setup
 # does nothing. A named root is read alone: created when absent, taken when its `cowshed:owner` is
 # set locally to the caller and, on macOS, its four com.apple properties are `off` locally, and
-# otherwise refused naming exactly the wrong properties. With nothing named, each serving root is
-# read and taken or refused, one `zfs get` no longer finds is refused, and with none the operator
-# is asked to name a pool: nothing unnamed is ever created.
+# otherwise refused naming exactly the wrong properties; a root whose parent does not exist is
+# refused naming its parent and the command that makes it, never created. With nothing named, each
+# serving root is read and taken or refused, one `zfs get` no longer finds is refused, and with
+# none the operator is asked to name a pool: nothing unnamed is ever created.
 #
 # A dataset name is its list of components, each a Nat: 0n is `cowshed`, 1n `projects`, 2n
 # `main`, 3n `build`, 4n `.trash` (an id that is hidden, never a build volume), and any other n a
@@ -89,17 +90,27 @@ type Parent is Data:
   Agreed{named: Named}
   Disagree{cli: R, declared: R}
 
-# What `zfs get` reads of a root: nothing there, or its `cowshed:owner` and its four com.apple
-# properties, each unread or a value and whether it is set locally; a com.apple value 0n is `off`.
+# What `zfs get` reads of a root: nothing there beneath an existing parent, nothing there and no
+# parent either (an orphan), or its `cowshed:owner` and its four com.apple properties, each unread
+# or a value and whether it is set locally; a com.apple value 0n is `off`.
 type Ev is Data:
   Absent{}
+  Orphan{}
   Present{owner: Owner, devdisk: Owner, browse: Owner, mimic: Owner, ignoreowner: Owner}
 
 # Which properties of an existing root are wrong, in the order the remedy sets them.
 type Wrong is Data:
   W{owner: Bool, devdisk: Bool, browse: Bool, mimic: Bool, ignoreowner: Bool}
 
-# zfs_root.rs `RootStep`: `SGone` is the refusal of a serving root `zfs get` no longer finds.
+# How the operator makes an orphan's parent exist (01b_zfs.md, "One pool, one root": the operator
+# owns the pool, and only the one named parent is touched): import its pool, or create that one
+# dataset.
+type Fix is Data:
+  Import{pool: Nat}
+  MakeParent{parent: +List<Nat>}
+
+# zfs_root.rs `RootStep`: `SGone` is the refusal of a serving root `zfs get` no longer finds, and
+# `SOrphan` the refusal of a root whose parent does not exist.
 type Step is Data:
   SNothing{}
   SNameAPool{}
@@ -107,6 +118,7 @@ type Step is Data:
   STake{root: +List<Nat>}
   SRefuse{root: +List<Nat>, wrong: Wrong}
   SGone{root: +List<Nat>}
+  SOrphan{root: +List<Nat>, fix: Fix}
 
 # --- Bool, Nat and list helpers ------------------------------------------------
 
@@ -522,21 +534,38 @@ def verdict.if(bad: Bool, +r: +List<Nat>, w: Wrong) -> Step:
 def judge(+r: +List<Nat>, +o: Owner, +dk: Owner, +bw: Owner, +mc: Owner, +io: Owner, +u: Nat, +a: Bool) -> Step:
   verdict.if(any(wrong(o, dk, bw, mc, io, u, a)), r, wrong(o, dk, bw, mc, io, u, a))
 
-# the named root: created when absent, with the com.apple properties on macOS, else judged
-def named_step(+r: +List<Nat>, +e: Ev, +u: Nat, +a: Bool) -> Step:
+# the command that makes an orphan's parent exist: a pool is imported, a dataset created
+def orphan_fix(r: R) -> Fix:
+  match r:
+    case R{p, Nil{}}:
+      Import{p}
+    case R{p, Con{h, t}}:
+      MakeParent{p <> h <> t}
+
+# a root whose parent does not exist: refused, naming the parent, never created
+def orphan(+r: R) -> Step:
+  SOrphan{root_names(r), orphan_fix(r)}
+
+# the named root: created when absent beneath an existing parent, with the com.apple properties on
+# macOS, refused when its parent does not exist, else judged
+def named_step(+r: R, +e: Ev, +u: Nat, +a: Bool) -> Step:
   match e:
     case Absent{}:
-      SCreate{r, a}
+      SCreate{root_names(r), a}
+    case Orphan{}:
+      orphan(r)
     case Present{o, dk, bw, mc, io}:
-      judge(r, o, dk, bw, mc, io, u, a)
+      judge(root_names(r), o, dk, bw, mc, io, u, a)
 
 # a serving root: nothing named it, so one `zfs get` no longer finds is refused, never created
-def served_step(+r: +List<Nat>, +e: Ev, +u: Nat, +a: Bool) -> Step:
+def served_step(+r: R, +e: Ev, +u: Nat, +a: Bool) -> Step:
   match e:
     case Absent{}:
-      SGone{r}
+      SGone{root_names(r)}
+    case Orphan{}:
+      orphan(r)
     case Present{o, dk, bw, mc, io}:
-      judge(r, o, dk, bw, mc, io, u, a)
+      judge(root_names(r), o, dk, bw, mc, io, u, a)
 
 # the evidence read for the next root; a read past the end finds nothing
 def first(es: +List<Ev>) -> Ev:
@@ -559,7 +588,7 @@ def served_steps(rs: +List<R>, +es: +List<Ev>, +u: Nat, +a: Bool) -> +List<Step>
     case Nil{}:
       []
     case Con{r, t}:
-      served_step(root_names(r), first(es), u, a) <> served_steps(t, rest(es), u, a)
+      served_step(r, first(es), u, a) <> served_steps(t, rest(es), u, a)
 
 def unnamed_steps(rs: +List<R>, +es: +List<Ev>, +u: Nat, +a: Bool) -> +List<Step>:
   match rs:
@@ -573,7 +602,7 @@ def zfs_steps(+n: Named, s: +List<R>, +es: +List<Ev>, +u: Nat, +a: Bool) -> +Lis
     case Unnamed{}:
       unnamed_steps(s, es, u, a)
     case Name{r}:
-      [named_step(root_names(r), first(es), u, a)]
+      [named_step(r, first(es), u, a)]
 
 # zfs_root.rs `root_steps`: `z` is whether the host has zfs, `n` the named root, `s` the roots
 # whose `cowshed:owner` names the caller, `u` the caller, `a` whether the host is macOS, and `es`
@@ -863,12 +892,14 @@ def verdict_refuses(+b: Bool, +r: +List<Nat>, +w: Wrong) -> IsTrue(b) -> {verdic
     case False{}:
       i => Empty.absurd({verdict.if(False{}, r, w) == SRefuse{r, w} : Step}, i)
 
-def served_creates_nothing(+r: +List<Nat>, +e: Ev, +u: Nat, +a: Bool) -> {is_create(served_step(r, e, u, a)) == False{} : Bool}:
+def served_creates_nothing(+r: R, +e: Ev, +u: Nat, +a: Bool) -> {is_create(served_step(r, e, u, a)) == False{} : Bool}:
   match e:
     case Absent{}:
       {==}
+    case Orphan{}:
+      {==}
     case Present{o, dk, bw, mc, io}:
-      verdict_creates_nothing(any(wrong(o, dk, bw, mc, io, u, a)), r, wrong(o, dk, bw, mc, io, u, a))
+      verdict_creates_nothing(any(wrong(o, dk, bw, mc, io, u, a)), root_names(r), wrong(o, dk, bw, mc, io, u, a))
 
 def served_none(rs: +List<R>, +es: +List<Ev>, +u: Nat, +a: Bool) -> {creates_none(served_steps(rs, es, u, a)) == True{} : Bool}:
   match rs:
@@ -876,20 +907,50 @@ def served_none(rs: +List<R>, +es: +List<Ev>, +u: Nat, +a: Bool) -> {creates_non
       {==}
     case Con{+r, +t}:
       Equal.trans(Bool,
-        and(not(is_create(served_step(root_names(r), first(es), u, a))), creates_none(served_steps(t, rest(es), u, a))),
+        and(not(is_create(served_step(r, first(es), u, a))), creates_none(served_steps(t, rest(es), u, a))),
         creates_none(served_steps(t, rest(es), u, a)),
         True{},
         Equal.cong(Bool, Bool, x => and(not(x), creates_none(served_steps(t, rest(es), u, a))),
-          is_create(served_step(root_names(r), first(es), u, a)), False{},
-          served_creates_nothing(root_names(r), first(es), u, a)),
+          is_create(served_step(r, first(es), u, a)), False{},
+          served_creates_nothing(r, first(es), u, a)),
         served_none(t, rest(es), u, a))
 
-def named_made_only(+r: +List<Nat>, +e: Ev, +u: Nat, +a: Bool) -> {only_made(r, named_step(r, e, u, a)) == True{} : Bool}:
+def named_made_only(+r: R, +e: Ev, +u: Nat, +a: Bool) -> {only_made(root_names(r), named_step(r, e, u, a)) == True{} : Bool}:
   match e:
     case Absent{}:
-      eq_refl(r)
+      eq_refl(root_names(r))
+    case Orphan{}:
+      {==}
     case Present{o, dk, bw, mc, io}:
-      verdict_made_only(any(wrong(o, dk, bw, mc, io, u, a)), r, wrong(o, dk, bw, mc, io, u, a))
+      verdict_made_only(any(wrong(o, dk, bw, mc, io, u, a)), root_names(r), wrong(o, dk, bw, mc, io, u, a))
+
+def is_absent(e: Ev) -> Bool:
+  match e:
+    case Absent{}:
+      True{}
+    case _:
+      False{}
+
+def fix_names(f: Fix) -> +List<Nat>:
+  match f:
+    case Import{p}:
+      [p]
+    case MakeParent{ps}:
+      ps
+
+def is_import(f: Fix) -> Bool:
+  match f:
+    case Import{p}:
+      True{}
+    case MakeParent{ps}:
+      False{}
+
+def is_pool(r: R) -> Bool:
+  match r:
+    case R{p, Nil{}}:
+      True{}
+    case R{p, Con{h, t}}:
+      False{}
 
 # === laws ==============================================================================
 
@@ -1422,8 +1483,8 @@ def only_the_named_root_is_created(z, r, s, u, a, es):
       {==}
     case True{}:
       Equal.cong(Bool, Bool, x => and(x, True{}),
-        only_made(root_names(r), named_step(root_names(r), first(es), u, a)), True{},
-        named_made_only(root_names(r), first(es), u, a))
+        only_made(root_names(r), named_step(r, first(es), u, a)), True{},
+        named_made_only(r, first(es), u, a))
 
 # The creation check the binding drives: nothing unnamed is ever created.
 law created_check:
@@ -1444,7 +1505,7 @@ def created_check(z, n, s, u, a, es):
 
 # An existing root is never created again, ...
 law an_existing_root_is_never_created:
-  for +r: +List<Nat>
+  for +r: R
   for +o: Owner
   for +dk: Owner
   for +bw: Owner
@@ -1455,18 +1516,79 @@ law an_existing_root_is_never_created:
   {is_create(named_step(r, Present{o, dk, bw, mc, io}, u, a)) == False{} : Bool}
 
 def an_existing_root_is_never_created(r, o, dk, bw, mc, io, u, a):
-  verdict_creates_nothing(any(wrong(o, dk, bw, mc, io, u, a)), r, wrong(o, dk, bw, mc, io, u, a))
+  verdict_creates_nothing(any(wrong(o, dk, bw, mc, io, u, a)), root_names(r), wrong(o, dk, bw, mc, io, u, a))
 
 # ... and a serving root `zfs get` no longer finds is refused, never created.
 law a_serving_root_that_is_gone_is_refused:
-  for +r: +List<Nat>
+  for +r: R
   for +u: Nat
   for +a: Bool
-  {served_step(r, Absent{}, u, a) == SGone{r} : Step}
+  {served_step(r, Absent{}, u, a) == SGone{root_names(r)} : Step}
 
 def a_serving_root_that_is_gone_is_refused(r, u, a):
   {==}
 
+# A root whose parent does not exist is never created: `zfs create` beneath it could only fail,
+# after the administrator's authorization was spent on it ...
+law an_orphan_root_is_never_created:
+  for +r: R
+  for +u: Nat
+  for +a: Bool
+  {is_create(named_step(r, Orphan{}, u, a)) == False{} : Bool}
+
+def an_orphan_root_is_never_created(r, u, a):
+  {==}
+
+# ... so a named root is created exactly when it is absent beneath an existing parent ...
+law a_root_is_created_exactly_when_absent_beneath_an_existing_parent:
+  for +r: R
+  for +e: Ev
+  for +u: Nat
+  for +a: Bool
+  {is_create(named_step(r, e, u, a)) == is_absent(e) : Bool}
+
+def a_root_is_created_exactly_when_absent_beneath_an_existing_parent(r, e, u, a):
+  match e:
+    case Absent{}:
+      {==}
+    case Orphan{}:
+      {==}
+    case Present{o, dk, bw, mc, io}:
+      verdict_creates_nothing(any(wrong(o, dk, bw, mc, io, u, a)), root_names(r), wrong(o, dk, bw, mc, io, u, a))
+
+# ... and a serving root whose parent is gone takes the named root's refusal.
+law a_serving_orphan_is_refused_as_a_named_one:
+  for +r: R
+  for +u: Nat
+  for +a: Bool
+  {served_step(r, Orphan{}, u, a) == named_step(r, Orphan{}, u, a) : Step}
+
+def a_serving_orphan_is_refused_as_a_named_one(r, u, a):
+  {==}
+
+# The remedy for an orphan names its parent, the root less its `cowshed` ...
+law the_remedy_for_an_orphan_names_its_parent:
+  for +r: R
+  {cat(fix_names(orphan_fix(r)), [0n]) == root_names(r) : +List<Nat>}
+
+def the_remedy_for_an_orphan_names_its_parent(r):
+  match r:
+    case R{p, Nil{}}:
+      {==}
+    case R{p, Con{h, t}}:
+      {==}
+
+# ... importing it when it is a pool, creating it when it is a dataset in one.
+law an_orphan_pool_is_imported_and_an_orphan_dataset_created:
+  for +r: R
+  {is_import(orphan_fix(r)) == is_pool(r) : Bool}
+
+def an_orphan_pool_is_imported_and_an_orphan_dataset_created(r):
+  match r:
+    case R{p, Nil{}}:
+      {==}
+    case R{p, Con{h, t}}:
+      {==}
 # A root whose `cowshed:owner` is not set locally to the caller is refused, never taken: an
 # inherited, received, unset or other owner.
 law a_root_the_caller_does_not_own_locally_is_refused:
