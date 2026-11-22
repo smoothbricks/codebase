@@ -7281,21 +7281,39 @@ self.finish_retire_intent(&workspace).await?;
         if let Some(targets) = read(self.build_volumes()?, mount.to_owned()).await? {
             return Ok(targets);
         }
-        self.refresh_build_state_for(source, mount, super::build_volumes::Lent::Nothing)
+        // The one discovery the refresh runs names them, whether or not a build volume records
+        // them: a checkout whose only build state is mbx's Cargo targets has none to hold the record.
+        let (_, discovered) = self
+            .refresh_build_state_discovering(source, mount, super::build_volumes::Lent::Nothing)
             .await?;
-        read(self.build_volumes()?, mount.to_owned())
+        match discovered {
+            Some(targets) => Ok(targets),
+            None => read(self.build_volumes()?, mount.to_owned())
+                .await?
+                .ok_or_else(|| {
+                    CowshedError::integrity(
+                        format!(
+                            "the build state of {} names no Cargo targets mbx manages at its \
+                             current inputs after its refresh, so a clone cannot tell which \
+                             inherited target links name its managed targets",
+                            mount.display()
+                        ),
+                        format!("cowshed doctor --json, then retry from {}", mount.display()),
+                    )
+                }),
+        }
+    }
+
+    async fn refresh_build_state_for(
+        &mut self,
+        current: &NativeWorkspace,
+        mount: &Path,
+        lent: super::build_volumes::Lent,
+    ) -> Result<crate::build_volume::BuildStateRefresh> {
+        Ok(self
+            .refresh_build_state_discovering(current, mount, lent)
             .await?
-            .ok_or_else(|| {
-                CowshedError::integrity(
-                    format!(
-                        "the build state of {} names no Cargo targets mbx manages at its current \
-                         inputs after its refresh, so a clone cannot tell which inherited target \
-                         links name its managed targets",
-                        mount.display()
-                    ),
-                    format!("cowshed doctor --json, then retry from {}", mount.display()),
-                )
-            })
+            .0)
     }
     /// Refresh `current`'s build state at its mounted checkout `mount`
     /// ([`ProjectRuntimeHost::refresh_build_state`]). Detection reads the same canonical context
@@ -7307,12 +7325,15 @@ self.finish_retire_intent(&workspace).await?;
     /// fingerprint moved off the one the volume's state records; otherwise only displaced links
     /// are restored. A first touch takes the volume `lent` names when it fits rather than
     /// minting one of its own ([`super::build_volumes::Lent`]).
-    async fn refresh_build_state_for(
+    async fn refresh_build_state_discovering(
         &mut self,
         current: &NativeWorkspace,
         mount: &Path,
         lent: super::build_volumes::Lent,
-    ) -> Result<crate::build_volume::BuildStateRefresh> {
+    ) -> Result<(
+        crate::build_volume::BuildStateRefresh,
+        Option<Vec<crate::capabilities::RelPath>>,
+    )> {
         use super::build_volumes::Discovered;
         let name = current.derived.workspace.name().clone();
         let volumes = self.build_volumes()?;
@@ -7393,6 +7414,14 @@ self.finish_retire_intent(&workspace).await?;
                 discovery.findings,
             )
         };
+        // What this refresh's discovery found mbx managing, for a clone taking it in memory: the
+        // record a volume would hold, or the only answer for a checkout with no volume.
+        let discovered_targets = match &discovered {
+            Discovered::Changed { released, .. } => {
+                Some(released.iter().map(|path| path.checkout.clone()).collect())
+            }
+            Discovered::Unchanged => None,
+        };
         let mut refresh = volumes
             .refresh(
                 super::build_volumes::Owner {
@@ -7430,7 +7459,7 @@ self.finish_retire_intent(&workspace).await?;
         for finding in &refresh.findings {
             cowshed_os::eprintln!("cowshed: {name}: {finding}");
         }
-        Ok(refresh)
+        Ok((refresh, discovered_targets))
     }
 
     /// Core owns gateway preparation after the decoded route and live workspace fences. A

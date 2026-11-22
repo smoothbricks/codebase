@@ -4782,6 +4782,262 @@ async fn directory_a_rename_cleans_its_retired_source_before_it_completes_substr
         .expect("stop the real directory project");
 }
 
+/// The fixture home's installed mbx, as `cowshed setup` leaves the host's: the link cowshed
+/// observes, naming the host's own pinned mbx, and the generated Cargo route beside it whose sidecar
+/// names that link (15_capabilities.md, "mbx detection").
+fn install_fixture_mbx(home: &Path) -> PathBuf {
+    let host_home = PathBuf::from(std::env::var_os("HOME").expect("the test's HOME"));
+    let executable = fs::canonicalize(cowshed_core::capabilities::mbx::host_link(&host_home))
+        .expect("this host has an installed mbx: run `cowshed setup` first");
+    let link = cowshed_core::capabilities::mbx::host_link(home);
+    fs::create_dir_all(link.parent().expect("the mbx link has a parent")).expect("bin directory");
+    std::os::unix::fs::symlink(&executable, &link).expect("the fixture's mbx link");
+    let route = cowshed_core::capabilities::mbx::cargo_route(home);
+    fs::create_dir_all(&route).expect("the fixture's Cargo route");
+    fs::copy(
+        cowshed_core::capabilities::mbx::cargo_route(&host_home).join("cargo"),
+        route.join("cargo"),
+    )
+    .expect("the generated Cargo shim");
+    fs::write(route.join("mbx-target"), format!("{}\n", link.display())).expect("shim sidecar");
+    executable
+}
+
+/// Where the checkout's Cargo writes one line per invocation: its own root, ignored.
+const CARGO_CALLS: &str = ".cargo-calls";
+
+/// A second Cargo workspace nested in the checkout, with a lockfile from the same Cargo, committed:
+/// mbx gives it a managed target of its own. The checkout's declared `cargo` logs each invocation's
+/// arguments to [`CARGO_CALLS`] in the checkout that runs it before it execs the real Cargo, so a
+/// discovery's `locate-project` is counted. With `declared_state` the checkout also declares one
+/// build-state path, so it has a build volume, as a project with Nx state does; without it the
+/// checkout's only build state is mbx's Cargo targets, and it has none.
+fn write_nested_cargo_workspace(checkout: &Path, rust: &RustToolchain, declared_state: bool) {
+    let nested = checkout.join("nested");
+    fs::create_dir_all(nested.join("src")).unwrap();
+    fs::write(
+        nested.join("Cargo.toml"),
+        "[workspace]\n\n[package]\nname = \"fixture-nested\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("src/lib.rs"),
+        "pub fn nested() -> u32 {\n    3\n}\n",
+    )
+    .unwrap();
+    let lockfile = Command::new(&rust.cargo)
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&nested)
+        .env("RUSTC", &rust.rustc)
+        .env_remove("CARGO_TARGET_DIR")
+        .output_bounded()
+        .expect("cargo generate-lockfile");
+    assert!(
+        lockfile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lockfile.stderr)
+    );
+    let cargo = checkout.join(".cowshed/bin/cargo");
+    fs::remove_file(&cargo).expect("the declared cargo link");
+    fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")/../..\" && pwd)\nprintf '%s\\n' \"$*\" >> \"$root/{CARGO_CALLS}\"\nexec {} \"$@\"\n",
+            rust.cargo.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut ignore = fs::read_to_string(checkout.join(".gitignore")).unwrap();
+    ignore.push_str(&format!(
+        "/nested/target\n/{CARGO_CALLS}\n/.fixture-cache/\n"
+    ));
+    fs::write(checkout.join(".gitignore"), ignore).unwrap();
+    if declared_state {
+        fs::write(
+            checkout.join(".cowshed.toml"),
+            format!("{FIXTURE_COWSHED_TOML}state = [\".fixture-cache\"]\n"),
+        )
+        .unwrap();
+    }
+    git(checkout, &["add", "-A"]);
+    git(checkout, &["commit", "-q", "-m", "nested Cargo workspace"]);
+}
+
+/// How many Cargo discoveries (`locate-project`) ran in `checkout` so far.
+fn discoveries(checkout: &Path) -> usize {
+    fs::read_to_string(checkout.join(CARGO_CALLS))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("locate-project"))
+        .count()
+}
+
+/// `checkout`'s Cargo target link at `relative`, which must name one checkout's managed target:
+/// `<build-cache>/mbx/targets/v1/<checkout digest>`, the digest spelled as mbx names it.
+fn managed_target_of(checkout: &Path, relative: &str, managed: &Path) -> PathBuf {
+    let link = checkout.join(relative);
+    let target = fs::read_link(&link)
+        .unwrap_or_else(|error| panic!("{} is no link: {error}", link.display()));
+    assert_eq!(
+        target.parent(),
+        Some(managed.join("v1").as_path()),
+        "{}",
+        link.display()
+    );
+    let digest = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "mbx named the managed target {digest:?}, not a 64-digit lowercase hex checkout digest"
+    );
+    target
+}
+
+const BUILD_BOTH: &str = "cargo build && cd nested && cargo build";
+
+/// 16_build_volumes.md, "Fork" step 4; 08_testing.md, "mbx target link at fork", with the host's
+/// real mbx and build-cache volume. A source built at its root and in a nested Cargo workspace
+/// holds two managed-target links; its fork starts with both inherited links gone and their
+/// managed targets untouched, builds to targets of its own, and still builds once the source is
+/// retired, whose `mbx clean --under` removes what the source's links named. A fork of the fork
+/// takes its source's targets from the record a build volume keeps, rediscovering nothing; with no
+/// volume, from the one discovery its refresh runs. Prints each shape's discovery counts.
+async fn a_fork_drops_inherited_mbx_target_links(declared_state: bool) {
+    let rust = RustToolchain::of_this_test();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: None,
+        rust: Some(&rust),
+    });
+    install_fixture_mbx(fixture.storage.home());
+    write_nested_cargo_workspace(&fixture.checkout, &rust, declared_state);
+    let managed = cowshed_core::build_volume::managed_targets::managed_root(
+        &cowshed_core::storage::bootstrap::native::provisioned_build_cache()
+            .expect("this host has its build-cache volume"),
+    );
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let shape = if declared_state {
+        "with a build volume"
+    } else {
+        "with no build volume"
+    };
+
+    let parent = new_workspace(&mut service, "parent").await;
+    sh(&mut service, "parent", BUILD_BOTH).await;
+    let parent_root = managed_target_of(&parent, "target", &managed);
+    let parent_nested = managed_target_of(&parent, "nested/target", &managed);
+    assert_ne!(parent_root, parent_nested);
+
+    let before = discoveries(&parent);
+    succeed(&mut service, ["fork", "parent", "child"]).await;
+    cowshed_os::eprintln!(
+        "{shape}: forking parent ran {} Cargo discoveries in it",
+        discoveries(&parent) - before
+    );
+    let child = service
+        .path("child", false)
+        .await
+        .expect("child mounted")
+        .mount;
+    for inherited in ["target", "nested/target"] {
+        assert!(
+            fs::symlink_metadata(child.join(inherited)).is_err(),
+            "{shape}: the fork kept the inherited {inherited} link"
+        );
+    }
+    assert!(
+        parent_root.is_dir() && parent_nested.is_dir(),
+        "the source's targets stay"
+    );
+
+    sh(&mut service, "child", BUILD_BOTH).await;
+    let child_root = managed_target_of(&child, "target", &managed);
+    let child_nested = managed_target_of(&child, "nested/target", &managed);
+    assert!(
+        child_root != parent_root && child_nested != parent_nested,
+        "{shape}: the fork builds to managed targets of its own"
+    );
+
+    succeed(&mut service, ["rm", "parent", "--force"]).await;
+    assert!(
+        !parent_root.exists() && !parent_nested.exists(),
+        "{shape}: the source's retirement cleaned the targets its links named"
+    );
+    sh(&mut service, "child", BUILD_BOTH).await;
+    assert_eq!(managed_target_of(&child, "target", &managed), child_root);
+    assert_eq!(
+        managed_target_of(&child, "nested/target", &managed),
+        child_nested
+    );
+
+    let before = discoveries(&child);
+    let state = declared_state.then(|| {
+        fs::canonicalize(child.join(".cowshed/build"))
+            .expect("the child's build volume")
+            .join(cowshed_core::build_volume::STATE_FILE)
+    });
+    let recorded = state
+        .as_ref()
+        .map(|state| fs::read(state).expect("the child's build state"));
+    succeed(&mut service, ["fork", "child", "grandchild"]).await;
+    let warm = discoveries(&child) - before;
+    cowshed_os::eprintln!("{shape}: forking the built child ran {warm} Cargo discoveries in it");
+    if let (Some(state), Some(recorded)) = (&state, &recorded) {
+        assert_eq!(warm, 0, "the warm fork rediscovered its source");
+        assert_eq!(
+            &fs::read(state).unwrap(),
+            recorded,
+            "the warm fork rewrote its source's record"
+        );
+    }
+    let grandchild = service
+        .path("grandchild", false)
+        .await
+        .expect("mounted")
+        .mount;
+    for inherited in ["target", "nested/target"] {
+        assert!(
+            fs::symlink_metadata(grandchild.join(inherited)).is_err(),
+            "{inherited}"
+        );
+    }
+    assert!(child_root.is_dir() && child_nested.is_dir());
+
+    for workspace in ["grandchild", "child"] {
+        succeed(&mut service, ["rm", workspace, "--force"]).await;
+    }
+    assert!(
+        !child_root.exists() && !child_nested.exists(),
+        "retirement cleans the fork's targets"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
+/// The production shape: the checkout holds build state besides mbx's targets. An explicit host
+/// proof with the installed mbx and the host's build-cache volume, outside ordinary landing: it
+/// writes managed targets on the host's own build-cache volume.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host proof with the installed mbx and the host's build-cache volume: run explicitly"]
+async fn directory_a_fork_drops_inherited_mbx_target_links_with_a_build_volume_real_mbx() {
+    a_fork_drops_inherited_mbx_target_links(true).await;
+}
+
+/// A checkout whose only build state is mbx's Cargo targets: no build volume records them, and its
+/// forks take them from the discovery each fork's refresh runs. The same explicit host proof.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host proof with the installed mbx and the host's build-cache volume: run explicitly"]
+async fn directory_a_fork_drops_inherited_mbx_target_links_with_no_build_volume_real_mbx() {
+    a_fork_drops_inherited_mbx_target_links(false).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_an_rm_while_a_land_holds_the_lease_is_refused_substrate_lifecycle() {
     let mut fixture = Fixture::directory();

@@ -29,6 +29,8 @@ pub struct FirstTouch<'a> {
     pub fingerprint: String,
     /// The realpath of the mbx discovery resolved in the checkout's canonical job environment.
     pub mbx: Option<std::path::PathBuf>,
+    /// The Cargo targets mbx manages, as the same discovery found them: recorded beside `paths`.
+    pub released: &'a [BuildStatePath],
     /// The capacity the checkout's `.cowshed.toml` asks of its first volume.
     pub capacity: ImageCapacity,
     pub beside: MintedBeside,
@@ -85,6 +87,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         paths,
         fingerprint,
         mbx,
+        released,
         capacity,
         beside,
         registration,
@@ -133,7 +136,7 @@ pub(crate) fn first_touch<H: RuntimeStorageHost>(
         .mount_build_volume(layout, &id)
         .map_err(storage_error)?;
     let previous = BuildVolumeState::read(&mount)?;
-    let (state, _, _) = previous.with_discovered(paths, &[], mbx, fingerprint, &mount)?;
+    let (state, _, _) = previous.with_discovered(paths, released, mbx, fingerprint, &mount)?;
     let adopted = adopt_preflighted(
         host.census(),
         checkout,

@@ -111,14 +111,24 @@ fn real_directories(tree_root: &Path, parent: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether `resolved` is one checkout's managed target: `<managed_root>/v1/<digest>`, the layout
-/// mbx documents ("Managed target directories"), never the store's root, `v1` itself or a path
-/// below a target.
+/// Whether `resolved` is one checkout's managed target: `<managed_root>/v1/<checkout digest>`,
+/// the layout mbx documents ("Managed target directories"; 16_build_volumes.md) with the digest
+/// spelled as mbx 1.30.0 names it, never the store's root, `v1` itself, another child of `v1` or
+/// a path below a target.
 fn is_managed_target(resolved: &Path, managed_root: &Path) -> bool {
     resolved.parent() == Some(managed_root.join("v1").as_path())
         && resolved
             .file_name()
-            .is_some_and(|digest| !digest.is_empty())
+            .and_then(|name| name.to_str())
+            .is_some_and(is_checkout_digest)
+}
+
+/// A checkout digest as mbx names its managed targets: 64 lowercase hexadecimal digits.
+fn is_checkout_digest(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 fn inspect_error(path: &Path, source: &io::Error) -> CowshedError {
     CowshedError::integrity(
@@ -163,6 +173,10 @@ mod tests {
         }
     }
 
+    /// A checkout digest as mbx spells one.
+    fn digest(seed: u8) -> String {
+        format!("{seed:064x}")
+    }
     fn rel(path: &str) -> RelPath {
         RelPath::new(path).unwrap()
     }
@@ -177,8 +191,8 @@ mod tests {
     #[test]
     fn drops_the_root_and_nested_links_to_managed_targets_and_never_their_payload() {
         let fixture = fixture();
-        let root = source_target(&fixture, "root-digest");
-        let nested = source_target(&fixture, "nested-digest");
+        let root = source_target(&fixture, &digest(1));
+        let nested = source_target(&fixture, &digest(2));
         fs::create_dir_all(fixture.tree.join("packages/fixture")).unwrap();
         symlink(&root, fixture.tree.join("target")).unwrap();
         symlink(&nested, fixture.tree.join("packages/fixture/target")).unwrap();
@@ -203,7 +217,7 @@ mod tests {
     #[test]
     fn drops_a_dangling_link_the_sources_retirement_left() {
         let fixture = fixture();
-        let gone = fixture.managed.join("v1/retired-digest");
+        let gone = fixture.managed.join("v1").join(digest(3));
         fs::create_dir_all(fixture.tree.join("fuzz")).unwrap();
         symlink(&gone, fixture.tree.join("fuzz/target")).unwrap();
         let dropped =
@@ -235,9 +249,15 @@ mod tests {
             fixture.tree.join("versioned/target"),
         )
         .unwrap();
+        fs::create_dir_all(fixture.tree.join("named")).unwrap();
+        symlink(
+            fixture.managed.join("v1/not-a-checkout-digest"),
+            fixture.tree.join("named/target"),
+        )
+        .unwrap();
         fs::create_dir_all(fixture.tree.join("deeper")).unwrap();
         symlink(
-            fixture.managed.join("v1/digest/debug"),
+            fixture.managed.join("v1").join(digest(4)).join("debug"),
             fixture.tree.join("deeper/target"),
         )
         .unwrap();
@@ -249,6 +269,7 @@ mod tests {
             rel("root/target"),
             rel("versioned/target"),
             rel("deeper/target"),
+            rel("named/target"),
             rel("absent/target"),
         ];
         let dropped = drop_inherited(&fixture.tree, &candidates, &fixture.managed).unwrap();
@@ -261,6 +282,7 @@ mod tests {
             "root/target",
             "versioned/target",
             "deeper/target",
+            "named/target",
         ] {
             assert!(
                 fs::symlink_metadata(fixture.tree.join(kept))
@@ -277,7 +299,7 @@ mod tests {
     fn adoptions_root_cleanup_drops_only_a_managed_link() {
         let root = [rel("target")];
         let managed = fixture();
-        let target = source_target(&managed, "pre-cowshed-digest");
+        let target = source_target(&managed, &digest(5));
         symlink(&target, managed.tree.join("target")).unwrap();
         assert_eq!(
             drop_inherited(&managed.tree, &root, &managed.managed).unwrap(),
@@ -311,7 +333,7 @@ mod tests {
     #[test]
     fn never_unlinks_through_a_symlinked_ancestor() {
         let fixture = fixture();
-        let target = source_target(&fixture, "digest");
+        let target = source_target(&fixture, &digest(6));
         // `linked` is a link to a directory outside the clone that holds a managed-target link.
         let outside = fixture.elsewhere.join("crate");
         fs::create_dir_all(&outside).unwrap();

@@ -1042,7 +1042,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         fingerprint,
                         capacity,
                         mbx,
-                        ..
+                        released,
                     },
                 ) => {
                     let touched = lent.touch(|beside| {
@@ -1055,6 +1055,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                                 fingerprint,
                                 capacity,
                                 mbx,
+                                released: &released,
                                 beside,
                                 registration: Registration::new(
                                     BuildVolumeRecord::new(
