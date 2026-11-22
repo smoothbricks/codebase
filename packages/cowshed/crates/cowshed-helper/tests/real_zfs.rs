@@ -2,93 +2,159 @@
 //! refusals that only a real host can prove (the root's owner property, a mountpoint outside the
 //! caller's tree, the handover of a new dataset's root).
 //!
-//! A host proof: it needs `sudo -n`, and `COWSHED_ZFS_TEST_PARENT` naming a dataset below which
-//! root may create (specs/cowshed/08_testing.md, "Real ZFS"). Everything it makes lives in one
-//! dataset of its own below that parent, destroyed on every exit path.
+//! An explicit host check, never part of an ordinary test run (specs/cowshed/08_testing.md, "Real
+//! ZFS"): it drives the helper `cowshed setup` installed, through `sudo -n` as the product does,
+//! below the cowshed root that names this user, `${COWSHED_ZFS_TEST_PARENT}/cowshed`. Nothing asks
+//! for a password: a host where that root or that helper is not proven skips, saying why.
+//! Everything it makes lives in a project namespace of its own, destroyed leaf first through the
+//! helper on every exit path.
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const HELPER: &str = env!("CARGO_BIN_EXE_cowshed-helper");
-
-fn sudo(program: &str, arguments: &[&str]) -> Output {
-    Command::new("sudo")
-        .arg("-n")
-        .arg(program)
-        .args(arguments)
-        .output()
-        .expect("sudo runs")
+/// The helper `cowshed setup` installed, where `sudo` admits it without a password.
+/// Where this run's mountpoints live: the per-user fixture directory beside cowshed's mount root
+/// (08_testing.md, "Fixtures"), a directory of this user's on a filesystem that keeps ownership.
+/// A temporary directory is no such place: a `cowshed exec` job's lies in the store, whose volume
+/// ignores ownership, and the helper refuses a mountpoint whose owner it cannot read as the
+/// caller's.
+#[cfg(target_os = "macos")]
+fn scratch_parent() -> PathBuf {
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    let parent = PathBuf::from(format!("/private/var/folders/cowshed/{uid}/t"));
+    std::fs::create_dir_all(&parent).expect("the per-user fixture directory");
+    parent
 }
 
-fn zfs_as_root(arguments: &[&str]) {
-    let output = sudo("zfs", arguments);
-    assert!(
-        output.status.success(),
-        "zfs {arguments:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+#[cfg(target_os = "linux")]
+fn scratch_parent() -> PathBuf {
+    let parent = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cowshed/t");
+    std::fs::create_dir_all(&parent).expect("the per-user fixture directory");
+    parent
+}
+fn installed_helper() -> PathBuf {
+    Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join("cowshed-helper")
+}
+
+fn zfs(arguments: &[&str]) -> Output {
+    Command::new("zfs")
+        .args(arguments)
+        .env("PATH", cowshed_helper::host::TRUSTED_PATH)
+        .output()
+        .expect("zfs runs")
 }
 
 /// A property of a dataset or snapshot, read without privilege.
 fn property(name: &str, property: &str) -> String {
-    let output = Command::new("zfs")
-        .args(["get", "-H", "-p", "-o", "value", property, name])
-        .output()
-        .expect("zfs runs");
+    let output = zfs(&["get", "-H", "-p", "-o", "value", property, name]);
     assert!(output.status.success(), "zfs get {property} {name}");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 fn exists(name: &str) -> bool {
-    Command::new("zfs")
-        .args(["list", "-H", "-t", "all", "-o", "name", name])
-        .output()
-        .expect("zfs runs")
+    zfs(&["list", "-H", "-t", "all", "-o", "name", name])
         .status
         .success()
 }
 
-/// One scratch tree: `<parent>/cowshed-itest-<pid>` holding a cowshed root that serves this
-/// user, a sibling root that serves nobody, and a directory for mountpoints.
+/// The names below `name`, itself included, parents before children.
+fn listed(name: &str) -> Vec<String> {
+    let output = zfs(&["list", "-H", "-r", "-t", "all", "-o", "name", name]);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One run's namespace below the cowshed root that names this user: the project owner
+/// `cowshed-itest-<pid>`, a root inside it that names nobody, and a directory of this user's for
+/// mountpoints.
 struct Fixture {
-    tree: String,
     root: String,
+    parent: String,
+    tree: String,
+    /// Whether this run made `<root>/projects`, which it then removes when it is empty.
+    projects: bool,
     directory: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
-        let parent = std::env::var("COWSHED_ZFS_TEST_PARENT")
-            .expect("COWSHED_ZFS_TEST_PARENT names the dataset this host proof may create below");
-        let tree = format!("{parent}/cowshed-itest-{}", std::process::id());
-        let directory = std::env::temp_dir()
-            .canonicalize()
-            .expect("the temporary directory resolves")
-            .join(format!("cowshed-itest-{}", std::process::id()));
+    /// The fixture, or `None` with the reason this host cannot run the check printed.
+    fn new() -> Option<Self> {
+        let skip = |reason: String| {
+            eprintln!("skipped: {reason}");
+            None
+        };
+        let Ok(parent) = std::env::var("COWSHED_ZFS_TEST_PARENT") else {
+            return skip(String::from(
+                "COWSHED_ZFS_TEST_PARENT names no pool or dataset whose cowshed root to use",
+            ));
+        };
+        let root = format!("{parent}/cowshed");
+        // SAFETY: reads this process's real uid.
+        let uid = unsafe { libc::getuid() };
+        let owner = zfs(&["get", "-H", "-o", "value,source", "cowshed:owner", &root]);
+        let owner = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
+        if owner != format!("{uid}\tlocal") {
+            return skip(format!(
+                "{root} is not a cowshed root whose owner property names uid {uid} locally (read: {owner:?})"
+            ));
+        }
+        let helper = installed_helper();
+        let proven = Command::new("sudo")
+            .args(["-n", "-k"])
+            .arg(&helper)
+            .args([root.as_str(), "check"])
+            .output();
+        match &proven {
+            Ok(output) if output.status.success() => {}
+            other => {
+                return skip(format!(
+                    "{} does not act as root for {root} without a password: {other:?}",
+                    helper.display()
+                ));
+            }
+        }
+        let directory = scratch_parent().join(format!("cowshed-itest-{}", std::process::id()));
         std::fs::create_dir(&directory).expect("the scratch directory is new");
-        let uid = std::fs::metadata(&directory).expect("it exists").uid();
+        let projects = !exists(&format!("{root}/projects"));
         let fixture = Self {
-            root: format!("{tree}/cowshed"),
-            tree,
+            tree: format!("{root}/projects/cowshed-itest-{}", std::process::id()),
+            root,
+            parent,
+            projects,
             directory,
         };
-        zfs_as_root(&["create", "-o", "mountpoint=none", &fixture.tree]);
-        zfs_as_root(&[
+        if projects {
+            fixture.run(&[
+                "create",
+                &format!("{}/projects", fixture.root),
+                "mountpoint=none",
+            ]);
+        }
+        fixture.run(&["create", &fixture.tree, "mountpoint=none"]);
+        fixture.run(&[
             "create",
-            "-o",
-            &format!("cowshed:owner={uid}"),
-            &fixture.root,
+            &format!("{}/unowned", fixture.tree),
+            "mountpoint=none",
         ]);
-        zfs_as_root(&["create", &format!("{}/unowned", fixture.tree)]);
-        zfs_as_root(&["create", &format!("{}/unowned/cowshed", fixture.tree)]);
-        fixture
+        fixture.run(&[
+            "create",
+            &format!("{}/unowned/cowshed", fixture.tree),
+            "mountpoint=none",
+        ]);
+        Some(fixture)
     }
 
     fn helper_at(&self, root: &str, arguments: &[&str]) -> Output {
-        let mut all = vec![root];
-        all.extend(arguments);
-        sudo(HELPER, &all)
+        Command::new("sudo")
+            .arg("-n")
+            .arg(installed_helper())
+            .arg(root)
+            .args(arguments)
+            .output()
+            .expect("sudo runs")
     }
 
     fn run(&self, arguments: &[&str]) {
@@ -109,39 +175,62 @@ impl Fixture {
     }
 
     fn dataset(&self, below: &str) -> String {
-        format!("{}/{below}", self.root)
+        format!("{}/{below}", self.tree)
     }
 
+    /// A mountpoint of this run, made by this user before anything mounts there.
     fn path(&self, below: &str) -> String {
-        self.directory
-            .join(below)
-            .to_str()
-            .expect("UTF-8")
-            .to_owned()
+        let path = self.directory.join(below);
+        std::fs::create_dir_all(&path).expect("the mountpoint");
+        path.to_str().expect("UTF-8").to_owned()
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // `-R` reaches clones, which all lie inside the tree; `-f` unmounts what a failed step
-        // left mounted.
-        let destroyed = sudo("zfs", &["destroy", "-R", "-f", &self.tree]);
-        let removed = sudo(
-            "rm",
-            &["-rf", "--", self.directory.to_str().expect("UTF-8")],
-        );
+        // Leaf first through the helper, which never recurses: a clone goes before its origin,
+        // so every pass destroys what nothing depends on until nothing is left.
+        let mut left = listed(&self.tree);
+        while !left.is_empty() {
+            for name in left.iter().rev() {
+                let _ = self.helper_at(&self.root, &["destroy", name]);
+            }
+            let after = listed(&self.tree);
+            if after.len() == left.len() {
+                break;
+            }
+            left = after;
+        }
+        let projects = format!("{}/projects", self.root);
+        if self.projects && left.is_empty() {
+            let _ = self.helper_at(&self.root, &["destroy", &projects]);
+        }
+        let removed = std::fs::remove_dir_all(&self.directory);
         if !std::thread::panicking() {
-            assert!(destroyed.status.success(), "the scratch tree is destroyed");
-            assert!(removed.status.success(), "the scratch directory is removed");
+            assert_eq!(
+                left,
+                Vec::<String>::new(),
+                "the run's datasets are destroyed"
+            );
+            assert!(
+                !self.projects || !exists(&projects),
+                "the projects container this run made is destroyed"
+            );
+            assert!(
+                removed.is_ok(),
+                "the scratch directory is removed: {removed:?}"
+            );
         }
     }
 }
 
 #[test]
-#[ignore = "host proof: needs sudo and COWSHED_ZFS_TEST_PARENT (the live host check of specs/cowshed/08_testing.md, Real ZFS)"]
+#[ignore = "explicit host check: real ZFS through the installed helper (specs/cowshed/08_testing.md, Real ZFS)"]
 fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
-    let fixture = Fixture::new();
-    let repo = "projects/acme/widget";
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let repo = "widget";
     let main = fixture.dataset(&format!("{repo}/main"));
     let ws = fixture.dataset(&format!("{repo}/ws"));
     let raven = format!("{ws}/raven");
@@ -150,10 +239,8 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
     let fork = format!("{main}@cowshed:fork-raven");
     let build = fixture.dataset(&format!("{repo}/build"));
 
-    // Adopt: containers that never mount, then main at a path of the caller's.
-    for container in ["projects", "projects/acme", repo] {
-        fixture.run(&["create", &fixture.dataset(container), "mountpoint=none"]);
-    }
+    // Adopt: a container that never mounts, then main at a path of the caller's.
+    fixture.run(&["create", &fixture.dataset(repo), "mountpoint=none"]);
     let checkout = fixture.path("checkout");
     fixture.run(&["create", &main, &format!("mountpoint={checkout}")]);
     assert_eq!(property(&main, "mounted"), "yes");
@@ -162,6 +249,7 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
 
     // Fork: a snapshot of main, cloned below a container that passes its mountpoint down.
     let mounts = fixture.path("mnt");
+    fixture.path("mnt/raven");
     fixture.run(&[
         "create",
         &ws,
@@ -193,7 +281,7 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
     // What only this host can refuse.
     fixture.refused(
         &fixture.root,
-        &["set", &raven, "mountpoint=/etc/cowshed-itest"],
+        &["set", &raven, "mountpoint=/usr/cowshed-itest"],
         "belongs to uid 0",
     );
     fixture.refused(
@@ -209,12 +297,19 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
         "cowshed:owner",
     );
     fixture.refused(&fixture.root, &["check", &raven], "usage:");
+    // A dataset outside the root, here one beside it that does not exist, is refused by name
+    // before anything runs.
+    let outside = format!(
+        "{}/cowshed-itest-{}-outside",
+        fixture.parent,
+        std::process::id()
+    );
     fixture.refused(
         &fixture.root,
-        &["destroy", &format!("{}/unowned", fixture.tree)],
+        &["destroy", &outside],
         "not below the cowshed root",
     );
-    assert!(exists(&format!("{}/unowned", fixture.tree)));
+    assert!(!exists(&outside));
     assert_eq!(property(&raven, "mountpoint"), workspace.to_str().unwrap());
 
     // The origin pins its clone's source: ZFS itself refuses, and the helper never recurses.
@@ -233,6 +328,8 @@ fn the_helper_drives_a_workspace_and_a_build_volume_through_their_lives() {
     // Land: the landing build dataset, a clone of the target's seed, takes over its lineage.
     let (target, landing) = (format!("{build}/1"), format!("{build}/2"));
     let seed = format!("{target}@seed-1");
+    fixture.path("build/1");
+    fixture.path("build/2");
     fixture.run(&[
         "create",
         &build,

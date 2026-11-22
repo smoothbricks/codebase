@@ -740,18 +740,20 @@ root. Successful cleanup removes the root, and every run first ends the processe
 and attachments of, runs whose owner pid is gone. The same flow table runs on both substrates; substrate-specific
 assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
-**Real ZFS.** A real-ZFS proof makes everything in one scratch tree of its own, `<parent>/cowshed-itest-<pid>`, below a
-dataset the host names in `COWSHED_ZFS_TEST_PARENT`, and destroys that tree on every exit path. It needs `sudo -n`: the
-fixture's own tree is created and destroyed by root directly, and everything under test goes through `cowshed-helper`.
-The parent is named, never discovered, for the reason a pool is never guessed (09_substrates.md, selection). A scratch
-pool on a file vdev is not the fixture: `zpool create` is refused to the root of a container whose datasets are zoned to
-its user namespace, which is where the Linux lane runs, while a tree below a zoned parent works there and on a bare host
-alike. Run without the variable, the proof fails naming it; it is never skipped. It is two proofs: the helper's
-(`crates/cowshed-helper/tests/real_zfs.rs`), one walk of adopt, fork, `rm` and a land's promote, with the refusals only
-a real host can show (a root whose `cowshed:owner` is not the caller, a mountpoint in root's tree, a dataset outside the
-root); and the dataset payloads' (`storage::directory::zfs_tests` in `cowshed-core`), the store's mount protocol, a
-fork's clone, a reclaim and a capacity, through the real helper. Both are `#[ignore]`d, so an ordinary test run skips
-them.
+**Real ZFS.** The real-ZFS check is an explicit host check, never part of an ordinary test run: both of its tests are
+`#[ignore]`d, and nothing it does asks for a password. It works below the cowshed root that names the caller,
+`${COWSHED_ZFS_TEST_PARENT}/cowshed`, the parent named, never discovered, for the reason a pool is never guessed
+(09_substrates.md, selection), and drives every mutation through the helper `cowshed setup` installed, with `sudo -n`,
+as the product does: after setup's one administrator authorization nothing it runs needs another. Each run keeps its
+datasets in a project namespace of its own, `<root>/projects/cowshed-itest-<id>`, destroyed leaf first through the
+helper on every exit path, and its mountpoints in the per-user fixture directory beside the mount root ("Fixtures"), a
+directory of the user's on a filesystem that keeps ownership: a job's temporary directory lies in the store, whose
+volume ignores it. A host where the variable names nothing, where that root does not name the caller locally, or whose
+installed helper does not act as root without a password skips, printing `skipped:` and why. It is two proofs: the
+helper's (`crates/cowshed-helper/tests/real_zfs.rs`), one walk of adopt, fork, `rm` and a land's promote, with the
+refusals only a real host can show (a root whose `cowshed:owner` is not the caller's locally, a mountpoint in root's
+tree, a dataset outside the root); and the dataset payloads' (`storage::directory::zfs_tests` in `cowshed-core`), the
+mount protocol over a store that is not a dataset, a fork's clone, a reclaim and a capacity, through the real helper.
 
 The real-ZFS proof is a live host check, never an Nx target: no target runs it, so it is neither cached nor part of a
 land's gate, and a land never waits on a host's pool (the owner's ruling, 2026-11-22). Its verdict is about the host it
