@@ -182,15 +182,16 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// what it kept of what it replaced.
     async fn re_adopt(&mut self, options: AdoptOptions) -> Result<(WorkspaceSnapshot, ReAdoption)>;
     /// Bring `source`'s record of the Cargo targets mbx manages current before a clone of it to
-    /// `destination` starts (16_build_volumes.md, "Fork" step 4): a host with build volumes
-    /// refreshes the source here, once, at the verb's own level, so the clone only reads the
-    /// record. A clone resumed under its unfinished intent refreshes nothing.
+    /// `destination` (a rename when `rename`) starts (16_build_volumes.md, "Fork" step 4): a host
+    /// with build volumes refreshes the source here, once, at the verb's own level, so the clone
+    /// only reads the record. A clone resumed under its own unfinished intent refreshes nothing.
     async fn prepare_clone_source(
         &mut self,
         source: &WorkspaceName,
         destination: &WorkspaceName,
+        rename: bool,
     ) -> Result<()> {
-        let _ = (source, destination);
+        let _ = (source, destination, rename);
         Ok(())
     }
     async fn resume_fork(
@@ -217,7 +218,8 @@ pub trait ProjectRuntimeHost: Send + 'static {
             ));
         }
         let source = source.unwrap_or_else(WorkspaceName::main);
-        self.prepare_clone_source(&source, &workspace).await?;
+        self.prepare_clone_source(&source, &workspace, false)
+            .await?;
         self.resume_fork(
             workspace,
             crate::storage::recovery::MintOptions::fork(Some(source), options),
@@ -7295,9 +7297,11 @@ self.finish_retire_intent(&workspace).await?;
     /// clone drops (16_build_volumes.md, "Fork" step 4): the source's record when it is current,
     /// else the answer the source's last refresh discovered for a checkout with no build volume to
     /// record it, at the same mount and fingerprint. No refresh runs here, so a replayed clone
-    /// never re-enters recovery. With neither (a replay whose source was never refreshed since the
-    /// record existed), only the root target link is a candidate, as before the record: the gap is
-    /// said, and every candidate still goes only if it names a managed target.
+    /// never re-enters recovery. With neither (a replay whose source was not refreshed at its
+    /// current inputs), the candidates are every target an earlier discovery recorded for the
+    /// source, at whatever inputs, and the root target, which mbx's mint discard always named;
+    /// the gap (a nested target no discovery recorded) is said, and every candidate still goes
+    /// only if it names a managed target, so a stale candidate is kept, never wrongly unlinked.
     async fn clone_mbx_targets(
         &mut self,
         mount: &Path,
@@ -7318,12 +7322,30 @@ self.finish_retire_intent(&workspace).await?;
                 return Ok(targets);
             }
         }
+        let (volumes, at) = (self.build_volumes()?, mount.to_owned());
+        let mut targets = crate::storage::lifecycle::dispatch_blocking(move || {
+            Ok::<_, CowshedError>(
+                volumes
+                    .state_of(&at)?
+                    .and_then(|(_, state)| state.mbx_targets)
+                    .unwrap_or_default(),
+            )
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("build state task failed: {error}")))??;
+        let recorded = targets.len();
+        let root = crate::capabilities::RelPath::new("target")?;
+        if !targets.contains(&root) {
+            targets.push(root);
+        }
         cowshed_os::eprintln!(
-            "cowshed: {} records no Cargo targets mbx manages at its current inputs; this clone drops \
-             only an inherited root target link that names a managed target, and nested ones stay",
-            mount.display()
+            "cowshed: {} records no Cargo targets mbx manages at its current inputs; this clone \
+             drops the inherited links of the {} target(s) earlier discoveries recorded and of the \
+             root target that name managed targets, and a nested one no discovery recorded stays",
+            mount.display(),
+            recorded
         );
-        Ok(vec![crate::capabilities::RelPath::new("target")?])
+        Ok(targets)
     }
 
     /// Refresh `current`'s build state at its mounted checkout `mount`
@@ -14782,13 +14804,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         &mut self,
         source: &WorkspaceName,
         destination: &WorkspaceName,
+        rename: bool,
     ) -> Result<()> {
-        // A clone resumed under its unfinished intent reads what its first attempt left: a
-        // rename's source refuses its own refresh, and recovery must not re-enter itself.
+        // This same clone resumed under its unfinished intent reads what its first attempt left:
+        // a rename's source refuses its own refresh, and recovery must not re-enter itself. Any
+        // other unfinished intent on the destination is the clone's own to refuse.
+        let resumed = crate::storage::recovery::LifecycleIntent::Fork {
+            source: source.clone(),
+            destination: destination.clone(),
+            rename,
+        };
         if self
             .lifecycle_intents
             .get(destination)
-            .is_some_and(|record| record.completion.is_none())
+            .is_some_and(|record| record.completion.is_none() && record.operation == resumed)
         {
             return Ok(());
         }
@@ -16053,7 +16082,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "choose a different destination name",
             ));
         }
-        self.prepare_clone_source(&source, &destination).await?;
+        self.prepare_clone_source(&source, &destination, true)
+            .await?;
         self.clone_for_rename(source, destination, ClonePurpose::Rename)
             .await
     }
