@@ -517,8 +517,7 @@
         "inputs": [
           "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
           "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
-          "{projectRoot}/**/*.rs",
-          "!{projectRoot}/crates/cowshed-cli/tests/**/*.rs",
+          "{projectRoot}/crates/cowshed-helper/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           {
@@ -564,7 +563,7 @@
         "inputs": [
           "{workspaceRoot}/packages/build-inputs/src/**/*.ts",
           "!{workspaceRoot}/packages/build-inputs/src/**/*.test.ts",
-          "{projectRoot}/**/*.rs",
+          "{projectRoot}/crates/cowshed-helper/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
           "{workspaceRoot}/Cargo.toml",
           {
