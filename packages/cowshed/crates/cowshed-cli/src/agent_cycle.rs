@@ -178,8 +178,8 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
     }
     Some(CowshedError::conflict(
         format!(
-            "this install would restart the gateway under work it cuts off, so it installed and \
-             restarted nothing: {}",
+            "this install would restart the gateway under work it cuts off, so it put no build in \
+             place and restarted nothing (the storage repair setup ran before it stays done): {}",
             busy.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -201,7 +201,8 @@ pub fn read_judged(turns: &[LandTurnQueue], fenced: bool) -> Result<(), CowshedE
         (None, true) => Ok(()),
         (None, false) => Err(CowshedError::internal(
             "the gateway read no land turn holder but set no fence on the turns, so a land asking \
-             now would hold a turn this install's restart cuts; it installed and restarted nothing",
+             now would hold a turn this install's restart cuts; it put no build in place and \
+             restarted nothing (the storage repair setup ran before it stays done)",
         )),
     }
 }
