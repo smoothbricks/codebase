@@ -167,12 +167,13 @@ repository identity/copy input, not host-volume authority.
 
 The macOS store is always that APFS volume, and a macOS host serves two substrates side by side, one per project: APFS
 images and ZFS datasets. A project's substrate is chosen once, by its adoption: `cowshed adopt` keeps the project on
-APFS images, and `cowshed adopt --filesystem zfs` keeps it on datasets below the one cowshed root whose `cowshed:owner`
-names the caller, refused when no root or more than one does. Nothing records the choice. The project's entry for main
-in the store, `<store>/<owner>/<repo>/main.dmg`, is the fact every later opening reads: a regular file is a disk image
-and the project is an APFS project; any other entry is a dataset project's mount record or home directory, and the
-dataset mounted where it says, or the one whose `mountpoint` names that place when nothing is mounted there, names the
-root. Each execution host is built from that fact for its one project, so the gateway's inventory and heal,
+APFS images, and `cowshed adopt --filesystem zfs` keeps it on datasets below the root its own `.cowshed.toml`
+`[substrate] parent` names, which must name the caller, and with no declaration below the one cowshed root whose
+`cowshed:owner` names the caller, refused when no root or more than one does. Nothing records the choice. The project's
+entry for main in the store, `<store>/<owner>/<repo>/main.dmg`, is the fact every later opening reads: a regular file is
+a disk image and the project is an APFS project; any other entry is a dataset project's mount record or home directory,
+and the dataset mounted where it says, or the one whose `mountpoint` names that place when nothing is mounted there,
+names the root. Each execution host is built from that fact for its one project, so the gateway's inventory and heal,
 `mount main`, store-wide attach and detach, and a project controller all serve an APFS project through the image host
 and a dataset project through the directory host's protocol, as Linux serves one, with one difference the store's volume
 decides. <a id="smoo/cowshed!n/macos-dataset-payload-home"></a>The macOS store volume mounts `noowners`, so it can say
@@ -210,9 +211,10 @@ file, and setup reads the nearest one at or above the directory it runs in. With
 selects the nearest of its dataset and that dataset's ancestors whose `cowshed` child carries the caller's
 `cowshed:owner` set locally, read by exact name; every other anchor selects the directory store. cowshed never scans
 pools or silently picks one. A declaration that names another parent than the published store's, or any declaration on a
-host whose store is a directory store, is refused naming both. The root `<parent>/cowshed` exists before setup runs:
-whoever administers `<parent>` creates it and sets its owner ("Privileged helper"), and setup refuses a root that is
-absent with that command. `cowshed doctor` prints the selected substrate, root, and evidence.
+host whose store is a directory store, is refused naming both. The root `<parent>/cowshed` is set up by setup's own
+decision (01b_zfs.md, "One pool, one root"): on Linux a named root that does not exist is refused with the `zfs create`
+command whoever administers `<parent>` runs, and one whose owner is not the caller's is refused with the `zfs set` that
+mends it. `cowshed doctor` prints the selected substrate, root, and evidence.
 
 ## APFS image substrate (reference)
 

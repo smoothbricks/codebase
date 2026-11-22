@@ -195,13 +195,38 @@ pub fn build_root_helper() -> Option<PathBuf> {
 pub fn zfs_installed() -> bool {
     zfs::zfs_installed()
 }
-/// The ZFS roots that name this user whose root helper is not yet the system directory's copy
-/// of the build whose helper hashes to `sha256`, admitted by `sudo` with no credentials a
-/// terminal cached (09_substrates.md, "Install and privilege"). Empty on a host with no `zfs`
-/// or no such root, and on one whose helper is proven. Only reads, and `check` through `sudo -n
-/// -k`: nothing changes and nothing prompts.
-pub fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, ApfsStorageError> {
-    zfs::roots_awaiting_root_helper(sha256)
+
+/// The cowshed roots whose `cowshed:owner` names this user, as `zfs list` reads them, with no
+/// privilege; none on a host with no `zfs`.
+pub fn roots_naming_caller() -> Result<Vec<cowshed_helper::name::Root>, ApfsStorageError> {
+    if !zfs::zfs_installed() {
+        return Ok(Vec::new());
+    }
+    zfs::roots_serving_this_user().map(|(_, roots)| roots)
+}
+
+/// What setup's ZFS root decision reads of `root`
+/// ([`crate::storage::bootstrap::zfs_root::root_steps`]): that it does not exist, or its owner and,
+/// when `apple`, its four com.apple properties, each as `zfs get` reads value and source.
+pub fn root_evidence(
+    root: &cowshed_helper::name::Root,
+    apple: bool,
+) -> Result<crate::storage::bootstrap::zfs_root::RootEvidence, ApfsStorageError> {
+    zfs::root_evidence(root, apple)
+}
+
+/// The ZFS roots that name this user, and the roots `created` this setup creates, whose root
+/// helper is not yet the system directory's copy of the build whose helper hashes to `sha256`,
+/// admitted by `sudo` with no credentials a terminal cached (09_substrates.md, "Install and
+/// privilege"). A created root awaits it only when that copy is not this build's: the sudoers
+/// entry admits the helper's bytes for the user, whichever root it is asked about. Empty on a
+/// host with no `zfs`, and on one whose helper is proven. Only reads, and `check` through `sudo
+/// -n -k`: nothing changes and nothing prompts.
+pub fn roots_awaiting_root_helper(
+    sha256: &str,
+    created: &[String],
+) -> Result<Vec<String>, ApfsStorageError> {
+    zfs::roots_awaiting_root_helper(sha256, created)
 }
 
 /// The lifecycle host of a directory store. It holds no state but its configuration: the
@@ -732,6 +757,8 @@ impl DirectoryExecutionHost {
     /// holds the store; `None` for a project that keeps disk images. The project's main entry in
     /// the store says which ([`zfs::ZfsPayloads::of_project`]); a project with none yet is being
     /// adopted, and keeps datasets when `adopting` asks for ZFS. Nothing else records it.
+    /// An adoption onto datasets takes the root the checkout's own `.cowshed.toml` names when it
+    /// declares a parent.
     pub fn for_datasets(
         config: ApfsSubstrateConfig,
         repo: &crate::repository::RepoId,
@@ -740,6 +767,13 @@ impl DirectoryExecutionHost {
         Self::validate(&config)?;
         let main = super::StorageLayout::new(&config.store_root, repo)?.main_image()?;
         let datasets = adopting == Some(crate::api::dto::StoreSubstrate::Zfs);
+        // Only an adoption reads the declaration: an adopted project's main entry names its root.
+        let declared = if datasets {
+            crate::storage::bootstrap::native::declared_substrate(&config.checkout_path)
+                .map_err(host_error)?
+        } else {
+            None
+        };
         Ok(zfs::ZfsPayloads::of_project(
             &config.store_root,
             main.image(),
@@ -748,6 +782,9 @@ impl DirectoryExecutionHost {
                 .project()
                 .mount_root
                 .join(super::recovery::STAGING_NAMESPACE),
+            declared
+                .as_ref()
+                .map(crate::storage::bootstrap::SubstrateConfig::parent),
         )?
         .map(|payloads| Self::over(config, Payloads::Datasets(payloads))))
     }

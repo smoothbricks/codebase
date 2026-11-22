@@ -181,12 +181,15 @@ pub(super) fn build_root_helper() -> Option<PathBuf> {
 }
 
 /// [`super::roots_awaiting_root_helper`].
-pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, ApfsStorageError> {
+pub(super) fn roots_awaiting_root_helper(
+    sha256: &str,
+    created: &[String],
+) -> Result<Vec<String>, ApfsStorageError> {
     if !zfs_installed() {
         return Ok(Vec::new());
     }
     let (_, roots) = roots_serving_this_user()?;
-    if roots.is_empty() {
+    if roots.is_empty() && created.is_empty() {
         return Ok(Vec::new());
     }
     let system = Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join(HELPER);
@@ -195,7 +198,7 @@ pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, Ap
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(io_error("hash the system root helper", &system, error)),
     };
-    Ok(roots
+    let mut awaiting = roots
         .into_iter()
         .filter(|root| {
             if !current {
@@ -209,7 +212,11 @@ pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, Ap
             run("cowshed-helper check", command).is_err()
         })
         .map(|root| root.dataset().to_string())
-        .collect())
+        .collect::<Vec<_>>();
+    if !current {
+        awaiting.extend(created.iter().cloned());
+    }
+    Ok(awaiting)
 }
 
 fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageError> {
@@ -224,6 +231,64 @@ fn run(role: &'static str, mut command: Command) -> Result<String, ApfsStorageEr
             String::from_utf8_lossy(&output.stderr).trim_end(),
         ))
     }
+}
+
+/// [`super::root_evidence`]: one `zfs get` of the root's owner and, when `apple`, its four
+/// com.apple properties. Only `zfs` saying the dataset does not exist reads as
+/// [`RootEvidence::Absent`](crate::storage::bootstrap::zfs_root::RootEvidence::Absent); every other
+/// failure is the read's error.
+pub(super) fn root_evidence(
+    root: &Root,
+    apple: bool,
+) -> Result<crate::storage::bootstrap::zfs_root::RootEvidence, ApfsStorageError> {
+    use crate::storage::bootstrap::zfs_root::{ROOT_APPLE_PROPERTIES, Read, RootEvidence};
+    let owner = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
+    let mut properties = vec![owner];
+    if apple {
+        properties.extend(ROOT_APPLE_PROPERTIES);
+    }
+    let mut command = Command::new("zfs");
+    command
+        .args(["get", "-H", "-p", "-o", "property,value,source"])
+        .arg(properties.join(","))
+        .arg(root.dataset().as_str())
+        .env("PATH", cowshed_helper::host::TRUSTED_PATH)
+        .env("LC_ALL", "C");
+    let described = format!("{command:?}");
+    let output =
+        deadline::output_within("zfs read", &mut command, &deadline::start("zfs read", ZFS))
+            .map_err(|error| host(&described, error))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return if stderr.contains("dataset does not exist") {
+            Ok(RootEvidence::Absent)
+        } else {
+            Err(host(
+                format_args!("{described} ended {}", output.status),
+                stderr.trim_end(),
+            ))
+        };
+    }
+    let listed = String::from_utf8_lossy(&output.stdout);
+    // An unset user property reads `-` with source `-`: none.
+    let read = |property: &str| {
+        listed
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                Some((fields.next()?, fields.next()?, fields.next()?))
+            })
+            .find(|(name, _, _)| *name == property)
+            .filter(|(_, value, source)| (*value, *source) != ("-", "-"))
+            .map(|(_, value, source)| Read {
+                value: value.to_owned(),
+                source: source.to_owned(),
+            })
+    };
+    Ok(RootEvidence::Present {
+        owner: read(owner),
+        apple: ROOT_APPLE_PROPERTIES.map(|property| if apple { read(property) } else { None }),
+    })
 }
 
 /// An unprivileged `zfs` read. `zfs` is the one the helper runs
@@ -243,7 +308,7 @@ pub(super) fn zfs_installed() -> bool {
 }
 
 /// This process's real uid and the cowshed roots that name it as their owner.
-fn roots_serving_this_user() -> Result<(u32, Vec<Root>), ApfsStorageError> {
+pub(super) fn roots_serving_this_user() -> Result<(u32, Vec<Root>), ApfsStorageError> {
     // SAFETY: reads this process's real uid.
     let uid = unsafe { libc::getuid() };
     let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
@@ -352,6 +417,9 @@ enum Unserved {
     NoRoot { uid: u32 },
     /// More than one root would serve: cowshed never picks one.
     Several { uid: u32, roots: Vec<Root> },
+    /// The root the project's `.cowshed.toml` declares does not name the user: cowshed never
+    /// serves another's root, nor falls back to one it was not told.
+    DeclaredNotServing { root: Root, uid: u32 },
 }
 
 impl From<Unserved> for ApfsStorageError {
@@ -374,6 +442,19 @@ impl From<Unserved> for ApfsStorageError {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
+            Unserved::DeclaredNotServing { root, uid } => {
+                let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
+                host(
+                    format_args!(
+                        "the cowshed ZFS root {} that .cowshed.toml declares does not name uid {uid} as its owner",
+                        root.dataset()
+                    ),
+                    format_args!(
+                        "cowshed setup creates it where it is absent; whoever administers its parent sets an existing one: zfs set {property}={uid} {}",
+                        root.dataset()
+                    ),
+                )
+            }
         }
     }
 }
@@ -396,12 +477,14 @@ fn the_one(uid: u32, roots: Vec<Root>) -> Result<Option<Root>, Unserved> {
 /// regular file is a disk image. A mounted or assigned dataset names its root
 /// ([`root_of_main`]). A main at home is kept on the one serving root that holds its main dataset
 /// by name, and keeps no datasets when none does. An absent main is not adopted yet: it keeps
-/// datasets only when `adopt_datasets`, below the one root that names the user. `serving` reads
-/// the roots that name the user and `holding` those of them that hold the project's main
-/// dataset, each only for the entry that needs it.
+/// datasets only when `adopt_datasets`: below the root the project declares (`declared`) when it
+/// is among the roots that name the user, refused when it is not, and with nothing declared below
+/// the one root that names the user. `serving` reads the roots that name the user and `holding`
+/// those of them that hold the project's main dataset, each only for the entry that needs it.
 fn select<E: From<Unserved>>(
     main: MainEntry,
     adopt_datasets: bool,
+    declared: Option<Root>,
     serving: impl FnOnce() -> Result<(u32, Vec<Root>), E>,
     holding: impl FnOnce() -> Result<(u32, Vec<Root>), E>,
 ) -> Result<Option<Root>, E> {
@@ -414,7 +497,11 @@ fn select<E: From<Unserved>>(
         }
         MainEntry::Absent if adopt_datasets => {
             let (uid, roots) = serving()?;
-            Ok(Some(the_one(uid, roots)?.ok_or(Unserved::NoRoot { uid })?))
+            match declared {
+                Some(root) if roots.contains(&root) => Ok(Some(root)),
+                Some(root) => Err(Unserved::DeclaredNotServing { root, uid }.into()),
+                None => Ok(Some(the_one(uid, roots)?.ok_or(Unserved::NoRoot { uid })?)),
+            }
         }
         MainEntry::Absent => Ok(None),
     }
@@ -440,7 +527,9 @@ impl ZfsPayloads {
     ///   at home and its dataset unmounted: the one root that names this user and holds that
     ///   dataset by name is the project's.
     /// - With no entry the project is not adopted yet and keeps what its adoption asks for:
-    ///   datasets only when `adopt_datasets`, below the one cowshed root that names this user.
+    ///   datasets only when `adopt_datasets`, below the root `declared` names (the parent the
+    ///   project's `.cowshed.toml` declares) when that root names this user, else below the one
+    ///   cowshed root that names this user.
     ///
     /// The choice is [`select`]'s; this reads what it needs.
     pub(super) fn of_project(
@@ -448,6 +537,7 @@ impl ZfsPayloads {
         main: &Path,
         adopt_datasets: bool,
         scratch: &Path,
+        declared: Option<&str>,
     ) -> Result<Option<Self>, ApfsStorageError> {
         let entry = match fs::symlink_metadata(main) {
             Ok(metadata) if metadata.is_file() => MainEntry::File,
@@ -467,9 +557,15 @@ impl ZfsPayloads {
             Err(error) if error.kind() == io::ErrorKind::NotFound => MainEntry::Absent,
             Err(error) => return Err(io_error("inspect main payload", main, error)),
         };
-        let root = select(entry, adopt_datasets, roots_serving_this_user, || {
-            roots_holding(store_root, main)
-        })?;
+        let declared = crate::storage::bootstrap::zfs_root::named_parent(None, declared)
+            .map_err(|error| host(format_args!("the project's .cowshed.toml"), error))?;
+        let root = select(
+            entry,
+            adopt_datasets,
+            declared,
+            roots_serving_this_user,
+            || roots_holding(store_root, main),
+        )?;
         match root {
             Some(root) => Self::with_root(root, store_root, beside_this_executable())
                 .map(|payloads| Some(payloads.unmounted_at_home(scratch))),

@@ -166,6 +166,7 @@ pub const PARITY: &[Row] = &[
     row("setup", "force", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "retire-caches-volume", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "downgrade", Counterpart::CliOnly { reason: SETUP_DIALOG }),
+    row("setup", "zfs-parent", Counterpart::CliOnly { reason: SETUP_DIALOG }),
 
     row("fork", "", field(&[("coordinator.fork", "")], &[member("Coordinator.fork")])),
     row("fork", "workspaces", field(&[("coordinator.fork", "workspace"), ("coordinator.fork", "source")], &[argument("Coordinator.fork", 0, ""), argument("Coordinator.fork", 1, "source")])),

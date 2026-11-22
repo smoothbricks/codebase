@@ -192,8 +192,9 @@ Two verbs own the host story, both runnable from any directory:
   authorization it can ask for is `sudo`'s, announced first, and only to make the root-owned directories of a directory
   store that is not there yet; a ZFS root is changed through `cowshed-helper` and asks nothing. It pins nothing in
   `/etc/fstab`, encrypts nothing and installs no system service, and its report says why no boot mount is pinned. Run
-  inside a checkout whose `.cowshed.toml` declares `[substrate]`, it provisions that root on a host that has no store
-  yet. The install half is the same: the invoking build becomes the installed cowshed under
+  inside a checkout whose `.cowshed.toml` declares `[substrate]`, or with `--zfs-parent <pool|dataset>`, it provisions
+  that root on a host that has no store yet, and on macOS it sets up the root itself (01b_zfs.md, "One pool, one root").
+  The install half is the same: the invoking build becomes the installed cowshed under
   `~/Library/Application Support/dev.cowshed/bin`, and the gateway runs as the systemd user unit
   `dev.cowshed.gateway.service` (05_gateway.md), with nothing signed.
 

@@ -38,6 +38,10 @@ pub use platform::TERMINAL_REMEDY;
 
 /// What setup says on a host with no `zfs`, where the platform has something to say.
 pub use platform::WITHOUT_ZFS;
+
+/// What setup says on a host with `zfs` where no root names the user and none was named: how to
+/// name one, since cowshed never picks a pool.
+pub const NAME_A_PARENT: &str = "no ZFS root names you, so projects stay on APFS images or directories; name the pool or dataset to hold it with `cowshed setup --zfs-parent <pool|dataset>` or a `.cowshed.toml` `[substrate] kind = \"zfs\"` and `parent = \"<pool|dataset>\"`, and setup sets up `<parent>/cowshed`";
 /// What makes a helper that did not act as root do so: why this is the step, and the command.
 #[derive(Debug, Eq, PartialEq)]
 struct Remedy {

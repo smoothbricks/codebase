@@ -287,6 +287,8 @@ pub struct NativeHostSetup {
     slot: InstallSlot,
     /// Whether this run may install a build that does not contain the installed cowshed.
     downgrade: Downgrade,
+    /// The ZFS root's parent this run was named on the command line (`--zfs-parent`).
+    zfs_parent: Option<String>,
 }
 
 impl NativeHostSetup {
@@ -296,18 +298,27 @@ impl NativeHostSetup {
             roots: CanonicalRoots::global(),
             slot,
             downgrade,
+            zfs_parent: None,
         })
+    }
+
+    /// This setup run, set up for the ZFS root below `parent` when one is named.
+    pub fn with_zfs_parent(self, parent: Option<String>) -> Self {
+        Self {
+            zfs_parent: parent,
+            ..self
+        }
     }
 }
 
 #[async_trait]
 impl HostSetup for NativeHostSetup {
     async fn plan(&mut self, caches_volume: CachesVolume) -> Result<HostSetupPlan> {
-        plan_host_setup(&self.home, caches_volume).await
+        plan_host_setup(&self.home, caches_volume, self.zfs_parent.as_deref()).await
     }
 
     async fn execute(&mut self, caches_volume: CachesVolume) -> Result<HostSetupReport> {
-        execute_host_setup(&self.home, caches_volume).await
+        execute_host_setup(&self.home, caches_volume, self.zfs_parent.as_deref()).await
     }
 
     async fn plan_uninstall(&mut self) -> Result<HostUninstallPlan> {
@@ -344,6 +355,16 @@ impl HostSetup for NativeHostSetup {
             && let Some(note) = crate::zfs_helper::WITHOUT_ZFS
         {
             cowshed_os::eprintln!("cowshed: {note}");
+        }
+        if self.zfs_parent.is_none()
+            && cowshed_core::storage::directory::zfs_installed()
+            && cowshed_core::storage::directory::roots_naming_caller()
+                .map_err(|error| {
+                    CowshedError::environment_missing(error.to_string(), "cowshed setup")
+                })?
+                .is_empty()
+        {
+            cowshed_os::eprintln!("cowshed: {}", crate::zfs_helper::NAME_A_PARENT);
         }
         let setup = crate::gateway_service::running_executable()?;
         let prove =
@@ -803,7 +824,8 @@ where
         } else {
             Downgrade::Refuse
         },
-    )?;
+    )?
+    .with_zfs_parent(args.zfs_parent.clone());
     dispatch(&mut host, args, json, output).await
 }
 
@@ -1477,6 +1499,10 @@ fn action_intent(action: &HostAction) -> String {
         } => format!(
             "{name} (UUID {uuid}) at {} holds nothing but its marker and will be deleted; its /etc/fstab pin and mount-service entry are rewritten without it",
             mounted_at.display()
+        ),
+        HostAction::CreateRoot { root, command } => format!(
+            "the ZFS root {root} will be created with `{}`, and read back before the root helper is installed for it",
+            command.join(" ")
         ),
         HostAction::InstallRootHelper {
             roots,

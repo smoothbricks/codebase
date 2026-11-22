@@ -75,7 +75,7 @@ identity with `cowshed mv main --repo-id`.
 
 ## Lifecycle
 
-### `cowshed setup [--uninstall] [--force] [--downgrade]`
+### `cowshed setup [--uninstall] [--force] [--downgrade] [--zfs-parent <pool|dataset>]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates an
 absent store volume, remounts a detached or mis-mounted one at its canonical path, FileVault-encrypts an unencrypted

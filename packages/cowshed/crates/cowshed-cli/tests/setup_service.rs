@@ -280,18 +280,21 @@ const REPAIR: SetupArgs = SetupArgs {
     force: false,
     retire_caches_volume: false,
     downgrade: false,
+    zfs_parent: None,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
     retire_caches_volume: false,
     downgrade: false,
+    zfs_parent: None,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
     retire_caches_volume: false,
     downgrade: false,
+    zfs_parent: None,
 };
 
 struct Streams {

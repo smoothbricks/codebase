@@ -16,19 +16,29 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
 - **The pool is selected, never guessed.** A published store selects its own root; on a Linux host without one, the
   anchor's dataset chain selects the root that names the caller. Any other Linux checkout names the root's parent with
   `.cowshed.toml` `[substrate] kind = "zfs"` and `parent = "<parent>"`, the pool or any dataset in it; on macOS a
-  project's adoption with `--filesystem zfs` takes the one root whose `cowshed:owner` names the caller, refused when
-  there is none or more than one (09_substrates.md, selection); cowshed never scans pools or picks one. One pool carries
-  cowshed on a host. The operator creates it and chooses its features against the installed OpenZFS; cowshed never
-  enables or upgrades a pool feature, since a feature upgrade is irreversible.
+  project's adoption with `--filesystem zfs` takes the root its own `.cowshed.toml` names when it declares a parent,
+  which must name the caller, and otherwise the one root whose `cowshed:owner` names the caller, refused when there is
+  none or more than one (09_substrates.md, selection); cowshed never scans pools or picks one. One pool carries cowshed
+  on a host. The operator creates it and chooses its features against the installed OpenZFS; cowshed never enables or
+  upgrades a pool feature, since a feature upgrade is irreversible.
 - **The pool's storage is not on the Data volume.** A file vdev on Data would have every rewritten block pinned by
   Data's hourly local snapshots, for the same reason the APFS store is a dedicated volume
   ([01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume), "Why a volume and not paths on Data").
   The pool lives on its own disk or partition, or on a file vdev on a volume that takes no local snapshots.
-- **One root dataset, `<pool>/cowshed`**, where `<pool>` stands for that parent. On Linux whoever administers the parent
-  creates the root and sets `cowshed:owner` on it, and `cowshed setup` creates only what lies below it
-  (09_substrates.md, "Privileged helper", "Linux host paths"). On macOS `cowshed setup` creates it with the macOS
-  properties of [No disk per dataset](#no-disk-per-dataset) set locally, before any dataset exists beneath it, and
-  attests them on every run. Every other cowshed dataset sits below it and inherits them:
+- <a id="smoo/cowshed!n/zfs-root-setup"></a>**One root dataset, `<pool>/cowshed`**, where `<pool>` stands for that
+  parent. `cowshed setup` sets it up, from one pure decision on both platforms (`zfs_root.rs`, proven by
+  [zfs_substrate.bend](laws/zfs_substrate.bend)). The parent is named, never guessed: `--zfs-parent <pool|dataset>`, or
+  the `[substrate] parent` of the nearest `.cowshed.toml` at or above where setup runs, the two refused, naming both,
+  when they disagree. A named root that does not exist is created with `mountpoint=none`, `cowshed:owner=<uid>` and, on
+  macOS, the four properties of [No disk per dataset](#no-disk-per-dataset), all set locally, before any dataset exists
+  beneath it: on macOS inside setup's one administrator authorization, with the root helper's install, so one dialog
+  serves both, and read back before anything trusts it; on Linux setup refuses with that `zfs create` command as its
+  `next:` line, the administrator's step. A root that exists is taken when its owner is the caller's uid set locally
+  and, on macOS, the four properties are `off` and local, which setup attests on every run with no dialog; otherwise
+  setup refuses, naming each wrong property, with the exact `zfs set` command that mends it. With nothing named, setup
+  takes or refuses each root that names the caller the same way, and with none it says how to name a parent.
+  `cowshed setup` creates only what lies below the root after that (09_substrates.md, "Privileged helper", "Linux host
+  paths"). Every other cowshed dataset sits below it and inherits them:
 
 ```
 <pool>                               the pool's root dataset

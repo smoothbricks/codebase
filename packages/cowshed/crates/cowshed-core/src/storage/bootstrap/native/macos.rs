@@ -37,7 +37,7 @@ use super::shared::{
     PIN_FSTAB_ACTION, SystemBootstrapHost, UninstallFstabOutcome, UninstallReport,
     UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_native_bootstrap_plan,
     existing_host_storage_error, platform_host_error, provision_volumes_action,
-    setup_execution_error, write_marker_action,
+    setup_execution_error, working_directory_declaration, write_marker_action,
 };
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
@@ -66,6 +66,8 @@ const CHMOD: &str = "/bin/chmod";
 const VISUDO: &str = "/usr/sbin/visudo";
 /// The root helper's file name, in the build and in the system directory.
 const ROOT_HELPER: &str = "cowshed-helper";
+/// The `zfs` OpenZFS for macOS installs, run by setup's authorization session to create a root.
+const ZFS_EXECUTABLE: &str = "/usr/local/zfs/bin/zfs";
 const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 const PRIVILEGED_SHELL: &str = "/bin/sh";
 /// POSIX `sh -c` body. `$0` is the absolute tool, `$@` its argv.
@@ -281,7 +283,15 @@ impl BootstrapHost for AuthorizedBootstrapHost {
             arbitration_probe(HostNamespace::Production, device)?;
         }
         if [
-            CHMOD, DISKUTIL, INSTALL, LAUNCHCTL, MV, RM, SECURITY, VISUDO,
+            CHMOD,
+            DISKUTIL,
+            INSTALL,
+            LAUNCHCTL,
+            MV,
+            RM,
+            SECURITY,
+            VISUDO,
+            ZFS_EXECUTABLE,
         ]
         .contains(&command.program())
         {
@@ -1250,6 +1260,7 @@ fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
             HostAction::EncryptVolume { .. }
                 | HostAction::InstallMountService { .. }
                 | HostAction::InstallRootHelper { .. }
+                | HostAction::CreateRoot { .. }
                 | HostAction::DeleteVolume { .. }
         )
     }) || snapshot
@@ -1283,7 +1294,8 @@ fn action_volume_name(action: &HostAction) -> Option<&str> {
         | HostAction::EnsureMountRoot { .. }
         | HostAction::ReclaimStubs { .. }
         | HostAction::InstallMountService { .. }
-        | HostAction::InstallRootHelper { .. } => None,
+        | HostAction::InstallRootHelper { .. }
+        | HostAction::CreateRoot { .. } => None,
     }
 }
 
@@ -1733,7 +1745,141 @@ fn root_helper_action(
 /// Plan the root helper's install (09_substrates.md, "Install and privilege"): only for a build
 /// that carries a helper, and only when a ZFS root that names the user is not yet served by the
 /// system directory's copy of exactly that helper, admitted by `sudo -n -k`. Reads only.
-fn add_root_helper_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
+/// Set up the ZFS root that serves the user (01b_zfs.md, "One pool, one root"), as
+/// [`crate::storage::bootstrap::zfs_root::root_steps`] decides from what is read: a named root
+/// that does not exist is planned as [`HostAction::CreateRoot`] in setup's authorization, an
+/// existing one is taken, and a wrong one refuses with its remedy before anything changes.
+/// Answers the roots it plans to create.
+fn add_zfs_root_actions(
+    snapshot: &mut SetupSnapshot,
+    zfs_parent: Option<&str>,
+) -> Result<Vec<String>, NativeBootstrapError> {
+    use crate::storage::bootstrap::zfs_root::{named_parent, root_steps};
+    if !crate::storage::directory::zfs_installed() {
+        return Ok(Vec::new());
+    }
+    let declared = working_directory_declaration()?;
+    let named = named_parent(
+        zfs_parent,
+        declared
+            .as_ref()
+            .map(crate::storage::bootstrap::SubstrateConfig::parent),
+    )?;
+    let serving = match named {
+        Some(_) => Vec::new(),
+        None => crate::storage::directory::roots_naming_caller().map_err(zfs_read_error)?,
+    };
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    let steps = root_steps(true, named.as_ref(), &serving, uid, true, |root| {
+        crate::storage::directory::root_evidence(root, true)
+    })
+    .map_err(zfs_read_error)?;
+    let (actions, created) = root_actions(steps)?;
+    snapshot.actions.extend(actions);
+    Ok(created)
+}
+
+fn zfs_read_error(error: crate::storage::apfs::ApfsStorageError) -> NativeBootstrapError {
+    NativeBootstrapError::Host(HostError::new(error.to_string()))
+}
+
+/// The actions setup takes for the root decision's `steps`, and the roots they create: a create
+/// step is its [`HostAction::CreateRoot`], a refusal ends setup with its remedy before anything
+/// changes, and every other step plans nothing.
+fn root_actions(
+    steps: Vec<crate::storage::bootstrap::zfs_root::RootStep>,
+) -> Result<(Vec<HostAction>, Vec<String>), NativeBootstrapError> {
+    use crate::storage::bootstrap::zfs_root::{RootStep, create_command};
+    let mut actions = Vec::new();
+    let mut created = Vec::new();
+    for step in &steps {
+        match step {
+            RootStep::Nothing | RootStep::NameAPool | RootStep::Take { .. } => {}
+            RootStep::Create { root, .. } => {
+                let command = create_command(step).expect("a create step spells its command");
+                actions.push(HostAction::CreateRoot {
+                    root: root.clone(),
+                    command,
+                });
+                created.push(root.clone());
+            }
+            RootStep::Refuse { root, why, remedy } => {
+                return Err(NativeBootstrapError::ZfsRoot {
+                    root: root.clone(),
+                    why: why.clone(),
+                    remedy: remedy.clone(),
+                });
+            }
+        }
+    }
+    Ok((actions, created))
+}
+
+/// Create the root `root` with `command`, `zfs create -o … <root>` as the decision spelled it, run
+/// by `host`, setup's authorization session, as the `zfs` OpenZFS for macOS installs; then read it
+/// back with `evidence` as `uid`'s: nothing trusts a root the decision would not take.
+fn create_zfs_root_with<E: std::fmt::Display>(
+    host: &dyn BootstrapHost,
+    root: &str,
+    command: &[String],
+    uid: u32,
+    evidence: impl FnMut(
+        &cowshed_helper::name::Root,
+    ) -> Result<crate::storage::bootstrap::zfs_root::RootEvidence, E>,
+) -> Result<(), HostError> {
+    use crate::storage::bootstrap::zfs_root::{RootStep, root_steps};
+    let parsed = cowshed_helper::name::Root::parse(root)
+        .map_err(|error| HostError::new(format!("{root}: {error}")))?;
+    let arguments = command
+        .get(1..)
+        .filter(|arguments| arguments.last().map(String::as_str) == Some(root))
+        .ok_or_else(|| HostError::new(format!("{command:?} does not create {root}")))?;
+    required_host_command(
+        host,
+        HostCommand::new(ZFS_EXECUTABLE, arguments.iter().map(String::as_str)),
+    )?;
+    let steps = root_steps(true, Some(&parsed), &[], uid, true, evidence)
+        .map_err(|error| HostError::new(format!("read back {root}: {error}")))?;
+    match steps.as_slice() {
+        [RootStep::Take { .. }] => Ok(()),
+        [RootStep::Refuse { why, .. }] => Err(HostError::new(format!(
+            "the root {root} setup created reads back wrong: {why}"
+        ))),
+        other => Err(HostError::new(format!(
+            "the root {root} setup created reads back as {other:?}"
+        ))),
+    }
+}
+
+async fn create_zfs_root(
+    host: Arc<dyn BootstrapHost>,
+    root: String,
+    command: Vec<String>,
+) -> Result<(), CowshedError> {
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: reads this process's real uid.
+        let uid = unsafe { libc::getuid() };
+        create_zfs_root_with(host.as_ref(), &root, &command, uid, |root| {
+            crate::storage::directory::root_evidence(root, true)
+        })
+    })
+    .await
+    .map_err(|error| {
+        setup_execution_error(
+            NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(
+                error.to_string(),
+            )),
+            "cowshed setup",
+        )
+    })?
+    .map_err(NativeBootstrapError::Host)
+    .map_err(|error| setup_execution_error(error, "cowshed setup"))
+}
+fn add_root_helper_action(
+    snapshot: &mut SetupSnapshot,
+    created: &[String],
+) -> Result<(), NativeBootstrapError> {
     let Some(helper) = crate::storage::directory::build_root_helper() else {
         return Ok(());
     };
@@ -1744,7 +1890,7 @@ fn add_root_helper_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBoot
             source,
         ))
     })?;
-    let roots = crate::storage::directory::roots_awaiting_root_helper(&sha256)
+    let roots = crate::storage::directory::roots_awaiting_root_helper(&sha256, created)
         .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
     // SAFETY: reads this process's real uid.
     let uid = unsafe { libc::getuid() };
@@ -2066,6 +2212,9 @@ async fn execute_snapshot_actions(
                     .collect::<Vec<_>>();
                 execute_setup_operations(&operations, Arc::clone(&host)).await
             }
+            HostAction::CreateRoot { root, command } => {
+                create_zfs_root(Arc::clone(&host), root.clone(), command.clone()).await
+            }
             HostAction::InstallRootHelper {
                 helper,
                 sha256,
@@ -2184,8 +2333,10 @@ async fn gather_setup_snapshot(
     home: &Path,
     host: Arc<dyn BootstrapHost>,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> Result<SetupSnapshot, NativeBootstrapError> {
     let home = home.to_owned();
+    let zfs_parent = zfs_parent.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
         let existing_fstab = read_fstab_text().map_err(NativeBootstrapError::Host)?;
         let mut source = SystemEvidenceSource {
@@ -2195,7 +2346,8 @@ async fn gather_setup_snapshot(
             prepare_setup_snapshot(&mut source, &home, &existing_fstab, caches_volume)?;
         add_mount_root_action(&mut snapshot)?;
         add_mount_service_action(&mut snapshot)?;
-        add_root_helper_action(&mut snapshot)?;
+        let created = add_zfs_root_actions(&mut snapshot, zfs_parent.as_deref())?;
+        add_root_helper_action(&mut snapshot, &created)?;
         Ok(snapshot)
     })
     .await
@@ -2207,11 +2359,17 @@ async fn gather_setup_snapshot(
 pub async fn plan_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> crate::Result<HostSetupPlan> {
     {
-        let snapshot = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume)
-            .await
-            .map_err(existing_host_storage_error)?;
+        let snapshot = gather_setup_snapshot(
+            home,
+            Arc::new(SystemBootstrapHost),
+            caches_volume,
+            zfs_parent,
+        )
+        .await
+        .map_err(existing_host_storage_error)?;
         Ok(HostSetupPlan::new(
             host_setup_actions(&snapshot),
             snapshot.volumes.clone(),
@@ -2223,11 +2381,17 @@ pub async fn plan_host_setup(
 pub async fn execute_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> crate::Result<HostSetupReport> {
     {
-        let initial = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost), caches_volume)
-            .await
-            .map_err(existing_host_storage_error)?;
+        let initial = gather_setup_snapshot(
+            home,
+            Arc::new(SystemBootstrapHost),
+            caches_volume,
+            zfs_parent,
+        )
+        .await
+        .map_err(existing_host_storage_error)?;
         let authorized = setup_requires_authorization(&initial);
         let host: Arc<dyn BootstrapHost> = if authorized {
             let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
@@ -2269,24 +2433,30 @@ pub async fn execute_host_setup(
             });
         let fstab = if needs_post_evidence {
             // A retired volume is gone by now; the host is re-read as it stands.
-            let post =
-                match gather_setup_snapshot(home, Arc::clone(&host), CachesVolume::Keep).await {
-                    Ok(post) => post,
-                    Err(error) => {
-                        let error = setup_execution_error(error, "cowshed setup");
-                        if let Some(last) = action_outcomes.last_mut() {
-                            last.outcome = HostActionResult::Failed {
-                                error: error.clone(),
-                            };
-                        }
-                        return Ok(HostSetupReport {
-                            action_outcomes,
-                            volumes: initial.volumes,
-                            fstab: FstabOutcome::Skipped(error.message.clone()),
-                            authorized,
-                        });
+            let post = match gather_setup_snapshot(
+                home,
+                Arc::clone(&host),
+                CachesVolume::Keep,
+                zfs_parent,
+            )
+            .await
+            {
+                Ok(post) => post,
+                Err(error) => {
+                    let error = setup_execution_error(error, "cowshed setup");
+                    if let Some(last) = action_outcomes.last_mut() {
+                        last.outcome = HostActionResult::Failed {
+                            error: error.clone(),
+                        };
                     }
-                };
+                    return Ok(HostSetupReport {
+                        action_outcomes,
+                        volumes: initial.volumes,
+                        fstab: FstabOutcome::Skipped(error.message.clone()),
+                        authorized,
+                    });
+                }
+            };
             if post
                 .plan
                 .operations()
@@ -9315,6 +9485,223 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert!(!scene.drop_in().exists());
     }
     //#endregion smoo/cowshed!n/macos-root-helper-authorization
+
+    /// Records the commands setup's authorization session is asked to run, answering each with
+    /// `answer`; it reads, creates and mounts nothing else.
+    struct ZfsRootCreateHost {
+        commands: Mutex<Vec<HostCommand>>,
+        answer: fn() -> Result<HostCommandOutput, HostError>,
+    }
+
+    impl ZfsRootCreateHost {
+        fn answering(answer: fn() -> Result<HostCommandOutput, HostError>) -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                answer,
+            }
+        }
+    }
+
+    impl BootstrapHost for ZfsRootCreateHost {
+        fn verify_zfs_delegation(&self, _pool: &str, _root: &str) -> Result<(), HostError> {
+            unreachable!("the root's creation verifies no delegation")
+        }
+
+        fn inspect_mountpoint(&self, _path: &Path) -> Result<MountpointState, HostError> {
+            unreachable!("the root's creation inspects no mountpoint")
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("the root's creation makes no directory")
+        }
+
+        fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("the root's creation reclaims nothing")
+        }
+
+        fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.commands.lock().unwrap().push(command.clone());
+            (self.answer)()
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            unreachable!("the root's creation provisions no volume")
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            unreachable!("the root's creation writes no file")
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            unreachable!("the root's creation pins nothing")
+        }
+    }
+
+    const CREATED_ROOT: &str = "csproof/fresh/cowshed";
+
+    fn root_read(value: &str) -> Option<crate::storage::bootstrap::zfs_root::Read> {
+        Some(crate::storage::bootstrap::zfs_root::Read {
+            value: value.into(),
+            source: "local".into(),
+        })
+    }
+
+    /// The evidence of a root set up as setup creates it, for `uid`.
+    fn created_root(uid: u32) -> crate::storage::bootstrap::zfs_root::RootEvidence {
+        crate::storage::bootstrap::zfs_root::RootEvidence::Present {
+            owner: root_read(&uid.to_string()),
+            apple: [
+                root_read("off"),
+                root_read("off"),
+                root_read("off"),
+                root_read("off"),
+            ],
+        }
+    }
+
+    fn create_step(uid: u32) -> crate::storage::bootstrap::zfs_root::RootStep {
+        use crate::storage::bootstrap::zfs_root::{RootEvidence, root_steps};
+        let root = cowshed_helper::name::Root::parse(CREATED_ROOT).unwrap();
+        let steps = root_steps(true, Some(&root), &[], uid, true, |_| {
+            Ok::<_, std::convert::Infallible>(RootEvidence::Absent)
+        })
+        .unwrap();
+        let [step] = <[_; 1]>::try_from(steps).unwrap();
+        step
+    }
+
+    /// A named root that does not exist is one CreateRoot, the decision's own command, and it
+    /// asks for setup's authorization, in which the helper's install for it follows; a root that
+    /// is taken plans nothing and asks nothing.
+    #[test]
+    fn a_named_absent_root_is_created_in_setups_authorization_and_a_taken_one_asks_nothing() {
+        use crate::storage::bootstrap::zfs_root::{RootStep, create_command};
+        let step = create_step(501);
+        let command = create_command(&step).unwrap();
+        assert_eq!(command.last().map(String::as_str), Some(CREATED_ROOT));
+        let (actions, created) = root_actions(vec![step]).unwrap();
+        assert_eq!(
+            actions,
+            vec![HostAction::CreateRoot {
+                root: CREATED_ROOT.into(),
+                command,
+            }]
+        );
+        assert_eq!(created, vec![String::from(CREATED_ROOT)]);
+
+        let mut source = healthy_existing_source();
+        let first = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .expect("pin plan");
+        let PlannedFstab::NeedsPin(pins) = first.fstab else {
+            panic!("empty fstab must need pins");
+        };
+        let current = build_fstab("", &pins).expect("desired fstab");
+        let mut source = healthy_existing_source();
+        let mut snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            &current,
+            CachesVolume::Keep,
+        )
+        .expect("healthy setup plan");
+        let (taken, none) = root_actions(vec![RootStep::Take {
+            root: CREATED_ROOT.into(),
+        }])
+        .unwrap();
+        assert_eq!((taken.clone(), none), (Vec::new(), Vec::new()));
+        snapshot.actions.extend(taken);
+        assert!(!setup_requires_authorization(&snapshot));
+        snapshot.actions.extend(actions);
+        assert!(setup_requires_authorization(&snapshot));
+    }
+
+    /// A wrong root ends setup before anything changes, its error the decision's reason and its
+    /// next step the decision's remedy, then setup again.
+    #[test]
+    fn a_wrong_root_refuses_setup_with_the_command_that_mends_it() {
+        use crate::storage::bootstrap::zfs_root::RootStep;
+        let error = root_actions(vec![RootStep::Refuse {
+            root: CREATED_ROOT.into(),
+            why: "com.apple.browse is on".into(),
+            remedy: format!("zfs set com.apple.browse=off {CREATED_ROOT}"),
+        }])
+        .unwrap_err();
+        let error = existing_host_storage_error(error);
+        assert_eq!(error.message, "com.apple.browse is on");
+        assert_eq!(
+            error.hint,
+            format!("zfs set com.apple.browse=off {CREATED_ROOT} && cowshed setup")
+        );
+    }
+
+    /// The session runs exactly the decision's `zfs create`, as the `zfs` OpenZFS for macOS
+    /// installs, and the root is trusted only once it reads back as the decision would take it.
+    #[test]
+    fn the_root_is_created_by_openzfss_zfs_and_trusted_only_as_it_reads_back() {
+        use crate::storage::bootstrap::zfs_root::{RootEvidence, create_command};
+        let step = create_step(501);
+        let command = create_command(&step).unwrap();
+        let host = ZfsRootCreateHost::answering(|| Ok(HostCommandOutput::default()));
+        create_zfs_root_with(&host, CREATED_ROOT, &command, 501, |_| {
+            Ok::<_, std::convert::Infallible>(created_root(501))
+        })
+        .unwrap();
+        let commands = host.commands.into_inner().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program(), ZFS_EXECUTABLE);
+        assert_eq!(commands[0].args(), &command[1..]);
+
+        let host = ZfsRootCreateHost::answering(|| Ok(HostCommandOutput::default()));
+        let error = create_zfs_root_with(&host, CREATED_ROOT, &command, 501, |_| {
+            Ok::<_, std::convert::Infallible>(RootEvidence::Absent)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("reads back"), "{error}");
+
+        let host = ZfsRootCreateHost::answering(|| Ok(HostCommandOutput::default()));
+        let error = create_zfs_root_with(&host, CREATED_ROOT, &command, 501, |_| {
+            Ok::<_, std::convert::Infallible>(created_root(502))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("reads back wrong"), "{error}");
+    }
+
+    /// A declined dialog runs nothing and reads nothing back, and setup says nothing changed.
+    #[test]
+    fn a_declined_dialog_creates_no_root() {
+        use crate::storage::bootstrap::zfs_root::create_command;
+        let command = create_command(&create_step(501)).unwrap();
+        let host = ZfsRootCreateHost::answering(|| {
+            Err(HostError::authorization_denied(
+                "preauthorize privileged execution was declined",
+            ))
+        });
+        let error = create_zfs_root_with(
+            &host,
+            CREATED_ROOT,
+            &command,
+            501,
+            |_| -> Result<
+                crate::storage::bootstrap::zfs_root::RootEvidence,
+                std::convert::Infallible,
+            > { unreachable!("a declined creation reads nothing back") },
+        )
+        .unwrap_err();
+        let error = setup_execution_error(NativeBootstrapError::Host(error), "cowshed setup");
+        assert_eq!(
+            error.message,
+            "authorization was declined; nothing was changed"
+        );
+    }
 
     #[tokio::test]
     async fn existing_host_storage_returns_roots_and_queries_only_home_without_mutation() {

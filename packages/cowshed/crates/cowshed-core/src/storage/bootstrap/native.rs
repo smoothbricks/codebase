@@ -16,6 +16,7 @@ use linux as platform;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
+pub(crate) use shared::declared_substrate;
 pub use shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,

@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,8 +9,11 @@ use thiserror::Error;
 use super::super::{
     ApfsVolumeProvision, BlockingLane, BootstrapExecutionError, BootstrapHost, BootstrapPlan,
     DISKUTIL, HostCommand, HostCommandFailure, HostError, HostOperation, PlanError, SelectionError,
-    VolumeRole, execute_bootstrap,
+    SubstrateConfig, VolumeRole, execute_bootstrap, parse_cowshed_config,
 };
+
+/// The file a checkout declares its cowshed settings in.
+const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
 use crate::error::CowshedError;
 use crate::storage::apfs::ApfsStorageError;
 
@@ -102,6 +106,14 @@ pub enum HostAction {
     },
     InstallMountService {
         label: String,
+    },
+    /// Create the ZFS root `root` with `command`, the `zfs create -o … <root>` setup's decision
+    /// spelled (01b_zfs.md, "One pool, one root"): planned on macOS for a named parent whose root
+    /// does not exist, and run in setup's one authorization session before the root helper's
+    /// install.
+    CreateRoot {
+        root: String,
+        command: Vec<String>,
     },
     /// Install this build's ZFS root helper in the root-owned system directory, with the sudoers
     /// entry that admits exactly its bytes for `uid` (09_substrates.md, "Install and privilege"):
@@ -230,7 +242,13 @@ pub enum UninstallFstabOutcome {
 pub struct SystemBootstrapHost;
 
 pub(crate) fn existing_host_storage_error(error: NativeBootstrapError) -> CowshedError {
-    CowshedError::environment_missing(error.to_string(), "cowshed setup")
+    match error {
+        // A ZFS root that is wrong says what mends it, and setup is the next step only after that.
+        NativeBootstrapError::ZfsRoot { why, remedy, .. } => {
+            CowshedError::environment_missing(why, format!("{remedy} && cowshed setup"))
+        }
+        error => CowshedError::environment_missing(error.to_string(), "cowshed setup"),
+    }
 }
 
 pub(crate) fn setup_execution_error(
@@ -344,6 +362,18 @@ fn is_unprivileged_apfs_remount(command: &HostCommand) -> bool {
 
 #[derive(Debug, Error)]
 pub enum NativeBootstrapError {
+    /// The ZFS root setup would take is wrong: `why` names each wrong property and `remedy` is the
+    /// exact command that mends it (01b_zfs.md, "One pool, one root").
+    #[error("{why}")]
+    ZfsRoot {
+        root: String,
+        why: String,
+        remedy: String,
+    },
+    /// The ZFS parent setup was named is no parent, or the command line and `.cowshed.toml` name
+    /// two.
+    #[error(transparent)]
+    ZfsParent(#[from] crate::storage::bootstrap::zfs_root::NamedParentError),
     #[error(
         "{existing} is this host's store, but .cowshed.toml declares the ZFS parent {configured:?}; a host has one store"
     )]
@@ -458,4 +488,46 @@ pub(crate) fn platform_host_error(operation: &str) -> HostError {
         "{operation} is unsupported on {}",
         std::env::consts::OS
     ))
+}
+
+/// The `[substrate]` the `.cowshed.toml` in `directory` declares, `None` when there is no file
+/// or it declares none.
+pub(crate) fn declared_substrate(
+    directory: &Path,
+) -> Result<Option<SubstrateConfig>, NativeBootstrapError> {
+    let path = directory.join(COWSHED_CONFIG_FILE);
+    let declaration = |message: String| NativeBootstrapError::SubstrateDeclaration {
+        path: path.clone(),
+        message,
+    };
+    match fs::read_to_string(&path) {
+        Ok(input) => parse_cowshed_config(&input)
+            .map(|config| config.substrate().cloned())
+            .map_err(|error| declaration(error.to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(declaration(error.to_string())),
+    }
+}
+
+/// The declaration setup runs under: that of the nearest `.cowshed.toml` at or above the
+/// directory it was started in. Setup takes no project, so the checkout it is run from is the
+/// one place a host with no store yet can name a ZFS root from.
+pub(crate) fn declared_substrate_above(
+    start: &Path,
+) -> Result<Option<SubstrateConfig>, NativeBootstrapError> {
+    for directory in start.ancestors() {
+        if fs::symlink_metadata(directory.join(COWSHED_CONFIG_FILE)).is_ok() {
+            return declared_substrate(directory);
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn working_directory_declaration()
+-> Result<Option<SubstrateConfig>, NativeBootstrapError> {
+    let start = std::env::current_dir().map_err(|source| NativeBootstrapError::StatFs {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    declared_substrate_above(&start)
 }

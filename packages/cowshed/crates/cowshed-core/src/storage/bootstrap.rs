@@ -423,6 +423,19 @@ impl SubstrateConfig {
     pub fn parent(&self) -> &str {
         &self.parent
     }
+
+    /// The declaration naming `root`, `<parent>/cowshed`, by its parent.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn of_root(root: &cowshed_helper::name::Root) -> Self {
+        let name = root.dataset().as_str();
+        let parent = name
+            .strip_suffix(cowshed_helper::name::ROOT_COMPONENT)
+            .and_then(|parent| parent.strip_suffix('/'))
+            .expect("a root is named <parent>/cowshed");
+        Self {
+            parent: parent.to_owned(),
+        }
+    }
 }
 
 /// `.cowshed.toml` as TOML spells it: every section and key cowshed reads, and nothing else. The

@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use super::super::super::parse_cowshed_config;
+use super::super::shared::declared_substrate_above;
 use super::*;
 
 const UID: u32 = 1000;

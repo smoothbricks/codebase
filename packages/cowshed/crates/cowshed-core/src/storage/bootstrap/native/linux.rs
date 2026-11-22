@@ -28,15 +28,16 @@ use super::super::{
     VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeMarker, VolumeRole, ZFS, ZFS_BUILD_CACHE_CHILD,
     ZFS_HELPER, ZFS_OWNER_PROPERTY, ZFS_PROJECTS_CHILD, ZFS_RETIRED_CACHES_CHILD,
     ZFS_ROLE_PROPERTY, ZFS_STORE_CHILD, ZFS_VERSION_PROPERTY, execute_bootstrap_operation,
-    parse_cowshed_config, plan_bootstrap, plan_directory, plan_zfs_build_cache,
-    plan_zfs_retire_caches, require_mounted_marker, select_substrate, zfs_child, zfs_root,
+    plan_bootstrap, plan_directory, plan_zfs_build_cache, plan_zfs_retire_caches,
+    require_mounted_marker, select_substrate, zfs_child, zfs_root,
 };
 use super::shared::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode,
     SystemBootstrapHost, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeState,
-    execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
-    provision_volumes_action, setup_execution_error, write_marker_action,
+    declared_substrate, execute_native_bootstrap_plan, existing_host_storage_error,
+    platform_host_error, provision_volumes_action, setup_execution_error,
+    working_directory_declaration, write_marker_action,
 };
 use crate::error::CowshedError;
 use crate::storage::fstab::FstabPin;
@@ -47,7 +48,6 @@ use cowshed_os::fsio::AnchoredDirectory;
 
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 const SUDO: &str = "sudo";
-const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
 const ZFS_FILESYSTEM: &str = "zfs";
 /// The per-user mount root and its parent are the user's alone.
 const MOUNT_ROOT_MODE: u32 = 0o700;
@@ -1517,27 +1517,35 @@ fn run_host_command(command: &HostCommand) -> Result<HostCommandOutput, HostErro
     })
 }
 
+/// The shared root decision ([`crate::storage::bootstrap::zfs_root::root_steps`]) over the root
+/// `required_root` of `parent`: taken, or refused with what its administrator runs. Setup never
+/// creates a Linux root: whoever administers `parent` does (01b_zfs.md, "One pool, one root").
 fn verify_root(parent: &str, required_root: &str) -> Result<(), HostError> {
+    use crate::storage::bootstrap::zfs_root::{RootStep, create_command, root_steps};
     if required_root != zfs_root(parent) {
         return Err(HostError::new(format!(
             "{required_root} is not the cowshed root of {parent}"
         )));
     }
+    let root = cowshed_helper::name::Root::parse(required_root)
+        .map_err(|error| HostError::new(format!("{required_root}: {error}")))?;
     let uid = invoking_identity().uid;
-    let dataset = read_dataset(required_root)
-        .map_err(|error| HostError::new(error.to_string()))?
-        .ok_or_else(|| {
-            HostError::new(format!(
-                "ZFS root {required_root} does not exist; whoever administers {parent} creates it: zfs create -o mountpoint=none -o {ZFS_OWNER_PROPERTY}={uid} {required_root}"
-            ))
-        })?;
-    if dataset.owner.as_deref() == Some(uid.to_string().as_str()) {
-        Ok(())
-    } else {
-        Err(HostError::new(format!(
-            "ZFS root {required_root} does not name uid {uid} as its owner ({ZFS_OWNER_PROPERTY} is {}); whoever administers {parent} sets it: zfs set {ZFS_OWNER_PROPERTY}={uid} {required_root}",
-            dataset.owner.as_deref().unwrap_or("not set on it")
-        )))
+    let steps = root_steps(true, Some(&root), &[], uid, false, |root| {
+        crate::storage::directory::root_evidence(root, false)
+    })
+    .map_err(|error| HostError::new(error.to_string()))?;
+    match steps.as_slice() {
+        [RootStep::Take { .. }] => Ok(()),
+        [step @ RootStep::Create { .. }] => Err(HostError::new(format!(
+            "ZFS root {required_root} does not exist; whoever administers {parent} creates it: {}",
+            create_command(step).unwrap_or_default().join(" ")
+        ))),
+        [RootStep::Refuse { why, remedy, .. }] => Err(HostError::new(format!(
+            "{why}; whoever administers {parent} runs: {remedy}"
+        ))),
+        other => Err(HostError::new(format!(
+            "the root decision for {required_root} took {other:?}, not one step for it"
+        ))),
     }
 }
 
@@ -1845,43 +1853,6 @@ async fn blocking<T: Send + 'static>(
     })?
 }
 
-/// The `[substrate]` the `.cowshed.toml` in `directory` declares, `None` when there is no file
-/// or it declares none.
-fn declared_substrate(directory: &Path) -> Result<Option<SubstrateConfig>, NativeBootstrapError> {
-    let path = directory.join(COWSHED_CONFIG_FILE);
-    let declaration = |message: String| NativeBootstrapError::SubstrateDeclaration {
-        path: path.clone(),
-        message,
-    };
-    match fs::read_to_string(&path) {
-        Ok(input) => parse_cowshed_config(&input)
-            .map(|config| config.substrate().cloned())
-            .map_err(|error| declaration(error.to_string())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(declaration(error.to_string())),
-    }
-}
-
-/// The declaration setup runs under: that of the nearest `.cowshed.toml` at or above the
-/// directory it was started in. Setup takes no project, so the checkout it is run from is the
-/// one place a host with no store yet can name a ZFS root from.
-fn declared_substrate_above(start: &Path) -> Result<Option<SubstrateConfig>, NativeBootstrapError> {
-    for directory in start.ancestors() {
-        if fs::symlink_metadata(directory.join(COWSHED_CONFIG_FILE)).is_ok() {
-            return declared_substrate(directory);
-        }
-    }
-    Ok(None)
-}
-
-fn working_directory_declaration() -> Result<Option<SubstrateConfig>, NativeBootstrapError> {
-    let start = std::env::current_dir().map_err(|source| NativeBootstrapError::StatFs {
-        path: PathBuf::from("."),
-        source,
-    })?;
-    declared_substrate_above(&start)
-}
-
 /// Gather the host's evidence for the checkout at `project_root`, plan its store purely, then
 /// execute the plan according to the explicit capability mode.
 ///
@@ -1983,10 +1954,17 @@ pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<Valida
 async fn gather_setup(
     home: &Path,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> Result<Setup, NativeBootstrapError> {
     let home = home.to_owned();
+    let zfs_parent = zfs_parent.map(str::to_owned);
     blocking(move || {
-        let configured = working_directory_declaration()?;
+        let declared = working_directory_declaration()?;
+        let named = crate::storage::bootstrap::zfs_root::named_parent(
+            zfs_parent.as_deref(),
+            declared.as_ref().map(SubstrateConfig::parent),
+        )?;
+        let configured = named.as_ref().map(SubstrateConfig::of_root);
         prepare_setup(
             &mut SystemEvidence,
             &home,
@@ -2000,8 +1978,9 @@ async fn gather_setup(
 pub async fn plan_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> crate::Result<HostSetupPlan> {
-    let setup = gather_setup(home, caches_volume)
+    let setup = gather_setup(home, caches_volume, zfs_parent)
         .await
         .map_err(existing_host_storage_error)?;
     Ok(HostSetupPlan::new(
@@ -2060,8 +2039,9 @@ async fn execute_step(
 pub async fn execute_host_setup(
     home: &Path,
     caches_volume: CachesVolume,
+    zfs_parent: Option<&str>,
 ) -> crate::Result<HostSetupReport> {
-    let setup = gather_setup(home, caches_volume)
+    let setup = gather_setup(home, caches_volume, zfs_parent)
         .await
         .map_err(existing_host_storage_error)?;
     let authorized = setup.requires_authorization;

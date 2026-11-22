@@ -396,6 +396,9 @@ pub struct SetupArgs {
     /// Install the invoking build without judging it, even when it does not contain the installed
     /// cowshed. Without it such a build is refused, naming the binary and the commits it lacks.
     pub downgrade: bool,
+    /// The parent of the ZFS root setup sets up, `<parent>/cowshed`: the pool or any dataset in
+    /// it. It must agree with a `[substrate] parent` the nearest `.cowshed.toml` declares.
+    pub zfs_parent: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -935,6 +938,7 @@ pub fn cli_command() -> ClapCommand {
             flag("force"),
             flag("retire-caches-volume"),
             flag("downgrade"),
+            value("zfs-parent"),
         ]))
         .subcommand(
             leaf("fork")
@@ -2708,6 +2712,10 @@ const SETUP: CommandSpec = CommandSpec {
             spelling: "--downgrade",
             meaning: "install the invoking build without judging whether it contains the installed cowshed",
         },
+        Opt {
+            spelling: "--zfs-parent <pool|dataset>",
+            meaning: "name the parent of the ZFS root setup creates, or takes when it exists, as `<parent>/cowshed` (cowshed never guesses a pool)",
+        },
     ],
 };
 
@@ -2722,6 +2730,21 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     let force = flagged(matches, "force");
     let retire_caches_volume = flagged(matches, "retire-caches-volume");
     let downgrade = flagged(matches, "downgrade");
+    let zfs_parent = match os(matches, "zfs-parent") {
+        Some(parent) => Some(parent.into_string().map_err(|parent| {
+            UsageError::new(
+                format!("--zfs-parent {parent:?} is not UTF-8, as no ZFS dataset name is"),
+                USAGE,
+            )
+        })?),
+        None => None,
+    };
+    if zfs_parent.is_some() && (uninstall || force) {
+        return Err(UsageError::new(
+            "--zfs-parent sets up a ZFS root; --uninstall tears a host down",
+            USAGE,
+        ));
+    }
     if retire_caches_volume && (uninstall || force) {
         return Err(UsageError::new(
             "--retire-caches-volume repairs a host; --uninstall tears it down",
@@ -2745,6 +2768,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         force,
         retire_caches_volume,
         downgrade,
+        zfs_parent,
     }))
 }
 
@@ -5379,6 +5403,7 @@ mod tests {
             force: false,
             retire_caches_volume: false,
             downgrade: false,
+            zfs_parent: None,
         };
         assert_eq!(
             parse_args(["setup"]).unwrap().command,
@@ -5400,6 +5425,7 @@ mod tests {
                 force: false,
                 retire_caches_volume: false,
                 downgrade: false,
+                zfs_parent: None,
             })
         );
         assert_eq!(
@@ -5411,6 +5437,7 @@ mod tests {
                 force: true,
                 retire_caches_volume: false,
                 downgrade: false,
+                zfs_parent: None,
             })
         );
 
@@ -5445,6 +5472,21 @@ mod tests {
             "--downgrade installs a build; --uninstall installs none"
         );
 
+        // A ZFS parent is named for the root setup sets up, and never alongside a teardown.
+        assert_eq!(
+            parse_args(["setup", "--zfs-parent", "tank/dev"])
+                .unwrap()
+                .command,
+            Command::Setup(SetupArgs {
+                zfs_parent: Some("tank/dev".into()),
+                ..REPAIR
+            })
+        );
+        let error = parse_args(["setup", "--zfs-parent", "tank", "--uninstall"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--zfs-parent sets up a ZFS root; --uninstall tears a host down"
+        );
         let error = parse_args(["setup", "--project", "/repo"]).unwrap_err();
         assert_eq!(error.message, "--project is not valid for setup");
         assert!(error.hint.contains("cowshed setup"));

@@ -84,7 +84,7 @@ impl Fixture {
         fs::create_dir_all(store.join(&owner).join("widget")).expect("the scratch store is new");
         let main = store.join(&owner).join("widget/main.dmg");
         let datasets =
-            match ZfsPayloads::of_project(&store, &main, true, &directory.join("scratch")) {
+            match ZfsPayloads::of_project(&store, &main, true, &directory.join("scratch"), None) {
                 Ok(Some(datasets)) if datasets.root().dataset().as_str() == root => datasets,
                 other => {
                     let _ = fs::remove_dir_all(&directory);
@@ -400,4 +400,49 @@ fn a_dataset_payloads_capacity_is_its_refquota_raised_in_place() {
     let uncapped = fixture.image("build/1.dmg");
     datasets.create(&uncapped, None).unwrap();
     assert_eq!(datasets.capacity(&uncapped).unwrap(), None);
+}
+
+/// Setup's root decision over what [`super::root_evidence`] reads on a real pool
+/// (01b_zfs.md, "One pool, one root"): the root naming this user, as setup made it, is taken on
+/// macOS with its four com.apple properties and elsewhere by its owner; a root below a dataset
+/// that does not exist reads as absent, so the decision would create it, never as an error. Only
+/// reads: nothing changes and nothing asks for privilege.
+#[test]
+#[ignore = "explicit host check: real ZFS through the installed helper (specs/cowshed/08_testing.md, Real ZFS)"]
+fn setup_reads_and_takes_the_root_that_names_the_user() {
+    use crate::storage::bootstrap::zfs_root::{RootEvidence, RootStep, root_steps};
+    let Ok(parent) = std::env::var("COWSHED_ZFS_TEST_PARENT") else {
+        cowshed_os::eprintln!(
+            "skipped: COWSHED_ZFS_TEST_PARENT names no pool or dataset whose cowshed root to use"
+        );
+        return;
+    };
+    if !super::zfs_installed() {
+        cowshed_os::eprintln!("skipped: this host has no zfs");
+        return;
+    }
+    // SAFETY: reads this process's real uid.
+    let uid = unsafe { libc::getuid() };
+    let apple = cfg!(target_os = "macos");
+    let root = cowshed_helper::name::Root::parse(&format!("{parent}/cowshed")).unwrap();
+    let steps = root_steps(true, Some(&root), &[], uid, apple, |root| {
+        super::root_evidence(root, apple)
+    })
+    .unwrap();
+    assert_eq!(
+        steps,
+        vec![RootStep::Take {
+            root: root.dataset().to_string()
+        }]
+    );
+
+    let absent = cowshed_helper::name::Root::parse(&format!(
+        "{parent}/cowshed-itest-absent-{}/cowshed",
+        std::process::id()
+    ))
+    .unwrap();
+    assert_eq!(
+        super::root_evidence(&absent, apple).unwrap(),
+        RootEvidence::Absent
+    );
 }

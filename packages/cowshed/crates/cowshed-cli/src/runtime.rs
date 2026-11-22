@@ -4334,11 +4334,11 @@ impl NativeAdoptHostSetup {
 #[async_trait]
 impl AdoptHostSetup for NativeAdoptHostSetup {
     async fn plan(&mut self) -> Result<HostSetupPlan> {
-        plan_host_setup(&self.home, CachesVolume::Keep).await
+        plan_host_setup(&self.home, CachesVolume::Keep, None).await
     }
 
     async fn execute(&mut self) -> Result<HostSetupReport> {
-        execute_host_setup(&self.home, CachesVolume::Keep).await
+        execute_host_setup(&self.home, CachesVolume::Keep, None).await
     }
 }
 
@@ -4421,6 +4421,10 @@ fn host_action_evidence(action: &HostAction) -> String {
         } => format!(
             "delete the retired {name} ({uuid}) mounted at {}, which holds nothing but its marker",
             mounted_at.display()
+        ),
+        HostAction::CreateRoot { root, command } => format!(
+            "create the ZFS root {root} as root with `{}`",
+            command.join(" ")
         ),
         HostAction::InstallRootHelper {
             roots,
@@ -4623,6 +4627,13 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 ),
                 hint: "cowshed setup".into(),
                 path: paths.first().cloned(),
+            }),
+            HostAction::CreateRoot { root, command } => findings.push(Finding {
+                code: "zfs-root-missing".into(),
+                severity: FindingSeverity::Error,
+                message: format!("the named ZFS root {root} does not exist"),
+                hint: format!("cowshed setup, which runs `{}`", command.join(" ")),
+                path: None,
             }),
             HostAction::InstallRootHelper { roots, sha256, .. } => findings.push(Finding {
                 code: "host-root-helper".into(),
@@ -5046,7 +5057,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     let roots = CanonicalRoots::global();
     let plan = probe("host-storage", async {
         waits_on(format_args!("host-storage"), platform::HOST_STORAGE_PARTIES);
-        plan_host_setup(&home, CachesVolume::Keep).await
+        plan_host_setup(&home, CachesVolume::Keep, None).await
     })
     .await;
     let mut findings = match plan {
