@@ -508,6 +508,19 @@ fn remove_source_flake(directory: &Path) -> Result<()> {
 /// above it, because the target directory is the workspace's, or a link to one outside the
 /// checkout, so it builds the flake of the sources it was compiled from, which it carries
 /// ([`SOURCE_FLAKE`]). An installed package never does.
+/// The flake a setup run from `executable` builds mbx from, or `None` when it has nothing to
+/// build: the installed copy (`installed` holds it) installs nothing, its mbx being the one the
+/// install that put it there built (06_cli.md, "Onboarding and repair"), and it has no package
+/// around it to find a flake in. Any other build is [`flake_directory_from`]'s.
+pub fn flake_for_setup(
+    executable: &Path,
+    installed: &crate::launchd::HostStableExecutable,
+) -> Result<Option<ShippedFlake>> {
+    if installed.holds_copy(executable) {
+        return Ok(None);
+    }
+    flake_directory_from(executable).map(Some)
+}
 pub fn flake_directory() -> Result<ShippedFlake> {
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -836,6 +849,29 @@ mod tests {
             b"a copied inode"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Setup run from the installed copy looks for no flake and so is not refused for want of
+    /// one; a packaged build that lacks its flake is still refused.
+    #[test]
+    fn the_installed_copy_needs_no_flake_and_a_package_without_one_is_refused() {
+        let home = std::fs::canonicalize(scratch("installed-copy")).unwrap();
+        let installed =
+            crate::launchd::HostStableExecutable::new(&home, crate::launchd::COWSHED_BINARY_NAME)
+                .unwrap();
+        std::fs::create_dir_all(installed.directory()).unwrap();
+        let copy = installed
+            .directory()
+            .join(format!("cowshed-{}", "a".repeat(64)));
+        std::fs::write(&copy, b"#!/bin/sh\n").unwrap();
+        assert_eq!(flake_for_setup(&copy, &installed).unwrap(), None);
+
+        let packaged = home.join("pkg/dist/bin/darwin-arm64/cowshed");
+        std::fs::create_dir_all(packaged.parent().unwrap()).unwrap();
+        std::fs::write(&packaged, b"#!/bin/sh\n").unwrap();
+        let refused = flake_for_setup(&packaged, &installed).unwrap_err();
+        assert_eq!(refused.code, cowshed_core::ErrorCode::EnvironmentMissing);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// What a Cargo build carries is its own sources' `nix/mbx`, byte for byte.

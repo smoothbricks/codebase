@@ -259,6 +259,17 @@ impl HostStableExecutable {
             .strip_prefix('-')
             .and_then(ExecutableDigest::parse)
     }
+
+    /// Whether `path` is a stored copy in [`Self::directory`]: the installed build itself, run by
+    /// its stored name.
+    pub fn holds_copy(&self, path: &Path) -> bool {
+        path.parent()
+            .is_some_and(|directory| directory == self.directory())
+            && path
+                .file_name()
+                .and_then(|name| self.stored_digest(name))
+                .is_some()
+    }
 }
 
 /// The SHA-256 of an executable's bytes: 64 lowercase hex digits.

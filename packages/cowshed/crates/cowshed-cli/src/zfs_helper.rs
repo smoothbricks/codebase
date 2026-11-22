@@ -35,6 +35,9 @@ use macos as platform;
 
 /// Whether setup runs the root remedy of an unproven helper itself, at a terminal.
 pub use platform::TERMINAL_REMEDY;
+
+/// What setup says on a host with no `zfs`, where the platform has something to say.
+pub use platform::WITHOUT_ZFS;
 /// What makes a helper that did not act as root do so: why this is the step, and the command.
 #[derive(Debug, Eq, PartialEq)]
 struct Remedy {

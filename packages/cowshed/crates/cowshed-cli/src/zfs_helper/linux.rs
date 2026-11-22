@@ -13,3 +13,7 @@ pub(super) fn why(why: String) -> String {
 pub(super) fn next(command: &str, rerun: String) -> String {
     format!("{command} && {rerun}")
 }
+
+/// A Linux store is its own substrate: a host with no `zfs` has a directory store, and setup has
+/// nothing to say of ZFS.
+pub const WITHOUT_ZFS: Option<&str> = None;

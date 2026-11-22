@@ -340,6 +340,11 @@ impl HostSetup for NativeHostSetup {
     async fn zfs_helper(&mut self) -> Result<Option<CowshedError>> {
         use std::io::IsTerminal as _;
         let storage = validate_existing_host_storage(&self.home).await?;
+        if !cowshed_core::storage::directory::zfs_installed()
+            && let Some(note) = crate::zfs_helper::WITHOUT_ZFS
+        {
+            cowshed_os::eprintln!("cowshed: {note}");
+        }
         let setup = crate::gateway_service::running_executable()?;
         let prove =
             || crate::zfs_helper::prove(storage.store(), &self.home, effective_uid(), &setup);
@@ -624,7 +629,15 @@ impl HostSetup for NativeHostSetup {
 
     /// Nix's build runs on this task: setup's own work, which the operator's interrupt ends.
     fn mbx_flake(&mut self) -> Result<Option<ShippedFlake>> {
-        crate::capabilities::mbx::flake_directory().map(Some)
+        let installed = crate::launchd::HostStableExecutable::new(
+            &self.home,
+            crate::launchd::COWSHED_BINARY_NAME,
+        )
+        .map_err(crate::gateway_service::launchd_error)?;
+        crate::capabilities::mbx::flake_for_setup(
+            &crate::gateway_service::running_executable()?,
+            &installed,
+        )
     }
 
     async fn install_mbx(&mut self, flake: &ShippedFlake) -> Result<Option<MbxInstall>> {

@@ -3550,15 +3550,7 @@ where
         // the Nx cache server.
         install_helper(executor, home, &candidate.source)?;
     }
-    let from_installed_copy = candidate
-        .source
-        .parent()
-        .is_some_and(|directory| directory == executable.directory())
-        && candidate
-            .source
-            .file_name()
-            .and_then(|name| executable.stored_digest(name))
-            .is_some();
+    let from_installed_copy = executable.holds_copy(&candidate.source);
     Ok(CliInstall::Installed {
         stable: executable.path().to_path_buf(),
         replaced,
