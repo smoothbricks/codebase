@@ -191,6 +191,10 @@ pub fn build_root_helper() -> Option<PathBuf> {
     zfs::build_root_helper()
 }
 
+/// Whether this host has a `zfs`, where the helper finds it ([`cowshed_helper::host::TRUSTED_PATH`]).
+pub fn zfs_installed() -> bool {
+    zfs::zfs_installed()
+}
 /// The ZFS roots that name this user whose root helper is not yet the system directory's copy
 /// of the build whose helper hashes to `sha256`, admitted by `sudo` with no credentials a
 /// terminal cached (09_substrates.md, "Install and privilege"). Empty on a host with no `zfs`
@@ -736,10 +740,16 @@ impl DirectoryExecutionHost {
         Self::validate(&config)?;
         let main = super::StorageLayout::new(&config.store_root, repo)?.main_image()?;
         let datasets = adopting == Some(crate::api::dto::StoreSubstrate::Zfs);
-        Ok(
-            zfs::ZfsPayloads::of_project(&config.store_root, main.image(), datasets)?
-                .map(|payloads| Self::over(config, Payloads::Datasets(payloads))),
-        )
+        Ok(zfs::ZfsPayloads::of_project(
+            &config.store_root,
+            main.image(),
+            datasets,
+            &super::StorageLayout::new(&config.store_root, repo)?
+                .project()
+                .mount_root
+                .join(super::recovery::STAGING_NAMESPACE),
+        )?
+        .map(|payloads| Self::over(config, Payloads::Datasets(payloads))))
     }
 
     fn over(config: ApfsSubstrateConfig, payloads: Payloads) -> Self {

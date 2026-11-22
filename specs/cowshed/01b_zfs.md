@@ -14,11 +14,12 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
 ## One pool, one root
 
 - **The pool is selected, never guessed.** A published store selects its own root; on a Linux host without one, the
-  anchor's dataset chain selects the root that names the caller. Any other checkout, and every macOS checkout, names the
-  root's parent with `.cowshed.toml` `[substrate] kind = "zfs"` and `parent = "<parent>"`, the pool or any dataset in it
-  (09_substrates.md, selection); cowshed never scans pools or picks one. One pool carries cowshed on a host. The
-  operator creates it and chooses its features against the installed OpenZFS; cowshed never enables or upgrades a pool
-  feature, since a feature upgrade is irreversible.
+  anchor's dataset chain selects the root that names the caller. Any other Linux checkout names the root's parent with
+  `.cowshed.toml` `[substrate] kind = "zfs"` and `parent = "<parent>"`, the pool or any dataset in it; on macOS a
+  project's adoption with `--filesystem zfs` takes the one root whose `cowshed:owner` names the caller, refused when
+  there is none or more than one (09_substrates.md, selection); cowshed never scans pools or picks one. One pool carries
+  cowshed on a host. The operator creates it and chooses its features against the installed OpenZFS; cowshed never
+  enables or upgrades a pool feature, since a feature upgrade is irreversible.
 - **The pool's storage is not on the Data volume.** A file vdev on Data would have every rewritten block pinned by
   Data's hourly local snapshots, for the same reason the APFS store is a dedicated volume
   ([01a_apfs.md §Dedicated store volume](./01a_apfs.md#dedicated-store-volume), "Why a volume and not paths on Data").
@@ -34,10 +35,10 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
 └── cowshed                          com.apple.devdisk=off  com.apple.browse=off  com.apple.mimic=off
     │                                com.apple.ignoreowner=off                    (all local)
     ├── store                        mountpoint=/private/cowshed/store  com.apple.ignoreowner=on (local)
-    ├── build-cache                  Linux only; hierarchy and mountpoint in 09_substrates.md
+    ├── build-cache                  hierarchy and mountpoint in 09_substrates.md; on macOS one of two choices
     └── projects                     mountpoint=none
         └── <owner>/<repo>           (inherit mountpoint=none: never mounted)
-            ├── main                 mountpoint=<checkout path>
+            ├── main                 mountpoint=<checkout path> while bound (at home: see below)
             ├── ws                   canmount=off  mountpoint=<mount-root>/<owner>/<repo>
             │   ├── <name>           clone of <src>@cowshed:fork-<name>, mounted at <mount-root>/<owner>/<repo>/<name>
             │   └── .trash           canmount=off  mountpoint=none
@@ -45,20 +46,28 @@ counterpart is [01a_apfs.md](./01a_apfs.md).
                 ├── <id>             one build volume, mounted at <mount-root>/.build/<owner>/<repo>/<id>;
                 │                    its seeds are its snapshots @seed-<n>
                 └── .trash           canmount=off  mountpoint=none
+
+On a store that is not a dataset, macOS's APFS store, no dataset is ever mounted inside the store: its volume mounts
+`noowners`, and the helper admits no mountpoint whose owner it cannot read as the caller's. A dataset payload at home
+there is unmounted, `mountpoint=none` and `canmount=noauto` set locally, and its image path in the store is an empty
+directory that names it by place; it mounts only at the bind place the tree above gives it, main at its checkout path,
+a workspace at `<mount-root>/<owner>/<repo>/<name>`, a build volume at `<mount-root>/.build/<owner>/<repo>/<id>`
+(09_substrates.md, selection). On a store that is the root's `store` dataset, a payload at home is mounted at its image
+path.
 ```
 
-The children of `<pool>/cowshed` and their roles are 09_substrates.md's fixed hierarchy; `build-cache` among them is
-Linux-only ("The mbx store on a ZFS host", below). A project's build volumes are datasets under its own container,
-`…/projects/<owner>/<repo>/build/<id>`, so creation, helper containment, discovery, send/receive and collection see one
-tree per project. `canmount=off` makes `ws` and `build` property containers: they pass their `mountpoint` down by
-inheritance and are never mounted themselves, so every workspace and build dataset mounts at its own path and never
-inside another dataset's mount. `canmount` is not inherited, so the datasets below them mount normally. Retirement does
-not rely on that inheritance: it unmounts a dataset, sets `canmount=off` on it locally and only then renames it under a
-`.trash` container (`mountpoint=none`). `canmount=off` holds whatever `mountpoint` the dataset carries, so main, whose
-`mountpoint` is set locally to its checkout path and survives a rename, cannot remount there; `cowshed unadopt` retires
-main this way, into `ws/.trash`, before it swaps the retained tree back (02_workspaces.md, "Checkout layouts").
-Collection sets `canmount=off` on any dataset it finds under a `.trash` without it before it decides anything else about
-that dataset.
+The children of `<pool>/cowshed` and their roles are 09_substrates.md's fixed hierarchy; `build-cache` among them is one
+of macOS's two choices for the mbx store ("The mbx store on a ZFS host", below). A project's build volumes are datasets
+under its own container, `…/projects/<owner>/<repo>/build/<id>`, so creation, helper containment, discovery,
+send/receive and collection see one tree per project. `canmount=off` makes `ws` and `build` property containers: they
+pass their `mountpoint` down by inheritance and are never mounted themselves, so every workspace and build dataset
+mounts at its own path and never inside another dataset's mount. `canmount` is not inherited, so the datasets below them
+mount normally. Retirement does not rely on that inheritance: it unmounts a dataset, sets `canmount=off` on it locally
+and only then renames it under a `.trash` container (`mountpoint=none`). `canmount=off` holds whatever `mountpoint` the
+dataset carries, so main, whose `mountpoint` is set locally to its checkout path and survives a rename, cannot remount
+there; `cowshed unadopt` retires main this way, into `ws/.trash`, before it swaps the retained tree back
+(02_workspaces.md, "Checkout layouts"). Collection sets `canmount=off` on any dataset it finds under a `.trash` without
+it before it decides anything else about that dataset.
 
 ## The datasets of a workspace
 
@@ -266,19 +275,19 @@ The one shared mbx store is not a per-workspace dataset and never sits inside a 
 capability the checkout's `target` is mbx's managed-target link out of the build dataset altogether
 (16_build_volumes.md; 15_capabilities.md), and every shed writes the same store (03_caches.md, "mbx"). On a Linux ZFS
 host the store lives in its own dedicated dataset, **`<pool>/cowshed/build-cache`**; its place in the hierarchy and its
-mountpoint are 09_substrates.md's ("Linux host paths", "Fixed dataset hierarchy") and are cited here, not restated. That
-dataset is Linux-only: a macOS host, on ZFS or not, always uses the APFS build-cache volume mounted at
-`/private/var/folders/cowshed/shared/build-cache` (01a_apfs.md, "Dedicated build-cache volume"). The dataset's
-mountpoint is the `<bc>` of 03_caches.md: the mbx cache directory is `<bc>/mbx`, with managed targets at mbx's default
-inside it and no `target.root` set, so store and targets share one filesystem — this one dataset — as 03_caches.md's
-reflink-reachability rule requires. [INFERENCE] Restores between them are then clones where the pool's block cloning
-serves them (09_substrates.md, "ZFS substrate"); where it does not, mbx hard-links or copies the restored output
-instead, in that order (mbx documentation, "How it works", output restoration), and a restore that had to copy is
-slower, never wrong. The dataset cannot sit under the store dataset: that tree is controller-owned and denied to
-sandboxes, and every shed's Cargo work writes the store. `cowshed setup` creates the dataset with its mountpoint set
-locally and attests both on every run, as it does the root's properties; the canonical environment that names `<bc>/mbx`
-to mbx is 11_shell.md's ("Canonical mbx environment"). mbx owns everything in the dataset, and no cowshed collection
-lists, sweeps or reclaims it.
+mountpoint are 09_substrates.md's ("Linux host paths", "Fixed dataset hierarchy") and are cited here, not restated. A
+macOS host may keep the APFS build-cache volume mounted at `/private/var/folders/cowshed/shared/build-cache`
+(01a_apfs.md, "Dedicated build-cache volume") or this dataset in its place: the cache is never cloned, so either
+substrate serves it. The dataset's mountpoint is the `<bc>` of 03_caches.md: the mbx cache directory is `<bc>/mbx`, with
+managed targets at mbx's default inside it and no `target.root` set, so store and targets share one filesystem — this
+one dataset — as 03_caches.md's reflink-reachability rule requires. [INFERENCE] Restores between them are then clones
+where the pool's block cloning serves them (09_substrates.md, "ZFS substrate"); where it does not, mbx hard-links or
+copies the restored output instead, in that order (mbx documentation, "How it works", output restoration), and a restore
+that had to copy is slower, never wrong. The dataset cannot sit under the store dataset: that tree is controller-owned
+and denied to sandboxes, and every shed's Cargo work writes the store. `cowshed setup` creates the dataset with its
+mountpoint set locally and attests both on every run, as it does the root's properties; the canonical environment that
+names `<bc>/mbx` to mbx is 11_shell.md's ("Canonical mbx environment"). mbx owns everything in the dataset, and no
+cowshed collection lists, sweeps or reclaims it.
 
 ## Mount root and Spotlight
 
@@ -299,9 +308,9 @@ lists, sweeps or reclaims it.
 
 ## Open questions
 
-- **macOS privilege boundary.** 09_substrates.md's `cowshed-helper` is the Linux root binary through which ZFS mutations
-  go, `promote` among its verbs. Which of `zfs create|clone|snapshot|destroy|rename|promote|mount` an unprivileged user
-  can run on macOS under `zfs allow`, and therefore whether the same fixed-verb helper is required there, is unmeasured.
+- **macOS privilege boundary.** Settled: every ZFS mutation on macOS goes through the same fixed-verb `cowshed-helper`
+  as on Linux, installed by `cowshed setup` in its one administrator authorization and admitted by `sudo -n` without a
+  password afterwards (09_substrates.md, "Install and privilege").
 - **Build recordsize.** One build dataset at `128K` against a `1M` child dataset for Cargo's target tree (which makes
   seed snapshots and fork clones recursive): cold-build wall time, CPU and allocated bytes, three interleaved rounds
   with a null arm, decide it.

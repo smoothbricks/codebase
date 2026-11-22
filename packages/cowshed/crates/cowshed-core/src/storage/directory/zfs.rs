@@ -118,6 +118,15 @@ fn dataset_component(encoded: &str) -> String {
     encoded.replace('%', ":")
 }
 
+/// The owner and repository of the store's project whose payload `image` is, each as a dataset
+/// name component, and the payload's place in that project: `<store>/<owner>/<repo>/<place>`.
+fn project_of<'a>(store_root: &Path, image: &'a Path) -> Option<(String, String, &'a Path)> {
+    let mut parts = image.strip_prefix(store_root).ok()?.components();
+    let mut component = || parts.next()?.as_os_str().to_str().map(dataset_component);
+    let (owner, repo) = (component()?, component()?);
+    Some((owner, repo, parts.as_path()))
+}
+
 fn host(context: impl std::fmt::Display, cause: impl std::fmt::Display) -> ApfsStorageError {
     ApfsStorageError::Host(format!("{context}: {cause}"))
 }
@@ -135,12 +144,26 @@ fn path_text(path: &Path) -> Result<&str, ApfsStorageError> {
         .ok_or_else(|| host("a ZFS mountpoint must be UTF-8", path.display()))
 }
 
+/// Where a payload is while it is home (01b_zfs.md, "One pool, one root").
+#[derive(Clone, Debug)]
+enum Home {
+    /// The store is the root's `store` dataset: a payload at home is mounted at its image path.
+    InStore,
+    /// The store is not a dataset, as macOS's APFS store is not, and its volume ignores
+    /// ownership: a payload at home is never mounted (`mountpoint=none`, `canmount=noauto`), its
+    /// image path is an empty directory that names it by place, and it mounts only at its bind
+    /// place. `scratch` is the directory of this user's where a new dataset is mounted once, so
+    /// the helper hands its root to this user, before it goes home.
+    Unmounted { scratch: PathBuf },
+}
+
 /// The datasets of one cowshed root, as payloads of the store at `store_root`.
 #[derive(Clone, Debug)]
 pub struct ZfsPayloads {
     root: Root,
     store_root: PathBuf,
     helper: PathBuf,
+    home: Home,
 }
 
 /// The directory of this executable, through the links that name it: the helper is installed
@@ -164,7 +187,7 @@ pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, Ap
     }
     let (_, roots) = roots_serving_this_user()?;
     if roots.is_empty() {
-        return Ok(roots);
+        return Ok(Vec::new());
     }
     let system = Path::new(cowshed_helper::host::SYSTEM_DIRECTORY).join(HELPER);
     let current = match super::file_sha256(&system) {
@@ -182,9 +205,10 @@ pub(super) fn roots_awaiting_root_helper(sha256: &str) -> Result<Vec<String>, Ap
             command
                 .args(["-n", "-k"])
                 .arg(&system)
-                .args([root.as_str(), "check"]);
+                .args([root.dataset().as_str(), "check"]);
             run("cowshed-helper check", command).is_err()
         })
+        .map(|root| root.dataset().to_string())
         .collect())
 }
 
@@ -213,13 +237,13 @@ fn read_zfs(arguments: &[&str]) -> Result<String, ApfsStorageError> {
 }
 
 /// Whether this host has a `zfs` to ask.
-fn zfs_installed() -> bool {
+pub(super) fn zfs_installed() -> bool {
     std::env::split_paths(cowshed_helper::host::TRUSTED_PATH)
         .any(|directory| directory.join("zfs").is_file())
 }
 
 /// This process's real uid and the cowshed roots that name it as their owner.
-fn roots_serving_this_user() -> Result<(u32, Vec<String>), ApfsStorageError> {
+fn roots_serving_this_user() -> Result<(u32, Vec<Root>), ApfsStorageError> {
     // SAFETY: reads this process's real uid.
     let uid = unsafe { libc::getuid() };
     let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
@@ -231,11 +255,25 @@ fn roots_serving_this_user() -> Result<(u32, Vec<String>), ApfsStorageError> {
         "-t",
         "filesystem",
     ])?;
-    let roots = serving_roots(&listed, uid)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    Ok((uid, roots))
+    Ok((uid, serving_roots(&listed, uid)))
+}
+
+/// This process's real uid and the cowshed roots that name it and hold the main dataset of the
+/// project whose main entry in the store is `main`, `<root>/projects/<owner>/<repo>/main`, by
+/// name. A host with no `zfs` has none.
+fn roots_holding(store_root: &Path, main: &Path) -> Result<(u32, Vec<Root>), ApfsStorageError> {
+    let (owner, repo, _) = project_of(store_root, main)
+        .ok_or_else(|| host("not a payload of a project in the store", main.display()))?;
+    if !zfs_installed() {
+        // SAFETY: reads this process's real uid.
+        return Ok((unsafe { libc::getuid() }, Vec::new()));
+    }
+    let (uid, roots) = roots_serving_this_user()?;
+    let holds = |root: &Root| {
+        let name = format!("{}/projects/{owner}/{repo}/main", root.dataset());
+        read_zfs(&["list", "-H", "-o", "name", &name]).is_ok()
+    };
+    Ok((uid, roots.into_iter().filter(holds).collect()))
 }
 
 /// What `ask` answers of the directory at `place`; a place that does not exist holds nothing.
@@ -267,13 +305,13 @@ fn assigned_in<'a>(listed: &'a str, place: &str) -> Option<&'a str> {
 }
 
 /// The cowshed roots in `listed` (`zfs list -H -o name,cowshed:owner`) that name `uid`.
-fn serving_roots(listed: &str, uid: u32) -> Vec<&str> {
+fn serving_roots(listed: &str, uid: u32) -> Vec<Root> {
     let uid = uid.to_string();
     listed
         .lines()
         .filter_map(|line| line.split_once('\t'))
-        .filter(|(name, owner)| *owner == uid && Root::parse(name).is_ok())
-        .map(|(name, _)| name)
+        .filter(|(_, owner)| *owner == uid)
+        .filter_map(|(name, _)| Root::parse(name).ok())
         .collect()
 }
 
@@ -289,6 +327,96 @@ fn root_of_main(dataset: &str) -> Option<Root> {
     ) {
         ("main", _repo, _owner, "projects", root) => Root::parse(root).ok(),
         _ => None,
+    }
+}
+
+/// What a project's entry for main in the store says (09_substrates.md, selection), as the store
+/// reads it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MainEntry {
+    /// A regular file: a disk image.
+    File,
+    /// A place a dataset is mounted at, or that a dataset's `mountpoint` names while nothing is
+    /// mounted there: that dataset.
+    Place(String),
+    /// A place no dataset is mounted at or assigned to: a main at home, its dataset unmounted.
+    Home,
+    /// No entry: the project is not adopted yet.
+    Absent,
+}
+
+/// Why no single cowshed root serves a project's datasets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Unserved {
+    /// Adoption asks for datasets and no root names the user.
+    NoRoot { uid: u32 },
+    /// More than one root would serve: cowshed never picks one.
+    Several { uid: u32, roots: Vec<Root> },
+}
+
+impl From<Unserved> for ApfsStorageError {
+    fn from(unserved: Unserved) -> Self {
+        match unserved {
+            Unserved::NoRoot { uid } => {
+                let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
+                host(
+                    format_args!("no cowshed ZFS root names uid {uid} as its owner"),
+                    format_args!(
+                        "whoever administers a pool creates one: zfs create -o mountpoint=none -o {property}={uid} <pool>/cowshed"
+                    ),
+                )
+            }
+            Unserved::Several { uid, roots } => host(
+                format_args!("several cowshed ZFS roots name uid {uid} as their owner"),
+                roots
+                    .iter()
+                    .map(|root| root.dataset().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
+    }
+}
+
+/// The one root of `roots`, `None` for none, refused for several.
+fn the_one(uid: u32, roots: Vec<Root>) -> Result<Option<Root>, Unserved> {
+    let mut roots = roots.into_iter();
+    match (roots.next(), roots.next()) {
+        (None, _) => Ok(None),
+        (Some(root), None) => Ok(Some(root)),
+        (Some(first), Some(second)) => Err(Unserved::Several {
+            uid,
+            roots: [first, second].into_iter().chain(roots).collect(),
+        }),
+    }
+}
+
+/// The cowshed root a project's datasets lie below, or `None` for a project that keeps disk
+/// images (09_substrates.md, selection; proven in specs/cowshed/laws/zfs_substrate.bend). A
+/// regular file is a disk image. A mounted or assigned dataset names its root
+/// ([`root_of_main`]). A main at home is kept on the one serving root that holds its main dataset
+/// by name, and keeps no datasets when none does. An absent main is not adopted yet: it keeps
+/// datasets only when `adopt_datasets`, below the one root that names the user. `serving` reads
+/// the roots that name the user and `holding` those of them that hold the project's main
+/// dataset, each only for the entry that needs it.
+fn select<E: From<Unserved>>(
+    main: MainEntry,
+    adopt_datasets: bool,
+    serving: impl FnOnce() -> Result<(u32, Vec<Root>), E>,
+    holding: impl FnOnce() -> Result<(u32, Vec<Root>), E>,
+) -> Result<Option<Root>, E> {
+    match main {
+        MainEntry::File => Ok(None),
+        MainEntry::Place(dataset) => Ok(root_of_main(&dataset)),
+        MainEntry::Home => {
+            let (uid, roots) = holding()?;
+            Ok(the_one(uid, roots)?)
+        }
+        MainEntry::Absent if adopt_datasets => {
+            let (uid, roots) = serving()?;
+            Ok(Some(the_one(uid, roots)?.ok_or(Unserved::NoRoot { uid })?))
+        }
+        MainEntry::Absent => Ok(None),
     }
 }
 
@@ -308,16 +436,21 @@ impl ZfsPayloads {
     /// - A regular file is a disk image: no datasets.
     /// - Any other entry is a mount record or a home payload: the dataset mounted where it
     ///   says, or, with nothing mounted there, the one whose `mountpoint` names the place, is
-    ///   `<root>/projects/<owner>/<repo>/main`, which names the root.
+    ///   `<root>/projects/<owner>/<repo>/main`, which names the root. With neither, the main is
+    ///   at home and its dataset unmounted: the one root that names this user and holds that
+    ///   dataset by name is the project's.
     /// - With no entry the project is not adopted yet and keeps what its adoption asks for:
     ///   datasets only when `adopt_datasets`, below the one cowshed root that names this user.
+    ///
+    /// The choice is [`select`]'s; this reads what it needs.
     pub(super) fn of_project(
         store_root: &Path,
         main: &Path,
         adopt_datasets: bool,
+        scratch: &Path,
     ) -> Result<Option<Self>, ApfsStorageError> {
-        let root = match fs::symlink_metadata(main) {
-            Ok(metadata) if metadata.is_file() => return Ok(None),
+        let entry = match fs::symlink_metadata(main) {
+            Ok(metadata) if metadata.is_file() => MainEntry::File,
             Ok(metadata) => {
                 let place = if metadata.file_type().is_symlink() {
                     fs::read_link(main)
@@ -329,36 +462,17 @@ impl ZfsPayloads {
                     Some(mounted) => Some(mounted),
                     None => assigned_to(&place)?,
                 };
-                dataset.as_deref().and_then(root_of_main)
+                dataset.map_or(MainEntry::Home, MainEntry::Place)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !adopt_datasets {
-                    return Ok(None);
-                }
-                let property = crate::storage::bootstrap::ZFS_OWNER_PROPERTY;
-                let (uid, roots) = roots_serving_this_user()?;
-                match roots.as_slice() {
-                    [root] => Root::parse(root).ok(),
-                    [] => {
-                        return Err(host(
-                            format_args!("no cowshed ZFS root names uid {uid} as its owner"),
-                            format_args!(
-                                "whoever administers a pool creates one: zfs create -o mountpoint=none -o {property}={uid} <pool>/cowshed"
-                            ),
-                        ));
-                    }
-                    several => {
-                        return Err(host(
-                            format_args!("several cowshed ZFS roots name uid {uid} as their owner"),
-                            several.join(", "),
-                        ));
-                    }
-                }
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => MainEntry::Absent,
             Err(error) => return Err(io_error("inspect main payload", main, error)),
         };
+        let root = select(entry, adopt_datasets, roots_serving_this_user, || {
+            roots_holding(store_root, main)
+        })?;
         match root {
-            Some(root) => Self::with_root(root, store_root, beside_this_executable()).map(Some),
+            Some(root) => Self::with_root(root, store_root, beside_this_executable())
+                .map(|payloads| Some(payloads.unmounted_at_home(scratch))),
             None => Ok(None),
         }
     }
@@ -376,8 +490,7 @@ impl ZfsPayloads {
         }
         let (_, roots) = roots_serving_this_user()?;
         roots
-            .iter()
-            .filter_map(|root| Root::parse(root).ok())
+            .into_iter()
             .map(|root| Self::with_root(root, store_root, Some(beside.to_owned())))
             .collect()
     }
@@ -424,7 +537,19 @@ impl ZfsPayloads {
             root,
             store_root: store_root.to_owned(),
             helper,
+            home: Home::InStore,
         })
+    }
+
+    /// These payloads, kept unmounted at home: the store is not a dataset. `scratch` is where
+    /// each new dataset is mounted once to be handed to this user ([`Home::Unmounted`]).
+    fn unmounted_at_home(self, scratch: &Path) -> Self {
+        Self {
+            home: Home::Unmounted {
+                scratch: scratch.to_owned(),
+            },
+            ..self
+        }
     }
 
     /// The cowshed root these payloads lie below.
@@ -503,36 +628,34 @@ impl ZfsPayloads {
         }
     }
 
-    /// The dataset name of the payload at `image`,
-    /// `<root>/projects/<owner>/<repo>/<place>` ([`place_name`]), its containers made first.
-    fn named(&self, image: &Path) -> Result<String, ApfsStorageError> {
+    /// The dataset name of the payload at `image`, `<root>/projects/<owner>/<repo>/<place>`
+    /// ([`place_name`]), with the names of the containers above it, outermost first.
+    fn placed(&self, image: &Path) -> Result<(Vec<String>, String), ApfsStorageError> {
         let outside = || host("not a payload of a project in the store", image.display());
-        let relative = image
-            .strip_prefix(&self.store_root)
-            .map_err(|_| outside())?;
-        let mut parts = relative.components();
-        let (Some(owner), Some(repo)) = (parts.next(), parts.next()) else {
-            return Err(outside());
-        };
-        let component = |part: std::path::Component<'_>| {
-            part.as_os_str()
-                .to_str()
-                .map(dataset_component)
-                .ok_or_else(outside)
-        };
-        let mut place = place_name(parts.as_path()).ok_or_else(outside)?;
+        let (owner, repo, rest) = project_of(&self.store_root, image).ok_or_else(outside)?;
+        let mut place = place_name(rest).ok_or_else(outside)?;
         let leaf = place.pop().ok_or_else(outside)?;
+        let mut containers = Vec::new();
         let mut name = self.root.dataset().to_string();
-        for part in ["projects".to_owned(), component(owner)?, component(repo)?]
+        for part in ["projects".to_owned(), owner, repo]
             .into_iter()
             .chain(place)
         {
             name = format!("{name}/{part}");
             Dataset::parse(&name).map_err(|error| host(&name, error))?;
-            self.ensure_container(&name)?;
+            containers.push(name.clone());
         }
         let name = format!("{name}/{leaf}");
         Dataset::parse(&name).map_err(|error| host(&name, error))?;
+        Ok((containers, name))
+    }
+
+    /// The dataset name of the payload at `image` ([`Self::placed`]), its containers made first.
+    fn named(&self, image: &Path) -> Result<String, ApfsStorageError> {
+        let (containers, name) = self.placed(image)?;
+        for container in &containers {
+            self.ensure_container(container)?;
+        }
         Ok(name)
     }
 
@@ -550,13 +673,37 @@ impl ZfsPayloads {
             .filter(|dataset| self.root.holds(dataset)))
     }
 
+    /// The payload at `directory`: the dataset of this root mounted there, or, for a payload at
+    /// home in a store that is not a dataset, the one its image path names when it exists.
     fn payload_at(&self, directory: &Path) -> Result<Dataset, ApfsStorageError> {
-        self.mounted_at(directory)?.ok_or_else(|| {
-            host(
-                "no dataset of this cowshed root is mounted at",
-                directory.display(),
-            )
-        })
+        if let Some(mounted) = self.mounted_at(directory)? {
+            return Ok(mounted);
+        }
+        if let Some(home) = self.at_home(directory)? {
+            return Ok(home);
+        }
+        Err(host(
+            "no dataset of this cowshed root is mounted at",
+            directory.display(),
+        ))
+    }
+
+    /// The dataset the image path `image` names, when the store keeps payloads unmounted at
+    /// home, `image` is a directory and that dataset exists and is not mounted.
+    fn at_home(&self, image: &Path) -> Result<Option<Dataset>, ApfsStorageError> {
+        if !matches!(self.home, Home::Unmounted { .. }) || !image.starts_with(&self.store_root) {
+            return Ok(None);
+        }
+        if !fs::symlink_metadata(image).is_ok_and(|metadata| metadata.is_dir()) {
+            return Ok(None);
+        }
+        let (_, name) = self.placed(image)?;
+        if !self.exists(&name) || self.property(&name, "mounted")? == "yes" {
+            return Ok(None);
+        }
+        Dataset::parse(&name)
+            .map(Some)
+            .map_err(|error| host(&name, error))
     }
 
     /// Whether a payload's dataset is mounted at `directory`.
@@ -594,6 +741,9 @@ impl ZfsPayloads {
         directory: &Path,
         refquota: Option<u64>,
     ) -> Result<(), ApfsStorageError> {
+        if let Home::Unmounted { scratch } = &self.home {
+            return self.create_unmounted(directory, refquota, scratch);
+        }
         let name = self.named(directory)?;
         fs::create_dir(directory).map_err(|error| io_error("create payload", directory, error))?;
         let mountpoint = format!("mountpoint={}", path_text(directory)?);
@@ -623,14 +773,18 @@ impl ZfsPayloads {
         let quota = self.property(origin.as_str(), "refquota")?;
         fs::create_dir(destination)
             .map_err(|error| io_error("create clone payload", destination, error))?;
-        let mountpoint = format!("mountpoint={}", path_text(destination)?);
+        // At home in a store that is not a dataset the clone is unmounted; otherwise it is
+        // mounted at its image path.
+        let placement = match self.home {
+            Home::InStore => vec![format!("mountpoint={}", path_text(destination)?)],
+            Home::Unmounted { .. } => vec![
+                String::from("canmount=noauto"),
+                String::from("mountpoint=none"),
+            ],
+        };
         let quota = (quota != "0").then(|| format!("refquota={quota}"));
-        let mut arguments = vec![
-            "clone",
-            snapshot.as_str(),
-            name.as_str(),
-            mountpoint.as_str(),
-        ];
+        let mut arguments = vec!["clone", snapshot.as_str(), name.as_str()];
+        arguments.extend(placement.iter().map(String::as_str));
         arguments.extend(quota.as_deref());
         let cloned = self
             .helper(&["snapshot", &snapshot])
@@ -786,7 +940,9 @@ impl ZfsPayloads {
         let used = used
             .parse()
             .map_err(|error| host(format_args!("`used` of {dataset} is {used:?}"), error))?;
-        self.helper(&["unmount", dataset.as_str(), "--force"])?;
+        if self.property(dataset.as_str(), "mounted")? == "yes" {
+            self.helper(&["unmount", dataset.as_str(), "--force"])?;
+        }
         for (snapshot, _) in &snapshots {
             self.helper(&["destroy", snapshot])?;
         }
@@ -802,6 +958,225 @@ impl ZfsPayloads {
     }
 }
 
+/// The mount protocol of a store that is not a dataset ([`Home::Unmounted`]). The record is the
+/// directory store's: while a payload is mounted its image path is a symlink naming its bind
+/// place, and while it is home its image path is an empty directory and its dataset, the one that
+/// path names, is unmounted with `mountpoint=none` and `canmount=noauto`. A move writes the new
+/// record beside the image path (its move sibling) first, then moves the dataset, then lets the
+/// record take the image path's place; the kernel's mount table decides a move a crash
+/// interrupted.
+impl ZfsPayloads {
+    /// Make the empty home payload at `image`, capped at `refquota` bytes: created mounted once in
+    /// `scratch`, where the helper hands its root to this user, then sent home.
+    fn create_unmounted(
+        &self,
+        image: &Path,
+        refquota: Option<u64>,
+        scratch: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        let name = self.named(image)?;
+        fs::create_dir(image).map_err(|error| io_error("create payload", image, error))?;
+        let leaf = name.rsplit('/').next().unwrap_or_default();
+        let handover = scratch.join(format!("{leaf}-{}", uuid::Uuid::new_v4().simple()));
+        let made = fs::create_dir_all(&handover)
+            .map_err(|error| io_error("create a new dataset's handover place", &handover, error))
+            .and_then(|()| {
+                let mountpoint = format!("mountpoint={}", path_text(&handover)?);
+                let quota = refquota.map(|bytes| format!("refquota={bytes}"));
+                let mut arguments = vec!["create", name.as_str(), mountpoint.as_str()];
+                arguments.extend(quota.as_deref());
+                self.helper(&arguments)
+            })
+            .and_then(|()| self.send_home(&name, false));
+        let cleared = fs::remove_dir(&handover);
+        if let Err(primary) = made {
+            if self.exists(&name) {
+                let _ = self.helper(&["destroy", &name]);
+            }
+            let _ = fs::remove_dir(image);
+            return Err(primary);
+        }
+        cleared.map_err(|error| io_error("clear a new dataset's handover place", &handover, error))
+    }
+
+    /// Unmount `dataset`, out from under whoever holds it when `force`, and keep it unmountable
+    /// where it is: home.
+    fn send_home(&self, dataset: &str, force: bool) -> Result<(), ApfsStorageError> {
+        if self.property(dataset, "mounted")? == "yes" {
+            let mut arguments = vec!["unmount", dataset];
+            arguments.extend(force.then_some("--force"));
+            self.helper(&arguments)?;
+        }
+        self.helper(&["set", dataset, "canmount=noauto", "mountpoint=none"])
+    }
+
+    /// Mount `dataset` at `mount_point`, made when absent.
+    fn mount_at(&self, dataset: &str, mount_point: &Path) -> Result<(), ApfsStorageError> {
+        match fs::create_dir(mount_point) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error("create mountpoint", mount_point, error)),
+        }
+        let mountpoint = format!("mountpoint={}", path_text(mount_point)?);
+        self.helper(&["set", dataset, "canmount=on", &mountpoint])?;
+        // Setting the property mounts a dataset that may mount; one already mounted remounts.
+        if !self.is_mounted(mount_point)? {
+            self.helper(&["mount", dataset])?;
+        }
+        Ok(())
+    }
+
+    fn settle_unmounted(&self, image: &Path) -> Result<Payload, ApfsStorageError> {
+        let sibling = move_sibling(image);
+        let metadata = match fs::symlink_metadata(image) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error("inspect payload", image, error)),
+        };
+        if let Some(metadata) = &metadata
+            && metadata.file_type().is_symlink()
+        {
+            let mount_point = fs::read_link(image)
+                .map_err(|error| io_error("read mount record", image, error))?;
+            if !mount_point.is_absolute() {
+                return Err(host(
+                    "a mount record names a relative path",
+                    image.display(),
+                ));
+            }
+            return if self.remount(&mount_point)? {
+                Ok(Payload::Mounted(mount_point))
+            } else {
+                Err(host(
+                    format_args!(
+                        "mount record {} names a mountpoint no dataset has",
+                        image.display()
+                    ),
+                    mount_point.display(),
+                ))
+            };
+        }
+        if metadata.as_ref().is_some_and(|metadata| !metadata.is_dir()) {
+            return Err(host(
+                "payload is neither a home record nor a mount record",
+                image.display(),
+            ));
+        }
+        let (_, name) = self.placed(image)?;
+        // A record waiting beside the image path names where a move in flight was taking the
+        // payload: it is there when the dataset is mounted there.
+        if mount_point_state(&sibling)? == MountPointState::Link {
+            let mount_point = fs::read_link(&sibling)
+                .map_err(|error| io_error("read mount record", &sibling, error))?;
+            if self.is_mounted(&mount_point)? {
+                if metadata.is_some() {
+                    fs::remove_dir(image)
+                        .map_err(|error| io_error("clear a moved payload's home", image, error))?;
+                }
+                fs::rename(&sibling, image)
+                    .map_err(|error| io_error("record mount", image, error))?;
+                sync_parent_path(image)?;
+                return Ok(Payload::Mounted(mount_point));
+            }
+        }
+        if !self.exists(&name) {
+            return Err(host(
+                "no dataset is named by the payload at",
+                image.display(),
+            ));
+        }
+        // Anything else is home: the dataset goes, or stays, unmounted and unmountable, and the
+        // image path is its home record again.
+        self.send_home(&name, false)?;
+        if metadata.is_none() {
+            fs::create_dir(image)
+                .map_err(|error| io_error("restore a payload's home", image, error))?;
+        }
+        if mount_point_state(&sibling)? == MountPointState::Link {
+            clear_move_sibling(&sibling)?;
+        }
+        sync_parent_path(image)?;
+        Ok(Payload::Home)
+    }
+
+    fn bind_unmounted(&self, image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
+        let dataset = self
+            .at_home(image)?
+            .ok_or_else(|| host("no payload is home at", image.display()))?;
+        let sibling = move_sibling(image);
+        clear_move_sibling(&sibling)?;
+        std::os::unix::fs::symlink(mount_point, &sibling)
+            .map_err(|error| io_error("create mount record", &sibling, error))?;
+        if let Err(primary) = self.mount_at(dataset.as_str(), mount_point) {
+            let back = self.send_home(dataset.as_str(), false);
+            return combine_cleanup(
+                "mount payload",
+                primary,
+                back.and_then(|()| {
+                    fs::remove_file(&sibling)
+                        .map_err(|error| io_error("remove unused mount record", &sibling, error))
+                }),
+            );
+        }
+        fs::remove_dir(image)
+            .map_err(|error| io_error("clear a mounted payload's home", image, error))?;
+        fs::rename(&sibling, image).map_err(|error| io_error("record mount", image, error))?;
+        sync_parent_path(image)
+    }
+
+    fn move_home_unmounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        force: bool,
+    ) -> Result<(), ApfsStorageError> {
+        let dataset = self.payload_at(mount_point)?;
+        let sibling = move_sibling(image);
+        clear_move_sibling(&sibling)?;
+        fs::rename(image, &sibling)
+            .map_err(|error| io_error("set a mount record aside", image, error))?;
+        if let Err(primary) = self.send_home(dataset.as_str(), force) {
+            let rollback = fs::rename(&sibling, image)
+                .map_err(|error| io_error("restore mount record", image, error));
+            return combine_cleanup("unmount payload", primary, rollback);
+        }
+        fs::create_dir(image)
+            .map_err(|error| io_error("restore a payload's home", image, error))?;
+        fs::remove_file(&sibling)
+            .map_err(|error| io_error("remove released mount record", &sibling, error))?;
+        sync_parent_path(image)
+    }
+
+    fn rename_unmounted(&self, from: &Path, to: &Path) -> Result<(), ApfsStorageError> {
+        let dataset = self
+            .at_home(from)?
+            .ok_or_else(|| host("no payload is home at", from.display()))?;
+        let renamed = self.named(to)?;
+        self.rename_dataset(dataset.as_str(), &renamed)?;
+        fs::rename(from, to).map_err(|error| io_error("move a payload's home", from, error))?;
+        sync_parent_path(to)?;
+        sync_parent_path(from)
+    }
+
+    /// Give `dataset` the name `renamed`, and its fork's origin snapshot the fork's new name,
+    /// which leaves the old name free for the next fork of that name.
+    fn rename_dataset(&self, dataset: &str, renamed: &str) -> Result<(), ApfsStorageError> {
+        if dataset == renamed {
+            return Ok(());
+        }
+        self.helper(&["rename", dataset, renamed])?;
+        let leaf = |name: &str| name.rsplit('/').next().unwrap_or_default().to_owned();
+        let origin = self.property(renamed, "origin")?;
+        if let Some((source, snapshot)) = origin.split_once('@')
+            && snapshot == format!("cowshed:fork-{}", leaf(dataset))
+        {
+            let followed = format!("{source}@cowshed:fork-{}", leaf(renamed));
+            self.helper(&["rename", &origin, &followed])?;
+        }
+        Ok(())
+    }
+}
+
 /// The store's mount protocol over datasets. The record is the directory store's: while a
 /// payload is mounted its image path is a symlink naming the mountpoint, and while it is home
 /// the image path is the directory its dataset is mounted at. A move is three steps: the new
@@ -812,6 +1187,9 @@ impl ZfsPayloads {
     /// Where `image`'s payload is, after completing a move a crash interrupted and mounting a
     /// dataset a reboot left unmounted.
     pub(super) fn settle(&self, image: &Path) -> Result<Payload, ApfsStorageError> {
+        if matches!(self.home, Home::Unmounted { .. }) {
+            return self.settle_unmounted(image);
+        }
         let sibling = move_sibling(image);
         let metadata = match fs::symlink_metadata(image) {
             Ok(metadata) => Some(metadata),
@@ -884,6 +1262,9 @@ impl ZfsPayloads {
     /// Mount the home payload `image` at `mount_point`, a vacant or absent path the caller
     /// checked.
     pub(super) fn bind(&self, image: &Path, mount_point: &Path) -> Result<(), ApfsStorageError> {
+        if matches!(self.home, Home::Unmounted { .. }) {
+            return self.bind_unmounted(image, mount_point);
+        }
         let sibling = move_sibling(image);
         clear_move_sibling(&sibling)?;
         std::os::unix::fs::symlink(mount_point, &sibling)
@@ -910,6 +1291,9 @@ impl ZfsPayloads {
         mount_point: &Path,
         force: bool,
     ) -> Result<(), ApfsStorageError> {
+        if matches!(self.home, Home::Unmounted { .. }) {
+            return self.move_home_unmounted(image, mount_point, force);
+        }
         let sibling = move_sibling(image);
         clear_move_sibling(&sibling)?;
         fs::rename(image, &sibling)
@@ -932,6 +1316,9 @@ impl ZfsPayloads {
     /// Move the home payload at `from` to `to`, which must not exist: what a rename is to a
     /// directory payload. The dataset takes the name of its new place first, then mounts there.
     pub(super) fn rename(&self, from: &Path, to: &Path) -> Result<(), ApfsStorageError> {
+        if matches!(self.home, Home::Unmounted { .. }) {
+            return self.rename_unmounted(from, to);
+        }
         if fs::symlink_metadata(to).is_ok() {
             return Err(host("a payload's new place already exists", to.display()));
         }
@@ -954,6 +1341,9 @@ impl ZfsPayloads {
         fs::remove_dir(from).map_err(|error| io_error("clear a moved payload's place", from, error))
     }
 }
+
+#[cfg(test)]
+mod laws;
 
 #[cfg(test)]
 mod tests {
@@ -995,8 +1385,42 @@ mod tests {
         assert_eq!(assigned_in(listed, "none"), Some("tank/cowshed"));
         let owners = "tank/cowshed\t501\ntank/x/cowshed\t502\ntank/y/cowshed\t-\n\
                       tank/cowshed/store\t501\ntank/z\t501\n";
-        assert_eq!(serving_roots(owners, 501), ["tank/cowshed"]);
-        assert_eq!(serving_roots(owners, 500), [""; 0]);
+        let names = |uid| {
+            serving_roots(owners, uid)
+                .iter()
+                .map(|root| root.dataset().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(501), ["tank/cowshed"]);
+        assert!(names(500).is_empty());
+    }
+
+    /// A project no root serves is refused naming the user, with the command that makes a root;
+    /// one several roots would serve is refused naming each.
+    #[test]
+    fn an_unserved_project_names_the_user_and_every_root() {
+        let roots = ["tank/cowshed", "tank/b/cowshed"].map(|name| Root::parse(name).unwrap());
+        assert_eq!(
+            ApfsStorageError::from(Unserved::NoRoot { uid: 501 }).to_string(),
+            ApfsStorageError::Host(
+                "no cowshed ZFS root names uid 501 as its owner: whoever administers a pool \
+                 creates one: zfs create -o mountpoint=none -o cowshed:owner=501 <pool>/cowshed"
+                    .to_owned()
+            )
+            .to_string()
+        );
+        assert_eq!(
+            ApfsStorageError::from(Unserved::Several {
+                uid: 501,
+                roots: roots.to_vec(),
+            })
+            .to_string(),
+            ApfsStorageError::Host(
+                "several cowshed ZFS roots name uid 501 as their owner: tank/cowshed, tank/b/cowshed"
+                    .to_owned()
+            )
+            .to_string()
+        );
     }
 
     #[test]

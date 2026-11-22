@@ -2,8 +2,9 @@
 
 cowshed's workspace physics — cheap CoW clone, instant delete, own inode namespace — is provided by a substrate.
 Everything above the substrate (grants, sandbox model, gateway, CLI contract, marker files, cache taxonomy) is
-substrate-independent. There are two substrates: **APFS images** (macOS, 01a_apfs.md/02_workspaces.md are written
-against it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
+substrate-independent. There are two substrates: **ZFS datasets**, the preferred one, which replaces APFS disk images
+wherever a host has ZFS (Linux; macOS once the user installs OpenZFS for macOS), and **APFS images** (macOS;
+01a_apfs.md/02_workspaces.md are written against them), which a macOS host without OpenZFS keeps.
 
 ## Public lifecycle and substrate API
 
@@ -173,9 +174,31 @@ and the project is an APFS project; any other entry is a dataset project's mount
 dataset mounted where it says, or the one whose `mountpoint` names that place when nothing is mounted there, names the
 root. Each execution host is built from that fact for its one project, so the gateway's inventory and heal,
 `mount main`, store-wide attach and detach, and a project controller all serve an APFS project through the image host
-and a dataset project through the directory host, as Linux serves one. A dataset project attaches no image: it registers
-no IOMedia, takes no part in making room for an attach (02_workspaces.md), and is refused the image-only operations by
-the substrate table (07_api.md, "Substrates"). `directory` is not a project substrate on macOS.
+and a dataset project through the directory host's protocol, as Linux serves one, with one difference the store's volume
+decides. <a id="smoo/cowshed!n/macos-dataset-payload-home"></a>The macOS store volume mounts `noowners`, so it can say
+nothing of who owns a directory in it, and the helper's mountpoint rule ("Privileged helper") cannot admit one: no
+dataset is ever mounted inside it. On a store that is not a dataset, a dataset payload at home is unmounted, with
+`mountpoint=none` and `canmount=noauto` set locally; its image path is an empty directory that names it by its place
+(01b_zfs.md, "One pool, one root"), and it mounts only at its bind place: main at its checkout path, a workspace at
+`<mount-root>/<owner>/<repo>/<name>`, a build volume at `<mount-root>/.build/<owner>/<repo>/<id>`. A new dataset is
+mounted once in a directory of the user's below the project's mount root, so the helper hands its root to the user, and
+then goes home. A dataset project attaches no image: it registers no IOMedia, takes no part in making room for an attach
+(02_workspaces.md), and is refused the image-only operations by the substrate table (07_api.md, "Substrates").
+`directory` is not a project substrate on macOS.
+
+<a id="smoo/cowshed!n/zfs-substrate-selection"></a>With nothing mounted at the place and no dataset's `mountpoint`
+naming it, the main is at home with its dataset unmounted, and the one root that names the caller and holds
+`<root>/projects/<owner>/<repo>/main` by name is the project's root. If no root holds it, the project keeps no datasets;
+if several do, the opening is refused and the refusal names them. The choice is one pure function of the entry, whether
+adoption asks for datasets, and the roots that name the caller (`select` in cowshed-core `storage/directory/zfs.rs`). It
+reads the roots that name the caller only for an absent main that adoption asks onto datasets, and the roots that hold
+the main only for a main at home. [zfs_substrate.bend](laws/zfs_substrate.bend) proves its laws, and property tests over
+the model's corpus and seeded draws bind them to the code:
+
+- a regular-file main is an APFS project whatever roots exist;
+- a mounted or assigned main dataset names its own root;
+- an adoption asked onto datasets takes exactly the one root that names the caller, refused when there is none and
+  refused, naming them, when there are several.
 
 On Linux a host has one store, every project in it is kept on the store's substrate, and `adopt --filesystem` accepts
 only that substrate. A store that is published decides the substrate by what answers at `/private/cowshed/store`: a
@@ -223,22 +246,22 @@ mbx creates (16_build_volumes.md); its build volume stays an image here like eve
 ### Mapping
 
 `<pool>` in the names below, and in 01b_zfs.md, stands for the root's parent `<parent>`: the pool itself, or any dataset
-in it that `.cowshed.toml` names.
+in it, the one `.cowshed.toml` names on Linux, and on macOS the parent of the one root that names the caller.
 
-| cowshed concept                   | ZFS object                                                                                                                                                                                                                                                                             |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                                                                                                         |
-| main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path                                                                                                                                                                                                    |
-| session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                                                                                                     |
-| workspace mounts                  | `mountpoint` inheritance on `…/ws` → `<mount-root>/<owner>/<repo>/<name>`                                                                                                                                                                                                              |
-| crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                                                                                            |
-| `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                                                                                                  |
-| `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves)                                                                           |
-| capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                                                                                                      |
-| shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                                                                                                   |
-| mbx store and managed targets     | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache`, holding only the mbx cache dir `mbx/`; store and targets together on one filesystem, so restores are clones where the pool's block cloning serves them [INFERENCE] (01b_zfs.md, "The mbx store on a ZFS host") |
-| Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                                                                                                      |
-| compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                                                                                           |
+| cowshed concept                   | ZFS object                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| project                           | `<pool>/cowshed/projects/<owner>/<repo>` (primary `repo_id`; component-safe container dataset)                                                                                                                                                                                                                                                                                          |
+| main workspace                    | `<pool>/cowshed/projects/<owner>/<repo>/main`, `mountpoint=` original checkout path while bound; at home on a store that is not a dataset `mountpoint=none`, `canmount=noauto`                                                                                                                                                                                                          |
+| session workspace                 | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`                                                                                                                                                                                                                                                                                                                                      |
+| workspace mounts                  | each bound workspace dataset at `<mount-root>/<owner>/<repo>/<name>`, a build dataset at `<mount-root>/.build/<owner>/<repo>/<id>`; unmounted at home on a store that is not a dataset                                                                                                                                                                                                  |
+| crash-consistent snapshot of main | `zfs snapshot main@cowshed:<name>` (transactionally atomic)                                                                                                                                                                                                                                                                                                                             |
+| `cowshed fork [<src>] <ws>`       | `zfs snapshot src@cowshed:fork-<ws>` + clone; source defaults to main                                                                                                                                                                                                                                                                                                                   |
+| `cowshed rm`                      | retire: `zfs rename` into `…/.trash`; reclaim: `zfs destroy` the clone **then** its origin snapshot — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted halves)                                                                                                                                                                            |
+| capacity cap                      | `refquota` per workspace dataset (replaces sparse-image capacity)                                                                                                                                                                                                                                                                                                                       |
+| shared caches (layers 1 and 3)    | none — layer 1 is cowshed's user cache directory and layer 3 each tool's own default in the host HOME (03_caches.md)                                                                                                                                                                                                                                                                    |
+| mbx store and managed targets     | Linux: `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache`, holding only the mbx cache dir `mbx/`; store and targets together on one filesystem, so restores are clones where the pool's block cloning serves them [INFERENCE] (01b_zfs.md, "The mbx store on a ZFS host"). macOS: the APFS build-cache volume or that dataset; it is never cloned, so either serves |
+| Linux gateway attachment          | no persistent port block; per-incarnation Unix socket + private netns + trusted `127.0.0.1:7644` connector, created and destroyed with attachment                                                                                                                                                                                                                                       |
+| compaction                        | not needed — freed blocks return to the pool                                                                                                                                                                                                                                                                                                                                            |
 
 Adopt on ZFS: create `…/projects/<owner>/<repo>/main`, copy the tree once (rsync-fidelity, preserving metadata), set
 `mountpoint=` the original path. The original tree moves aside as `<root>.pre-cowshed` exactly as on macOS. The
@@ -337,6 +360,21 @@ status 2:
   paths"), or an absolute path of normal components whose every existing component is not a symlink and whose deepest
   existing component belongs to the caller. `legacy` is refused.
 
+<a id="smoo/cowshed!n/zfs-helper-admission"></a>Admission is a pure core over what the helper reads:
+
+- the verb's plan (`verb::plan`);
+- the root's owner, as `zfs get` reports its value and source (`verb::admit`);
+- the mountpoint rule, over what a walk that follows no symlink finds at each component (`mountpoint::judge`).
+
+The helper's shell only reads those and runs the one command. [zfs_substrate.bend](laws/zfs_substrate.bend) proves these
+refusals for every root, owner, caller and verb:
+
+- only an owner set locally to the caller's uid admits a verb;
+- every dataset an admitted plan names lies strictly below the root, never the root, a parent or a sibling;
+- `promote` is admitted exactly for a build dataset.
+
+cowshed-helper's law tests hold `plan` and `admit` to that model on its corpus and its seeded draws.
+
 A new dataset's root directory belongs to root, so `create` hands it to the caller: it opens the mountpoint once and
 changes its owner only when the kernel says that descriptor is the mounted root of the dataset it just created
 (`/proc/self/mountinfo` on Linux, `fstatfs` on macOS). A clone needs no handover, its root carries its origin's owner.
@@ -413,11 +451,11 @@ is the one shared cache that is a dataset on ZFS and a dedicated volume on APFS,
 (03_caches.md, "The reflink-reachability rule"). ZFS additionally keeps workspace data in the sibling `projects` dataset
 tree:
 
-| macOS                                                                                                          | Linux                                                                  |
-| -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry) | `<pool>/cowshed/store` dataset at `/private/cowshed/store`             |
-| `cowshed.build-cache` APFS volume at `/private/var/folders/cowshed/shared/build-cache` (the mbx store, `mbx/`) | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache` |
-| project images are files on `cowshed.store`                                                                    | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers  |
+| macOS                                                                                                                                                                                                                     | Linux                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `cowshed.store` APFS volume at `/private/cowshed/store` (images, grants, quarantine, gateway state, telemetry)                                                                                                            | `<pool>/cowshed/store` dataset at `/private/cowshed/store`             |
+| `cowshed.build-cache` APFS volume at `/private/var/folders/cowshed/shared/build-cache` (the mbx store, `mbx/`), or a `<pool>/cowshed/build-cache` dataset there: the cache is never cloned, so either substrate serves it | `<pool>/cowshed/build-cache` dataset at `/private/cowshed/build-cache` |
+| project images are files on `cowshed.store`                                                                                                                                                                               | `<pool>/cowshed/projects/<owner>/<repo>` workspace dataset containers  |
 
 A Linux host without a ZFS root that serves the user has a **directory store**: `/private/cowshed/store` and
 `/private/cowshed/build-cache` are plain directories of whatever filesystem holds them, owned by the user, and every
@@ -474,9 +512,14 @@ mounted, never creating one, until its retirement destroys it (03_caches.md, "Wi
 
 ### macOS ZFS, btrfs
 
-OpenZFS on macOS (o3x) is a kext requiring reduced-security boot on Apple silicon; cowshed supports the ZFS substrate
-there when the pool and its cowshed root already exist but never selects it by default — APFS images remain the macOS
-path, and a project is kept on datasets only when its adoption names them (selection, above). btrfs occupies the third
+ZFS datasets are the preferred substrate on macOS too, replacing APFS disk images: a dataset project attaches no image
+and spends none of the IOKit, `diskimagesiod` and Spotlight budgets an image does (01b_zfs.md, "Why no dataset gets a
+disk"). macOS ships no ZFS: the user installs OpenZFS for macOS (o3x), a kext that needs reduced-security boot on Apple
+silicon, and its pool. Until then the host keeps its projects on APFS images, and `cowshed setup` on a macOS host with
+no `zfs` says once that datasets need OpenZFS for macOS, installed by the user, and that its projects stay on APFS
+images. Once a pool and its cowshed root exist, a project is kept on datasets when its adoption names them (selection,
+above); an adopted project never moves between substrates. The shared build cache is never cloned, so on macOS it may
+stay the APFS build-cache volume or be a dataset (01b_zfs.md, "The mbx store on a ZFS host"). btrfs occupies the third
 implementation slot when needed: subvolume snapshot + clone maps one-to-one onto the trait, its clones are independent
 (no origin rule), and reflink crosses subvolumes natively; it is listed only to show the trait is not ZFS-shaped.
 
