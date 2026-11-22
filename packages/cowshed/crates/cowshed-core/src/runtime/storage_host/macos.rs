@@ -221,6 +221,7 @@ impl ApfsExecutionHost for NativeHost {
             workspace: &LifecycleWorkspace,
             checkout: &Path,
         ) -> Result<(), ApfsStorageError>;
+        fn release_project_containers(&self, repo: &RepoId) -> Result<(), ApfsStorageError>;
         fn detach_owned_build_volumes(
             &self,
             workspace: &LifecycleWorkspace,

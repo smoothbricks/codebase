@@ -692,17 +692,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
+    /// Remove what project `repo`'s payloads leave of their own once every one is reclaimed, for
+    /// its unbinding: nothing for images or directories; a dataset project's containers
+    /// (01b_zfs.md, "One pool, one root"). Something still in them refuses, named, while the
+    /// project is bound, for the same removal to retry. Required, never defaulted: a host that
+    /// answers for others must ask the one it is.
+    fn release_project_containers(&self, repo: &RepoId) -> Result<(), ApfsStorageError>;
     /// Detach every build volume `workspace`'s checkout owns, kept whole for its next mount,
     /// once the checkout itself is detached: a detached workspace holds none of its images
     /// (02_workspaces.md, "Attach and detach"). Its next mount mounts the volume again
     /// ([`Self::ensure_linked_build_volume`]).
-    /// Remove what project `repo`'s payloads leave of their own once every one is reclaimed, for
-    /// its unbinding: nothing for images or directories; a dataset project's containers
-    /// (01b_zfs.md, "One pool, one root"). Something still in them refuses, named, while the
-    /// project is bound, for the same removal to retry.
-    fn release_project_containers(&self, _repo: &RepoId) -> Result<(), ApfsStorageError> {
-        Ok(())
-    }
     fn detach_owned_build_volumes(
         &self,
         workspace: &LifecycleWorkspace,

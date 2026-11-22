@@ -616,6 +616,10 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn release_project_containers(&self, repo: &RepoId) -> Result<(), ApfsStorageError> {
+        self.record(format!("release-project-containers:{repo}"));
+        Ok(())
+    }
     fn detach_owned_build_volumes(
         &self,
         workspace: &LifecycleWorkspace,

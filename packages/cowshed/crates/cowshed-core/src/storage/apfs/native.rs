@@ -4284,6 +4284,10 @@ where
         )
     }
 
+    /// An image project keeps no container: its images go with its store tree.
+    fn release_project_containers(&self, _repo: &RepoId) -> Result<(), ApfsStorageError> {
+        Ok(())
+    }
     fn detach_owned_build_volumes(
         &self,
         workspace: &LifecycleWorkspace,
