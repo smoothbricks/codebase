@@ -8929,7 +8929,13 @@ async fn directory_managed_install_restores_developer_links_before_nx_and_cleans
     )
     .unwrap();
     assert_eq!(native_identity["name"], "@nx/nx-darwin-arm64");
-    assert_eq!(native_identity["version"], "24.0.3");
+    let installed_nx: serde_json::Value =
+        serde_json::from_slice(&fs::read(nx.join("package.json")).expect("the cloned Nx manifest"))
+            .unwrap();
+    assert_eq!(
+        native_identity["version"], installed_nx["version"],
+        "the native binding is the installed Nx's own version"
+    );
     let closure_probe = format!(
         "node -e 'const assert=require(\"node:assert/strict\"); const root=require(\"node:path\").resolve({},\"../../../../\"); assert.equal(root,{}); assert.equal(require(\"node:module\").createRequire(root+\"/package.json\").resolve(\"nx/bin/nx.js\"),{}); require(\"fs\").readFileSync({}); require(\"fs\").readFileSync({}); require({})'",
         serde_json::to_string(&nx.join("dist/bin").to_string_lossy()).unwrap(),
