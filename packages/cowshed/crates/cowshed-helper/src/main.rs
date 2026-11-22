@@ -14,6 +14,8 @@
 //! it answers 0 once the helper runs as root and the root names the caller, which is how an
 //! install is proven before anything depends on it.
 
+#[cfg(test)]
+mod laws;
 mod mountpoint;
 mod verb;
 
@@ -106,22 +108,6 @@ fn properties(dataset: &Dataset, properties: &str) -> Result<Vec<(String, String
         .collect())
 }
 
-/// Refuse unless `root` itself says cowshed serves `uid` there.
-fn authorize(root: &Root, uid: u32) -> Result<(), Failure> {
-    let owner = properties(root.dataset(), OWNER_PROPERTY)?;
-    match owner.as_slice() {
-        [(value, source)] if *value == uid.to_string() && source == "local" => Ok(()),
-        [(value, source)] => Err(refused(format_args!(
-            "{} has {OWNER_PROPERTY}={value} ({source}); it must be set locally to the caller's uid, {uid}",
-            root.dataset()
-        ))),
-        _ => Err(refused(format_args!(
-            "cannot read {OWNER_PROPERTY} of {}",
-            root.dataset()
-        ))),
-    }
-}
-
 /// Give the mounted root of the dataset `create` just made to the caller. The directory is
 /// opened once and is only handed over when the kernel says that descriptor is the root of this
 /// dataset's mount, so no path the caller can rearrange decides what changes owner.
@@ -168,7 +154,7 @@ fn run(arguments: &[String]) -> Result<(), Failure> {
         own: created,
     } = verb::plan(&root, verb).map_err(refused)?;
     let (uid, gid) = host::caller();
-    authorize(&root, uid)?;
+    verb::admit(&root, &properties(root.dataset(), OWNER_PROPERTY)?, uid).map_err(refused)?;
     for mountpoint in &mountpoints {
         mountpoint::permit(mountpoint, uid).map_err(refused)?;
     }

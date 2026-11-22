@@ -44,10 +44,43 @@ impl fmt::Display for Denied {
     }
 }
 
-/// Permit `mountpoint` (absolute, normal components only) for `caller`: every existing component
-/// is a real directory entry, never a symlink, and the deepest one that exists belongs to the
-/// caller. Root is permitted everywhere it could mount anyway.
+/// What a walk finds at one existing component of a mountpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Entry {
+    pub symlink: bool,
+    pub owner: u32,
+}
+
+/// Permit `mountpoint` (absolute, normal components only) for `caller`: [`judge`] over the
+/// entries the host's directory tree holds, read without following a symlink.
 pub fn permit(mountpoint: &Path, caller: u32) -> Result<(), Denied> {
+    judge(
+        mountpoint,
+        caller,
+        |walked| match std::fs::symlink_metadata(walked) {
+            Ok(metadata) => Ok(Some(Entry {
+                symlink: metadata.file_type().is_symlink(),
+                owner: metadata.uid(),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Denied::Read {
+                path: walked.to_owned(),
+                source,
+            }),
+        },
+    )
+}
+
+/// The mountpoint rule (09_substrates.md, "Privileged helper"): every existing component is a
+/// real directory entry, never a symlink, and the deepest one that exists belongs to the caller.
+/// Root is permitted everywhere it could mount anyway, and so is every fixed host path. `look`
+/// answers what is at one component, `None` when nothing is; the walk asks for each component
+/// from the root down, and stops at the first that does not exist or is a symlink.
+pub fn judge(
+    mountpoint: &Path,
+    caller: u32,
+    mut look: impl FnMut(&Path) -> Result<Option<Entry>, Denied>,
+) -> Result<(), Denied> {
     if caller == 0
         || HOST_MOUNTPOINTS
             .iter()
@@ -59,18 +92,10 @@ pub fn permit(mountpoint: &Path, caller: u32) -> Result<(), Denied> {
     let mut walked = PathBuf::new();
     for component in mountpoint.components() {
         walked.push(component);
-        match std::fs::symlink_metadata(&walked) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Denied::Symlink(walked));
-            }
-            Ok(metadata) => deepest = (walked.clone(), metadata.uid()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(source) => {
-                return Err(Denied::Read {
-                    path: walked,
-                    source,
-                });
-            }
+        match look(&walked)? {
+            Some(Entry { symlink: true, .. }) => return Err(Denied::Symlink(walked)),
+            Some(Entry { owner, .. }) => deepest = (walked.clone(), owner),
+            None => break,
         }
     }
     let (path, owner) = deepest;
@@ -144,5 +169,59 @@ mod tests {
             permit(Path::new(host), stranger).unwrap();
         }
         permit(Path::new("/etc"), 0).unwrap();
+    }
+
+    /// The rule over a walk's findings, without a filesystem: a table of what each path holds.
+    #[test]
+    fn a_mountpoint_is_judged_by_what_its_walk_finds() {
+        let dir = |owner| {
+            Some(Entry {
+                symlink: false,
+                owner,
+            })
+        };
+        let link = Some(Entry {
+            symlink: true,
+            owner: 501,
+        });
+        let tree = [
+            ("/", dir(0)),
+            ("/srv", dir(0)),
+            ("/srv/u", dir(501)),
+            ("/srv/u/link", link),
+            ("/srv/u/w", dir(501)),
+            ("/srv/v", dir(502)),
+        ];
+        let mut asked = Vec::new();
+        let mut verdict = |mountpoint: &str, caller| {
+            asked.clear();
+            judge(Path::new(mountpoint), caller, |path| {
+                asked.push(path.to_owned());
+                Ok(tree
+                    .iter()
+                    .find(|(at, _)| Path::new(at) == path)
+                    .and_then(|(_, entry)| *entry))
+            })
+            .map_err(|denied| denied.to_string())
+        };
+        assert_eq!(verdict("/srv/u/w/x/y", 501), Ok(()));
+        assert_eq!(verdict("/srv/u", 501), Ok(()));
+        assert_eq!(
+            verdict("/srv/u/link/x", 501),
+            Err("/srv/u/link is a symlink".to_owned())
+        );
+        assert_eq!(
+            verdict("/srv/v/x", 501),
+            Err("/srv/v belongs to uid 502, not to the caller, uid 501".to_owned())
+        );
+        assert_eq!(
+            verdict("/absent/x", 501),
+            Err("/ belongs to uid 0, not to the caller, uid 501".to_owned())
+        );
+        assert_eq!(verdict("/srv/v/x", 0), Ok(()));
+        assert_eq!(verdict(HOST_MOUNTPOINTS[0], 501), Ok(()));
+        // The walk stops at the first component that does not exist: nothing below it is read.
+        verdict("/srv/u/absent/deeper", 501).unwrap();
+        assert_eq!(asked.last(), Some(&PathBuf::from("/srv/u/absent")));
     }
 }

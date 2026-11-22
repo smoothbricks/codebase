@@ -5,6 +5,7 @@
   "sideEffects": false,
   "scripts": {
     "emit-land-turn-law": "bun scripts/emit-land-turn-law.ts",
+    "emit-zfs-substrate-law": "bun scripts/emit-zfs-substrate-law.ts",
     "test": "nx run cowshed:test --outputStyle=stream",
     "cowshed": "nx run cowshed:cli-native && bin/cowshed"
   },

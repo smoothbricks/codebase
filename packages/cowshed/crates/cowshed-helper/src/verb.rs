@@ -33,12 +33,37 @@ const WORD_PROPERTIES: [&str; 13] = [
 pub enum Refusal {
     Usage,
     UnknownVerb(String),
-    Name { argument: String, error: NameError },
-    Outside { dataset: String },
-    NotABuildVolume { dataset: String },
-    Property { property: String },
-    Value { property: String, value: String },
-    Mountpoint { value: String },
+    Name {
+        argument: String,
+        error: NameError,
+    },
+    Outside {
+        dataset: String,
+    },
+    NotABuildVolume {
+        dataset: String,
+    },
+    Property {
+        property: String,
+    },
+    Value {
+        property: String,
+        value: String,
+    },
+    Mountpoint {
+        value: String,
+    },
+    /// The root's owner, read as `(value, source)`, is not set locally to the caller's uid.
+    Owner {
+        root: Dataset,
+        value: String,
+        source: String,
+        uid: u32,
+    },
+    /// The root's owner could not be read as one value with its source.
+    OwnerUnread {
+        root: Dataset,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -60,6 +85,16 @@ impl fmt::Display for Refusal {
                 f,
                 "mountpoint {value:?} is neither `none` nor an absolute path without `.`, `..` or a repeated `/`"
             ),
+            Self::Owner {
+                root,
+                value,
+                source,
+                uid,
+            } => write!(
+                f,
+                "{root} has {OWNER_PROPERTY}={value} ({source}); it must be set locally to the caller's uid, {uid}"
+            ),
+            Self::OwnerUnread { root } => write!(f, "cannot read {OWNER_PROPERTY} of {root}"),
         }
     }
 }
@@ -208,6 +243,24 @@ fn command<const N: usize>(head: [&str; N]) -> Vec<String> {
     head.map(str::to_owned).to_vec()
 }
 
+/// Admit `uid` at `root` when the root's own `cowshed:owner`, read as the `(value, source)` lines
+/// of `zfs get`, is set locally to that uid (09_substrates.md, "Privileged helper"): the property
+/// on the root itself is the whole authorization. An inherited, received or default owner, another
+/// uid, or a read that is not one line, admits nothing.
+pub fn admit(root: &Root, owner: &[(String, String)], uid: u32) -> Result<(), Refusal> {
+    match owner {
+        [(value, source)] if *value == uid.to_string() && source == "local" => Ok(()),
+        [(value, source)] => Err(Refusal::Owner {
+            root: root.dataset().clone(),
+            value: value.clone(),
+            source: source.clone(),
+            uid,
+        }),
+        _ => Err(Refusal::OwnerUnread {
+            root: root.dataset().clone(),
+        }),
+    }
+}
 /// The plan for `arguments`, the helper's arguments after the root. No verb ever passes `-r`,
 /// `-R`, `-f` to a destroy, or `-p`: one invocation touches the datasets it names and no other.
 pub fn plan(root: &Root, arguments: &[String]) -> Result<Plan, Refusal> {
@@ -584,6 +637,34 @@ mod tests {
                     value: value.to_owned()
                 }),
                 "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_owner_set_locally_to_the_caller_admits_and_a_refusal_names_both() {
+        let root = Root::parse(ROOT).unwrap();
+        let read = |value: &str, source: &str| vec![(value.to_owned(), source.to_owned())];
+        assert_eq!(admit(&root, &read("501", "local"), 501), Ok(()));
+        for (owner, refusal) in [
+            (
+                read("501", "inherited from tank/dev"),
+                "tank/dev/cowshed has cowshed:owner=501 (inherited from tank/dev); it must be set locally to the caller's uid, 501",
+            ),
+            (
+                read("502", "local"),
+                "tank/dev/cowshed has cowshed:owner=502 (local); it must be set locally to the caller's uid, 501",
+            ),
+            (Vec::new(), "cannot read cowshed:owner of tank/dev/cowshed"),
+            (
+                [read("501", "local"), read("501", "local")].concat(),
+                "cannot read cowshed:owner of tank/dev/cowshed",
+            ),
+        ] {
+            assert_eq!(
+                admit(&root, &owner, 501).map_err(|refused| refused.to_string()),
+                Err(refusal.to_owned()),
+                "{owner:?}"
             );
         }
     }
