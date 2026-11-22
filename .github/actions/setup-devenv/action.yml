@@ -169,9 +169,6 @@ runs:
           if [ "$copied" -gt 0 ]; then echo "task records: $copied from the $from_workflow scope of $from_ref"; fi
         fi
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
-        # Nx 24.0.6 refuses a cache or workspace-data directory that others can write (UntrustedDataDirectoryError):
-        # it restores outputs and reads configuration from it. The shared bind is group-writable, so these are not.
-        chmod go-w "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {
           echo "NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache"
           echo "NX_WORKSPACE_DATA_DIRECTORY=$NX_CACHE_ROOT/workspace-data"
