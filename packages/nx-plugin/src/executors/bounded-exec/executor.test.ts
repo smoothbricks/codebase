@@ -295,7 +295,15 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   //#region smoo/cowshed!n/awake-idle-bound
   it('preserves the remaining idle and capture budgets on wake, then ends genuine awake silence', async () => {
     const workspace = await createWorkspace();
-    await workspace.write('suspend.js', `${OWNED_GROUP_LINE}\n${LIFELINE}`);
+    // The fixture's group holds a member besides its leader, one that ignores SIGTERM, and names its group only once
+    // that member is up. The leader exits at the bound's SIGTERM and the member is still in the group when the leader
+    // settles, every time: the executor's force-kill of what the command left is part of the case. Before, the group
+    // was its leader alone, and a member a loaded host had not yet ended when the leader settled turned that same
+    // force-kill into a race the case lost.
+    await workspace.write(
+      'suspend.js',
+      `const member = require('node:child_process').spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); process.stdin.on('end', () => process.exit(0)); process.stdin.resume(); console.log('up')"], { stdio: ['inherit', 'pipe', 'inherit'] });\nmember.stdout.once('data', () => { ${OWNED_GROUP_LINE} });\n${LIFELINE}`,
+    );
     const owned: { group?: number } = {};
     const ownGroup = ownFixtureGroup(owned);
     const { promise: ready, resolve: started } = Promise.withResolvers<void>();
@@ -364,7 +372,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(result.success).toBe(false);
       expect(result.terminalOutput).toContain(`idleTimeoutMs=${limit}`);
       expect(result.terminalOutput).toContain('awake pre-expiry capture');
-      expect(signals).toEqual(['SIGTERM']);
+      // The bound's SIGTERM, then the force-kill of the member it left, repeated while the group lists it.
+      expect(signals[0]).toBe('SIGTERM');
+      expect(signals.length).toBeGreaterThan(1);
+      expect(new Set(signals.slice(1))).toEqual(new Set(['SIGKILL']));
+      expect(result.terminalOutput).toContain('Force-killing what the timed-out command left in its process group');
     } finally {
       clock.mockRestore();
       jest.useRealTimers();
