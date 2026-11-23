@@ -55,6 +55,9 @@ pub struct CapacityCounts {
     pub dry_run_fit: u64,
     /// Refused with `NEEDS_GROWTH` before any write.
     pub refused: u64,
+    /// Walks over a reduce program's instructions: one per program
+    /// admission decoded, however many batches and slots read it.
+    pub program_walks: u64,
 }
 
 /// What admission decided without running the batch.
@@ -99,9 +102,6 @@ pub(crate) struct CapacityScratch {
     pub(crate) scratch: ScratchDemand,
     /// Set when admission could not back its own storage.
     out_of_memory: bool,
-    /// Walks over a reduce program's instructions admission has made: one
-    /// per program it decodes.
-    pub(crate) program_walks: u64,
 }
 
 /// One slot's demand. `units` are new keys, members or entries; `touches`
@@ -799,7 +799,7 @@ impl CapacityScratch {
         // The copy is backed first: a cache whose effects outlive a failed
         // copy would match an empty reduce section.
         Self::room(&mut self.out_of_memory, &mut self.program, code.len())?;
-        self.program_walks += 1;
+        self.counts.program_walks += 1;
         let mut operands = core::mem::take(&mut self.operands);
         let Self {
             out_of_memory,

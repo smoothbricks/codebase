@@ -192,6 +192,7 @@ fn each_tier_answers_only_what_the_tier_before_cannot() {
     assert_eq!(
         CapacityCounts {
             bound: 1,
+            program_walks: 1,
             ..CapacityCounts::default()
         },
         counts(&vm)
@@ -1318,6 +1319,7 @@ fn a_counts_fold_whose_rows_fit_is_cleared_without_a_dry_run() {
     assert_eq!(
         CapacityCounts {
             probed: 2,
+            program_walks: 1,
             ..CapacityCounts::default()
         },
         vm.capacity_counts()
@@ -1375,9 +1377,9 @@ fn tier_two_reads_the_program_it_decoded_once() {
     assert_eq!(
         CapacityCounts {
             probed: 4,
+            program_walks: 1,
             ..CapacityCounts::default()
         },
         vm.capacity_counts()
     );
-    assert_eq!(1, vm.capacity_program_walks());
 }
