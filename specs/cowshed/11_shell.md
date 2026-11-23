@@ -1545,17 +1545,25 @@ refusal's pid and choose `kill`: measured 2026-11-23, an install drained a coder
 command reached it through a fresh `cowshed controller` of the new build and was refused, and the coder's writer parked
 for 11 minutes on that refusal. So `cowshed controller` waits at each ensure as a land step does, under the same
 ceiling, said on stderr the same way, while its connection's heartbeats name the waiting op (05_gateway.md,
-"Deadlines"). A CLI verb is still refused at once with the pid and `kill`. The land step asks it to `drain` (already
-draining when this build's daemon recovered it), says on stderr which socket and pid it waits for, and waits on the exit
-watch registered before that `drain`, never a poll. The wait has one ceiling per step, an hour, which bounds only the
-step: past it the step refuses naming the pid, and the supervisor and its jobs run on. Neither the wait nor its refusal
-ends a job. The wait includes the supervisor's read-out after its last job (above), at most the 30-minute bound when a
-job's end goes unread. A lifecycle verb that must change the workspace's substrate — `detach`, `rm`, `resize`, `mv` —
-does not wait for it, since a drain lasts as long as its longest job. A lifecycle verb stops admission with `drain` and
-identifies the serving process from that exact connection's kernel peer credential, cross-checking the reply's pid. TERM
-and, after the existing grace, KILL go only through that non-reusable identity: a macOS audit token or Linux peer pidfd
-(kernel 6.5 or newer), never a later process that reused the pid. A host lacking that identity primitive gets a typed
-refusal, not a raw-pid fallback.
+"Deadlines"). That wait ends: the embedder that replaced its controller lets the replaced child go (its worker relays
+end once new work goes to the fresh child), the child exits once the last job it admitted ends, the drained supervisor
+ends the residents that child asked for and retires, and the wait answers on its exit. That is the Bend model
+`laws/supervisor_handover.bend` (`--verdict`): with the child replaced, a state where nothing more can happen has
+retired (`handover_is_never_stuck`), and each thing that can happen leaves one fewer to happen (the `*_shrinks` laws),
+so every order of them ends retired. A resident some other live process asked for is outside it. The open twin
+`laws/supervisor_handover_open.bend` is the law over a relay that holds a replaced child, which `todays_cycle_is_stuck`
+refutes with the cycle measured 2026-11-23: the resident waiting for the child's exit, the child held by the relay's
+handle on that resident. A CLI verb is still refused at once with the pid and `kill`. The land step asks it to `drain`
+(already draining when this build's daemon recovered it), says on stderr which socket and pid it waits for, and waits on
+the exit watch registered before that `drain`, never a poll. The wait has one ceiling per step, an hour, which bounds
+only the step: past it the step refuses naming the pid, and the supervisor and its jobs run on. Neither the wait nor its
+refusal ends a job. The wait includes the supervisor's read-out after its last job (above), at most the 30-minute bound
+when a job's end goes unread. A lifecycle verb that must change the workspace's substrate — `detach`, `rm`, `resize`,
+`mv` — does not wait for it, since a drain lasts as long as its longest job. A lifecycle verb stops admission with
+`drain` and identifies the serving process from that exact connection's kernel peer credential, cross-checking the
+reply's pid. TERM and, after the existing grace, KILL go only through that non-reusable identity: a macOS audit token or
+Linux peer pidfd (kernel 6.5 or newer), never a later process that reused the pid. A host lacking that identity
+primitive gets a typed refusal, not a raw-pid fallback.
 
 The owner exit watch is registered before sending `drain` or a termination signal. On macOS, registration is followed by
 an actual kernel pid-version match, never a guessed numeric-pid or signal-zero probe; on Linux the watch duplicates the
