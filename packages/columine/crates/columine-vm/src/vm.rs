@@ -5195,6 +5195,12 @@ impl<I: KeyIndex> Vm<I> {
     }
 
     /// How this VM has admitted batches so far.
+    /// The walks capacity admission has made over reduce programs: one per
+    /// program it decoded, however many batches and slots read it.
+    pub fn capacity_program_walks(&self) -> u64 {
+        self.capacity.program_walks
+    }
+
     pub fn capacity_counts(&self) -> CapacityCounts {
         self.capacity.counts
     }

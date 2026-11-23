@@ -1325,3 +1325,59 @@ fn a_counts_fold_whose_rows_fit_is_cleared_without_a_dry_run() {
     let map = columine_vm::vm::CheckedStructMap::bind(&state, 0).unwrap();
     assert!(map.row(5).is_some() && map.row(6).is_some());
 }
+
+/// Tier 2 probes every open slot against the program its first batch
+/// decoded: a later batch, and a second slot, walk the program no more.
+#[test]
+fn tier_two_reads_the_program_it_decoded_once() {
+    let counts_into = |slot: u8| {
+        [
+            Opcode::BatchStructMapCountsFold as u8,
+            slot,
+            0,
+            0,
+            1,
+            2,
+            0,
+            1,
+            4,
+            4,
+            1,
+            3,
+            0,
+            1,
+            b'P',
+        ]
+    };
+    let map = |slot: u8| {
+        [
+            Opcode::SlotStructMap as u8,
+            slot,
+            SlotType::StructMap as u8,
+            16,
+            0,
+            1,
+            StructFieldType::Vo as u8,
+        ]
+    };
+    let prog = program(
+        2,
+        4,
+        &[map(0), map(1)].concat(),
+        &[counts_into(0), counts_into(1)].concat(),
+    );
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    for batch in 0..4u32 {
+        let keys = [10 * batch + 1, 10 * batch + 2, 10 * batch + 1];
+        assert_eq!(OK, fold_counts(&mut vm, &mut state, &prog, &keys));
+    }
+    assert_eq!(
+        CapacityCounts {
+            probed: 4,
+            ..CapacityCounts::default()
+        },
+        vm.capacity_counts()
+    );
+    assert_eq!(1, vm.capacity_program_walks());
+}

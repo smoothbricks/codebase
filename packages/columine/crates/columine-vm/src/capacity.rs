@@ -82,6 +82,15 @@ pub(crate) struct CapacityScratch {
     /// Tier 1's capacity effects of `program` in program order, each with
     /// whether it runs over the whole batch (outside every `FLAT_MAP`).
     effects: Vec<(Effect, bool)>,
+    /// Tier 2's reading of `program`: each effect with the domain and
+    /// operands it runs over, in program order.
+    sites: Vec<Site>,
+    /// The `FOR_EACH` match ids the sites' domains name, end to end.
+    site_ids: Vec<u8>,
+    /// The `FLAT_MAP` offsets columns the sites' domains name, end to end.
+    site_flats: Vec<u32>,
+    /// Each site's instruction operands, end to end.
+    site_operands: Vec<u32>,
     /// Tier 2's `(outer, inner)` keys of one nested slot.
     pairs: Vec<(u32, u32)>,
     pub(crate) counts: CapacityCounts,
@@ -90,6 +99,9 @@ pub(crate) struct CapacityScratch {
     pub(crate) scratch: ScratchDemand,
     /// Set when admission could not back its own storage.
     out_of_memory: bool,
+    /// Walks over a reduce program's instructions admission has made: one
+    /// per program it decodes.
+    pub(crate) program_walks: u64,
 }
 
 /// One slot's demand. `units` are new keys, members or entries; `touches`
@@ -133,20 +145,29 @@ struct Domain<'p> {
     /// `FOR_EACH`'s type column and match ids, or the whole batch.
     for_each: Option<(u32, &'p [u8])>,
     /// Offsets columns of the enclosing `FLAT_MAP`s, outermost first.
-    flat: [u32; MAX_DEPTH],
-    depth: usize,
+    flat: &'p [u32],
 }
 
 impl Domain<'_> {
     const TOP: Domain<'static> = Domain {
         for_each: None,
-        flat: [0; MAX_DEPTH],
-        depth: 0,
+        flat: &[],
     };
 
     fn flat_maps(&self) -> &[u32] {
-        &self.flat[..self.depth]
+        self.flat
     }
+}
+
+/// One capacity effect of a decoded program with what tier 2 reads it over:
+/// its domain's \`FOR_EACH\` type column and match ids, its \`FLAT_MAP\` offsets
+/// columns and its instruction's operands, as ranges of the scratch's pools.
+#[derive(Clone, Debug)]
+struct Site {
+    effect: Effect,
+    for_each: Option<(u32, core::ops::Range<usize>)>,
+    flat: core::ops::Range<usize>,
+    operands: core::ops::Range<usize>,
 }
 
 /// A capacity effect of one instruction, as admission reads it.
@@ -490,11 +511,11 @@ pub(crate) fn slot_writes(
 }
 
 /// Visit every instruction of `code` with the domain it runs over.
-fn walk<'p>(
-    code: &'p [u8],
-    domain: Domain<'p>,
+fn walk(
+    code: &[u8],
+    domain: Domain<'_>,
     operands: &mut Vec<u32>,
-    visit: &mut impl FnMut(Opcode, &[u32], &Domain<'p>) -> Option<()>,
+    visit: &mut impl FnMut(Opcode, &[u32], &Domain<'_>) -> Option<()>,
 ) -> Option<()> {
     let mut pc = 0;
     while pc < code.len() {
@@ -505,6 +526,7 @@ fn walk<'p>(
         match op {
             Opcode::ForEach | Opcode::FlatMap => {
                 let mut inner = domain;
+                let mut flat = [0u32; MAX_DEPTH];
                 let mut header = Operands::at(code, pc + 1);
                 if op == Opcode::ForEach {
                     let type_col = header.index()?;
@@ -512,11 +534,13 @@ fn walk<'p>(
                     let ids = header.bytes(count.checked_mul(4)?)?;
                     inner.for_each = Some((type_col, ids));
                 } else {
-                    if inner.depth == MAX_DEPTH {
+                    let depth = domain.flat.len();
+                    if depth == MAX_DEPTH {
                         return None;
                     }
-                    inner.flat[inner.depth] = header.index()?;
-                    inner.depth += 1;
+                    flat[..depth].copy_from_slice(domain.flat);
+                    flat[depth] = header.index()?;
+                    inner.flat = &flat[..=depth];
                 }
                 let (body_at, body) = envelope_body(op, code, pc + 1)?;
                 walk(body, inner, operands, visit)?;
@@ -752,7 +776,7 @@ impl CapacityScratch {
             if !d.rows && fits::<I>(state, slot, &meta, &d)? {
                 continue;
             }
-            let probed = self.probe(state, code, cols, batch_len, slot, d, cx)?;
+            let probed = self.probe(state, cols, batch_len, slot, d, cx)?;
             if probed.opaque || !fits::<I>(state, slot, &meta, &probed)? {
                 return Some(Admission::DryRun);
             }
@@ -761,44 +785,77 @@ impl CapacityScratch {
         Some(Admission::Fits)
     }
 
-    /// Decode `code`'s tier-1 effects into `effects` and remember `code`.
-    /// An undecodable program caches nothing, so every batch over it is
-    /// left to the dry run, which reports what execution would.
+    /// Decode \`code\`'s effects once and remember \`code\`: tier 1's effects
+    /// and tier 2's sites. An undecodable program caches nothing, so every
+    /// batch over it is left to the dry run, which reports what execution
+    /// would.
     fn decode(&mut self, code: &[u8]) -> Option<()> {
         self.program.clear();
         self.effects.clear();
+        self.sites.clear();
+        self.site_ids.clear();
+        self.site_flats.clear();
+        self.site_operands.clear();
         // The copy is backed first: a cache whose effects outlive a failed
         // copy would match an empty reduce section.
         Self::room(&mut self.out_of_memory, &mut self.program, code.len())?;
+        self.program_walks += 1;
         let mut operands = core::mem::take(&mut self.operands);
-        let out_of_memory = &mut self.out_of_memory;
-        let decoded = &mut self.effects;
+        let Self {
+            out_of_memory,
+            effects: decoded,
+            sites,
+            site_ids,
+            site_flats,
+            site_operands,
+            ..
+        } = self;
         let walked = walk(code, Domain::TOP, &mut operands, &mut |op, o, domain| {
             let mut ok = Some(());
             effects(op, o, &mut |effect| {
-                if ok.is_some() {
-                    ok = Self::room(out_of_memory, decoded, 1)
-                        .map(|()| decoded.push((effect, domain.depth == 0)));
-                }
+                ok = ok.and_then(|()| {
+                    Self::room(out_of_memory, decoded, 1)?;
+                    decoded.push((effect, domain.flat.is_empty()));
+                    let for_each = match domain.for_each {
+                        Some((type_col, ids)) => {
+                            let at = site_ids.len();
+                            Self::room(out_of_memory, site_ids, ids.len())?;
+                            site_ids.extend_from_slice(ids);
+                            Some((type_col, at..site_ids.len()))
+                        }
+                        None => None,
+                    };
+                    let flat_at = site_flats.len();
+                    Self::room(out_of_memory, site_flats, domain.flat.len())?;
+                    site_flats.extend_from_slice(domain.flat);
+                    let operands_at = site_operands.len();
+                    Self::room(out_of_memory, site_operands, o.len())?;
+                    site_operands.extend_from_slice(o);
+                    Self::room(out_of_memory, sites, 1)?;
+                    sites.push(Site {
+                        effect,
+                        for_each,
+                        flat: flat_at..site_flats.len(),
+                        operands: operands_at..site_operands.len(),
+                    });
+                    Some(())
+                });
             });
             ok
         });
         self.operands = operands;
         if walked.is_none() {
             self.effects.clear();
+            self.sites.clear();
             return None;
         }
         self.program.extend_from_slice(code);
         Some(())
     }
 
-    /// Recount `target`'s demand from the rows. Algebra bounds carry over
-    /// from tier 1: they read slot cardinalities, not rows.
-    #[allow(clippy::too_many_arguments)]
     fn probe<I: KeyIndex, S: InternBytes + ?Sized>(
         &mut self,
         state: &[u8],
-        code: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
         target: u32,
@@ -811,147 +868,148 @@ impl CapacityScratch {
             touched: true,
             ..Demand::default()
         };
-        let mut operands = core::mem::take(&mut self.operands);
         let mut pairs = core::mem::take(&mut self.pairs);
         pairs.clear();
         let mut out_of_memory = false;
         let mut nested_type = None;
-        let walked = walk(code, Domain::TOP, &mut operands, &mut |op, o, domain| {
-            let mut ok = Some(());
-            effects(op, o, &mut |effect| {
-                if ok.is_none() {
-                    return;
-                }
-                ok = match effect {
-                    Effect::Key { slot, col } if slot == target => {
-                        for_rows(domain, cols, batch_len, &mut |row| {
-                            let key = cell(cols, col, row)?;
-                            if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
-                                d.units += 1;
-                                d.touches += 1;
-                            }
-                            Some(())
-                        })
+        let mut walked = Some(());
+        for site in self
+            .sites
+            .iter()
+            .filter(|site| site.effect.slot() == target)
+        {
+            let for_each = site
+                .for_each
+                .as_ref()
+                .map(|(type_col, ids)| (*type_col, &self.site_ids[ids.clone()]));
+            let domain = &Domain {
+                for_each,
+                flat: &self.site_flats[site.flat.clone()],
+            };
+            let o = &self.site_operands[site.operands.clone()];
+            let read = match site.effect {
+                Effect::Key { col, .. } => for_rows(domain, cols, batch_len, &mut |row| {
+                    let key = cell(cols, col, row)?;
+                    if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
+                        d.units += 1;
+                        d.touches += 1;
                     }
-                    Effect::Pair { slot, col1, col2 } if slot == target => {
-                        for_rows(domain, cols, batch_len, &mut |row| {
-                            let (k1, k2) = (cell(cols, col1, row)?, cell(cols, col2, row)?);
-                            if !lookup.contains_pair(state, k1, k2, cx)? {
-                                d.units += 1;
-                            }
-                            Some(())
-                        })
+                    Some(())
+                }),
+                Effect::Pair { col1, col2, .. } => for_rows(domain, cols, batch_len, &mut |row| {
+                    let (k1, k2) = (cell(cols, col1, row)?, cell(cols, col2, row)?);
+                    if !lookup.contains_pair(state, k1, k2, cx)? {
+                        d.units += 1;
                     }
-                    // Present members only: the same deliberate touch margin
-                    // as tier 1.
-                    Effect::Remove { slot, col } if slot == target => {
-                        for_rows(domain, cols, batch_len, &mut |row| {
-                            if lookup.contains(state, cell(cols, col, row)?, cx)? {
-                                d.touches += 1;
-                            }
-                            Some(())
-                        })
+                    Some(())
+                }),
+                // Present members only: the same deliberate touch margin as
+                // tier 1.
+                Effect::Remove { col, .. } => for_rows(domain, cols, batch_len, &mut |row| {
+                    if lookup.contains(state, cell(cols, col, row)?, cx)? {
+                        d.touches += 1;
                     }
-                    Effect::Entry { slot } if slot == target => {
-                        for_rows(domain, cols, batch_len, &mut |_| {
-                            d.units += 1;
-                            Some(())
-                        })
-                    }
-                    Effect::Arena { slot, col } if slot == target => arena_demand(
-                        state,
-                        &lookup,
-                        o,
-                        domain,
-                        cols,
-                        batch_len,
-                        ArenaKey::One(col),
-                        &mut d,
-                        cx,
-                    ),
-                    Effect::Counts {
-                        slot,
-                        col,
+                    Some(())
+                }),
+                Effect::Entry { .. } => for_rows(domain, cols, batch_len, &mut |_| {
+                    d.units += 1;
+                    Some(())
+                }),
+                Effect::Arena { col, .. } => arena_demand(
+                    state,
+                    &lookup,
+                    o,
+                    domain,
+                    cols,
+                    batch_len,
+                    ArenaKey::One(col),
+                    &mut d,
+                    cx,
+                ),
+                Effect::Counts {
+                    col,
+                    field,
+                    init_offsets,
+                    ..
+                } => counts_demand(
+                    state,
+                    &lookup,
+                    domain,
+                    cols,
+                    batch_len,
+                    CountsCols {
+                        key: col,
                         field,
                         init_offsets,
-                    } if slot == target => counts_demand(
-                        state,
-                        &lookup,
-                        domain,
-                        cols,
-                        batch_len,
-                        CountsCols {
-                            key: col,
-                            field,
-                            init_offsets,
-                        },
-                        &mut d,
-                        cx,
-                    ),
-                    Effect::PairArena { slot, col1, col2 } if slot == target => arena_demand(
-                        state,
-                        &lookup,
-                        o,
-                        domain,
-                        cols,
-                        batch_len,
-                        ArenaKey::Pair(col1, col2),
-                        &mut d,
-                        cx,
-                    ),
-                    Effect::Routed {
-                        slot,
-                        route_col,
-                        route,
-                        key_col,
-                        col,
-                    } if slot == target => for_rows(domain, cols, batch_len, &mut |row| {
-                        // Execution skips sentinel keys and SKIP or
-                        // out-of-range routes before choosing a slot.
-                        if is_sentinel(cell(cols, key_col, row)?)
-                            || cell(cols, route_col, row)? != route
-                        {
-                            return Some(());
-                        }
-                        let key = cell(cols, col, row)?;
-                        if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
-                            d.units += 1;
-                            d.touches += 1;
-                        }
-                        Some(())
-                    }),
-                    Effect::Nested {
-                        slot,
-                        outer_col,
-                        inner_col,
-                        inner,
-                    } if slot == target => {
-                        if nested_type.is_some_and(|ty| ty != inner) {
-                            d.opaque = true;
-                        }
-                        nested_type = Some(inner);
-                        for_rows(domain, cols, batch_len, &mut |row| {
-                            let outer = cell(cols, outer_col, row)?;
-                            let key = if inner == SlotType::Aggregate {
-                                0
-                            } else {
-                                cell(cols, inner_col, row)?
-                            };
-                            Self::room(&mut out_of_memory, &mut pairs, 1)?;
-                            pairs.push((outer, key));
-                            Some(())
-                        })
+                    },
+                    &mut d,
+                    cx,
+                ),
+                Effect::PairArena { col1, col2, .. } => arena_demand(
+                    state,
+                    &lookup,
+                    o,
+                    domain,
+                    cols,
+                    batch_len,
+                    ArenaKey::Pair(col1, col2),
+                    &mut d,
+                    cx,
+                ),
+                Effect::Routed {
+                    route_col,
+                    route,
+                    key_col,
+                    col,
+                    ..
+                } => for_rows(domain, cols, batch_len, &mut |row| {
+                    // Execution skips sentinel keys and SKIP or out-of-range
+                    // routes before choosing a slot.
+                    if is_sentinel(cell(cols, key_col, row)?)
+                        || cell(cols, route_col, row)? != route
+                    {
+                        return Some(());
                     }
-                    Effect::Opaque { slot } if slot == target => {
+                    let key = cell(cols, col, row)?;
+                    if !is_sentinel(key) && !lookup.contains(state, key, cx)? {
+                        d.units += 1;
+                        d.touches += 1;
+                    }
+                    Some(())
+                }),
+                Effect::Nested {
+                    outer_col,
+                    inner_col,
+                    inner,
+                    ..
+                } => {
+                    if nested_type.is_some_and(|ty| ty != inner) {
                         d.opaque = true;
-                        Some(())
                     }
-                    _ => Some(()),
-                };
-            });
-            ok
-        });
-        self.operands = operands;
+                    nested_type = Some(inner);
+                    for_rows(domain, cols, batch_len, &mut |row| {
+                        let outer = cell(cols, outer_col, row)?;
+                        let key = if inner == SlotType::Aggregate {
+                            0
+                        } else {
+                            cell(cols, inner_col, row)?
+                        };
+                        Self::room(&mut out_of_memory, &mut pairs, 1)?;
+                        pairs.push((outer, key));
+                        Some(())
+                    })
+                }
+                Effect::Opaque { .. } => {
+                    d.opaque = true;
+                    Some(())
+                }
+                Effect::Algebra { .. } | Effect::Sweep { .. } | Effect::Cut { .. } => Some(()),
+            };
+            if read.is_none() {
+                walked = None;
+                break;
+            }
+        }
         let nested = match (walked, nested_type) {
             (Some(()), Some(inner)) if !d.opaque => {
                 crate::nested::batch_demand(state, &meta, inner, &mut pairs)
