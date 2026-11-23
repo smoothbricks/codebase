@@ -58,7 +58,11 @@ export {
 } from './private-npm.js';
 
 import type { ReleaseVersionMode } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
-import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import {
+  LINUX_PLATFORM_TARGET_GLOBS,
+  PLATFORM_TARGET_GLOBS,
+  RELEASE_CONFIGURATION,
+} from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { ciApiContext } from '../github-ci/api.js';
 import { readProjectTargets } from '../nx/index.js';
 import {
@@ -1326,6 +1330,19 @@ function releaseRepairShell(root: string, platformOutputs: readonly string[]): R
         });
         return;
       }
+
+      // The producer jobs handed over the macOS legs only (build-platform-outputs
+      // selects `*-<arch>-macos`); the Linux legs are this runner's, built after
+      // `build` exactly as publish's supplemental Linux step builds them. A package
+      // whose `build` drops its native edges (cowshed's compiles no Rust) has its
+      // Linux addon and binaries from this step alone.
+      console.log('Repair pending releases: building Linux outputs on this runner.');
+      await githubCiNxRunMany(root, {
+        targets: LINUX_PLATFORM_TARGET_GLOBS.join(','),
+        projects: releasePackageProjects(packages),
+        configuration: RELEASE_CONFIGURATION,
+        allowEmptyProjects: true,
+      });
       console.log(`Repair pending releases: applying cross-platform outputs from ${outputs.join(', ')}.`);
       await githubCiApplyOutputs(root, outputs, sourceSha);
     },
