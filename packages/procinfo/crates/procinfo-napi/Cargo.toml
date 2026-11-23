@@ -1,0 +1,18 @@
+[package]
+name = "procinfo-napi"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# `@smoothbricks/procinfo`'s addon: each export reads one fact through the procinfo crate
+# (specs/procinfo/01_procinfo.md, "JavaScript"). cowshed links the procinfo crate, never this one.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi.workspace = true
+napi-derive.workspace = true
+procinfo.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true

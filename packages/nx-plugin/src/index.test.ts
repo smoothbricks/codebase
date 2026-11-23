@@ -1644,7 +1644,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('orders Darwin idle runs and Cargo leaves after the manifest-owned cowshed producers, keys none of their bytes, and never loads the addon', async () => {
+  it('orders Darwin idle runs and Cargo leaves after the manifest-owned procinfo addon producer, keys none of their bytes, adds no JavaScript compile edge, and never loads the addon', async () => {
     const workspace = await createWorkspace();
     const bounded: TargetConfiguration = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1656,24 +1656,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     const pluginTargets: Record<string, TargetConfiguration> = { check: bounded };
     const ownerTargets: Record<string, TargetConfiguration> = {
       lint: bounded,
-      'api-generator': { executor: 'nx:run-commands', options: { command: 'generate-api' } },
-      'api-check': {
-        ...bounded,
-        options: { command: 'check-api', timeoutMs: 120_000 },
-        dependsOn: ['...', 'api-generator'],
-      },
-      'tsc-js': { dependsOn: ['...', 'api-check'] },
-      'lineage-js': {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: ['{projectRoot}/src/process-lineage.ts'],
-        outputs: ['{projectRoot}/dist/lineage'],
-        options: { command: 'tsc -p tsconfig.lineage.json' },
-      },
-      build: { dependsOn: ['tsc-js'] },
+      // A wall-bound run reads neither Node's idle clock nor mbx's activity report.
+      'wall-check': { ...bounded, options: { command: 'check-wall', timeoutMs: 120_000 }, dependsOn: ['...'] },
+      // procinfo's build is JavaScript only: no native producer sits in it.
+      build: { dependsOn: ['^build', 'tsc-js'] },
       'release-check': { executor: '@smoothbricks/nx-plugin:bounded-exec', cache: false },
-      // A Cargo leaf also loads native process lineage while it waits for admission.
-      'cargo-check': { ...bounded, options: { command: 'cargo test -p cowshed-napi', idleTimeoutMs: 180000 } },
+      // A Cargo leaf also loads procinfo's process lineage while it waits for admission.
+      'cargo-check': { ...bounded, options: { command: 'cargo test -p procinfo-napi', idleTimeoutMs: 180000 } },
       // The package's loader reads napi-debug's addon under NAPI_DEBUG_ADDON=1.
       'host-napi-test': {
         ...bounded,
@@ -1689,14 +1678,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         manifest: { name: '@smoothbricks/nx-plugin', nx: { name: 'graph-plugin', targets: pluginTargets } },
       },
       {
-        file: 'tools/cowshed/package.json',
-        name: 'lineage-owner',
+        file: 'tools/procinfo/package.json',
+        name: 'procinfo-owner',
         targets: ownerTargets,
         manifest: {
-          name: '@smoothbricks/cowshed',
-          nx: { name: 'lineage-owner', targets: ownerTargets },
-          napi: { binaryName: 'cowshed', targets: ['aarch64-apple-darwin'] },
-          exports: { './process-lineage': './src/process-lineage.ts' },
+          name: '@smoothbricks/procinfo',
+          nx: { name: 'procinfo-owner', targets: ownerTargets },
+          napi: { binaryName: 'procinfo', targets: ['aarch64-apple-darwin'] },
+          exports: { '.': { types: './dist/ts/index.d.ts', default: './dist/ts/index.js' } },
         },
       },
       {
@@ -1710,20 +1699,20 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const root = workspace.context.workspaceRoot;
       for (const project of projects) await workspace.write(project.file, JSON.stringify(project.manifest));
       await workspace.write(
-        'tools/cowshed/src/process-lineage.ts',
+        'tools/procinfo/src/index.ts',
         'throw new Error("graph inference loaded the addon entry");\n',
       );
-      for (const dir of ['tools/nx-plugin', 'tools/cowshed']) {
+      for (const dir of ['tools/nx-plugin', 'tools/procinfo']) {
         await workspace.write(`${dir}/tsconfig.lib.json`, '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n');
       }
       await workspace.write('tools/nx-plugin/tsconfig.test.json', '{}\n');
       await workspace.write(
         'Cargo.toml',
-        '[workspace]\nmembers = ["tools/cowshed/crates/*", "services/worker/crates/*"]\n',
+        '[workspace]\nmembers = ["tools/procinfo/crates/*", "services/worker/crates/*"]\n',
       );
       await workspace.write(
-        'tools/cowshed/crates/cowshed-napi/Cargo.toml',
-        '[package]\nname = "cowshed-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+        'tools/procinfo/crates/procinfo-napi/Cargo.toml',
+        '[package]\nname = "procinfo-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
       );
       await workspace.write(
         'services/worker/crates/worker-core/Cargo.toml',
@@ -1743,15 +1732,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const files = projects.map((project) => project.file);
       const tools = await resolveNativeTools(
         root,
-        [...files, 'tools/cowshed/package.json'],
+        [...files, 'tools/procinfo/package.json'],
         'darwin-arm64',
         'scriptc-arm64-macos',
       );
-      expect([...tools.projects]).toEqual([['cowshed', 'lineage-owner']]);
-      const addon = nativeToolDependsOn(tools, 'cowshed')[0];
-      const lineage = nativeToolDependsOn(tools, 'cowshed', 'lineage-js')[0];
-      expect(addon).toEqual({ projects: ['lineage-owner'], target: 'napi-native' });
-      expect(lineage).toEqual({ projects: ['lineage-owner'], target: 'lineage-js' });
+      expect([...tools.projects]).toEqual([['procinfo', 'procinfo-owner']]);
+      const addon = nativeToolDependsOn(tools, 'procinfo')[0];
+      expect(addon).toEqual({ projects: ['procinfo-owner'], target: 'napi-native' });
       await prepareCargoFixture(root);
       resetWorkspaceContext();
       const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
@@ -1769,9 +1756,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         );
         nodes[project.name] = { name: project.name, type: 'lib', data: { root: dirname(project.file), targets } };
       }
+      // The plugin's `@smoothbricks/procinfo` dependency is an ordinary package edge: nothing excludes it from caret builds.
       const graph: ProjectGraph = {
         nodes,
-        dependencies: Object.fromEntries(projects.map((project) => [project.name, []])),
+        dependencies: {
+          workspace: [],
+          'graph-plugin': [{ source: 'graph-plugin', target: 'procinfo-owner', type: 'static' }],
+          'procinfo-owner': [],
+          worker: [],
+        },
       };
       const expectedRunners = ['cargo-test-worker-core-shard1', 'cargo-test-worker-core-shard2'];
       for (const name of expectedRunners)
@@ -1779,7 +1772,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(nodes.workspace?.data.targets?.['cargo-test-group-exclusive']?.executor).toBe(
         '@smoothbricks/nx-plugin:bounded-exec',
       );
-      const cargoLeaves = new Set(['lineage-owner:cargo-check', 'workspace:mutation']);
+      const cargoLeaves = new Set(['procinfo-owner:cargo-check', 'workspace:mutation']);
       for (const node of Object.values(nodes)) {
         for (const [name, target] of Object.entries(node.data.targets ?? {})) {
           if (target.executor !== '@smoothbricks/nx-plugin:bounded-exec' || name === 'release-check') continue;
@@ -1791,8 +1784,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             cargoLeaves.has(id) ||
             target.options?.nativeTest !== undefined ||
             typeof target.options?.idleTimeoutMs === 'number';
-          expect(direct.includes('lineage-owner:napi-native'), id).toBe(readsAddon);
-          expect(direct.includes('lineage-owner:lineage-js'), id).toBe(readsAddon);
+          expect(direct.includes('procinfo-owner:napi-native'), id).toBe(readsAddon);
+          expect(
+            direct.filter((dependency) => dependency.includes('lineage')),
+            id,
+          ).toEqual([]);
           expect(
             target.dependsOn?.filter((dependency) => JSON.stringify(dependency) === JSON.stringify(addon)) ?? [],
             id,
@@ -1801,60 +1797,65 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             dependentTasksOutputFiles: '**/*.node',
             transitive: true,
           });
-          expect(target.inputs ?? [], id).not.toContainEqual({
-            dependentTasksOutputFiles: '**/dist/lineage/**/*.js',
-            transitive: true,
-          });
+          expect(JSON.stringify(target.dependsOn ?? []), id).not.toMatch(/lineage/);
+          expect(JSON.stringify(target.inputs ?? []), id).not.toMatch(/lineage/);
           expect(target.inputs ?? [], id).not.toContain('{workspaceRoot}/**/*.rs');
         }
       }
-      // api-check gates the TypeScript build and, through the wire fixtures, the Cargo test build: the addon build never
-      // sits in front of it. It reaches lineage-js only through the plugin build its executor runs from (the plugin
-      // compiles against dist/lineage), never by an observer edge of its own.
-      const apiCheck = createTaskGraph(graph, {}, ['lineage-owner'], ['api-check'], undefined, {});
-      expect(Object.keys(apiCheck.tasks)).not.toContain('lineage-owner:napi-native');
-      expect(apiCheck.dependencies['lineage-owner:api-check']?.map((edge) => edge.id)).toEqual([
+      // A wall-bound target takes no observer edge: the addon build never sits in front of it. Its one precondition is
+      // the plugin build its executor runs from.
+      const wallCheck = createTaskGraph(graph, {}, ['procinfo-owner'], ['wall-check'], undefined, {});
+      expect(findCycles(wallCheck)).toBeNull();
+      expect(Object.keys(wallCheck.tasks)).not.toContain('procinfo-owner:napi-native');
+      expect(wallCheck.dependencies['procinfo-owner:wall-check']?.map((edge) => edge.id)).toEqual([
         'graph-plugin:build',
-        'lineage-owner:api-generator',
       ]);
-      const hostNapi = nodes['lineage-owner']?.data.targets?.['host-napi-test'];
+      const hostNapi = nodes['procinfo-owner']?.data.targets?.['host-napi-test'];
       expect(hostNapi?.dependsOn).toContain('napi-debug');
       expect(hostNapi?.inputs).toContainEqual({ dependentTasksOutputFiles: '**/*.node', transitive: false });
       expect(hostNapi?.inputs).toContain('{projectRoot}/checks.ts');
-      const hostNapiTasks = createTaskGraph(graph, {}, ['lineage-owner'], ['host-napi-test'], undefined, {});
-      expect(hostNapiTasks.dependencies['lineage-owner:host-napi-test']?.map((edge) => edge.id)).toContain(
-        'lineage-owner:napi-debug',
+      const hostNapiTasks = createTaskGraph(graph, {}, ['procinfo-owner'], ['host-napi-test'], undefined, {});
+      expect(hostNapiTasks.dependencies['procinfo-owner:host-napi-test']?.map((edge) => edge.id)).toContain(
+        'procinfo-owner:napi-debug',
       );
       const plugin = nodes['graph-plugin']?.data.targets ?? {};
+      // The plugin's compile and typecheck reach procinfo's tsc-js through the package edge alone: they take neither
+      // the addon nor a producer of their own.
+      expect(plugin['tsc-js']?.dependsOn).toContain('^*-js');
+      expect(plugin.typecheck?.dependsOn).toContain('^*-js');
       for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
-        expect(plugin[name]?.dependsOn).toContainEqual(lineage);
-        expect(plugin[name]?.dependsOn).not.toContainEqual(addon);
-        expect(plugin[name]?.inputs).toContainEqual({
-          dependentTasksOutputFiles: '**/dist/lineage/**/*',
-          transitive: false,
-        });
+        expect(plugin[name]?.dependsOn ?? [], name).not.toContainEqual(addon);
+        expect(JSON.stringify(plugin[name]?.dependsOn ?? []), name).not.toMatch(/lineage/);
+        expect(JSON.stringify(plugin[name]?.inputs ?? []), name).not.toMatch(/lineage/);
       }
+      const pluginCompile = createTaskGraph(graph, {}, ['graph-plugin'], ['tsc-js'], undefined, {});
+      expect(findCycles(pluginCompile)).toBeNull();
+      expect(pluginCompile.dependencies['graph-plugin:tsc-js']?.map((edge) => edge.id)).toContain(
+        'procinfo-owner:tsc-js',
+      );
+      expect(Object.keys(pluginCompile.tasks)).not.toContain('procinfo-owner:napi-native');
       expect(plugin.check?.dependsOn).toContain('prepare');
       expect(plugin.check?.inputs).toContain('{projectRoot}/checks.ts');
       expect(plugin.check?.inputs).not.toContain('default');
-      const owner = nodes['lineage-owner']?.data.targets ?? {};
+      const owner = nodes['procinfo-owner']?.data.targets ?? {};
       expect(owner['napi-native']?.outputs).toEqual([]);
       expect(owner['napi-native']?.dependsOn).toEqual(['napi-arm64-macos']);
       expect(owner['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/{options.outputDir}/']);
       expect(owner['napi-arm64-macos']?.options?.outputDir).toBe('.cache/native-dev/darwin-arm64');
-      expect(owner['lineage-js']?.outputs).toEqual(['{projectRoot}/dist/lineage']);
+      expect(owner['tsc-js']?.dependsOn ?? []).not.toContainEqual(addon);
+      expect(owner['tsc-js']?.dependsOn ?? []).not.toContain('napi-native');
       expect(owner['release-check']?.dependsOn).toBeUndefined();
-      expect(owner.build?.dependsOn).toEqual(['tsc-js']);
-      const build = createTaskGraph(graph, {}, ['lineage-owner'], ['build'], undefined, {});
+      expect(owner.build?.dependsOn).toEqual(['^build', 'tsc-js']);
+      const build = createTaskGraph(graph, {}, ['procinfo-owner'], ['build'], undefined, {});
       expect(findCycles(build)).toBeNull();
-      expect(Object.keys(build.tasks)).not.toContain('lineage-owner:napi-native');
-      expect(Object.keys(build.tasks)).toContain('lineage-owner:lineage-js');
+      expect(Object.keys(build.tasks)).not.toContain('procinfo-owner:napi-native');
+      expect(Object.keys(build.tasks)).toContain('procinfo-owner:tsc-js');
     } finally {
       await workspace.cleanup();
     }
   });
 
-  it('adds no local cowshed producer for an installed plugin even when the workspace has an unrelated cowshed project', async () => {
+  it('adds no local procinfo producer for an installed plugin even when the workspace has an unrelated procinfo project', async () => {
     const workspace = await createWorkspace();
     try {
       const root = workspace.context.workspaceRoot;
@@ -1870,16 +1871,16 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         }),
       );
       await workspace.write(
-        'tools/cowshed/package.json',
-        '{"name":"@smoothbricks/cowshed","nx":{"name":"unrelated-owner"}}\n',
+        'tools/procinfo/package.json',
+        '{"name":"@smoothbricks/procinfo","nx":{"name":"unrelated-owner"}}\n',
       );
       await workspace.write(
         'node_modules/.fixture/@smoothbricks/nx-plugin/package.json',
         '{"name":"@smoothbricks/nx-plugin"}\n',
       );
       await workspace.write(
-        'node_modules/.fixture/@smoothbricks/cowshed/package.json',
-        '{"name":"@smoothbricks/cowshed"}\n',
+        'node_modules/.fixture/@smoothbricks/procinfo/package.json',
+        '{"name":"@smoothbricks/procinfo"}\n',
       );
       await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
       await symlink(
@@ -1887,10 +1888,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         join(root, 'node_modules/@smoothbricks/nx-plugin'),
         'dir',
       );
-      const files = ['app/package.json', 'tools/cowshed/package.json'];
+      const files = ['app/package.json', 'tools/procinfo/package.json'];
       const tools = await resolveNativeTools(root, files, 'darwin-arm64', 'scriptc-arm64-macos');
       expect(tools.projects.size).toBe(0);
-      expect(nativeToolDependsOn(tools, 'cowshed')).toEqual([]);
+      expect(nativeToolDependsOn(tools, 'procinfo')).toEqual([]);
       const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
       const results = await inferFixture(infer, files, undefined, workspace.context);
       expect(results.find(([file]) => file === 'app/package.json')?.[1].projects?.app?.targets?.check).toBeUndefined();

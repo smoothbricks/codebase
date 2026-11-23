@@ -1,9 +1,9 @@
 /** The idle clock tracks awake time, not wall time or CPU consumed by this process. */
 export async function openAwakeClock(): Promise<() => number> {
   // Bun 1.4.4 uses Rust Instant, and Linux Node uses CLOCK_MONOTONIC. Darwin Node's libuv uses
-  // mach_continuous_time, which includes sleep; its awake reading comes from the cowshed addon.
+  // mach_continuous_time, which includes sleep; its awake reading comes from procinfo's addon.
   if (process.platform !== 'darwin' || process.versions.bun !== undefined) return () => performance.now();
-  const { awakeTimeMs } = await import('@smoothbricks/cowshed/awake-clock');
+  const { awakeTimeMs } = await import('@smoothbricks/procinfo');
   awakeTimeMs(); // Refuse a missing or stale addon before the executor spawns anything.
   return awakeTimeMs;
 }

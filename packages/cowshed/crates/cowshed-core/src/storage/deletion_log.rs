@@ -235,7 +235,7 @@ impl Caller {
 }
 
 fn parent_process(pid: libc::pid_t) -> Option<CallerProcess> {
-    let arguments = cowshed_os::process::process_arguments(pid).ok()?;
+    let arguments = procinfo::process_arguments(pid).ok()?;
     Some(CallerProcess {
         pid: u32::try_from(pid).ok()?,
         argv: arguments

@@ -4353,13 +4353,13 @@ mod tests {
         assert!(said.contains(&format!("pid {pid}")), "{said}");
         assert!(fixture.actor.nx_backends.is_empty());
         let pid = libc::pid_t::try_from(pid).expect("a pid_t");
-        let state = cowshed_os::process::run_state(pid);
+        let state = procinfo::run_state(pid);
         assert!(
             matches!(
                 state,
-                cowshed_os::process::RunState::Running
-                    | cowshed_os::process::RunState::Sleeping
-                    | cowshed_os::process::RunState::Uninterruptible
+                procinfo::RunState::Running
+                    | procinfo::RunState::Sleeping
+                    | procinfo::RunState::Uninterruptible
             ),
             "the expiry leaves the backend running: {state}"
         );

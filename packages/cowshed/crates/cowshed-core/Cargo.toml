@@ -56,6 +56,7 @@ cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 # the root helper every ZFS mutation goes through (specs/cowshed/09_substrates.md).
 cowshed-helper = { path = "../cowshed-helper" }
 cowshed-os = { path = "../cowshed-os" }
+procinfo.workspace = true
 getrandom = "0.3"
 libc = "0.2"
 # DIRENV_WATCHES is zlib-deflated; a pure-Rust inflate, bounded at the call site.

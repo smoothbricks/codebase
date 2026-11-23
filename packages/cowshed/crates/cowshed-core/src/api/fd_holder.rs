@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use cowshed_os::process::DescriptorName;
+use procinfo::DescriptorName;
 
 use super::held_lock::DecimalU64;
 use super::hold::KernelAddress;

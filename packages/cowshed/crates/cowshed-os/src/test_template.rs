@@ -83,7 +83,7 @@ pub fn run_process() -> io::Result<libc::pid_t> {
     // SAFETY: `getpgrp` and `getppid` have no preconditions and cannot fail.
     let (group, mut ancestor) = unsafe { (libc::getpgrp(), libc::getppid()) };
     loop {
-        let lineage = crate::process::lineage(ancestor)?.ok_or_else(|| {
+        let lineage = procinfo::lineage(ancestor)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("the run's process: ancestor {ancestor} of test process {this} is gone"),

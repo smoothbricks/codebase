@@ -28,7 +28,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::time::Sleep;
 
-use crate::process::{ExitWatch, RunState};
+use crate::process::ExitWatch;
+use procinfo::RunState;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -511,7 +512,7 @@ impl ChildPeer {
     pub fn observed(role: &'static str, pid: u32) -> Self {
         let state = libc::pid_t::try_from(pid).map_or_else(
             |error| RunState::Unread(error.to_string()),
-            crate::process::run_state,
+            procinfo::run_state,
         );
         Self { role, pid, state }
     }
@@ -827,7 +828,7 @@ pub enum RunError {
 #[derive(Debug)]
 pub struct SilentRun {
     pub silent: Silent<ChildPeer>,
-    pub group: io::Result<Vec<crate::process::GroupMember>>,
+    pub group: io::Result<Vec<procinfo::GroupMember>>,
     pub cpu_unread: Option<io::Error>,
 }
 
@@ -1846,7 +1847,7 @@ fn poll_ready(
 mod tests {
     use super::*;
     use crate::fork_lock::Spawn as _;
-    use crate::process::RunState;
+    use procinfo::RunState;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     const SHORT_REAP: Bound = Bound::new(LatencyClass::Reap, Duration::from_millis(50));
@@ -2162,7 +2163,7 @@ mod tests {
             "the hung process is named: {failure}"
         );
         assert_eq!(
-            crate::process::run_state(libc::pid_t::try_from(run.silent.holder.pid).expect("a pid")),
+            procinfo::run_state(libc::pid_t::try_from(run.silent.holder.pid).expect("a pid")),
             RunState::Gone,
             "the silent child was ended and reaped"
         );
@@ -2308,17 +2309,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             matches!(
-                crate::process::run_state(pid),
+                procinfo::run_state(pid),
                 RunState::Running | RunState::Sleeping
             ),
             "the child is left running: {}",
-            crate::process::run_state(pid)
+            procinfo::run_state(pid)
         );
         // Its stdin closed, sh exits, and the task collects it: no zombie is left. A collection that
         // never comes is a hang the no-progress bound names, not a deadline of this test.
         drop(stdin);
         loop {
-            match crate::process::run_state(pid) {
+            match procinfo::run_state(pid) {
                 RunState::Gone => break,
                 RunState::Unread(why) => panic!("the child's state is unread: {why}"),
                 RunState::Running

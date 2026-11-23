@@ -153,7 +153,7 @@ fn running_command(pid: libc::pid_t, now: SystemTime) -> io::Result<Option<Runni
     let started = SystemTime::UNIX_EPOCH
         + Duration::from_secs(info.pbi_start_tvsec)
         + Duration::from_micros(info.pbi_start_tvusec);
-    let command = match cowshed_os::process::process_arguments(pid) {
+    let command = match procinfo::process_arguments(pid) {
         Ok(arguments) => arguments
             .argv
             .iter()
@@ -178,7 +178,7 @@ fn running_command(pid: libc::pid_t, now: SystemTime) -> io::Result<Option<Runni
 pub fn running_attaches() -> io::Result<u64> {
     let mut attaching = 0;
     for pid in scan_processes()?.disk_tools {
-        match cowshed_os::process::process_arguments(pid) {
+        match procinfo::process_arguments(pid) {
             Ok(arguments) if !attaches(&arguments.argv) => {}
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
             Ok(_) | Err(_) => attaching += 1,

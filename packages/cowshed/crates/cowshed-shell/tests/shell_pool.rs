@@ -38,8 +38,8 @@ use cowshed_core::sandbox::{EgressGrant, SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
-use cowshed_os::host_load::HostLoad;
 use cowshed_os::process::ExitWatch;
+use procinfo::HostLoad;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
 

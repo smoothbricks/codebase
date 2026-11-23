@@ -848,9 +848,9 @@ def changed_input_changes_key(g, t, e1, e2, h):
 
 # --- the plugin's observer injection, as modelled ------------------------------------------------
 
-# packages/nx-plugin/src/index.ts:2467-2492 gives every bounded-exec target that has a cowshed native
-# producer `{dependentTasksOutputFiles: '**/*.node', transitive: true}` and
-# `{dependentTasksOutputFiles: '**/dist/lineage/**/*.js', transitive: true}`, whether or not the run
+# packages/nx-plugin/src/index.ts's observer injection, as first written, gave every bounded-exec target
+# that has a native producer `{dependentTasksOutputFiles: '**/*.node', transitive: true}` and a
+# transitive selector of the producing package's TypeScript entry, whether or not the run
 # reads either output.
 def observe_t(t: Tgt) -> Tgt:
   match t:
@@ -864,16 +864,16 @@ def observe(g: +List<Tgt>) -> +List<Tgt>:
     case Con{t, r}:
       observe_t(infer_t(t)) <> observe(r)
 
-# lineage-js (TypeScript, writes JavaScript), napi-native (Rust, writes the addon) and a Rust runner
+# a TypeScript entry (writes JavaScript), napi-native (Rust, writes the addon) and a Rust runner
 # that reads the addon and waits for both
 def runner_graph() -> +List<Tgt>:
   [Tgt{1n, Ts{}, OJs{}, [Ts{}], [], [], [], []}, Tgt{2n, Rust{}, ONode{}, [Rust{}], [], [], [], []}, Tgt{3n, Rust{}, ONone{}, [Rust{}], [], [2n], [1n], []}]
 
-# the same runner when the lineage JavaScript's bytes reach its outputs
+# the same runner when the entry's JavaScript bytes reach its outputs
 def runner_reads_lineage() -> +List<Tgt>:
   [Tgt{1n, Ts{}, OJs{}, [Ts{}], [], [], [], []}, Tgt{2n, Rust{}, ONode{}, [Rust{}], [], [], [], []}, Tgt{3n, Rust{}, ONone{}, [Rust{}], [], [2n, 1n], [], []}]
 
-# The injection violates (a): the runner's key names lineage-js's TypeScript output, which its run does
+# The injection violates (a): the runner's key names the TypeScript entry's output, which its run does
 # not read. The counterexample is the one pair (runner 3, producer 1).
 law observer_key_refuted:
   {a_viol(observe(runner_graph())) == [Viol{3n, 1n}] : +List<Viol>}
@@ -881,7 +881,7 @@ law observer_key_refuted:
 def observer_key_refuted():
   {==}
 
-# The same injection is sound exactly when the lineage bytes reach the runner's outputs: whether they do
+# The same injection is sound exactly when the entry's bytes reach the runner's outputs: whether they do
 # is the spec decision (03 "What a land re-runs").
 law observer_key_sound_when_read:
   {a_viol(observe(runner_reads_lineage())) == [] : +List<Viol>}

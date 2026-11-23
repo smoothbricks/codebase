@@ -287,14 +287,11 @@ async fn a_host_connection_answers_fd_holders_as_the_verb_prints_them() {
     let mut arguments = Arguments::new();
     let mut named = Vec::new();
     for descriptor in [write.as_raw_fd(), file.as_raw_fd()] {
-        let (kind, option, value) = match cowshed_os::process::descriptor_name(descriptor).unwrap()
-        {
-            cowshed_os::process::DescriptorName::Device(address) => {
+        let (kind, option, value) = match procinfo::descriptor_name(descriptor).unwrap() {
+            procinfo::DescriptorName::Device(address) => {
                 ("device", "--device", format!("0x{address:x}"))
             }
-            cowshed_os::process::DescriptorName::Inode(inode) => {
-                ("inode", "--inode", inode.to_string())
-            }
+            procinfo::DescriptorName::Inode(inode) => ("inode", "--inode", inode.to_string()),
             other => panic!("a pipe or a file is named by its address or inode, not {other:?}"),
         };
         options.extend([option.into(), value.clone().into()]);

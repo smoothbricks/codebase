@@ -22,8 +22,8 @@
  * The addon of this host's family must be in the tree too, and every other family's addon that is
  * there is judged the same way, at `dist/native/<directory>/` for each row of `NATIVE_TARGETS`
  * (src/platform.ts `shippedAddonProblems`): an installed package loads only that tree, so a family
- * packed with a broken addon fails at a user's first import, and a consumer such as bounded-exec's
- * admission observer (`processLineages`) has nothing to call. The publishing job has every family's
+
+ * packed with a broken addon fails at a user's first import. The publishing job has every family's
  * addon there; the land seam builds this host's. An empty file, or one this process cannot open for
  * reading, is a problem; nothing is loaded. The development addons under `.cache/native-dev/` are
  * not shipped, and this never reads them.

@@ -809,7 +809,7 @@ mod tests {
         );
         // SAFETY: the null signal to this test's own unreaped child.
         assert_eq!(unsafe { libc::kill(pgid, 0) }, 0);
-        assert!(!cowshed_os::process::running(pgid).unwrap());
+        assert!(!procinfo::running(pgid).unwrap());
         assert!(job_groups::group_has_live_members(pgid).unwrap());
         fence
             .signal(libc::SIGKILL)

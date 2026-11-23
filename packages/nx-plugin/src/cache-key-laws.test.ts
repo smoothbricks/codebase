@@ -415,7 +415,7 @@ describe('the cache keys of the Rust runners of this repository, judged by specs
 });
 
 describe('the judge, on a graph that plants each violation', () => {
-  const lineage = { dependentTasksOutputFiles: '**/dist/lineage/**/*.js', transitive: true };
+  const typescriptOutput = { dependentTasksOutputFiles: '**/dist/ts/**/*.js', transitive: true };
   const addon = { dependentTasksOutputFiles: '**/*.node', transitive: true };
   const owner = (inputs: TargetConfiguration['inputs']): ProjectGraph => ({
     nodes: {
@@ -425,10 +425,10 @@ describe('the judge, on a graph that plants each violation', () => {
         data: {
           root: 'owner',
           targets: {
-            'lineage-js': {
-              executor: 'nx:run-commands',
-              options: { command: 'tsc --build tsconfig.lineage.json' },
-              outputs: ['{projectRoot}/dist/lineage'],
+            'tsc-js': {
+              executor: TYPESCRIPT_EMIT,
+              options: { tsConfig: 'tsconfig.lib.json' },
+              outputs: ['{projectRoot}/dist/ts'],
             },
             'napi-native': {
               executor: 'nx:run-commands',
@@ -438,7 +438,7 @@ describe('the judge, on a graph that plants each violation', () => {
             'cargo-test-owner': {
               executor: BOUNDED_EXEC,
               options: { command: 'cargo --frozen nextest run' },
-              dependsOn: ['napi-native', 'lineage-js'],
+              dependsOn: ['napi-native', 'tsc-js'],
               inputs,
             },
           },
@@ -456,8 +456,8 @@ describe('the judge, on a graph that plants each violation', () => {
   };
 
   it('names the TypeScript output a Rust runner keys without reading it', () => {
-    const judged = judge(owner([addon, lineage]), runner, {}, [readsAddon]);
-    expect([judged.keyedTs, judged.keyedOther, judged.unkeyed]).toEqual([['owner:lineage-js'], [], []]);
+    const judged = judge(owner([addon, typescriptOutput]), runner, {}, [readsAddon]);
+    expect([judged.keyedTs, judged.keyedOther, judged.unkeyed]).toEqual([['owner:tsc-js'], [], []]);
   });
 
   it('is silent when the runner keys only the addon it reads', () => {
@@ -471,7 +471,7 @@ describe('the judge, on a graph that plants each violation', () => {
   });
 
   it('names an addon the runner reads and its key leaves out', () => {
-    const judged = judge(owner([lineage]), runner, {}, [readsAddon]);
+    const judged = judge(owner([typescriptOutput]), runner, {}, [readsAddon]);
     expect(judged.unkeyed).toEqual(['owner:napi-native']);
   });
 

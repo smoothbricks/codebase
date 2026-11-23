@@ -88,7 +88,7 @@ mod tests {
     use std::time::Duration;
 
     use cowshed_os::deadline::{ChildPeer, Expired, LatencyClass, Progress};
-    use cowshed_os::process::RunState;
+    use procinfo::RunState;
 
     use super::{LiveMember, LiveMembership, MEMBER_ROLE};
 

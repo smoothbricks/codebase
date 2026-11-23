@@ -214,7 +214,7 @@ pub(super) fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
 /// The record of every running process that holds the group id.
 fn running_in_group(pgid: i32) -> io::Result<Vec<RunningLife>> {
     let mut members = Vec::new();
-    for pid in cowshed_os::process::group_pids(pgid)? {
+    for pid in procinfo::group_pids(pgid)? {
         // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
         let Some(life) = running_life(pid)? else {
             continue;
@@ -536,7 +536,7 @@ impl Process {
     /// own, not that of a later process given the pid. A read that failed for a process gone
     /// since is its exit, not an error.
     pub(in crate::runtime) fn resident_bytes(&self) -> io::Result<Option<u64>> {
-        let read = cowshed_os::process::resident_bytes(self.pid);
+        let read = procinfo::resident_bytes(self.pid);
         match running_identity(self.pid)? {
             Some(identity) if identity.id_version.cast_unsigned() == self.version => read,
             Some(_) | None => Ok(None),
@@ -549,7 +549,7 @@ impl Process {
     /// failed -- was its own; gone, or another process's now, it holds nothing, whatever the
     /// read met.
     pub(in crate::runtime) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
-        let read = cowshed_os::process::listening_ports(self.pid);
+        let read = procinfo::listening_ports(self.pid);
         match running_identity(self.pid)? {
             Some(identity) if identity.id_version.cast_unsigned() == self.version => read.map(Some),
             Some(_) | None => Ok(None),

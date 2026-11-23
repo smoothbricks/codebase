@@ -5,10 +5,11 @@ edition.workspace = true
 publish.workspace = true
 
 # The host primitives every cowshed layer shares: child processes, durable file I/O, the fork
-# lock, lifecycle spans and the host load. Below both `cowshed-apfs` and `cowshed-core`, so the
+# lock and lifecycle spans; process facts are procinfo's. Below both `cowshed-apfs` and `cowshed-core`, so the
 # disk-image layer builds without the workspace controller.
 [dependencies]
 libc = "0.2"
+procinfo.workspace = true
 # The deadline vocabulary only (13_telemetry.md, "Dependency honesty"): lmao-core has no dependencies.
 lmao-core.workspace = true
 thiserror = "2"

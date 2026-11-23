@@ -1166,8 +1166,7 @@ Find the symptom in the left column and follow the link.
   [02_workspaces.md §Holders cowshed does not run](./02_workspaces.md#holders-cowshed-does-not-run) (the tree and volume
   censuses, which see this user's processes only);
   [04_sandbox.md §Process inspection](./04_sandbox.md#process-inspection). Code: [`cowshed-core/src/build_volume/nx.rs`]
-  `object_holders`; [`cowshed-os/src/process.rs`] `Unread`, `descriptor_names`;
-  [`cowshed-apfs/src/disk_image_helpers.rs`].
+  `object_holders`; [`procinfo/src/lib.rs`] `Unread`, `descriptor_names`; [`cowshed-apfs/src/disk_image_helpers.rs`].
 
 ### `proc_pid_rusage` counters can fall between reads
 
@@ -1351,7 +1350,7 @@ Find the symptom in the left column and follow the link.
 [`cowshed-gateway/src/proxy.rs`]: ../../packages/cowshed/crates/cowshed-gateway/src/proxy.rs
 [`cowshed-os/src/fork_lock.rs`]: ../../packages/cowshed/crates/cowshed-os/src/fork_lock.rs
 [`cowshed-os/src/fsio.rs`]: ../../packages/cowshed/crates/cowshed-os/src/fsio.rs
-[`cowshed-os/src/process.rs`]: ../../packages/cowshed/crates/cowshed-os/src/process.rs
+[`procinfo/src/lib.rs`]: ../../packages/procinfo/crates/procinfo/src/lib.rs
 [`cowshed-os/src/scratch.rs`]: ../../packages/cowshed/crates/cowshed-os/src/scratch.rs
 [`cowshed-shell/src/script.rs`]: ../../packages/cowshed/crates/cowshed-shell/src/script.rs
 [`cowshed-shell/tests/script_host.rs`]: ../../packages/cowshed/crates/cowshed-shell/tests/script_host.rs

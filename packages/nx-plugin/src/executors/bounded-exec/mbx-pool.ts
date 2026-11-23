@@ -123,7 +123,7 @@ export function mbxLeaf(pool: MbxPool, demand: Demand, command: string, testGate
 /**
  * Whether a run of `command` under mbx's pool is a Cargo leaf: the one leaf whose admission wait the run reads from
  * mbx's activity report and its waiters' native lineage (mbx-queue.ts; specs/cowshed/11_shell.md, "Cargo test-runner
- * boundaries"), through cowshed's process-lineage entry. The command alone decides it: the pool's priority, the core
+ * boundaries"), through procinfo's `processLineages`. The command alone decides it: the pool's priority, the core
  * count and the environment size a leaf, never its kind.
  */
 export function runsAsCargoLeaf(command: string): boolean {

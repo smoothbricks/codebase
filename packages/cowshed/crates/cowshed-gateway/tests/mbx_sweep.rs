@@ -264,7 +264,7 @@ fn a_failing_body_leaves_no_sweep_behind() {
         .expect("a sweep started before the body failed");
     let deadline = cowshed_os::deadline::start("a failed body's sweep", REAP);
     let ended = cowshed_os::deadline::await_exit("fake sweep", pid, &deadline, Progress::Nothing);
-    let left = cowshed_os::process::group_members(libc::pid_t::try_from(pid).expect("a pid"));
+    let left = procinfo::group_members(libc::pid_t::try_from(pid).expect("a pid"));
     assert!(
         ended.is_ok() && left.as_ref().is_ok_and(Vec::is_empty),
         "the sweep's group ended with its failed test: {ended:?}; still running: {left:?}"

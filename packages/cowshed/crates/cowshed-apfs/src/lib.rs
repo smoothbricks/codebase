@@ -20,10 +20,10 @@ use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
 use cowshed_os::deadline::{Bound, LatencyClass};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
-use cowshed_os::host_load::HostLoad;
 use cowshed_os::namespace::HostNamespace;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
 use cowshed_os::process::{fmt_command, fmt_command_failure, fmt_command_spawn};
+use procinfo::HostLoad;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -1190,8 +1190,8 @@ fn warn_overdue(request: &CommandRequest, deadline: Duration, pid: u32, elapsed:
 fn warn_waited(request: &CommandRequest, pid: u32, elapsed: Duration) {
     use std::io::Write;
     let state = libc::pid_t::try_from(pid).map_or_else(
-        |error| cowshed_os::process::RunState::Unread(error.to_string()),
-        cowshed_os::process::run_state,
+        |error| procinfo::RunState::Unread(error.to_string()),
+        procinfo::run_state,
     );
     let mount = MountArgs::of(request).map(|args| {
         let image = image_of_device(args.device);
@@ -1211,7 +1211,7 @@ fn warn_waited(request: &CommandRequest, pid: u32, elapsed: Duration) {
 fn waited_line(
     request: &CommandRequest,
     pid: u32,
-    state: &cowshed_os::process::RunState,
+    state: &procinfo::RunState,
     mount: Option<(MountArgs<'_>, io::Result<Option<DiskImageSource>>)>,
     elapsed: Duration,
 ) -> String {
@@ -8677,7 +8677,7 @@ mod tests {
     /// its process, and claims no extent copy.
     #[test]
     fn a_waited_mount_names_its_device_image_and_the_extents_its_wait_copies() {
-        use cowshed_os::process::RunState;
+        use procinfo::RunState;
         let mount = CommandRequest::new(
             MOUNT_APFS,
             [

@@ -347,7 +347,7 @@
         "@nx/js": "24.0.6",
         "@smoothbricks/build-inputs": "workspace:*",
         "@smoothbricks/cargo-retain": "workspace:*",
-        "@smoothbricks/cowshed": "workspace:*",
+        "@smoothbricks/procinfo": "workspace:*",
         "jsonc-parser": "^3.3.1",
         "minimatch": "10.2.5",
         "nx": "latest",
@@ -376,6 +376,14 @@
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "typescript": "^6.0.3",
+      },
+    },
+    "packages/procinfo": {
+      "name": "@smoothbricks/procinfo",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@napi-rs/cli": "3.7.3",
+        "@types/node": "catalog:",
       },
     },
     "packages/statebus-core": {
@@ -1943,6 +1951,8 @@
     "@smoothbricks/nx-plugin": ["@smoothbricks/nx-plugin@workspace:packages/nx-plugin"],
 
     "@smoothbricks/opencode-entangled": ["@smoothbricks/opencode-entangled@workspace:packages/opencode-entangled"],
+
+    "@smoothbricks/procinfo": ["@smoothbricks/procinfo@workspace:packages/procinfo"],
 
     "@smoothbricks/statebus-core": ["@smoothbricks/statebus-core@workspace:packages/statebus-core"],
 

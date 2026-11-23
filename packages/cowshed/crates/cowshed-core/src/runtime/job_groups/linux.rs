@@ -665,7 +665,7 @@ impl Process {
     /// still runs afterwards: then the size read was its own, not that of a later process given
     /// the pid. A read that failed for a process gone since is its exit, not an error.
     pub(in crate::runtime) fn resident_bytes(&self) -> io::Result<Option<u64>> {
-        let read = cowshed_os::process::resident_bytes(self.pid);
+        let read = procinfo::resident_bytes(self.pid);
         if pidfd_exited(&self.handle)? {
             return Ok(None);
         }
@@ -677,7 +677,7 @@ impl Process {
     /// network tables were read -- or failed to be -- as its own; exited, it holds nothing,
     /// whatever the read met. A missing table of a process still running is an error.
     pub(in crate::runtime) fn listening_ports(&self) -> io::Result<Option<BTreeSet<u16>>> {
-        read_while_running(&self.handle, cowshed_os::process::listening_ports(self.pid))
+        read_while_running(&self.handle, procinfo::listening_ports(self.pid))
     }
 }
 

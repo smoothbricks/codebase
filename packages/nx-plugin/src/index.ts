@@ -2461,25 +2461,11 @@ async function createProjectTargets(
     };
   }
 
-  // The process-lineage entry has no full API-generator dependency: the generator check itself is bounded work.
-  const lineageProducer = nativeToolDependsOn(nativeTools, 'cowshed', 'lineage-js');
-  if (lineageProducer.length > 0 && packageJson.name === '@smoothbricks/nx-plugin') {
-    for (const name of ['tsc-js', 'typecheck', 'typecheck-tests']) {
-      const target = targets[name];
-      if (target === undefined) continue;
-      target.dependsOn = [...(target.dependsOn ?? []), ...lineageProducer];
-      target.inputs = [
-        ...(target.inputs ?? ['production']),
-        { dependentTasksOutputFiles: '**/dist/lineage/**/*', transitive: false },
-      ];
-    }
-  }
-
-  // The Darwin Node idle clock and the Cargo admission observer both load the local cowshed addon. They can fail
-  // a run but do not change a passing command, so none keys its bytes (README, "Bounded exec key"). Declarations
-  // retain these prerequisites with Nx's ordinary "..." merge token. The wall-only release-check judges already
-  // built shipping artifacts and remains dependency-free.
-  const addonProducers = [...nativeToolDependsOn(nativeTools, 'cowshed'), ...lineageProducer];
+  // The Darwin Node idle clock and the Cargo admission observer both load the local procinfo addon (`awakeTimeMs`,
+  // `processLineages`). They can fail a run but do not change a passing command, so none keys its bytes (README,
+  // "Bounded exec key"). Declarations retain these prerequisites with Nx's ordinary "..." merge token. The wall-only
+  // release-check judges already built shipping artifacts and remains dependency-free.
+  const addonProducers = nativeToolDependsOn(nativeTools, 'procinfo');
   if (addonProducers.length > 0) {
     for (const name of new Set([...Object.keys(targets), ...Object.keys(declaredTargets)])) {
       const declared = declaredTargets[name];

@@ -43,15 +43,15 @@ impl Members<'_> {
     /// The CPU the members have used so far, in a unit comparable only to another reading.
     pub(super) fn cpu(self, child: u32) -> io::Result<u64> {
         match self {
-            Self::OwnGroup => crate::process::group_cpu(group_of(child)?),
+            Self::OwnGroup => procinfo::group_cpu(group_of(child)?),
             Self::Unborrowed(never, _) => match never {},
         }
     }
 
     /// The running members, each by pid, command and state.
-    pub(super) fn members(self, child: u32) -> io::Result<Vec<crate::process::GroupMember>> {
+    pub(super) fn members(self, child: u32) -> io::Result<Vec<procinfo::GroupMember>> {
         match self {
-            Self::OwnGroup => crate::process::group_members(group_of(child)?),
+            Self::OwnGroup => procinfo::group_members(group_of(child)?),
             Self::Unborrowed(never, _) => match never {},
         }
     }

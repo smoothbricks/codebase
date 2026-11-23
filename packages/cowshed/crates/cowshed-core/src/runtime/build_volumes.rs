@@ -6651,7 +6651,7 @@ fn main() {
         let mut pid = parent;
         let mut seen = Vec::new();
         let arguments = loop {
-            let arguments = cowshed_os::process::process_arguments(pid)
+            let arguments = procinfo::process_arguments(pid)
                 .expect("the kernel names each live ancestor of the build script");
             let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable.clone()));
             if kernel_executable.canonicalize().unwrap() == cargo {
@@ -6663,7 +6663,7 @@ fn main() {
                 "no ancestor of the build script runs its CARGO {}: {seen:?}",
                 cargo.display()
             );
-            pid = cowshed_os::process::lineage(pid)
+            pid = procinfo::lineage(pid)
                 .expect("read the ancestor's lineage")
                 .expect("the ancestor is live")
                 .ppid;

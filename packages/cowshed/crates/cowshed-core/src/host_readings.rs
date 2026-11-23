@@ -6,7 +6,7 @@ use cowshed_gateway_types::host_status::{
     HostReadings, HostValueError, LoadAverage, LoadAverages, LoadReading, MemoryPressureReading,
     SwapReading,
 };
-use cowshed_os::host_load::HostLoad;
+use procinfo::HostLoad;
 
 use crate::host_pressure::{read_memory_pressure, read_swap};
 

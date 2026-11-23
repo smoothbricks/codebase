@@ -5,6 +5,7 @@ members = [
   "packages/bitmosaic/crates/*",
   "packages/cowshed/crates/*",
   "packages/lmao/crates/*",
+  "packages/procinfo/crates/*",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ columine-vm = { path = "packages/columine/crates/columine-vm" }
 cowshed-core = { path = "packages/cowshed/crates/cowshed-core" }
 lmao-core = { path = "packages/lmao/crates/lmao-core" }
 lmao-arena = { path = "packages/lmao/crates/lmao-arena" }
+procinfo = { path = "packages/procinfo/crates/procinfo" }
 # bitmosaic is this repository's public compressed bitmap package: the
 # ladder-selected container bitmap whose native image is the BITMAP slot
 # codec. It is a plain in-repo workspace member, so the dependency is a

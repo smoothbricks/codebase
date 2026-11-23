@@ -442,7 +442,7 @@ fn inspect(path: &Path, store: &Path, dry_run: bool) -> Option<Finding> {
         Err(error) => return Some(kept(path, format!("unknown owner: {error}"))),
     };
     for pid in pids {
-        match crate::process::running(pid) {
+        match procinfo::running(pid) {
             Ok(false) => {}
             Ok(true) => {
                 return Some(kept(

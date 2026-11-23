@@ -849,6 +849,7 @@ dependencies = [
  "cowshed-os",
  "libc",
  "plist",
+ "procinfo",
  "proptest",
  "serde",
  "serde_json",
@@ -864,6 +865,7 @@ dependencies = [
  "cowshed-apfs",
  "cowshed-os",
  "libc",
+ "procinfo",
 ]
 
 [[package]]
@@ -895,6 +897,7 @@ dependencies = [
  "cowshed-os",
  "cowshed-shell",
  "libc",
+ "procinfo",
  "proptest",
  "rcgen",
  "serde",
@@ -928,6 +931,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "parking_lot",
  "plist",
+ "procinfo",
  "proptest",
  "rcgen",
  "security-framework",
@@ -969,6 +973,7 @@ dependencies = [
  "idna",
  "libc",
  "pin-project-lite",
+ "procinfo",
  "proptest",
  "rcgen",
  "rustls",
@@ -1035,6 +1040,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lmao-core",
+ "procinfo",
  "rustix",
  "thiserror",
  "tokio",
@@ -1055,6 +1061,7 @@ dependencies = [
  "cowshed-gateway-types",
  "cowshed-os",
  "libc",
+ "procinfo",
  "serde",
  "serde_json",
  "tokio",
@@ -2676,6 +2683,24 @@ dependencies = [
  "bitflags",
  "chrono",
  "hex",
+]
+
+[[package]]
+name = "procinfo"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "procinfo-napi"
+version = "0.1.0"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "procinfo",
 ]
 
 [[package]]

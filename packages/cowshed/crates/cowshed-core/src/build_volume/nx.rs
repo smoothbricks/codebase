@@ -27,7 +27,8 @@ pub const RUN_SUMMARY: &str = "run.json";
 /// How long a stopped daemon gets to exit after `SIGTERM`, as `nx daemon --stop` sends it.
 pub(crate) const DAEMON_EXIT_GRACE: Duration = Duration::from_secs(10);
 
-use cowshed_os::process::{DescriptorName, Holder};
+use cowshed_os::process::Holder;
+use procinfo::DescriptorName;
 
 use crate::census::{CensusScope, Listed};
 
@@ -167,7 +168,7 @@ pub fn hand_over_daemon_records(
         let Some(live) = crate::runtime::nx_daemon::live_record(&record) else {
             continue;
         };
-        if cowshed_os::process::sandboxed(live.pid)? {
+        if procinfo::sandboxed(live.pid)? {
             continue;
         }
         let directory = into.join(data).join(DAEMON_DIRECTORY);
@@ -490,7 +491,7 @@ pub struct ObjectCensus<K> {
 }
 
 /// Every process with a descriptor on one of `objects`, each named as
-/// [`cowshed_os::process::descriptor_name`] names it (lsof's `d` or `i`), with the caller's key
+/// [`procinfo::descriptor_name`] names it (lsof's `d` or `i`), with the caller's key
 /// for it. One pass over the processes `census` asks ([`census_pids`]), reading only the names the
 /// objects need ([`NameKinds`]). A process found holding one is confirmed: its life is read, its
 /// descriptors read again, then its life again, so the descriptors reported are that life's and
@@ -504,7 +505,7 @@ pub fn object_holders<K: Copy>(
     objects: &[(DescriptorName, K)],
 ) -> io::Result<ObjectCensus<K>> {
     use crate::runtime::job_groups::life_of;
-    use cowshed_os::process::{NameKinds, Unread, descriptor_names};
+    use procinfo::{NameKinds, Unread, descriptor_names};
 
     let kinds = NameKinds {
         devices: objects
@@ -606,7 +607,7 @@ fn listed(census: &CensusScope) -> io::Result<Vec<Listed>> {
 /// `pid`'s argument vector joined by spaces, or its executable path, or a placeholder naming that
 /// neither could be read.
 fn command_line(pid: libc::pid_t) -> String {
-    if let Ok(arguments) = cowshed_os::process::process_arguments(pid)
+    if let Ok(arguments) = procinfo::process_arguments(pid)
         && !arguments.argv.is_empty()
     {
         return arguments
@@ -1734,7 +1735,7 @@ mod tests {
         let linked = Linked::new(&root, &stock);
         stock.daemon("--start");
         let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
-        assert!(!cowshed_os::process::sandboxed(daemon).unwrap());
+        assert!(!procinfo::sandboxed(daemon).unwrap());
 
         hand_over_daemon_records(&linked.from, &linked.state, &linked.into).unwrap();
         super::super::link::point(&stock.checkout, &linked.into).unwrap();
@@ -1753,7 +1754,7 @@ mod tests {
         events.exit(daemon as u32);
         super::super::link::point(&stock.checkout, &linked.from).unwrap();
         assert_eq!(events.next(), Event::Exit);
-        assert!(!cowshed_os::process::running(daemon).unwrap());
+        assert!(!procinfo::running(daemon).unwrap());
     }
 
     /// Land 5.3's output enumeration (16_build_volumes.md): a root whose package graph resolves no
@@ -2057,10 +2058,7 @@ mod tests {
         );
         // Exited, though its parent may not have reaped it yet: a zombie, which `kill(pid, 0)`
         // still reaches.
-        assert!(
-            !cowshed_os::process::running(first).unwrap(),
-            "the daemon exited"
-        );
+        assert!(!procinfo::running(first).unwrap(), "the daemon exited");
         // The daemon's own shutdown ran: it removed its record and its socket, as after
         // `nx daemon --stop`. A signal Nx did not handle would leave both behind.
         assert!(!record.exists(), "the daemon removed its record");

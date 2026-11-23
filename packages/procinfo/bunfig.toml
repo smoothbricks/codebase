@@ -1,0 +1,3 @@
+[test]
+# The napi-test target runs `bun test --config=../bunfig.toml` from src/. Nothing is preloaded: the
+# entry has no Typia or LMAO transform callsite, so a compiler preload would only cost its startup.

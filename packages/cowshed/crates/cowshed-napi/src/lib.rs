@@ -13,10 +13,9 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     pin::Pin,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicI32, Ordering},
     },
-    time::Instant,
 };
 
 use bytes::Bytes;
@@ -578,63 +577,6 @@ pub fn open_host(env: Env, launcher: String) -> napi::Result<JsObject> {
     })
 }
 
-/// Where a process descends from, as the kernel's own record of it says (07_api.md, "Process
-/// lineage"): its parent, its group, and whether it has exited unreaped.
-#[napi(object)]
-pub struct ProcessLineage {
-    pub pid: i32,
-    pub ppid: i32,
-    pub pgid: i32,
-    pub zombie: bool,
-}
-
-/// The lineage of each listed pid a process holds, in the order asked; a pid none holds is left
-/// out, as `ps -p` leaves it out. A direct export, not an operation: it asks no controller and no
-/// `cowshed host`, so it carries no skew with the installed CLI. Each pid is read for itself
-/// (`cowshed_os::process::lineage`): no process-table census, no spawned process, no wait on
-/// another process's task.
-#[napi(js_name = "processLineages")]
-pub fn process_lineages(env: Env, pids: Vec<i32>) -> napi::Result<Vec<ProcessLineage>> {
-    let mut lineages = Vec::with_capacity(pids.len());
-    for pid in pids {
-        if pid < 1 {
-            return Err(to_napi_error(
-                env,
-                AddonFailure::usage(
-                    format!("{pid} is not a process id"),
-                    "pass the positive pids to read",
-                ),
-            ));
-        }
-        match cowshed_os::process::lineage(pid) {
-            Ok(Some(read)) => lineages.push(ProcessLineage {
-                pid: read.pid,
-                ppid: read.ppid,
-                pgid: read.pgid,
-                zombie: read.zombie,
-            }),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(to_napi_error(
-                    env,
-                    CowshedError::environment_missing(
-                        format!("cannot read the lineage of process {pid}: {error}"),
-                        "read it again; the process may be changing state",
-                    )
-                    .into(),
-                ));
-            }
-        }
-    }
-    Ok(lineages)
-}
-
-/// Process-relative monotonic milliseconds, excluding host suspension on Darwin and Linux.
-#[napi(js_name = "awakeTimeMs")]
-pub fn awake_time_ms() -> f64 {
-    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
-    ORIGIN.elapsed().as_secs_f64() * 1_000.0
-}
 type HostReaped = tokio::sync::oneshot::Receiver<io::Result<std::process::ExitStatus>>;
 
 /// How a host connection's process ended, once the thread that reaps it has said so.

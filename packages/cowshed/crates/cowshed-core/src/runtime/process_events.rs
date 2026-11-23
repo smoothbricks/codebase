@@ -73,7 +73,7 @@ use crate::runtime::process_tree::{
 };
 use crate::runtime::process_usage::{SampleError, Sampled, StartStamp};
 use crate::runtime::supervisor::{process_termination_from_wait, utc_at_second, utc_now};
-use cowshed_os::process::process_arguments;
+use procinfo::process_arguments;
 
 #[cfg(target_os = "linux")]
 mod linux;

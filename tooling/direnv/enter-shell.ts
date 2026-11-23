@@ -30,9 +30,6 @@ const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'sourc
  */
 const buildMarkerFile = 'node_modules/.cache/smoo/dist-verified';
 
-/** The configuration each bootstrap program compiles. */
-const programConfiguration = { library: 'tsconfig.lib.json', 'process-lineage': 'tsconfig.lineage.json' } as const;
-
 // devenv runs this hook twice per shell entry. First it captures the shell's environment: a pass that runs the shell
 // hook to read what the prologue exports, marked DEVENV_SKIP_TASKS (`capture_shell_environment` in cachix/devenv sets
 // it on that subprocess alone), and that runs BEFORE the tasks ordered ahead of devenv:enterShell (smoo:install,
@@ -89,8 +86,7 @@ async function syncRuntimePinsIfDrifted(): Promise<void> {
 type BootstrapPackage = {
   directory: string;
   invalidatesPlugin: boolean;
-  program: keyof typeof programConfiguration;
-  /** The directory the program emits into, which bootstrap judges and digests. */
+  /** The directory the package emits into, which bootstrap judges and digests. */
   output: string;
   /** The packages it compiles against: its direct `workspace:*` runtime dependencies, by directory. */
   dependencies: string[];
@@ -98,16 +94,11 @@ type BootstrapPackage = {
 
 /**
  * The plugin, CLI and their transitive workspace runtime dependencies, once each and dependency first. The plugin's
- * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages. The lineage
- * program compiles its entry alone, so it compiles against no dependency.
+ * closure comes first so a rebuild can invalidate only the Nx state it owns, never for CLI-only packages.
  */
 async function bootstrapPackages(): Promise<BootstrapPackage[]> {
   const ordered: BootstrapPackage[] = [];
-  const visit = async (
-    directory: string,
-    invalidatesPlugin: boolean,
-    program: BootstrapPackage['program'] = 'library',
-  ): Promise<void> => {
+  const visit = async (directory: string, invalidatesPlugin: boolean): Promise<void> => {
     if (ordered.some((entry) => entry.directory === directory)) return;
     const manifest: unknown = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
     const declared =
@@ -115,20 +106,18 @@ async function bootstrapPackages(): Promise<BootstrapPackage[]> {
         ? manifest.dependencies
         : undefined;
     const dependencies: string[] = [];
-    if (program === 'library' && typeof declared === 'object' && declared !== null) {
+    if (typeof declared === 'object' && declared !== null) {
       for (const [name, range] of Object.entries(declared)) {
         if (range !== 'workspace:*') continue;
         const dependency = await realpath(path.join(directory, 'node_modules', name));
         dependencies.push(dependency);
-        await visit(dependency, invalidatesPlugin, name === '@smoothbricks/cowshed' ? 'process-lineage' : 'library');
+        await visit(dependency, invalidatesPlugin);
       }
     }
     ordered.push({
       directory,
       invalidatesPlugin,
-      program,
-      // A full cowshed API dist does not supply its independent public lineage entry.
-      output: path.join(directory, program === 'process-lineage' ? 'dist/lineage' : 'dist'),
+      output: path.join(directory, 'dist'),
       dependencies,
     });
   };
@@ -171,22 +160,16 @@ async function rebuildWorkspaceToolsIfStale(): Promise<void> {
   // recorded only once the Nx state computed from the earlier bytes is cleared, so until then they stay stale and keep
   // the digest a later entry compares against.
   const changed: { directory: string; digest: string }[] = [];
-  for (const { directory, invalidatesPlugin, program, output } of packages) {
+  for (const { directory, invalidatesPlugin, output } of packages) {
     const verified = stale.get(directory);
     if (verified === undefined || held.has(directory)) continue;
     // Bootstrap invokes neither nx (whose graph loads the plugin) nor smoo (whose launcher needs CLI dist).
-    // The lineage program is the same plain-tsc producer the Nx compile lane owns: no addon,
-    // generated API or native transformer. Other packages retain the ordinary library emit.
-    if (program === 'process-lineage') {
-      await runQuietly('tsc', ['--build', programConfiguration[program], '--force'], directory);
-    } else {
-      // An output that already holds its bytes keeps its file (the managed ttsc patch): rewriting it moved every dist
-      // stamp, so the plugin's tsc-js then found its outputs changed and Nx restored its dist from the cache, removing
-      // the directory while concurrent tasks resolved their executor from it. This emit prunes nothing.
-      await runQuietly('ttsc', ['-p', programConfiguration[program], '--emit', ...EMIT_OVERRIDES], directory, {
-        TTSC_WRITE_IF_CHANGED: '1',
-      });
-    }
+    // An output that already holds its bytes keeps its file (the managed ttsc patch): rewriting it moved every dist
+    // stamp, so the plugin's tsc-js then found its outputs changed and Nx restored its dist from the cache, removing
+    // the directory while concurrent tasks resolved their executor from it. This emit prunes nothing.
+    await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit', ...EMIT_OVERRIDES], directory, {
+      TTSC_WRITE_IF_CHANGED: '1',
+    });
     // A compiler run is not a change. ttsc is content-incremental, so an mtime-only change (a checkout, a revert, a
     // formatter rewriting a file identically) recompiles to the bytes the marker verified; clearing the daemon record
     // and graph anyway cleared them under a running gate's test tasks. A marker that records no digest verified none,
@@ -233,30 +216,18 @@ async function readVerification(marker: string): Promise<Verification | null> {
 }
 
 /**
- * Whether `entry` needs an emit: it has no marker, no output (for the lineage entry, not both of its public files), or a
- * source or configuration file newer than its marker.
+ * Whether `entry` needs an emit: it has no marker, no output (an absent or empty `dist`), or a source or
+ * configuration file newer than its marker.
  */
-async function isStale(
-  { directory, program, output }: BootstrapPackage,
-  verification: Verification | null,
-): Promise<boolean> {
+async function isStale({ directory, output }: BootstrapPackage, verification: Verification | null): Promise<boolean> {
   const outputs = await readdir(output, { withFileTypes: true }).catch((cause: unknown) => {
     // A cold or removed output directory is the expected reason to bootstrap.
     if (isMissing(cause)) return [];
     throw new Error(`Cannot read bootstrap output directory ${output}`, { cause });
   });
-  const built =
-    program === 'process-lineage'
-      ? ['process-lineage.d.ts', 'process-lineage.js', 'awake-clock.d.ts', 'awake-clock.js'].every((file) =>
-          outputs.some((listed) => listed.name === file && listed.isFile()),
-        )
-      : outputs.length > 0;
+  const built = outputs.length > 0;
   // Directory mtimes miss edits to existing nested files, so compare source file mtimes against the build marker.
-  return (
-    verification === null ||
-    !built ||
-    (await hasFileNewerThanMarker(directory, verification.mtimeMs, programConfiguration[program]))
-  );
+  return verification === null || !built || (await hasFileNewerThanMarker(directory, verification.mtimeMs));
 }
 
 /**
@@ -460,12 +431,8 @@ async function runQuietly(
   throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
-async function hasFileNewerThanMarker(
-  directory: string,
-  markerMtimeMs: number,
-  configuration: 'tsconfig.lib.json' | 'tsconfig.lineage.json',
-): Promise<boolean> {
-  const sourcePaths = [path.join(directory, 'src'), path.join(directory, configuration)];
+async function hasFileNewerThanMarker(directory: string, markerMtimeMs: number): Promise<boolean> {
+  const sourcePaths = [path.join(directory, 'src'), path.join(directory, 'tsconfig.lib.json')];
 
   for (const sourcePath of sourcePaths) {
     if (await pathHasFileNewerThanMarker(sourcePath, markerMtimeMs)) {

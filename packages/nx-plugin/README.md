@@ -1548,24 +1548,27 @@ A wildcard without a caret selects the current project instead. For example, a w
 this local relationship explicit for inferred `tsc-js` targets that also have inferred `cargo-wasm`. Package-managed
 JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
 
-A self-hosted workspace that owns the plugin's cowshed dependency builds its `napi-native` and independent `lineage-js`
-producers before every Darwin `bounded-exec` task with an idle bound, to supply Node's awake clock
-(specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On both Darwin and Linux it also builds them before
-a bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
+A self-hosted workspace that owns the plugin's `@smoothbricks/procinfo` dependency builds its `napi-native` producer
+before every Darwin `bounded-exec` task with an idle bound, to supply Node's awake clock (`awakeTimeMs`)
+(specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On both Darwin and Linux it also builds it before a
+bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
 `--archive-file`, or `cargo mutants`, as the executor classifies the command in the declaration, inference, or any
-configuration. Only those leaves read mbx's activity report and its waiters' native lineage (specs/cowshed/11_shell.md,
-"Cargo test-runner boundaries"). Neither reading changes a passing run, so no bounded target keys these bytes for those
-reads (Bounded exec key, below); a command that itself reads a producer's output depends on that producer and keys its
-output, as cowshed's Cargo runners do for the `dist/ts` entry and host addon their Node embedder loads (`nx.json`
-`targetDefaults`). Native tool discovery resolves the local owner from the linked package manifest, not a repository
-path or project-name alias; an installed consumer takes no local producer edge because its package ships the addon and
-both runtime entries. The plugin's compile and typecheck targets require only `lineage-js`, never the addon or cowshed's
-full API build. Its runtime-only cowshed project dependency is excluded from ordinary caret build edges, avoiding the
-executor bootstrap cycle. Declarations that replace `dependsOn` keep the inferred preconditions with Nx’s `"..."` token.
-When a declaration changes an inferred executor to bounded-exec, its compatible inferred base contains only these
-runtime prerequisites; the incompatible executor’s command and inputs do not leak across the normal Nx override. The
-canonical dependency-free `release-check` is the exception: it judges already assembled shipping artifacts and verifies
-the addon is present, without compiling at runtime or disabling the observer (specs/cowshed/06_cli.md, `release-check`).
+configuration. Only those leaves read mbx's activity report and its waiters' native lineage (`processLineages`;
+specs/cowshed/11_shell.md, "Cargo test-runner boundaries"; what it reads is in
+[specs/procinfo/01_procinfo.md](../../specs/procinfo/01_procinfo.md)). Neither reading changes a passing run, so no
+bounded target keys these bytes for those reads (Bounded exec key, below); a command that itself reads a producer's
+output depends on that producer and keys its output, as cowshed's Cargo runners do for the `dist/ts` entry and host
+addon their Node embedder loads (`nx.json` `targetDefaults`). Native tool discovery resolves the local owner from the
+linked package manifest, not a repository path or project-name alias; an installed consumer takes no local producer edge
+because its package ships the addon. The plugin compiles against procinfo's ordinary `dist/ts` through the normal
+package edge: procinfo's `build` is `["^build", "tsc-js"]`, with no native producer in its JavaScript build, so that
+edge is acyclic and nothing excludes it from caret builds. The plugin's compile and typecheck targets take no producer
+of their own and never the addon. Declarations that replace `dependsOn` keep the inferred preconditions with Nx’s
+`"..."` token. When a declaration changes an inferred executor to bounded-exec, its compatible inferred base contains
+only these runtime prerequisites; the incompatible executor’s command and inputs do not leak across the normal Nx
+override. The canonical dependency-free `release-check` is the exception: it judges already assembled shipping artifacts
+and verifies the addon is present, without compiling at runtime or disabling the observer (specs/cowshed/06_cli.md,
+`release-check`).
 
 A target of a napi package whose run sets `NAPI_DEBUG_ADDON=1`, in its declaration or inference, loads the package's
 dev-profile addon from `napi-debug`'s `.cache/native-debug`: it depends on `napi-debug` and keys
@@ -2183,23 +2186,23 @@ and a run with no endpoint refuses its reserved leaves.
 Independently of that spawn-time zero-hold rule, **any live process of a Cargo leaf explicitly queued for mbx admission
 pauses idle**, even while another of its processes holds capacity or the runner is otherwise unsupported. The executor
 polls public `mbx stats --scheduler --json --activity` activity, accepting only `kind: "waiter"`, `live: true` rows
-whose PID is corroborated by bounded, scoped per-PID lineage reads through cowshed's native `processLineages` owner
-(libproc on macOS, procfs on Linux), never a spawned ps or a process-table census. Names, private waiter files and
-decision logs prove nothing. Public `queue_position` is preserved, never recomputed by the consumer. A successful
-snapshot with no task waiters resumes the remaining budget when the lifecycle and hold count permit it; a finished test
-resets the paused budget. An idle callback drains any in-flight poll and takes a fresh bounded snapshot before expiring.
-The stats read and every native lineage batch share one five-second monotonic control-plane budget, independent of the
-idle clock; late or cancelled snapshots never become queue or empty-membership evidence. Snapshot failures are reported
-operational failures, never manufactured queue/admission evidence or an idle wedge; an unidentifiable foreign legacy row
-is diagnosed without claiming task membership. Live diagnostics say `queued for admission N s` with the mbx queue
-position. A command that fails or is cancelled before its first admission records a distinct `queued` verdict with
-observed wait duration and its last public PID/ticket/position rows, or, for a reserved leaf, its wait on its run's
-endpoint and no rows. Queue observation adds no deadline and changes neither total nor fixture ceilings. Queue
-observations take effect at snapshot completion, never backdated across a finished test's budget reset. Observed wait
-duration freezes when the command settles or cancellation stops observation, before teardown or report reading. The
-observer requires the version-2 activity-only report; the full statistics document's cache, savings and memory histories
-are not polling input. The activity projection omits those walks and encodings instead of raising the observer's output
-or control-plane limits.
+whose PID is corroborated by bounded, scoped per-PID lineage reads through procinfo's native `processLineages` owner
+(libproc on macOS, procfs on Linux; [specs/procinfo/01_procinfo.md](../../specs/procinfo/01_procinfo.md)), never a
+spawned ps or a process-table census. Names, private waiter files and decision logs prove nothing. Public
+`queue_position` is preserved, never recomputed by the consumer. A successful snapshot with no task waiters resumes the
+remaining budget when the lifecycle and hold count permit it; a finished test resets the paused budget. An idle callback
+drains any in-flight poll and takes a fresh bounded snapshot before expiring. The stats read and every native lineage
+batch share one five-second monotonic control-plane budget, independent of the idle clock; late or cancelled snapshots
+never become queue or empty-membership evidence. Snapshot failures are reported operational failures, never manufactured
+queue/admission evidence or an idle wedge; an unidentifiable foreign legacy row is diagnosed without claiming task
+membership. Live diagnostics say `queued for admission N s` with the mbx queue position. A command that fails or is
+cancelled before its first admission records a distinct `queued` verdict with observed wait duration and its last public
+PID/ticket/position rows, or, for a reserved leaf, its wait on its run's endpoint and no rows. Queue observation adds no
+deadline and changes neither total nor fixture ceilings. Queue observations take effect at snapshot completion, never
+backdated across a finished test's budget reset. Observed wait duration freezes when the command settles or cancellation
+stops observation, before teardown or report reading. The observer requires the version-2 activity-only report; the full
+statistics document's cache, savings and memory histories are not polling input. The activity projection omits those
+walks and encodings instead of raising the observer's output or control-plane limits.
 
 The decision to use zero-hold pausing is made before spawn, from the canonical scheduling switch and the supported
 command, never from silence on the pipe. Native nextest uses the invocation's binaries metadata and reserves cores only

@@ -1249,7 +1249,7 @@ export type HeldBirth =
 
 /**
  * The kernel's name of one descriptor the leader was handed, read from the holder's own copy,
- * as `lsof -F di` prints it ([`cowshed_os::process::DescriptorName`]).
+ * as `lsof -F di` prints it ([`procinfo::DescriptorName`]).
  */
 export type HeldDescriptor =
   | ({ readonly kind: 'device' } & {

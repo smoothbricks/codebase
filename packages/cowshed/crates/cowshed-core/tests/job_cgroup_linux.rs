@@ -52,8 +52,8 @@ use cowshed_core::runtime::supervisor::{
 };
 use cowshed_os::deadline::{Bound, LatencyClass, REAP};
 use cowshed_os::fork_lock::Spawn as _;
-use cowshed_os::process::RunState;
 use cowshed_os::test_backstop::{ChildBackstop as _, CommandBackstop as _};
+use procinfo::RunState;
 use serde::{Deserialize, Serialize};
 
 const ROLE: &str = "COWSHED_JOB_CGROUP_ROLE";

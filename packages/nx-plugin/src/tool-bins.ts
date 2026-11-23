@@ -24,7 +24,7 @@ function toolCommand(cwd: string, tool: string, file: string): string {
 }
 
 /** The tool packages whose native artifacts inferred commands consume. */
-const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'cowshed'] as const;
+const NATIVE_TOOL_PACKAGES = ['build-inputs', 'cargo-retain', 'procinfo'] as const;
 
 export type NativeToolPackage = (typeof NATIVE_TOOL_PACKAGES)[number];
 
@@ -32,7 +32,7 @@ type TargetDependency = NonNullable<TargetConfiguration['dependsOn']>[number];
 
 /**
  * Native tools as the inferring host consumes them. Installed packages already ship their artifacts; a workspace
- * package needs its declared producer. Scriptc tools use the host platform target, cowshed its napi-native addon.
+ * package needs its declared producer. Scriptc tools use the host platform target, procinfo its napi-native addon.
  */
 export interface NativeTools {
   /** The host's directory under a tool package's `dist/bin`. */
@@ -111,15 +111,11 @@ export function nativeToolCommand(
 }
 
 /** The task producing a tool artifact, only when this workspace owns its package. */
-export function nativeToolDependsOn(
-  tools: NativeTools | null,
-  tool: NativeToolPackage,
-  target?: string,
-): TargetDependency[] {
+export function nativeToolDependsOn(tools: NativeTools | null, tool: NativeToolPackage): TargetDependency[] {
   const project = tools?.projects.get(tool);
   return project === undefined || tools === null
     ? []
-    : [{ projects: [project], target: target ?? (tool === 'cowshed' ? 'napi-native' : tools.target) }];
+    : [{ projects: [project], target: tool === 'procinfo' ? 'napi-native' : tools.target }];
 }
 
 /** The plugin executors its own build runs: they load from a dist an earlier build left, so none can wait for it. */

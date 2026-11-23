@@ -2108,14 +2108,14 @@ impl JobRunState {
         }
         ObservedRun::Running {
             pid,
-            state: format!("{}", cowshed_os::process::run_state(pid)),
+            state: format!("{}", procinfo::run_state(pid)),
             command: observed_command(pid),
         }
     }
 }
 
 fn observed_command(pid: i32) -> Option<String> {
-    let arguments = cowshed_os::process::process_arguments(pid).ok()?;
+    let arguments = procinfo::process_arguments(pid).ok()?;
     Some(
         arguments
             .argv

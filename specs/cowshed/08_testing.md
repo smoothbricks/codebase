@@ -863,7 +863,7 @@ pidfds, and a tree that cannot be removed stays in `/tmp` for the shared-temp sw
 cleanup enumerates or releases disk images.
 
 The clone-intent publication-handoff oracle waits for the supervisor hello after the image becomes `Active`, then reads
-its own process's TCP listeners through `cowshed-os::process::listening_ports` and filters them to the published block
+its own process's TCP listeners through procinfo's `listening_ports` and filters them to the published block
 (05_gateway.md, "Placement and identity"). It never probes released ports or calls `getsockname` on every descriptor:
 non-IP sockets, including Darwin's `AF_SYSTEM` control sockets, need not implement that operation and are unrelated to
 the allocator's TCP listener claims.

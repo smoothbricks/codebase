@@ -1457,7 +1457,7 @@ impl Fixture {
             assert_eq!(published.publication_state, PublicationState::Active);
             let block = published.grants.port_block.expect("a port block");
             let pid = libc::pid_t::try_from(std::process::id()).expect("this process's pid");
-            let held = cowshed_os::process::listening_ports(pid)
+            let held = procinfo::listening_ports(pid)
                 .expect("read this process's TCP listeners")
                 .into_iter()
                 .filter(|port| block.ports().expect("block ports").contains(port))

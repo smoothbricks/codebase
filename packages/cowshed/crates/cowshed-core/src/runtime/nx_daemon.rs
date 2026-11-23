@@ -345,11 +345,11 @@ fn read_and_probe(record: &Path) -> (Probe, Option<(libc::pid_t, Vec<u8>)>) {
     }
 }
 
-/// Whether the process `pid` has not exited ([`cowshed_os::process::running`]): a daemon that exited
+/// Whether the process `pid` has not exited ([`procinfo::running`]): a daemon that exited
 /// and is still a zombie awaiting its reaper is gone. A process whose state cannot be read is
 /// left for the socket to judge.
 fn running(pid: libc::pid_t) -> bool {
-    cowshed_os::process::running(pid).unwrap_or(true)
+    procinfo::running(pid).unwrap_or(true)
 }
 
 /// The Nx project whose daemon a supervisor keeps: the project Nx is rooted at under the

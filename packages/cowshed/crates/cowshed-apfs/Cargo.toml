@@ -24,6 +24,7 @@ bench = false
 [dependencies]
 cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 cowshed-os = { path = "../cowshed-os" }
+procinfo.workspace = true
 libc = "0.2"
 plist = "1"
 serde.workspace = true

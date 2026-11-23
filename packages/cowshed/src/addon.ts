@@ -7,9 +7,9 @@ import { addonDirectory, addonFileName, addonSearch } from './platform.js';
 /**
  * The host's addon, required from the first path {@link addonSearch} names for the module at
  * `modulePath` whose loaded module `accept` takes. The module's own location decides the package
- * root, and so the tree it loads from. Every entry that loads the addon searches this one way: the
- * root entry accepts a module carrying every operation it binds, `process-lineage` one carrying its
- * own export. A host the package ships no addon for, or no path that loads, throws naming every
+
+ * root, and so the tree it loads from. The root entry accepts a module carrying every operation it
+ * binds. A host the package ships no addon for, or no path that loads, throws naming every
  * path tried and the Nx target that writes them in a checkout.
  */
 export function loadAddon<T>(modulePath: string, accept: (module: unknown) => T): T {

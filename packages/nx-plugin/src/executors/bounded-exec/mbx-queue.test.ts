@@ -1,5 +1,5 @@
 import { expect, it } from 'bun:test';
-import type { ProcessLineage } from '@smoothbricks/cowshed/process-lineage';
+import type { ProcessLineage } from '@smoothbricks/procinfo';
 import type { HangProbeResult } from './hang-diagnostics.js';
 import { MBX_QUEUE_SNAPSHOT_MS, snapshotMbxQueue } from './mbx-queue.js';
 

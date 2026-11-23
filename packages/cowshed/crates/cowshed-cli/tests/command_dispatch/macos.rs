@@ -6014,7 +6014,7 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
     until_daemon_recorded(&w1).await;
     let source_daemon = recorded_daemon(&w1).expect("w1's keeper left its daemon recorded");
     assert!(
-        cowshed_os::process::running(source_daemon).expect("observe w1's daemon"),
+        procinfo::running(source_daemon).expect("observe w1's daemon"),
         "the source keeper's daemon runs before the fork"
     );
     let source_volume = linked_volume(&layout, &w1);
@@ -6044,7 +6044,7 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
     until_daemon_recorded(&w2).await;
     let kept = recorded_daemon(&w2).expect("w2's run left its kept daemon recorded");
     assert!(
-        cowshed_os::process::running(kept).expect("read the daemon's state"),
+        procinfo::running(kept).expect("read the daemon's state"),
         "w2's kept daemon {kept} runs before the shutdown"
     );
     let workers: Vec<libc::pid_t> = [&w1, &w2]
@@ -6056,7 +6056,7 @@ async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_sub
     for checkout in [&w1, &w2] {
         if let Some(daemon) = recorded_daemon(checkout) {
             assert!(
-                !cowshed_os::process::running(daemon).expect("read the daemon's state"),
+                !procinfo::running(daemon).expect("read the daemon's state"),
                 "{}'s kept Nx daemon {daemon} outlives the runtime",
                 checkout.display()
             );

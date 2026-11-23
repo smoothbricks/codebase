@@ -23,9 +23,9 @@ use cowshed_cli::launchd::{
 use cowshed_os::deadline::{self, Bound, Deadline, LatencyClass, ReapError, RunError};
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use cowshed_os::namespace::{HostNamespace, TestNamespace};
-use cowshed_os::process::RunState;
 #[cfg(target_os = "macos")]
 use cowshed_os::test_backstop::CommandBackstop as _;
+use procinfo::RunState;
 
 #[cfg(target_os = "macos")]
 #[path = "../../cowshed-apfs/tests/support/scratch_apfs.rs"]

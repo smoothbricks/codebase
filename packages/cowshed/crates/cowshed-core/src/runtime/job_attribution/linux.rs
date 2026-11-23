@@ -1,6 +1,6 @@
 //! Linux's read of a job's members into its census: each member's record under the pidfd the
 //! membership read opened (`job_groups/linux.rs`), its image from `/proc/<pid>/exe` and
-//! `/proc/<pid>/cmdline` (`cowshed_os::process::process_arguments`) and its own counters from
+//! `/proc/<pid>/cmdline` (`procinfo::process_arguments`) and its own counters from
 //! `/proc/<pid>/stat` and `/proc/<pid>/io` (`process_usage::sample`).
 //!
 //! Every read names the pid alone, and the member's pidfd fences each: the image counts only if
@@ -25,7 +25,7 @@ pub(super) const IMAGE_READ: &str = "reading /proc/<pid>/exe and /proc/<pid>/cmd
 
 /// The executable and byte-exact argv of the image `pid` runs now.
 fn image(pid: libc::pid_t) -> io::Result<ProcessImage> {
-    let arguments = cowshed_os::process::process_arguments(pid)?;
+    let arguments = procinfo::process_arguments(pid)?;
     Ok(ProcessImage::observed(
         String::from_utf8_lossy(&arguments.executable).into_owned(),
         arguments.argv,

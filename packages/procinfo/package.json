@@ -1,0 +1,92 @@
+{
+  "name": "@smoothbricks/procinfo",
+  "version": "0.1.0",
+  "description": "Host process facts read natively on macOS and Linux: no ps or lsof spawn, no process-table census",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/ts/index.js",
+  "types": "./dist/ts/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/ts/index.d.ts",
+      "import": "./dist/ts/index.js",
+      "default": "./dist/ts/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!**/*.tsbuildinfo"
+  ],
+  "napi": {
+    "binaryName": "procinfo",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "scripts": {
+    "test": "nx run procinfo:test --outputStyle=stream"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.3",
+    "@types/node": "catalog:"
+  },
+  "nx": {
+    "name": "procinfo",
+    "targets": {
+      "build": {
+        "//": "The TypeScript entry alone: the addon is each platform target's (napi-<arch>-<family>, napi-native for this host), so nx-plugin depends on this package with an ordinary edge and no executor bootstrap cycle (specs/procinfo/01_procinfo.md, Package).",
+        "dependsOn": [
+          "^build",
+          "tsc-js"
+        ]
+      },
+      "release-check": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "//": "The package's release gate, as cowshed's is (specs/cowshed/06_cli.md, release-check): smoo release pack runs it after every platform's prebuilt addon is applied and before the tarball is packed, so it judges the packed dist/native, never a rebuild; it declares no dependsOn and is cached on a runtime digest of those bytes.",
+        "inputs": [
+          "{projectRoot}/scripts/verify-packaged-addons.ts",
+          "{projectRoot}/src/addon.ts",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/procinfo/scripts/verify-packaged-addons.ts --digest"
+          },
+          {
+            "externalDependencies": []
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "command": "bun scripts/verify-packaged-addons.ts",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "test": {
+        "executor": "nx:noop",
+        "//": "The Rust suite of both crates and the built-addon tests of the JavaScript entry.",
+        "dependsOn": [
+          "cargo-test",
+          "napi-test"
+        ]
+      }
+    },
+    "tags": [
+      "npm:public"
+    ]
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/procinfo"
+  }
+}

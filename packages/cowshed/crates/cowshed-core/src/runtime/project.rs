@@ -3223,7 +3223,7 @@ fn process_is_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
-    cowshed_os::process::running(pid).unwrap_or(true)
+    procinfo::running(pid).unwrap_or(true)
 }
 
 fn claim_port_block(staging: &Path, base: u16) -> std::io::Result<Option<PathBuf>> {

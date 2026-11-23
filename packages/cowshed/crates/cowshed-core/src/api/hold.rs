@@ -233,7 +233,7 @@ impl<'de> Deserialize<'de> for KernelAddress {
 }
 
 /// The kernel's name of one descriptor the leader was handed, read from the holder's own copy,
-/// as `lsof -F di` prints it ([`cowshed_os::process::DescriptorName`]).
+/// as `lsof -F di` prints it ([`procinfo::DescriptorName`]).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -253,9 +253,9 @@ pub enum HeldDescriptor {
     Unnamed { fd_type: u32 },
 }
 
-impl From<cowshed_os::process::DescriptorName> for HeldDescriptor {
-    fn from(name: cowshed_os::process::DescriptorName) -> Self {
-        use cowshed_os::process::DescriptorName;
+impl From<procinfo::DescriptorName> for HeldDescriptor {
+    fn from(name: procinfo::DescriptorName) -> Self {
+        use procinfo::DescriptorName;
         match name {
             DescriptorName::Device(address) => Self::Device {
                 device: KernelAddress::new(address),

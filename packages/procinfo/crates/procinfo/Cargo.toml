@@ -1,0 +1,15 @@
+[package]
+name = "procinfo"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# Host process facts, each read from the kernel's own record of one process or one group, with
+# no spawned `ps` or `lsof` and no census of the process table (specs/procinfo/01_procinfo.md).
+# It links nothing of cowshed, so anything that needs a process fact links it alone.
+[dependencies]
+libc = "0.2"
+
+# Darwin's procargs refusal (macos.rs) derives its message.
+[target.'cfg(target_os = "macos")'.dependencies]
+thiserror = "2"

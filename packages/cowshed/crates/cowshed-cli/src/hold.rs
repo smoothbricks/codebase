@@ -255,7 +255,7 @@ fn end_group(fence: &ChildFence, state: &mut State<HoldEvent>) -> Result<(), Str
 
 /// The kernel's name of this process's `descriptor`, as the leader inherits it.
 fn name(descriptor: RawFd) -> Result<HeldDescriptor, CowshedError> {
-    cowshed_os::process::descriptor_name(descriptor)
+    procinfo::descriptor_name(descriptor)
         .map(HeldDescriptor::from)
         .map_err(|error| {
             CowshedError::internal(format!(

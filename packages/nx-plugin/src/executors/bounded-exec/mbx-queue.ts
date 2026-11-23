@@ -1,4 +1,4 @@
-import type { ProcessLineage } from '@smoothbricks/cowshed/process-lineage';
+import type { ProcessLineage } from '@smoothbricks/procinfo';
 import typia from 'typia';
 import { type HangDiagnosticHost, runProbe } from './hang-diagnostics.js';
 import { CONTROL_MS } from './lease-wait.js';
@@ -50,7 +50,7 @@ export async function snapshotMbxQueue(
     now: () => performance.now(),
     probe: (file, args, timeoutMs, abort) => runProbe(file, args, timeoutMs, abort, environment),
     async lineages(pids) {
-      const { processLineages } = await import('@smoothbricks/cowshed/process-lineage');
+      const { processLineages } = await import('@smoothbricks/procinfo');
       return processLineages(pids);
     },
   },

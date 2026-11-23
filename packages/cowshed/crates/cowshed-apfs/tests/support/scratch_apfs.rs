@@ -366,7 +366,7 @@ mod sweep_ownership_tests {
         );
         assert_eq!(dead_owner(root.path()), None, "its owner is alive");
         let keeper = i32::try_from(root.keeper()).unwrap();
-        let lineage = cowshed_os::process::lineage(keeper)
+        let lineage = procinfo::lineage(keeper)
             .unwrap()
             .expect("the keeper runs while its root is held");
         assert_eq!(lineage.ppid, own, "the root's owner started its keeper");

@@ -80,7 +80,7 @@ impl Members<'_> {
     }
 
     /// The running members, each by pid, command and state.
-    pub(super) fn members(self, child: u32) -> io::Result<Vec<crate::process::GroupMember>> {
+    pub(super) fn members(self, child: u32) -> io::Result<Vec<procinfo::GroupMember>> {
         match self {
             Self::OwnGroup => crate::process::group_members(group_of(child)?),
             Self::Leaf { cgroup, .. } => crate::process::cgroup_members(cgroup),

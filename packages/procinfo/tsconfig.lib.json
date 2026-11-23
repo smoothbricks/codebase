@@ -2,12 +2,13 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": "src",
-    "outDir": "dist/lineage",
-    "tsBuildInfoFile": "dist/lineage/tsconfig.lineage.tsbuildinfo",
+    "outDir": "dist/ts",
+    "tsBuildInfoFile": "dist/ts/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
     "lib": ["es2024"],
     "types": []
   },
-  "files": ["src/process-lineage.ts", "src/awake-clock.ts", "src/addon.ts", "src/platform.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

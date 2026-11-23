@@ -211,93 +211,58 @@ it('the rebuild asks ttsc to rewrite no output that already holds its bytes', ()
     dispose();
   }
 });
-it('bootstrap emits the native-free lineage entry before its consumer and repairs a missing declaration in a warm dist', () => {
+/**
+ * A library dependency of the plugin compiles through the library program before the plugin compiles against its dist:
+ * a missing dist is emitted, and a tsconfig newer than the marker emits it again.
+ */
+it('a library dependency of the plugin is emitted before the plugin, again when its tsconfig is newer', () => {
   const { root, plugin, enter, dispose } = staleCheckout();
   try {
+    // A renamed stand-in for @smoothbricks/procinfo: bootstrap reads the dependency's name from the plugin's manifest.
     const owner = join(root, 'packages/renamed-runtime');
     mkdirSync(join(owner, 'src'), { recursive: true });
-    mkdirSync(join(owner, 'dist/ts'), { recursive: true });
-    writeFileSync(join(owner, 'package.json'), JSON.stringify({ name: '@smoothbricks/cowshed' }));
+    writeFileSync(join(owner, 'package.json'), '{}');
     writeFileSync(join(owner, 'tsconfig.lib.json'), '{}');
-    writeFileSync(join(owner, 'tsconfig.lineage.json'), '{}');
-    writeFileSync(join(owner, 'src/process-lineage.ts'), 'export {};\n');
-    writeFileSync(join(owner, 'dist/ts/index.d.ts'), 'export {};\n');
-    for (const file of ['package.json', 'tsconfig.lib.json', 'tsconfig.lineage.json', 'src/process-lineage.ts']) {
+    writeFileSync(join(owner, 'src/index.ts'), 'export {};\n');
+    for (const file of ['package.json', 'tsconfig.lib.json', 'src/index.ts']) {
       utimesSync(join(owner, file), new Date(0), new Date(0));
     }
+    // Its marker is current, and it has no dist yet: the entry must emit it.
     const marker = join(owner, buildMarker);
     mkdirSync(dirname(marker), { recursive: true });
     writeFileSync(marker, '');
     utimesSync(marker, new Date(1000), new Date(1000));
     mkdirSync(join(plugin, 'node_modules/@smoothbricks'), { recursive: true });
-    symlinkSync(owner, join(plugin, 'node_modules/@smoothbricks/cowshed'));
+    symlinkSync(owner, join(plugin, 'node_modules/@smoothbricks/procinfo'));
     writeFileSync(
       join(plugin, 'package.json'),
-      JSON.stringify({ dependencies: { '@smoothbricks/cowshed': 'workspace:*' } }),
+      JSON.stringify({ dependencies: { '@smoothbricks/procinfo': 'workspace:*' } }),
     );
-
-    const bin = join(root, 'bin');
+    // The library program's stand-in: each emit records the package it ran in, and writes that package's dist.
+    const builds = join(root, 'builds');
     writeFileSync(
-      join(bin, 'tsc'),
-      `#!/bin/sh
-set -eu
-root=$(dirname "$(dirname "$0")")
-[ "$PWD" = "$root/packages/renamed-runtime" ]
-[ "$*" = '--build tsconfig.lineage.json --force' ]
-printf 'lineage\n' >> "$root/compiler-order"
-mkdir -p dist/lineage
-for entry in process-lineage awake-clock; do
-  printf 'export {};\n' > "dist/lineage/$entry.d.ts"
-  printf 'export {};\n' > "dist/lineage/$entry.js"
-done
-`,
+      join(root, 'bin/ttsc'),
+      '#!/bin/sh\nbasename "$PWD" >> "$(dirname "$0")/../builds"\nmkdir -p dist\necho "export {};" > dist/index.js\n',
     );
-    writeFileSync(
-      join(bin, 'ttsc'),
-      `#!/bin/sh
-set -eu
-root=$(dirname "$(dirname "$0")")
-if [ ! -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.d.ts" ]; then
-  printf 'Cannot find module @smoothbricks/cowshed/process-lineage\n' >&2
-  exit 79
-fi
-[ -f "$root/packages/renamed-runtime/dist/lineage/process-lineage.js" ]
-[ -f "$root/packages/renamed-runtime/dist/lineage/awake-clock.d.ts" ]
-[ -f "$root/packages/renamed-runtime/dist/lineage/awake-clock.js" ]
-[ "$PWD" != "$root/packages/renamed-runtime" ]
-mkdir -p dist
-printf 'export {};' > dist/index.js
-basename "$PWD" >> "$root/compiler-order"
-`,
-    );
-    chmodSync(join(bin, 'tsc'), 0o755);
-    chmodSync(join(bin, 'ttsc'), 0o755);
+    chmodSync(join(root, 'bin/ttsc'), 0o755);
 
     const entered = enter();
-    expect(entered.status, `${entered.stdout}${entered.stderr}`).toBe(0);
-    const order = join(root, 'compiler-order');
-    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli']);
-    const warm = enter();
-    expect(warm.status, `${warm.stdout}${warm.stderr}`).toBe(0);
-    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli']);
+    expect(entered.status, entered.stderr).toBe(0);
+    // The dependency was emitted first, which also repaired its missing dist before the plugin compiled against it.
+    expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual(['renamed-runtime', 'nx-plugin', 'cli']);
+    expect(readdirSync(join(owner, 'dist'))).toEqual(['index.js']);
 
-    rmSync(join(owner, 'dist/lineage/awake-clock.d.ts'));
-    const repaired = enter();
-    expect(repaired.status, `${repaired.stdout}${repaired.stderr}`).toBe(0);
-    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual(['lineage', 'nx-plugin', 'cli', 'lineage']);
-
-    const configuration = join(owner, 'tsconfig.lineage.json');
-    writeFileSync(configuration, '{"compilerOptions":{"strict":true}}');
+    // A newer tsconfig.lib.json, the configuration the library program compiles, makes it stale again.
+    writeFileSync(join(owner, 'tsconfig.lib.json'), '{"compilerOptions":{"strict":true}}');
     const changedAt = new Date(statSync(marker).mtimeMs + 1000);
-    utimesSync(configuration, changedAt, changedAt);
+    utimesSync(join(owner, 'tsconfig.lib.json'), changedAt, changedAt);
     const reconfigured = enter();
-    expect(reconfigured.status, `${reconfigured.stdout}${reconfigured.stderr}`).toBe(0);
-    expect(readFileSync(order, 'utf8').trim().split('\n')).toEqual([
-      'lineage',
+    expect(reconfigured.status, reconfigured.stderr).toBe(0);
+    expect(readFileSync(builds, 'utf8').trim().split('\n')).toEqual([
+      'renamed-runtime',
       'nx-plugin',
       'cli',
-      'lineage',
-      'lineage',
+      'renamed-runtime',
     ]);
   } finally {
     dispose();
