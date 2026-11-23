@@ -47,6 +47,11 @@
       "release-check": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "metadata": {
+          "ungated": {
+            "kind": "release"
+          }
+        },
         "//": "The package's release gate, as cowshed's is (specs/cowshed/06_cli.md, release-check): smoo release pack runs it after every platform's prebuilt addon is applied and before the tarball is packed, so it judges the packed dist/native, never a rebuild; it declares no dependsOn and is cached on a runtime digest of those bytes.",
         "inputs": [
           "{projectRoot}/scripts/verify-packaged-addons.ts",
