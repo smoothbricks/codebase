@@ -34,6 +34,25 @@ describe("mbx's one pool at the leaf", () => {
     });
   });
 
+  it("carries an interactive job's start, which its leaves' requests decay by, and no start for another class", () => {
+    const named = { MBX_SCHEDULER: '1', MBX_CACHE_DIR: '/bc/mbx', MBX_SCHEDULER_JOB_STARTED_MS: '1700000000000' };
+    const interactive = mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'interactive' });
+    expect(interactive).toEqual({ priority: 'interactive', jobStartedMs: 1_700_000_000_000 });
+    // cowshed exports the start empty for every job that is not interactive: a request of it names none.
+    expect(mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'interactive', MBX_SCHEDULER_JOB_STARTED_MS: '' })).toEqual({
+      priority: 'interactive',
+    });
+    // Only an interactive request decays, so no other band's request names a start it happens to inherit.
+    expect(mbxPool({ ...named, MBX_SCHEDULER_PRIORITY: 'normal' })).toEqual({ priority: 'normal' });
+    expect(mbxPool({ ...named })).toEqual({ priority: 'low' });
+    if (interactive === null) throw new Error('the canonical environment names a pool');
+    expect(mbxLeaf(interactive, runnerDemand('bun test', 4, 18, {}), 'bun test', false)).toMatchObject({
+      kind: 'reserve',
+      priority: 'interactive',
+      jobStartedMs: 1_700_000_000_000,
+    });
+  });
+
   it('names no pool inside a reservation: nested work shares the grant it runs under', () => {
     // The 2026-10-29 sb-r22 gate: a bounded-exec suite under `mbx reserve` started an executor that reserved again and
     // waited in the pool behind its own parent's grant until the progress bound ended the suite.

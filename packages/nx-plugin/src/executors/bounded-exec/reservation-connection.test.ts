@@ -259,6 +259,24 @@ describe("a leaf's connection to its run's reservation endpoint", () => {
     }
   });
 
+  it("writes an interactive job's start on its request, and none on a request that names none", () => {
+    const written = (event: ConnectionEvent): unknown => {
+      const [, effects] = connectionStep(opened(ENDPOINT), event);
+      const line = effects.flatMap((effect) => (effect.do === 'write' ? [effect.line] : []))[0];
+      if (line === undefined) throw new Error('a reserve on an open connection writes its request');
+      return JSON.parse(line);
+    };
+    expect(
+      written({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', min: 1, jobStartedMs: 1_700_000_000_000 }),
+    ).toEqual({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', job_started_ms: 1_700_000_000_000 });
+    expect(written({ type: 'reserve', id: 1, cpus: 2, priority: 'interactive', min: 1 })).toEqual({
+      type: 'reserve',
+      id: 1,
+      cpus: 2,
+      priority: 'interactive',
+    });
+  });
+
   it('answers every request once: by the pool, by its own release, or by the end of its connection', () => {
     everyOrder((steps) => {
       const ended = endedAt(steps);
