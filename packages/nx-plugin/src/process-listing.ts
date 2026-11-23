@@ -1,5 +1,5 @@
 /**
- * Running one listing of named processes, `ps -p` or `pgrep -P`, under a deadline. A listing waits on the kernel's view
+ * Running one listing of named processes, `ps -p`, under a deadline. A listing waits on the kernel's view
  * of the processes it names; one of those caught in an uninterruptible kernel wait can hold the listing there with it.
  *
  * Node APIs only: this module is built with the library.

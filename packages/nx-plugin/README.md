@@ -174,15 +174,15 @@ whose it is (`specs/cowshed/11_shell.md`, "Process identity and signal ownership
 tree (a child its last act started, reparented when it exited) stays in the tree the job's supervisor observes, and is
 retired with the test command's subtree when that command ends (`bounded-exec`, below). No fixture helper reads a
 process it was not given: each starts from pids its caller holds (a child it spawned, a daemon's record, the test
-process itself) and walks down their children (`pgrep -P` on macOS, each parent's `/proc/<pid>/task/*/children` on
-Linux), then lists exactly those with `ps -p`, each under a deadline. A census of the user's processes by working
-directory or `TMPDIR` (`lsof -d cwd`, `ps -E`) asked every one of them, and one caught in an uninterruptible kernel wait
-held the census with it: measured 2026-10-25, `lsof -d cwd` slept 77.8 s on a `cowshed fork`'s first write to its build
-image. What a signalled test process still runs of its own tree is named on stderr (`descendantsDiagnostic`) when it
-deletes its runs. Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in
-their own `nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind.
-Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's
-Cargo home.
+process itself) and walks down their children (procinfo's `childPids`: `proc_listchildpids` on macOS, each parent's
+`/proc/<pid>/task/*/children` on Linux), then lists exactly those with `ps -p`, each under a deadline. A census of the
+user's processes by working directory or `TMPDIR` (`lsof -d cwd`, `ps -E`) asked every one of them, and one caught in an
+uninterruptible kernel wait held the census with it: measured 2026-10-25, `lsof -d cwd` slept 77.8 s on a
+`cowshed fork`'s first write to its build image. What a signalled test process still runs of its own tree is named on
+stderr (`descendantsDiagnostic`) when it deletes its runs. Fixtures that intentionally strip caller directory overrides
+declare `cacheDirectory: ".nx/cache"` in their own `nx.json`; this keeps the native task database local too, rather than
+leaving a new `~/.nx/<repoKey>` behind. Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`;
+production commands still keep the caller's Cargo home.
 
 Fixtures the suite infers in its own process own their Nx state the same way. The package's test preload
 (`src/__tests__/isolate-nx-state.ts`) drops the `NX_WORKSPACE_DATA_DIRECTORY`, `NX_PROJECT_GRAPH_CACHE_DIRECTORY` and
@@ -1551,8 +1551,9 @@ JavaScript targets with another platform prerequisite must likewise declare that
 A self-hosted workspace that owns the plugin's `@smoothbricks/procinfo` dependency builds its `napi-native` producer
 before every `bounded-exec` task with an idle bound: its pre-expiry hang snapshot reads the runner's tree through
 procinfo on both platforms, and on Darwin Node's awake clock (`awakeTimeMs`) is procinfo's too
-(specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On both Darwin and Linux it also builds it before a
-bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
+(specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On Linux it builds it before every bounded task,
+whose leaf's peak waiter walks the tree through procinfo's `childPids`. On both Darwin and Linux it also builds it
+before a bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
 `--archive-file`, or `cargo mutants`, as the executor classifies the command in the declaration, inference, or any
 configuration. Only those leaves read mbx's activity report and its waiters' native lineage (`processLineages`;
 specs/cowshed/11_shell.md, "Cargo test-runner boundaries"; what it reads is in
@@ -3017,9 +3018,10 @@ tests) owns those roots:
   `<workspace>/.nx/workspace-data/d/server-process.json`, and its descendants, has exited. A workspace with no live
   record has nothing of a daemon to stop here.
 - `processesOf(pids)` lists exactly the named processes that still exist (`ps -p`); `processTree(roots)` adds every
-  process descending from them, roots first, by walking down their children (`process-children.ts`; the walk itself is
-  `walkTree`). `descendantsDiagnostic(subject)` names the test process's own running descendants for a failure report.
-  Each listing waits at most the leg's no-progress backstop and then fails naming its command rather than answer empty.
+  process descending from them, roots first, by walking down their children (procinfo's `childPids`,
+  `process-children.ts`; the walk itself is `walkTree`). `descendantsDiagnostic(subject)` names the test process's own
+  running descendants for a failure report. Each listing waits at most the leg's no-progress backstop and then fails
+  naming its command rather than answer empty.
 
 A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.

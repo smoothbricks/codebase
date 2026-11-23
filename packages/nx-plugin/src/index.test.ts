@@ -1855,7 +1855,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('orders a Linux idle run after the procinfo addon producer its hang snapshot reads, and leaves a wall-bound run without it', async () => {
+  it('orders every Linux bounded run after the procinfo addon producer: the hang snapshot and the peak waiter read the tree through it', async () => {
     const workspace = await createWorkspace();
     const idle: TargetConfiguration = {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -1902,7 +1902,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ?.targets;
       const addon = { projects: ['procinfo-owner'], target: 'napi-native' };
       expect(targets?.check?.dependsOn).toContainEqual(addon);
-      expect(targets?.['wall-check']?.dependsOn ?? []).not.toContainEqual(addon);
+      // A wall-bound leaf has no hang snapshot, but its peak waiter walks its tree through procinfo's childPids.
+      expect(targets?.['wall-check']?.dependsOn).toContainEqual(addon);
     } finally {
       await workspace.cleanup();
     }

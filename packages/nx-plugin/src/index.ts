@@ -2461,7 +2461,7 @@ async function createProjectTargets(
     };
   }
 
-  // An idle-bounded run's hang snapshot (its runner's tree), the Darwin Node idle clock and the Cargo admission observer
+  // A Linux leaf's peak waiter (its tree's children), an idle-bounded run's hang snapshot, the Darwin Node idle clock and the Cargo admission observer
   // load the local procinfo addon (`childPids` and the other per-process facts, `awakeTimeMs`, `processLineages`). They
   // can fail a run but do not change a passing command, so none keys its bytes (README,
   // "Bounded exec key"). Declarations retain these prerequisites with Nx's ordinary "..." merge token. The wall-only
@@ -2478,7 +2478,8 @@ async function createProjectTargets(
         (options) =>
           options.nativeTest !== undefined ||
           runsAsCargoLeaf(boundedCommandLine(options) ?? '') ||
-          typeof options.idleTimeoutMs === 'number',
+          typeof options.idleTimeoutMs === 'number' ||
+          hostPlatform?.targetFamily === 'linux',
       );
       if (!needsAddon) continue;
       // Nx discards an incompatible executor's inferred configuration; only the runtime prerequisites belong below it.

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
-import { childPids } from '../../process-children.linux.js';
+import { childPids } from '../../process-children.js';
 import type {
   HostMemory,
   LiveUsageReading,

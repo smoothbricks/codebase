@@ -1,22 +1,13 @@
 /**
- * The children of named processes, each platform by its own mechanism ({@link ChildPids}). Callers walk a tree with
- * `childPids` and never ask which platform answers.
+ * The children of named processes, as procinfo reads them from the kernel's own parent links (`childPids`,
+ * specs/procinfo/01_procinfo.md): one read per parent, never a spawned listing or a census of the process table.
  */
-import { childPids as darwinChildPids } from './process-children.darwin.js';
-import { childPids as linuxChildPids } from './process-children.linux.js';
+import { childPids as childrenOf } from '@smoothbricks/procinfo';
 
 /**
  * The pids whose parent is one of `parents`, as the kernel links them now: a child of a parent that has exited is
  * listed by none, and an empty list is no failure. Only the named parents' children are answered, whatever else runs.
  */
-export type ChildPids = (parents: readonly number[]) => Promise<number[]>;
-
-const BY_PLATFORM: Partial<Record<NodeJS.Platform, ChildPids>> = { darwin: darwinChildPids, linux: linuxChildPids };
-
-export const childPids: ChildPids = (parents) => {
-  const list = BY_PLATFORM[process.platform];
-  if (list === undefined) {
-    throw new Error(`No child-process listing for ${process.platform}`);
-  }
-  return list(parents);
-};
+export async function childPids(parents: readonly number[]): Promise<number[]> {
+  return parents.flatMap((parent) => childrenOf(parent));
+}
