@@ -1191,13 +1191,53 @@ impl LocalWaitCauses {
 ///
 /// Dropping this future owns only connection state: its unanswered requests are abandoned, its
 /// streams end, and routed jobs remain owned by the router actor.
+///
 /// Serve a process-external controller connection; private error causes never cross its wire.
+/// The connection runs on a thread of its own, under a current-thread runtime of its own, apart
+/// from the router actor's: a route that waits in a kernel call on the actor's thread (a disk
+/// lease, a disk command, a queued image lock, a slow file-system call) then keeps the
+/// connection's heartbeats coming, naming that op as `busy` with its `forMs` rising, instead of
+/// silencing every call on it (05_gateway.md, "Deadlines";
+/// smoo/cowshed!n/controller-connection-own-thread). An in-process pair stays on its caller's
+/// runtime ([`serve_controller_connection_in_process`]).
 pub async fn serve_controller_connection(
     descriptor: OwnedFd,
     authority: ConnectionAuthority,
     router: RouterHandle,
 ) -> Result<()> {
-    serve_controller_connection_inner(descriptor, authority, router, None).await
+    // Held until this future ends: dropping it ends the connection on its thread.
+    let (_dropped, dropping) = oneshot::channel::<()>();
+    let (done, finished) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("cowshed-controller-connection".to_owned())
+        .spawn(move || {
+            let served = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    connection_error(format!(
+                        "the controller connection's runtime failed to start: {error}"
+                    ))
+                })
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        tokio::select! {
+                            served = serve_controller_connection_inner(descriptor, authority, router, None) => served,
+                            _ = dropping => Ok(()),
+                        }
+                    })
+                });
+            // Nobody hears an answer once this future was dropped.
+            let _ = done.send(served);
+        })
+        .map_err(|error| {
+            connection_error(format!(
+                "the controller connection's thread failed to start: {error}"
+            ))
+        })?;
+    finished.await.map_err(|_| {
+        CowshedError::internal("the controller connection's thread ended without an answer")
+    })?
 }
 
 /// Serve the server end of an in-process pair with its connection-local wait custody.

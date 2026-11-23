@@ -5,7 +5,7 @@ use bytes::Bytes;
 use cowshed_core::api::operations::{Lane, OPERATIONS, OperationRequest, Scope};
 use cowshed_core::api::server::{
     ConnectionAuthority, EventSource, HANDSHAKE_VERSION, HostRole, MAX_BINARY_FRAME_BYTES,
-    MAX_JSON_FRAME_BYTES, RouterHandle, RouterResponse, serve_controller_connection,
+    MAX_JSON_FRAME_BYTES, RouteBusy, RouterHandle, RouterResponse, serve_controller_connection,
 };
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
@@ -1272,3 +1272,136 @@ async fn the_stream_cap_refuses_a_sixty_fifth_stream_and_still_reads_a_close() {
         .expect("server joins")
         .expect("clean disconnect");
 }
+
+//#region smoo/cowshed!n/controller-connection-own-thread
+/// A blocking client frame: a big-endian length, then JSON.
+fn write_blocking(stream: &mut std::os::unix::net::UnixStream, value: &Value) {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(value).expect("frame JSON");
+    let length = u32::try_from(bytes.len()).expect("the frame fits the wire");
+    stream
+        .write_all(&length.to_be_bytes())
+        .expect("frame header");
+    stream.write_all(&bytes).expect("frame body");
+}
+
+/// The next frame, or the read's failure once its timeout passes with none.
+fn read_blocking(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Value> {
+    use std::io::Read;
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header)?;
+    let mut bytes = vec![0_u8; usize::try_from(u32::from_be_bytes(header)).expect("frame fits")];
+    stream.read_exact(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes).expect("frame JSON"))
+}
+
+/// `flock(LOCK_EX)` on `file`, waiting for it.
+// WHY unbounded: the holder is this test's client thread, which lets go after the call's first
+// frame or its 12 s read bound, whichever comes first; the waiter is the image-lock wait under test.
+#[allow(clippy::disallowed_methods)]
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` owns the descriptor for the call; flock does not consume it.
+    match unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// 05_gateway.md "Deadlines": a heartbeat proves that the controller process and its connection
+/// serve and names the op its actor is busy with; an actor stuck inside one op keeps the
+/// heartbeats coming. A route queued behind a held image lock waits in the kernel's `flock` on
+/// its actor's own thread (`cowshed_os::flock::queued`, as a fork's image-lock wait does, and as a
+/// disk lease or a disk child does), so the process-external connection hears a heartbeat naming
+/// that op while the lock is still held, never silence. The test runtime is the CLI's
+/// current-thread runtime; the client reads on a thread of its own.
+#[tokio::test]
+async fn a_route_waiting_in_a_kernel_call_keeps_its_call_heartbeating() {
+    let lock_path = std::env::temp_dir().join(format!(
+        "cowshed-controller-heartbeat-{}.lock",
+        std::process::id()
+    ));
+    let holder = std::fs::File::create(&lock_path).expect("the lock file");
+    lock_exclusive(&holder).expect("the test holds the lock");
+    let (router, mut commands) = RouterHandle::channel(NonZeroUsize::MIN);
+    let busy = router.busy().clone();
+    let waited = lock_path.clone();
+    let actor = tokio::spawn(async move {
+        let (request, reply) = commands.recv().await.expect("routed command").into_parts();
+        busy.publish(Some(RouteBusy::of(&request)));
+        let file = std::fs::File::open(&waited).expect("the waiter's lock file");
+        let taken = cowshed_os::flock::queued(
+            &waited,
+            std::time::Duration::from_secs(60),
+            |_| "the test".to_owned(),
+            || lock_exclusive(&file),
+        );
+        busy.publish(None);
+        let _ = reply.send(Ok(RouterResponse::json(json!({ "locked": taken.is_ok() }))));
+    });
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let served = tokio::spawn(serve_controller_connection(
+        server.into(),
+        coordinator_authority(),
+        router,
+    ));
+    let rebase = params("coordinator.rebase");
+    let subject = rebase["workspace"].clone();
+    let heard = std::thread::spawn(move || {
+        write_blocking(
+            &mut client,
+            &json!({ "version": HANDSHAKE_VERSION, "nonce": NONCE }),
+        );
+        let hello = read_blocking(&mut client).expect("the controller's hello");
+        assert_eq!(hello["nonce"], json!(NONCE));
+        write_blocking(
+            &mut client,
+            &json!({ "id": 1, "method": "coordinator.rebase", "params": rebase, "binaryLength": null }),
+        );
+        // A bound on the read, not its signal: a heartbeat is due at 5 s.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(12)))
+            .expect("read bound");
+        let first = read_blocking(&mut client).map_err(|error| error.to_string());
+        drop(holder);
+        client.set_read_timeout(None).expect("unbounded drain");
+        let answer = loop {
+            let frame = read_blocking(&mut client).expect("the call's answer");
+            if frame.get("id").is_some() {
+                break frame;
+            }
+        };
+        (first, answer)
+    });
+    let (first, answer) = tokio::task::spawn_blocking(move || heard.join())
+        .await
+        .expect("the client thread joins")
+        .expect("the client thread ends");
+    let _ = std::fs::remove_file(&lock_path);
+    let first = first.unwrap_or_else(|error| {
+        panic!(
+            "the call heard no frame in 12 s while its route waited in flock on the actor's \
+             thread ({error}): the connection fell silent behind the actor"
+        )
+    });
+    assert_eq!(
+        (
+            &first["progress"],
+            &first["busy"]["method"],
+            &first["busy"]["subject"]
+        ),
+        (&json!(1), &json!("coordinator.rebase"), &subject),
+        "the first frame is a heartbeat naming the waiting op: {first}"
+    );
+    assert_eq!(
+        (&answer["id"], &answer["result"]),
+        (&json!(1), &json!({ "locked": true })),
+        "the call is answered once the lock is released"
+    );
+    actor.await.expect("the router joins");
+    served
+        .await
+        .expect("the connection joins")
+        .expect("a clean disconnect ends the connection");
+}
+//#endregion smoo/cowshed!n/controller-connection-own-thread

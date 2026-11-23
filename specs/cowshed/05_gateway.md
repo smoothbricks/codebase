@@ -1362,7 +1362,13 @@ the handshake bound.
   controller's pid and the sample of its last recorded silence, and closes the connection, which ends a
   `cowshed controller` serving it. A heartbeat proves that the controller process and its connection serve, and names
   the op the actor is busy with. It does not prove the actor is not deadlocked: an actor stuck inside one op keeps the
-  heartbeats coming, and their `forMs` keeps rising. A version 1 connection, an older client's, hears none (07_api.md,
+  heartbeats coming, and their `forMs` keeps rising. <a id="smoo/cowshed!n/controller-connection-own-thread"></a>A
+  process-external controller (`cowshed controller`, `cowshed host`) serves its connection on a thread of its own, apart
+  from its router actor's, so an op that waits in a kernel call on the actor's thread (a disk lease, a disk command, a
+  queued image lock, a slow file-system call) keeps those heartbeats coming and is named in them, while each of those
+  waits keeps its own bound. Measured 2026-11-23: six controllers of one host test gate, each forking on the one thread
+  that also wrote its heartbeats, fell silent within 4 s of each other and failed their calls `SILENT`. An in-process
+  pair shares its client's thread, as above. A version 1 connection, an older client's, hears none (07_api.md,
   "Controller handshake").
 - **Spans.** A failure reaches the boundary that owns the wait as a value. A `TIMEOUT`, `SILENT` or `PEER_LOST` failure
   carries its facts (`WaitFailure`: code, op, peer and its pid, class, bound, time waited, last progress) on the

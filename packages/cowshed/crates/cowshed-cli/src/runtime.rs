@@ -6104,7 +6104,8 @@ mod tests {
             }
         }
 
-        /// The operator's coordinator over a real controller connection to `job`'s router.
+        /// The operator's coordinator over the in-process controller pair a `cowshed exec` holds to
+        /// `job`'s router: its connection shares this runtime, and so the paused clock.
         async fn coordinator(job: &Arc<ScriptedJob>) -> Coordinator {
             let repo_id = RepoId::parse("acme/widget").expect("repo");
             let (router, mut commands) =
@@ -6123,14 +6124,17 @@ mod tests {
                 }
             });
             let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-            tokio::spawn(serve_controller_connection(
+            let local_waits = cowshed_core::api::server::LocalWaitCauses::default();
+            tokio::spawn(serve_controller_connection_in_process(
                 server.into(),
                 ConnectionAuthority::Coordinator { repo_id },
                 router,
+                local_waits.clone(),
             ));
-            let (cowshed, token) = cowshed_core::Cowshed::connect(client.into())
-                .await
-                .expect("handshake");
+            let (cowshed, token) =
+                cowshed_core::Cowshed::connect_in_process(client.into(), local_waits)
+                    .await
+                    .expect("handshake");
             let project = cowshed.open("/w/widget").await.expect("open");
             cowshed.coordinator(&project, token).expect("coordinator")
         }
