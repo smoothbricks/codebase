@@ -1287,7 +1287,15 @@ function releaseNextShell(root: string): { bumpStablePackagesToNext(packages: Re
 
 function releaseTargetCheckoutShell(root: string) {
   return {
-    checkout: (ref: string) => run('git', ['switch', '--detach', ref], root),
+    // A checkout also clears node_modules/.smoo-install. The next devenv entry runs the checked-out tree's own
+    // installer, and before a905a27fc3 that installer kept the stamp of an earlier success when it failed after
+    // rewriting node_modules: the release's entry left node_modules at its pins under the dispatch ref's stamp, so
+    // the entry after restoring found smoo:install current and built tools against the release's Nx. Without a stamp,
+    // every entry after a checkout installs for the tree it enters, whichever installer that tree carries.
+    checkout: async (ref: string) => {
+      await run('git', ['switch', '--detach', ref], root);
+      await rm(join(root, 'node_modules', '.smoo-install'), { force: true });
+    },
     withDevenvEnv: <T>(runWithEnv: () => Promise<T>) => withDevenvEnv(root, runWithEnv),
     beforeRepairTarget: (target: ReleaseTarget) => {
       console.log(`::group::Repair pending release ${target.sha.slice(0, 12)} (${packageSummary(target.packages)})`);
