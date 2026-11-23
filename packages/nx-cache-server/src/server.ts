@@ -24,6 +24,7 @@ import {
   type CompleteUpload,
   describe,
   isCacheKey,
+  memberEntry,
   openCacheStore,
   publishEntry,
   readEntry,
@@ -145,6 +146,7 @@ export async function startCacheServer(config: CacheServerConfig): Promise<Cache
       routes: {
         [CACHE_ROUTE]: {
           GET: (request) => handleGet(store, request),
+          HEAD: (request) => handleHead(store, request),
           PUT: (request) => handlePut(store, config, request, admission, publish),
         },
       },
@@ -212,6 +214,31 @@ async function handleGet(store: CacheStore, request: Bun.BunRequest<typeof CACHE
     case 'found':
       record('get', key, 200, entry.bytes, startedNs, undefined);
       return new Response(entry.body, { status: 200, headers: OCTET_STREAM });
+  }
+}
+
+/** A membership check: the entry's length, or a miss, with no body and no read of its recency. */
+async function handleHead(store: CacheStore, request: Bun.BunRequest<typeof CACHE_ROUTE>): Promise<Response> {
+  const startedNs = Bun.nanoseconds();
+  const key = request.params.hash;
+  if (!isCacheKey(key)) {
+    record('head', key, 404, 0, startedNs, 'invalid-key');
+    return new Response(null, { status: 404, headers: PLAIN });
+  }
+  const member = await memberEntry(store, key);
+  switch (member.kind) {
+    case 'missing':
+      record('head', key, 404, 0, startedNs, 'miss');
+      return new Response(null, { status: 404, headers: PLAIN });
+    case 'failed':
+      record('head', key, 500, 0, startedNs, member.reason);
+      return new Response(null, { status: 500, headers: PLAIN });
+    case 'found':
+      record('head', key, 200, member.bytes, startedNs, undefined);
+      return new Response(null, {
+        status: 200,
+        headers: { ...OCTET_STREAM, 'content-length': String(member.bytes) },
+      });
   }
 }
 
@@ -326,7 +353,7 @@ async function handlePut(
 }
 
 function record(
-  event: 'get' | 'put',
+  event: 'get' | 'head' | 'put',
   key: string,
   status: number,
   bytes: number,

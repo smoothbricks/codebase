@@ -42,8 +42,7 @@ async function publish() {
       continue;
     }
     const url = `${server}/v1/cache/${hash}`;
-    const probe = await fetch(url, { headers: { ...bearer, accept: 'application/octet-stream' } });
-    await probe.body?.cancel();
+    const probe = await fetch(url, { method: 'HEAD', headers: bearer });
     if (probe.status === 200) {
       existing += 1;
       continue;
