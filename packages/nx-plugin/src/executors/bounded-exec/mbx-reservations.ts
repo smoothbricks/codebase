@@ -282,10 +282,10 @@ class EndpointSocket {
     this.#socket.on('close', () => this.#feed({ type: 'close' }));
   }
 
-  reserve(cpus: number, priority: MbxPriority, min: number, name?: string): Reservation {
+  reserve(cpus: number, priority: MbxPriority, min: number, name?: string, jobStartedMs?: number): Reservation {
     const id = this.#nextId++;
     const granted = new Promise<Granted>((resolve) => this.#answers.set(id, resolve));
-    this.#feed({ type: 'reserve', id, cpus, priority, min, name });
+    this.#feed({ type: 'reserve', id, cpus, priority, min, name, jobStartedMs });
     return {
       granted,
       release: () => {
@@ -342,7 +342,8 @@ const connections = new Map<string, EndpointSocket>();
 /**
  * Ask the endpoint at `socket` for at most `cpus` cores at `priority`, starting on no fewer than `min` of them until
  * mbx's aging bound, over this process's one connection to it, opened by its first request and kept while another one
- * may come. `name` is the class mbx predicts the reservation by; absent, mbx's own for an unnamed one.
+ * may come. `name` is the class mbx predicts the reservation by; absent, mbx's own for an unnamed one. `jobStartedMs`
+ * is the start of the interactive job the request runs for, which mbx decays its band by.
  */
 export function reserveCores(
   socket: string,
@@ -350,6 +351,7 @@ export function reserveCores(
   priority: MbxPriority,
   min: number,
   name?: string,
+  jobStartedMs?: number,
 ): Reservation {
   let connection = connections.get(socket);
   if (connection === undefined) {
@@ -359,5 +361,5 @@ export function reserveCores(
     connections.set(socket, fresh);
     connection = fresh;
   }
-  return connection.reserve(cpus, priority, min, name);
+  return connection.reserve(cpus, priority, min, name, jobStartedMs);
 }

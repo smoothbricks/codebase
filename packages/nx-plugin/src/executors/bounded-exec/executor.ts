@@ -1573,7 +1573,7 @@ async function runCommand(
         const min = idleTimeoutMs === undefined ? 1 : suiteMinimum([...lastWalls.values()], cpus, idleTimeoutMs);
         const named = min > 1 ? ` min=${min}` : '';
         tell(`cowshed: mbx reserve wait start cpus=${cpus}${named} priority=${reservedLeaf.priority}\n`);
-        const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min);
+        const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min, undefined, reservedLeaf.jobStartedMs);
         reservation = held;
         void held.granted.then((granted) => {
           if (!granted.ok) {

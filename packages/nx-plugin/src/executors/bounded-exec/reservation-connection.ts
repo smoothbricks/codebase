@@ -40,6 +40,8 @@ export type ConnectionEvent =
       readonly min: number;
       /** The class mbx predicts the reservation by. */
       readonly name?: string | undefined;
+      /** When the interactive job the request runs for started, which mbx decays its band by; absent, it does not decay. */
+      readonly jobStartedMs?: number | undefined;
     }
   | { readonly type: 'release'; readonly id: number }
   | { readonly type: 'data'; readonly text: string }
@@ -80,6 +82,8 @@ type ReservationRequest =
       min?: Uint & tags.Minimum<2>;
       /** The class mbx keeps the reservation's run times under and predicts it by. */
       name?: string;
+      /** When the job an interactive request runs for started, in milliseconds since the Unix epoch. */
+      job_started_ms?: number & tags.Type<'uint64'>;
     }
   | { type: 'release'; id: Uint };
 
@@ -116,6 +120,7 @@ export function connectionStep(connection: Connection, event: ConnectionEvent): 
         priority: event.priority,
         ...(gathers > 1 ? { min: gathers } : {}),
         ...(event.name === undefined ? {} : { name: event.name }),
+        ...(event.jobStartedMs === undefined ? {} : { job_started_ms: event.jobStartedMs }),
       });
       return [
         { ...connection, entries: new Map(connection.entries).set(event.id, 'waiting') },

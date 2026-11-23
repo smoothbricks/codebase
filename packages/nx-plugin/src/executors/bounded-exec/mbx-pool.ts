@@ -22,11 +22,18 @@ export type MbxPriority = (typeof MBX_PRIORITIES)[number];
 /**
  * mbx's machine-wide pool as a leaf runner meets it (specs/cowshed/05_gateway.md, "Host scheduling", "Parallelism inside
  * a job"). With the mbx capability the canonical environment names the one pool (`MBX_SCHEDULER=1` beside the shared
- * `MBX_CACHE_DIR`) and the job's priority in it; that pool is the host's CPU and memory ledger, so no Nx run or leaf
- * serves a pool of its own beside it.
+ * `MBX_CACHE_DIR`), the job's priority in it and, for an interactive job, when the job started, which mbx decays its
+ * requests by ("Classes"); that pool is the host's CPU and memory ledger, so no Nx run or leaf serves a pool of its own
+ * beside it.
  */
 export interface MbxPool {
   readonly priority: MbxPriority;
+  /**
+   * When an interactive job started, in milliseconds since the Unix epoch (`MBX_SCHEDULER_JOB_STARTED_MS`, which
+   * cowshed's supervisor exports and leaves empty for every other class): each request of the job names it, and mbx
+   * admits a request asked 120 s after it as `normal` and 240 s after it as `low`. Absent, a request does not decay.
+   */
+  readonly jobStartedMs?: number;
 }
 
 /**
@@ -42,7 +49,11 @@ export function mbxPool(environment: Readonly<NodeJS.ProcessEnv>): MbxPool | nul
     return null;
   }
   const named = MBX_PRIORITIES.find((priority) => priority === environment.MBX_SCHEDULER_PRIORITY);
-  return { priority: named ?? 'low' };
+  const priority = named ?? 'low';
+  // Only an interactive request decays, so no other band's request names a start its environment happens to hold.
+  const started = priority === 'interactive' ? environment.MBX_SCHEDULER_JOB_STARTED_MS : undefined;
+  const jobStartedMs = started !== undefined && /^\d+$/.test(started) ? Number(started) : undefined;
+  return { priority, ...(jobStartedMs === undefined ? {} : { jobStartedMs }) };
 }
 
 /**
@@ -71,6 +82,8 @@ export type MbxLeaf =
   | {
       readonly kind: 'reserve';
       readonly priority: MbxPriority;
+      /** The start of the interactive job the leaf runs for, which its request names ({@link MbxPool.jobStartedMs}). */
+      readonly jobStartedMs?: number;
       readonly demand: ReservedDemand;
       /**
        * Whether its runner starts every thread of its ask and each case takes a core at the leaf's gate (case-gate.ts):
@@ -101,6 +114,7 @@ export function mbxLeaf(pool: MbxPool, demand: Demand, command: string, testGate
   const reserve = (reserved: ReservedDemand): MbxLeaf => ({
     kind: 'reserve',
     priority: pool.priority,
+    ...(pool.jobStartedMs === undefined ? {} : { jobStartedMs: pool.jobStartedMs }),
     demand: reserved,
     gated: testGate && reserved.kind === 'nextest',
   });
