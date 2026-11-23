@@ -675,12 +675,11 @@ fn signaled(status: Option<&ExitStatus>) -> Option<i32> {
     }
 }
 
+/// A pipe whose ends are close-on-exec from their creation (`fork_lock::create`), so no process
+/// spawned meanwhile inherits a write end and holds its reader's end of file.
 fn pipe() -> (OwnedFd, OwnedFd) {
-    let mut ends = [0; 2];
-    // SAFETY: room for the two descriptors pipe(2) writes.
-    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors were just created and are owned here alone.
-    unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    let (read, write) = cowshed_os::fork_lock::create(std::io::pipe).expect("a pipe");
+    (OwnedFd::from(read), OwnedFd::from(write))
 }
 
 fn script(parts: &[&str], values: Vec<ScriptValue>) -> RenderedScript {
@@ -905,6 +904,63 @@ fn a_script_that_does_not_parse_never_runs() {
     );
 }
 
+/// The pid a script process publishes on a FIFO: the one line it writes there, read up to its
+/// newline. The FIFO's end of file waits for every write end, and a process the script forked may
+/// hold an inherited copy for as long as it runs.
+fn read_published_pid(path: &Path) -> i32 {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    std::io::BufReader::new(std::fs::File::open(path).expect("open the actual process's FIFO"))
+        .read_line(&mut line)
+        .expect("read the actual process's FIFO");
+    line.trim().parse::<i32>().expect("published process PID")
+}
+
+/// A pid a script publishes on a FIFO is read as its line, never to the FIFO's end: a process
+/// the script forked may hold an inherited copy of the write end for as long as it runs, and that
+/// copy owes no end of file. A land gate hung on such a read with the pid in hand
+/// (2026-11-23, killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host).
+#[test]
+fn a_published_pid_is_read_while_a_forked_process_holds_the_fifo_s_write_end() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_published_pid_is_read_while_a_forked_process_holds_the_fifo_s_write_end") {
+        return;
+    }
+    let mut host = Host::start("inherited");
+    let published = host.directory.join("published");
+    let hold = host.directory.join("hold");
+    for path in [&published, &hold] {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("FIFO path");
+        // SAFETY: a NUL-terminated path in this fixture's own directory.
+        assert_eq!(
+            unsafe { libc::mkfifo(path.as_ptr(), 0o600) },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // The script's shell opens the write end as fd 9, forks a holder that inherits it and waits on
+    // `hold`, then publishes its pid on fd 9 and closes its own copy.
+    let rendered = text(&format!(
+        "sh -c 'exec 9> {}; sh -c \"read -r _ < {}\" & printf \"%s\\n\" \"$$\" >&9; exec 9>&-; wait'",
+        published.display(),
+        hold.display()
+    ));
+    let Submitted { reply, readers } = submit(&host, &rendered);
+    let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
+    assert_eq!(tag, REPLY_STARTED);
+    fields.birth().expect("the real parent observed its leader");
+    fields.finish().expect("start frame");
+    let pid = read_published_pid(&published);
+    assert!(pid > 0, "the published pid {pid}");
+    std::fs::write(&hold, "\n").expect("release the holder");
+    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 0 });
+    let [stdout, stderr] = readers.map(|reader| reader.join().expect("owned output reader"));
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+    release(host.control());
+    host.finish().expect("finish the host fixture");
+}
+
 #[test]
 fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     #[cfg(target_os = "linux")]
@@ -950,8 +1006,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
     let pids = [&leader, &descendant].map(|path| {
         cowshed_os::eprintln!("script-group phase=reading-pid fifo={}", path.display());
-        let value = std::fs::read_to_string(path).expect("read the actual process's FIFO");
-        let pid = value.trim().parse::<i32>().expect("published process PID");
+        let pid = read_published_pid(path);
         cowshed_os::eprintln!(
             "script-group phase=pid-read fifo={} pid={pid}",
             path.display()
