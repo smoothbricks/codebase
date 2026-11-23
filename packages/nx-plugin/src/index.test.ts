@@ -1855,6 +1855,58 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('orders a Linux idle run after the procinfo addon producer its hang snapshot reads, and leaves a wall-bound run without it', async () => {
+    const workspace = await createWorkspace();
+    const idle: TargetConfiguration = {
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
+      cache: true,
+      options: { command: 'bun test --timeout=0', idleTimeoutMs: 180000 },
+    };
+    const ownerTargets: Record<string, TargetConfiguration> = {
+      check: idle,
+      'wall-check': { ...idle, options: { command: 'check-wall', timeoutMs: 120_000 } },
+      build: { dependsOn: ['^build', 'tsc-js'] },
+    };
+    try {
+      const root = workspace.context.workspaceRoot;
+      const files = ['package.json', 'tools/nx-plugin/package.json', 'tools/procinfo/package.json'];
+      await workspace.write('package.json', JSON.stringify({ name: 'workspace' }));
+      await workspace.write(
+        'tools/nx-plugin/package.json',
+        JSON.stringify({ name: '@smoothbricks/nx-plugin', nx: { name: 'graph-plugin' } }),
+      );
+      await workspace.write(
+        'tools/procinfo/package.json',
+        JSON.stringify({
+          name: '@smoothbricks/procinfo',
+          nx: { name: 'procinfo-owner', targets: ownerTargets },
+          napi: { binaryName: 'procinfo', targets: ['x86_64-unknown-linux-gnu'] },
+          exports: { '.': { types: './dist/ts/index.d.ts', default: './dist/ts/index.js' } },
+        }),
+      );
+      for (const dir of ['tools/nx-plugin', 'tools/procinfo']) {
+        await workspace.write(`${dir}/tsconfig.lib.json`, '{"compilerOptions":{"rootDir":"src","outDir":"dist/ts"}}\n');
+      }
+      await workspace.write('Cargo.toml', '[workspace]\nmembers = ["tools/procinfo/crates/*"]\n');
+      await workspace.write(
+        'tools/procinfo/crates/procinfo-napi/Cargo.toml',
+        '[package]\nname = "procinfo-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+      await mkdir(join(root, 'node_modules/@smoothbricks'), { recursive: true });
+      await symlink(join(root, 'tools/nx-plugin'), join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+      await prepareCargoFixture(root);
+      resetWorkspaceContext();
+      const [, infer] = createNodesV2ForPlatform('linux', 'x64');
+      const results = await inferFixture(infer, files, undefined, workspace.context);
+      const targets = results.find(([file]) => file === 'tools/procinfo/package.json')?.[1].projects?.['tools/procinfo']
+        ?.targets;
+      const addon = { projects: ['procinfo-owner'], target: 'napi-native' };
+      expect(targets?.check?.dependsOn).toContainEqual(addon);
+      expect(targets?.['wall-check']?.dependsOn ?? []).not.toContainEqual(addon);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
   it('adds no local procinfo producer for an installed plugin even when the workspace has an unrelated procinfo project', async () => {
     const workspace = await createWorkspace();
     try {

@@ -1060,53 +1060,60 @@ Land-turn fixtures observe queued replies and executed-command readiness before 
 snapshots. The after-land job's records (a background job of main's supervisor, never awaited by the land) are read on a
 vnode subscription armed before the first lands.log read, not on an elapsed-time poll.
 
-An unfinished test name is not holder attribution. During the final ten seconds of an unchanged no-progress interval,
-the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
-progress, a finished test or a reported record, discards and cancels that interval's snapshot. At expiry the executor
-emits the completed observation, or an explicit incomplete-capture result, and starts termination immediately without
-awaiting a probe. Diagnostic capture does not extend the configured no-progress deadline. Capture timestamps, the offset
-from the scheduled expiry and the actual expiry-to-capture interval accompany the observation. Process rows retain PID,
-PPID, PGID, state, percent CPU, elapsed time, CPU time, start identity and command. The snapshot's two process censuses,
-at least five seconds apart inside that window, name each process of the tree whose CPU time rose between them by at
-least the larger of 0.5 s and twice the coarser resolution of its two readings: two counted seconds where ps counts
-whole seconds (Linux), 0.5 s where it counts centiseconds (macOS, `0:03.63`). A bar of two seconds alone missed a
-spinner that held 47 % of a core over 5.1 s on a loaded macOS host. The snapshot's CPU line says the bar it used, in
-seconds. A process is named with its PID, command and gain, and a rise classifies the expiry as "a process in the test's
-tree was using CPU: likely a build inside the test" (a compile inside a test is a defect, not a test), which the wedged
-verdict records, and CPU never restarts the no-progress interval. On macOS the snapshot also holds call stacks: the
-runner and up to four leaf processes of its tree (members with no live child; further leaves are named, not sampled) are
-each sampled for one second by `sudo -n sample <pid> 1 -file /dev/stdout`, all at once and beside the open-resource
-probe, inside the same window. The samples set the window's length: under load averages of 27-52 on 18 cores one sample
-took 1.1-4.6 s, and in a five-second window two of eight real captures lost their sample at its limit. Each sample runs
-until the closing process census would have less than its one second left; `-mayDie` is not passed, since it reads
-symbols before sampling and measured about a second slower under load; the report is kept through its call graph,
-without its binary-image list, and is written to the probe's pipe alone, never to a file in `/tmp`. A stack names the
-call a process waits in (`read`, `open`, a condition wait), which the open-resource probe cannot. A sample that sudo
-refuses, that fails or that reaches its limit is named, with its stderr, as no stack for that process: it never delays
-termination and does not change the holder outcome, which stacks do not establish. Once the open-resource probe names a
-lock wait, each of its waiters the leaf samples left out (up to four) is sampled the same way inside the same window, so
-the verdict carries the call a named waiter blocks in, or shows it blocks in none: on 2026-11-10 a gate's two named
-waiters were cowshed controllers holding a shared project lease, which never waits, and neither was sampled. Other
-platforms record that no stack is sampled. The case this answers: a gate run's deadlock was located only from `sample`
-stacks taken by hand while the run hung. On macOS the open-resource probe invokes `/usr/sbin/lsof` through
-noninteractive sudo, with an explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout,
-truncated output, other probe stderr or changing process identity is incomplete evidence, never an empty holder set.
-lsof's mount-table fallback (`can't stat() <type> file system <mount>` ... `assuming "dev=<hex>" from mount table`) is
-the one stderr kept without that verdict: it names a mount lsof could not stat(), such as one detaching under a
-concurrent shed, and omits no descriptor of the selected processes. Successful observations with resources, successful
-observations without matches and incomplete/raced captures remain distinct. An open file is not proof of a contested
-lock, and an admission token count or one CPU/state sample does not establish CPU starvation or its absence. The
-snapshot also names, for each regular file the run holds on a numbered descriptor, the processes outside the run that
-hold that file open. Such a file is classified as a lock wait, naming those processes as holder evidence (open handles,
-not a kernel lock owner), and the verdict records it; the lock call itself is not observed. The bound and the kill are
-unchanged. The case this answers: on 2026-10-21 a `cargo --frozen test` that printed
-`Blocking waiting for file lock on package cache` held `~/.cargo/.package-cache` open and was killed at the bound with
-only its own files in the snapshot, so its holder went unnamed. The process census resolves `ps` through the runtime
-`PATH`, as fixture process tables do; NixOS has no `/bin/ps`. A probe past its limit is ended without being awaited: an
-ordinary probe by SIGKILL to its process group, the privileged one by SIGTERM to `sudo` itself, which relays it to its
-root command and exits only after that command. A group signal from the caller reaches `sudo` but not the command it
-runs as root, so it would orphan `lsof`. While `sudo` starts it holds root's real uid and refuses every signal from the
-caller; the probe result names that refusal rather than claiming the probe ended.
+<a id="smoo/cowshed!n/hang-snapshot-tree"></a>An unfinished test name is not holder attribution. During the final ten
+seconds of an unchanged no-progress interval, the executor takes one bounded pre-signal snapshot of its runner,
+descendants and retained process group. Resumed progress, a finished test or a reported record, discards and cancels
+that interval's snapshot. At expiry the executor emits the completed observation, or an explicit incomplete-capture
+result, and starts termination immediately without awaiting a probe. Diagnostic capture does not extend the configured
+no-progress deadline. Capture timestamps, the offset from the scheduled expiry and the actual expiry-to-capture interval
+accompany the observation. Process rows retain PID, PPID, PGID, state, elapsed time (the capture's clock less the
+process's start), CPU time, start identity and command. They keep no percent CPU: that was ps's decayed estimate, and
+the CPU time each process gained between the snapshot's two readings is the measured replacement. The two readings of
+the tree, at least five seconds apart inside that window, name each process of the tree whose CPU time rose between them
+by at least 0.5 s. procinfo reads CPU time to the kernel's clock tick (10 ms on Linux) or finer, so one bar holds every
+reading; the two seconds whole-second ps readings needed missed a spinner that held 47 % of a core over 5.1 s on a
+loaded macOS host. The snapshot's CPU line says the bar, in seconds. A process is named with its PID, command and gain,
+and a rise classifies the expiry as "a process in the test's tree was using CPU: likely a build inside the test" (a
+compile inside a test is a defect, not a test), which the wedged verdict records, and CPU never restarts the no-progress
+interval. On macOS the snapshot also holds call stacks: the runner and up to four leaf processes of its tree (members
+with no live child; further leaves are named, not sampled) are each sampled for one second by
+`sudo -n sample <pid> 1 -file /dev/stdout`, all at once and beside the open-resource probe, inside the same window. The
+samples set the window's length: under load averages of 27-52 on 18 cores one sample took 1.1-4.6 s, and in a
+five-second window two of eight real captures lost their sample at its limit. Each sample runs until the closing reading
+of the tree would have less than its one-second reserve left; `-mayDie` is not passed, since it reads symbols before
+sampling and measured about a second slower under load; the report is kept through its call graph, without its
+binary-image list, and is written to the probe's pipe alone, never to a file in `/tmp`. A stack names the call a process
+waits in (`read`, `open`, a condition wait), which the open-resource probe cannot. A sample that sudo refuses, that
+fails or that reaches its limit is named, with its stderr, as no stack for that process: it never delays termination and
+does not change the holder outcome, which stacks do not establish. Once the open-resource probe names a lock wait, each
+of its waiters the leaf samples left out (up to four) is sampled the same way inside the same window, so the verdict
+carries the call a named waiter blocks in, or shows it blocks in none: on 2026-11-10 a gate's two named waiters were
+cowshed controllers holding a shared project lease, which never waits, and neither was sampled. Other platforms record
+that no stack is sampled. The case this answers: a gate run's deadlock was located only from `sample` stacks taken by
+hand while the run hung. On macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an
+explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output, other probe
+stderr or changing process identity is incomplete evidence, never an empty holder set. lsof's mount-table fallback
+(`can't stat() <type> file system <mount>` ... `assuming "dev=<hex>" from mount table`) is the one stderr kept without
+that verdict: it names a mount lsof could not stat(), such as one detaching under a concurrent shed, and omits no
+descriptor of the selected processes. Successful observations with resources, successful observations without matches
+and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission token
+count or one CPU/state sample does not establish CPU starvation or its absence. The snapshot also names, for each
+regular file the run holds on a numbered descriptor, the processes outside the run that hold that file open. Such a file
+is classified as a lock wait, naming those processes as holder evidence (open handles, not a kernel lock owner), and the
+verdict records it; the lock call itself is not observed. The bound and the kill are unchanged. The case this answers:
+on 2026-10-21 a `cargo --frozen test` that printed `Blocking waiting for file lock on package cache` held
+`~/.cargo/.package-cache` open and was killed at the bound with only its own files in the snapshot, so its holder went
+unnamed. The tree is read through procinfo (../procinfo/01_procinfo.md), never a `ps` census of the process table: from
+the runner, `childPids` walks its descendants, and on Darwin the retained group's `processGroups.pids` adds the members
+that left the runner's tree; each process is read for itself (`processLineages`, `processRunState`, `processArguments`,
+`cpuTimeNs`, `startedUs`). A census of the whole table ran past its one-second limit at load averages of 40-90 on 18
+cores and left the snapshots of two killed gates with no tree and no stack. A lineage or child list procinfo cannot read
+leaves the capture incomplete, never a smaller tree. Linux lists a group to no one, so there a group member reparented
+out of the runner's tree is not reached, and the snapshot says so. A probe past its limit is ended without being
+awaited: an ordinary probe by SIGKILL to its process group, the privileged one by SIGTERM to `sudo` itself, which relays
+it to its root command and exits only after that command. A group signal from the caller reaches `sudo` but not the
+command it runs as root, so it would orphan `lsof`. While `sudo` starts it holds root's real uid and refuses every
+signal from the caller; the probe result names that refusal rather than claiming the probe ended.
 
 **Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times

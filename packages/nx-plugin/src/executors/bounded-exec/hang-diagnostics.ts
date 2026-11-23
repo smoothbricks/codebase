@@ -1,17 +1,9 @@
 import { spawn } from 'node:child_process';
+import type { ProcessArguments, RunState } from '@smoothbricks/procinfo';
+import * as procinfo from '@smoothbricks/procinfo';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
-import { type ProcessEntry, withDescendants } from '../../testing.js';
 import { atClockDeadline } from './awake-clock.js';
-import {
-  CPU_RISING_CLASS,
-  type CpuRise,
-  type CpuTime,
-  cpuChange,
-  cpuRiseThresholdsMs,
-  describeCpuRise,
-  describeCpuThresholds,
-  parseCpuTime,
-} from './cpu-rise.js';
+import { CPU_RISE_MS, CPU_RISING_CLASS, type CpuRise, type CpuSample, cpuChange, describeCpuRise } from './cpu-rise.js';
 import {
   describeHolders,
   type LockWait,
@@ -27,13 +19,11 @@ import {
  */
 export const HANG_CAPTURE_MS = 10_000;
 const MAX_PROBE_BYTES = 4 * 1024 * 1024;
-const PS_FIELDS = 'pid=,ppid=,pgid=,stat=,%cpu=,etime=,cputime=,lstart=,command=';
 /**
- * The least time between the two process censuses, which are the snapshot's two CPU samples. A process is named
- * after gaining 2 s where ps counts whole seconds and 0.5 s where it counts centiseconds (cpuRiseThresholdMs), so five
- * seconds show a process at 40% or at 10% of a core. On Darwin the stack samples have usually spent most of it;
- * elsewhere, or when sudo refuses them, the snapshot pauses, inside its window and early enough that the closing
- * census keeps its own limit.
+ * The least time between the two readings of the tree, which are the snapshot's two CPU samples. A process is named
+ * after gaining 0.5 s (CPU_RISE_MS), so five seconds show a process at 10% of a core. On Darwin the stack samples have
+ * usually spent most of it; elsewhere, or when sudo refuses them, the snapshot pauses, inside its window and early
+ * enough that the closing reading keeps its reserve.
  */
 const CPU_INTERVAL_MS = 5_000;
 /**
@@ -47,9 +37,10 @@ const SAMPLE_SECONDS = 1;
 /** How long a process in an uninterruptible kernel wait has its file-system calls traced. */
 const FS_USAGE_SECONDS = 5;
 /**
- * A process census's limit. The stack samples run until the closing census is this far from the window's end.
+ * What the stack samples leave of the window for the closing reading of the tree and the verdict: they run until the
+ * window's end is this near.
  */
-const CENSUS_LIMIT_MS = 1_000;
+const READING_RESERVE_MS = 1_000;
 /**
  * lsof's mount-table fallback (darwin libproc dmnt.c, readmnt()): a mount it cannot stat(), such as one detaching under a
  * concurrent shed, is kept with its mount-table device. Descriptors come per process from libproc, so this warning omits
@@ -78,8 +69,8 @@ export interface HangDiagnostics {
   /** Lock waits the snapshot names: empty unless the capture is complete, and always empty without the open-file census. */
   lockWaits: readonly LockWait[];
   /**
-   * The processes of the tree whose CPU time rose between the two censuses, largest gain first: empty when none did, and
-   * when the closing census did not complete. A build inside the test, never a restart of the idle bound.
+   * The processes of the tree whose CPU time rose between the two readings, largest gain first: empty when none did, and
+   * when the closing reading did not complete. A build inside the test, never a restart of the idle bound.
    */
   cpuRising: readonly CpuRise[];
   text: string;
@@ -103,13 +94,27 @@ export interface HangDiagnosticHost {
   probe(file: string, args: readonly string[], timeoutMs: number, signal: AbortSignal): Promise<HangProbeResult>;
   /** Waits `ms`, or until `signal` aborts: the capture's end ends its own CPU interval. */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
+  /** The runner's tree is read through it, one process at a time, never through a `ps` census of the process table. */
+  processes: HangProcessReader;
 }
 
-interface ObservedProcess extends ProcessEntry {
-  pgid: number;
-  started: string;
-  cpu: CpuTime | null;
-  raw: string;
+/**
+ * The process facts the snapshot reads, each from the kernel's own record of one process or one group: procinfo's own
+ * exports (specs/procinfo/01_procinfo.md), which a test fakes at this boundary. A `ps` census of the whole process table
+ * ran past its one-second limit under load averages of 40-90 on 18 cores and left wedged runs with no tree at all.
+ */
+export type HangProcessReader = Pick<
+  typeof procinfo,
+  'childPids' | 'cpuTimeNs' | 'processArguments' | 'processGroups' | 'processLineages' | 'processRunState' | 'startedUs'
+>;
+
+/** One process of the runner's tree, as procinfo read it. */
+interface ObservedProcess extends CpuSample {
+  readonly ppid: number;
+  readonly pgid: number;
+  readonly state: RunState;
+  /** Why a fact of it was not read, each said in its row. */
+  readonly unread: readonly string[];
 }
 
 function sleepUnlessAborted(ms: number, signal: AbortSignal, now: () => number): Promise<void> {
@@ -132,6 +137,7 @@ export function captureHangDiagnostics(
     platform: process.platform,
     probe: (file, args, timeoutMs, signal) => runProbe(file, args, timeoutMs, signal, undefined, request.awakeNow),
     sleep: (ms, signal) => sleepUnlessAborted(ms, signal, request.awakeNow),
+    processes: procinfo,
   },
 ): Promise<HangDiagnostics> {
   const startedAtMs = Date.now();
@@ -145,7 +151,7 @@ export function captureHangDiagnostics(
     'Open files and process observations are evidence, not proof of a contested lock or its owner.',
   ];
   const active = new Set<string>();
-  const during = (): string => (active.size === 0 ? 'process census' : [...active].join(', '));
+  const during = (): string => (active.size === 0 ? 'the process tree reads' : [...active].join(', '));
   let finished = false;
   let waits: readonly LockWait[] = [];
   let rising: readonly CpuRise[] = [];
@@ -208,53 +214,18 @@ export function captureHangDiagnostics(
       }
       return result;
     };
-    const census = async (name: string): Promise<ObservedProcess[] | null> => {
-      // Bare `ps`, resolved through PATH like testing.ts's processesOf: NixOS has no /bin/ps.
-      const result = await probe(name, 'ps', ['-A', '-o', PS_FIELDS], CENSUS_LIMIT_MS);
-      if (finished) return null;
-      if (result.status !== 'exited' || result.code !== 0) {
-        lines.push(`${name}: could not inspect the process table; not an empty process tree.`);
+    /** The runner's tree, read now; null, said in the snapshot, when it cannot be read or holds no runner. */
+    const census = (name: string): ObservedProcess[] | null => {
+      let tree: ObservedProcess[];
+      try {
+        tree = readProcessTree(source.processes, request.pid, request.pgid);
+      } catch (error) {
+        lines.push(`${name}: could not read the process tree: ${errorText(error)}; not an empty process tree.`);
         return null;
       }
-      const parsed: ObservedProcess[] = [];
-      for (const row of result.stdout.split('\n').filter((line) => line.trim() !== '')) {
-        const match =
-          /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.*)$/.exec(
-            row,
-          );
-        if (match === null) {
-          lines.push(`${name}: could not decode ps row: ${row}`);
-          return null;
-        }
-        const [, pid, ppid, pgid, stat, , , cputime, started, command] = match;
-        if (
-          pid === undefined ||
-          ppid === undefined ||
-          pgid === undefined ||
-          stat === undefined ||
-          cputime === undefined ||
-          started === undefined ||
-          command === undefined
-        ) {
-          lines.push(`${name}: incomplete ps row: ${row}`);
-          return null;
-        }
-        parsed.push({
-          pid: Number(pid),
-          ppid: Number(ppid),
-          pgid: Number(pgid),
-          stat,
-          cpu: parseCpuTime(cputime),
-          started,
-          command,
-          raw: row,
-        });
-      }
-      const roots = [request.pid, ...parsed.filter((entry) => entry.pgid === request.pgid).map((entry) => entry.pid)];
-      const selected = new Set(withDescendants(parsed, roots).map((entry) => entry.pid));
-      const tree = parsed.filter((entry) => selected.has(entry.pid));
-      lines.push(`${name}: PID PPID PGID STAT %CPU ELAPSED CPUTIME STARTED COMMAND`);
-      lines.push(...tree.map((entry) => entry.raw));
+      const nowUs = Date.now() * 1_000;
+      lines.push(`${name}: PID PPID PGID STATE ELAPSED CPU STARTED COMMAND`);
+      lines.push(...tree.map((entry) => processRow(entry, nowUs)));
       if (!tree.some((entry) => entry.pid === request.pid)) {
         lines.push(`${name}: root pid ${request.pid} exited or is not visible; capture raced or is incomplete.`);
         return null;
@@ -263,7 +234,7 @@ export function captureHangDiagnostics(
     };
     /** The runner and up to MAX_SAMPLED_LEAVES leaf processes of `tree` (members with no live child), and the leaves past that bound. */
     const leafSamples = (tree: readonly ObservedProcess[]): { sampled: number[]; omitted: number[] } => {
-      const live = tree.filter((entry) => !entry.stat.startsWith('Z'));
+      const live = tree.filter((entry) => entry.state.state !== 'zombie');
       const parents = new Set(live.map((entry) => entry.ppid));
       const leaves = live.filter((entry) => entry.pid !== request.pid && !parents.has(entry.pid));
       return {
@@ -272,7 +243,7 @@ export function captureHangDiagnostics(
       };
     };
     /**
-     * One one-second call stack of `pid`, until the closing census would have less than its own limit left: a stack
+     * One one-second call stack of `pid`, until the closing reading's reserve is all the window has left: a stack
      * names the call a process waits in, which the open-file census cannot. A sample sudo refuses, or one that does
      * not answer, is named as no stack for that process; stacks never change the holder outcome.
      */
@@ -280,7 +251,7 @@ export function captureHangDiagnostics(
       const name = `stack sample pid ${pid}`;
       // `-file /dev/stdout` writes the report to the probe's pipe alone, not also to a root-owned file in /tmp.
       const args = ['-n', 'sample', String(pid), String(SAMPLE_SECONDS), '-file', '/dev/stdout'];
-      const result = await probe(name, 'sudo', args, endsAtMs - awakeNow() - CENSUS_LIMIT_MS);
+      const result = await probe(name, 'sudo', args, endsAtMs - awakeNow() - READING_RESERVE_MS);
       if (finished) return;
       const report = callGraph(result.stdout);
       if (result.status === 'exited' && result.code === 0 && report !== '') {
@@ -308,8 +279,8 @@ export function captureHangDiagnostics(
      * operation. Bounded like the stack samples; one fs_usage sudo refuses is named as no trace.
      */
     const kernelWaits = async (tree: readonly ObservedProcess[]): Promise<void> => {
-      const waiting = tree.filter((entry) => entry.stat.startsWith('U')).slice(0, MAX_SAMPLED_LEAVES);
-      const limitMs = endsAtMs - awakeNow() - CENSUS_LIMIT_MS;
+      const waiting = tree.filter((entry) => entry.state.state === 'uninterruptible').slice(0, MAX_SAMPLED_LEAVES);
+      const limitMs = endsAtMs - awakeNow() - READING_RESERVE_MS;
       await Promise.all(
         waiting.map(async ({ pid }) => {
           const name = `fs_usage pid ${pid}`;
@@ -327,8 +298,12 @@ export function captureHangDiagnostics(
       );
     };
     const collect = async (): Promise<void> => {
-      const before = await census('ps before');
-      if (finished) return;
+      if (request.pgid !== null && source.processes.processGroups === null) {
+        lines.push(
+          `Process group ${request.pgid} is not listed on ${source.platform}: procinfo lists no group there, so a member that left the runner's tree is not reached.`,
+        );
+      }
+      const before = census('process tree before');
       if (before === null) return finish('incomplete');
       const beforeAtMs = awakeNow();
       let incomplete = false;
@@ -396,17 +371,17 @@ export function captureHangDiagnostics(
         lines.push(`Open-file census not provided on ${source.platform}; observations below name processes only.`);
         lines.push(`Stack samples not provided on ${source.platform}; no blocking call is observed.`);
       }
-      const settleMs = Math.min(beforeAtMs + CPU_INTERVAL_MS, endsAtMs - CENSUS_LIMIT_MS) - awakeNow();
+      const settleMs = Math.min(beforeAtMs + CPU_INTERVAL_MS, endsAtMs - READING_RESERVE_MS) - awakeNow();
       if (settleMs > 0) {
         active.add('CPU interval');
         await source.sleep(settleMs, controller.signal);
         active.delete('CPU interval');
         if (finished) return;
       }
-      const after = await census('ps after');
-      if (finished) return;
+      const after = census('process tree after');
       if (after === null) return finish('incomplete');
       const afterAtMs = awakeNow();
+      const zombie = (entry: ObservedProcess): boolean => entry.state.state === 'zombie';
       if (
         before.length !== after.length ||
         before.some(
@@ -416,36 +391,36 @@ export function captureHangDiagnostics(
                 other.pid === entry.pid &&
                 other.ppid === entry.ppid &&
                 other.pgid === entry.pgid &&
-                other.started === entry.started &&
+                other.startedUs === entry.startedUs &&
                 other.command === entry.command &&
-                other.stat.startsWith('Z') === entry.stat.startsWith('Z'),
+                zombie(other) === zombie(entry),
             ),
         )
       ) {
         incomplete = true;
         lines.push('Process identities or membership changed during capture; open-file census raced.');
       }
-      const change = cpuChange(before, after);
-      const thresholdsMs = cpuRiseThresholdsMs(before, after);
+      // A zombie runs nothing: its CPU time is no longer read, and it is no idle process left unread.
+      const live = (tree: readonly ObservedProcess[]) => tree.filter((entry) => !zombie(entry));
+      const change = cpuChange(live(before), live(after));
       rising = change.rising;
       const intervalMs = afterAtMs - beforeAtMs;
+      const bar = `${CPU_RISE_MS / 1_000} s`;
       if (change.unread.length > 0) {
         lines.push(
-          `CPU time not read for pid ${change.unread.join(', ')}: ps printed none that parses, so they are not counted idle.`,
+          `CPU time not read for pid ${change.unread.join(', ')}: a reading gave no CPU time or start for them, so they are not counted idle.`,
         );
       }
       if (rising.length > 0) {
         lines.push(
-          `CPU rose in the tree over about ${intervalMs}ms between the censuses (a rise is named from ${describeCpuThresholds(thresholdsMs)} of CPU):`,
+          `CPU rose in the tree over about ${intervalMs}ms between the readings (a rise is named from ${bar} of CPU):`,
           ...rising.map((rise) => `  ${describeCpuRise(rise)}`),
           `Classification: ${CPU_RISING_CLASS}`,
         );
-      } else if (thresholdsMs.length === 0) {
-        lines.push('CPU: no process of the tree had a CPU time ps gave in both censuses, so none was compared.');
+      } else if (change.compared === 0) {
+        lines.push('CPU: no process of the tree had a CPU time read in both readings, so none was compared.');
       } else {
-        lines.push(
-          `CPU: no process of the tree gained ${describeCpuThresholds(thresholdsMs)} of CPU over about ${intervalMs}ms between the censuses.`,
-        );
+        lines.push(`CPU: no process of the tree gained ${bar} of CPU over about ${intervalMs}ms between the readings.`);
       }
       if (!incomplete) {
         for (const wait of waits) {
@@ -462,6 +437,84 @@ export function captureHangDiagnostics(
       finish('incomplete');
     });
   });
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** A process's argument vector as one command line, its control characters (a script's newlines) each a space so it stays on its row, else the executable the kernel records for it. */
+function commandLine(read: ProcessArguments): string {
+  const text = new TextDecoder();
+  const argv = read.argv.map((argument) => text.decode(argument));
+  const line = argv.length > 0 ? argv.join(' ') : text.decode(read.executable);
+  return line.replace(/\p{Cc}/gu, ' ');
+}
+
+/**
+ * The runner's tree as the kernel links it now: the runner, the members of its retained process group where the kernel
+ * lists a group (Darwin; Linux lists one to no one, specs/procinfo/01_procinfo.md), and every descendant of either, each
+ * read for itself by pid, smallest pid first. A process reaped since it was listed is left out. A lineage, a group or a
+ * child list that cannot be read throws, so the tree is unread, never smaller; a start, a CPU time or arguments that
+ * cannot be read leave that fact unread and say why.
+ */
+function readProcessTree(reader: HangProcessReader, root: number, pgid: number | null): ObservedProcess[] {
+  const groups = reader.processGroups;
+  const pending = [root, ...(pgid === null || groups === null ? [] : groups.pids(pgid))];
+  const seen = new Set<number>();
+  const tree: ObservedProcess[] = [];
+  for (let pid = pending.pop(); pid !== undefined; pid = pending.pop()) {
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const [lineage] = reader.processLineages([pid]);
+    if (lineage === undefined) continue;
+    const unread: string[] = [];
+    const attempt = <T>(fact: string, read: () => T): T | null => {
+      try {
+        return read();
+      } catch (error) {
+        unread.push(`${fact}: ${errorText(error)}`);
+        return null;
+      }
+    };
+    const cpuNs = attempt('CPU time', () => reader.cpuTimeNs(pid));
+    tree.push({
+      pid,
+      ppid: lineage.ppid,
+      pgid: lineage.pgid,
+      state: reader.processRunState(pid),
+      startedUs: attempt('start', () => reader.startedUs(pid)),
+      cpuMs: cpuNs === null ? null : Number(cpuNs / 1_000n) / 1_000,
+      command: attempt('arguments', () => commandLine(reader.processArguments(pid))) ?? 'command unread',
+      unread,
+    });
+    pending.push(...reader.childPids(pid));
+  }
+  return tree.sort((left, right) => left.pid - right.pid);
+}
+
+/** `ms` as ps prints an elapsed time: `[[D-]HH:]MM:SS`. */
+function elapsedClock(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1_000));
+  const two = (count: number): string => String(count).padStart(2, '0');
+  const clock = `${two(Math.floor(seconds / 60) % 60)}:${two(seconds % 60)}`;
+  const hours = Math.floor(seconds / 3_600) % 24;
+  const days = Math.floor(seconds / 86_400);
+  if (days > 0) return `${days}-${two(hours)}:${clock}`;
+  return hours > 0 ? `${two(hours)}:${clock}` : clock;
+}
+
+/**
+ * A process's row: pid, parent, group, state, how long it has run (now less its start), the CPU time it has used, its
+ * start and its command, then each fact not read and why.
+ */
+function processRow(entry: ObservedProcess, nowUs: number): string {
+  const elapsed = entry.startedUs === null ? '-' : elapsedClock((nowUs - entry.startedUs) / 1_000);
+  const cpu = entry.cpuMs === null ? '-' : `${(entry.cpuMs / 1_000).toFixed(3)}s`;
+  const started = entry.startedUs === null ? '-' : new Date(entry.startedUs / 1_000).toISOString();
+  const state = entry.state.state === 'unread' ? `unread (${entry.state.reason})` : entry.state.state;
+  const unread = entry.unread.length === 0 ? '' : ` [not read: ${entry.unread.join('; ')}]`;
+  return `${entry.pid} ${entry.ppid} ${entry.pgid} ${state} ${elapsed} ${cpu} ${started} ${entry.command}${unread}`;
 }
 
 /**

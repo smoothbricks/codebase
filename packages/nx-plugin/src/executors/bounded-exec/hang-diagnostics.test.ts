@@ -2,6 +2,8 @@ import { describe, expect, it, jest } from 'bun:test';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ProcessGroups, RunState } from '@smoothbricks/procinfo';
+import * as procinfo from '@smoothbricks/procinfo';
 import { churnFailures, startChurn } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import {
@@ -10,18 +12,32 @@ import {
   type HangCaptureRequest,
   type HangDiagnosticHost,
   type HangProbeResult,
+  type HangProcessReader,
   runProbe,
   stopProbe,
 } from './hang-diagnostics.js';
 
 const ROOT = 101;
-const STARTED = 'Thu Oct 15 12:34:56 2026';
-const rootRow = `${ROOT} 1 ${ROOT} S 0.0 03:01 00:00 ${STARTED} runner --test selected`;
-const childRow = `202 ${ROOT} ${ROOT} S 0.0 03:00 00:00 ${STARTED} child waiting`;
-const grandchildRow = `303 202 ${ROOT} S 0.0 02:59 00:00 ${STARTED} grandchild holding pipe`;
-const reparentedRow = `404 1 ${ROOT} S 0.0 02:58 00:00 ${STARTED} reparented group member`;
-const unrelatedRow = `505 1 505 S 0.0 02:58 00:00 ${STARTED} unrelated process`;
-const census = [rootRow, childRow, grandchildRow, reparentedRow, unrelatedRow].join('\n');
+const STARTED_US = 1_792_000_000_000_000;
+
+/** One process as procinfo reads it: in the runner's group, asleep, idle and started at STARTED_US unless it says so. */
+interface FakeProcess {
+  readonly pid: number;
+  readonly ppid: number;
+  readonly pgid?: number;
+  readonly state?: RunState;
+  /** The CPU time it has used, in ms; null is a reading procinfo refuses. */
+  readonly cpuMs?: number | null;
+  readonly startedUs?: number;
+  readonly command: string;
+}
+const root: FakeProcess = { pid: ROOT, ppid: 1, command: 'runner --test selected' };
+const child: FakeProcess = { pid: 202, ppid: ROOT, command: 'child waiting' };
+const grandchild: FakeProcess = { pid: 303, ppid: 202, command: 'grandchild holding pipe' };
+/** A member of the runner's group whose parent exited: no descendant of the runner, reached by its group alone. */
+const reparented: FakeProcess = { pid: 404, ppid: 1, command: 'reparented group member' };
+const unrelated: FakeProcess = { pid: 505, ppid: 1, pgid: 505, command: 'unrelated process' };
+const HOST = [root, child, grandchild, reparented, unrelated];
 const fileObservation =
   'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 303 tester 7r REG 1,2 4 123 /fixture/held-file\n';
 const exited = (stdout: string, code = 0, stderr = ''): HangProbeResult => ({ status: 'exited', code, stdout, stderr });
@@ -32,23 +48,94 @@ const request = (): HangCaptureRequest => ({
   awakeNow: () => performance.now(),
 });
 
-/**
- * The tree of a run that compiles: its runner at `runner` CPU time, an idle child, and a compiler (pid 303) at
- * `compiler` CPU time. Whole seconds as Linux ps prints them, unless the times say otherwise.
- */
-const compileTree = (child: string, compiler: string, runner = '00:00'): string =>
-  [
-    `${ROOT} 1 ${ROOT} S 0.0 03:01 ${runner} ${STARTED} runner --test selected`,
-    `202 ${ROOT} ${ROOT} S 0.0 03:00 ${child} ${STARTED} child waiting`,
-    `303 202 ${ROOT} R 97.5 02:59 ${compiler} ${STARTED} rustc --crate-name hang_fixture`,
-  ].join('\n');
+/** The tree of a run that compiles: its runner, an idle child, and a compiler (pid 303) at `compilerMs` of CPU. */
+const compileTree = (compilerMs: number | null): FakeProcess[] => [
+  root,
+  child,
+  { pid: 303, ppid: 202, state: { state: 'running' }, cpuMs: compilerMs, command: 'rustc --crate-name hang_fixture' },
+];
 const COMPILE_CLASS = "a process in the test's tree was using CPU: likely a build inside the test";
+
+/** A refusal as the procinfo addon throws it. */
+function refused(message: string): Error {
+  return Object.assign(new Error(message), { code: 'environment-missing', hint: 'read it again' });
+}
+
+/**
+ * procinfo's answers about the processes `table()` holds now, each read as the kernel answers for one pid: a pid in no
+ * row is reaped. `groups` is false where the kernel lists no group (Linux). Faked at procinfo's exported boundary, never
+ * below it.
+ */
+function readerOf(table: () => readonly FakeProcess[], groups = true): { reader: HangProcessReader; reads(): number } {
+  let reads = 0;
+  const find = (pid: number): FakeProcess | undefined => {
+    reads += 1;
+    return table().find((entry) => entry.pid === pid);
+  };
+  const text = new TextEncoder();
+  const processGroups: ProcessGroups = {
+    pids(pgid) {
+      reads += 1;
+      return table()
+        .filter((entry) => (entry.pgid ?? ROOT) === pgid)
+        .map((entry) => entry.pid);
+    },
+    members() {
+      throw new Error('the snapshot reads a group by its pids');
+    },
+    cpu() {
+      throw new Error("the snapshot reads no group's CPU");
+    },
+  };
+  const reader: HangProcessReader = {
+    processLineages: (pids) =>
+      pids.flatMap((pid) => {
+        const entry = find(pid);
+        return entry === undefined
+          ? []
+          : [{ pid, ppid: entry.ppid, pgid: entry.pgid ?? ROOT, zombie: entry.state?.state === 'zombie' }];
+      }),
+    childPids(pid) {
+      reads += 1;
+      return table()
+        .filter((entry) => entry.ppid === pid)
+        .map((entry) => entry.pid);
+    },
+    processGroups: groups ? processGroups : null,
+    processRunState(pid) {
+      const entry = find(pid);
+      return entry === undefined ? { state: 'gone' } : (entry.state ?? { state: 'sleeping' });
+    },
+    processArguments(pid) {
+      const entry = find(pid);
+      if (entry === undefined) throw refused(`no process ${pid}`);
+      const argv = entry.command.split(' ').map((argument) => text.encode(argument));
+      return { executable: argv[0] ?? new Uint8Array(), argv };
+    },
+    cpuTimeNs(pid) {
+      const entry = find(pid);
+      if (entry === undefined || entry.state?.state === 'zombie') return null;
+      if (entry.cpuMs === null) throw refused(`cannot read the CPU time of process ${pid}`);
+      return BigInt(entry.cpuMs ?? 0) * 1_000_000n;
+    },
+    startedUs(pid) {
+      const entry = find(pid);
+      return entry === undefined ? null : (entry.startedUs ?? STARTED_US);
+    },
+  };
+  return { reader, reads: () => reads };
+}
 
 /**
  * The real process boundary with the CPU interval's wait taken out. The cases that use it hold the clock still while the
- * real ps and lsof run, so a timer would never fire; the censuses and probes are the real ones.
+ * real lsof runs, so a timer would never fire; the tree is read through the real procinfo.
  */
-const realProbes: HangDiagnosticHost = { platform: process.platform, probe: runProbe, sleep: async () => {} };
+const realProbes: HangDiagnosticHost = {
+  platform: process.platform,
+  probe: runProbe,
+  sleep: async () => {},
+  processes: procinfo,
+};
 
 /** A `sample` report as the tool prints it: header, call graph, then the binary-image list a snapshot omits. */
 const SAMPLE_REPORT = [
@@ -66,22 +153,28 @@ const SAMPLE_REPORT = [
 const FS_USAGE_REPORT =
   '12:00:00.000000  RdData[A]  D=0x0001  B=0x1000  /dev/disk3s1  /fixture/store/image.dmg  0.512 W child.303\n';
 /**
- * Answers the census probes in order from `results`, and every `sudo -n sample` stack probe, which runs beside them,
- * from `sample`.
+ * A Darwin host whose processes are `trees[0]` until the snapshot pauses between its two readings and `trees[1]` (else
+ * the same) after: time passes only in the pause. Answers the open-file probes in order from `results`, and every
+ * `sudo -n sample` stack probe, which runs beside them, from `sample`.
  */
 function scriptedHost(
-  results: readonly HangProbeResult[],
+  trees: readonly (readonly FakeProcess[])[],
+  results: readonly HangProbeResult[] = [],
   sample: (pid: number) => HangProbeResult | Promise<HangProbeResult> = () => exited(SAMPLE_REPORT),
 ) {
   const calls: { file: string; args: readonly string[]; timeoutMs: number }[] = [];
   const samples: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
   const traces: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
-  const pauses: { ms: number; censuses: number }[] = [];
+  const pauses: number[] = [];
+  let tree = trees[0] ?? [];
+  const { reader, reads } = readerOf(() => tree);
   let index = 0;
   const host: HangDiagnosticHost = {
     platform: 'darwin',
+    processes: reader,
     async sleep(ms) {
-      pauses.push({ ms, censuses: calls.filter((call) => call.file === 'ps').length });
+      pauses.push(ms);
+      tree = trees[1] ?? tree;
     },
     async probe(file, args, timeoutMs) {
       if (file === 'sudo' && args[1] === 'sample') {
@@ -99,7 +192,7 @@ function scriptedHost(
       return result;
     },
   };
-  return { host, calls, samples, traces, pauses };
+  return { host, calls, samples, traces, pauses, reads };
 }
 
 /** The first complete line a process prints. A stream that ends first fails, naming what it did print. */
@@ -121,25 +214,52 @@ async function firstLine(stdout: ReadableStream<Uint8Array>, who: string): Promi
 }
 
 describe('pre-expiry hang diagnostics', () => {
-  it('keeps grandchildren and reparented group members, but not unrelated host rows', async () => {
-    const { host, calls } = scriptedHost([exited(census), exited(fileObservation), exited('', 1), exited(census)]);
+  //#region smoo/cowshed!n/hang-snapshot-tree
+  it("reads the runner's descendants and its group's reparented members through procinfo, never a process table", async () => {
+    const { host, calls } = scriptedHost([HOST], [exited(fileObservation), exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('holders');
-    for (const row of [rootRow, childRow, grandchildRow, reparentedRow]) expect(capture.text).toContain(row);
-    expect(capture.text).not.toContain(unrelatedRow);
+    for (const entry of [root, child, grandchild, reparented]) expect(capture.text).toContain(entry.command);
+    expect(capture.text).not.toContain(unrelated.command);
     expect(capture.text).toContain('/fixture/held-file');
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
-    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
-    expect(calls[2]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
+    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
     expect(capture.lockWaits).toEqual([]);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
   });
 
+  it('names each process with its lineage, state, run time, CPU time, start and command', async () => {
+    const started = Date.now() * 1_000 - 61_000_000;
+    const compiler: FakeProcess = { ...grandchild, state: { state: 'running' }, cpuMs: 4_250, startedUs: started };
+    const { host } = scriptedHost([[root, child, compiler]], [exited('', 1)]);
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.text).toContain('process tree before: PID PPID PGID STATE ELAPSED CPU STARTED COMMAND');
+    expect(capture.text).toMatch(
+      new RegExp(
+        `\\n303 202 101 running 01:0[12] 4\\.250s ${new Date(started / 1_000).toISOString()} grandchild holding pipe\\n`,
+      ),
+    );
+  });
+
+  it('reaches no reparented group member where the kernel lists no group, and says so', async () => {
+    const { reader } = readerOf(() => HOST, false);
+    const capture = await captureHangDiagnostics(request(), {
+      ...scriptedHost([HOST]).host,
+      platform: 'linux',
+      processes: reader,
+    });
+    expect(capture.text).toContain(child.command);
+    expect(capture.text).not.toContain(reparented.command);
+    expect(capture.text).toContain('group 101 is not listed on linux');
+  });
+  //#endregion smoo/cowshed!n/hang-snapshot-tree
+
   it('reports no matches only after successful resource inspection and stable identities', async () => {
-    const { host } = scriptedHost([exited(rootRow), exited('', 1), exited(rootRow)]);
+    const { host } = scriptedHost([[root]], [exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('none');
     expect(capture.text).toContain('no open-file matches within its stated visibility');
@@ -152,13 +272,13 @@ describe('pre-expiry hang diagnostics', () => {
       stdout: '',
       stderr: '',
     };
-    const { host, calls } = scriptedHost([exited(rootRow), denied, exited(fileObservation), exited(rootRow)]);
+    const { host, calls } = scriptedHost([[root]], [denied, exited(fileObservation)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('incomplete');
     expect(capture.text).toContain('sudo: permission denied');
     expect(capture.text).toContain('ordinary-user visibility only');
     expect(capture.text).toContain('/fixture/held-file');
-    expect(calls[2]?.file).toBe('lsof');
+    expect(calls[1]?.file).toBe('lsof');
   });
 
   it('retains partial failed output instead of replacing it with an empty fallback', async () => {
@@ -168,7 +288,7 @@ describe('pre-expiry hang diagnostics', () => {
       stdout: fileObservation,
       stderr: 'read failed',
     };
-    const { host } = scriptedHost([exited(rootRow), partial, exited('', 1), exited(rootRow)]);
+    const { host } = scriptedHost([[root]], [partial, exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('incomplete');
     expect(capture.text).toContain('Partial privileged lsof output');
@@ -182,21 +302,16 @@ describe('pre-expiry hang diagnostics', () => {
       "lsof: WARNING: can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm\n" +
       '      Output information may be incomplete.\n' +
       '      assuming "dev=100037e" from mount table\n';
-    const warned = scriptedHost([
-      exited(rootRow),
-      exited(fileObservation, 0, fallback),
-      exited('', 1),
-      exited(rootRow),
-    ]);
+    const warned = scriptedHost([[root]], [exited(fileObservation, 0, fallback), exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), warned.host);
     expect(capture.outcome, capture.text).toBe('holders');
     expect(capture.text).toContain("can't stat() apfs file system /private/tmp/hang-capture-repro/dmg.Gqndhm");
     expect(capture.text).toContain('omits no descriptor of the selected processes');
-    expect(warned.calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
-    const empty = scriptedHost([exited(rootRow), exited('', 1, fallback), exited(rootRow)]);
+    expect(warned.calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
+    const empty = scriptedHost([[root]], [exited('', 1, fallback)]);
     expect((await captureHangDiagnostics(request(), empty.host)).outcome).toBe('none');
     for (const stderr of [`${fallback}lsof: WARNING: other\n`, 'lsof: WARNING: other\n']) {
-      const { host } = scriptedHost([exited(rootRow), exited(fileObservation, 0, stderr), exited(rootRow)]);
+      const { host } = scriptedHost([[root]], [exited(fileObservation, 0, stderr)]);
       const other = await captureHangDiagnostics(request(), host);
       expect(other.outcome, other.text).toBe('incomplete');
       expect(other.text).toContain('lsof: WARNING: other');
@@ -206,7 +321,7 @@ describe('pre-expiry hang diagnostics', () => {
   it('names a lock wait for a file the run holds and a process outside the run also holds', async () => {
     // Pid 303 is the run's own grandchild, so its row in the holder census is not an outside holder.
     const outside = 'p303\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
-    const { host, calls } = scriptedHost([exited(census), exited(fileObservation), exited(outside), exited(census)]);
+    const { host, calls } = scriptedHost([HOST], [exited(fileObservation), exited(outside)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome, capture.text).toBe('holders');
     expect(capture.lockWaits).toEqual([
@@ -215,7 +330,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain(
       'Lock wait (open-handle evidence, not a kernel lock owner): /fixture/held-file open in the run by pid 303 and outside it by pid 505 (perl)',
     );
-    expect(calls[2]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
+    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-F', 'pcn', '--', '/fixture/held-file']);
   });
 
   it('stack-samples a named lock waiter that the leaf samples left out', async () => {
@@ -224,7 +339,7 @@ describe('pre-expiry hang diagnostics', () => {
     const opened =
       'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n';
     const outside = 'p202\ncchild\nf7\nn/fixture/held-file\np505\ncperl\nf3\nn/fixture/held-file\n';
-    const { host, samples } = scriptedHost([exited(census), exited(opened), exited(outside), exited(census)]);
+    const { host, samples } = scriptedHost([HOST], [exited(opened), exited(outside)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.lockWaits.map((wait) => wait.waiters)).toEqual([[202]]);
     expect(samples.map((sample) => sample.pid).sort((left, right) => left - right)).toEqual([ROOT, 202, 303, 404]);
@@ -233,11 +348,11 @@ describe('pre-expiry hang diagnostics', () => {
   it('names no lock wait for a file the run holds only through an unnumbered descriptor', async () => {
     const library =
       'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 303 tester txt REG 1,2 4 123 /fixture/library\n';
-    const { host, calls } = scriptedHost([exited(census), exited(library), exited(census)]);
+    const { host, calls } = scriptedHost([HOST], [exited(library)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome).toBe('holders');
     expect(capture.lockWaits).toEqual([]);
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo']);
   });
 
   it('marks the capture incomplete, with no lock wait, when the holder census does not answer', async () => {
@@ -248,7 +363,7 @@ describe('pre-expiry hang diagnostics', () => {
       exited('p505\ncperl\nq3\n'),
     ];
     for (const holder of holders) {
-      const { host } = scriptedHost([exited(census), exited(fileObservation), holder, exited(census)]);
+      const { host } = scriptedHost([HOST], [exited(fileObservation), holder]);
       const capture = await captureHangDiagnostics(request(), host);
       expect(capture.outcome, capture.text).toBe('incomplete');
       expect(capture.lockWaits).toEqual([]);
@@ -257,30 +372,39 @@ describe('pre-expiry hang diagnostics', () => {
   });
 
   it('does not turn an exited root, reused pid, or changed descendant membership into no holders', async () => {
-    const absent = scriptedHost([exited(unrelatedRow)]);
+    const absent = scriptedHost([[unrelated]]);
     expect((await captureHangDiagnostics(request(), absent.host)).outcome).toBe('incomplete');
-    expect(absent.calls).toHaveLength(1);
-    for (const after of [rootRow.replace(STARTED, 'Thu Oct 15 12:35:00 2026'), `${rootRow}\n${childRow}`]) {
-      const { host } = scriptedHost([exited(rootRow), exited('', 1), exited(after)]);
+    expect(absent.calls).toHaveLength(0);
+    for (const after of [[{ ...root, startedUs: STARTED_US + 4_000_000 }], [root, child]]) {
+      const { host } = scriptedHost([[root], after], [exited('', 1)]);
       const capture = await captureHangDiagnostics(request(), host);
       expect(capture.outcome).toBe('incomplete');
       expect(capture.text).toContain('identities or membership changed');
     }
   });
 
-  it('names process probe failures and malformed census output without throwing', async () => {
-    for (const result of [
-      exited('', 1, 'ps: denied'),
-      exited('not a ps row'),
-      { status: 'timed-out', detail: 'ps deadline', stdout: '', stderr: '' } satisfies HangProbeResult,
-    ]) {
-      const { host } = scriptedHost([result]);
-      const capture = await captureHangDiagnostics(request(), host);
+  it('names a process tree procinfo cannot read, and a probe that throws, without throwing', async () => {
+    const base = scriptedHost([HOST]).host;
+    for (const processes of [
+      {
+        ...base.processes,
+        childPids: () => {
+          throw refused('cannot read the children of process 202: Operation not permitted');
+        },
+      },
+      {
+        ...base.processes,
+        processLineages: () => {
+          throw refused('cannot read process 101: Operation not permitted');
+        },
+      },
+    ] satisfies HangProcessReader[]) {
+      const capture = await captureHangDiagnostics(request(), { ...base, processes });
       expect(capture.outcome).toBe('incomplete');
-      expect(capture.text).toContain('ps before');
+      expect(capture.text).toContain('process tree before: could not read the process tree: cannot read');
     }
     const throwing: HangDiagnosticHost = {
-      ...scriptedHost([]).host,
+      ...scriptedHost([[root]]).host,
       async probe() {
         throw new Error('probe rejected');
       },
@@ -291,12 +415,12 @@ describe('pre-expiry hang diagnostics', () => {
   //#region smoo/cowshed!n/awake-idle-bound
   it('lets an unanswered probe keep its remaining diagnostic budget on wake, then aborts it at expiry', async () => {
     let calls = 0;
-    let signal: AbortSignal | undefined;
+    const signals: AbortSignal[] = [];
     const unresponsive: HangDiagnosticHost = {
-      ...scriptedHost([]).host,
+      ...scriptedHost([[root]]).host,
       probe(_file, _args, _timeoutMs, captureSignal) {
         calls += 1;
-        signal = captureSignal;
+        signals.push(captureSignal);
         // An unanswered process boundary; the capture must not rely on its cooperation.
         return new Promise<HangProbeResult>(() => {});
       },
@@ -310,17 +434,18 @@ describe('pre-expiry hang diagnostics', () => {
         unresponsive,
       );
       jest.advanceTimersByTime(limit); // Only the timer advances during sleep.
-      expect(signal?.aborted).toBe(false);
+      expect(signals.some((signal) => signal.aborted)).toBe(false);
       awake = limit - 1;
       jest.advanceTimersByTime(limit - 1);
-      expect(signal?.aborted).toBe(false);
+      expect(signals.some((signal) => signal.aborted)).toBe(false);
       awake = limit;
       jest.advanceTimersByTime(1);
       const result = await capture;
       expect(result.outcome).toBe('incomplete');
-      expect(result.text).toContain('1000ms deadline reached during ps before');
-      expect(signal?.aborted).toBe(true);
-      expect(calls).toBe(1);
+      expect(result.text).toContain('1000ms deadline reached during lsof privileged');
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      // The open-file census and the runner's stack sample, started together; nothing after them.
+      expect(calls).toBe(2);
     } finally {
       jest.useRealTimers();
     }
@@ -330,130 +455,95 @@ describe('pre-expiry hang diagnostics', () => {
   it('cancels a pending probe when its progress generation ends without starting another', async () => {
     const controller = new AbortController();
     let calls = 0;
-    let seen: AbortSignal | undefined;
+    const seen: AbortSignal[] = [];
     const pending: HangDiagnosticHost = {
-      ...scriptedHost([]).host,
+      ...scriptedHost([[root]]).host,
       probe(_file, _args, _timeoutMs, signal) {
         calls += 1;
-        seen = signal;
+        seen.push(signal);
         return new Promise<HangProbeResult>(() => {});
       },
     };
     const collecting = captureHangDiagnostics({ ...request(), signal: controller.signal }, pending);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
     controller.abort();
     const capture = await collecting;
     expect(capture.outcome).toBe('incomplete');
-    expect(capture.text).toContain('Capture cancelled during ps before');
-    expect(seen?.aborted).toBe(true);
-    expect(calls).toBe(1);
+    expect(capture.text).toContain('Capture cancelled during lsof privileged');
+    expect(seen.every((signal) => signal.aborted)).toBe(true);
+    expect(calls).toBe(2);
   });
 
-  it('starts no probe for a generation already cancelled', async () => {
+  it('starts no probe and reads no process for a generation already cancelled', async () => {
     const controller = new AbortController();
     controller.abort();
-    const { host, calls } = scriptedHost([]);
+    const { host, calls, reads } = scriptedHost([HOST]);
     const capture = await captureHangDiagnostics({ ...request(), signal: controller.signal }, host);
     expect(capture.outcome).toBe('incomplete');
     expect(capture.text).toContain('Capture cancelled');
     expect(calls).toHaveLength(0);
+    expect(reads()).toBe(0);
   });
 
-  it('starts no process probe after the pre-expiry window or with no remaining budget', async () => {
+  it('starts no process probe and reads no process after the pre-expiry window or with no remaining budget', async () => {
     for (const bounds of [{ awakeExpiresAtMs: performance.now() - 1 }, { awakeExpiresAtMs: performance.now() }]) {
-      const { host, calls } = scriptedHost([]);
+      const { host, calls, reads } = scriptedHost([HOST]);
       const capture = await captureHangDiagnostics({ ...request(), ...bounds }, host);
       expect(capture.outcome).toBe('incomplete');
       expect(capture.text).toContain('no probe started');
       expect(calls).toEqual([]);
+      expect(reads()).toBe(0);
     }
   });
 
   it('keeps process-only visibility explicit on platforms without the Darwin open-file probe', async () => {
-    const { host, calls, samples } = scriptedHost([exited(rootRow), exited(rootRow)]);
+    const { host, calls, samples } = scriptedHost([[root]]);
     const capture = await captureHangDiagnostics(request(), { ...host, platform: 'linux' });
     expect(capture.outcome).toBe('holders');
     expect(capture.text).toContain('observations below name processes only');
     expect(capture.text).toContain('Stack samples not provided on linux');
     expect(samples).toEqual([]);
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'ps']);
+    expect(calls).toEqual([]);
   });
 
-  it('names the process whose CPU time rose between the two censuses, and classifies the expiry as a build in the test', async () => {
-    const { host } = scriptedHost([
-      exited(compileTree('00:00', '00:41')),
-      exited('', 1),
-      exited(compileTree('00:00', '00:48')),
-    ]);
+  it('names the process whose CPU time rose between the two readings, and classifies the expiry as a build in the test', async () => {
+    const { host } = scriptedHost([compileTree(41_000), compileTree(48_000)], [exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.cpuRising).toEqual([{ pid: 303, command: 'rustc --crate-name hang_fixture', gainedMs: 7_000 }]);
     expect(capture.text).toContain(`Classification: ${COMPILE_CLASS}`);
+    expect(capture.text).toContain('a rise is named from 0.5 s of CPU');
     expect(capture.text).toContain('pid 303 (rustc --crate-name hang_fixture) gained 7.0 s of CPU');
     expect(capture.text).not.toContain('pid 202 (child waiting) gained');
     expect(capture.text).not.toContain('pid 101 (runner --test selected) gained');
   });
 
-  it('classifies nothing when no process gained two counted seconds, which one boundary tick can fake', async () => {
-    const { host } = scriptedHost([
-      exited(compileTree('00:01', '00:41')),
-      exited('', 1),
-      exited(compileTree('00:02', '00:42')),
-    ]);
-    const capture = await captureHangDiagnostics(request(), host);
+  it('names a process that gained 0.5 s, and classifies nothing when none did', async () => {
+    const named = scriptedHost([compileTree(3_630), compileTree(4_130)], [exited('', 1)]);
+    const rose = await captureHangDiagnostics(request(), named.host);
+    expect(rose.cpuRising).toEqual([{ pid: 303, command: 'rustc --crate-name hang_fixture', gainedMs: 500 }]);
+    const idle = scriptedHost([compileTree(3_630), compileTree(4_129)], [exited('', 1)]);
+    const capture = await captureHangDiagnostics(request(), idle.host);
     expect(capture.cpuRising).toEqual([]);
     expect(capture.text).not.toContain(COMPILE_CLASS);
-    expect(capture.text).toContain('no process of the tree gained 2 s of CPU');
-  });
-
-  it('names a process that gained 1.2 s between centisecond readings, as macOS ps prints them, and says the 0.5 s bar', async () => {
-    const { host } = scriptedHost([
-      exited(compileTree('0:00.04', '0:03.63', '0:00.20')),
-      exited('', 1),
-      exited(compileTree('0:00.04', '0:04.83', '0:00.20')),
-    ]);
-    const capture = await captureHangDiagnostics(request(), host);
-    expect(capture.cpuRising).toEqual([{ pid: 303, command: 'rustc --crate-name hang_fixture', gainedMs: 1_200 }]);
-    expect(capture.text).toContain(`Classification: ${COMPILE_CLASS}`);
-    expect(capture.text).toContain('a rise is named from 0.5 s of CPU');
-    expect(capture.text).not.toContain('whole seconds');
-  });
-
-  it('says the 0.5 s bar when no centisecond reading gained that much', async () => {
-    const { host } = scriptedHost([
-      exited(compileTree('0:00.04', '0:03.63', '0:00.20')),
-      exited('', 1),
-      exited(compileTree('0:00.04', '0:03.98', '0:00.20')),
-    ]);
-    const capture = await captureHangDiagnostics(request(), host);
-    expect(capture.cpuRising).toEqual([]);
     expect(capture.text).toContain('no process of the tree gained 0.5 s of CPU');
-    expect(capture.text).not.toContain('whole seconds');
   });
 
   it('says a CPU time it could not read rather than counting that process idle', async () => {
-    const { host } = scriptedHost([
-      exited(compileTree('00:00', '00:41')),
-      exited('', 1),
-      exited(compileTree('00:00', '-')),
-    ]);
+    const { host } = scriptedHost([compileTree(41_000), compileTree(null)], [exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.cpuRising).toEqual([]);
     expect(capture.text).toContain('CPU time not read for pid 303');
   });
 
-  it('classifies a build in the test on a platform without stack samples, after one pause between the censuses', async () => {
-    const { host, pauses } = scriptedHost([
-      exited(compileTree('00:00', '00:41')),
-      exited(compileTree('00:00', '00:48')),
-    ]);
+  it('classifies a build in the test on a platform without stack samples, after one pause between the readings', async () => {
+    const { host, pauses } = scriptedHost([compileTree(41_000), compileTree(48_000)]);
     const capture = await captureHangDiagnostics(request(), { ...host, platform: 'linux' });
+    // The rise is seen only because the closing reading came after the one pause, where the compiler ran.
     expect(capture.cpuRising.map((rise) => rise.pid)).toEqual([303]);
     expect(capture.text).toContain(COMPILE_CLASS);
-    // One pause, between the two censuses, and inside the window that leaves the closing census its own limit.
     expect(pauses).toHaveLength(1);
-    expect(pauses[0]?.censuses).toBe(1);
-    expect(pauses[0]?.ms).toBeGreaterThan(0);
-    expect(pauses[0]?.ms).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
+    expect(pauses[0]).toBeGreaterThan(0);
+    expect(pauses[0]).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
   });
 
   it('ends a capture whose CPU interval outlasts its window at the window, naming the interval', async () => {
@@ -464,7 +554,7 @@ describe('pre-expiry hang diagnostics', () => {
       const asleep = new Promise<void>((resolve) => {
         sleeping = resolve;
       });
-      const { host } = scriptedHost([exited(compileTree('00:00', '00:41'))]);
+      const { host } = scriptedHost([compileTree(41_000)]);
       const waiting: HangDiagnosticHost = {
         ...host,
         platform: 'linux',
@@ -489,14 +579,15 @@ describe('pre-expiry hang diagnostics', () => {
     }
   });
 
-  it('samples the runner and its leaf processes beside the open-file census, and closes the census after them', async () => {
+  it('samples the runner and its leaf processes beside the open-file census, and reads the tree again after them', async () => {
     const answers: ((result: HangProbeResult) => void)[] = [];
     let allStarted!: () => void;
     const started = new Promise<void>((resolve) => {
       allStarted = resolve;
     });
     const { host, calls, samples } = scriptedHost(
-      [exited(census), exited(fileObservation), exited('', 1), exited(census)],
+      [HOST],
+      [exited(fileObservation), exited('', 1)],
       () =>
         new Promise<HangProbeResult>((resolve) => {
           answers.push(resolve);
@@ -504,19 +595,20 @@ describe('pre-expiry hang diagnostics', () => {
         }),
     );
     const capturing = captureHangDiagnostics(request(), host);
-    // Every stack sample has started while none has answered, beside the open-file census; the closing census waits.
+    // Every stack sample has started while none has answered, beside the open-file census; the closing reading waits.
     await started;
     expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 303, 404]);
-    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
-    expect(calls.filter((call) => call.file === 'ps')).toHaveLength(1);
+    expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
     for (const answer of answers) answer(exited(SAMPLE_REPORT));
     const capture = await capturing;
     expect(capture.outcome, capture.text).toBe('holders');
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'sudo', 'ps']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo', 'sudo']);
     expect(samples[1]?.args).toEqual(['-n', 'sample', '303', '1', '-file', '/dev/stdout']);
-    // Each sample may run until the closing census has its one second left of the capture window.
+    // Each sample may run until the closing reading has its one second left of the capture window.
     for (const sample of samples) expect(sample.timeoutMs).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
-    expect(capture.text).toContain('stack sample pid 303 (1s; binary image list omitted):');
+    expect(capture.text.indexOf('stack sample pid 303 (1s; binary image list omitted):')).toBeLessThan(
+      capture.text.indexOf('process tree after: PID'),
+    );
     expect(capture.text).toContain('1000 read  (in libsystem_kernel.dylib) + 8');
     expect(capture.text).not.toContain('Binary Images:');
     expect(capture.text).not.toContain('/fixture/runner');
@@ -524,11 +616,10 @@ describe('pre-expiry hang diagnostics', () => {
 
   it('bounds stack samples to the runner and four live leaf processes, and names the leaves it left out', async () => {
     const workers = [601, 602, 603, 604, 605, 606].map(
-      (pid) => `${pid} ${ROOT} ${ROOT} S 0.0 03:00 00:00 ${STARTED} worker ${pid}`,
+      (pid): FakeProcess => ({ pid, ppid: ROOT, command: `worker ${pid}` }),
     );
-    const zombie = `607 ${ROOT} ${ROOT} Z 0.0 03:00 00:00 ${STARTED} (worker)`;
-    const rows = [rootRow, ...workers, zombie].join('\n');
-    const { host, samples } = scriptedHost([exited(rows), exited('', 1), exited(rows)]);
+    const zombie: FakeProcess = { pid: 607, ppid: ROOT, state: { state: 'zombie' }, command: '(worker)' };
+    const { host, samples } = scriptedHost([[root, ...workers, zombie]], [exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome, capture.text).toBe('none');
     expect(samples.map((sample) => sample.pid)).toEqual([ROOT, 601, 602, 603, 604]);
@@ -536,9 +627,13 @@ describe('pre-expiry hang diagnostics', () => {
   });
 
   it('traces the file-system calls of a process in an uninterruptible kernel wait beside its stack', async () => {
-    const stuck = `303 202 ${ROOT} UN 0.0 02:59 00:00 ${STARTED} grandchild stuck in the kernel`;
-    const rows = [rootRow, childRow, stuck].join('\n');
-    const { host, traces } = scriptedHost([exited(rows), exited('', 1), exited(rows)]);
+    const stuck: FakeProcess = {
+      pid: 303,
+      ppid: 202,
+      state: { state: 'uninterruptible' },
+      command: 'grandchild stuck in the kernel',
+    };
+    const { host, traces } = scriptedHost([[root, child, stuck]], [exited('', 1)]);
     const capture = await captureHangDiagnostics(request(), host);
     expect(traces.map((trace) => trace.args)).toEqual([['-n', 'fs_usage', '-w', '-t', '5', '-f', 'filesys', '303']]);
     for (const trace of traces) expect(trace.timeoutMs).toBeLessThanOrEqual(HANG_CAPTURE_MS - 1_000);
@@ -546,14 +641,15 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('/fixture/store/image.dmg');
   });
 
-  it('records a stack sample sudo refuses as no stack, keeping the holder outcome and the closing census', async () => {
-    const refused = exited('', 1, 'sudo: a password is required\n');
-    const { host, calls } = scriptedHost([exited(rootRow), exited('', 1), exited(rootRow)], () => refused);
+  it('records a stack sample sudo refuses as no stack, keeping the holder outcome and the closing reading', async () => {
+    const refusedSample = exited('', 1, 'sudo: a password is required\n');
+    const { host, calls } = scriptedHost([[root]], [exited('', 1)], () => refusedSample);
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome, capture.text).toBe('none');
-    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(calls.map((call) => call.file)).toEqual(['sudo']);
     expect(capture.text).toContain('stack sample pid 101 stderr:\nsudo: a password is required');
     expect(capture.text).toContain('stack sample pid 101: no stack;');
+    expect(capture.text).toContain('process tree after: PID');
   });
 
   it('ends a probe whose members fork as it is stopped, leaving none behind', async () => {
@@ -626,7 +722,7 @@ describe('pre-expiry hang diagnostics', () => {
         `expected a tagged PID line, observed ${JSON.stringify(line)}`,
       ).toBe(true);
       // The capture budget (`HANG_CAPTURE_MS`) and probe limits are product constants this test cannot set, so the
-      // clock is stopped while the real `ps` and `lsof` run: each ends when it exits; no timer cuts it short.
+      // clock is stopped while the real `lsof` runs: each ends when it exits; no timer cuts it short.
       jest.useFakeTimers();
       const capture = await captureHangDiagnostics({ ...request(), pid: child.pid, pgid: null }, realProbes).finally(
         () => jest.useRealTimers(),

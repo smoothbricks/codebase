@@ -1549,7 +1549,8 @@ this local relationship explicit for inferred `tsc-js` targets that also have in
 JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
 
 A self-hosted workspace that owns the plugin's `@smoothbricks/procinfo` dependency builds its `napi-native` producer
-before every Darwin `bounded-exec` task with an idle bound, to supply Node's awake clock (`awakeTimeMs`)
+before every `bounded-exec` task with an idle bound: its pre-expiry hang snapshot reads the runner's tree through
+procinfo on both platforms, and on Darwin Node's awake clock (`awakeTimeMs`) is procinfo's too
 (specs/cowshed/08_testing.md, "Integration tests (real substrate)"). On both Darwin and Linux it also builds it before a
 bounded task that runs as an mbx Cargo leaf: `cargo test`, `cargo nextest run` without `--binaries-metadata` or
 `--archive-file`, or `cargo mutants`, as the executor classifies the command in the declaration, inference, or any

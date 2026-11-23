@@ -2461,8 +2461,9 @@ async function createProjectTargets(
     };
   }
 
-  // The Darwin Node idle clock and the Cargo admission observer both load the local procinfo addon (`awakeTimeMs`,
-  // `processLineages`). They can fail a run but do not change a passing command, so none keys its bytes (README,
+  // An idle-bounded run's hang snapshot (its runner's tree), the Darwin Node idle clock and the Cargo admission observer
+  // load the local procinfo addon (`childPids` and the other per-process facts, `awakeTimeMs`, `processLineages`). They
+  // can fail a run but do not change a passing command, so none keys its bytes (README,
   // "Bounded exec key"). Declarations retain these prerequisites with Nx's ordinary "..." merge token. The wall-only
   // release-check judges already built shipping artifacts and remains dependency-free.
   const addonProducers = nativeToolDependsOn(nativeTools, 'procinfo');
@@ -2477,7 +2478,7 @@ async function createProjectTargets(
         (options) =>
           options.nativeTest !== undefined ||
           runsAsCargoLeaf(boundedCommandLine(options) ?? '') ||
-          (hostPlatform?.targetFamily === 'macos' && typeof options.idleTimeoutMs === 'number'),
+          typeof options.idleTimeoutMs === 'number',
       );
       if (!needsAddon) continue;
       // Nx discards an incompatible executor's inferred configuration; only the runtime prerequisites belong below it.
