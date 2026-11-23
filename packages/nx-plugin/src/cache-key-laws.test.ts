@@ -45,7 +45,7 @@ const RUNTIME_READS: readonly RuntimeRead[] = [
     // The test takes NAPI_DEBUG_ADDON away, so `addonSearch` names the dev addon `.cache/native-dev`, never `.cache/native-debug`.
     crates: ['cowshed-core', 'cowshed-cli'],
     producer: { project: 'cowshed', target: 'napi-native' },
-    glob: '**/*.node',
+    glob: '**/cowshed.*.node',
     evidence:
       'cowshed-core/tests/support/napi_client.rs:30-55 runs Node on the package, whose loadAddon loads the dev addon',
     // project_runtime.rs:68 builds napi_client only on macOS; the one key that serves Linux too still covers it.
@@ -125,7 +125,12 @@ function writtenFiles(task: Task, target: TargetConfiguration): string[] {
     : undefined;
   let emitted = ['output'];
   if (target.executor === TYPESCRIPT_EMIT || /^tsc\b/.test(command)) emitted = ['index.js', 'index.d.ts'];
-  else if (/\bnapi build\b/.test(command) && !/--bin\b/.test(command)) emitted = ['addon.node'];
+  else if (/\bnapi build\b/.test(command) && !/--bin\b/.test(command)) {
+    // napi names the addon after its declaration file: `--dts <binaryName>.<family>.d.ts` writes `<binaryName>.<family>.node`.
+    const declaration = /--dts\s+(\S+)\.d\.ts\b/.exec(command);
+    if (declaration === null) throw new Error(`${task.id}: a napi addon build names no --dts declaration`);
+    emitted = [`${declaration[1]}.node`];
+  }
   return task.outputs.flatMap((output) =>
     posix.basename(output) === installedBin || /\.[A-Za-z0-9]+$/.test(posix.basename(output))
       ? [output]
@@ -427,7 +432,7 @@ describe('the judge, on a graph that plants each violation', () => {
             },
             'napi-native': {
               executor: 'nx:run-commands',
-              options: { command: 'napi build --platform --no-js' },
+              options: { command: 'napi build --platform --no-js --dts owner.darwin-arm64.d.ts' },
               outputs: ['{projectRoot}/.cache/native-dev/'],
             },
             'cargo-test-owner': {

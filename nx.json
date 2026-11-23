@@ -91,7 +91,7 @@
         { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
         { "dependentTasksOutputFiles": "**/sandbox-exec/cowshed-sandbox-exec", "transitive": false },
         { "dependentTasksOutputFiles": "**/capability-probe/diagnostics.json", "transitive": false },
-        { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
+        { "dependentTasksOutputFiles": "**/cowshed.*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
         { "externalDependencies": ["nx@24.0.6", "nx@23.2.1", "bun-lock:packages/cowshed"] },
         "{workspaceRoot}/patches/nx@*.patch"
@@ -111,7 +111,7 @@
         "...",
         { "dependentTasksOutputFiles": "**/apfs-test-sweep/cowshed-test-sweep", "transitive": false },
         { "dependentTasksOutputFiles": "**/sandbox-exec/cowshed-sandbox-exec", "transitive": false },
-        { "dependentTasksOutputFiles": "**/*.node", "transitive": true },
+        { "dependentTasksOutputFiles": "**/cowshed.*.node", "transitive": true },
         { "dependentTasksOutputFiles": "**/dist/ts/**/*", "transitive": false },
         { "externalDependencies": ["nx@24.0.6", "bun-lock:packages/cowshed"] },
         "{workspaceRoot}/patches/nx@*.patch"
