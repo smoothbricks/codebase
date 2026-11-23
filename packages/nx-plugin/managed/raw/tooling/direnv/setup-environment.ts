@@ -335,6 +335,10 @@ try {
     // skip the git-diff diagnostic that follows a frozen-lockfile miss. The
     // exits inside the install lock are safe: the kernel releases it.
     await withInstallLock(async () => {
+      // Before anything touches node_modules: an install that fails past this point leaves no stamp naming the
+      // tree it changed, so the next entry reinstalls (bunInstallStamp).
+      const stamp = bunInstallStamp(bunInputs);
+      stamp.clear();
       let frozenError: unknown;
       let fallbackError: unknown;
       try {
@@ -380,7 +384,7 @@ try {
       // ephemeral one restores it from the Actions cache). node_modules/.smoo-install is the one input that
       // goes with node_modules: without it a fresh checkout of the same lockfile found the task current,
       // installed nothing, and the shell's `ttsc` was not there.
-      const integrityError = bunInstallStamp(bunInputs).record();
+      const integrityError = stamp.record();
       if (integrityError !== undefined) reportSetupFailure(integrityError);
       if (uv !== null) {
         const error = await uv.install({ quiet: false });
@@ -895,8 +899,13 @@ function exchangePayloadDirectories(source: string, destination: string): Error 
  * workspace that is most of an unchanged shell entry. So each installer
  * records the digest of its inputs after a successful run, in a stamp that
  * lives inside what it installed (deleting node_modules or the uv environment
- * deletes the stamp with it), and runs again only when the digest moved. A
- * failed run records nothing, so the next entry retries it.
+ * deletes the stamp with it), and runs again only when the digest moved. It
+ * removes the stamp before it touches what it installs and a failed run records
+ * nothing, so the next entry retries it: a run that failed halfway (a historical
+ * checkout's install that rewrote node_modules, then failed) must not leave the
+ * previous success's stamp claiming the tree it changed. devenv records its
+ * smoo:install inputs only after a success too, so with that stamp in place
+ * every input matched the last success and the next entry installed nothing.
  */
 interface Installer {
   isCurrent(): boolean;
@@ -914,11 +923,13 @@ interface InstallStamp {
  * What every successful install of node_modules leaves in it, a CI runner's frozen install as well as a
  * developer's: the digest of what it ran on, in `node_modules/.smoo-install`. A developer entry skips the install
  * while the stamp matches and no developer link is stale (bunInstaller), and devenv's smoo:install task lists the file
- * among its inputs, so a checkout without node_modules reads as changed there.
+ * among its inputs, so a checkout without node_modules, or with a cleared stamp, reads as changed there.
  */
 function bunInstallStamp(inputs: readonly string[]): {
   isCurrent(): boolean;
   record(): BunInstallIntegrityError | undefined;
+  /** Removes the stamp; every install calls it before touching node_modules. */
+  clear(): void;
 } {
   const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
   const identity = ['bun install', Bun.version, Bun.revision];
@@ -942,6 +953,7 @@ function bunInstallStamp(inputs: readonly string[]): {
         Object.entries(locks).every(([name, digest]) => stamp.lockfiles?.[name] === digest)
       );
     },
+    clear: () => rmSync(stampPath, { force: true }),
     record: () => {
       const error = verifyInstalledBunLinks(projectRoot, workspaceMemberModules(projectRoot));
       if (error !== undefined) return error;
@@ -995,6 +1007,7 @@ function bunInstaller(inputs: readonly string[]): Installer {
       !hasStaleDeveloperLinks(projectRoot, ['nx']) &&
       danglingStoreLinks(projectRoot, () => workspaceMemberModules(projectRoot)).length === 0,
     install: async ({ quiet }) => {
+      stamp.clear();
       await keepDeveloperLinks(
         projectRoot,
         () =>

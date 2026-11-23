@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { readFileSync, readlinkSync, symlinkSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync, symlinkSync } from 'node:fs';
 import { appendFile, chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
@@ -472,7 +472,7 @@ describe('what shell entry keeps linked', () => {
         // The shell link task repairs an external Nx entry without changed install inputs: devenv's install inputs did
         // not change, so only the link task's status runs.
         await linkEntry(root, NX, retired);
-        let stamp = readFileSync(stampPath, 'utf8');
+        const stamp = readFileSync(stampPath, 'utf8');
         expect((await enter({ links: true, check: true })).exitCode).toBe(1);
         expect(count('install')).toBe(1);
         expect(readlinkSync(join(root, NX))).toBe(retired);
@@ -502,16 +502,16 @@ describe('what shell entry keeps linked', () => {
         expect(count('install')).toBe(3);
         expectNxBindings(root);
 
-        // A failed shell link repair is reported, and its status stays stale.
+        // A failed shell link repair is reported, and its status stays stale: the install removed its stamp before it
+        // touched node_modules, so no stamp names the tree the failed install changed.
         for (const entry of Object.keys(NX_BINDINGS)) await linkEntry(root, entry, retired);
-        stamp = readFileSync(stampPath, 'utf8');
         await writeFile(join(root, 'refuse-install'), '');
         const failed = await enter({ links: true });
         expect(failed.exitCode).toBe(1);
         expect(failed.stderr).toContain('fixture-install-refused');
         for (const entry of Object.keys(NX_BINDINGS)) expect(readlinkSync(join(root, entry))).toBe(retired);
         expect(readlinkSync(join(root, LINKED))).toBe(local);
-        expect(readFileSync(stampPath, 'utf8')).toBe(stamp);
+        expect(existsSync(stampPath)).toBe(false);
         expect((await enter({ links: true, check: true })).exitCode).toBe(1);
 
         // A CI runner's install that fails keeps the captured Nx and sibling links: the frozen install fails on
