@@ -164,6 +164,16 @@ enum Effect {
     Arena { slot: u32, col: u32 },
     /// One new pair per execution plus its array bytes.
     PairArena { slot: u32, col1: u32, col2: u32 },
+    /// A counts fold: one struct-map row per execution whose key the slot
+    /// lacks, and a copy of that execution's init frame (its
+    /// `init_offsets` cell span) for every row whose `field` holds no
+    /// frame yet; a held frame folds in place.
+    Counts {
+        slot: u32,
+        col: u32,
+        field: u32,
+        init_offsets: u32,
+    },
     /// Slot-to-slot bitmap algebra: `source` is `None` for the scratch image.
     Algebra {
         target: u32,
@@ -206,6 +216,7 @@ impl Effect {
             | Effect::Remove { slot, .. }
             | Effect::Entry { slot }
             | Effect::Arena { slot, .. }
+            | Effect::Counts { slot, .. }
             | Effect::Routed { slot, .. }
             | Effect::Nested { slot, .. }
             | Effect::Sweep { slot }
@@ -227,6 +238,7 @@ impl Effect {
             | Effect::PairArena { slot, .. }
             | Effect::Entry { slot }
             | Effect::Arena { slot, .. }
+            | Effect::Counts { slot, .. }
             | Effect::Routed { slot, .. }
             | Effect::Nested { slot, .. }
             | Effect::Opaque { slot } => Some(SlotWrite::Produce(slot)),
@@ -331,7 +343,13 @@ fn effects(op: Opcode, o: &[u32], out: &mut impl FnMut(Effect)) -> Option<()> {
             }
         }
         // Init frames charged for absent rows and clear fields alike.
-        Opcode::BatchStructMapCountsFold => out(Effect::Opaque { slot: at(0)? }),
+        // slot, key column, VO field, init offsets, init bytes, ...
+        Opcode::BatchStructMapCountsFold => out(Effect::Counts {
+            slot: at(0)?,
+            col: at(1)?,
+            field: at(2)?,
+            init_offsets: at(3)?,
+        }),
         Opcode::StructMapSweep => out(Effect::Sweep { slot: at(0)? }),
         // A removal only shrinks its slot: slot, key (key1) column. Each
         // execution records one cut.
@@ -588,6 +606,7 @@ impl CapacityScratch {
                 Effect::Key { col, .. }
                 | Effect::Arena { col, .. }
                 | Effect::Cut { col, .. }
+                | Effect::Counts { col, .. }
                 | Effect::Routed { col, .. } => Some(col),
                 Effect::Pair { col1, .. } | Effect::PairArena { col1, .. } => Some(col1),
                 Effect::Opaque { .. } => None,
@@ -847,6 +866,25 @@ impl CapacityScratch {
                         cols,
                         batch_len,
                         ArenaKey::One(col),
+                        &mut d,
+                        cx,
+                    ),
+                    Effect::Counts {
+                        slot,
+                        col,
+                        field,
+                        init_offsets,
+                    } if slot == target => counts_demand(
+                        state,
+                        &lookup,
+                        domain,
+                        cols,
+                        batch_len,
+                        CountsCols {
+                            key: col,
+                            field,
+                            init_offsets,
+                        },
                         &mut d,
                         cx,
                     ),
@@ -1154,6 +1192,57 @@ fn arena_demand<I: KeyIndex, S: InternBytes + ?Sized>(
     })
 }
 
+/// The operands of a counts fold its tier-2 demand reads.
+#[derive(Clone, Copy)]
+struct CountsCols {
+    key: u32,
+    field: u32,
+    init_offsets: u32,
+}
+
+/// A counts fold's rows and arena bytes from the rows: a row for each key the
+/// slot lacks, and its init frame for each row whose field holds no frame yet
+/// (execution copies the init frame there; a held frame folds in place). A
+/// key absent before the batch is charged once per row naming it, as every
+/// other row-read bound.
+#[allow(clippy::too_many_arguments)]
+fn counts_demand<I: KeyIndex, S: InternBytes + ?Sized>(
+    state: &[u8],
+    lookup: &Lookup<'_, I>,
+    domain: &Domain<'_>,
+    cols: &[&[u8]],
+    batch_len: u32,
+    op: CountsCols,
+    d: &mut Demand,
+    cx: &mut KeyCx<'_, I, S>,
+) -> Option<()> {
+    // Execution refuses a counts fold over another slot kind; the dry run
+    // reports it.
+    let Lookup::Rows(map) = lookup else {
+        d.opaque = true;
+        return Some(());
+    };
+    let field = u8::try_from(op.field).ok()?;
+    for_rows(domain, cols, batch_len, &mut |row| {
+        let key = cell(cols, op.key, row)?;
+        if is_sentinel(key) {
+            return Some(());
+        }
+        let held = match map.lookup(state, key, cx).ok()? {
+            Some(pos) => map.arena_field(state, pos, field).ok()?.is_some(),
+            None => {
+                d.units += 1;
+                false
+            }
+        };
+        if !held {
+            let start = cell(cols, op.init_offsets, row)?;
+            let end = cell(cols, op.init_offsets, row.checked_add(1)?)?;
+            d.bytes = d.bytes.saturating_add(u64::from(end.checked_sub(start)?));
+        }
+        Some(())
+    })
+}
 /// The key columns of an arena-writing upsert: a one-key map's, or a
 /// two-key map's pair.
 #[derive(Clone, Copy)]
@@ -1254,7 +1343,12 @@ impl Tier1<'_> {
             // because the bound's two bytes per member already cover every
             // shape tried, but the bound's soundness argument is per term.
             (Effect::Remove { .. }, Some(n)) => d.touches = d.touches.saturating_add(n),
-            (Effect::Arena { col: key, .. } | Effect::PairArena { col1: key, .. }, _) => {
+            (
+                Effect::Arena { col: key, .. }
+                | Effect::PairArena { col1: key, .. }
+                | Effect::Counts { col: key, .. },
+                _,
+            ) => {
                 // Rows are bounded like any key; the array bytes need rows.
                 d.rows = true;
                 if let Some(n) = self.executions(whole_batch, Some(key)) {

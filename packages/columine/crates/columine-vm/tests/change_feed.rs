@@ -540,8 +540,9 @@ fn a_row_the_removal_cut_skips_records_nothing() {
 /// arena, and one growth for that room lets the batch through with the rows
 /// unchanged. Named as the rows, the growth would double rows the slot never
 /// lacked, every replay asking again, without bound.
-#[test]
-fn a_counts_fold_that_fills_its_arena_asks_for_arena_room() {
+/// A counts fold whose init frame is 200 prefix bytes, so its arena runs out
+/// long before its rows: the program and that frame.
+fn long_counts_fold() -> (Vec<u8>, Vec<u8>) {
     const PREFIX: usize = 200;
     let init = struct_map(0, 16, &[StructFieldType::Vo]);
     let mut reduce = vec![
@@ -561,16 +562,26 @@ fn a_counts_fold_that_fills_its_arena_asks_for_arena_room() {
     ];
     reduce.extend_from_slice(encode_index(PREFIX as u32).as_bytes());
     reduce.extend_from_slice(&[b'P'; PREFIX]);
-    let code = program(1, &init, &reduce);
-    let mut state = image(&code);
     let frame = [&[b'P'; PREFIX][..], &COUNTS_INIT[1..]].concat();
-    let one = |key: u32| {
-        let mut rows = batch(&[add(key, 0, 1, 0)]);
-        rows.cols[usize::from(INIT_OFFSETS)] =
-            u32s_as_bytes(&[0, u32::try_from(frame.len()).unwrap()]).to_vec();
-        rows.cols[usize::from(INIT_VALUES)] = frame.clone();
-        rows
-    };
+    (program(1, &init, &reduce), frame)
+}
+
+/// `rows`, each carrying `frame` as its init frame.
+fn with_frame(frame: &[u8], rows: &[Row]) -> Batch {
+    let mut batch = batch(rows);
+    let offsets: Vec<u32> = (0..=rows.len())
+        .map(|row| u32::try_from(row * frame.len()).unwrap())
+        .collect();
+    batch.cols[usize::from(INIT_OFFSETS)] = u32s_as_bytes(&offsets).to_vec();
+    batch.cols[usize::from(INIT_VALUES)] = frame.repeat(rows.len());
+    batch
+}
+
+#[test]
+fn a_counts_fold_that_fills_its_arena_asks_for_arena_room() {
+    let (code, frame) = long_counts_fold();
+    let mut state = image(&code);
+    let one = |key: u32| with_frame(&frame, &[add(key, 0, 1, 0)]);
     let capacity = |state: &[u8]| {
         columine_vm::bytes::read_u32(state, slot_meta_base(0) + SlotMetaOffset::CAPACITY)
     };
@@ -596,37 +607,35 @@ fn a_counts_fold_that_fills_its_arena_asks_for_arena_room() {
     assert_eq!(rows, capacity(&next), "the rows never ran out");
     assert_eq!(OK, run(&mut vm, &mut next, &code, &one(key)));
 }
+
+/// Admission charges a key the slot lacks once per row naming it, so with
+/// room for two more frames a batch naming one new key twice and another once
+/// is cleared only by a dry run; the fold still records each row once.
 #[test]
 fn a_counts_fold_records_once_though_admission_dry_runs_it() {
-    let init = struct_map(0, 16, &[StructFieldType::Vo]);
-    let code = program(
-        1,
-        &init,
-        &[
-            Opcode::BatchStructMapCountsFold as u8,
-            0,
-            ADD_K1,
-            0,
-            INIT_OFFSETS,
-            INIT_VALUES,
-            0,
-            1,
-            4,
-            4,
-            1,
-            ZERO,
-            0,
-            1,
-            b'P',
-        ],
-    );
+    let (code, frame) = long_counts_fold();
+    let single = |key: u32| with_frame(&frame, &[add(key, 0, 1, 0)]);
     let mut state = image(&code);
+    // The frames an empty arena holds, counted on a copy: the fill ends at
+    // the first frame the arena refuses.
+    let mut fill = state.clone();
+    let mut filler = Vm::default();
+    let frames = (100..200)
+        .take_while(|&key| run(&mut filler, &mut fill, &code, &single(key)) == OK)
+        .count();
     let mut vm = Vm::default();
+    for key in (100..).take(frames - 2) {
+        assert_eq!(OK, run(&mut vm, &mut state, &code, &single(key)));
+    }
+    let seq = write_seq(&state, 0);
     arm(&mut vm, &mut state, &plane(&[0], false), 0, 64);
     vm.watch(&state, 0, 64, 4096).expect("watch");
     let dry_runs = vm.capacity_counts().dry_run_fit;
     let log = [add(KEY, 0, 1, 0), add(6, 0, 1, 0), add(KEY, 0, 1, 0)];
-    assert_eq!(OK, run(&mut vm, &mut state, &code, &batch(&log)));
+    assert_eq!(
+        OK,
+        run(&mut vm, &mut state, &code, &with_frame(&frame, &log))
+    );
     assert_eq!(
         vm.capacity_counts().dry_run_fit,
         dry_runs + 1,
@@ -641,15 +650,18 @@ fn a_counts_fold_records_once_though_admission_dry_runs_it() {
         ]
     );
     // Three row writes, each logged once though admission dry-ran them.
-    assert_eq!(write_seq(&state, 0), 3);
+    assert_eq!(write_seq(&state, 0), seq + 3);
     assert_eq!(
-        net(&vm, &state, 0, 0),
+        net(&vm, &state, 0, seq),
         [
             (KEY, 0, NetChangeKind::INSERT),
             (6, 0, NetChangeKind::INSERT)
         ]
     );
-    assert_eq!(net(&vm, &state, 0, 2), [(KEY, 0, NetChangeKind::UPDATE)]);
+    assert_eq!(
+        net(&vm, &state, 0, seq + 2),
+        [(KEY, 0, NetChangeKind::UPDATE)]
+    );
 }
 
 #[test]

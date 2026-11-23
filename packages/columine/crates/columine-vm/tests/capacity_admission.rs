@@ -1240,3 +1240,88 @@ proptest! {
         prop_assert_eq!(view.len(), set.len() as u64);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A counts fold is cleared from its rows.
+// ---------------------------------------------------------------------------
+
+/// A fresh counts frame: prefix `P`, a zero count, the ref word naming the
+/// histogram region and that region: one bin, zero.
+const COUNTS_INIT: [u8; 15] = [b'P', 0, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+
+/// One struct map of declared capacity 16 whose one field is a counts frame,
+/// folded from the key, init offsets, init bytes and bucket columns.
+fn counts_program() -> Vec<u8> {
+    program(
+        1,
+        4,
+        &[
+            Opcode::SlotStructMap as u8,
+            0,
+            SlotType::StructMap as u8,
+            16,
+            0,
+            1,
+            StructFieldType::Vo as u8,
+        ],
+        &[
+            Opcode::BatchStructMapCountsFold as u8,
+            0,
+            0,
+            0,
+            1,
+            2,
+            0,
+            1,
+            4,
+            4,
+            1,
+            3,
+            0,
+            1,
+            b'P',
+        ],
+    )
+}
+
+fn fold_counts(vm: &mut Vm, state: &mut [u8], prog: &[u8], keys: &[u32]) -> u32 {
+    let offsets: Vec<u32> = (0..=keys.len())
+        .map(|row| u32::try_from(row * COUNTS_INIT.len()).unwrap())
+        .collect();
+    let buckets = vec![0u32; keys.len()];
+    let frames = COUNTS_INIT.repeat(keys.len());
+    vm.execute_batch(
+        state,
+        prog,
+        &[
+            u32s_as_bytes(keys),
+            u32s_as_bytes(&offsets),
+            &frames,
+            u32s_as_bytes(&buckets),
+        ],
+        u32::try_from(keys.len()).unwrap(),
+    )
+}
+
+/// The rows a counts fold adds and the init frames it copies into the arena
+/// are read from the batch, so a fold with room runs on the image without a
+/// copy of it: new keys and held frames alike.
+#[test]
+fn a_counts_fold_whose_rows_fit_is_cleared_without_a_dry_run() {
+    let prog = counts_program();
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+    // Two new rows, one of them named twice.
+    assert_eq!(OK, fold_counts(&mut vm, &mut state, &prog, &[5, 6, 5]));
+    // Held frames fold in place and take no arena.
+    assert_eq!(OK, fold_counts(&mut vm, &mut state, &prog, &[6, 5]));
+    assert_eq!(
+        CapacityCounts {
+            probed: 2,
+            ..CapacityCounts::default()
+        },
+        vm.capacity_counts()
+    );
+    let map = columine_vm::vm::CheckedStructMap::bind(&state, 0).unwrap();
+    assert!(map.row(5).is_some() && map.row(6).is_some());
+}
