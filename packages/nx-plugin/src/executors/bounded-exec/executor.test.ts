@@ -516,20 +516,27 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   it('ends a fixture that outlives its own ceiling as a fixture bound, not a wedge', async () => {
     const workspace = await createWorkspace();
 
-    // The fixture prints a finished-test line, then stalls: compilation output is not the command's progress,
-    // so only the fixture ceiling can end it, and it must name itself rather than the hang it is not.
-    const result = await runBoundedExec(
-      {
-        command: "node -e \"console.log('main' + '-ran')\"",
-        fixtureCommand:
-          'mkdir "$BOUNDED_EXEC_FIXTURE_DIR/final" && printf "fixture-root=%s\\n" "$BOUNDED_EXEC_FIXTURE_DIR" > fixture-root && node -e "console.log(\'test fixture::warm ... ok\'); process.stdin.resume()"',
-        fixtureTimeoutMs: 150,
-        idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
-        killAfterMs: 0,
-      },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
+    // The fixture writes fixture-root, prints a finished-test line, then stalls: compilation output is not the
+    // command's progress, so only the fixture ceiling can end it, and it must name itself rather than the hang it is
+    // not. The clock moves past the ceiling only once the fixture has said that line, after it wrote fixture-root, so
+    // however long a loaded host takes to start it, the ceiling ends a fixture that has done its writing.
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('test fixture::warm ... ok'),
+      150,
+      () =>
+        runBoundedExec(
+          {
+            command: "node -e \"console.log('main' + '-ran')\"",
+            fixtureCommand:
+              'mkdir "$BOUNDED_EXEC_FIXTURE_DIR/final" && printf "fixture-root=%s\\n" "$BOUNDED_EXEC_FIXTURE_DIR" > fixture-root && node -e "console.log(\'test fixture::warm ... ok\'); process.stdin.resume()"',
+            fixtureTimeoutMs: 150,
+            idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            killAfterMs: 0,
+          },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+        ),
     );
 
     expect(result.success).toBe(false);
