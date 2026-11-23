@@ -100,7 +100,7 @@ pub fn take_inherited_socket() -> Result<OwnedFd> {
 pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     // Only this controller's selected recovery runs during open; workspace requests are fenced
     // by the Core actor before its job path reconciles any gateway state.
-    let runtime = ProjectRuntime::open_existing_for_embedder(
+    let runtime = ProjectRuntime::open_existing(
         project_root,
         RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         crate::gateway_service::runtime_control,
@@ -116,6 +116,9 @@ pub async fn serve_runtime(
     backend: GatewayStoreBackend,
     socket: OwnedFd,
 ) -> Result<()> {
+    // No operator stands behind an embedder to choose `kill`: its ensures wait out a supervisor
+    // of another build as a land step does (11_shell.md, "Draining a supervisor of another build").
+    runtime.wait_out_other_builds();
     let authority = ConnectionAuthority::Coordinator {
         repo_id: runtime.descriptor().repo_id.clone(),
     };

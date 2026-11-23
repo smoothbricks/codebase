@@ -149,6 +149,9 @@ pub enum GcReach {
 #[async_trait]
 pub trait ProjectRuntimeHost: Send + 'static {
     fn descriptor(&self) -> &ProjectDescriptor;
+    /// Take the flag that says whether this host's ensures wait out a supervisor of another
+    /// build ([`OtherBuildWait`]); a host that starts no workspace supervisor ignores it.
+    fn share_other_build_wait(&mut self, _wait: OtherBuildWait) {}
     /// The lanes this host holds to its workspaces' supervisors, which the router answers a
     /// job's calls on beside the operation it serves (07_api.md, "A job's calls are its
     /// supervisor's to answer"). A host that publishes none has every call routed in turn.
@@ -530,6 +533,8 @@ pub struct ProjectRuntime {
     descriptor: ProjectDescriptor,
     router: RouterHandle,
     actor: JoinHandle<()>,
+    /// Set by the `cowshed controller` that serves this runtime ([`Self::wait_out_other_builds`]).
+    other_builds: OtherBuildWait,
 }
 
 fn continuity_from_environment() -> Result<crate::storage::audit::ContinuityAudit> {
@@ -876,19 +881,25 @@ fn rename_selected_by_source(
     }
 }
 
-/// What an ensure does when a supervisor of another build serves its workspace (11_shell.md,
-/// "Draining a supervisor of another build"): that supervisor admits nothing more and retires once
-/// its jobs' ends are read or owed to nobody.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OtherBuildSupervisors {
-    /// Refused at once, naming its pid and the `kill` that ends its jobs now: a CLI verb's, whose
-    /// operator chooses. A land step of such a verb waits all the same.
-    Refused,
-    /// Waited for to retire, a queued wait named on stderr and bounded by
-    /// [`super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING`] per ensure: an embedder's
-    /// `cowshed controller`, which no operator stands behind to choose and whose own calls
-    /// heartbeat meanwhile (05_gateway.md, "Deadlines").
-    Awaited,
+/// Whether a runtime's ensures wait out a supervisor of another build serving their workspace
+/// (11_shell.md, "Draining a supervisor of another build"), which admits nothing more and retires
+/// once its jobs' ends are read or owed to nobody. An embedder's `cowshed controller`, which no
+/// operator stands behind to choose `kill`, sets it on the runtime it serves
+/// ([`ProjectRuntime::wait_out_other_builds`]): each ensure then waits as a land step does, named
+/// on stderr and bounded by [`super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING`], while its
+/// calls heartbeat (05_gateway.md, "Deadlines"). A CLI verb never sets it and is refused at once,
+/// naming the pid and `kill`.
+#[derive(Clone, Debug, Default)]
+pub struct OtherBuildWait(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl OtherBuildWait {
+    fn awaited(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 /// Runtime collaborators supplied once by the composition root, moved into the native host.
 struct RuntimeServices {
@@ -897,8 +908,6 @@ struct RuntimeServices {
     /// Where a background verb's run says what it does: its span's `info` rows
     /// (13_telemetry.md, "Background verb spans"). Any other verb's runtime says it on stderr.
     notes: super::verb_spans::VerbNotes,
-    /// What an ensure does when a supervisor of another build serves its workspace.
-    other_builds: OtherBuildSupervisors,
 }
 
 impl ProjectRuntime {
@@ -923,7 +932,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -945,47 +953,14 @@ impl ProjectRuntime {
         scope: RecoveryScope,
         gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
-        Self::open_existing_with(
-            project_root.as_ref(),
-            scope,
-            gateway_factory,
-            OtherBuildSupervisors::Refused,
-        )
-        .await
-    }
-
-    /// [`Self::open_existing`] for an embedder's `cowshed controller` (06_cli.md): every ensure
-    /// of it waits out a supervisor of another build instead of refusing
-    /// ([`OtherBuildSupervisors::Awaited`]; 11_shell.md, "Draining a supervisor of another build").
-    pub async fn open_existing_for_embedder(
-        project_root: impl AsRef<Path>,
-        scope: RecoveryScope,
-        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
-    ) -> Result<Self> {
-        Self::open_existing_with(
-            project_root.as_ref(),
-            scope,
-            gateway_factory,
-            OtherBuildSupervisors::Awaited,
-        )
-        .await
-    }
-
-    async fn open_existing_with(
-        project_root: &Path,
-        scope: RecoveryScope,
-        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
-        other_builds: OtherBuildSupervisors,
-    ) -> Result<Self> {
         Self::open_native(
-            project_root,
+            project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
             RuntimeServices {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds,
             },
             BindingRemoteValidation::Strict,
             scope,
@@ -1028,7 +1003,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes,
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1056,7 +1030,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::ForIdentityChange,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1084,7 +1057,6 @@ impl ProjectRuntime {
                 continuity,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1110,7 +1082,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
@@ -1135,7 +1106,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds: OtherBuildSupervisors::Refused,
             },
             BindingRemoteValidation::Strict,
             scope,
@@ -1162,7 +1132,6 @@ impl ProjectRuntime {
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             storage,
             gateway_factory,
-            OtherBuildSupervisors::Refused,
         )
         .await
     }
@@ -1181,26 +1150,6 @@ impl ProjectRuntime {
             scope,
             storage,
             gateway_factory,
-            OtherBuildSupervisors::Refused,
-        )
-        .await
-    }
-
-    /// [`Self::open_directory_existing_at`] as [`Self::open_existing_for_embedder`] opens it.
-    pub async fn open_directory_existing_for_embedder_at(
-        project_root: impl AsRef<Path>,
-        scope: RecoveryScope,
-        storage: crate::storage::bootstrap::ValidatedHostStorage,
-        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
-    ) -> Result<Self> {
-        Self::open_directory(
-            project_root.as_ref(),
-            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
-            None,
-            scope,
-            storage,
-            gateway_factory,
-            OtherBuildSupervisors::Awaited,
         )
         .await
     }
@@ -1212,7 +1161,6 @@ impl ProjectRuntime {
         scope: RecoveryScope,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
         gateway_factory: crate::gateway_sessions::GatewayControlFactory,
-        other_builds: OtherBuildSupervisors,
     ) -> Result<Self> {
         let host = StorageProjectRuntimeHost::open(
             project_root,
@@ -1222,7 +1170,6 @@ impl ProjectRuntime {
                 continuity: continuity_from_environment()?,
                 gateway_factory,
                 notes: super::verb_spans::VerbNotes::default(),
-                other_builds,
             },
             BindingRemoteValidation::Strict,
             scope,
@@ -1290,12 +1237,21 @@ impl ProjectRuntime {
             .ok_or_else(|| CowshedError::internal("project router capacity is zero"))?;
         let (router, receiver) = RouterHandle::channel(capacity);
         let busy = router.busy().clone();
+        let other_builds = OtherBuildWait::default();
+        host.share_other_build_wait(other_builds.clone());
         let actor = tokio::spawn(ProjectActor::new(Box::new(host), busy).run(receiver));
         Ok(Self {
             descriptor,
             router,
             actor,
+            other_builds,
         })
+    }
+
+    /// This runtime serves an embedder's `cowshed controller` (06_cli.md): from now on each
+    /// ensure waits out a supervisor of another build instead of refusing ([`OtherBuildWait`]).
+    pub fn wait_out_other_builds(&self) {
+        self.other_builds.set();
     }
 
     pub fn descriptor(&self) -> &ProjectDescriptor {
@@ -3176,9 +3132,9 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     /// instant, a supervisor of another build that the step meets is waited for to retire rather
     /// than refused (11_shell.md, "Draining a supervisor of another build").
     other_build_wait_until: Option<std::time::Instant>,
-    /// An embedder's controller waits out a supervisor of another build at every ensure, as a
-    /// land step does ([`OtherBuildSupervisors`]).
-    other_builds: OtherBuildSupervisors,
+    /// Whether every ensure waits out a supervisor of another build as a land step does: set by
+    /// an embedder's `cowshed controller` ([`OtherBuildWait`]).
+    other_builds: OtherBuildWait,
     /// With a sink of the host's own: per supervisor socket, the task forwarding that
     /// supervisor's commitments into it. `None` when the host's default sink already has them.
     forwarders: Option<std::collections::BTreeMap<PathBuf, tokio::task::JoinHandle<()>>>,
@@ -4251,7 +4207,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             continuity,
             gateway_factory,
             notes,
-            other_builds,
         } = services;
 
         // The store this controller serves: a fixture's supplied one, or the host store that
@@ -4692,7 +4647,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             lanes: crate::resident::JobLanes::default(),
             supervisors_run_in,
             other_build_wait_until: None,
-            other_builds,
+            other_builds: OtherBuildWait::default(),
             forwarders: if forwards_commitments {
                 Some(std::collections::BTreeMap::new())
             } else {
@@ -10710,11 +10665,10 @@ self.finish_retire_intent(&workspace).await?;
         // failing the land on it; it is past the drain by the time it asks for its own. Every
         // ensure of an embedder's controller waits the same way (11_shell.md,
         // "Draining a supervisor of another build").
-        let other_build_deadline = match self.other_builds {
-            OtherBuildSupervisors::Awaited => Some(
-                std::time::Instant::now() + super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING,
-            ),
-            OtherBuildSupervisors::Refused => self.other_build_wait_until,
+        let other_build_deadline = if self.other_builds.awaited() {
+            Some(std::time::Instant::now() + super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING)
+        } else {
+            self.other_build_wait_until
         };
         if let Some(deadline) = other_build_deadline {
             super::supervisor_socket::await_other_build_retired(&socket, deadline).await?;
@@ -14889,6 +14843,9 @@ mod rebase_recovery_tests {
 }
 #[async_trait]
 impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> {
+    fn share_other_build_wait(&mut self, wait: OtherBuildWait) {
+        self.other_builds = wait;
+    }
     async fn prepare_clone_source(
         &mut self,
         source: &WorkspaceName,

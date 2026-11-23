@@ -168,18 +168,10 @@ fn serves_as_a_supervisor_of_another_build() {
     }
 }
 
-/// `/usr/bin/true` in main through `worker.exec`, on a new coordinator connection to `runtime`'s
-/// controller, answered once it ended.
-async fn exec_true(runtime: &ProjectRuntime, checkout: &Path) -> cowshed_core::Result<JobInfo> {
-    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-    tokio::spawn(serve_controller_connection(
-        server.into(),
-        ConnectionAuthority::Coordinator {
-            repo_id: runtime.descriptor().repo_id.clone(),
-        },
-        runtime.router(),
-    ));
-    let (cowshed, token) = cowshed_core::Cowshed::connect(client.into()).await?;
+/// `/usr/bin/true` in main through `worker.exec`, on the coordinator connection whose client end
+/// is `client`, answered once it ended.
+async fn exec_true(client: OwnedFd, checkout: &Path) -> cowshed_core::Result<JobInfo> {
+    let (cowshed, token) = cowshed_core::Cowshed::connect(client).await?;
     let project = cowshed.open(checkout).await?;
     let coordinator = cowshed.coordinator(&project, token)?;
     let worker = coordinator.worker("main").await?;
@@ -259,7 +251,15 @@ async fn host_controller_an_embedder_waits_out_a_supervisor_of_another_build_a_v
         != "ready"
     {}
 
-    let refused = exec_true(&verb, &fixture.checkout)
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    tokio::spawn(serve_controller_connection(
+        server.into(),
+        ConnectionAuthority::Coordinator {
+            repo_id: verb.descriptor().repo_id.clone(),
+        },
+        verb.router(),
+    ));
+    let refused = exec_true(client.into(), &fixture.checkout)
         .await
         .expect_err("a CLI verb is refused by a supervisor of another build");
     assert_eq!(refused.code, ErrorCode::Conflict, "{refused:?}");
@@ -269,7 +269,7 @@ async fn host_controller_an_embedder_waits_out_a_supervisor_of_another_build_a_v
     );
     verb.shutdown().await.expect("stop the verb's runtime");
 
-    let embedder = ProjectRuntime::open_directory_existing_for_embedder_at(
+    let embedder = ProjectRuntime::open_directory_existing_at(
         &fixture.checkout,
         scope(),
         fixture.storage.clone(),
@@ -277,11 +277,15 @@ async fn host_controller_an_embedder_waits_out_a_supervisor_of_another_build_a_v
     )
     .await
     .expect("an embedder's runtime");
+    // Served as `cowshed controller` serves its embedder: the relay marks the runtime.
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let served = tokio::spawn(controller_service::serve_runtime(
+        embedder,
+        GatewayStoreBackend::Directory,
+        server.into(),
+    ));
     let checkout = fixture.checkout.clone();
-    let exec = tokio::spawn(async move {
-        let ended = exec_true(&embedder, &checkout).await;
-        (embedder, ended)
-    });
+    let exec = tokio::spawn(async move { exec_true(client.into(), &checkout).await });
     tokio::pin!(exec);
     let drained = async {
         while said
@@ -297,7 +301,7 @@ async fn host_controller_an_embedder_waits_out_a_supervisor_of_another_build_a_v
         answered = &mut exec => panic!(
             "the embedder's exec was answered before it asked the supervisor of another build to \
              drain: {:?}",
-            answered.expect("the exec task").1
+            answered.expect("the exec task")
         ),
     }
     assert!(
@@ -308,17 +312,17 @@ async fn host_controller_an_embedder_waits_out_a_supervisor_of_another_build_a_v
         .kill_bounded()
         .await
         .expect("the drained supervisor exits");
-    let (embedder, ended) = exec.await.expect("the exec task");
+    let ended = exec.await.expect("the exec task");
     assert_eq!(
         ended
             .expect("the exec runs on a supervisor of this build")
             .exit,
         Some(ExitStatus::Exited { code: 0 })
     );
-    embedder
-        .shutdown()
+    served
         .await
-        .expect("stop the embedder's runtime");
+        .expect("the controller task")
+        .expect("the controller ends once its embedder closed its end");
     fixture.stop_gateway().await;
 }
 //#endregion smoo/cowshed!n/embedder-awaits-other-build
