@@ -1351,19 +1351,7 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
         tokio::select! {
             (reader, frame) = incoming.as_mut(), if !closing => {
                 let Some(frame) = frame? else {
-                    // The peer closed its end. A fatal refusal written just before that close has
-                    // ended too, and its error is how the connection ended; nothing else is
-                    // waited for. The connection runs on a thread of its own, so the close and
-                    // that answer's end may be ready together and either taken first.
-                    while let Some(outcome) = answers.try_join_next() {
-                        let (_, outcome) = outcome.map_err(|error| {
-                            CowshedError::internal(format!(
-                                "controller RPC answer task failed: {error}"
-                            ))
-                        })?;
-                        outcome?;
-                    }
-                    return Ok(());
+                    return ended_answers(&mut answers);
                 };
                 incoming.set(next_frame(reader));
                 let (request, upload) = match frame {
@@ -1497,6 +1485,21 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
+/// How the connection ends when its peer closes: the error of the first answer that has
+/// already ended in one, else `Ok` with every ended answer read. An answer still running is not
+/// waited for. The connection runs on a thread of its own, so the close and a fatal refusal's
+/// end may be ready together and the loop's select takes either; reading the ended answers here
+/// is what makes the result the same both ways (specs/cowshed/laws/connection_close.bend,
+/// `close_reports_every_ended_answer`).
+fn ended_answers(answers: &mut tokio::task::JoinSet<(u64, Result<()>)>) -> Result<()> {
+    while let Some(outcome) = answers.try_join_next() {
+        let (_, outcome) = outcome.map_err(|error| {
+            CowshedError::internal(format!("controller RPC answer task failed: {error}"))
+        })?;
+        outcome?;
+    }
+    Ok(())
+}
 /// A validated call, ready to route: its id, whether it asked for its steps, its decoded request
 /// and upload frame, for a stream-lane call where its demands arrive, and for any other call
 /// where its caller's close arrives.
@@ -2336,3 +2339,54 @@ mod heartbeat_tests {
         }
     }
 }
+
+//#region smoo/cowshed!n/controller-connection-own-thread
+/// The peer's close as specs/cowshed/laws/connection_close.bend proves it
+/// (`close_reports_every_ended_answer`), on the two queues the model tells apart. The tasks hold
+/// no wait, so one yield of the test's own thread runs each to its end; the running one never ends.
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    type Answers = tokio::task::JoinSet<(u64, Result<()>)>;
+
+    async fn ended(outcomes: Vec<Result<()>>) -> Answers {
+        let mut answers = Answers::new();
+        let mut handles = Vec::with_capacity(outcomes.len());
+        for (id, outcome) in (1_u64..).zip(outcomes) {
+            handles.push(answers.spawn(async move { (id, outcome) }));
+        }
+        answers.spawn(std::future::pending());
+        tokio::task::yield_now().await;
+        assert!(
+            handles.iter().all(tokio::task::AbortHandle::is_finished),
+            "every answer but the running one has ended"
+        );
+        answers
+    }
+
+    #[tokio::test]
+    async fn a_close_returns_the_error_of_a_fatal_answer_that_has_ended() {
+        let mut answers = ended(vec![
+            Ok(()),
+            Err(protocol_error("an unsolicited second raw lane")),
+            Ok(()),
+        ])
+        .await;
+        assert_eq!(
+            ended_answers(&mut answers).map_err(|error| error.code),
+            Err(ErrorCode::Integrity)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_with_no_fatal_answer_reads_every_ended_one_and_waits_for_none() {
+        let mut answers = ended(vec![Ok(()), Ok(())]).await;
+        assert_eq!(
+            ended_answers(&mut answers).map_err(|error| error.code),
+            Ok(())
+        );
+        assert_eq!(answers.len(), 1, "only the running answer is left unread");
+    }
+}
+//#endregion smoo/cowshed!n/controller-connection-own-thread

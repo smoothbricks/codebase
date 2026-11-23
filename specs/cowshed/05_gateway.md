@@ -1369,7 +1369,13 @@ the handshake bound.
   waits keeps its own bound. Measured 2026-11-23: six controllers of one host test gate, each forking on the one thread
   that also wrote its heartbeats, fell silent within 4 s of each other and failed their calls `SILENT`. An in-process
   pair shares its client's thread, as above. A version 1 connection, an older client's, hears none (07_api.md,
-  "Controller handshake").
+  "Controller handshake"). On that thread the peer's close and an answer's end may be ready together, and the connection
+  reads either first. Its result does not depend on which: at the close it reads every answer that has already ended and
+  ends in a fatal one's error, and waits for none still running. That is the Bend model `laws/connection_close.bend`,
+  proven for every order of answers ending and arms taken (`--verdict`, `close_reports_every_ended_answer`): the
+  connection ends in error exactly when a fatal answer has ended, and an Ok end has read every ended answer. The open
+  twin `laws/connection_close_open.bend` is the same law over a close that returns at once, which
+  `the_old_loop_loses_an_ended_fatal` refutes: one fatal answer ended, the reader taken, Ok.
 - **Spans.** A failure reaches the boundary that owns the wait as a value. A `TIMEOUT`, `SILENT` or `PEER_LOST` failure
   carries its facts (`WaitFailure`: code, op, peer and its pid, class, bound, time waited, last progress) on the
   caller's error, inside the process only. An owner that has a span ends it `span-err` with the failure's message. The

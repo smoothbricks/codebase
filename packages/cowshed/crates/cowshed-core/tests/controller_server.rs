@@ -942,33 +942,6 @@ async fn router_cannot_return_an_unsolicited_second_raw_lane() {
     );
 }
 
-/// The connection serves on a thread of its own (05_gateway.md "Deadlines",
-/// smoo/cowshed!n/controller-connection-own-thread), so a client that closes the moment it has
-/// read a fatal refusal races the connection's own reading of that refusal's end. The refusal
-/// was written: the connection ended in error, whichever the connection sees first. Repeated, as
-/// the two are ready together and either may be taken first.
-#[tokio::test]
-async fn a_fatal_refusal_ends_the_connection_in_error_however_soon_its_client_closes() {
-    for attempt in 0..64 {
-        let (router, mut records, _actor) = recording_router();
-        let (mut client, server) = TestClient::connect(worker_authority(), router).await;
-        let mut exec = params("worker.exec");
-        exec.as_object_mut()
-            .expect("worker.exec params")
-            .insert("session".into(), json!(UNSOLICITED_BINARY_SESSION));
-        let response = client.request("worker.exec", exec, Some(b"stdin")).await;
-        assert!(!response.envelope.ok, "attempt {attempt}");
-        records.recv().await.expect("router response recorded");
-        drop(client);
-        let ended = server.await.expect("server joins");
-        assert_eq!(
-            ended.map_err(|error| error.code),
-            Err(ErrorCode::Integrity),
-            "attempt {attempt}: the unsolicited lane ended the connection in error"
-        );
-    }
-}
-
 #[tokio::test]
 async fn disconnect_cancels_only_the_connection_while_routed_work_continues() {
     let (router, mut commands) =
