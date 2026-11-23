@@ -394,6 +394,143 @@ pub fn hold_opens(
     Ok(Ok(Opens { _locks: locks }))
 }
 
+/// SQLite's write lock on each task database of a volume, held by this process until dropped
+/// (16_build_volumes.md, "Fork" step 3). While it is held no row commits: every Nx writer waits
+/// on it and retries (pinned Nx 24.0.6, `native/db/connection.rs`
+/// `retry_db_operation_when_busy`), and readers keep reading. Nx commits a cache row only after
+/// writing that entry's outputs and deletes a row before its outputs (`native/cache/cache.rs`
+/// `put`, `ensure_cache_size_within_limit`), so a volume synced and cloned under these locks
+/// holds every committed row with complete outputs and no row without them. Dropping it closes
+/// each connection, which rolls its empty transaction back.
+#[must_use]
+pub struct Writes {
+    #[cfg(target_os = "macos")]
+    _transactions: Vec<super::sqlite::Connection>,
+}
+
+/// A task database whose write lock another connection still held when the wait for it ended,
+/// with the processes that have the database open.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteBusy {
+    pub database: PathBuf,
+    pub bound: Duration,
+    pub holders: Vec<Holder>,
+}
+
+impl std::fmt::Display for WriteBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} stayed write-locked for {} ms",
+            self.database.display(),
+            self.bound.as_millis()
+        )?;
+        for (index, holder) in self.holders.iter().enumerate() {
+            let separator = if index == 0 { "; open in " } else { ", " };
+            write!(formatter, "{separator}{holder}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Take [`Writes`] on every task database of the volume rooted at `volume`, waiting up to
+/// `bound` for each as SQLite's busy timeout allows. A volume without Nx state opens nothing.
+/// One still locked at its bound is [`WriteBusy`], after letting go of the rest.
+#[cfg(target_os = "macos")]
+pub fn hold_writes(
+    census: &CensusScope,
+    volume: &Path,
+    state: &BuildVolumeState,
+    bound: Duration,
+) -> io::Result<Result<Writes, WriteBusy>> {
+    let mut transactions = Vec::new();
+    for data in state.nx_workspace_data() {
+        for database in task_databases_in(&volume.join(data))? {
+            let connection = super::sqlite::Connection::open(&database)?;
+            connection.busy_timeout(bound)?;
+            if !connection.begin_immediate()? {
+                drop(connection);
+                drop(transactions);
+                return Ok(Err(WriteBusy {
+                    holders: holders(census, &database)?,
+                    database,
+                    bound,
+                }));
+            }
+            transactions.push(connection);
+        }
+    }
+    Ok(Ok(Writes {
+        _transactions: transactions,
+    }))
+}
+
+/// [`hold_writes`] where cowshed links no SQLite: build volumes live on APFS (16_build_volumes.md,
+/// "Substrate"), so only the directory test substrate reaches this, and a task database there
+/// refuses rather than being cloned unguarded.
+#[cfg(not(target_os = "macos"))]
+pub fn hold_writes(
+    _census: &CensusScope,
+    volume: &Path,
+    state: &BuildVolumeState,
+    _bound: Duration,
+) -> io::Result<Result<Writes, WriteBusy>> {
+    unlinked_sqlite(volume, state)?;
+    Ok(Ok(Writes {}))
+}
+
+/// Fork step 4 (16_build_volumes.md): delete Nx's running-task rows from each task database of a
+/// fork's own volume. Each names a process of the checkout the volume was cloned from, which stock
+/// Nx takes as running the fork's task when its pid, command and working directory still match,
+/// all the source's (pinned Nx 24.0.6, `native/tasks/running_tasks_service.rs`
+/// `is_task_running`), and then shares that process instead of starting the fork's own
+/// continuous task (`tasks-runner/task-orchestrator.js`). A database without those tables, an
+/// empty one, holds none.
+#[cfg(target_os = "macos")]
+pub fn forget_running_tasks(volume: &Path, state: &BuildVolumeState) -> io::Result<()> {
+    for data in state.nx_workspace_data() {
+        for database in task_databases_in(&volume.join(data))? {
+            let connection = super::sqlite::Connection::open(&database)?;
+            let mut tables = Vec::new();
+            {
+                let mut rows = connection.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name IN ('running_tasks', 'running_task_readiness')",
+                )?;
+                while rows.step()? {
+                    tables.push(rows.text(0));
+                }
+            }
+            for table in tables {
+                connection.execute(&format!("DELETE FROM {table}"), &[])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`forget_running_tasks`] where cowshed links no SQLite ([`hold_writes`]).
+#[cfg(not(target_os = "macos"))]
+pub fn forget_running_tasks(volume: &Path, state: &BuildVolumeState) -> io::Result<()> {
+    unlinked_sqlite(volume, state)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unlinked_sqlite(volume: &Path, state: &BuildVolumeState) -> io::Result<()> {
+    for data in state.nx_workspace_data() {
+        if let Some(database) = task_databases_in(&volume.join(data))?.into_iter().next() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{} is an Nx task database, and cowshed links SQLite on macOS only",
+                    database.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
     let mut databases = Vec::new();
     let entries = match fs::read_dir(data) {
@@ -2314,7 +2451,9 @@ mod tests {
         };
         // Nx takes the lock with `flock`, which holds it per open: the open `hold_opens` makes
         // waits behind this one as it would behind another process's.
-        let taken = fs::File::create(database.with_extension("lock")).unwrap();
+        let taken = cowshed_os::fork_lock::Fenced::new(
+            fs::File::create(database.with_extension("lock")).unwrap(),
+        );
         taken.try_lock().unwrap();
         let own = i32::try_from(std::process::id()).unwrap();
         match hold_opens(&crate::census::this_test(), &root, &state, &next).unwrap() {
@@ -2338,5 +2477,134 @@ mod tests {
         );
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&next).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn task_database(root: &Path) -> (BuildVolumeState, PathBuf) {
+        let database = root.join("nx/workspace-data/T-v6.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        fs::write(&database, b"").unwrap();
+        let connection = super::super::sqlite::Connection::open(&database).unwrap();
+        for sql in [
+            "PRAGMA journal_mode=WAL",
+            "CREATE TABLE task_history (hash TEXT NOT NULL)",
+            "CREATE TABLE running_tasks (task_id TEXT PRIMARY KEY NOT NULL, pid INTEGER NOT NULL)",
+            "CREATE TABLE running_task_readiness (task_id TEXT PRIMARY KEY NOT NULL)",
+            "INSERT INTO task_history VALUES ('1')",
+            "INSERT INTO running_tasks VALUES ('p:serve', 1)",
+            "INSERT INTO running_task_readiness VALUES ('p:serve')",
+        ] {
+            connection.execute(sql, &[]).unwrap();
+        }
+        (state(), database)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn writer(database: &Path) -> super::super::sqlite::Connection {
+        let connection = super::super::sqlite::Connection::open(database).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        connection
+    }
+
+    /// While a capture holds the task databases' write locks no other connection commits, as an
+    /// Nx writer would, and once they are let go it does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_writes_keep_every_other_writer_out_until_dropped() {
+        let root = scratch("writes");
+        let (state, database) = task_database(&root);
+        let writes = hold_writes(&crate::census::this_test(), &root, &state, Duration::ZERO)
+            .unwrap()
+            .expect("nothing else writes");
+        let nx = writer(&database);
+        assert!(
+            !nx.begin_immediate().unwrap(),
+            "no row commits under the lock"
+        );
+        drop(writes);
+        assert!(
+            nx.begin_immediate().unwrap(),
+            "the lock is let go with them"
+        );
+        nx.execute("ROLLBACK", &[]).unwrap();
+        drop(nx);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A write lock another connection still holds at the bound is a busy capture naming the
+    /// database and the processes that have it open, never a capture without it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_write_lock_held_past_the_bound_names_the_database_and_its_holders() {
+        let root = scratch("writes-busy");
+        let (state, database) = task_database(&root);
+        let nx = writer(&database);
+        assert!(nx.begin_immediate().unwrap());
+        let bound = Duration::from_millis(20);
+        let Err(busy) = hold_writes(&crate::census::this_test(), &root, &state, bound).unwrap()
+        else {
+            panic!("a held write lock is busy");
+        };
+        assert_eq!(
+            (busy.database.as_path(), busy.bound),
+            (database.as_path(), bound)
+        );
+        let own = i32::try_from(std::process::id()).unwrap();
+        assert!(
+            busy.holders.iter().any(|holder| holder.pid == own),
+            "{busy}"
+        );
+        drop(nx);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A project without Nx has no task database, so the capture takes no SQLite step: even a
+    /// file SQLite could not read is never opened.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_volume_without_nx_state_opens_no_database() {
+        let root = scratch("writes-none");
+        fs::create_dir_all(root.join("nx/workspace-data")).unwrap();
+        fs::write(root.join("nx/workspace-data/T-v6.db"), b"not a database").unwrap();
+        let without = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/cache", "nx/cache").unwrap()],
+            ..state()
+        };
+        drop(
+            hold_writes(&crate::census::this_test(), &root, &without, Duration::ZERO)
+                .unwrap()
+                .expect("nothing to lock"),
+        );
+        forget_running_tasks(&root, &without).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fork's own task database keeps its task history and names no running task: those name
+    /// the source checkout's processes. A database without the tables is left as it is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_forks_task_database_names_no_running_task() {
+        let root = scratch("running-tasks");
+        let (state, database) = task_database(&root);
+        fs::write(root.join("nx/workspace-data/E-v6.db"), b"").unwrap();
+        forget_running_tasks(&root, &state).unwrap();
+        let connection = super::super::sqlite::Connection::open(&database).unwrap();
+        let count = |table: &str| {
+            let mut rows = connection
+                .prepare(&format!("SELECT count(*) FROM {table}"))
+                .unwrap();
+            assert!(rows.step().unwrap());
+            rows.integer(0)
+        };
+        assert_eq!(
+            (
+                count("task_history"),
+                count("running_tasks"),
+                count("running_task_readiness")
+            ),
+            (1, 0, 0)
+        );
+        drop(connection);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use super::seed_move::{lock_workspace, named};
 use super::{
     BuildVolumes, CapturedFork, Destination, Harmonized, Owner, PreparedFork, ReplacedWorkspace,
-    RuntimeStorageHost, SourceDaemon, SourcePaths, allocated_image_bytes, capture_live,
-    capture_seed, claim_superseded, head_tree, io, ready, retire_seeds, say_release, seeds_of,
-    source_mtimes, storage,
+    RuntimeStorageHost, SourcePaths, allocated_image_bytes, capture_live, capture_seed,
+    claim_superseded, head_tree, io, ready, retire_seeds, say_release, seeds_of, source_mtimes,
+    storage,
 };
 use crate::api::held_lock::{LockHolding, LockOperation};
 use crate::build_volume::{
@@ -343,9 +343,9 @@ fn reseed<H: RuntimeStorageHost>(
 
 /// Fork step 3 for a reseed, under the target's image lock, waited for and said on stderr, so no
 /// land or seed refresh of the target retires the seed being cloned: the target's latest seed, or
-/// an mbx target's live volume under its jobs' shared hold, with Nx guards that leave the target's
-/// daemon running (a running daemon is a holder, so the workspace starts without the target's Nx
-/// state). Nothing holds a target's image lock and then waits on a workspace's lock or lease, so
+/// an mbx target's live volume under its jobs' shared hold and SQLite's write lock on its task
+/// databases, which leaves the target's daemon running and keeps the target's Nx state
+/// ([`capture_live`]). Nothing holds a target's image lock and then waits on a workspace's lock or lease, so
 /// the wait, under the workspace's own lock and claim, cannot deadlock.
 fn capture_target<H: RuntimeStorageHost>(
     host: &H,
@@ -397,14 +397,7 @@ fn capture_target<H: RuntimeStorageHost>(
         placed: head_tree(&workspace.checkout).ok(),
     };
     if mbx {
-        return capture_live(
-            host,
-            layout,
-            target.clone(),
-            live,
-            destination,
-            SourceDaemon::Keep,
-        );
+        return capture_live(host, layout, target.clone(), live, destination);
     }
     capture_seed(host, layout, target.clone(), destination, None)?.ok_or_else(|| {
         CowshedError::not_found(

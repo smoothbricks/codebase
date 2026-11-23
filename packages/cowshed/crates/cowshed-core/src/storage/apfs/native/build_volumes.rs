@@ -560,13 +560,12 @@ where
     /// seed held, then the live volume mounted without the seed's Nx daemon record: a daemon
     /// record names another checkout's process. A failure after publication releases the live
     /// volume and a seed already made. The caller points a checkout's link at the answered
-    /// mountpoint. An mbx fork keeps of its target's Nx state what `nx` says.
+    /// mountpoint. Its own task databases name no running task of the source's checkout.
     pub fn ready_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf, Option<Duration>), ApfsStorageError> {
         let live = captured.id.clone();
         let capture_elapsed = captured.capture_elapsed;
@@ -588,8 +587,11 @@ where
                 crate::build_volume::nx::discard_daemon_records(&mount, &state).map_err(
                     |error| io_error("discard the seed's Nx daemon record", &mount, error),
                 )?;
+                crate::build_volume::nx::forget_running_tasks(&mount, &state).map_err(|error| {
+                    io_error("forget the source's running Nx tasks", &mount, error)
+                })?;
                 state.discard_clone_invalid(&mount).map_err(host_error)?;
-                state.discard_rebuildable(&mount, nx).map_err(host_error)?;
+                state.discard_rebuildable(&mount).map_err(host_error)?;
                 Ok((mount, capture_elapsed.max(elapsed)))
             });
         match mounted {
@@ -1008,12 +1010,7 @@ where
                     },
                 ),
             )?;
-            let (_, mount, _) = self.ready_fork_build_volume(
-                layout,
-                captured,
-                None,
-                crate::build_volume::ForkNx::Inherit,
-            )?;
+            let (_, mount, _) = self.ready_fork_build_volume(layout, captured, None)?;
             link::point(checkout, &mount).map_err(host)
         };
         match layout.resolve_link(workspace, linked).map_err(host)? {

@@ -21,7 +21,6 @@ pub mod managed_targets;
 pub mod migrate;
 pub mod nx;
 #[cfg(target_os = "macos")]
-#[cfg(test)]
 pub(crate) mod sqlite;
 
 use std::collections::BTreeMap;
@@ -287,19 +286,6 @@ pub struct CapturedBuildVolume {
     /// A directory test substrate performs no native image operation.
     pub capture_elapsed: Option<std::time::Duration>,
     pub creating: BuildVolumeHold,
-}
-
-/// What an mbx fork's clone of its target's live volume keeps of the target's Nx state
-/// (16_build_volumes.md, "Fork" step 4). Every clone keeps it on a non-mbx volume and on a seed:
-/// both are captured under the Nx guards, so the variant only decides an mbx live capture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ForkNx {
-    /// The capture held the Nx guards: no Nx process had a task database open or could open one,
-    /// so the cache and the database that indexes it are one consistent state the fork replays.
-    Inherit,
-    /// An Nx process could have been writing the cache or the database: the fork starts without
-    /// them, as without every other unguarded rebuildable path.
-    Discard,
 }
 
 /// The build-state paths a volume holds, as written at its root ([`STATE_FILE`]), the
@@ -592,20 +578,20 @@ impl BuildVolumeState {
 
     /// Empty what an mbx fork's clone of its target's live volume must not inherit: every path
     /// not retained, captured while the target's jobs may have been writing it, except the Nx
-    /// state when the capture held its guards (`nx`, 16_build_volumes.md, "Fork"). Each is moved
-    /// into the volume's discard directory in one rename, so the fork never waits on deleting a
-    /// target's caches (tens of thousands of Nx cache files); the workspace's supervisor deletes
+    /// state, captured under SQLite's write lock on its task databases (16_build_volumes.md, "Fork"
+    /// step 3). Each is moved into the volume's discard directory in one rename, so the fork never
+    /// waits on deleting a target's caches (tens of thousands of Nx cache files); the workspace's
+    /// supervisor deletes
     /// them in the background once it starts, since the fork's own process exits first. A
     /// rebuildable directory is left empty for its link; one declared but not retained is left
     /// absent. A non-mbx volume is a seed's clone, captured under its writers' exclusion, and keeps
     /// everything.
-    pub fn discard_rebuildable(&self, volume_root: &Path, nx: ForkNx) -> crate::Result<()> {
+    pub fn discard_rebuildable(&self, volume_root: &Path) -> crate::Result<()> {
         if self.mbx.is_none() {
             return Ok(());
         }
         let kept = |path: &BuildStatePath| {
-            path.retained()
-                || (nx == ForkNx::Inherit && BuildStateTool::of(path) == BuildStateTool::Nx)
+            path.retained() || BuildStateTool::of(path) == BuildStateTool::Nx
         };
         cowshed_os::timing::timed("fork", format_args!("rebuildable"), || {
             for path in self.paths.iter().filter(|path| !kept(path)) {
@@ -2099,13 +2085,15 @@ mod tests {
     fn discarding_rebuildable_state_moves_it_aside_without_deleting_it() {
         let root = crate::temp_root::TempRoot::new_in(&std::env::temp_dir(), "cs-rebuildable");
         let volume = root.join("volume");
-        for path in ["nx/cache/entry", "codegraph"] {
+        for path in ["lint-cache/entry", "nx/cache/1234", "codegraph"] {
             fs::create_dir_all(volume.join(path)).unwrap();
         }
-        fs::write(volume.join("nx/cache/entry/output"), b"cached").unwrap();
+        fs::write(volume.join("lint-cache/entry/output"), b"cached").unwrap();
+        fs::write(volume.join("nx/cache/1234/out.js"), b"replayed").unwrap();
         fs::write(volume.join("codegraph/index.db"), b"index").unwrap();
         let state = BuildVolumeState {
             paths: vec![
+                BuildStatePath::new(".lint-cache", "lint-cache").unwrap(),
                 BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
                 BuildStatePath::new(".codegraph", "codegraph")
                     .unwrap()
@@ -2114,11 +2102,16 @@ mod tests {
             mbx: Some(PathBuf::from("/installed/mbx")),
             ..Default::default()
         };
-        state.discard_rebuildable(&volume, ForkNx::Discard).unwrap();
+        state.discard_rebuildable(&volume).unwrap();
         assert_eq!(
-            fs::read_dir(volume.join("nx/cache")).unwrap().count(),
+            fs::read_dir(volume.join("lint-cache")).unwrap().count(),
             0,
             "the rebuildable directory stays, empty, for its link"
+        );
+        assert_eq!(
+            fs::read(volume.join("nx/cache/1234/out.js")).unwrap(),
+            b"replayed",
+            "the Nx state, captured under its task databases' write locks, stays"
         );
         assert_eq!(
             fs::read(volume.join("codegraph/index.db")).unwrap(),

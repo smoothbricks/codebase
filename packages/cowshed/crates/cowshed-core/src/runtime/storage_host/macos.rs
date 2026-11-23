@@ -557,7 +557,6 @@ impl RuntimeStorageHost for NativeHost {
             layout: &BuildVolumeLayout,
             captured: CapturedBuildVolume,
             own_seed: Option<(&BuildVolumeId, &Registration)>,
-            nx: crate::build_volume::ForkNx,
         ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError>;
         fn abandon_captured_build_volume(
             &self,
@@ -801,9 +800,8 @@ where
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf, Option<std::time::Duration>), ApfsStorageError> {
-        MacOsApfsExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed, nx)
+        MacOsApfsExecutionHost::ready_fork_build_volume(self, layout, captured, own_seed)
     }
 
     fn abandon_captured_build_volume(

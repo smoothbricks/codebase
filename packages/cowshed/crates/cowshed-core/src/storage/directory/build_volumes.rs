@@ -636,14 +636,13 @@ impl DirectoryExecutionHost {
 
     /// The captured live volume published, then `own_seed`, when one is asked for, copied from it
     /// before anything binds it, then the live volume bound without the seed's Nx daemon record.
-    /// A failure after publication releases the live volume and a seed already made. An mbx fork
-    /// keeps of its target's Nx state what `nx` says.
+    /// A failure after publication releases the live volume and a seed already made. Its own task
+    /// databases name no running task of the source's checkout.
     pub fn ready_fork_build_volume(
         &self,
         layout: &BuildVolumeLayout,
         captured: CapturedBuildVolume,
         own_seed: Option<(&BuildVolumeId, &Registration)>,
-        nx: crate::build_volume::ForkNx,
     ) -> Result<(BuildVolumeId, PathBuf), ApfsStorageError> {
         let live = captured.id.clone();
         self.finish_captured_build_volume(layout, captured)?;
@@ -660,8 +659,10 @@ impl DirectoryExecutionHost {
             let state = crate::build_volume::BuildVolumeState::read(&mount).map_err(host_error)?;
             crate::build_volume::nx::discard_daemon_records(&mount, &state)
                 .map_err(|error| io_error("discard the seed's Nx daemon record", &mount, error))?;
+            crate::build_volume::nx::forget_running_tasks(&mount, &state)
+                .map_err(|error| io_error("forget the source's running Nx tasks", &mount, error))?;
             state.discard_clone_invalid(&mount).map_err(host_error)?;
-            state.discard_rebuildable(&mount, nx).map_err(host_error)?;
+            state.discard_rebuildable(&mount).map_err(host_error)?;
             Ok(mount)
         });
         match mounted {
@@ -1066,12 +1067,7 @@ impl DirectoryExecutionHost {
                     },
                 ),
             )?;
-            let (_, mount) = self.ready_fork_build_volume(
-                layout,
-                captured,
-                None,
-                crate::build_volume::ForkNx::Inherit,
-            )?;
+            let (_, mount) = self.ready_fork_build_volume(layout, captured, None)?;
             link::point(checkout, &mount).map_err(host_error)
         };
         match layout.resolve_link(workspace, linked).map_err(host_error)? {

@@ -1,6 +1,8 @@
-//! The few SQLite calls a test needs to hold a database open in-process, as Nx or an index
-//! writer does, against the system library macOS ships in `/usr/lib`. A crate would add a C
-//! build or a second copy of the library for a small FFI surface.
+//! The few SQLite calls cowshed makes against the system library macOS ships in `/usr/lib`: a
+//! fork holds SQLite's write lock on its target's Nx task databases across the clone and clears
+//! the running tasks its own copy names (16_build_volumes.md, "Fork" steps 3 and 4), and a test
+//! holds a database open in-process, as Nx or an index writer does. A crate would add a C build
+//! or a second copy of the library for a small FFI surface.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io;
@@ -18,6 +20,8 @@ struct Sqlite3Stmt {
 }
 
 const SQLITE_OK: c_int = 0;
+/// `SQLITE_BUSY`, the primary code of every `SQLITE_BUSY_*` extended code.
+const SQLITE_BUSY: c_int = 5;
 const SQLITE_ROW: c_int = 100;
 const SQLITE_DONE: c_int = 101;
 const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
@@ -60,9 +64,11 @@ unsafe extern "C" {
     fn sqlite3_sql(statement: *mut Sqlite3Stmt) -> *const c_char;
     fn sqlite3_column_text(statement: *mut Sqlite3Stmt, column: c_int) -> *const u8;
     fn sqlite3_column_bytes(statement: *mut Sqlite3Stmt, column: c_int) -> c_int;
+    #[cfg(test)]
     fn sqlite3_column_int64(statement: *mut Sqlite3Stmt, column: c_int) -> i64;
     fn sqlite3_reset(statement: *mut Sqlite3Stmt) -> c_int;
     fn sqlite3_finalize(statement: *mut Sqlite3Stmt) -> c_int;
+    fn sqlite3_busy_timeout(database: *mut Sqlite3, milliseconds: c_int) -> c_int;
 }
 
 /// One open database. Closing it (on drop) releases every file it opened, the attached ones
@@ -122,6 +128,30 @@ impl Connection {
                 statement,
             }),
             _ => Err(self.error(sql)),
+        }
+    }
+
+    /// Wait up to `bound` for a lock another connection holds before a statement answers busy:
+    /// SQLite's own busy handler, the only wait its locking offers.
+    pub fn busy_timeout(&self, bound: std::time::Duration) -> io::Result<()> {
+        let milliseconds = c_int::try_from(bound.as_millis()).unwrap_or(c_int::MAX);
+        // SAFETY: the handle is open.
+        match unsafe { sqlite3_busy_timeout(self.database.as_ptr(), milliseconds) } {
+            SQLITE_OK => Ok(()),
+            _ => Err(self.error("busy_timeout")),
+        }
+    }
+
+    /// Take SQLite's write lock: `BEGIN IMMEDIATE`, waiting as [`Self::busy_timeout`] allows.
+    /// `false` when another connection still held it then. Readers keep reading; every other
+    /// writer waits until this connection ends the transaction or closes, which rolls it back.
+    pub fn begin_immediate(&self) -> io::Result<bool> {
+        let statement = self.prepare("BEGIN IMMEDIATE")?;
+        // SAFETY: the statement is live.
+        match unsafe { sqlite3_step(statement.statement.as_ptr()) } {
+            SQLITE_DONE => Ok(true),
+            status if status & 0xff == SQLITE_BUSY => Ok(false),
+            _ => Err(self.error("BEGIN IMMEDIATE")),
         }
     }
 
@@ -226,6 +256,7 @@ impl Statement<'_> {
     }
 
     /// Column `column` of the current row as an integer.
+    #[cfg(test)]
     pub fn integer(&self, column: c_int) -> i64 {
         // SAFETY: a row is current.
         unsafe { sqlite3_column_int64(self.statement.as_ptr(), column) }
