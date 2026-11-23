@@ -77,6 +77,9 @@ interface ProcinfoAddon {
   ) => { readonly pid: number; readonly command: string; readonly state: NativeRunState }[];
   readonly groupCpu?: (pgid: number) => bigint;
   residentBytes(pid: number): bigint | null | undefined;
+  childPids(pid: number): number[];
+  cpuTimeNs(pid: number): bigint | null | undefined;
+  startedUs(pid: number): number | null | undefined;
   listeningPorts(pid: number): number[];
   descriptorName(fd: number): NativeDescriptorName;
   descriptorNames(
@@ -99,6 +102,9 @@ const ADDON_EXPORTS = [
   'processArguments',
   'residentBytes',
   'listeningPorts',
+  'childPids',
+  'cpuTimeNs',
+  'startedUs',
   'descriptorName',
   'descriptorNames',
   'sandboxed',
@@ -251,6 +257,31 @@ export const processGroups: ProcessGroups | null =
 /** The bytes the process `pid` holds resident now, or `null` once no such process runs. */
 export function residentBytes(pid: number): bigint | null {
   return addon().residentBytes(int32(pid, 'process id')) ?? null;
+}
+
+/**
+ * The pids whose parent is the process `pid`, as the kernel links them now (`proc_listchildpids` on Darwin, each
+ * thread's `/proc/<pid>/task/<tid>/children` on Linux): none for a pid no process holds. A tree is walked from its root
+ * one parent at a time, never by a census of the process table.
+ */
+export function childPids(pid: number): number[] {
+  return addon().childPids(int32(pid, 'process id'));
+}
+
+/**
+ * The CPU time the process `pid` has used, user and system together, in nanoseconds; `null` once it has exited, an
+ * unreaped one included, or no process has the pid. Two readings of one process differ by the CPU it used between them.
+ */
+export function cpuTimeNs(pid: number): bigint | null {
+  return addon().cpuTimeNs(int32(pid, 'process id')) ?? null;
+}
+
+/**
+ * When the process `pid` started, in microseconds since the Unix epoch: fixed for its life, so with its pid it names one
+ * process. `null` once no process has the pid. Linux counts it from a boot time given in whole seconds.
+ */
+export function startedUs(pid: number): number | null {
+  return addon().startedUs(int32(pid, 'process id')) ?? null;
 }
 
 /** The TCP ports the process `pid` listens on, IPv4 and IPv6 alike, each once, ascending. */

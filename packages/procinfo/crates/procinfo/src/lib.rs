@@ -23,8 +23,8 @@ use macos as platform;
 
 // Each fact is read from its platform's own kernel, selected here and nowhere else.
 pub use platform::{
-    descriptor_name, descriptor_names, lineage, listening_ports, process_arguments, resident_bytes,
-    run_state, running, sandboxed,
+    child_pids, cpu_time, descriptor_name, descriptor_names, lineage, listening_ports,
+    process_arguments, resident_bytes, run_state, running, sandboxed, started,
 };
 // A process group's members, where the kernel lists them (`proc_listpgrppids`). Linux lists a
 // group only to a census of `/proc`, so procinfo offers no group facts there: cowshed's Linux job
@@ -338,5 +338,130 @@ mod tests {
         assert!(running(libc::pid_t::try_from(std::process::id()).unwrap()).unwrap());
         // Launchd's: not this user's to inspect, and running.
         assert!(running(1).unwrap());
+    }
+
+    /// A process's children are the processes it started, as the kernel links them now: a leader
+    /// that forked two sleepers lists exactly those, a sleeper lists none, and once the leader is
+    /// reaped no process names its pid as a parent.
+    #[test]
+    fn a_process_s_children_are_the_ones_it_started() {
+        use std::io::BufRead as _;
+
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 600 & a=$!; sleep 600 & echo $a $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn_reaped()
+            .expect("spawn the leader");
+        let pid = libc::pid_t::try_from(leader.id()).expect("a pid");
+        let mut said = String::new();
+        std::io::BufReader::new(leader.stdout.take().expect("piped stdout"))
+            .read_line(&mut said)
+            .expect("read the leader's line");
+        let mut sleepers: Vec<libc::pid_t> = said
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("the leader says pids"))
+            .collect();
+        sleepers.sort_unstable();
+        let sleeper = sleepers
+            .first()
+            .copied()
+            .expect("the leader started sleepers");
+        // Every read happens before any assertion, so a failed assertion leaves no sleeper.
+        let children = child_pids(pid);
+        let grandchildren = child_pids(sleeper);
+        for sleeper in &sleepers {
+            // SAFETY: each pid is a sleeper this test's own child started and has not reaped.
+            unsafe { libc::kill(*sleeper, libc::SIGKILL) };
+        }
+        leader.kill().expect("kill the leader");
+        leader.wait().expect("reap the leader");
+        let reaped = child_pids(pid);
+        let mut children = children.expect("read the leader's children");
+        children.sort_unstable();
+        assert_eq!(children, sleepers);
+        assert_eq!(
+            grandchildren.expect("read a sleeper's children"),
+            Vec::new()
+        );
+        assert_eq!(reaped.expect("read a reaped pid's children"), Vec::new());
+    }
+
+    /// The CPU this process's threads used, user and system, as getrusage(2) counts it.
+    fn own_rusage() -> std::time::Duration {
+        // SAFETY: an all-zero `rusage` is valid storage for the call to fill.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is live storage for the call to fill.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) },
+            0
+        );
+        let time = |value: libc::timeval| {
+            std::time::Duration::from_secs(value.tv_sec.cast_unsigned())
+                + std::time::Duration::from_micros(u64::try_from(value.tv_usec).expect("usec"))
+        };
+        time(usage.ru_utime) + time(usage.ru_stime)
+    }
+
+    /// A process's CPU time is in real time units: across a stretch of work this process's own
+    /// reading advances as getrusage(2) counts it, within the two readings' resolutions (Linux
+    /// stat counts clock ticks), never in Mach ticks or any other unit of the kernel's own.
+    #[test]
+    fn a_process_s_cpu_time_advances_as_getrusage_counts_it() {
+        let me = libc::pid_t::try_from(std::process::id()).expect("a pid");
+        let read_before = cpu_time(me);
+        let counted_before = own_rusage();
+        let mut sum = 0_u64;
+        for step in 0..100_000_000_u64 {
+            sum = std::hint::black_box(sum.wrapping_mul(31).wrapping_add(step));
+        }
+        std::hint::black_box(sum);
+        let counted = own_rusage() - counted_before;
+        let read = cpu_time(me).expect("read").expect("this process runs")
+            - read_before.expect("read").expect("this process runs");
+        // Mach ticks read as nanoseconds would be 1/41 of the time on Apple silicon; Linux counts
+        // 10 ms ticks.
+        assert!(
+            counted >= std::time::Duration::from_millis(30),
+            "{counted:?}"
+        );
+        assert!(
+            read >= counted / 2 && read <= counted * 3 / 2 + std::time::Duration::from_millis(20),
+            "procinfo read {read:?} where getrusage counted {counted:?}"
+        );
+    }
+
+    /// A process's start is fixed for its life and falls in the span its spawn took, so with its
+    /// pid it names one process. Its CPU time is read while it runs; exited and unreaped it keeps
+    /// its start but has no CPU time left to read; reaped, it has neither.
+    #[test]
+    fn a_childs_start_names_it_for_its_life() {
+        let before = std::time::SystemTime::now();
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn_reaped()
+            .expect("spawn sleep");
+        let after = std::time::SystemTime::now();
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+        // Every read happens before any assertion, so a failed assertion leaves no sleeper.
+        let live = (started(pid), started(pid), cpu_time(pid));
+        child.kill().expect("kill sleep");
+        // Waitable means zombie; see a_childs_run_state_follows_its_life for why an exit watch is too early.
+        exited_unreaped(child.id()).expect("sleep exits, unreaped");
+        let exited = (started(pid), cpu_time(pid));
+        child.wait().expect("reap sleep");
+        let reaped = (started(pid), cpu_time(pid));
+        let start = live.0.expect("read").expect("a live child started");
+        assert_eq!(live.1.expect("read again"), Some(start));
+        // Linux counts a start in clock ticks after a boot time it gives in whole seconds.
+        let slack = std::time::Duration::from_secs(1);
+        assert!(
+            start + slack >= before && start <= after + slack,
+            "{start:?}"
+        );
+        assert!(live.2.expect("read").is_some());
+        assert_eq!(exited.0.expect("read the zombie"), Some(start));
+        assert_eq!(exited.1.expect("read the zombie"), None);
+        assert_eq!(reaped.0.expect("read the reaped pid"), None);
+        assert_eq!(reaped.1.expect("read the reaped pid"), None);
     }
 }

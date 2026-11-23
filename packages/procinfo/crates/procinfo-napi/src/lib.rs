@@ -199,6 +199,42 @@ pub fn resident_bytes(env: Env, pid: i32) -> napi::Result<Option<BigInt>> {
         .map_err(|error| unread(env, format!("the resident memory of process {pid}"), &error))
 }
 
+/// The pids whose parent is the process `pid`, as the kernel links them now; none for a pid no
+/// process holds.
+#[napi(js_name = "childPids")]
+pub fn child_pids(env: Env, pid: i32) -> napi::Result<Vec<i32>> {
+    let pid = process_id(env, pid, "process id")?;
+    procinfo::child_pids(pid)
+        .map_err(|error| unread(env, format!("the children of process {pid}"), &error))
+}
+
+/// The CPU time the process `pid` has used, user and system, in nanoseconds; `null` once it has
+/// exited or no process holds the pid.
+#[napi(js_name = "cpuTimeNs")]
+pub fn cpu_time_ns(env: Env, pid: i32) -> napi::Result<Option<BigInt>> {
+    let pid = process_id(env, pid, "process id")?;
+    procinfo::cpu_time(pid)
+        .map(|time| time.map(|time| BigInt::from(time.as_nanos())))
+        .map_err(|error| unread(env, format!("the CPU time of process {pid}"), &error))
+}
+
+/// When the process `pid` started, in microseconds since the Unix epoch; `null` once no process
+/// holds the pid.
+#[napi(js_name = "startedUs")]
+pub fn started_us(env: Env, pid: i32) -> napi::Result<Option<i64>> {
+    let pid = process_id(env, pid, "process id")?;
+    let started = procinfo::started(pid)
+        .map_err(|error| unread(env, format!("the start of process {pid}"), &error))?;
+    started
+        .map(|started| {
+            started
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)
+                .and_then(|since| i64::try_from(since.as_micros()).map_err(io::Error::other))
+                .map_err(|error| unread(env, format!("the start of process {pid}"), &error))
+        })
+        .transpose()
+}
 /// The TCP ports the process `pid` listens on, IPv4 and IPv6 alike, each once, ascending.
 #[napi(js_name = "listeningPorts")]
 pub fn listening_ports(env: Env, pid: i32) -> napi::Result<Vec<u32>> {

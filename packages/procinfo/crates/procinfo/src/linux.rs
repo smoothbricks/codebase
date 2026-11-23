@@ -3,6 +3,8 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     DescriptorName, GroupMember, NameKinds, ProcessArguments, ProcessLineage, RunState, Unread,
@@ -230,6 +232,137 @@ fn not_a_stat_line(pid: libc::pid_t, read: &[u8]) -> io::Error {
             String::from_utf8_lossy(read)
         ),
     )
+}
+
+/// The field at `index` of the stat fields [`stat_fields`] gives (the state is 0), as a count.
+fn stat_count(pid: libc::pid_t, fields: &str, index: usize) -> io::Result<u64> {
+    fields
+        .split_ascii_whitespace()
+        .nth(index)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| not_a_stat_line(pid, fields.as_bytes()))
+}
+
+/// Indexes of [`stat_fields`] (proc(5) numbers them from 1, the state 3rd): `utime` (14th),
+/// `stime` (15th) and `starttime` (22nd), each in clock ticks.
+const UTIME: usize = 11;
+const STIME: usize = 12;
+const STARTTIME: usize = 19;
+
+/// `ticks` of the kernel's clock (`_SC_CLK_TCK`, `USER_HZ`) as a duration.
+fn clock_ticks(ticks: u64) -> io::Result<Duration> {
+    // SAFETY: sysconf takes a plain integer and touches no memory of ours.
+    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hertz = u64::try_from(hertz)
+        .ok()
+        .filter(|hertz| *hertz > 0)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "the clock tick cannot be read: {}",
+                io::Error::last_os_error()
+            ))
+        })?;
+    let nanoseconds = u128::from(ticks) * 1_000_000_000 / u128::from(hertz);
+    u64::try_from(nanoseconds)
+        .map(Duration::from_nanos)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a tick count passes 2^64 ns"))
+}
+
+/// [`cpu_time`] from procfs: `utime` and `stime` of `/proc/<pid>/stat`, in clock ticks. A process
+/// in state `Z` or `X` has exited and is read as none, as Darwin has no task left to read.
+pub fn cpu_time(pid: libc::pid_t) -> io::Result<Option<Duration>> {
+    let Some(fields) = stat_fields(pid)? else {
+        return Ok(None);
+    };
+    if matches!(fields.split_ascii_whitespace().next(), Some("Z" | "X")) {
+        return Ok(None);
+    }
+    let ticks = stat_count(pid, &fields, UTIME)?
+        .checked_add(stat_count(pid, &fields, STIME)?)
+        .ok_or_else(|| not_a_stat_line(pid, fields.as_bytes()))?;
+    clock_ticks(ticks).map(Some)
+}
+
+/// The host's boot time, `btime` of `/proc/stat` (whole seconds since the epoch), read once, so every
+/// start this process reads is measured from the same boot time and a process's start stays the same
+/// between two reads.
+static BOOT_TIME: LazyLock<Result<SystemTime, String>> = LazyLock::new(|| {
+    let stat =
+        std::fs::read_to_string("/proc/stat").map_err(|error| format!("/proc/stat: {error}"))?;
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|seconds| seconds.trim().parse().ok())
+        .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+        .ok_or_else(|| "/proc/stat names no btime".to_owned())
+});
+
+/// [`started`] from procfs: `starttime` of `/proc/<pid>/stat`, clock ticks after boot, from the
+/// boot time `/proc/stat` gives in whole seconds. An exited, unreaped process keeps its start.
+pub fn started(pid: libc::pid_t) -> io::Result<Option<SystemTime>> {
+    let Some(fields) = stat_fields(pid)? else {
+        return Ok(None);
+    };
+    let after_boot = clock_ticks(stat_count(pid, &fields, STARTTIME)?)?;
+    let boot = BOOT_TIME
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?;
+    Ok(Some(*boot + after_boot))
+}
+
+/// A procfs entry of a process or thread that exited since it was named: `ENOENT`, or `ESRCH` for
+/// one opened before it went.
+fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// [`child_pids`] from procfs: each thread's `/proc/<pid>/task/<tid>/children`, which lists the
+/// children that thread forked, as the kernel links them now. A process or thread that has exited
+/// since it was listed has none. A thread whose directory stands without a `children` file is a
+/// kernel built without that list (`CONFIG_PROC_CHILDREN`), which is an error, never an empty list.
+pub fn child_pids(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let tasks = format!("/proc/{pid}/task");
+    let entries = match std::fs::read_dir(&tasks) {
+        Ok(entries) => entries,
+        Err(error) if gone(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(io::Error::new(error.kind(), format!("{tasks}: {error}"))),
+    };
+    let mut children = Vec::new();
+    for entry in entries {
+        let task = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(io::Error::new(error.kind(), format!("{tasks}: {error}"))),
+        };
+        let list = task.join("children");
+        let listed = match std::fs::read_to_string(&list) {
+            Ok(listed) => listed,
+            Err(error) if gone(&error) && task.exists() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{}: this kernel lists no thread's children (CONFIG_PROC_CHILDREN)",
+                        list.display()
+                    ),
+                ));
+            }
+            Err(error) if gone(&error) => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", list.display()),
+                ));
+            }
+        };
+        for child in listed.split_ascii_whitespace() {
+            children.push(child.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} lists {child:?}, which is no pid", list.display()),
+                )
+            })?);
+        }
+    }
+    Ok(children)
 }
 
 /// The running processes among `pids`, each named by its command line (`cmdline`) and its state.

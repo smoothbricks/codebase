@@ -7,6 +7,8 @@ import { createInterface } from 'node:readline';
 import { ADDON_DIRECTORIES } from './addon.js';
 import {
   awakeTimeMs,
+  childPids,
+  cpuTimeNs,
   descriptorNames,
   hostLoad,
   listeningPorts,
@@ -18,6 +20,7 @@ import {
   residentBytes,
   running,
   sandboxed,
+  startedUs,
 } from './index.js';
 
 const children: ChildProcess[] = [];
@@ -159,6 +162,44 @@ describe('processGroups', () => {
   });
 });
 
+describe('childPids', () => {
+  it('lists the children a process started, none for a sleeper, and none once the parent is reaped', async () => {
+    const { child, pid, line } = await started('sleep 600 & echo $!; wait');
+    const sleeper = Number(line);
+    expect(childPids(pid)).toEqual([sleeper]);
+    expect(childPids(sleeper)).toEqual([]);
+    process.kill(sleeper, 'SIGKILL');
+    await stop(child);
+    expect(childPids(pid)).toEqual([]);
+  });
+
+  it('refuses what is not a process id', () => {
+    expect(() => childPids(0)).toThrow(expect.objectContaining({ code: 'usage', hint: expect.any(String) }));
+    expect(() => childPids(1.5)).toThrow(RangeError);
+  });
+});
+
+describe('cpuTimeNs and startedUs', () => {
+  it("read this process's CPU time as it rises, a child's start inside its spawn, and neither once it is reaped", async () => {
+    const used = cpuTimeNs(process.pid);
+    let sum = 0;
+    for (let step = 0; step < 1_000_000; step += 1) sum = (sum * 31 + step) % 1_000_003;
+    expect(sum).toBeGreaterThanOrEqual(0);
+    expect(cpuTimeNs(process.pid)).toBeGreaterThan(used ?? 0n);
+    const before = Date.now();
+    const { child, pid } = await started('echo up; exec sleep 600');
+    const after = Date.now();
+    const start = startedUs(pid);
+    // Linux counts a start from a boot time given in whole seconds.
+    expect(start).toBeGreaterThanOrEqual((before - 1_000) * 1_000);
+    expect(start).toBeLessThanOrEqual((after + 1_000) * 1_000);
+    expect(startedUs(pid)).toBe(start);
+    expect(cpuTimeNs(pid)).toBeGreaterThanOrEqual(0n);
+    await stop(child);
+    expect(startedUs(pid)).toBeNull();
+    expect(cpuTimeNs(pid)).toBeNull();
+  });
+});
 describe('residentBytes', () => {
   it("counts this process's memory and none for a reaped child", async () => {
     expect(residentBytes(process.pid)).toBeGreaterThan(0n);

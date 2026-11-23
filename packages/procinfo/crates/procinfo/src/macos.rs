@@ -1,9 +1,12 @@
 //! Darwin's readings of a process: libproc (`proc_pidinfo`, `proc_pidfdinfo`,
-//! `proc_listpgrppids`, `proc_pid_rusage`), `sysctl(KERN_PROCARGS2)` and libsystem_sandbox's
-//! `sandbox_check`.
+//! `proc_listpgrppids`, `proc_listchildpids`, `proc_pid_rusage`), `sysctl(KERN_PROCARGS2)`,
+//! libsystem_sandbox's `sandbox_check` and the Mach timebase.
 
 use std::collections::BTreeSet;
 use std::io;
+use std::num::NonZeroU32;
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     DescriptorName, GroupMember, NameKinds, ProcessArguments, ProcessLineage, RunState, Unread,
@@ -290,10 +293,11 @@ fn darwin_run_state(pid: libc::pid_t) -> io::Result<RunState> {
     })
 }
 
-/// [`ProcessLineage`] of `pid`, or `None` when no process holds it. One system call for this pid
-/// alone: nothing walks the process table, spawns a process or waits on the process's task, so a
-/// process stalled in the kernel cannot stall the reader, as it stalls `ps`.
-pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
+/// The kernel's BSD record of `pid` (`proc_pidinfo(PROC_PIDTBSDINFO)`), or `None` when no process
+/// holds it. One system call for this pid alone: nothing walks the process table, spawns a
+/// process or waits on the process's task, so a process stalled in the kernel cannot stall the
+/// reader, as it stalls `ps`.
+fn bsd_info(pid: libc::pid_t) -> io::Result<Option<libc::proc_bsdinfo>> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
         .map_err(io::Error::other)?;
@@ -326,7 +330,14 @@ pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
         };
     }
     // SAFETY: proc_pidinfo filled all `size` bytes.
-    let info = unsafe { info.assume_init() };
+    Ok(Some(unsafe { info.assume_init() }))
+}
+
+/// [`ProcessLineage`] of `pid`, or `None` when no process holds it, from its BSD record.
+pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
+    let Some(info) = bsd_info(pid)? else {
+        return Ok(None);
+    };
     Ok(Some(ProcessLineage {
         pid,
         ppid: libc::pid_t::try_from(info.pbi_ppid).map_err(io::Error::other)?,
@@ -335,24 +346,37 @@ pub fn lineage(pid: libc::pid_t) -> io::Result<Option<ProcessLineage>> {
     }))
 }
 
-/// The pids holding the group id `pgid`, exited processes included, as `proc_listpgrppids` lists
-/// them. A full buffer is never taken as the whole group: it is doubled and read again.
-pub fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+/// When process `pid` started, as its BSD record keeps it (`pbi_start_tvsec`, `pbi_start_tvusec`):
+/// fixed for the process's life, an exited and unreaped one's included, so with its pid it names
+/// one process. `None` once no process holds the pid.
+pub fn started(pid: libc::pid_t) -> io::Result<Option<SystemTime>> {
+    Ok(bsd_info(pid)?.map(|info| {
+        UNIX_EPOCH
+            + Duration::from_secs(info.pbi_start_tvsec)
+            + Duration::from_micros(info.pbi_start_tvusec)
+    }))
+}
+
+/// The pids libproc's `list` writes into the buffer it is given, of `bytes` bytes, returning how
+/// many it wrote. A full buffer is never taken as the whole list: it is doubled and read again.
+/// `what` names the list in an error.
+fn listed_pids(
+    what: &str,
+    list: impl Fn(*mut libc::c_void, libc::c_int) -> libc::c_int,
+) -> io::Result<Vec<libc::pid_t>> {
     let mut pids = vec![0; 32];
     loop {
         let bytes =
             i32::try_from(std::mem::size_of_val(pids.as_slice())).map_err(io::Error::other)?;
-        // SAFETY: errno is thread-local; libproc writes at most `bytes` into this live slice.
-        let count = unsafe {
-            *libc::__error() = 0;
-            libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes)
-        };
+        // SAFETY: errno is thread-local.
+        unsafe { *libc::__error() = 0 };
+        let count = list(pids.as_mut_ptr().cast(), bytes);
         if count <= 0 {
             let error = io::Error::last_os_error();
             return if count == 0 && error.raw_os_error() == Some(0) {
                 Ok(Vec::new())
             } else {
-                Err(error)
+                Err(io::Error::new(error.kind(), format!("{what}: {error}")))
             };
         }
         let count = usize::try_from(count).map_err(io::Error::other)?;
@@ -361,19 +385,35 @@ pub fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
             if pids.iter().any(|pid| *pid <= 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "process group membership contains an invalid pid",
+                    format!("{what} contains an invalid pid"),
                 ));
             }
             return Ok(pids);
         }
         let length = pids.len().checked_mul(2).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "process group membership overflowed",
-            )
+            io::Error::new(io::ErrorKind::InvalidData, format!("{what} overflowed"))
         })?;
         pids.resize(length, 0);
     }
+}
+
+/// The pids holding the group id `pgid`, exited processes included, as `proc_listpgrppids` lists
+/// them.
+pub fn group_pids(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    listed_pids("process group membership", |buffer, bytes| {
+        // SAFETY: listed_pids hands over live storage of `bytes` bytes, at most which libproc writes.
+        unsafe { libc::proc_listpgrppids(pgid, buffer, bytes) }
+    })
+}
+
+/// The pids whose parent is `pid`, exited and unreaped ones included, as `proc_listchildpids`
+/// lists them from the kernel's own parent links. A pid no process holds is no one's parent, so it
+/// has none.
+pub fn child_pids(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    listed_pids("the children of a process", |buffer, bytes| {
+        // SAFETY: listed_pids hands over live storage of `bytes` bytes, at most which libproc writes.
+        unsafe { libc::proc_listchildpids(pid, buffer, bytes) }
+    })
 }
 
 /// The CPU the processes of group `pgid` have used, each with its reaped children's, in the
@@ -446,7 +486,10 @@ pub fn group_members(pgid: libc::pid_t) -> io::Result<Vec<GroupMember>> {
 /// `pti_resident_size` of `proc_pidinfo(PROC_PIDTASKINFO)`, which answers `ESRCH` once the
 /// process has no task, not `ri_resident_size` of `proc_pid_rusage`, which still answers for an
 /// exited, unreaped process with the size it last held (measured: 1.1 MB for a zombie).
-pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+/// The task record of process `pid` (`proc_pidinfo(PROC_PIDTASKINFO)`); `None` once the kernel says
+/// no such process runs, which it says of an exited, unreaped process too: it has no task left.
+/// `what` names the reading in an error.
+fn task_info(pid: libc::pid_t, what: &str) -> io::Result<Option<libc::proc_taskinfo>> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>())
         .map_err(io::Error::other)?;
@@ -462,7 +505,7 @@ pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
     };
     if written == size {
         // SAFETY: proc_pidinfo filled all `size` bytes.
-        return Ok(Some(unsafe { info.assume_init() }.pti_resident_size));
+        return Ok(Some(unsafe { info.assume_init() }));
     }
     if written > 0 {
         return Err(io::Error::new(
@@ -477,10 +520,70 @@ pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
         Some(libc::ESRCH) => Ok(None),
         _ => Err(io::Error::new(
             error.kind(),
-            format!("the resident memory of process {pid} cannot be read: {error}"),
+            format!("the {what} of process {pid} cannot be read: {error}"),
         )),
     }
 }
+
+/// The bytes the process `pid` names holds resident now; `None` once the kernel says no such
+/// process runs. An exited process never counts as holding memory: this reads
+/// `pti_resident_size` of the task record, which answers `ESRCH` once the process has no task, not
+/// `ri_resident_size` of `proc_pid_rusage`, which still answers for an exited, unreaped process
+/// with the size it last held (measured: 1.1 MB for a zombie).
+pub fn resident_bytes(pid: libc::pid_t) -> io::Result<Option<u64>> {
+    Ok(task_info(pid, "resident memory")?.map(|info| info.pti_resident_size))
+}
+
+/// The CPU time the threads of process `pid` have used, user and system together; `None` once it
+/// has exited, an unreaped one included, or no process holds the pid. `pti_total_user` and
+/// `pti_total_system` of the task record count Mach ticks, which are nanoseconds on Intel and
+/// 125/3 ns on Apple silicon, so they are converted through the Mach timebase, never read as
+/// nanoseconds.
+pub fn cpu_time(pid: libc::pid_t) -> io::Result<Option<Duration>> {
+    let Some(info) = task_info(pid, "CPU time")? else {
+        return Ok(None);
+    };
+    let (numerator, denominator) = (*MACH_TICK).map_err(|status| {
+        io::Error::other(format!(
+            "the Mach timebase cannot be read: mach_timebase_info returned {status}"
+        ))
+    })?;
+    let ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
+    let nanoseconds = ticks * u128::from(numerator) / u128::from(denominator.get());
+    let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("process {pid}'s CPU time of {ticks} Mach ticks passes 2^64 ns"),
+        )
+    })?;
+    Ok(Some(Duration::from_nanos(nanoseconds)))
+}
+
+/// `struct mach_timebase_info` (`<mach/mach_time.h>`): one tick is `numer / denom` ns. The `libc`
+/// crate's declaration is deprecated in favour of another crate; this is all of it.
+#[repr(C)]
+struct MachTimebase {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebase) -> libc::c_int;
+}
+
+/// The length of one Mach tick, `numerator / denominator` ns, read once; the `kern_return_t` of a
+/// failed read, or `KERN_INVALID_VALUE` for a zero denominator.
+static MACH_TICK: LazyLock<Result<(u32, NonZeroU32), libc::c_int>> = LazyLock::new(|| {
+    let mut timebase = MachTimebase { numer: 0, denom: 0 };
+    // SAFETY: one writable timebase record.
+    let status = unsafe { mach_timebase_info(&raw mut timebase) };
+    if status != libc::KERN_SUCCESS {
+        return Err(status);
+    }
+    NonZeroU32::new(timebase.denom)
+        .map(|denominator| (timebase.numer, denominator))
+        .ok_or(libc::KERN_INVALID_VALUE)
+});
 
 /// The local ports of the TCP sockets in `LISTEN` that the descriptors of process `pid` hold,
 /// IPv4 and IPv6 alike, each port once. A socket that is merely bound, or connected, or of
