@@ -5250,6 +5250,77 @@ async fn progress_samples_a_silent_job_periodically_then_its_sealed_terminal_onc
     );
 }
 
+//#region cowshed!n/keyed-admission
+/// 07_api: Inline is identified by SHA-256 and length, not by a reader or a workspace path.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_large_finite_stdin_is_delivered_once_under_its_key() {
+    use cowshed_core::api::dto::{AdmissionKey, Sha256Digest, StdinKind};
+    use cowshed_core::error::{AdmissionField, AdmissionRefusal};
+    let root = test_root();
+    let supervisor = system_supervisor(&root);
+    let jobs = SupervisedJobs::connect(&root, supervisor).await;
+    let bytes = Bytes::from(
+        (0..414_027)
+            .map(|n| u8::try_from(n % 251).expect("byte"))
+            .collect::<Vec<_>>(),
+    );
+    let key = AdmissionKey::new("finite-input").expect("key");
+    let request = |stdin| ExecRequest {
+        command: ExecCommand::Argv(vec![CommandArg::from("/bin/cat")]),
+        stdin: StdinSource::Inline(stdin),
+        admission_key: Some(key.clone()),
+        ..gated_request(ExecClass::Background)
+    };
+    let (client, token) = Cowshed::connect(jobs.controller.endpoint().into())
+        .await
+        .expect("second connection");
+    let project = client.open(root.join("checkout")).await.expect("project");
+    let next = client
+        .coordinator(&project, token)
+        .expect("coordinator")
+        .worker("main")
+        .await
+        .expect("same workspace");
+    let (one, two) = tokio::join!(
+        jobs.worker.exec(request(bytes.clone())),
+        next.exec(request(bytes.clone()))
+    );
+    let job = one.expect("large finite stdin admitted");
+    assert_eq!(two.expect("concurrent identical admission").id(), job.id());
+    let ended = job.wait().await.expect("cat exits");
+    assert_eq!(
+        ended.exit,
+        Some(cowshed_core::api::ExitStatus::Exited { code: 0 })
+    );
+    assert_eq!(ended.stdin.kind, StdinKind::Inline);
+    assert!(ended.stdin.complete);
+    assert_eq!(ended.stdin.bytes, 414_027);
+    assert_eq!(ended.stdout.bytes, ended.stdin.bytes);
+    assert_eq!(ended.stdout.sha256, Sha256Digest::compute(&bytes));
+    let repeated = next
+        .exec(request(bytes.clone()))
+        .await
+        .expect("identical request after reconnect");
+    assert_eq!(repeated.id(), job.id());
+    let mut changed = bytes.to_vec();
+    changed[65_536] ^= 1;
+    for other in [Bytes::from(changed), bytes.slice(..bytes.len() - 1)] {
+        let refused = next
+            .exec(request(other))
+            .await
+            .expect_err("different input under the same key");
+        assert_eq!(
+            refused.admission_source(),
+            Some(&AdmissionRefusal::KeyConflict {
+                job_id: job.id(),
+                fields: vec![AdmissionField::Stdin]
+            })
+        );
+    }
+}
+//#endregion cowshed!n/keyed-admission
 /// The backend half of attachment stdin: an actual sandboxed child echoes a line before EOF,
 /// stops reading at a FIFO barrier, then echoes 4 MiB of binary input. A pipe write held behind
 /// already delivered bytes is not acknowledged or counted until the child starts reading again.
