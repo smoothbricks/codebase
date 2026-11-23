@@ -1536,19 +1536,26 @@ end, or a failed retirement held them.
 
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
 other verb that would run work there, because they cannot speak its protocol — except a land step (`exec --class gate`,
-`rebase`, `land`, the commands a land is made of), which waits for it. An install mid-train leaves the old build's
+`rebase`, `land`, the commands a land is made of), which waits for it, and every ensure of an embedder's
+`cowshed controller` (06_cli.md), which waits as a land step does. An install mid-train leaves the old build's
 supervisor serving whatever job ran then, and a land that failed on it would fail on a job that has nothing to do with
 the land: measured 2026-10-20, a land's `rebase` met main's supervisor of the replaced build serving a 16-minute job.
-The land step asks it to `drain` (already draining when this build's daemon recovered it), says on stderr which socket
-and pid it waits for, and waits on the exit watch registered before that `drain`, never a poll. The wait has one ceiling
-per step, an hour, which bounds only the step: past it the step refuses naming the pid, and the supervisor and its jobs
-run on. Neither the wait nor its refusal ends a job. The wait includes the supervisor's read-out after its last job
-(above), at most the 30-minute bound when a job's end goes unread. A lifecycle verb that must change the workspace's
-substrate — `detach`, `rm`, `resize`, `mv` — does not wait for it, since a drain lasts as long as its longest job. A
-lifecycle verb stops admission with `drain` and identifies the serving process from that exact connection's kernel peer
-credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only through that non-reusable
-identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process that reused the pid. A
-host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
+<a id="smoo/cowshed!n/embedder-awaits-other-build"></a>An embedder's controller has no operator behind it to read the
+refusal's pid and choose `kill`: measured 2026-11-23, an install drained a coder lane's supervisor, the lane's next
+command reached it through a fresh `cowshed controller` of the new build and was refused, and the coder's writer parked
+for 11 minutes on that refusal. So `cowshed controller` waits at each ensure as a land step does, under the same
+ceiling, said on stderr the same way, while its connection's heartbeats name the waiting op (05_gateway.md,
+"Deadlines"). A CLI verb is still refused at once with the pid and `kill`. The land step asks it to `drain` (already
+draining when this build's daemon recovered it), says on stderr which socket and pid it waits for, and waits on the exit
+watch registered before that `drain`, never a poll. The wait has one ceiling per step, an hour, which bounds only the
+step: past it the step refuses naming the pid, and the supervisor and its jobs run on. Neither the wait nor its refusal
+ends a job. The wait includes the supervisor's read-out after its last job (above), at most the 30-minute bound when a
+job's end goes unread. A lifecycle verb that must change the workspace's substrate — `detach`, `rm`, `resize`, `mv` —
+does not wait for it, since a drain lasts as long as its longest job. A lifecycle verb stops admission with `drain` and
+identifies the serving process from that exact connection's kernel peer credential, cross-checking the reply's pid. TERM
+and, after the existing grace, KILL go only through that non-reusable identity: a macOS audit token or Linux peer pidfd
+(kernel 6.5 or newer), never a later process that reused the pid. A host lacking that identity primitive gets a typed
+refusal, not a raw-pid fallback.
 
 The owner exit watch is registered before sending `drain` or a termination signal. On macOS, registration is followed by
 an actual kernel pid-version match, never a guessed numeric-pid or signal-zero probe; on Linux the watch duplicates the

@@ -100,7 +100,7 @@ pub fn take_inherited_socket() -> Result<OwnedFd> {
 pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     // Only this controller's selected recovery runs during open; workspace requests are fenced
     // by the Core actor before its job path reconciles any gateway state.
-    let runtime = ProjectRuntime::open_existing(
+    let runtime = ProjectRuntime::open_existing_for_embedder(
         project_root,
         RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
         crate::gateway_service::runtime_control,
