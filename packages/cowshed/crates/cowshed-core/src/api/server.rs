@@ -1351,6 +1351,18 @@ async fn serve_connection_with_waits<W: AsyncWrite + Unpin + Send + 'static>(
         tokio::select! {
             (reader, frame) = incoming.as_mut(), if !closing => {
                 let Some(frame) = frame? else {
+                    // The peer closed its end. A fatal refusal written just before that close has
+                    // ended too, and its error is how the connection ended; nothing else is
+                    // waited for. The connection runs on a thread of its own, so the close and
+                    // that answer's end may be ready together and either taken first.
+                    while let Some(outcome) = answers.try_join_next() {
+                        let (_, outcome) = outcome.map_err(|error| {
+                            CowshedError::internal(format!(
+                                "controller RPC answer task failed: {error}"
+                            ))
+                        })?;
+                        outcome?;
+                    }
                     return Ok(());
                 };
                 incoming.set(next_frame(reader));
