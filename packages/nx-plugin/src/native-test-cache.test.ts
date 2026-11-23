@@ -160,4 +160,108 @@ it('replays native NX results without binaries and builds only the missed select
     await absent('beta');
   });
 });
+
+it('prepares one real integration binary for five independent native selectors', async () => {
+  await withNxFixture('native-shared-prep', async ({ workspace, socketDirectory }) => {
+    const selectors = ['agent', 'generator', 'replay', 'provider', 'callback'];
+    const pluginRoot = fileURLToPath(new URL('../../../node_modules', import.meta.url));
+    await symlink(pluginRoot, join(workspace, 'node_modules'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['@smoothbricks/nx-plugin'] }));
+    const targets = Object.fromEntries(
+      selectors.map((name) => [
+        `test-${name}`,
+        {
+          executor: '@smoothbricks/nx-plugin:bounded-exec',
+          cache: true,
+          inputs: ['{projectRoot}/Cargo.toml', '{projectRoot}/Cargo.lock', '{projectRoot}/tests/**/*.rs'],
+          options: {
+            nativeTest: {
+              cargoArgs: ['-p', 'native-probe', '--test', 'integration'],
+              selectionArgs: ['-E', `test(=${name}_case)`],
+            },
+          },
+        },
+      ]),
+    );
+    await writeFile(
+      join(workspace, 'package.json'),
+      JSON.stringify({ name: 'native-probe', private: true, nx: { targets } }),
+    );
+    await writeFile(
+      join(workspace, 'Cargo.toml'),
+      '[package]\nname="native-probe"\nversion="0.1.0"\nedition="2021"\n',
+    );
+    await writeFile(join(workspace, '.gitignore'), 'node_modules/\ntarget/\n.nx/\n*.log\n.bin/\n');
+    await mkdir(join(workspace, 'tests'));
+    await mkdir(join(workspace, '.bin'));
+    await mkdir(socketDirectory, { recursive: true });
+    const source = join(workspace, 'tests/integration.rs');
+    const fixtureSource = (version: string) =>
+      selectors
+        .map(
+          (name) => `#[test] fn ${name}_case() {
+            let path = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+            let root = std::path::Path::new(&path);
+            std::fs::write(root.join("${name}.log"), "${version}").unwrap();
+          }\n`,
+        )
+        .join('');
+    await writeFile(source, fixtureSource('initial'));
+    const toolPath = (process.env.PATH ?? '')
+      .split(':')
+      .filter((directory) => directory !== process.env.COWSHED_CARGO_ROUTE)
+      .join(':');
+    const cargo = Bun.which('cargo', { PATH: toolPath });
+    if (cargo === null) throw new Error('the fixture requires real Cargo');
+    const trace = join(workspace, 'prep.log');
+    await writeFile(
+      join(workspace, '.bin/cargo'),
+      `#!/bin/sh
+case " $* " in
+  *' nextest list '*' --list-type binaries-only '*) printf '%s\\n' "$*" >>"$NATIVE_PREP_TRACE" ;;
+esac
+exec "$NATIVE_REAL_CARGO" "$@"
+`,
+      { mode: 0o755 },
+    );
+    const env = {
+      ...fixtureNxEnv(workspace, socketDirectory),
+      TMPDIR: socketDirectory,
+      PATH: `${join(workspace, '.bin')}:${toolPath}`,
+      NATIVE_PREP_TRACE: trace,
+      NATIVE_REAL_CARGO: cargo,
+    };
+    const run = async (args: string[]) => {
+      const child = Bun.spawn(args, { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' });
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(code, stdout + stderr).toBe(0);
+    };
+    await run(['git', 'init', '--quiet']);
+    await run(['cargo', 'generate-lockfile', '--offline']);
+    const nx = () =>
+      run(['bun', 'nx', 'run-many', '-p', 'native-probe', '-t', ...Object.keys(targets), '--outputStyle=static']);
+    const observed = () => readFile(trace, 'utf8').then((log) => log.trim().split('\n'));
+    await nx();
+    for (const name of selectors) {
+      expect(await readFile(join(workspace, `${name}.log`), 'utf8')).toBe('initial');
+      expect(
+        await readRecord(taskDirectory(join(workspace, '.nx/workspace-data'), `native-probe:test-${name}`)),
+      ).toMatchObject({ verdict: { outcome: 'passed' } });
+    }
+    expect(await observed()).toHaveLength(1);
+
+    await nx();
+    expect(await observed()).toHaveLength(1);
+    await writeFile(source, fixtureSource('revised build input'));
+    await nx();
+    expect(await observed()).toHaveLength(2);
+    for (const name of selectors) {
+      expect(await readFile(join(workspace, `${name}.log`), 'utf8')).toBe('revised build input');
+    }
+  });
+});
 //#endregion smoo/cowshed!n/native-test-verdicts
