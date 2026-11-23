@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/procinfo",
-  "version": "0.1.0",
+  "version": "0.1.1-next.0",
   "description": "Host process facts read natively on macOS and Linux: no ps or lsof spawn, no process-table census",
   "type": "module",
   "sideEffects": false,

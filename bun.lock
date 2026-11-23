@@ -99,7 +99,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.13.22",
+      "version": "0.13.23-next.0",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -329,7 +329,7 @@
     },
     "packages/nx-plugin": {
       "name": "@smoothbricks/nx-plugin",
-      "version": "0.7.21",
+      "version": "0.7.22-next.0",
       "bin": {
         "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js",
         "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
@@ -380,7 +380,7 @@
     },
     "packages/procinfo": {
       "name": "@smoothbricks/procinfo",
-      "version": "0.1.0",
+      "version": "0.1.1-next.0",
       "devDependencies": {
         "@napi-rs/cli": "3.7.3",
         "@types/node": "catalog:",
