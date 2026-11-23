@@ -17,7 +17,7 @@
 
 use cowshed_os::test_backstop::ChildBackstop as _;
 use std::io::Read as _;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
