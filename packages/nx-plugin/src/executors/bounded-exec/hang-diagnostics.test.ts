@@ -29,6 +29,8 @@ interface FakeProcess {
   /** The CPU time it has used, in ms; null is a reading procinfo refuses. */
   readonly cpuMs?: number | null;
   readonly startedUs?: number;
+  /** procinfo could not read its arguments in time and answered its command name alone. */
+  readonly nameOnly?: boolean;
   readonly command: string;
 }
 const root: FakeProcess = { pid: ROOT, ppid: 1, command: 'runner --test selected' };
@@ -110,7 +112,11 @@ function readerOf(table: () => readonly FakeProcess[], groups = true): { reader:
       const entry = find(pid);
       if (entry === undefined) throw refused(`no process ${pid}`);
       const argv = entry.command.split(' ').map((argument) => text.encode(argument));
-      return { executable: argv[0] ?? new Uint8Array(), argv };
+      return {
+        executable: argv[0] ?? new Uint8Array(),
+        argv: entry.nameOnly ? argv.slice(0, 1) : argv,
+        nameOnly: entry.nameOnly ?? false,
+      };
     },
     cpuTimeNs(pid) {
       const entry = find(pid);
@@ -255,6 +261,20 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain(child.command);
     expect(capture.text).not.toContain(reparented.command);
     expect(capture.text).toContain('group 101 is not listed on linux');
+  });
+
+  it('names a process whose arguments procinfo could not read in time by its command name, and keeps its identity', async () => {
+    const stuck: FakeProcess = { ...grandchild, state: { state: 'uninterruptible' }, nameOnly: true };
+    const { host } = scriptedHost(
+      [
+        [root, child, stuck],
+        [root, child, grandchild],
+      ],
+      [exited('', 1)],
+    );
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.text).toContain('grandchild (command name only: its arguments were not read in time)');
+    expect(capture.text).not.toContain('identities or membership changed');
   });
   //#endregion smoo/cowshed!n/hang-snapshot-tree
 

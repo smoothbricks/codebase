@@ -392,7 +392,6 @@ export function captureHangDiagnostics(
                 other.ppid === entry.ppid &&
                 other.pgid === entry.pgid &&
                 other.startedUs === entry.startedUs &&
-                other.command === entry.command &&
                 zombie(other) === zombie(entry),
             ),
         )
@@ -443,12 +442,16 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** A process's argument vector as one command line, its control characters (a script's newlines) each a space so it stays on its row, else the executable the kernel records for it. */
+/**
+ * A process's argument vector as one command line, its control characters (a script's newlines) each a space so it
+ * stays on its row, else the executable the kernel records for it. A vector procinfo could not read in time is the
+ * command name alone, and says so.
+ */
 function commandLine(read: ProcessArguments): string {
   const text = new TextDecoder();
   const argv = read.argv.map((argument) => text.decode(argument));
-  const line = argv.length > 0 ? argv.join(' ') : text.decode(read.executable);
-  return line.replace(/\p{Cc}/gu, ' ');
+  const line = (argv.length > 0 ? argv.join(' ') : text.decode(read.executable)).replace(/\p{Cc}/gu, ' ');
+  return read.nameOnly ? `${line} (command name only: its arguments were not read in time)` : line;
 }
 
 /**
