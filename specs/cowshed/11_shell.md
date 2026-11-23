@@ -1151,8 +1151,14 @@ handles are `ForeignHandle`, and an operational failure retains the capability f
 The existing monitor writer retires the root and its retained descendants, including children reparented after the root
 exited. It never expands a subtree into the whole job group: sibling commands stay alive. A naturally ended subtree's
 first retirement succeeds with no signal rows and then spends its capability. TERM/grace/KILL joins native exits before
-success. The receipt is `Observed { lost }`, never a Darwin completeness claim; its `outlived` rows name the lives
-signalled, not survivors. Those rows also remain in the whole job's later terminal receipt. The same
+
+success. The receipt is `Observed { lost }`, never a Darwin completeness claim. Its `lost` holds the adoptions missed
+under the subtree's own lives (a fork of one of them whose children could not be listed, a listed child of one that
+could not be watched) and every loss of the event source, which can hide a birth anywhere; an adoption missed under a
+sibling is the sibling's and the whole job's, so a command's receipt does not grow with the forks of the commands beside
+it. Its `outlived` rows name the lives signalled, not survivors. Those rows also remain in the whole job's later
+terminal receipt. The same
+
 `outlivedIncomplete` vocabulary distinguishes incomplete native kill metadata from membership proof.
 
 Custody-only admission and retirement fold the same native fork and exit events without reading current argv or final

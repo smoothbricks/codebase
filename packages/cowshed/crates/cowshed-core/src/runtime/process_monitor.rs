@@ -1258,10 +1258,13 @@ impl<P: ProcessReads> Writer<P> {
         if matches!(scope, RetirementScope::Job(_)) {
             self.signalled.clear();
         }
+
+        let lost = self.observer.missed(match scope {
+            RetirementScope::Subtree(root) => Some(root),
+            RetirementScope::Job(_) => None,
+        });
         JobProcessRetirement {
-            containment: JobContainment::Observed {
-                lost: self.observer.missed().to_vec(),
-            },
+            containment: JobContainment::Observed { lost },
             outlived,
             outlived_incomplete: false,
         }

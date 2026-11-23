@@ -313,10 +313,12 @@ pub struct KqueueObserver<P = Darwin> {
     /// Every life with a registration and the watch the source holds of it: its reports are the
     /// only ones the observer folds.
     registered: HashMap<ProcessIdentity, Watch>,
-    /// Each adoption the observer saw it miss: a fork whose children could not be listed before
-    /// its parent's life ended, or a listed child that could not be watched. Such a child may run
-    /// on outside every registration; a retirement reports these as its `lost`.
-    missed: Vec<ProcessCoverageGap>,
+    /// Each adoption the observer saw it miss, with the member it was missed under: a fork whose
+    /// children could not be listed before its parent's life ended, or a listed child that could
+    /// not be watched, each under the forking parent. Such a child may run on outside every
+    /// registration; a retirement reports these as its `lost`. A loss of the event source is
+    /// under no member: it can hide a birth anywhere in the job.
+    missed: Vec<(Option<ProcessIdentity>, ProcessCoverageGap)>,
     /// The batch of reports being folded, kept between batches for its allocation.
     reports: Vec<Result<Report, ObserveError>>,
 }
@@ -455,7 +457,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
         // An explicit event-source loss can hide births as well as exits. Keep it in the
         // containment receipt even if an earlier metadata gap already set tree coverage.
         if reason == ProcessCoverageGap::EventsLost {
-            self.missed.push(reason);
+            self.missed.push((None, reason));
         }
         self.observe(ProcessObservation::Lost(reason))
     }
@@ -703,9 +705,19 @@ impl<P: ProcessReads> KqueueObserver<P> {
             .map_err(|source| kernel(platform::SIGNAL, process.pid, source))
     }
 
-    /// Every adoption this observer saw it miss, in the order it missed them.
-    pub(crate) fn missed(&self) -> &[ProcessCoverageGap] {
-        &self.missed
+    /// The adoptions this observer saw it miss, in the order it missed them: every one of the
+    /// job (`None`), or those a retirement of the subtree under `root` answers for, which are the
+    /// ones missed under a life of that subtree and every loss of the event source.
+    pub(crate) fn missed(&self, under: Option<ProcessIdentity>) -> Vec<ProcessCoverageGap> {
+        let lives = self.fold.lives();
+        self.missed
+            .iter()
+            .filter(|&&(member, _)| match (under, member) {
+                (Some(root), Some(member)) => lives.in_subtree(root, member),
+                (None, _) | (_, None) => true,
+            })
+            .map(|&(_, gap)| gap)
+            .collect()
     }
 
     fn drain_into(&mut self, failures: &mut Failures, purpose: ObservationPurpose) {
@@ -912,8 +924,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
         match self.children(parent) {
             Ok(Some(children)) => self.adopt_each(parent, children, purpose),
             unlisted => {
-                self.missed
-                    .push(ProcessCoverageGap::UncountedFork { pid: parent.pid });
+                self.missed.push((
+                    Some(parent),
+                    ProcessCoverageGap::UncountedFork { pid: parent.pid },
+                ));
                 // The gap is already recorded above: a failed list is returned beside it.
                 unlisted.map(|_| ()).map_err(|cause| ObserveError::Unread {
                     gap: ProcessCoverageGap::UncountedFork { pid: parent.pid },
@@ -949,8 +963,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
         for child in children {
             let adopted = self.adopt(parent, child, purpose);
             if adopted.is_err() && self.fold.lives().live(child).is_none() {
-                self.missed
-                    .push(ProcessCoverageGap::UnobservedBirth { pid: child });
+                self.missed.push((
+                    Some(parent),
+                    ProcessCoverageGap::UnobservedBirth { pid: child },
+                ));
             }
             failures.note(adopted);
         }
@@ -1586,7 +1602,7 @@ mod tests {
                 reason: ProcessCoverageGap::UnobservedBirth { pid }
             }
         );
-        assert!(observer.missed().is_empty(), "{:?}", observer.missed());
+        assert_eq!(observer.missed(None), []);
         let refused = observer.owned(&leader).expect_err("an unread membership");
         assert_eq!(failed(&refused), (platform::GROUP, pid, Some(libc::EPERM)));
 
@@ -1628,7 +1644,7 @@ mod tests {
             )
             .expect("a parent gone before its list is no read failure");
         assert_eq!(
-            observer.missed(),
+            observer.missed(None),
             [ProcessCoverageGap::UncountedFork { pid: 800 }]
         );
 
@@ -1650,9 +1666,64 @@ mod tests {
             .expect_err("the child's record read failed");
         assert_eq!(failed(&error), (platform::RECORD, 901, Some(libc::EIO)));
         assert_eq!(
-            observer.missed(),
+            observer.missed(None),
             [ProcessCoverageGap::UnobservedBirth { pid: 901 }]
         );
+    }
+
+    /// A subtree's retirement answers for the adoptions missed under its own lives and for a loss
+    /// of the event source, which names no life; a sibling's missed fork is the sibling's and the
+    /// whole job's (07_api.md: "Subtree scope is the retained root and its descendants ... not
+    /// siblings").
+    #[test]
+    fn a_subtree_s_lost_adoptions_are_those_missed_under_its_own_lives() {
+        let (root, ours, sibling) = (life(800, 1), life(901, 2), life(902, 3));
+        let mut fold = TestFold::default();
+        let at = utc_at_second(1_700_000_000).unwrap();
+        fold.apply(ProcessObservation::Root {
+            process: root,
+            ppid: 1,
+            at: at.clone(),
+            image: shell_image("/bin/bash"),
+        })
+        .unwrap();
+        for process in [ours, sibling] {
+            fold.apply(ProcessObservation::Forked {
+                process,
+                parent: root,
+                at: at.clone(),
+            })
+            .unwrap();
+        }
+        // The sibling forked and its life ended before its children could be listed.
+        let reads = Scripted::default().record(902, &[None]);
+        let mut observer = scripted(reads, fold, &[root, ours, sibling]);
+        observer
+            .fold_report(
+                Report {
+                    forked: true,
+                    ..report(sibling)
+                },
+                ObservationPurpose::Metadata,
+            )
+            .expect("a parent gone before its list is no read failure");
+        observer.gap(ProcessCoverageGap::EventsLost).unwrap();
+
+        let missed_fork = ProcessCoverageGap::UncountedFork { pid: 902 };
+        assert_eq!(
+            observer.missed(Some(ours)),
+            [ProcessCoverageGap::EventsLost]
+        );
+        assert_eq!(
+            observer.missed(Some(sibling)),
+            [missed_fork, ProcessCoverageGap::EventsLost]
+        );
+        for whole in [Some(root), None] {
+            assert_eq!(
+                observer.missed(whole),
+                [missed_fork, ProcessCoverageGap::EventsLost]
+            );
+        }
     }
 
     /// An image or child list read while the pid changed life is a stranger's and is never
