@@ -123,11 +123,13 @@ pub fn run_state(env: Env, pid: i32) -> napi::Result<RunState> {
     Ok(procinfo::run_state(pid).into())
 }
 
-/// A process's executable path and its byte-exact argument vector, as the kernel records them.
+/// A process's executable path and its byte-exact argument vector, as the kernel records them;
+/// `nameOnly` when the vector could not be read within its bound and `argv` is the command name.
 #[napi(object)]
 pub struct ProcessArguments {
     pub executable: Buffer,
     pub argv: Vec<Buffer>,
+    pub name_only: bool,
 }
 
 /// The executable and arguments of the process `pid`, byte for byte.
@@ -139,6 +141,7 @@ pub fn process_arguments(env: Env, pid: i32) -> napi::Result<ProcessArguments> {
     Ok(ProcessArguments {
         executable: read.executable.into(),
         argv: read.argv.into_iter().map(Buffer::from).collect(),
+        name_only: read.name_only,
     })
 }
 

@@ -1,5 +1,6 @@
 //! Linux's readings of a process: procfs (`/proc/<pid>/stat`, `status`, `statm`, `exe`,
-//! `cmdline`, `fd` and `net/tcp`).
+//! `cmdline`, `comm`, `fd` and `net/tcp`). `cmdline` alone waits on the process's own state, its
+//! memory map, so it is read on procinfo's reader thread under a bound ([`bounded_cmdline`]).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -91,11 +92,37 @@ fn status_field<'a>(status: &'a [u8], field: &str) -> Option<&'a [u8]> {
     })
 }
 
+/// How long a read of a process's `cmdline` may take. The kernel copies it out of the process's
+/// memory under the process's memory-map lock (`access_remote_vm`), which a thread of it stalled
+/// in a page fault, or a writer queued behind one, holds for as long as it is stalled. Unheld, the
+/// read takes microseconds; the bound leaves a loaded host's scheduler room to run the reader.
+const CMDLINE_BOUND: Duration = Duration::from_millis(250);
+
+static CMDLINE_READER: crate::bounded::BoundedReader = crate::bounded::BoundedReader::new();
+
+/// The `cmdline` of process `pid`, read on procinfo's reader thread; `None` when the read gave no
+/// answer within [`CMDLINE_BOUND`], its thread left to finish it.
+fn bounded_cmdline(pid: libc::pid_t) -> io::Result<Option<io::Result<Vec<u8>>>> {
+    let path = format!("/proc/{pid}/cmdline");
+    CMDLINE_READER.read(CMDLINE_BOUND, move || std::fs::read(path))
+}
+
+/// The kernel's name for process `pid` (`/proc/<pid>/comm`): it keeps the name in the task and
+/// hands it out under the task's own lock, never the memory map's.
+fn command_name(pid: libc::pid_t) -> io::Result<Vec<u8>> {
+    let mut name = std::fs::read(format!("/proc/{pid}/comm"))?;
+    if name.last() == Some(&b'\n') {
+        name.pop();
+    }
+    Ok(name)
+}
+
 /// [`process_arguments`] from procfs: the executable is the image the kernel records
 /// (`/proc/<pid>/exe`: the resolved path of the file exec'd, with the kernel's ` (deleted)` after
-/// one since unlinked), and the argument vector is `/proc/<pid>/cmdline`. Fails for a process
-/// that has exited, reaped or not, which has neither, and for one whose image this user may not
-/// read (another user's, or one that made itself undumpable).
+/// one since unlinked), and the argument vector is `/proc/<pid>/cmdline`, read under
+/// [`CMDLINE_BOUND`]; past it the vector is the command name alone, `name_only`. Fails for a
+/// process that has exited, reaped or not, which has neither, and for one whose image this user
+/// may not read (another user's, or one that made itself undumpable).
 pub fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
     use std::os::unix::ffi::OsStringExt as _;
 
@@ -111,8 +138,16 @@ pub fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
     };
     let mut executable = image()?;
     loop {
-        let line = std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map_err(|error| unreadable("arguments", error))?;
+        let Some(line) = bounded_cmdline(pid).map_err(|error| unreadable("arguments", error))?
+        else {
+            let name = command_name(pid).map_err(|error| unreadable("command name", error))?;
+            return Ok(ProcessArguments {
+                executable: executable.into_os_string().into_vec(),
+                argv: vec![name],
+                name_only: true,
+            });
+        };
+        let line = line.map_err(|error| unreadable("arguments", error))?;
         // Two files are two moments. An exec between them pairs one image with another's
         // arguments, and an exit leaves an empty line: the image read once more tells either.
         let after = image()?;
@@ -120,6 +155,7 @@ pub fn process_arguments(pid: libc::pid_t) -> io::Result<ProcessArguments> {
             return Ok(ProcessArguments {
                 executable: executable.into_os_string().into_vec(),
                 argv: arguments(&line),
+                name_only: false,
             });
         }
         executable = after;
@@ -373,16 +409,24 @@ pub fn running_members(pids: Vec<libc::pid_t>) -> Vec<GroupMember> {
             if matches!(state, RunState::Gone | RunState::Zombie) {
                 return None;
             }
-            let command = std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
-                |error| format!("command unread: {error}"),
-                |line| {
-                    line.split(|byte| *byte == 0)
-                        .filter(|argument| !argument.is_empty())
-                        .map(String::from_utf8_lossy)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                },
-            );
+            let command = match bounded_cmdline(pid) {
+                Ok(Some(Ok(line))) => line
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .map(String::from_utf8_lossy)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Ok(Some(Err(error))) | Err(error) => format!("command unread: {error}"),
+                Ok(None) => command_name(pid).map_or_else(
+                    |error| format!("command unread: {error}"),
+                    |name| {
+                        format!(
+                            "{} (arguments not read within {CMDLINE_BOUND:?})",
+                            String::from_utf8_lossy(&name)
+                        )
+                    },
+                ),
+            };
             Some(GroupMember {
                 pid,
                 command,
@@ -836,6 +880,7 @@ mod tests {
                     .into_os_string()
                     .into_vec(),
                 argv: argv(&[b"/bin/sh", b"-c", b"echo x; read _", b"", b"\xff\xfe"]),
+                name_only: false,
             }
         );
         assert!(reaped.is_err(), "{reaped:?}");

@@ -132,6 +132,7 @@ describe('processArguments', () => {
     const text = new TextDecoder();
     expect(read.argv.map((argument) => text.decode(argument))).toEqual(['/bin/sh', '-c', script, 'name', '']);
     expect(read.executable.length).toBeGreaterThan(0);
+    expect(read.nameOnly).toBe(false);
   });
 });
 

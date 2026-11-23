@@ -7,6 +7,8 @@ use std::fmt;
 use std::sync::LazyLock;
 use std::time::Instant;
 
+#[cfg(any(target_os = "linux", test))]
+mod bounded;
 mod host_load;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -39,10 +41,14 @@ pub use linux::{running_members, stat_lineage};
 /// A process's executable path and its byte-exact argument vector, as the kernel reports them
 /// ([`process_arguments`]). The executable is the kernel's own record of the image, never
 /// `argv[0]`: on Darwin the path exec was given, on Linux the resolved path of the file exec'd.
+/// `name_only` says the vector could not be read within its bound (Linux, where `cmdline` waits on
+/// the process's memory map, which a process stalled in the kernel holds): `argv` is then the
+/// kernel's command name for the process (`comm`) alone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessArguments {
     pub executable: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
+    pub name_only: bool,
 }
 
 /// What the kernel shows a process doing, as `ps` names its state. A wait on a process that gave
@@ -463,5 +469,33 @@ mod tests {
         assert_eq!(exited.1.expect("read the zombie"), None);
         assert_eq!(reaped.0.expect("read the reaped pid"), None);
         assert_eq!(reaped.1.expect("read the reaped pid"), None);
+    }
+
+    /// A read that does not answer within its bound is given up: its caller is answered at the
+    /// bound, and the next read runs on a fresh reader thread, never queued behind the stuck one.
+    /// A read that panics is an error, and the reader serves the next one.
+    #[test]
+    fn a_read_past_its_bound_is_given_up_and_holds_no_later_read() {
+        let reader = crate::bounded::BoundedReader::new();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let stuck = reader
+            .read(std::time::Duration::from_millis(50), move || {
+                held.recv().is_ok()
+            })
+            .expect("read");
+        let next = reader
+            .read(std::time::Duration::from_secs(10), || 7)
+            .expect("read");
+        release.send(()).expect("release the stuck read");
+        let failed = reader.read(std::time::Duration::from_secs(10), || -> u8 {
+            panic!("a read that fails")
+        });
+        let after = reader
+            .read(std::time::Duration::from_secs(10), || 9)
+            .expect("read");
+        assert_eq!(stuck, None);
+        assert_eq!(next, Some(7));
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(after, Some(9));
     }
 }

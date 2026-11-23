@@ -169,6 +169,7 @@ fn parse_procargs(buffer: &[u8]) -> Result<ProcessArguments, UnreadableProcargs>
     Ok(ProcessArguments {
         executable: executable.to_vec(),
         argv,
+        name_only: false,
     })
 }
 
@@ -1188,6 +1189,7 @@ mod tests {
         ProcessArguments {
             executable: executable.to_vec(),
             argv: argv.iter().map(|argument| argument.to_vec()).collect(),
+            name_only: false,
         }
     }
 

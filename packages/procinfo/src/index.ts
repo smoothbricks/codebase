@@ -27,7 +27,16 @@ export type RunState =
   | { readonly state: 'unread'; readonly reason: string };
 
 /** A process's executable path and its byte-exact argument vector, as the kernel records them. */
-export type ProcessArguments = { readonly executable: Uint8Array; readonly argv: readonly Uint8Array[] };
+/**
+ * A process's executable path and its byte-exact argument vector, as the kernel records them. `nameOnly` says the
+ * vector could not be read within its bound (Linux, where `cmdline` waits on the process's memory map, which a process
+ * stalled in the kernel holds): `argv` is then the kernel's command name alone.
+ */
+export type ProcessArguments = {
+  readonly executable: Uint8Array;
+  readonly argv: readonly Uint8Array[];
+  readonly nameOnly: boolean;
+};
 
 /** One running process of a group: its pid, its command line and what the kernel shows it doing. */
 export type GroupMember = { readonly pid: number; readonly command: string; readonly state: RunState };
