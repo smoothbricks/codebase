@@ -95,7 +95,8 @@ pub(crate) fn processes_in(root: &Path) -> io::Result<Vec<(u32, PathBuf)>> {
 }
 
 fn working_directory(pid: u32) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    procinfo::directories(pid).ok().flatten()?.cwd
 }
 
 /// `pid`'s executable as procfs names it, for the report of a process being ended.

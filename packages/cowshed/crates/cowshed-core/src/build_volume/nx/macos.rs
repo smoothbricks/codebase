@@ -307,44 +307,35 @@ fn hold_in_tree(pid: libc::pid_t, root: &Path) -> io::Result<Option<Hold>> {
         .map(Hold::OpenFile))
 }
 
-/// `pid`'s working directory and root directory (`PROC_PIDVNODEPATHINFO`). A process the kernel
+/// `pid`'s working directory and root directory (`procinfo::directories`). A process the kernel
 /// withholds from this user, or that exited, names none.
 fn directories(pid: libc::pid_t) -> io::Result<Vec<Hold>> {
-    let size = c_size::<libc::proc_vnodepathinfo>()?;
-    // SAFETY: `proc_vnodepathinfo` is plain C data (integers and byte arrays), for which all
-    // zeros is a valid value; it is read only when the kernel fills all of it, as checked below.
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
+    let dirs = match procinfo::directories(pid) {
+        Ok(Some(dirs)) => dirs,
+        Ok(None) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    if filled != size {
-        return Ok(Vec::new());
-    }
     Ok([
-        c_path(info.pvi_cdir.vip_path.as_flattened()).map(Hold::WorkingDirectory),
-        c_path(info.pvi_rdir.vip_path.as_flattened()).map(Hold::RootDirectory),
+        dirs.cwd.map(Hold::WorkingDirectory),
+        dirs.root.map(Hold::RootDirectory),
     ]
     .into_iter()
     .flatten()
     .collect())
 }
 
-/// The path of each open vnode descriptor of `pid` ([`vnode_descriptors`]), then one
-/// `PROC_PIDFDVNODEPATHINFO` call per vnode. A descriptor closed since the listing names none, and
-/// an event-only open (`O_EVTONLY`: FSEvents, Spotlight, a file watcher) holds nothing, as
-/// `volume_holders` leaves it out.
+/// The path of each open vnode descriptor of `pid` (`procinfo::open_paths`). A descriptor closed
+/// since the listing names none, and an event-only open (`O_EVTONLY`: FSEvents, Spotlight, a file
+/// watcher) holds nothing, as `volume_holders` leaves it out.
 fn open_vnodes(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
-    let vinfo_size = c_size::<VnodeFdinfoWithPath>()?;
-    Ok(vnode_descriptors(pid)?
+    let Ok(paths) = procinfo::open_paths(pid)? else {
+        return Ok(Vec::new());
+    };
+    Ok(paths
         .into_iter()
-        .filter_map(|fd| vnode_fd_path(pid, fd, vinfo_size))
+        .filter(|entry| !entry.event_only)
+        .map(|entry| entry.path)
         .collect())
 }
 
@@ -436,51 +427,13 @@ fn vnode_fd_identity(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Op
 }
 
 /// `sys/proc_info.h`'s `struct vnode_fdinfo`, which libc 0.2 does not bind: the 24-byte
-/// `proc_fileinfo` head [`VnodeFdinfoWithPath`] also has, then the vnode's attributes.
+/// `proc_fileinfo` head whose first field is the descriptor's open flags, then the vnode's
+/// attributes.
 #[repr(C)]
 struct VnodeFdinfo {
     pfi_openflags: u32,
     _pfi_rest: [u8; 20],
     pvi: libc::vnode_info,
-}
-
-/// The path of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEPATHINFO`), or `None` if the kernel
-/// names none or the descriptor is an event-only open. `size` is `VnodeFdinfoWithPath`'s size:
-/// the kernel fills exactly that or nothing.
-fn vnode_fd_path(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Option<PathBuf> {
-    // libc 0.2 binds neither this flavor nor `vnode_fdinfowithpath`; `sys/proc_info.h` defines
-    // the flavor as 2.
-    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
-    let mut info = VnodeFdinfoWithPath {
-        pfi_openflags: 0,
-        _pfi_rest: [0; 20],
-        // SAFETY: `vnode_info_path` is plain C data (integers and byte arrays), for which all
-        // zeros is a valid value; it is read only when the kernel fills all of it, as checked.
-        pvip: unsafe { std::mem::zeroed() },
-    };
-    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
-    let filled = unsafe {
-        libc::proc_pidfdinfo(
-            pid,
-            fd,
-            PROC_PIDFDVNODEPATHINFO,
-            std::ptr::from_mut(&mut info).cast(),
-            size,
-        )
-    };
-    if filled != size || info.pfi_openflags & O_EVTONLY != 0 {
-        return None;
-    }
-    c_path(info.pvip.vip_path.as_flattened())
-}
-
-/// `sys/proc_info.h`'s `struct vnode_fdinfowithpath`, which libc 0.2 does not bind: a 24-byte
-/// `proc_fileinfo` head whose first field is the descriptor's open flags, then the vnode's path.
-#[repr(C)]
-struct VnodeFdinfoWithPath {
-    pfi_openflags: u32,
-    _pfi_rest: [u8; 20],
-    pvip: libc::vnode_info_path,
 }
 
 /// `fcntl.h`'s `O_EVTONLY` as `proc_fileinfo.fi_openflags` carries it: an open for event

@@ -196,16 +196,24 @@ pub fn tree_holds(census: &CensusScope, root: &Path) -> io::Result<Vec<TreeHold>
     let mut holds = Vec::new();
     for pid in census_pids(census)?.pids {
         let process = PathBuf::from(format!("/proc/{pid}"));
-        let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(under);
-        let hold = link("cwd")
+        let dirs = procinfo::directories(pid).ok().flatten();
+        let hold = dirs
+            .as_ref()
+            .and_then(|dirs| dirs.cwd.as_ref().filter(|path| path.starts_with(&root)))
+            .cloned()
             .map(Hold::WorkingDirectory)
-            .or_else(|| link("root").map(Hold::RootDirectory))
-            .or_else(|| link("exe").map(Hold::Executable))
             .or_else(|| {
-                fs::read_dir(process.join("fd"))
+                dirs.and_then(|dirs| dirs.root)
+                    .filter(|path| path.starts_with(&root))
+                    .map(Hold::RootDirectory)
+            })
+            .or_else(|| executable(pid).and_then(under).map(Hold::Executable))
+            .or_else(|| {
+                procinfo::open_paths(pid)
                     .ok()?
-                    .flatten()
-                    .find_map(|descriptor| fs::read_link(descriptor.path()).ok().and_then(under))
+                    .ok()?
+                    .into_iter()
+                    .find_map(|entry| under(entry.path))
                     .map(Hold::OpenFile)
             })
             // A mapping's path is its line's last field and the line's first `/`: the

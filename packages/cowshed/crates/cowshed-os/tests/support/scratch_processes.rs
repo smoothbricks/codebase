@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -66,27 +65,7 @@ pub(crate) fn processes_in(
 }
 
 fn working_directory(pid: libc::pid_t) -> Option<PathBuf> {
-    let size = libc::c_int::try_from(size_of::<libc::proc_vnodepathinfo>()).ok()?;
-    // SAFETY: `proc_vnodepathinfo` is plain data, for which all zeroes is a value.
-    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for `size` bytes, the size passed.
-    let filled = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            (&raw mut info).cast(),
-            size,
-        )
-    };
-    if filled != size {
-        return None;
-    }
-    let path = info.pvi_cdir.vip_path.as_flattened();
-    // SAFETY: `c_char` and `u8` have one size and alignment; the slice is `path` itself.
-    let path = unsafe { std::slice::from_raw_parts(path.as_ptr().cast::<u8>(), path.len()) };
-    let path = std::ffi::CStr::from_bytes_until_nul(path).ok()?.to_bytes();
-    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+    procinfo::directories(pid).ok().flatten()?.cwd
 }
 
 /// `pid`'s executable, to name it by, or why it could not be read.
