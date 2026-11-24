@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, jest } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
@@ -15,111 +15,210 @@ describe('Go test progress host proofs', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
-  it('excludes held initial linking and inter-package linking from test idle time', async () => {
-    const root = await goFixture();
-    for (const name of ['first', 'second']) {
-      await mkdir(join(root, name));
-      await writeFile(
-        join(root, name, 'ready_test.go'),
-        `package ${name}\nimport "testing"\nfunc TestReady(t *testing.T) {}\n`,
-      );
+  describe('held linking phases', () => {
+    let root = '';
+    let endpoint = '';
+    let wrapper = '';
+    let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
+
+    async function runPhase(name: string, body: () => Promise<void>): Promise<void> {
+      if (failedPhase !== null) {
+        throw new Error(`skipped ${name}: depends on earlier phase "${failedPhase.name}", which failed`);
+      }
+      try {
+        await body();
+      } catch (error) {
+        failedPhase ??= { name, error };
+        throw error;
+      }
     }
-    const endpoint = join(root, 'runner.sock');
-    const wrapper = join(root, 'tool.cjs');
-    await writeFile(
-      wrapper,
-      [
-        '#!/usr/bin/env node',
-        "const { spawnSync } = require('node:child_process');",
-        "const { connect } = require('node:net');",
-        "const { basename } = require('node:path');",
-        'const [tool, ...args] = process.argv.slice(2);',
-        'function run() {',
-        "  const result = spawnSync(tool, args, { stdio: 'inherit' });",
-        '  if (result.error) throw result.error;',
-        '  if (result.signal) process.kill(process.pid, result.signal);',
-        '  else process.exit(result.status ?? 1);',
-        '}',
-        "if (basename(tool) !== 'link' || args.some(arg => arg.startsWith('-V'))) run();",
-        'else {',
-        `  const socket = connect(${JSON.stringify(endpoint)}, () => socket.write('link-ready\\n'));`,
-        "  socket.once('error', error => { throw error; });",
-        "  let answer = '';",
-        "  socket.on('data', data => { answer += data.toString(); });",
-        "  socket.once('end', () => {",
-        "    if (answer !== 'go\\n') throw new Error('unexpected link release');",
-        '    socket.end(); run();',
-        '  });',
-        '}',
-        '',
-      ].join('\n'),
-    );
-    await chmod(wrapper, 0o700);
-    const sockets = new Set<Socket>();
-    const exchanges: Promise<unknown>[] = [];
-    const firstFinished = Promise.withResolvers<boolean>();
-    let links = 0;
-    const server = createServer((socket) => {
-      sockets.add(socket);
-      socket.once('close', () => sockets.delete(socket));
-      exchanges.push(
-        new Promise<void>((resolve, reject) => {
-          socket.once('error', reject);
-          let request = '';
-          const received = (data: Buffer) => {
-            request += data.toString();
-            if (!request.includes('\n')) return;
-            socket.off('data', received);
-            void (async () => {
-              expect(request).toBe('link-ready\n');
-              links += 1;
-              if (links === 2) expect(await firstFinished.promise).toBe(true);
-              // The linker is held at a real IPC barrier while virtual idle time crosses the
-              // unchanged production bound twice. No test binary exists for this package yet.
-              jest.advanceTimersByTime(2 * BOUNDED_TEST_IDLE_TIMEOUT_MS);
-              socket.end('go\n');
-              resolve();
-            })().catch(reject);
-          };
-          socket.on('data', received);
-        }).catch((error: unknown) => error),
-      );
+
+    beforeAll(async () => {
+      try {
+        root = await ownedSocketDirectory('go-progress-', 'runner.sock');
+        await writeFile(join(root, 'go.mod'), 'module example\n\ngo 1.24\n');
+        for (const name of ['first', 'second']) {
+          await mkdir(join(root, name));
+          await writeFile(
+            join(root, name, 'ready_test.go'),
+            `package ${name}\nimport "testing"\nfunc TestReady(t *testing.T) {}\n`,
+          );
+        }
+        endpoint = join(root, 'runner.sock');
+        wrapper = join(root, 'tool.cjs');
+        await writeFile(
+          wrapper,
+          [
+            '#!/usr/bin/env node',
+            "const { spawnSync } = require('node:child_process');",
+            "const { connect } = require('node:net');",
+            "const { basename } = require('node:path');",
+            'const [tool, ...args] = process.argv.slice(2);',
+            'function run() {',
+            "  const result = spawnSync(tool, args, { stdio: 'inherit' });",
+            '  if (result.error) throw result.error;',
+            '  if (result.signal) process.kill(process.pid, result.signal);',
+            '  else process.exit(result.status ?? 1);',
+            '}',
+            "if (basename(tool) !== 'link' || args.some(arg => arg.startsWith('-V'))) run();",
+            'else {',
+            `  const socket = connect(${JSON.stringify(endpoint)}, () => socket.write('link-ready\\n'));`,
+            "  socket.once('error', error => { throw error; });",
+            "  let answer = '';",
+            "  socket.on('data', data => { answer += data.toString(); });",
+            "  socket.once('end', () => {",
+            "    if (answer !== 'go\\n') throw new Error('unexpected link release');",
+            '    socket.end(); run();',
+            '  });',
+            '}',
+            '',
+          ].join('\n'),
+        );
+        await chmod(wrapper, 0o700);
+      } catch (error) {
+        failedPhase ??= { name: 'beforeAll fixture setup', error };
+        throw error;
+      }
     });
-    await new Promise<void>((resolve) => server.listen(endpoint, resolve));
-    const stdout = process.stdout.write;
-    const stderr = process.stderr.write;
-    let output = '';
-    process.stdout.write = (chunk) => {
-      output += chunk.toString();
-      if (output.includes('"Action":"pass","Package":"example/first","Elapsed":')) firstFinished.resolve(true);
-      return true;
-    };
-    process.stderr.write = () => true;
-    jest.useFakeTimers();
-    try {
-      const command = ['first', 'second']
-        .map((name) => `go test -p=1 -count=1 -toolexec=${JSON.stringify(wrapper)} ./${name}`)
-        .join(' && ');
-      const result = await runBoundedExec(
-        { command, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
-        { root },
-        createProcessTreeKiller(),
-        null,
-      );
-      firstFinished.resolve(false);
-      const exchangeErrors = (await Promise.all(exchanges)).filter((error) => error !== undefined);
-      expect(result.success, result.terminalOutput).toBe(true);
-      expect(exchangeErrors).toEqual([]);
-      expect(links).toBe(2);
-      expect(result.terminalOutput).not.toContain('Command made no progress');
-    } finally {
-      firstFinished.resolve(false);
-      jest.useRealTimers();
-      process.stdout.write = stdout;
-      process.stderr.write = stderr;
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-    }
+
+    afterAll(async () => {
+      if (root !== '') {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('excludes held initial linking from test idle time', async () => {
+      await runPhase('held initial linking', async () => {
+        const sockets = new Set<Socket>();
+        const exchanges: Promise<unknown>[] = [];
+        let links = 0;
+        const server = createServer((socket) => {
+          sockets.add(socket);
+          socket.once('close', () => sockets.delete(socket));
+          exchanges.push(
+            new Promise<void>((resolve, reject) => {
+              socket.once('error', reject);
+              let request = '';
+              const received = (data: Buffer) => {
+                request += data.toString();
+                if (!request.includes('\n')) return;
+                socket.off('data', received);
+                void (async () => {
+                  expect(request).toBe('link-ready\n');
+                  links += 1;
+                  // The linker is held at a real IPC barrier while virtual idle time crosses the
+                  // unchanged production bound twice. No test binary exists for this package yet.
+                  jest.advanceTimersByTime(2 * BOUNDED_TEST_IDLE_TIMEOUT_MS);
+                  socket.end('go\n');
+                  resolve();
+                })().catch(reject);
+              };
+              socket.on('data', received);
+            }).catch((error: unknown) => error),
+          );
+        });
+        await rm(endpoint, { force: true });
+        await new Promise<void>((resolve) => server.listen(endpoint, resolve));
+        const stdout = process.stdout.write;
+        const stderr = process.stderr.write;
+        process.stdout.write = () => true;
+        process.stderr.write = () => true;
+        jest.useFakeTimers();
+        try {
+          const command = `go test -p=1 -count=1 -toolexec=${JSON.stringify(wrapper)} ./first`;
+          const result = await runBoundedExec(
+            { command, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+            { root },
+            createProcessTreeKiller(),
+            null,
+          );
+          const exchangeErrors = (await Promise.all(exchanges)).filter((error) => error !== undefined);
+          expect(result.success, result.terminalOutput).toBe(true);
+          expect(exchangeErrors).toEqual([]);
+          expect(links).toBe(1);
+          expect(result.terminalOutput).not.toContain('Command made no progress');
+        } finally {
+          jest.useRealTimers();
+          process.stdout.write = stdout;
+          process.stderr.write = stderr;
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        }
+      });
+    });
+
+    it('excludes held inter-package linking from test idle time', async () => {
+      await runPhase('held inter-package linking', async () => {
+        const sockets = new Set<Socket>();
+        const exchanges: Promise<unknown>[] = [];
+        const firstFinished = Promise.withResolvers<boolean>();
+        let links = 0;
+        const server = createServer((socket) => {
+          sockets.add(socket);
+          socket.once('close', () => sockets.delete(socket));
+          exchanges.push(
+            new Promise<void>((resolve, reject) => {
+              socket.once('error', reject);
+              let request = '';
+              const received = (data: Buffer) => {
+                request += data.toString();
+                if (!request.includes('\n')) return;
+                socket.off('data', received);
+                void (async () => {
+                  expect(request).toBe('link-ready\n');
+                  links += 1;
+                  if (links === 2) {
+                    expect(await firstFinished.promise).toBe(true);
+                    // The linker is held at a real IPC barrier while virtual idle time crosses the
+                    // unchanged production bound twice. No test binary exists for this package yet.
+                    jest.advanceTimersByTime(2 * BOUNDED_TEST_IDLE_TIMEOUT_MS);
+                  }
+                  socket.end('go\n');
+                  resolve();
+                })().catch(reject);
+              };
+              socket.on('data', received);
+            }).catch((error: unknown) => error),
+          );
+        });
+        await rm(endpoint, { force: true });
+        await new Promise<void>((resolve) => server.listen(endpoint, resolve));
+        const stdout = process.stdout.write;
+        const stderr = process.stderr.write;
+        let output = '';
+        process.stdout.write = (chunk) => {
+          output += chunk.toString();
+          if (output.includes('"Action":"pass","Package":"example/first","Elapsed":')) firstFinished.resolve(true);
+          return true;
+        };
+        process.stderr.write = () => true;
+        jest.useFakeTimers();
+        try {
+          const command = ['first', 'second']
+            .map((name) => `go test -p=1 -count=1 -toolexec=${JSON.stringify(wrapper)} ./${name}`)
+            .join(' && ');
+          const result = await runBoundedExec(
+            { command, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+            { root },
+            createProcessTreeKiller(),
+            null,
+          );
+          firstFinished.resolve(false);
+          const exchangeErrors = (await Promise.all(exchanges)).filter((error) => error !== undefined);
+          expect(result.success, result.terminalOutput).toBe(true);
+          expect(exchangeErrors).toEqual([]);
+          expect(links).toBe(2);
+          expect(result.terminalOutput).not.toContain('Command made no progress');
+        } finally {
+          firstFinished.resolve(false);
+          jest.useRealTimers();
+          process.stdout.write = stdout;
+          process.stderr.write = stderr;
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        }
+      });
+    });
   });
 
   it('ends a real hanging Go test when its unchanged active-test budget expires', async () => {
