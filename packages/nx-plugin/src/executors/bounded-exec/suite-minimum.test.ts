@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
-import { suiteMinimum } from './suite-minimum.js';
+import fc from 'fast-check';
+import { fewestThreadsWithin, suiteMinimum, suiteWall } from './suite-minimum.js';
 
 const IDLE_MS = 180_000;
+const SEED = 20261124;
 const seconds = (...walls: number[]): number[] => walls.map((wall) => wall * 1000);
 
 describe('the minimum a whole-suite test leaf names', () => {
@@ -34,5 +36,99 @@ describe('the minimum a whole-suite test leaf names', () => {
   it('answers the same for the walls in any order', () => {
     const walls = seconds(511, 156, 99, 67, 66, 39);
     expect(suiteMinimum([...walls].reverse(), 18, IDLE_MS)).toBe(suiteMinimum(walls, 18, IDLE_MS));
+  });
+});
+
+describe('the LPT wall of a suite', () => {
+  it('is zero for a leaf with no recorded wall', () => {
+    expect(suiteWall([], 1)).toBe(0);
+    expect(suiteWall([], 18)).toBe(0);
+  });
+
+  it('schedules the walls longest first onto the thread that frees first', () => {
+    expect(suiteWall(seconds(60, 45, 30, 5), 1)).toBe(140_000);
+    expect(suiteWall(seconds(60, 45, 30, 30), 2)).toBe(90_000);
+    expect(suiteWall(seconds(900, 1, 1, 1), 1)).toBe(903_000);
+    expect(suiteWall(seconds(900, 1, 1, 1), 2)).toBe(900_000);
+    expect(suiteWall(seconds(900, 1, 1, 1), 18)).toBe(900_000);
+  });
+
+  it('answers the same for the walls in any order', () => {
+    const walls = seconds(511, 156, 99, 67, 66, 39);
+    expect(suiteWall(walls, 2)).toBe(511_000);
+    expect(suiteWall([...walls].reverse(), 2)).toBe(suiteWall(walls, 2));
+  });
+});
+
+describe('the fewest threads to finish a suite within a target wall', () => {
+  it('is one for a leaf with no recorded wall', () => {
+    expect(fewestThreadsWithin([], 18, 180_000)).toBe(1);
+    expect(fewestThreadsWithin([], 1, 0)).toBe(1);
+  });
+
+  it('names the fewest threads whose LPT wall meets the target for 6,000 tests of 300 ms', () => {
+    const walls = new Array<number>(6_000).fill(300);
+    expect(fewestThreadsWithin(walls, 18, 180_000)).toBe(10);
+    expect(fewestThreadsWithin(walls, 18, 360_000)).toBe(5);
+    expect(fewestThreadsWithin(walls, 18, 90_000)).toBe(18);
+  });
+
+  it('is one when a single thread already finishes the whole suite within the target', () => {
+    const underTarget = [...seconds(60, 45, 30), ...new Array<number>(1_000).fill(5)];
+    const sixtySeconds = [...seconds(25, 15, 10, 5), ...new Array<number>(1_000).fill(5)];
+    expect(fewestThreadsWithin(underTarget, 18, 180_000)).toBe(1);
+    expect(fewestThreadsWithin(sixtySeconds, 18, 180_000)).toBe(1);
+  });
+
+  it('names the fewest threads at the least wall when one test outlasts the target', () => {
+    // One 900 s test beside three 1 s tests: 1 thread takes 903 s, 2 threads take 900 s, and 3..18 threads still take
+    // 900 s, so 2 is the fewest threads at the least wall, never want.
+    expect(fewestThreadsWithin(seconds(900, 1, 1, 1), 18, 300_000)).toBe(2);
+  });
+
+  it('never names more than the leaf asks for or than it has tests', () => {
+    expect(fewestThreadsWithin(seconds(900, 900, 900, 900, 900), 2, 180_000)).toBe(2);
+    expect(fewestThreadsWithin(seconds(900, 900), 18, 180_000)).toBe(2);
+    expect(fewestThreadsWithin(seconds(900), 18, 180_000)).toBe(1);
+  });
+
+  it('answers the same for the walls in any order', () => {
+    const walls = seconds(511, 156, 99, 67, 66, 39);
+    const reversed = [...walls].reverse();
+    expect(fewestThreadsWithin(walls, 18, 520_000)).toBe(2);
+    for (const targetMs of [300_000, 520_000, 1_000_000]) {
+      expect(fewestThreadsWithin(reversed, 18, targetMs)).toBe(fewestThreadsWithin(walls, 18, targetMs));
+    }
+  });
+
+  it('is non-increasing in the target, meets the target or the least wall, and stays within 1..min(want, n)', () => {
+    fc.assert(
+      fc.property(
+        fc.array(fc.integer({ min: 0, max: 1_000_000 }), { minLength: 1, maxLength: 60 }),
+        fc.integer({ min: 1, max: 24 }),
+        fc.integer({ min: 0, max: 5_000_000 }),
+        fc.integer({ min: 0, max: 5_000_000 }),
+        (walls, want, targetA, targetB) => {
+          const t1 = Math.min(targetA, targetB);
+          const t2 = Math.max(targetA, targetB);
+          const most = Math.min(want, walls.length);
+          let leastWall = Number.POSITIVE_INFINITY;
+          for (let threads = 1; threads <= most; threads++) {
+            const wall = suiteWall(walls, threads);
+            if (wall < leastWall) leastWall = wall;
+          }
+          const r1 = fewestThreadsWithin(walls, want, t1);
+          const r2 = fewestThreadsWithin(walls, want, t2);
+          expect(r2).toBeLessThanOrEqual(r1);
+          expect(r1).toBeGreaterThanOrEqual(1);
+          expect(r1).toBeLessThanOrEqual(most);
+          expect(r2).toBeGreaterThanOrEqual(1);
+          expect(r2).toBeLessThanOrEqual(most);
+          expect(suiteWall(walls, r1)).toBeLessThanOrEqual(Math.max(t1, leastWall));
+          expect(suiteWall(walls, r2)).toBeLessThanOrEqual(Math.max(t2, leastWall));
+        },
+      ),
+      { seed: SEED, numRuns: 200 },
+    );
   });
 });

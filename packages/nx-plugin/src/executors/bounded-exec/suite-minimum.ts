@@ -79,3 +79,11 @@ export function suiteMinimum(recordedWallsMs: readonly number[], want: number, i
   }
   return most;
 }
+
+export function suiteWall(_recordedWallsMs: readonly number[], _threads: number): number {
+  return -1;
+}
+
+export function fewestThreadsWithin(_recordedWallsMs: readonly number[], _want: number, _targetMs: number): number {
+  return 0;
+}
