@@ -67,6 +67,7 @@ import { CompositeTracer } from '../tracers/CompositeTracer.js';
 import { SQLiteTracer } from '../tracers/SQLiteTracer.js';
 import { StdioTracer } from '../tracers/StdioTracer.js';
 import { TestTracer as InMemoryTestTracer } from '../tracers/TestTracer.js';
+import type { AnySpanBuffer } from '../types.js';
 
 // Preloads wire `sqlite.dbPath` from here rather than spelling the sink path, which is only safe under a directory
 // project walkers and watchers ignore.
@@ -92,6 +93,19 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
   if (typeof batchWriter === 'function') {
     batchWriter.call(tag, { describe: describePath });
   }
+}
+
+function formatTestName(ctx: { readonly buffer: AnySpanBuffer; readonly spanName: string }): string {
+  const describeNulls = ctx.buffer.getNullsIfAllocated('describe');
+  const describeValues =
+    describeNulls === undefined || ((describeNulls[0] ?? 0) & 1) !== 0
+      ? ctx.buffer.getColumnIfAllocated('describe')
+      : undefined;
+  const describePath =
+    Array.isArray(describeValues) && typeof describeValues[0] === 'string' && describeValues[0].length > 0
+      ? describeValues[0]
+      : undefined;
+  return describePath !== undefined ? `${describePath} > ${ctx.spanName}` : ctx.spanName;
 }
 
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
@@ -362,6 +376,7 @@ async function endTestRun<B extends OpContextBinding>(
 export interface BunTestTracerInstance<B extends OpContextBinding> {
   setup(): void;
   useTestSpan(): HarnessSpanContext<B>;
+  currentTestName(): string | undefined;
   getTracer(): Tracer<B>;
   createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule;
 }
@@ -369,6 +384,7 @@ export interface BunTestTracerInstance<B extends OpContextBinding> {
 export interface BunTestSuiteTracer<B extends OpContextBinding> {
   useTestTracer: BunTestTracerInstance<B>;
   useTestSpan(): HarnessSpanContext<B>;
+  currentTestName(): string | undefined;
   setupBunTestSuiteTracing(): void;
 }
 
@@ -385,6 +401,7 @@ export type TestTracer<
 export interface ActiveBunTestTracer {
   setup(): void;
   useTestSpan(): unknown;
+  currentTestName(): string | undefined;
   getTracer(): unknown;
   createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule;
 }
@@ -422,6 +439,7 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
   return {
     useTestTracer,
     useTestSpan: () => useTestTracer.useTestSpan(),
+    currentTestName: () => useTestTracer.currentTestName(),
     setupBunTestSuiteTracing: () => installBunTestTracing(useTestTracer),
   };
 }
@@ -558,6 +576,11 @@ function createTestTracerInstance<
         throw new Error('useTestSpan() called outside of a traced it()');
       }
       return ctx;
+    },
+
+    currentTestName(): string | undefined {
+      const ctx = als.getStore();
+      return ctx ? formatTestName(ctx) : undefined;
     },
 
     getTracer(): Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
@@ -701,6 +724,19 @@ export function useTestSpan(): unknown {
 }
 
 /**
+ * Return the current traced test's identity (`describePath > label`, or `label` alone at top level),
+ * or `undefined` outside a traced `it()`. Never throws.
+ */
+export function currentTestName(): string | undefined {
+  if (_activeSuiteTracer) {
+    return _activeSuiteTracer.currentTestName();
+  }
+
+  const ctx = _als.getStore();
+  return ctx ? formatTestName(ctx) : undefined;
+}
+
+/**
  * Get the root tracer instance.
  *
  * The optional type parameter narrows the return type for consumers that know
@@ -813,15 +849,19 @@ function traceTests<Ctx extends OpContext>(
   };
 }
 
-/** Runs each describe callback with its label on the describe stack, so the tests it registers record the path. */
+/** Runs each describe callback with its registered ancestry on the describe stack, so its tests record the full path. */
 function trackDescribes(describeStack: string[]): (label: string) => CallbackRun {
-  return (label) => (values, _arity, call) => {
-    describeStack.push(label);
-    try {
-      return call(values);
-    } finally {
-      describeStack.pop();
-    }
+  return (label) => {
+    // Capture enclosing describes at registration: Bun may run a nested describe's callback after its parent returns.
+    const registeredPath = [...describeStack, label];
+    return (values, _arity, call) => {
+      const previous = describeStack.splice(0, describeStack.length, ...registeredPath);
+      try {
+        return call(values);
+      } finally {
+        describeStack.splice(0, describeStack.length, ...previous);
+      }
+    };
   };
 }
 

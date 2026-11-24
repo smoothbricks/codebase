@@ -1,12 +1,18 @@
 import * as bunTest from 'bun:test';
 import { describe, expect, it } from 'bun:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
-import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
+import { type BunTestModuleShape, currentTestName, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
 import { spanException } from '../facts.js';
 import { querySpan } from '../queryable-span.js';
+
+const outsideTestName = currentTestName();
 
 type BunTestModuleLike = BunTestModuleShape;
 
@@ -305,5 +311,71 @@ describe('bun harness modifiers', () => {
     wrapped.it('records a function label by its name', () => {
       expect(tracer.useTestSpan().buffer.describe_values[0]).toBe('makeTestTracer');
     });
+  });
+});
+
+it('currentTestName() returns the label alone at top level and undefined outside a test', () => {
+  expect(outsideTestName).toBeUndefined();
+  expect(currentTestName()).toBe('currentTestName() returns the label alone at top level and undefined outside a test');
+});
+
+describe('bun harness currentTestName', () => {
+  describe('nested suite', () => {
+    it('returns describePath > label across await', async () => {
+      const expected = 'bun harness currentTestName > nested suite > returns describePath > label across await';
+      expect(currentTestName()).toBe(expected);
+      await Promise.resolve();
+      expect(currentTestName()).toBe(expected);
+    });
+  });
+
+  it('answers on instance and suite tracers without duplicating the describe path', async () => {
+    const suite = makeBunTestSuiteTracer(baseBinding);
+    suite.useTestTracer.setup();
+    const wrapped = suite.useTestTracer.createBunTestMock(createImmediateBunTestModule());
+
+    expect(suite.currentTestName()).toBeUndefined();
+    expect(suite.useTestTracer.currentTestName()).toBeUndefined();
+
+    await wrapped.it('top-level test', () => {
+      expect(suite.currentTestName()).toBe('top-level test');
+      expect(suite.useTestTracer.currentTestName()).toBe('top-level test');
+      // A row-1 describe write on a top-level test must not leak into row-0 describePath.
+      suite.useTestSpan().ok(1).describe('row-1-only');
+      expect(suite.currentTestName()).toBe('top-level test');
+    });
+
+    await wrapped.describe('outer', () =>
+      wrapped.describe('inner', () =>
+        wrapped.it('leaf', async () => {
+          expect(suite.currentTestName()).toBe('outer > inner > leaf');
+          await Promise.resolve();
+          expect(suite.useTestTracer.currentTestName()).toBe('outer > inner > leaf');
+        }),
+      ),
+    );
+
+    expect(suite.currentTestName()).toBeUndefined();
+  });
+
+  it('answers on the global singleton _als path and before initialization', async () => {
+    const fixture = fileURLToPath(new URL('./fixtures/bun-harness-current-test-name.fixture.ts', import.meta.url));
+    const directory = await mkdtemp(join(tmpdir(), 'lmao-bun-current-test-name-'));
+    try {
+      const command = Bun.spawn([process.execPath, 'test', fixture], {
+        cwd: directory,
+        env: { ...process.env, NO_COLOR: '1' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        command.exited,
+        new Response(command.stdout).text(),
+        new Response(command.stderr).text(),
+      ]);
+      expect(exitCode, stdout + stderr).toBe(0);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

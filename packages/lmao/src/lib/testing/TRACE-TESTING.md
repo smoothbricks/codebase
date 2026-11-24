@@ -76,6 +76,12 @@ expect(facts.hasMatch('span:*: err(*)')).toBe(false);
 `querySpan(buffer).ownFacts()` reads one span's own facts (its lifecycle, retries, tags and logs), never a descendant's,
 so a tag or outcome selects that span alone: `spans.filter((s) => s.ownFacts().has(tagFact('result', 'done')))`.
 
+## Bun Harness Identity
+
+`currentTestName()` from `@smoothbricks/lmao/testing/bun` returns the running traced test's identity as
+`describePath > label` (or `label` alone at top level), reading from the active test span's row 0. Outside a traced
+`it()`, it returns `undefined` without throwing.
+
 ## Buffer Layout (Why This Works)
 
 Per `specs/lmao/01h_entry_types_and_logging_primitives.md`:

@@ -41,21 +41,26 @@ const ctx = useTestSpan();
 await ctx.span('work', async (c) => c.ok(null));
 ```
 
+### `currentTestName()`
+
+Returns the current traced test's identity as `describePath > label` (or the `it()` label alone at top level), or
+`undefined` without throwing outside a traced `it()`. Import from `@smoothbricks/lmao/testing/bun`.
+
 ## Span query API
 
 Import from `@smoothbricks/lmao/testing`.
 
 ### `querySpan(buffer)` → `QueryableSpan`
 
-| Member | Description |
-|---|---|
-| `.name` | The span's name. |
-| `.facts(options?)` | Facts recorded in this span tree. |
-| `.find(name)` | First descendant span with that name. |
-| `.findAll(name)` | All descendant spans with that name. |
-| `.children` | Direct child spans (as `QueryableSpan`s). |
-| `.names()` | All descendant span names. |
-| `.buffer` | The underlying buffer. |
+| Member             | Description                               |
+| ------------------ | ----------------------------------------- |
+| `.name`            | The span's name.                          |
+| `.facts(options?)` | Facts recorded in this span tree.         |
+| `.find(name)`      | First descendant span with that name.     |
+| `.findAll(name)`   | All descendant spans with that name.      |
+| `.children`        | Direct child spans (as `QueryableSpan`s). |
+| `.names()`         | All descendant span names.                |
+| `.buffer`          | The underlying buffer.                    |
 
 ```ts
 const q = querySpan(ctx.buffer);
