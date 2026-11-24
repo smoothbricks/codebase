@@ -1,11 +1,13 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { checkBendFile } from './emit.js';
 
 export async function run(argv: readonly string[]): Promise<void> {
   const [file, outdir, ...rest] = argv;
   if (file === undefined || outdir === undefined) {
-    throw new Error('bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--cap N]');
+    throw new Error(
+      'bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--cap N] [--manifest path]',
+    );
   }
   const opt = (name: string): string => {
     const i = rest.indexOf(name);
@@ -14,23 +16,36 @@ export async function run(argv: readonly string[]): Promise<void> {
   const book = await checkBendFile(file);
   const moduleKind = opt('--rust-module') ? 'rust-module' : opt('--ts-module') ? 'ts-module' : 'go-module';
   const modulePath = opt(`--${moduleKind}`);
+  const manifestPath = opt('--manifest');
+  const modelName = opt('--model-name') || basename(file);
   const stem = basename(file, '.bend');
+  const filteredFlags = rest.filter((arg, i) => {
+    if (arg === modulePath) return false;
+    if (manifestPath && (arg === '--manifest' || rest[i - 1] === '--manifest')) return false;
+    return true;
+  });
   const emission = book.emit({
     target: modulePath
       ? {
           kind: moduleKind,
-          modelName: opt('--model-name') || basename(file),
-          flags: rest.filter((arg) => arg !== modulePath),
+          modelName,
+          flags: filteredFlags,
         }
       : { kind: 'all', stem },
+    modelName,
     functions: opt('--fns').split(',').filter(Boolean),
     laws: opt('--laws').split(',').filter(Boolean),
     cap: Number(opt('--cap') || '400'),
     listLength: Number(opt('--len') || '3'),
+    adtDepth: Number(opt('--adt-depth') || '2'),
     properties: Number(opt('--props') || '200'),
     propertyLength: Number(opt('--prop-len') || '12'),
     noCorpus: opt('--no-corpus').split(',').filter(Boolean),
   });
+  if (manifestPath) {
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, `${JSON.stringify(emission.manifest, null, 2)}\n`);
+  }
   const counts = `${emission.functions} fns, ${emission.laws} laws`;
   if (emission.kind === 'module') {
     writeFileSync(modulePath, emission.source);
