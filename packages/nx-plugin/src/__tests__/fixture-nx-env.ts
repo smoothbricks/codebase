@@ -108,6 +108,37 @@ export interface NxFixture {
   readonly socketDirectory: string;
 }
 
+/** A live {@link NxFixture} whose caller owns its {@link retire} step (for example in `beforeAll` / `afterAll`). */
+export interface OwnedNxFixture extends NxFixture {
+  retire(): Promise<void>;
+}
+
+/**
+ * Create a fresh fixture root whose Nx workspace is `workspace` (relative to the root, made if it is not the root),
+ * publish its socket alias, and return it with an idempotent `retire()` that stops its daemon, unlinks the alias and
+ * deletes the root. If creation fails part-way, the partial fixture is retired before rethrowing.
+ */
+export async function openNxFixture(prefix: string, workspace = '.'): Promise<OwnedNxFixture> {
+  const root = await nxFixtureRoot(prefix);
+  const owned = { root, workspace: join(root, workspace) };
+  let retirement: Promise<void> | undefined;
+  const retire = () => {
+    retirement ??= retireNxFixture(owned);
+    return retirement;
+  };
+  try {
+    await mkdir(owned.workspace, { recursive: true });
+    return { ...owned, socketDirectory: await publishFixtureSocketDirectory(owned.workspace), retire };
+  } catch (error) {
+    try {
+      await retire();
+    } catch (retireError) {
+      throw new AggregateError([error, retireError], `fixture ${root} failed, and so did its retirement`);
+    }
+    throw error;
+  }
+}
+
 /**
  * Run `body` in a fresh fixture root whose Nx workspace is `workspace`
  * (relative to the root, made if it is not the root), with the workspace's

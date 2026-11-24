@@ -12,7 +12,7 @@ import { expandOutputs } from 'nx/src/native';
 import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
-import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { nxFixtureRoot, type OwnedNxFixture, openNxFixture, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { pastTick } from './__tests__/past-tick.js';
 import type { EnsureBuiltProbeResult } from './ensure-built.js';
@@ -1161,86 +1161,167 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
   // daemon it starts is also the one whose socket is in question, so the same
   // lifetime answers where a root entered from another workspace's shell binds.
   // They share one fixture and one daemon, so every daemon step passes the directory the provider binds.
-  it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
-    // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
-    // socket directory is made in the short socket namespace the sandbox admits.
-    const socketDir = await ownedSocketDirectory('eb-sock-', NX_LONGEST_SOCKET_NAME);
+  describe("a fresh daemon's graph, replay and refresh steps", () => {
+    let fixture: OwnedNxFixture | undefined;
     let root = '';
-    let failure: { readonly error: unknown } | null = null;
+    let workspace = '';
+    let fixtureSocketDir = '';
+    let socketDir = '';
+    let builds = '';
+    let caller = '';
+    let providerSockets: string | null = null;
+    let ownEnv: Record<string, string> = {};
+    let reuseEntry = '';
+    let raceEntry = '';
     const providerDirectories: string[] = [];
-    try {
-      await withNxFixture(
-        'ensure-built-daemon-',
-        async (fixture) => {
-          root = fixture.root;
-          const { workspace } = fixture;
-          const builds = join(root, 'lib-builds.log');
-          await writeTwoProjectWorkspace(workspace, builds);
-          // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
-          // installation the graph-witness steps write into is the fixture's, not the copy this file's fixtures share.
-          const shared = await realpath(join(workspace, 'node_modules'));
-          await rm(join(workspace, 'node_modules'));
-          await mkdir(join(workspace, 'node_modules'));
-          for (const entry of await readdir(shared)) {
-            if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
-          }
-          await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
-            recursive: true,
-          });
-          // What the provider binds for this workspace when the call is entered from another one's shell.
-          const providerSockets = providerSocketDirectory(workspace);
-          if (providerSockets !== null) providerDirectories.push(providerSockets);
-          const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
+    let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
 
-          // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
-          // cached and on disk, recorded by no daemon.
-          // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
-          const built = await run(
-            'node',
-            nxEntry(workspace),
-            workspace,
-            ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: fixture.socketDirectory },
+    /**
+     * Run one sequential phase on the shared daemon fixture. If setup or an earlier phase failed, fail fast naming it
+     * rather than running on a broken fixture; record the first failure so `afterAll` can include any surviving
+     * descendants diagnostic.
+     */
+    async function runPhase(name: string, body: () => Promise<void>): Promise<void> {
+      if (failedPhase !== null) {
+        throw new Error(`skipped ${name}: depends on earlier phase "${failedPhase.name}", which failed`);
+      }
+      try {
+        await body();
+      } catch (error) {
+        failedPhase ??= { name, error };
+        throw error;
+      }
+    }
+
+    beforeAll(async () => {
+      try {
+        // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
+        // socket directory is made in the short socket namespace the sandbox admits.
+        socketDir = await ownedSocketDirectory('eb-sock-', NX_LONGEST_SOCKET_NAME);
+        fixture = await openNxFixture('ensure-built-daemon-', 'workspace');
+        root = fixture.root;
+        workspace = fixture.workspace;
+        fixtureSocketDir = fixture.socketDirectory;
+        builds = join(root, 'lib-builds.log');
+        await writeTwoProjectWorkspace(workspace, builds);
+        // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
+        // installation the graph-witness steps write into is the fixture's, not the copy this file's fixtures share.
+        const shared = await realpath(join(workspace, 'node_modules'));
+        await rm(join(workspace, 'node_modules'));
+        await mkdir(join(workspace, 'node_modules'));
+        for (const entry of await readdir(shared)) {
+          if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
+        }
+        await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
+          recursive: true,
+        });
+        // What the provider binds for this workspace when the call is entered from another one's shell.
+        providerSockets = providerSocketDirectory(workspace);
+        if (providerSockets !== null) providerDirectories.push(providerSockets);
+        ownEnv = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
+        caller = join(root, 'caller');
+        await mkdir(caller);
+      } catch (error) {
+        failedPhase ??= { name: 'beforeAll fixture setup', error };
+        throw error;
+      }
+    });
+
+    afterAll(async () => {
+      let retireFailure: { readonly error: unknown } | null = null;
+      try {
+        if (fixture !== undefined) {
+          await fixture.retire();
+        }
+      } catch (error) {
+        retireFailure = { error };
+      } finally {
+        // Only the directories this test made: the caller's, and the one the provider bound for this workspace.
+        for (const directory of [...(socketDir === '' ? [] : [socketDir]), ...providerDirectories]) {
+          await rm(directory, { recursive: true, force: true });
+        }
+      }
+      if (retireFailure !== null) {
+        if (failedPhase !== null) {
+          throw new AggregateError(
+            [failedPhase.error, retireFailure.error],
+            `fixture ${root} failed in "${failedPhase.name}", and so did its retirement`,
           );
-          expect(built.code, built.stdout + built.stderr).toBe(0);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        }
+        throw retireFailure.error;
+      }
+      // The fixture retires on every exit path of its body, a throwing one
+      // included: once it has, its root is gone. What of this process's tree
+      // still runs is named only to explain a failure.
+      if (failedPhase === null) {
+        expect(root === '' || !existsSync(root)).toBe(true);
+      } else {
+        const left = root === '' ? null : await descendantsDiagnostic(`the fixture ${root}`);
+        if (left !== null) {
+          // A cause, not an AggregateError: the test harness prints an aggregate's
+          // inner errors without its message.
+          throw new Error(`${left} after "${failedPhase.name}" failed`, { cause: failedPhase.error });
+        }
+      }
+    });
 
-          // Entered from outside the root by a shell set up for another
-          // workspace, as a managed devenv's is: its socket directory belongs to
-          // that workspace's daemon, and a second daemon listening there would
-          // take the socket from it.
-          const caller = join(root, 'caller');
-          await mkdir(caller);
-          const hit = await run(
-            'bun',
-            binEntry,
-            caller,
-            ['app:build', '--workspace-root', workspace, '--', join(workspace, 'report')],
-            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_SOCKET_DIR: socketDir },
-          );
-          expect(hit.code, hit.stdout + hit.stderr).toBe(0);
-          expect(hit.stderr).toBe('');
-          expect(hit.stdout.split('\n')[0], hit.stdout).toBe(MARKER);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          expect(await readdir(socketDir)).toEqual([]);
-          const record = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
-          expect(record).not.toContain(socketDir);
-          // The daemon it started binds in the directory the provider named, not the caller's nor Nx's default.
-          const daemon = typia.json.assertParse<DaemonProcessJson>(record);
-          if (providerSockets !== null) {
-            expect(daemon.socketPath.startsWith(`${providerSockets}/`), record).toBe(true);
-          }
+    it('builds and caches the workspace with daemonless Nx', async () => {
+      await runPhase('daemonless build', async () => {
+        // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
+        // cached and on disk, recorded by no daemon.
+        // Its plugin workers bind sockets too: Nx's default root is not admitted in a sandbox.
+        const built = await run(
+          'node',
+          nxEntry(workspace),
+          workspace,
+          ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
+          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: fixtureSocketDir },
+        );
+        expect(built.code, built.stdout + built.stderr).toBe(0);
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
 
-          // Every plugin worker the call starts binds where the provider's Nx binds, never in the caller's directory: a
-          // socket there is a second Nx listening in another workspace's namespace. The call loads the provider's
-          // plugins in its own process for the task hooks, and under Bun an assignment to `process.env` does not reach
-          // the C environment Nx's native socket resolver reads. A Bun caller records the socket each plugin worker is
-          // spawned with (Nx passes it as the argument after the worker script), so the run is judged on every path it
-          // the workers have closed.
-          const workerSocketsEntry = join(root, 'plugin-worker-sockets.ts');
-          await writeFile(
-            workerSocketsEntry,
-            `
+    it('replays daemonless outputs from an external shell and binds the daemon in the provider socket directory', async () => {
+      await runPhase('external shell replay and daemon socket', async () => {
+        // Entered from outside the root by a shell set up for another
+        // workspace, as a managed devenv's is: its socket directory belongs to
+        // that workspace's daemon, and a second daemon listening there would
+        // take the socket from it.
+        const hit = await run(
+          'bun',
+          binEntry,
+          caller,
+          ['app:build', '--workspace-root', workspace, '--', join(workspace, 'report')],
+          { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_SOCKET_DIR: socketDir },
+        );
+        expect(hit.code, hit.stdout + hit.stderr).toBe(0);
+        expect(hit.stderr).toBe('');
+        expect(hit.stdout.split('\n')[0], hit.stdout).toBe(MARKER);
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        expect(await readdir(socketDir)).toEqual([]);
+        const record = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
+        expect(record).not.toContain(socketDir);
+        // The daemon it started binds in the directory the provider named, not the caller's nor Nx's default.
+        const daemon = typia.json.assertParse<DaemonProcessJson>(record);
+        if (providerSockets !== null) {
+          expect(daemon.socketPath.startsWith(`${providerSockets}/`), record).toBe(true);
+        }
+      });
+    });
+
+    it('binds plugin workers in the provider socket directory under Bun', async () => {
+      await runPhase('plugin worker sockets', async () => {
+        // Every plugin worker the call starts binds where the provider's Nx binds, never in the caller's directory: a
+        // socket there is a second Nx listening in another workspace's namespace. The call loads the provider's
+        // plugins in its own process for the task hooks, and under Bun an assignment to `process.env` does not reach
+        // the C environment Nx's native socket resolver reads. A Bun caller records the socket each plugin worker is
+        // spawned with (Nx passes it as the argument after the worker script), so the run is judged on every path it
+        // the workers have closed.
+        const workerSocketsEntry = join(root, 'plugin-worker-sockets.ts');
+        await writeFile(
+          workerSocketsEntry,
+          `
 import { createRequire } from 'node:module';
 import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const workspace = process.argv[2];
@@ -1256,45 +1337,53 @@ childProcess.spawn = (command, args, options) => {
 const result = await ensureBuilt({ target: 'app:build', cwd: workspace });
 console.log(JSON.stringify({ result, bound }));
 `,
+        );
+        const workerSockets = await run('bun', workerSocketsEntry, caller, [workspace], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_SOCKET_DIR: socketDir,
+        });
+        expect(workerSockets.code, workerSockets.stdout + workerSockets.stderr).toBe(0);
+        const { result: workerSocketsResult, bound } = typia.json.assertParse<{
+          result: import('./ensure-built.js').EnsureBuiltResult;
+          bound: string[];
+        }>(workerSockets.stdout);
+        expect(workerSocketsResult).toEqual({ disposition: 'hit' });
+        expect(bound.length, 'plugin workers the call started in its own process').toBeGreaterThan(0);
+        for (const path of bound) {
+          expect(path.startsWith(`${socketDir}/`), `a plugin worker bound ${path} in the caller's ${socketDir}`).toBe(
+            false,
           );
-          const workerSockets = await run('bun', workerSocketsEntry, caller, [workspace], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_SOCKET_DIR: socketDir,
-          });
-          expect(workerSockets.code, workerSockets.stdout + workerSockets.stderr).toBe(0);
-          const { result: workerSocketsResult, bound } = typia.json.assertParse<{
-            result: import('./ensure-built.js').EnsureBuiltResult;
-            bound: string[];
-          }>(workerSockets.stdout);
-          expect(workerSocketsResult).toEqual({ disposition: 'hit' });
-          expect(bound.length, 'plugin workers the call started in its own process').toBeGreaterThan(0);
-          for (const path of bound) {
-            expect(path.startsWith(`${socketDir}/`), `a plugin worker bound ${path} in the caller's ${socketDir}`).toBe(
-              false,
-            );
-            if (providerSockets !== null) {
-              expect(path.startsWith(`${providerSockets}/`), `plugin worker socket ${path}`).toBe(true);
-            }
+          if (providerSockets !== null) {
+            expect(path.startsWith(`${providerSockets}/`), `plugin worker socket ${path}`).toBe(true);
           }
+        }
+      });
+    });
 
-          // That hit re-armed the daemon's records. The emitted wrapper, under
-          // Node and with nothing to exec, is as silent.
-          const again = await run('node', builtBinEntry, workspace, ['app:build'], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            ...ownEnv,
-          });
-          expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+    it('stays silent through the built Node wrapper once the daemon records outputs', async () => {
+      await runPhase('built Node wrapper hit', async () => {
+        // That hit re-armed the daemon's records. The emitted wrapper, under
+        // Node and with nothing to exec, is as silent.
+        const again = await run('node', builtBinEntry, workspace, ['app:build'], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          ...ownEnv,
+        });
+        expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
 
-          // An awaited daemon graph can see B while both disk snapshots see
-          // A. Node stamps revoke that generation; the fresh daemon file table
-          // supplies the A reconciliation instead of an empty A-to-A diff.
-          const generationRaceEntry = join(root, 'graph-generation-race.ts');
-          await writeFile(
-            generationRaceEntry,
-            `
+    it('revokes a stale graph generation race via node stamps and reconciles to a hit', async () => {
+      await runPhase('graph generation race', async () => {
+        // An awaited daemon graph can see B while both disk snapshots see
+        // A. Node stamps revoke that generation; the fresh daemon file table
+        // supplies the A reconciliation instead of an empty A-to-A diff.
+        const generationRaceEntry = join(root, 'graph-generation-race.ts');
+        await writeFile(
+          generationRaceEntry,
+          `
 import { createRequire } from 'node:module';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -1321,35 +1410,42 @@ daemonClient.getProjectGraphAndSourceMaps = async () => {
 const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
 console.log(JSON.stringify({ result, requests }));
 `,
-          );
-          const generationRace = await run('bun', generationRaceEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(generationRace.code, generationRace.stdout + generationRace.stderr).toBe(0);
-          const generations = typia.json.assertParse<{
-            result: import('./ensure-built.js').EnsureBuiltResult;
-            requests: number;
-          }>(generationRace.stdout);
-          expect(generations.result).toEqual({ disposition: 'hit' });
-          expect(generations.requests).toBeGreaterThanOrEqual(2);
-          expect(generationRace.stderr).toBe('');
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          // Graph witness steps of the case that reuses authoritative graphs without assuming an unstable generation
-          // republishes its witness. They run on this walk's daemon, through the directory the provider binds.
-          const reuseEntry = join(root, 'graph-reuse.ts');
-          const resultsPath = join(root, 'graph-checks.json');
-          await writeFile(
-            reuseEntry,
-            `
+        );
+        const generationRace = await run('bun', generationRaceEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(generationRace.code, generationRace.stdout + generationRace.stderr).toBe(0);
+        const generations = typia.json.assertParse<{
+          result: import('./ensure-built.js').EnsureBuiltResult;
+          requests: number;
+        }>(generationRace.stdout);
+        expect(generations.result).toEqual({ disposition: 'hit' });
+        expect(generations.requests).toBeGreaterThanOrEqual(2);
+        expect(generationRace.stderr).toBe('');
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
+
+    it('reuses an authoritative graph witness and invalidates it on workspace file and dependency changes', async () => {
+      await runPhase('workspace and dependency graph witness reuse', async () => {
+        // Graph witness steps of the case that reuses authoritative graphs without assuming an unstable generation
+        // republishes its witness. They run on this walk's daemon, through the directory the provider binds.
+        reuseEntry = join(root, 'graph-reuse.ts');
+        const resultsPath = join(root, 'graph-checks-workspace.json');
+        await writeFile(
+          reuseEntry,
+          `
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { chmod, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const mode = process.argv[2];
+const outputPath = process.argv[3];
 const requireNx = createRequire(process.cwd() + '/package.json');
 const { daemonClient } = requireNx('nx/src/daemon/client/client');
 const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
@@ -1376,107 +1472,129 @@ async function check(label) {
   const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
   results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
 }
-await check('establish');
-await check('reuse');
-const added = join(process.cwd(), 'new-graph-input.txt');
-await writeFile(added, 'new');
-await check('created');
-await rm(added);
-await check('deleted');
-const project = join(process.cwd(), 'packages/app/project.json');
-const original = await readFile(project, 'utf8');
-const config = JSON.parse(original);
-config.implicitDependencies = [];
-await writeFile(project, JSON.stringify(config));
-await check('dependency');
-await writeFile(project, original);
-await check('dependency-restored');
-// Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
-// witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
-// changed installation, and the call after that reuses the graph the changed installation was proved with.
-const installed = join(process.cwd(), 'node_modules/typescript/README.md');
-const readme = await readFile(installed);
-const { atime, mtime } = await stat(installed);
-readme[0] ^= 1;
-await writeFile(installed, readme);
-await utimes(installed, atime, mtime);
-await check('installation');
-await check('installation-reuse');
-// Save only evidence the real daemon generation actually authorized, outside
-// the workspace: the later missing-witness RPC is not obliged to replace it.
-const authoritativeWitness = await readFile(witness, 'utf8');
-const witnessMode = (await stat(witness)).mode & 0o7777;
-await rename(witness, savedWitness);
-// Equal pre/post bytes do not authorize publication after a write/revert.
-// Count and return the actual RPC response, including the required successor.
-invalidateGeneration = true;
-await check('missing-witness');
-assert.equal(invalidateGeneration, false);
-assert.equal(existsSync(witness), false);
-// Restore that same genuine witness, not synthesized evidence or a retry of
-// the unstable generation, so the unreadable control always runs.
-await rename(savedWitness, witness);
-assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
-await chmod(witness, 0);
-try {
-  await assert.rejects(readFile(witness), { code: 'EACCES' });
-  await check('unreadable-witness');
-} finally {
-  await chmod(witness, witnessMode);
+if (mode === 'workspace') {
+  await check('establish');
+  await check('reuse');
+  const added = join(process.cwd(), 'new-graph-input.txt');
+  await writeFile(added, 'new');
+  await check('created');
+  await rm(added);
+  await check('deleted');
+  const project = join(process.cwd(), 'packages/app/project.json');
+  const original = await readFile(project, 'utf8');
+  const config = JSON.parse(original);
+  config.implicitDependencies = [];
+  await writeFile(project, JSON.stringify(config));
+  await check('dependency');
+  await writeFile(project, original);
+  await check('dependency-restored');
+} else if (mode === 'witness') {
+  // Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
+  // witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
+  // changed installation, and the call after that reuses the graph the changed installation was proved with.
+  const installed = join(process.cwd(), 'node_modules/typescript/README.md');
+  const readme = await readFile(installed);
+  const { atime, mtime } = await stat(installed);
+  readme[0] ^= 1;
+  await writeFile(installed, readme);
+  await utimes(installed, atime, mtime);
+  await check('installation');
+  await check('installation-reuse');
+  // Save only evidence the real daemon generation actually authorized, outside
+  // the workspace: the later missing-witness RPC is not obliged to replace it.
+  const authoritativeWitness = await readFile(witness, 'utf8');
+  const witnessMode = (await stat(witness)).mode & 0o7777;
+  await rename(witness, savedWitness);
+  // Equal pre/post bytes do not authorize publication after a write/revert.
+  // Count and return the actual RPC response, including the required successor.
+  invalidateGeneration = true;
+  await check('missing-witness');
+  assert.equal(invalidateGeneration, false);
+  assert.equal(existsSync(witness), false);
+  // Restore that same genuine witness, not synthesized evidence or a retry of
+  // the unstable generation, so the unreadable control always runs.
+  await rename(savedWitness, witness);
+  assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
+  await chmod(witness, 0);
+  try {
+    await assert.rejects(readFile(witness), { code: 'EACCES' });
+    await check('unreadable-witness');
+  } finally {
+    await chmod(witness, witnessMode);
+  }
+} else {
+  throw new Error(\`unknown graph-reuse mode: \${mode}\`);
 }
-await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
+await writeFile(outputPath, JSON.stringify(results));
 `,
-          );
-          const reused = await run('bun', reuseEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(reused.code, reused.stdout + reused.stderr).toBe(0);
-          // A changed dependency configuration may legitimately run app:build;
-          // its streamed logs are not the graph-observation protocol.
-          const graphChecks = typia.json.assertParse<
-            { label: string; requests: number; disposition: string; witnessExists: boolean }[]
-          >(await readFile(resultsPath, 'utf8'));
-          expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
-            label: 'reuse',
-            requests: 0,
-            disposition: 'hit',
-            witnessExists: true,
-          });
-          for (const label of [
-            'created',
-            'deleted',
-            'dependency',
-            'dependency-restored',
-            'installation',
-            'unreadable-witness',
-          ]) {
-            expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
-          }
-          expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
-            label: 'missing-witness',
-            requests: 2,
-            disposition: 'hit',
-            witnessExists: false,
-          });
-          expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
-            label: 'installation-reuse',
-            requests: 0,
-            disposition: 'hit',
-            witnessExists: true,
-          });
-          expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
-          expect(await readFile(builds, 'utf8')).toBe('lib\n');
-          expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
-          // Coordinate a real write after the real daemon returned its file
-          // table. The response is not substituted: this makes the
-          // graph→snapshot race deterministic without relying on FSEvents.
-          const raceEntry = join(root, 'freshness-race.ts');
-          await writeFile(
-            raceEntry,
-            `
+        );
+        const reused = await run('bun', reuseEntry, workspace, ['workspace', resultsPath], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(reused.code, reused.stdout + reused.stderr).toBe(0);
+        // A changed dependency configuration may legitimately run app:build;
+        // its streamed logs are not the graph-observation protocol.
+        const graphChecks = typia.json.assertParse<
+          { label: string; requests: number; disposition: string; witnessExists: boolean }[]
+        >(await readFile(resultsPath, 'utf8'));
+        expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
+          label: 'reuse',
+          requests: 0,
+          disposition: 'hit',
+          witnessExists: true,
+        });
+        for (const label of ['created', 'deleted', 'dependency', 'dependency-restored']) {
+          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
+        }
+      });
+    });
+
+    it('invalidates a graph witness on installation ctime, unstable missing witness and unreadable witness', async () => {
+      await runPhase('installation and witness invalidation', async () => {
+        const resultsPath = join(root, 'graph-checks-witness.json');
+        const reused = await run('bun', reuseEntry, workspace, ['witness', resultsPath], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(reused.code, reused.stdout + reused.stderr).toBe(0);
+        const graphChecks = typia.json.assertParse<
+          { label: string; requests: number; disposition: string; witnessExists: boolean }[]
+        >(await readFile(resultsPath, 'utf8'));
+        for (const label of ['installation', 'unreadable-witness']) {
+          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
+        }
+        expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
+          label: 'missing-witness',
+          requests: 2,
+          disposition: 'hit',
+          witnessExists: false,
+        });
+        expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
+          label: 'installation-reuse',
+          requests: 0,
+          disposition: 'hit',
+          witnessExists: true,
+        });
+        expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
+        expect(await readFile(builds, 'utf8')).toBe('lib\n');
+        expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
+      });
+    });
+
+    it('refreshes a stale file snapshot on an unrelated edit without rebuilding', async () => {
+      await runPhase('unrelated edit freshness race', async () => {
+        // Coordinate a real write after the real daemon returned its file
+        // table. The response is not substituted: this makes the
+        // graph→snapshot race deterministic without relying on FSEvents.
+        raceEntry = join(root, 'freshness-race.ts');
+        await writeFile(
+          raceEntry,
+          `
 import { createRequire } from 'node:module';
 import { writeFile } from 'node:fs/promises';
 import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
@@ -1489,55 +1607,39 @@ daemonClient.getWorkspaceContextFileData = async () => {
 };
 console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process.cwd() })));
 `,
-          );
-          const refreshed = await run(
-            'bun',
-            raceEntry,
-            workspace,
-            [join(workspace, 'README.md'), 'an unrelated edit\n'],
-            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
-          );
-          expect(refreshed.code, refreshed.stdout + refreshed.stderr).toBe(0);
-          expect(refreshed.stdout.trim()).toBe(JSON.stringify({ disposition: 'hit' }));
-          expect(refreshed.stderr).toBe('');
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        );
+        const refreshed = await run(
+          'bun',
+          raceEntry,
+          workspace,
+          [join(workspace, 'README.md'), 'an unrelated edit\n'],
+          { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
+        );
+        expect(refreshed.code, refreshed.stdout + refreshed.stderr).toBe(0);
+        expect(refreshed.stdout.trim()).toBe(JSON.stringify({ disposition: 'hit' }));
+        expect(refreshed.stderr).toBe('');
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
 
-          // STRICT-BY: the same boundary moving an actual declared input must
-          // miss, run its producer, and rebuild the dependent artifact.
-          const changed = await run(
-            'bun',
-            raceEntry,
-            workspace,
-            [join(workspace, 'packages', 'lib', 'source.txt'), 'changed\n'],
-            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
-          );
-          expect(changed.code, changed.stdout + changed.stderr).toBe(0);
-          expect(changed.stdout).toContain('"disposition":"built"');
-          expect(await readFile(builds, 'utf-8')).toBe('lib\nchanged\n');
-          expect(await readFile(join(workspace, 'packages', 'app', 'dist', 'marker.txt'), 'utf-8')).toBe(
-            'built\nchanged\n',
-          );
-        },
-        'workspace',
-      );
-    } catch (error) {
-      failure = { error };
-    }
-    // Only the directories this test made: the caller's, and the one the provider bound for this workspace.
-    for (const directory of [socketDir, ...providerDirectories]) {
-      await rm(directory, { recursive: true, force: true });
-    }
-    // The fixture retires on every exit path of its body, a throwing one
-    // included: once it has, its root is gone. What of this process's tree
-    // still runs is named only to explain a failure.
-    if (failure === null) {
-      expect(root === '' || !existsSync(root)).toBe(true);
-    } else {
-      const left = root === '' ? null : await descendantsDiagnostic(`the fixture ${root}`);
-      if (left === null) throw failure.error;
-      // A cause, not an AggregateError: the test harness prints an aggregate's
-      // inner errors without its message.
-      throw new Error(`${left} after its body failed`, { cause: failure.error });
-    }
+    it('misses and rebuilds when a declared input changes across the graph-to-snapshot boundary', async () => {
+      await runPhase('declared input freshness race', async () => {
+        // STRICT-BY: the same boundary moving an actual declared input must
+        // miss, run its producer, and rebuild the dependent artifact.
+        const changed = await run(
+          'bun',
+          raceEntry,
+          workspace,
+          [join(workspace, 'packages', 'lib', 'source.txt'), 'changed\n'],
+          { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
+        );
+        expect(changed.code, changed.stdout + changed.stderr).toBe(0);
+        expect(changed.stdout).toContain('"disposition":"built"');
+        expect(await readFile(builds, 'utf-8')).toBe('lib\nchanged\n');
+        expect(await readFile(join(workspace, 'packages', 'app', 'dist', 'marker.txt'), 'utf-8')).toBe(
+          'built\nchanged\n',
+        );
+      });
+    });
   });
 });
