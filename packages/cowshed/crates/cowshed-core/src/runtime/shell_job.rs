@@ -437,6 +437,78 @@ struct JobIo {
     stderr: OwnedFd,
 }
 
+/// Chunks buffered ahead of a job's stderr writer task: at 4 KiB per tee read, one pipe's
+/// capacity (64 KiB) of backpressure before the tee yields on `reserve`.
+const JOB_STDERR_QUEUE_CHUNKS: usize = 16;
+
+/// One ordered writer lane for everything the supervisor writes to a job's stderr: the tee's
+/// forwarding, waiting and evaluating lines, and why no command ran.
+///
+/// The supervisor drains the job's stderr pipe on its one runtime thread, so a `write(2)` made
+/// there into a full pipe waits on a reader that cannot run and wedges every `hello` behind it
+/// (11_shell.md, "Cold activation is single-flight per workspace"). One task owns the `File`,
+/// wraps it in [`cowshed_os::stdio::Blocking`] so `O_NONBLOCK` is never mutated on a description
+/// shared with the host or command, and writes each chunk on tokio's blocking pool. Once every
+/// sender drops, the task ends and drops its `File`, letting the job's stderr reach EOF.
+#[derive(Clone)]
+pub(super) struct JobStderr {
+    chunks: mpsc::Sender<Box<[u8]>>,
+}
+
+impl JobStderr {
+    /// Start the job's stderr writer owning `file` directly, without cloning its descriptor.
+    pub(super) fn from_file(file: std::fs::File) -> Self {
+        use std::io::Write as _;
+        let (chunks, mut received) = mpsc::channel::<Box<[u8]>>(JOB_STDERR_QUEUE_CHUNKS);
+        tokio::spawn(async move {
+            let mut sink = Some(cowshed_os::stdio::Blocking::new(file));
+            while let Some(chunk) = received.recv().await {
+                let Some(mut writer) = sink.take() else {
+                    continue;
+                };
+                match tokio::task::spawn_blocking(move || {
+                    let result = writer.write_all(&chunk);
+                    (writer, result)
+                })
+                .await
+                {
+                    Ok((writer, Ok(()))) => sink = Some(writer),
+                    Ok((_writer, Err(error))) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: the job's stderr refused supervisor output: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        cowshed_os::eprintln!(
+                            "cowshed: the job's stderr writer task failed: {error}"
+                        );
+                    }
+                }
+            }
+        });
+        Self { chunks }
+    }
+
+    /// Clone `stderr` once and start the job's stderr writer on that clone.
+    pub(super) fn try_clone_from(stderr: &OwnedFd) -> io::Result<Self> {
+        let clone = stderr.try_clone()?;
+        Ok(Self::from_file(std::fs::File::from(clone)))
+    }
+
+    /// Reserve one slot before reading a source pipe so a cancelled read loses no bytes.
+    pub(super) async fn reserve(&self) -> Option<mpsc::Permit<'_, Box<[u8]>>> {
+        self.chunks.reserve().await.ok()
+    }
+
+    /// Enqueue one diagnostic line with a trailing newline, in order with all other writes.
+    pub(super) async fn write_line(&self, line: &str) {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        let _ = self.chunks.send(bytes.into_boxed_slice()).await;
+    }
+}
+
 struct RunCommand {
     command: HostCommand,
     cwd: PathBuf,
@@ -475,17 +547,21 @@ async fn drive(
     job_id: JobId,
     events: mpsc::Sender<ProcessEvent>,
 ) {
-    // A copy of the job's stderr, for saying why no command ran. It is closed the moment the
-    // command starts: while this process holds a writer, the job's stderr never ends, and the
-    // job never concludes.
-    let mut diagnostics = match io.stderr.try_clone() {
-        Ok(stderr) => Some(std::fs::File::from(stderr)),
+    // One writer lane over a copy of the job's stderr, for activation output and saying why no
+    // command ran. Its handle is dropped the moment the command starts: while this process holds
+    // a writer, the job's stderr never ends, and the job never concludes.
+    let mut diagnostics = match JobStderr::try_clone_from(&io.stderr) {
+        Ok(stderr) => Some(stderr),
         Err(cause) => {
             let error = CowshedError::environment_missing(
                 format!("cannot clone the job's stderr for diagnostics: {cause}"),
                 "retry the command; check the supervisor's descriptor limit",
             );
-            note(&Some(std::fs::File::from(io.stderr)), &error);
+            note(
+                Some(&JobStderr::from_file(std::fs::File::from(io.stderr))),
+                &error,
+            )
+            .await;
             control.finish();
             let _ = events
                 .send(ProcessEvent::LaunchFailed { job_id, error })
@@ -510,19 +586,21 @@ async fn drive(
         Outcome::Reported => return,
         Outcome::Unobserved(error) => ProcessEvent::WaitFailed { job_id, error },
         Outcome::NotLaunched(error) => {
-            note(&diagnostics, &error);
+            note(diagnostics.as_ref(), &error).await;
             ProcessEvent::LaunchFailed { job_id, error }
         }
         Outcome::ScriptSyntax => ProcessEvent::ScriptSyntax { job_id },
     };
+    drop(diagnostics);
     let _ = events.send(event).await;
 }
 
 /// Tell the job, on its own stderr, why its command did not run.
-fn note(stderr: &Option<std::fs::File>, error: &CowshedError) {
-    use std::io::Write as _;
-    if let Some(mut stderr) = stderr.as_ref() {
-        let _ = writeln!(stderr, "cowshed: {}", error.message);
+async fn note(stderr: Option<&JobStderr>, error: &CowshedError) {
+    if let Some(stderr) = stderr {
+        stderr
+            .write_line(&format!("cowshed: {}", error.message))
+            .await;
     }
 }
 
@@ -545,7 +623,7 @@ async fn run_pooled(
     command: RunCommand,
     control: &JobControl,
     mut released: oneshot::Receiver<()>,
-    diagnostics: &mut Option<std::fs::File>,
+    diagnostics: &mut Option<JobStderr>,
     job_id: JobId,
     events: &mpsc::Sender<ProcessEvent>,
 ) -> Outcome {
@@ -596,6 +674,7 @@ async fn run_pooled(
                         TreeOwner::Job(job_id),
                         ticket.predicted(),
                         (stdout, stderr),
+                        diagnostics.clone(),
                     )
                     .await),
                 (Err(error), _) | (_, Err(error)) => Err(pipe_error(error)),
@@ -621,7 +700,7 @@ async fn run_pooled(
                     // here, is a launch that failed.
                     return match host.end().await {
                         HostEnd::Own(status) if libc::WIFSIGNALED(status) => {
-                            note(diagnostics, &error);
+                            note(diagnostics.as_ref(), &error).await;
                             decode(status)
                         }
                         HostEnd::Own(_) | HostEnd::Killed => Outcome::NotLaunched(error),
@@ -1220,6 +1299,7 @@ impl HostActivator {
         owner: TreeOwner,
         predicted: Vec<PathBuf>,
         (stdout, stderr): (OwnedFd, OwnedFd),
+        stderr_lane: Option<JobStderr>,
     ) -> HostActivation {
         let Some(envrc_directory) = &self.envrc_directory else {
             // Nothing to evaluate and nothing to watch: the generation never goes stale.
@@ -1236,7 +1316,7 @@ impl HostActivator {
         let claim = match self.activation.try_claim() {
             Some(claim) => claim,
             None => tokio::select! {
-                claim = self.activation.claim(&stderr) => claim,
+                claim = self.activation.claim(stderr_lane.as_ref()) => claim,
                 ended = host.fence.exited() => {
                     return HostActivation::Broken(match ended {
                         Ok(_) => CowshedError::conflict(
@@ -1283,9 +1363,10 @@ impl HostActivator {
             ));
         }
         report_on(
-            &stderr,
+            stderr_lane.as_ref(),
             &format!("cowshed: evaluating the workspace shell: {miss}"),
-        );
+        )
+        .await;
         let envrc = envrc_directory.join(".envrc");
         let request = FrameWriter::new(REQUEST_APPROVE)
             .bytes(envrc.as_os_str().as_bytes())
@@ -1295,7 +1376,7 @@ impl HostActivator {
             Err(error) => return HostActivation::Broken(protocol_error("request", error)),
         };
         // The evaluation writes to the job's stderr through a tee that keeps its last line.
-        let (evaluation_stderr, mut tee) = match Tee::new(&stderr) {
+        let (evaluation_stderr, mut tee) = match Tee::new(stderr_lane) {
             Ok(tee) => tee,
             Err(error) => return HostActivation::Broken(pipe_error(error)),
         };
@@ -1341,7 +1422,7 @@ impl HostActivator {
         drop(evaluation_stderr);
         let payload = match claim.watch(&evaluation, &mut tee, host.receive()).await {
             Ok(received) => {
-                tee.finish();
+                tee.finish().await;
                 match received {
                     Ok(payload) => payload,
                     Err(error) => return HostActivation::Broken(error),
@@ -1352,7 +1433,7 @@ impl HostActivator {
                     HostEnd::Killed => "was ended".to_owned(),
                     HostEnd::Own(status) => format!("had already exited with wait status {status}"),
                 };
-                tee.finish();
+                tee.finish_stalled().await;
                 return HostActivation::Broken(stall.into_error(&ended));
             }
         };
@@ -1529,12 +1610,10 @@ impl HostActivator {
     }
 }
 
-/// Write one diagnostic line to a job's stderr. A stream the job already closed loses it.
-fn report_on(stderr: &OwnedFd, line: &str) {
-    use std::io::Write as _;
-    if let Ok(clone) = stderr.try_clone() {
-        let mut stream = std::fs::File::from(clone);
-        let _ = writeln!(stream, "{line}");
+/// Write one diagnostic line to a job's stderr through its off-runtime writer lane.
+async fn report_on(stderr: Option<&JobStderr>, line: &str) {
+    if let Some(stderr) = stderr {
+        stderr.write_line(line).await;
     }
 }
 
@@ -1563,7 +1642,7 @@ async fn expect_status(host: &mut ExecHost, expected: u8) -> Result<RawWaitStatu
 #[async_trait]
 impl Activator for HostActivator {
     type Host = ExecHost;
-    type Output = (JobId, (OwnedFd, OwnedFd));
+    type Output = (JobId, (OwnedFd, OwnedFd), JobStderr);
 
     /// A spare's activation output has no job to belong to and is discarded; its failure only
     /// means no spare exists, and the next command activates for itself.
@@ -1572,10 +1651,10 @@ impl Activator for HostActivator {
         predicted: Vec<PathBuf>,
         output: Option<Self::Output>,
     ) -> Activation<ExecHost> {
-        let (owner, output) = match output {
-            Some((job_id, output)) => (TreeOwner::Job(job_id), output),
+        let (owner, output, stderr_lane) = match output {
+            Some((job_id, output, lane)) => (TreeOwner::Job(job_id), output, Some(lane)),
             None => match (null_device(), null_device()) {
-                (Ok(stdout), Ok(stderr)) => (TreeOwner::Spare, (stdout, stderr)),
+                (Ok(stdout), Ok(stderr)) => (TreeOwner::Spare, (stdout, stderr), None),
                 (Err(error), _) | (_, Err(error)) => {
                     return Activation::Broken {
                         error: pipe_error(error),
@@ -1588,7 +1667,7 @@ impl Activator for HostActivator {
             Err(error) => return Activation::Broken { error },
         };
         match self
-            .activate_host(&mut host, owner, predicted, output)
+            .activate_host(&mut host, owner, predicted, output, stderr_lane)
             .await
         {
             HostActivation::Ready(evidence) => Activation::Ready { host, evidence },

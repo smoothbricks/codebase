@@ -293,10 +293,17 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
         ));
         assert!(observed.recv().await.is_none(), "no process was started");
 
-        let mut diagnostics = String::new();
-        std::fs::File::from(stderr_reader)
-            .read_to_string(&mut diagnostics)
-            .expect("stderr closes after reporting the clone failure");
+        // Read on a blocking thread so the `current_thread` runtime stays free to run the
+        // `JobStderr` writer task to EOF, as the supervisor drains job stderr asynchronously.
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            let mut diagnostics = String::new();
+            std::fs::File::from(stderr_reader)
+                .read_to_string(&mut diagnostics)
+                .expect("stderr closes after reporting the clone failure");
+            diagnostics
+        })
+        .await
+        .expect("read diagnostics stderr");
         assert_eq!(diagnostics, format!("cowshed: {}\n", error.message));
         let mut stdout_bytes = Vec::new();
         std::fs::File::from(stdout_reader)

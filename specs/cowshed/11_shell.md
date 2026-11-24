@@ -431,8 +431,13 @@ A waiter names what it waits for. Once the holder sends its evaluation request, 
 `cowshed: waiting for this workspace's shell evaluation (pid N, running Ns, last: "…")`: the evaluating host's pid, how
 long the evaluation has run and the last line it wrote (`no output yet` before its first). The evaluation's stderr
 reaches the job's through a tee that forwards every byte unchanged, so the output still belongs to the job, and keeps
-the last line it ended. The holder shares its pid, start and last line as one atomically swapped record, replaced once
-per chunk that ends a line and loaded once per waiting line; a waiter prints again only when the last line changes,
+the last line it ended. Every byte the supervisor writes to a job's stderr goes through one writer per job, off the
+runtime thread and in order: the tee's forwarding, the evaluating and waiting lines, and why no command ran. The job's
+stderr is a pipe the supervisor itself drains on its one runtime thread, so a write made there into a full pipe waits on
+a reader that cannot run, and every `hello` behind it times out (05_gateway.md, "Deadlines"). Measured 2026-11-24: a
+workspace supervisor sat in `write(2)` from the tee into its own full job stderr pipe, and every `exec` into that
+workspace failed its `hello`. The holder shares its pid, start and last line as one atomically swapped record, replaced
+once per chunk that ends a line and loaded once per waiting line; a waiter prints again only when the last line changes,
 never on a timer. Progress is output, not CPU: an evaluation that waits on the Nix daemon's socket sits near zero CPU
 while the daemon builds for it. An evaluation is idle while it writes no line and no Nix build runs. A live process of a
 Nix build user, a member of the `nixbld` group, is the sign a build runs, read from what names those processes rather
@@ -446,11 +451,14 @@ restarts the bound. Otherwise the holder ends the host's process group, as the h
 protocol, and fails the job with
 `the workspace shell evaluation wrote nothing for 5 min and no Nix build was running: "<last line>"`, naming the host it
 ended; a probe that cannot list processes ends it too and says so, and an unwatched answer ends it as
-`no Nix build was seen running (<why>)`. The claim opens once that host is reaped, and the next waiter takes it and
-evaluates afresh. Without the bound, five execs once printed only the bare waiting line for 10–25 min behind a
-`devenv direnv-export` blocked reading the daemon's socket (13 min elapsed, 9 s CPU) while the daemon compiled a newly
-pinned mbx (14_nix.md, "mbx"). Enforced by `shell_job::stall_tests` with a fake host, clock and build probe, and by
-`nix_builds::tests` against the kernel and a scratch cgroup root with and without the daemon's service.
+`no Nix build was seen running (<why>)`. After a stall, the holder forwards what the evaluation's pipe already holds, at
+most one pipe's capacity, and then closes its writer without keeping a background drain task: descendants left outside
+the host's process group no longer own the job's output, so the job's stderr ends and the job seals and fails visibly.
+The claim opens once that host is reaped, and the next waiter takes it and evaluates afresh. Without the bound, five
+execs once printed only the bare waiting line for 10–25 min behind a `devenv direnv-export` blocked reading the daemon's
+socket (13 min elapsed, 9 s CPU) while the daemon compiled a newly pinned mbx (14_nix.md, "mbx"). Enforced by
+`shell_job::stall_tests` with a fake host, clock and build probe, and by `nix_builds::tests` against the kernel and a
+scratch cgroup root with and without the daemon's service.
 
 **Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the

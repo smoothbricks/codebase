@@ -211,8 +211,9 @@ fn activate(
 ) -> tokio::task::JoinHandle<HostActivation> {
     let activator = Arc::clone(activator);
     tokio::spawn(async move {
+        let stderr_lane = JobStderr::try_clone_from(&stdio.1).unwrap();
         activator
-            .activate_host(&mut host, job(id), Vec::new(), stdio)
+            .activate_host(&mut host, job(id), Vec::new(), stdio, Some(stderr_lane))
             .await
     })
 }

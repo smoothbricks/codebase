@@ -4,14 +4,16 @@
 //!
 //! The holder shares its evaluation once it starts it: the host's pid, when it started and its
 //! last output line, which the tee of the evaluation's stderr swaps in once per chunk that ends a
-//! line. A waiter loads it once per report and is woken only when it changes, so nothing it
-//! prints repeats on a timer. An evaluation is idle while it writes no line and no Nix build
-//! runs: a build the daemon runs for it writes nothing to its stderr while it waits on the
-//! daemon's socket. A live process of a Nix build user is the observable sign of a build; it
-//! cannot say whose build it is ([`super::super::nix_builds`]).
+//! line. The tee and waiting lines write through the job's single off-runtime stderr lane
+//! ([`super::JobStderr`]), never calling `write(2)` on the supervisor's runtime thread, which also
+//! drains that pipe. A waiter loads the shared record once per report and is woken only when it
+//! changes, so nothing it prints repeats on a timer. An evaluation is idle while it writes no line
+//! and no Nix build runs: a build the daemon runs for it writes nothing to its stderr while it
+//! waits on the daemon's socket. A live process of a Nix build user is the observable sign of a
+//! build; it cannot say whose build it is ([`super::super::nix_builds`]).
 
 use std::future::Future;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,13 +21,19 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{Mutex, MutexGuard, Notify};
+use tokio::sync::{Mutex, MutexGuard, Notify, mpsc};
 
 use super::super::nix_builds::{Builds, Unwatched};
+use super::JobStderr;
 use crate::error::CowshedError;
 
 /// How long an evaluation may write no line while no Nix build runs before it is ended.
 pub(super) const STALL_BOUND: Duration = Duration::from_secs(5 * 60);
+
+/// Most bytes [`Tee::finish_stalled`] drains from the evaluation's pipe before dropping the job's
+/// stderr lane: one pipe buffer's capacity, so a live descendant outside the host's group cannot
+/// hold the drain open.
+const STALL_DRAIN_BOUND: usize = 64 * 1024;
 
 /// The most of a line a waiter quotes, in chars.
 const QUOTED_CHARS: usize = 200;
@@ -120,7 +128,7 @@ impl ActivationGate {
 
     /// Wait for the claim, saying so on the waiting job's `stderr`: once now, then each time the
     /// holder starts an evaluation or it writes a new last line, never on a timer.
-    pub(super) async fn claim(&self, stderr: &OwnedFd) -> Claim<'_> {
+    pub(super) async fn claim(&self, stderr: Option<&JobStderr>) -> Claim<'_> {
         let acquire = self.lock.lock();
         tokio::pin!(acquire);
         let mut shown = None;
@@ -140,7 +148,8 @@ impl ActivationGate {
                 super::report_on(
                     stderr,
                     &self.waiting(holder.as_deref().zip(progress.as_deref())),
-                );
+                )
+                .await;
                 shown = Some(key);
             }
             tokio::select! {
@@ -314,11 +323,13 @@ impl Stall {
     }
 }
 
-/// The evaluation's stderr on its way to the job's: forwarded unchanged, its last line kept.
+/// The evaluation's stderr on its way to the job's: forwarded unchanged through the job's
+/// off-runtime writer lane, its last line kept.
 pub(super) struct Tee {
     pipe: AsyncFd<std::fs::File>,
-    /// The job's stderr; none once a write to it failed, after which output is only read.
-    job: Option<std::fs::File>,
+    /// The job's stderr writer lane; `None` for a spare, whose output is discarded while its
+    /// lines are still tracked for waiters and the stall bound.
+    job: Option<JobStderr>,
     lines: Lines,
     /// Until every writer of the pipe closed it, or reading it failed.
     open: bool,
@@ -326,8 +337,8 @@ pub(super) struct Tee {
 
 impl Tee {
     /// A pipe whose write end is the evaluation's stderr, and the tee that forwards its read end
-    /// to the job's `stderr`.
-    pub(super) fn new(stderr: &OwnedFd) -> io::Result<(OwnedFd, Self)> {
+    /// onto the job's stderr lane (`None` for a spare).
+    pub(super) fn new(job: Option<JobStderr>) -> io::Result<(OwnedFd, Self)> {
         let (read, write) = super::pipe()?;
         // SAFETY: fcntl on a descriptor this function owns; only its own flags change.
         let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
@@ -340,7 +351,7 @@ impl Tee {
         }
         let tee = Self {
             pipe: AsyncFd::new(std::fs::File::from(read))?,
-            job: Some(std::fs::File::from(stderr.try_clone()?)),
+            job,
             lines: Lines::default(),
             open: true,
         };
@@ -348,7 +359,14 @@ impl Tee {
     }
 
     /// Forward the next chunk; the last line it ends, if any.
+    ///
+    /// Reserves a lane permit before awaiting readability and reading the pipe so cancelling this
+    /// future inside [`Claim::watch`]'s `select!` loses no bytes.
     async fn forward(&mut self) -> Option<Box<str>> {
+        let permit = match &self.job {
+            Some(job) => job.reserve().await,
+            None => None,
+        };
         let mut buffer = [0_u8; 4096];
         let read = loop {
             let mut ready = match self.pipe.readable().await {
@@ -359,51 +377,49 @@ impl Tee {
                 break read;
             }
         };
-        self.take(read, &buffer)
+        take_chunk(&mut self.open, &mut self.lines, read, &buffer, permit)
     }
 
-    /// Forward what one read returned; the last line it ends, if any.
-    fn take(&mut self, read: io::Result<usize>, buffer: &[u8]) -> Option<Box<str>> {
-        let chunk = match read {
-            Ok(0) => {
-                self.open = false;
-                return None;
-            }
-            Ok(read) => &buffer[..read],
-            Err(error) => {
-                cowshed_os::eprintln!(
-                    "cowshed: cannot read the workspace shell evaluation's stderr: {error}"
-                );
-                self.open = false;
-                return None;
-            }
-        };
-        if let Some(job) = &mut self.job
-            && let Err(error) = job.write_all(chunk)
-        {
-            cowshed_os::eprintln!(
-                "cowshed: the job's stderr refused the workspace shell evaluation's output: {error}"
-            );
-            self.job = None;
-        }
-        self.lines.feed(chunk)
-    }
-
-    /// Forward everything the evaluation wrote before its host answered, which the pipe already
-    /// holds, so the job's own output follows it; then the rest, on its own task, until the last
-    /// writer closes the pipe.
-    pub(super) fn finish(mut self) {
+    /// Forward what the evaluation's pipe already holds, stopping at `WouldBlock`, EOF, or `limit`
+    /// bytes. Reserves a lane permit before each non-blocking read so the runtime thread never
+    /// blocks on a full job stderr pipe.
+    async fn drain_buffered(&mut self, limit: Option<usize>) {
         let mut buffer = [0_u8; 4096];
+        let mut drained = 0_usize;
         while self.open {
-            let read = self.pipe.get_ref().read(&mut buffer);
+            let want = match limit {
+                Some(max) => {
+                    let remaining = max.saturating_sub(drained);
+                    if remaining == 0 {
+                        break;
+                    }
+                    buffer.len().min(remaining)
+                }
+                None => buffer.len(),
+            };
+            let permit = match &self.job {
+                Some(job) => job.reserve().await,
+                None => None,
+            };
+            let read = self.pipe.get_ref().read(&mut buffer[..want]);
             if read
                 .as_ref()
                 .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
             {
                 break;
             }
-            self.take(read, &buffer);
+            if let Ok(count) = read {
+                drained = drained.saturating_add(count);
+            }
+            take_chunk(&mut self.open, &mut self.lines, read, &buffer, permit);
         }
+    }
+
+    /// End forwarding after the host answered: enqueue everything the evaluation's pipe already
+    /// holds onto the job's stderr lane so the job's own output follows it, then keep forwarding
+    /// the rest on its own task until the last writer closes the pipe.
+    pub(super) async fn finish(mut self) {
+        self.drain_buffered(None).await;
         if self.open {
             tokio::spawn(async move {
                 while self.open {
@@ -412,6 +428,42 @@ impl Tee {
             });
         }
     }
+
+    /// End forwarding after a stall: enqueue what the evaluation's pipe already holds, at most
+    /// [`STALL_DRAIN_BOUND`], then drop the job's stderr lane without spawning a background task.
+    /// Descendants left outside the host's process group no longer own the job's output, so the
+    /// job's stderr reaches EOF and the job seals and fails visibly.
+    pub(super) async fn finish_stalled(mut self) {
+        self.drain_buffered(Some(STALL_DRAIN_BOUND)).await;
+    }
+}
+
+/// Forward what one read returned using its reserved `permit`; the last line it ends, if any.
+fn take_chunk(
+    open: &mut bool,
+    lines: &mut Lines,
+    read: io::Result<usize>,
+    buffer: &[u8],
+    permit: Option<mpsc::Permit<'_, Box<[u8]>>>,
+) -> Option<Box<str>> {
+    let chunk = match read {
+        Ok(0) => {
+            *open = false;
+            return None;
+        }
+        Ok(read) => &buffer[..read],
+        Err(error) => {
+            cowshed_os::eprintln!(
+                "cowshed: cannot read the workspace shell evaluation's stderr: {error}"
+            );
+            *open = false;
+            return None;
+        }
+    };
+    if let Some(permit) = permit {
+        permit.send(Box::<[u8]>::from(chunk));
+    }
+    lines.feed(chunk)
 }
 
 /// The last line of a byte stream, a carriage return ending a line as a newline does.
@@ -534,8 +586,8 @@ mod tests {
                     collected
                 });
 
-                let (eval_write, mut tee) = super::Tee::new(&job_write).expect("tee");
-                drop(job_write);
+                let lane = super::super::JobStderr::from_file(std::fs::File::from(job_write));
+                let (eval_write, mut tee) = super::Tee::new(Some(lane)).expect("tee");
 
                 let producer = std::thread::spawn(move || {
                     let mut eval_stderr = std::fs::File::from(eval_write);
@@ -547,7 +599,7 @@ mod tests {
                 while tee.open {
                     tee.forward().await;
                 }
-                tee.finish();
+                tee.finish().await;
 
                 let collected = reader.await.expect("reader task");
                 producer.join().expect("evaluation stderr producer");
@@ -592,8 +644,8 @@ mod tests {
                 .expect("current_thread runtime");
             runtime.block_on(async move {
                 let (job_read, job_write) = super::super::pipe().expect("job stderr pipe");
-                let (eval_write, mut tee) = super::Tee::new(&job_write).expect("tee");
-                drop(job_write);
+                let lane = super::super::JobStderr::from_file(std::fs::File::from(job_write));
+                let (eval_write, mut tee) = super::Tee::new(Some(lane)).expect("tee");
 
                 let producer = std::thread::spawn(move || {
                     let mut eval_stderr = std::fs::File::from(eval_write);
@@ -604,7 +656,7 @@ mod tests {
                     while tee.open {
                         tee.forward().await;
                     }
-                    tee.finish();
+                    tee.finish().await;
                 });
 
                 let ticker = tokio::spawn(async move {
