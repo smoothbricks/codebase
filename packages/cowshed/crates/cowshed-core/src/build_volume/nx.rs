@@ -1097,7 +1097,7 @@ pub struct OutputMiss {
     pub reason: String,
 }
 
-/// A land's publish (05_gateway.md "`/nx/v1/cache/{hash}`"): `node - <root> <JSON hashes>` with
+/// A land's publish (05_gateway.md "`/nx/v1/cache/{hash}`"): `<runtime> - <root> <JSON hashes>` with
 /// this on stdin, run as a job of the landing workspace, stores each named task result of that
 /// checkout's Nx cache to the project's store (`nx_publish.js` says how).
 pub fn publish_script() -> bytes::Bytes {
@@ -1899,31 +1899,10 @@ mod tests {
     /// there but cannot answer — its policy module missing — is a failure, never read as absent.
     #[test]
     fn source_paths_answer_null_only_for_a_root_without_the_plugin() {
-        use std::io::Write as _;
-
         let root =
             crate::scratch_directory::ScratchRoot::new("nx-source-paths").expect("scratch root");
         let stock = StockNx::new(root.path());
-        // The helper as the land runs it: `node -` with the program on stdin, in its own process
-        // (no daemon), without the caller's `NX_*` or `CI`.
-        let enumerate = || {
-            let mut node = std::process::Command::new("node");
-            node.args(["-", stock.checkout.to_str().expect("a UTF-8 checkout")])
-                .current_dir(&stock.checkout)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            without_caller_nx(&mut node);
-            node.env("NX_DAEMON", "false");
-            let mut child = node.spawn_locked().expect("node runs");
-            child
-                .stdin
-                .take()
-                .expect("piped stdin")
-                .write_all(SOURCE_PATHS_SCRIPT.as_bytes())
-                .unwrap();
-            child.wait_with_output_bounded().expect("the helper ends")
-        };
+        let enumerate = || enumerate_source_paths("node", &stock.checkout);
 
         let absent = enumerate();
         assert!(
@@ -1948,6 +1927,74 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&broken.stderr)
         );
+    }
+
+    //#region smoo/cowshed!n/land-helper-runtime
+    /// Land 5.3's output enumeration (16_build_volumes.md) runs under the runtime the landing
+    /// workspace's jobs reach: Node, or Bun in a shell-less Bun workspace. Both answer the same
+    /// bytes on stdout, even when the plugin logs to the console as it answers: Bun's console
+    /// writes to the descriptor, not through `process.stdout.write`.
+    #[test]
+    fn source_paths_answer_the_same_bytes_under_node_and_bun() {
+        let root = crate::scratch_directory::ScratchRoot::new("nx-source-paths-runtimes")
+            .expect("scratch root");
+        let stock = StockNx::new(root.path());
+        let plugin = stock.checkout.join("node_modules/@smoothbricks/nx-plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("package.json"),
+            r#"{"name":"@smoothbricks/nx-plugin","exports":{"./package.json":"./package.json","./build-state-output-policy":"./policy.mjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("policy.mjs"),
+            "export function existingOutputFiles() {\n  console.log('the policy logs');\n  console.info('and informs');\n  console.debug('and debugs');\n  return ['dist/a.txt', 'b/out.json'];\n}\n",
+        )
+        .unwrap();
+
+        let answers = ["node", "bun"].map(|runtime| {
+            let output = enumerate_source_paths(runtime, &stock.checkout);
+            assert!(
+                output.status.success(),
+                "{runtime}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        });
+        assert_eq!(
+            String::from_utf8_lossy(&answers[0]),
+            "[\"dist/a.txt\",\"b/out.json\"]\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&answers[1]),
+            String::from_utf8_lossy(&answers[0]),
+            "Bun answers the bytes Node does"
+        );
+    }
+    //#endregion smoo/cowshed!n/land-helper-runtime
+
+    /// The source-path helper as the land runs it: `<runtime> -` with the program on stdin, in its
+    /// own process (no daemon), without the caller's `NX_*` or `CI`.
+    fn enumerate_source_paths(runtime: &str, checkout: &Path) -> std::process::Output {
+        use std::io::Write as _;
+
+        let mut helper = std::process::Command::new(runtime);
+        helper
+            .args(["-", checkout.to_str().expect("a UTF-8 checkout")])
+            .current_dir(checkout)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        without_caller_nx(&mut helper);
+        helper.env("NX_DAEMON", "false");
+        let mut child = helper.spawn_locked().expect("the runtime runs");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(SOURCE_PATHS_SCRIPT.as_bytes())
+            .unwrap();
+        child.wait_with_output_bounded().expect("the helper ends")
     }
 
     /// The repository this test binary was built from. Read at run time: `env!` would compile

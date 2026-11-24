@@ -877,28 +877,29 @@ possession, which the backend answers from the entry's metadata without reading 
 
 **Publication.** `cowshed land`'s own `--check` publishes after every check passes: it attributes each passed check's Nx
 run from the run summary the check's Nx wrote (16_build_volumes.md, "Land step 7 source capture"), then runs
-`node - <root> <hashes>` with `build_volume/nx_publish.js` on stdin as a gate-class job of the landing workspace. The
-job stores every attributed task result from that checkout's own Nx cache through the workspace's own route: local hits
-as well as executed tasks, since stock Nx stores only what it executed. It looks the keys up in that cache in chunks of
-Nx's own batch lookup, then first asks the store for each key with a `HEAD`, a membership check that is no use of the
-archive; a key already stored is counted, never archived or replaced. A missing key's archive is built by the job
-itself, in the layout the stock native `HttpRemoteCache.store` writes but at gzip level 1 (03_caches.md, "Nx
-accepted-task artifact service"), and sent in one plain `PUT`; a `409` counts as already stored. Nx's own client, under
-the bound the job also carries, has stored the results worth their bytes by then, and the publish finds those stored. A
-task Nx does not cache, or one that failed, is skipped. The cache never blocks a land: a failed publish is said on
-stderr with its cause, and the land goes on. A declared land's gate (02_workspaces.md, "A declared land") uses
-`@smoothbricks/nx-plugin`'s emitted `smoo-nx-publish` executable, not a repository-local publisher. It captures each
-invocation's succeeded hashes before another can overwrite the summary, whatever the invocation's verdict, and publishes
-every list it captured before the gate states its verdict: a red gate publishes each task that succeeded in it as a
-green gate does, and never one that failed (the owner's ruling, 2026-11-10; 03_caches.md, "Nx accepted-task artifact
-service"). The plugin's cached asset producer packages unchanged bytes from the canonical
-`build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint runtime output. A failed publication is a
-distinct diagnostic with the cause, never a claim that results were stored. `cache_adapter.js` is the one boundary to
-the checkout's local Nx cache, whose `DbCache` and native cache are Nx internals: it declares each Nx version it was
-read against (23.2.1, 24.0.3 and 24.0.6) with the layout it relies on — the checkout's `.nx/workspace-data` and
-`.nx/cache`, and the archive its native `HttpRemoteCache` stores and restores — opens the cache through the installed
-version's entry and checks Nx resolved that layout, and refuses any other version by name before it loads Nx. So a land
-publishes from a repository on either version, and an upgrade requalifies the adapter first.
+`<runtime> - <root> <hashes>`, the runtime of the land's helpers (16_build_volumes.md, Land step 5.3), with
+`build_volume/nx_publish.js` on stdin as a gate-class job of the landing workspace. The job stores every attributed task
+result from that checkout's own Nx cache through the workspace's own route: local hits as well as executed tasks, since
+stock Nx stores only what it executed. It looks the keys up in that cache in chunks of Nx's own batch lookup, then first
+asks the store for each key with a `HEAD`, a membership check that is no use of the archive; a key already stored is
+counted, never archived or replaced. A missing key's archive is built by the job itself, in the layout the stock native
+`HttpRemoteCache.store` writes but at gzip level 1 (03_caches.md, "Nx accepted-task artifact service"), and sent in one
+plain `PUT`; a `409` counts as already stored. Nx's own client, under the bound the job also carries, has stored the
+results worth their bytes by then, and the publish finds those stored. A task Nx does not cache, or one that failed, is
+skipped. The cache never blocks a land: a failed publish is said on stderr with its cause, and the land goes on. A
+declared land's gate (02_workspaces.md, "A declared land") uses `@smoothbricks/nx-plugin`'s emitted `smoo-nx-publish`
+executable, not a repository-local publisher. It captures each invocation's succeeded hashes before another can
+overwrite the summary, whatever the invocation's verdict, and publishes every list it captured before the gate states
+its verdict: a red gate publishes each task that succeeded in it as a green gate does, and never one that failed (the
+owner's ruling, 2026-11-10; 03_caches.md, "Nx accepted-task artifact service"). The plugin's cached asset producer
+packages unchanged bytes from the canonical `build_volume/{cache_adapter.js,nx_publish.js}` sources in its own disjoint
+runtime output. A failed publication is a distinct diagnostic with the cause, never a claim that results were stored.
+`cache_adapter.js` is the one boundary to the checkout's local Nx cache, whose `DbCache` and native cache are Nx
+internals: it declares each Nx version it was read against (23.2.1, 24.0.3 and 24.0.6) with the layout it relies on —
+the checkout's `.nx/workspace-data` and `.nx/cache`, and the archive its native `HttpRemoteCache` stores and restores —
+opens the cache through the installed version's entry and checks Nx resolved that layout, and refuses any other version
+by name before it loads Nx. So a land publishes from a repository on either version, and an upgrade requalifies the
+adapter first.
 
 The existing artifact server is a controller-owned foreground child. The gateway passes `--exit-on-stdin-eof` and
 retains the write end of its stdin pipe; EOF drains the server and releases its store lock. A gateway SIGKILL closes

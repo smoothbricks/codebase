@@ -315,6 +315,7 @@ enum Call {
         build_volume: Option<PathBuf>,
     },
     ShellPool,
+    ScriptRuntime,
     TraceHealth,
     #[serde(rename_all = "camelCase")]
     ListeningPorts {
@@ -402,6 +403,7 @@ impl Call {
             Self::ProcessEvents { .. } => "process-events",
             Self::AsIs { .. } => "as-is",
             Self::ShellPool => "shell-pool",
+            Self::ScriptRuntime => "script-runtime",
             Self::TraceHealth => "trace-health",
             Self::ListeningPorts { .. } => "listening-ports",
             Self::JobByKey { .. } => "job-by-key",
@@ -3160,6 +3162,7 @@ async fn answer(
             Bytes::new(),
         ),
         Call::ShellPool => (to_value(&supervisor.shell_pool().await?)?, Bytes::new()),
+        Call::ScriptRuntime => (to_value(&supervisor.script_runtime().await?)?, Bytes::new()),
         Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
         Call::ListeningPorts { job_id } => (
             to_value(&supervisor.listening_ports(job_id).await?)?,
@@ -3947,6 +3950,9 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
         }
         Command::ShellPool { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::ShellPool, Bytes::new()).await);
+        }
+        Command::ScriptRuntime { authority, reply } => {
+            let _ = reply.send(call(path, &authority, Call::ScriptRuntime, Bytes::new()).await);
         }
         Command::TraceHealth { authority, reply } => {
             let _ = reply.send(call(path, &authority, Call::TraceHealth, Bytes::new()).await);

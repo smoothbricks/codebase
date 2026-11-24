@@ -2,12 +2,15 @@
 // graph names, so the land carries generated inputs with the tracked sources. Every target and configuration counts,
 // checked or not; @smoothbricks/nx-plugin's output policy (`existingOutputFiles`) reads the declarations and stock Nx
 // expands them. No task runner, executor or execution hook runs, and nothing is recorded.
-// Usage: node - <absolute Nx root>, with this program on stdin. Prints one JSON array of paths relative to that root,
+// Usage: <node or bun> - <absolute Nx root>, with this program on stdin. Prints one JSON array of paths relative to that root,
 // or `null` when the root's package graph does not resolve @smoothbricks/nx-plugin at all, which leaves its outputs
 // without a policy. A graph or read failure, a plugin that is present but throws or misses a module of its own
 // included, is stderr and a nonzero exit, never an empty answer.
 const answer = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
+// Bun's console writes to the descriptor, not through process.stdout.write: route it to stderr as well, so under
+// either runtime nothing but the answer reaches stdout.
+console.log = console.info = console.debug = console.error;
 const path = require('node:path');
 const { createRequire } = require('node:module');
 const { pathToFileURL } = require('node:url');

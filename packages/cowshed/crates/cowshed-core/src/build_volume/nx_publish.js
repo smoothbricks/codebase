@@ -5,14 +5,17 @@
 // counted and never archived. Only a missing key is archived, by
 // cache_adapter's nxArchive in Nx's own layout at gzip level 1, and sent in one plain PUT. Prefixed once by
 // cache_adapter::script.
-// Usage: node - <absolute Nx root> <JSON array of task hashes>; answers one JSON line on stdout.
+// Usage: <node or bun> - <absolute Nx root> <JSON array of task hashes>; answers one JSON line on stdout.
 const answer = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
+// Bun's console writes to the descriptor, not through process.stdout.write: route it to stderr as well, so under
+// either runtime nothing but the answer reaches stdout.
+console.log = console.info = console.debug = console.error;
 const fs = require('node:fs');
 const path = require('node:path');
 const [root, hashesJson] = process.argv.slice(2);
 if (!root || !path.isAbsolute(root) || hashesJson === undefined) {
-  throw new Error('usage: node - <absolute Nx root> <JSON array of task hashes>');
+  throw new Error('usage: <node or bun> - <absolute Nx root> <JSON array of task hashes>');
 }
 const hashes = JSON.parse(hashesJson);
 if (!Array.isArray(hashes) || new Set(hashes).size !== hashes.length) {

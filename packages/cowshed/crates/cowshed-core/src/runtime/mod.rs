@@ -12,6 +12,7 @@ mod job_attribution;
 pub mod job_cgroup;
 pub mod job_cpu;
 pub mod job_groups;
+mod job_program;
 pub mod job_progress;
 mod job_resources;
 pub mod job_span_facts;

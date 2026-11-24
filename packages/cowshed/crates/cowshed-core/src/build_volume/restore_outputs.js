@@ -1,8 +1,11 @@
 // Land step 7 (16_build_volumes.md): hash/restore only the captured check's Nx task graph.
 // No task runner, executor, check shell or execution hook is called, even on a miss.
-// Usage: node - <absolute Nx root> <CheckedRun JSON>, with this program on stdin.
+// Usage: <node or bun> - <absolute Nx root> <CheckedRun JSON>, with this program on stdin.
 const answer = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
+// Bun's console writes to the descriptor, not through process.stdout.write: route it to stderr as well, so under
+// either runtime nothing but the answer reaches stdout.
+console.log = console.info = console.debug = console.error;
 const path = require('node:path');
 const { createRequire } = require('node:module');
 const root = process.argv[2];

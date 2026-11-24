@@ -7134,11 +7134,12 @@ self.finish_retire_intent(&workspace).await?;
         let mut roots = state.nx_project_roots().peekable();
         if roots.peek().is_some() {
             let (handle, build_volume) = self.admit_build_state(workspace).await?;
+            let runtime = handle.script_runtime().await?;
             for relative_root in roots {
                 let root = landing.join(relative_root);
                 let request = ExecRequest {
                     command: crate::api::dto::ExecCommand::Argv(vec![
-                        "node".into(),
+                        runtime.clone(),
                         "-".into(),
                         root.as_os_str().to_owned().into(),
                     ]),
@@ -7235,6 +7236,7 @@ self.finish_retire_intent(&workspace).await?;
             return Ok(result);
         }
         let (handle, build_volume) = self.admit_build_state(target).await?;
+        let runtime = handle.script_runtime().await?;
         for run in &checks.runs {
             let root = mount.join(run.cache.parent().and_then(Path::parent).ok_or_else(|| {
                 CowshedError::internal(format!(
@@ -7244,7 +7246,7 @@ self.finish_retire_intent(&workspace).await?;
             })?);
             let request = ExecRequest {
                 command: crate::api::dto::ExecCommand::Argv(vec![
-                    "node".into(),
+                    runtime.clone(),
                     "-".into(),
                     root.to_string_lossy().into_owned().into(),
                     serde_json::to_string(run)
@@ -23835,10 +23837,13 @@ async fn read_job_stdout(
     .map_err(|error| error.to_string())
 }
 
-/// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at
-/// `mount`, as the root's own directory so its `.envrc` gives its toolchain. Read-write, as a
-/// run: stock Nx records task details in the root's database. It asks for one token at `class`.
+/// The one job that runs `script` with `runtime`, `node` or `bun`
+/// ([`super::supervisor::WorkspaceSupervisorHandle::script_runtime`]), in the Nx root `root` of
+/// the workspace mounted at `mount`, as the root's own directory so its `.envrc` gives its
+/// toolchain. Read-write, as a run: stock Nx records task details in the root's database. It asks
+/// for one token at `class`.
 fn nx_probe_request(
+    runtime: crate::api::dto::CommandArg,
     mount: &Path,
     root: &Path,
     script: bytes::Bytes,
@@ -23853,10 +23858,8 @@ fn nx_probe_request(
         })?)
     };
     let mut argv: Vec<crate::api::dto::CommandArg> = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "exec node - \"$@\"".into(),
-        "sh".into(),
+        runtime,
+        "-".into(),
         crate::api::dto::CommandArg::new(mount.join(root)),
     ];
     argv.extend(args);
@@ -23921,7 +23924,12 @@ async fn publish_nx_run(
         .ok_or_else(|| format!("{} names no Nx root", run.cache.display()))?;
     let hashes: std::collections::BTreeSet<&str> = run.tasks.values().map(String::as_str).collect();
     let hashes = serde_json::to_string(&hashes).map_err(|error| error.to_string())?;
+    let runtime = handle
+        .script_runtime()
+        .await
+        .map_err(|error| error.message)?;
     let request = nx_probe_request(
+        runtime,
         mount,
         root,
         crate::build_volume::nx::publish_script(),

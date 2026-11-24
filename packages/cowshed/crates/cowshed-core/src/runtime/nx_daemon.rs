@@ -25,9 +25,7 @@
 //! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::io;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,6 +36,8 @@ use crate::api::dto::{
     CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, JobInfo, RunSandboxMode, StdinSource,
     WorkspacePath,
 };
+
+use super::job_program::{JobPath, Lookup};
 use crate::capabilities::nx;
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceRole;
@@ -472,59 +472,25 @@ enum Hold {
     },
 }
 
-/// Where a start job's `node` comes from.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum NodeSource<'a> {
-    /// The shed activates a shell, which declares its own toolchain (15_capabilities.md,
-    /// "Bootstrap executables"): `node` is whatever the activated PATH names, which only the job
-    /// can tell.
-    Shell,
-    /// The shed activates none: the job's PATH is this bootstrap PATH and nothing else.
-    Path(&'a OsStr),
-}
-
-/// The `node` a start job runs, or why none can run. In a shed that activates a shell, `node`.
-/// In one that activates none, `node` as `execvp` would find it on the job's own bootstrap
-/// `path`, by its absolute path: the first executable `node` along it, past ones that cannot
-/// execute. When the lookup cannot tell -- a directory it may not read -- the job runs `node`
-/// and its start is a failure bounded by [`START_ATTEMPTS`]. When the lookup proves no `node`
-/// along the PATH can run, its `ENOENT`, or `EACCES` when one exists but cannot execute, is named
-/// here rather than met as `sandbox-exec`'s exit 71 at every probe.
-pub(crate) fn daemon_node(node: NodeSource<'_>) -> std::result::Result<CommandArg, String> {
-    let path = match node {
-        NodeSource::Shell => return Ok(CommandArg::from("node")),
-        NodeSource::Path(path) => path,
-    };
-    let mut unexecutable = false;
-    let mut undecided = false;
-    for candidate in std::env::split_paths(path).map(|directory| directory.join("node")) {
-        match std::fs::metadata(&candidate) {
-            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
-                return Ok(CommandArg::new(candidate));
-            }
-            Ok(_) => unexecutable = true,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => unexecutable = true,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(_) => undecided = true,
-        }
+/// The `node` a start job runs, or why none can run (04_sandbox.md, the Nx daemon keeper). In a
+/// shed that activates a shell, `node`. In one that activates none, `node` as `execvp` would find
+/// it on the job's own bootstrap `path`, by its absolute path ([`Lookup::along`]). When the lookup
+/// cannot tell -- a directory it may not read -- the job runs `node` and its start is a failure
+/// bounded by [`START_ATTEMPTS`]. When the lookup proves no `node` along the PATH can run, its
+/// `ENOENT`, or `EACCES` when one exists but cannot execute, is named here rather than met as
+/// `sandbox-exec`'s exit 71 at every probe.
+pub(crate) fn daemon_node(job: JobPath<'_>) -> std::result::Result<CommandArg, String> {
+    match job {
+        JobPath::Shell => Ok(CommandArg::from("node")),
+        JobPath::Bootstrap(path) => Lookup::along(path, "node")
+            .runnable("node")
+            .map_err(|errno| {
+                format!(
+                    "no executable `node` on its PATH {}: {errno}",
+                    path.display()
+                )
+            }),
     }
-    if undecided {
-        return Ok(CommandArg::from("node"));
-    }
-    let errno = if unexecutable {
-        libc::EACCES
-    } else {
-        libc::ENOENT
-    };
-    Err(format!(
-        "no executable `node` on its PATH {}: {}",
-        path.display(),
-        io::Error::from_raw_os_error(errno)
-    ))
 }
 
 /// How the start job `job` ended, as the keeper says it; `None` for an exit 0.
@@ -1145,6 +1111,7 @@ pub(crate) async fn stop_owned_daemon(
 mod tests {
     use cowshed_os::test_backstop::ChildBackstop as _;
     use cowshed_os::test_backstop::CommandBackstop as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
     use proptest::prelude::*;
@@ -1598,7 +1565,7 @@ mod tests {
     fn probe_and_start(
         keeper: &mut NxDaemonKeeper,
         root: &Path,
-        node: NodeSource<'_>,
+        node: JobPath<'_>,
     ) -> Option<ExecRequest> {
         keeper.observe(Probe::Unrecorded, root);
         keeper.start(root, root, daemon_node(node))
@@ -1619,7 +1586,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_start_with_no_node_on_its_path_is_refused_without_a_job_until_one_appears() {
         let (root, path) = scratch();
-        let node = NodeSource::Path(&path);
+        let node = JobPath::Bootstrap(&path);
         let mut keeper = keeper();
 
         assert!(probe_and_start(&mut keeper, &root, node).is_none());
@@ -1649,7 +1616,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_start_whose_only_node_cannot_execute_is_refused_with_its_eacces_named() {
         let (root, path) = scratch();
-        let node = NodeSource::Path(&path);
+        let node = JobPath::Bootstrap(&path);
         plant(&root.join("a/node"), 0o644);
         plant(&root.join("b/node"), 0o755);
         let request = keeper()
@@ -1674,7 +1641,7 @@ mod tests {
     async fn an_activated_shell_names_its_own_node() {
         let (root, _) = scratch();
         let request = keeper()
-            .start(&root, &root, daemon_node(NodeSource::Shell))
+            .start(&root, &root, daemon_node(JobPath::Shell))
             .expect("an activated shed starts");
         assert_eq!(program(&request), "node");
         std::fs::remove_dir_all(&root).expect("remove scratch");
@@ -1685,7 +1652,7 @@ mod tests {
     fn one_start(keeper: &mut NxDaemonKeeper, served: bool, ending: Option<&str>, daemon: Probe) {
         let root = Path::new(NO_PROJECT);
         keeper
-            .start(root, root, daemon_node(NodeSource::Shell))
+            .start(root, root, daemon_node(JobPath::Shell))
             .expect("a start is admitted");
         let job = JobId::new(1).expect("job id");
         keeper.starting = Some(job);
@@ -1740,7 +1707,7 @@ mod tests {
             tokio::time::advance(pause - Duration::from_secs(1)).await;
             assert!(
                 keeper
-                    .start(root, root, daemon_node(NodeSource::Shell))
+                    .start(root, root, daemon_node(JobPath::Shell))
                     .is_none(),
                 "no start while the pause runs"
             );

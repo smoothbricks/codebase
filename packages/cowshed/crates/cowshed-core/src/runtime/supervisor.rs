@@ -1615,6 +1615,30 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
         .map_err(|error| CowshedError::internal(format!("construct sandbox PATH: {error}")))
 }
 
+/// `find` asked of the PATH a read-write job of `policy` gets, as that job's own exec would get
+/// it ([`super::job_program`]): the activated shell's, which only the job sees, or the bootstrap
+/// PATH. Building that PATH and looking along it stat the file system, so both run on the
+/// blocking pool.
+async fn on_job_path<T: Send + 'static>(
+    policy: &SandboxPolicy,
+    find: fn(super::job_program::JobPath<'_>) -> T,
+) -> Result<T> {
+    let (read_write, _) = policy.child(crate::api::dto::RunSandboxMode::ReadWrite);
+    let bootstrap = read_write
+        .capabilities
+        .contribution
+        .shell
+        .is_none()
+        .then(|| read_write.clone());
+    off_actor::run(move || match bootstrap {
+        None => Ok(find(super::job_program::JobPath::Shell)),
+        Some(sandbox) => {
+            bootstrap_path(&sandbox).map(|path| find(super::job_program::JobPath::Bootstrap(&path)))
+        }
+    })
+    .await
+}
+
 /// The generic directories owned by each exec mode's private environment.
 pub(super) const PRIVATE_ENVIRONMENT_DIRECTORIES: [&std::ffi::CStr; 6] =
     [c"home", c"config", c"cache", c"data", c"state", c"run"];
@@ -3963,6 +3987,17 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::NxDaemonKeeper { reply }).await
     }
 
+    /// The runtime this workspace's land helper jobs run, `node` or `bun`
+    /// ([`super::job_program::script_runtime`]), looked up on the PATH its read-write jobs get
+    /// (16_build_volumes.md, Land 5.3). Refused, naming the PATH, when none of them can run.
+    pub async fn script_runtime(&self) -> Result<crate::api::dto::CommandArg> {
+        self.call(|reply| Command::ScriptRuntime {
+            authority: self.authority.clone(),
+            reply,
+        })
+        .await
+    }
+
     /// Stop the shed's Nx daemon keeper from starting a daemon until the shed is used again, and
     /// end the start it has in flight, answered once that start concluded: a lifecycle verb asks
     /// before its census of the mount (02_workspaces.md, "Holders cowshed does not run"). A start
@@ -4394,6 +4429,11 @@ pub(super) enum Command {
         authority: WorkspaceAuthoritySnapshot,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// The runtime a land helper job of the workspace runs.
+    ScriptRuntime {
+        authority: WorkspaceAuthoritySnapshot,
+        reply: oneshot::Sender<Result<crate::api::dto::CommandArg>>,
+    },
 }
 
 impl Command {
@@ -4435,6 +4475,7 @@ impl Command {
             Self::CurrentAuthority { .. } => "current-authority",
             Self::Idle { .. } => "idle",
             Self::NxDaemonKeeper { .. } => "nx-daemon-keeper",
+            Self::ScriptRuntime { .. } => "script-runtime",
             Self::StopNxKeeper { .. } => "stop-nx-keeper",
         }
     }
@@ -6518,6 +6559,23 @@ impl SupervisorActor {
                 }
             },
             Command::StopNxKeeper { authority, reply } => self.stop_nx_keeper(&authority, reply),
+            Command::ScriptRuntime { authority, reply } => {
+                let runtime = match self.validate_authority(&authority) {
+                    Ok(()) => on_job_path(&self.policy, super::job_program::script_runtime)
+                        .await
+                        .and_then(|found| {
+                            found.map_err(|missing| {
+                                CowshedError::environment_missing(
+                                    format!("no runtime can run the land's Nx helpers: {missing}"),
+                                    "give the workspace a `node` or a `bun`: its shell's, or one \
+                                     in the host's conventional installation directories",
+                                )
+                            })
+                        }),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(runtime);
+            }
         }
     }
 
@@ -7838,26 +7896,8 @@ impl SupervisorActor {
         if daemon == Probe::Live || running {
             return true;
         }
-        // The job's `node` is found as its own exec would find it: on the PATH it gets. Building
-        // that PATH and looking along it stat the file system, so both run on the blocking pool.
-        let (read_write, _) = self
-            .policy
-            .child(crate::api::dto::RunSandboxMode::ReadWrite);
-        let bootstrap = read_write
-            .capabilities
-            .contribution
-            .shell
-            .is_none()
-            .then(|| read_write.clone());
-        let found = off_actor::run(move || match bootstrap {
-            None => Ok(super::nx_daemon::daemon_node(
-                super::nx_daemon::NodeSource::Shell,
-            )),
-            Some(sandbox) => bootstrap_path(&sandbox).map(|path| {
-                super::nx_daemon::daemon_node(super::nx_daemon::NodeSource::Path(&path))
-            }),
-        })
-        .await;
+        // The job's `node` is found as its own exec would find it: on the PATH it gets.
+        let found = on_job_path(&self.policy, super::nx_daemon::daemon_node).await;
         let node = match found {
             Ok(node) => node,
             Err(error) => {

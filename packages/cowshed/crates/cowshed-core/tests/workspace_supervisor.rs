@@ -9840,6 +9840,38 @@ async fn a_shed_with_no_node_refuses_its_nx_daemon_with_its_enoent_named_until_o
     h.handle.wait(start.request.job_id).await.unwrap();
 }
 
+//#region smoo/cowshed!n/land-helper-runtime
+/// A land's Nx helpers run the runtime the landing workspace's jobs reach (16_build_volumes.md,
+/// Land 5.3). In a shell-less Bun workspace whose tools hold `bun` and no `node`, that is its
+/// `bun`, by its absolute path, where a literal `node` never started; once a `node` lies on the
+/// same PATH, the `node`, as every helper ran before.
+#[tokio::test(start_paused = true)]
+async fn a_shell_less_bun_workspace_runs_its_land_helpers_with_its_bun() {
+    let (supervisor_config, _root) = nx_project("bun-only");
+    let project = supervisor_config.workspace_root.clone();
+    let node = fixture_node(&project);
+    std::fs::remove_file(&node).unwrap();
+    let bun = project.join(".cowshed/tools/manager-bin/bun");
+    let executable = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    std::fs::create_dir_all(bun.parent().unwrap()).unwrap();
+    std::fs::write(&bun, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&bun, executable.clone()).unwrap();
+    let h = harness_with_config(supervisor_config, 1, 1024, false, false);
+
+    assert_eq!(
+        h.handle.script_runtime().await.unwrap(),
+        CommandArg::from(bun.into_os_string())
+    );
+
+    std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&node, executable).unwrap();
+    assert_eq!(
+        h.handle.script_runtime().await.unwrap(),
+        CommandArg::from(node.into_os_string())
+    );
+}
+//#endregion smoo/cowshed!n/land-helper-runtime
+
 /// The unattributed-usage cells of a sealed job-span row: null on every row but that one.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Unattributed {
