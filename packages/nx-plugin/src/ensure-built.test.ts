@@ -12,7 +12,7 @@ import { expandOutputs } from 'nx/src/native';
 import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
-import { nxFixtureRoot, type OwnedNxFixture, openNxFixture, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { nxFixtureRoot, type OwnedNxFixture, openNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { pastTick } from './__tests__/past-tick.js';
 import type { EnsureBuiltProbeResult } from './ensure-built.js';
@@ -826,123 +826,191 @@ describe('smoo-nx-exec with a fresh daemon', () => {
 
   // Publication is opt-in only for the receipt case. Graph/exec probes below
   // keep ordinary plugin hooks but have no producer source/tool prepass.
-  it('publishes real completion receipts and reuses their original basis for the same tree', async () => {
+  describe('producer completion receipts and readonly validation', () => {
+    let fixture: OwnedNxFixture | undefined;
+    let root = '';
+    let workspace = '';
+    let fixtureSocketDir = '';
+    let builds = '';
     let providerSockets: string | null = null;
-    try {
-      await withNxFixture(
-        'ensure-built-producer-',
-        async ({ root, workspace, socketDirectory }) => {
-          const builds = join(root, 'lib-builds.log');
-          await writeTwoProjectWorkspace(workspace, builds, true);
-          // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
-          // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
-          // It runs before any daemon starts and before any receipt is published, the state that case began in.
-          const noDaemonLabel =
-            'reports no-daemon and writes nothing when no daemon serves a provider without a receipt';
-          const listing = async () =>
-            (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
-          const listingBefore = await listing();
-          const noDaemonEntry = join(root, 'probe-no-daemon.ts');
-          await writeFile(
-            noDaemonEntry,
-            `
+    let ownEnv: Record<string, string> = {};
+    let fixtureGit = '';
+    let expectedHit: EnsureBuiltProbeResult | undefined;
+    let failedPhase: { readonly name: string; readonly error: unknown } | null = null;
+
+    async function runPhase(name: string, body: () => Promise<void>): Promise<void> {
+      if (failedPhase !== null) {
+        throw new Error(`skipped ${name}: depends on earlier phase "${failedPhase.name}", which failed`);
+      }
+      try {
+        await body();
+      } catch (error) {
+        failedPhase ??= { name, error };
+        throw error;
+      }
+    }
+
+    beforeAll(async () => {
+      try {
+        fixture = await openNxFixture('ensure-built-producer-', 'workspace');
+        root = fixture.root;
+        workspace = fixture.workspace;
+        fixtureSocketDir = fixture.socketDirectory;
+        builds = join(root, 'lib-builds.log');
+        await writeTwoProjectWorkspace(workspace, builds, true);
+      } catch (error) {
+        failedPhase ??= { name: 'beforeAll fixture setup', error };
+        throw error;
+      }
+    });
+
+    afterAll(async () => {
+      let retireFailure: { readonly error: unknown } | null = null;
+      try {
+        if (fixture !== undefined) {
+          await fixture.retire();
+        }
+      } catch (error) {
+        retireFailure = { error };
+      } finally {
+        if (providerSockets !== null) await rm(providerSockets, { recursive: true, force: true });
+      }
+      if (retireFailure !== null) {
+        if (failedPhase !== null) {
+          throw new AggregateError(
+            [failedPhase.error, retireFailure.error],
+            `fixture ${root} failed in "${failedPhase.name}", and so did its retirement`,
+          );
+        }
+        throw retireFailure.error;
+      }
+    });
+
+    it('reports no-daemon and writes nothing when no daemon serves a provider without a receipt', async () => {
+      await runPhase('no-daemon probe', async () => {
+        // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
+        // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
+        // It runs before any daemon starts and before any receipt is published, the state that case began in.
+        const noDaemonLabel = 'reports no-daemon and writes nothing when no daemon serves a provider without a receipt';
+        const listing = async () =>
+          (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
+        const listingBefore = await listing();
+        const noDaemonEntry = join(root, 'probe-no-daemon.ts');
+        await writeFile(
+          noDaemonEntry,
+          `
 import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const result = await probeBuilt({ target: 'app:build', cwd: ${JSON.stringify(workspace)} });
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify(result) + "\\n", error => error ? reject(error) : resolve()));
 `,
-          );
-          // Run from the fixture root, outside the provider workspace, as a consumer calls it.
-          const noDaemon = await run('bun', noDaemonEntry, root, [], {
+        );
+        // Run from the fixture root, outside the provider workspace, as a consumer calls it.
+        const noDaemon = await run('bun', noDaemonEntry, root, [], {
+          NX_DAEMON: 'true',
+          NX_SOCKET_DIR: fixtureSocketDir,
+        });
+        expect(noDaemon.code, noDaemon.stdout + noDaemon.stderr).toBe(0);
+        const noDaemonResult = typia.json.assertParse<EnsureBuiltProbeResult>(noDaemon.stdout);
+        expect(noDaemonResult, noDaemonLabel).toMatchObject({
+          disposition: 'failed',
+          reason: { kind: 'provider-proof', taskId: 'app:build' },
+        });
+        if (noDaemonResult.disposition !== 'failed' || noDaemonResult.reason.kind !== 'provider-proof') {
+          throw new Error(`the probe must refuse with its provider proof, not ${noDaemon.stdout}`);
+        }
+        expect(noDaemonResult.reason.detail, noDaemonLabel).toEndWith(
+          `authoritative graph unavailable: ${describeMiss({ kind: 'no-daemon', taskId: 'app:build' })}`,
+        );
+        expect(await listing(), noDaemonLabel).toEqual(listingBefore);
+      });
+    });
+
+    it('builds and caches the workspace with daemonless Nx before publishing a receipt', async () => {
+      await runPhase('daemonless seed build', async () => {
+        providerSockets = providerSocketDirectory(workspace);
+        ownEnv = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
+        const built = await run(
+          'node',
+          nxEntry(workspace),
+          workspace,
+          ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
+          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: fixtureSocketDir },
+        );
+        expect(built.code, built.stdout + built.stderr).toBe(0);
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
+
+    it('publishes a completion receipt from a committed workspace and owned git tool', async () => {
+      await runPhase('receipt publish', async () => {
+        // Probe-only receipts use the real Nx keys/cache and independently
+        // census public output bytes without starting a task runner.
+        const committed = spawnSync(
+          'git',
+          [
+            '-C',
+            workspace,
+            'add',
+            '.gitignore',
+            'report',
+            'nx.json',
+            'packages/app/project.json',
+            'packages/app/source.txt',
+            'packages/lib/project.json',
+            'packages/lib/source.txt',
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(committed.status, committed.stdout + committed.stderr).toBe(0);
+        const sourceCommit = spawnSync(
+          'git',
+          [
+            '-C',
+            workspace,
+            '-c',
+            'user.name=EnsureBuilt fixture',
+            '-c',
+            'user.email=fixture@example.invalid',
+            'commit',
+            '-qm',
+            'source fixture',
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
+        // The receipt binds the producer's executables. A `git` this fixture owns lets the consumer case below move
+        // one tool node's ctime alone, as a same-mode chmod by another checkout's install moves a shared store file.
+        const realGit = Bun.which('git');
+        if (realGit === null) throw new Error('git is not on PATH');
+        const fixtureBin = join(root, 'bin');
+        await mkdir(fixtureBin);
+        fixtureGit = join(fixtureBin, 'git');
+        await writeExecutable(fixtureGit, `#!/bin/sh\nexec ${JSON.stringify(realGit)} "$@"\n`);
+        const published = await run(
+          'node',
+          nxEntry(workspace),
+          workspace,
+          ['run', 'app:build', '--outputStyle=static-failures-only'],
+          {
             NX_DAEMON: 'true',
-            NX_SOCKET_DIR: socketDirectory,
-          });
-          expect(noDaemon.code, noDaemon.stdout + noDaemon.stderr).toBe(0);
-          const noDaemonResult = typia.json.assertParse<EnsureBuiltProbeResult>(noDaemon.stdout);
-          expect(noDaemonResult, noDaemonLabel).toMatchObject({
-            disposition: 'failed',
-            reason: { kind: 'provider-proof', taskId: 'app:build' },
-          });
-          if (noDaemonResult.disposition !== 'failed' || noDaemonResult.reason.kind !== 'provider-proof') {
-            throw new Error(`the probe must refuse with its provider proof, not ${noDaemon.stdout}`);
-          }
-          expect(noDaemonResult.reason.detail, noDaemonLabel).toEndWith(
-            `authoritative graph unavailable: ${describeMiss({ kind: 'no-daemon', taskId: 'app:build' })}`,
-          );
-          expect(await listing(), noDaemonLabel).toEqual(listingBefore);
-          providerSockets = providerSocketDirectory(workspace);
-          const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
-          const built = await run(
-            'node',
-            nxEntry(workspace),
-            workspace,
-            ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
-            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace, NX_SOCKET_DIR: socketDirectory },
-          );
-          expect(built.code, built.stdout + built.stderr).toBe(0);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          // Probe-only receipts use the real Nx keys/cache and independently
-          // census public output bytes without starting a task runner.
-          const committed = spawnSync(
-            'git',
-            [
-              '-C',
-              workspace,
-              'add',
-              '.gitignore',
-              'report',
-              'nx.json',
-              'packages/app/project.json',
-              'packages/app/source.txt',
-              'packages/lib/project.json',
-              'packages/lib/source.txt',
-            ],
-            { encoding: 'utf8' },
-          );
-          expect(committed.status, committed.stdout + committed.stderr).toBe(0);
-          const sourceCommit = spawnSync(
-            'git',
-            [
-              '-C',
-              workspace,
-              '-c',
-              'user.name=EnsureBuilt fixture',
-              '-c',
-              'user.email=fixture@example.invalid',
-              'commit',
-              '-qm',
-              'source fixture',
-            ],
-            { encoding: 'utf8' },
-          );
-          expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
-          // The receipt binds the producer's executables. A `git` this fixture owns lets the consumer case below move
-          // one tool node's ctime alone, as a same-mode chmod by another checkout's install moves a shared store file.
-          const realGit = Bun.which('git');
-          if (realGit === null) throw new Error('git is not on PATH');
-          const fixtureBin = join(root, 'bin');
-          await mkdir(fixtureBin);
-          const fixtureGit = join(fixtureBin, 'git');
-          await writeExecutable(fixtureGit, `#!/bin/sh\nexec ${JSON.stringify(realGit)} "$@"\n`);
-          const published = await run(
-            'node',
-            nxEntry(workspace),
-            workspace,
-            ['run', 'app:build', '--outputStyle=static-failures-only'],
-            {
-              NX_DAEMON: 'true',
-              NX_WORKSPACE_ROOT_PATH: workspace,
-              ...ownEnv,
-              PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
-            },
-          );
-          expect(published.code, published.stdout + published.stderr).toBe(0);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          const modulesLink = join(workspace, 'node_modules');
-          const modulesReal = await realpath(modulesLink);
-          const probeEntry = join(root, 'probe-receipt.ts');
-          await writeFile(
-            probeEntry,
-            `
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+            PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
+          },
+        );
+        expect(published.code, published.stdout + published.stderr).toBe(0);
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
+
+    it('validates hit, daemonless hit, tampered output and uncached source without opening tool files or touching outputs', async () => {
+      await runPhase('receipt probe checks', async () => {
+        const modulesLink = join(workspace, 'node_modules');
+        const modulesReal = await realpath(modulesLink);
+        const probeEntry = join(root, 'probe-receipt.ts');
+        await writeFile(
+          probeEntry,
+          `
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -979,44 +1047,48 @@ const outputAfterMiss = await readFile(output, 'utf8');
 await writeFile(source, originalSource);
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, daemonless, stale, uncached, toolFileOpens, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }) + "\\n", error => error ? reject(error) : resolve()));
 `,
-          );
-          const probed = await run('bun', probeEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(probed.code, probed.stdout + probed.stderr).toBe(0);
-          const receipts = typia.json.assertParse<{
-            hit: EnsureBuiltProbeResult;
-            daemonless: EnsureBuiltProbeResult;
-            stale: EnsureBuiltProbeResult;
-            uncached: EnsureBuiltProbeResult;
-            toolFileOpens: number;
-            outputUnwritten: boolean;
-            outputAfterMiss: string;
-          }>(probed.stdout);
-          expect(receipts.hit.disposition, probed.stderr).toBe('hit');
-          expect(receipts.toolFileOpens).toBe(0);
-          if (receipts.hit.disposition === 'hit') {
-            expect(receipts.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
-            expect(
-              receipts.hit.receipt.tasks
-                .flatMap(({ outputs }) => outputs)
-                .find(({ path }) => path === 'packages/app/dist/marker.txt'),
-            ).toMatchObject({ type: 'file', sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
-          }
-          expect(receipts.daemonless.disposition).toBe('hit');
-          expect(receipts.stale).toMatchObject({ disposition: 'failed', reason: { kind: 'provider-proof' } });
-          expect(receipts.uncached.disposition).toBe('failed');
-          expect(receipts.outputUnwritten).toBe(true);
-          expect(receipts.outputAfterMiss).toBe('built\nlib\n');
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        );
+        const probed = await run('bun', probeEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(probed.code, probed.stdout + probed.stderr).toBe(0);
+        const receipts = typia.json.assertParse<{
+          hit: EnsureBuiltProbeResult;
+          daemonless: EnsureBuiltProbeResult;
+          stale: EnsureBuiltProbeResult;
+          uncached: EnsureBuiltProbeResult;
+          toolFileOpens: number;
+          outputUnwritten: boolean;
+          outputAfterMiss: string;
+        }>(probed.stdout);
+        expect(receipts.hit.disposition, probed.stderr).toBe('hit');
+        expect(receipts.toolFileOpens).toBe(0);
+        if (receipts.hit.disposition === 'hit') {
+          expect(receipts.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
+          expect(
+            receipts.hit.receipt.tasks
+              .flatMap(({ outputs }) => outputs)
+              .find(({ path }) => path === 'packages/app/dist/marker.txt'),
+          ).toMatchObject({ type: 'file', sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+        }
+        expect(receipts.daemonless.disposition).toBe('hit');
+        expect(receipts.stale).toMatchObject({ disposition: 'failed', reason: { kind: 'provider-proof' } });
+        expect(receipts.uncached.disposition).toBe('failed');
+        expect(receipts.outputUnwritten).toBe(true);
+        expect(receipts.outputAfterMiss).toBe('built\nlib\n');
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+      });
+    });
 
-          const producerEnvironmentEntry = join(root, 'producer-environment-independence.ts');
-          await writeFile(
-            producerEnvironmentEntry,
-            `
+    it('reuses the receipt across consumer environment differences and empty commits without hashing or inspecting modules', async () => {
+      await runPhase('producer environment independence', async () => {
+        const producerEnvironmentEntry = join(root, 'producer-environment-independence.ts');
+        await writeFile(
+          producerEnvironmentEntry,
+          `
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
@@ -1033,32 +1105,37 @@ if (empty.status !== 0) throw new Error(empty.stderr);
 const sameTree = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ first, sameTree, moduleInspections }) + "\\n", error => error ? reject(error) : resolve()));
 `,
-          );
-          const producerEnvironment = await run('bun', producerEnvironmentEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(producerEnvironment.code, producerEnvironment.stdout + producerEnvironment.stderr).toBe(0);
-          const environmentResults = typia.json.assertParse<{
-            first: EnsureBuiltProbeResult;
-            sameTree: EnsureBuiltProbeResult;
-            moduleInspections: number;
-          }>(producerEnvironment.stdout);
-          expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
-          expect(environmentResults.sameTree).toEqual(environmentResults.first);
-          expect(environmentResults.moduleInspections).toBe(0);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        );
+        const producerEnvironment = await run('bun', producerEnvironmentEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(producerEnvironment.code, producerEnvironment.stdout + producerEnvironment.stderr).toBe(0);
+        const environmentResults = typia.json.assertParse<{
+          first: EnsureBuiltProbeResult;
+          sameTree: EnsureBuiltProbeResult;
+          moduleInspections: number;
+        }>(producerEnvironment.stdout);
+        expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
+        expect(environmentResults.sameTree).toEqual(environmentResults.first);
+        expect(environmentResults.moduleInspections).toBe(0);
+        expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        expectedHit = environmentResults.first;
+      });
+    });
 
-          // Between its readonly read of the receipt's tools and its last check of them, the consumer censuses the
-          // public outputs through Nx's expandOutputs. Moving the fixture `git` there is a tool node moving under the
-          // readonly validation: a same-mode chmod moves its ctime alone and keeps the hit, a byte change refuses and
-          // names the node.
-          const toolMoveEntry = join(root, 'tool-node-move.ts');
-          await writeFile(
-            toolMoveEntry,
-            `
+    it('keeps a hit on a tool ctime-only chmod during validation and refuses a byte rewrite', async () => {
+      await runPhase('tool-node move during validation', async () => {
+        // Between its readonly read of the receipt's tools and its last check of them, the consumer censuses the
+        // public outputs through Nx's expandOutputs. Moving the fixture `git` there is a tool node moving under the
+        // readonly validation: a same-mode chmod moves its ctime alone and keeps the hit, a byte change refuses and
+        // names the node.
+        const toolMoveEntry = join(root, 'tool-node-move.ts');
+        await writeFile(
+          toolMoveEntry,
+          `
 import { chmodSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
@@ -1082,37 +1159,43 @@ move = () => writeFileSync(git, '#!/bin/sh\\nexit 1\\n');
 const rewritten = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ chmodded, ctimeAlone, chmodMoves, rewritten }) + "\\n", error => error ? reject(error) : resolve()));
 `,
-          );
-          const toolMove = await run('bun', toolMoveEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(toolMove.code, toolMove.stdout + toolMove.stderr).toBe(0);
-          const toolMoves = typia.json.assertParse<{
-            chmodded: EnsureBuiltProbeResult;
-            ctimeAlone: boolean;
-            chmodMoves: number;
-            rewritten: EnsureBuiltProbeResult;
-          }>(toolMove.stdout);
-          expect(toolMoves.chmodMoves).toBeGreaterThan(0);
-          expect(toolMoves.ctimeAlone).toBe(true);
-          expect(toolMoves.chmodded, toolMove.stderr).toEqual(environmentResults.first);
-          expect(toolMoves.rewritten).toMatchObject({
-            disposition: 'failed',
-            reason: {
-              kind: 'provider-proof',
-              detail: `Producer tool namespace changed during independent product validation: ${fixtureGit}`,
-            },
-          });
+        );
+        const toolMove = await run('bun', toolMoveEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(toolMove.code, toolMove.stdout + toolMove.stderr).toBe(0);
+        const toolMoves = typia.json.assertParse<{
+          chmodded: EnsureBuiltProbeResult;
+          ctimeAlone: boolean;
+          chmodMoves: number;
+          rewritten: EnsureBuiltProbeResult;
+        }>(toolMove.stdout);
+        expect(toolMoves.chmodMoves).toBeGreaterThan(0);
+        expect(toolMoves.ctimeAlone).toBe(true);
+        if (expectedHit === undefined)
+          throw new Error('expected producer environment independence phase to record a hit');
+        expect(toolMoves.chmodded, toolMove.stderr).toEqual(expectedHit);
+        expect(toolMoves.rewritten).toMatchObject({
+          disposition: 'failed',
+          reason: {
+            kind: 'provider-proof',
+            detail: `Producer tool namespace changed during independent product validation: ${fixtureGit}`,
+          },
+        });
+      });
+    });
 
-          // A tool file rewritten in place before the probe starts moves its stamp: readonly validation must read that
-          // file and refuse, naming the rewritten node.
-          const toolRewriteEntry = join(root, 'tool-node-rewrite.ts');
-          await writeFile(
-            toolRewriteEntry,
-            `
+    it('refuses a tool file rewritten in place before validation starts', async () => {
+      await runPhase('tool-node rewrite before validation', async () => {
+        // A tool file rewritten in place before the probe starts moves its stamp: readonly validation must read that
+        // file and refuse, naming the rewritten node.
+        const toolRewriteEntry = join(root, 'tool-node-rewrite.ts');
+        await writeFile(
+          toolRewriteEntry,
+          `
 import { createRequire } from 'node:module';
 const fs = createRequire(import.meta.url)('node:fs');
 const openSync = fs.openSync;
@@ -1127,32 +1210,28 @@ fs.writeFileSync(git, '#!/bin/sh\\nexit 2\\n');
 const refused = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ refused, gitOpens }) + "\\n", error => error ? reject(error) : resolve()));
 `,
-          );
-          const toolRewrite = await run('bun', toolRewriteEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(toolRewrite.code, toolRewrite.stdout + toolRewrite.stderr).toBe(0);
-          const toolRewrites = typia.json.assertParse<{
-            refused: EnsureBuiltProbeResult;
-            gitOpens: number;
-          }>(toolRewrite.stdout);
-          expect(toolRewrites.gitOpens).toBeGreaterThan(0);
-          expect(toolRewrites.refused).toMatchObject({
-            disposition: 'failed',
-            reason: {
-              kind: 'provider-proof',
-              detail: expect.stringContaining(fixtureGit),
-            },
-          });
-        },
-        'workspace',
-      );
-    } finally {
-      if (providerSockets !== null) await rm(providerSockets, { recursive: true, force: true });
-    }
+        );
+        const toolRewrite = await run('bun', toolRewriteEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          ...ownEnv,
+        });
+        expect(toolRewrite.code, toolRewrite.stdout + toolRewrite.stderr).toBe(0);
+        const toolRewrites = typia.json.assertParse<{
+          refused: EnsureBuiltProbeResult;
+          gitOpens: number;
+        }>(toolRewrite.stdout);
+        expect(toolRewrites.gitOpens).toBeGreaterThan(0);
+        expect(toolRewrites.refused).toMatchObject({
+          disposition: 'failed',
+          reason: {
+            kind: 'provider-proof',
+            detail: expect.stringContaining(fixtureGit),
+          },
+        });
+      });
+    });
   });
 
   // The graph, replay and refresh steps run real Nx because their subject is the daemon:
