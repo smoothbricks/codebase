@@ -13,8 +13,9 @@ import { REAP_MS } from './lease-wait.js';
  *   line is refused and the child killed. A child whose standard output ends without a line can say none: its start
  *   is refused, by how it ended when it ends within the reap bound, and it is killed when it does not.
  * - `probing`, for the endpoint's answer to `{"type":"capabilities"}` on the probe's connection, or that connection's
- *   end: whether the installed mbx's shim gates test cases (05_gateway.md, "A case starts on a core"). The start is
- *   then answered served, which publishes the socket to the run's tasks. A child that ends first is refused by how it
+ *   end: whether the installed mbx's shim gates test cases (05_gateway.md, "A case starts on a core") and, when stated,
+ *   the pool's aging bound in milliseconds (05_gateway.md, "A minimum for a whole suite"). The start is then answered
+ *   served, which publishes the socket and capabilities to the run's tasks. A child that ends first is refused by how it
  *   ended: no task is told of an endpoint that is gone.
  * - `serving`, for the run's end. A child that ends first is `gone`, and the run's end says how.
  * - `ending`, for the child's end once a pipe of it closed (its standard input by the run, its standard output by
@@ -64,14 +65,23 @@ export type EndpointEvent =
   /** The reap timer the last `arm` started has run out. */
   | { readonly type: 'expired' };
 
+/** What the installed mbx's reservation endpoint states it supports (`{"type":"capabilities"}`). */
+export interface EndpointCapabilities {
+  readonly gates: boolean;
+  /** The pool's aging bound in milliseconds, or null when the endpoint did not state one. */
+  readonly agingMs: number | null;
+}
+
+const NO_CAPABILITIES: EndpointCapabilities = { gates: false, agingMs: null };
+
 /** What the shell does. `refuse` and `conclude` remove the socket's directory before they answer. */
 export type EndpointEffect =
   /** Connect to the endpoint's socket and send it `{"type":"capabilities"}`. */
   | { readonly do: 'probe' }
   /** End the probe's connection. */
   | { readonly do: 'hang-up' }
-  /** Answer the start: the endpoint serves, and its mbx gates test cases or does not. */
-  | { readonly do: 'serve'; readonly gates: boolean }
+  /** Answer the start: the endpoint serves, with the capabilities its mbx stated. */
+  | { readonly do: 'serve'; readonly capabilities: EndpointCapabilities }
   /** Answer the start: no endpoint, and why. */
   | { readonly do: 'refuse'; readonly why: string }
   | { readonly do: 'close-stdin' }
@@ -95,24 +105,25 @@ export function spawned(pid: number | undefined): EndpointLife {
 }
 const ENDED: EndpointLife = { phase: 'ended' };
 
-type CapabilitiesReply = { type: 'capabilities'; test_gate: boolean };
+type CapabilitiesReply = {
+  type: 'capabilities';
+  test_gate: boolean;
+  aging_ms?: number & typia.tags.Type<'uint64'> & typia.tags.Maximum<9007199254740991>;
+};
 const parseCapabilities = typia.json.createValidateParse<CapabilitiesReply>();
 
 /**
- * Whether the mbx that answered `line` to `{"type":"capabilities"}` gates test cases. One that does not know the
- * request answers an error, which gates nothing.
+ * The capabilities the mbx that answered `line` to `{"type":"capabilities"}` states: whether its shim gates test cases
+ * and, when stated, the pool's aging bound in milliseconds. One that does not know the request answers an error, which
+ * states neither, and so does an invalid reply or a line that is no JSON: typia's parse validates what `JSON.parse`
+ * returns and throws what it throws.
  */
-/**
- * Whether the mbx that answered `line` to `{"type":"capabilities"}` gates test cases. One that does not know the
- * request answers an error, which gates nothing, and so does a line that is no JSON: typia's parse validates what
- * `JSON.parse` returns and throws what it throws.
- */
-export function gatesTests(line: string): boolean {
+export function endpointCapabilities(line: string): EndpointCapabilities {
   try {
     const reply = parseCapabilities(line);
-    return reply.success && reply.data.test_gate;
+    return reply.success ? { gates: reply.data.test_gate, agingMs: reply.data.aging_ms ?? null } : NO_CAPABILITIES;
   } catch {
-    return false;
+    return NO_CAPABILITIES;
   }
 }
 
@@ -218,10 +229,10 @@ function probing(life: EndpointLife & { phase: 'probing' }, event: EndpointEvent
       const reply = life.reply + event.text;
       const line = firstLine(reply);
       if (line === null) return [{ ...life, reply }, []];
-      return [served, [{ do: 'hang-up' }, { do: 'serve', gates: gatesTests(line) }]];
+      return [served, [{ do: 'hang-up' }, { do: 'serve', capabilities: endpointCapabilities(line) }]];
     }
     case 'probe-end':
-      return [served, [{ do: 'serve', gates: false }]];
+      return [served, [{ do: 'serve', capabilities: NO_CAPABILITIES }]];
     case 'run-end':
       return unanswered(life.phase);
     default:

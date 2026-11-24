@@ -3,7 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { closeSync, existsSync } from 'node:fs';
 import { access, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
-import { createServer, type Socket } from 'node:net';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { enclosingTreeMarker, outsideTreesTmpdir } from '@smoothbricks/cargo-retain/testing/outside-trees';
@@ -18,6 +18,7 @@ import { ownedSocketDirectory, processesOf } from '../../testing.js';
 import { TEST_GATE_ENV, TEST_GATE_SERVED_ENV } from './case-gate.js';
 import { type CpuPool, createCpuPool, takeParentCpuTokens } from './cpu-pool.js';
 import { CPU_RISING_CLASS } from './cpu-rise.js';
+import { endpointCapabilities } from './endpoint-life.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -30,7 +31,7 @@ import {
 import { GATEWAY_SOCKET } from './gateway-lease.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS, type HangDiagnostics } from './hang-diagnostics.js';
 import { MBX_QUEUE_POLL_MS } from './mbx-queue.js';
-import { RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.js';
+import { MBX_AGING_MS_ENV, RESERVATIONS_ENV, RESERVATIONS_UNSERVED_ENV } from './mbx-reservations.js';
 import { MUTATION_REPORT_ARTIFACT, MUTATION_REPORT_ENV, TASK_ARTIFACTS_ENV } from './mutation-report.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
@@ -115,6 +116,7 @@ const INHERITED_SIZING_ENV = [
   RESERVATIONS_ENV,
   RESERVATIONS_UNSERVED_ENV,
   TEST_GATE_SERVED_ENV,
+  MBX_AGING_MS_ENV,
 ] as const;
 const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
@@ -2244,20 +2246,39 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await mkdir(directory);
     const lines = Array.from({ length: 600 }, (_, i) => JSON.stringify({ id: `suite::t-${i}`, durationMs: 1_000 }));
     await writeFile(join(directory, TEST_RESULTS_FILE), `${lines.join('\n')}\n`);
-    const endpoint = await standInReservations((heard) => heard.cpus);
+    const endpoint = await standInReservations(
+      (heard) => heard.cpus,
+      agingMs === null ? { gates: true } : { gates: true, agingMs },
+    );
+    const probed = await new Promise<string>((resolve, reject) => {
+      const client = createConnection(endpoint.socket);
+      client.setEncoding('utf8');
+      let reply = '';
+      client.on('connect', () => client.write('{"type":"capabilities"}\n'));
+      client.on('data', (chunk: string) => {
+        reply += chunk;
+        const end = reply.indexOf('\n');
+        if (end !== -1) {
+          client.destroy();
+          resolve(reply.slice(0, end));
+        }
+      });
+      client.on('error', reject);
+    });
+    const capabilities = endpointCapabilities(probed);
     const saved = {
       PATH: process.env.PATH,
       MBX_SCHEDULER: process.env.MBX_SCHEDULER,
       MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
       [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
-      BOUNDED_EXEC_MBX_AGING_MS: process.env.BOUNDED_EXEC_MBX_AGING_MS,
+      [MBX_AGING_MS_ENV]: process.env[MBX_AGING_MS_ENV],
     };
     process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
     process.env.MBX_SCHEDULER = '1';
     process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
     process.env[RESERVATIONS_ENV] = endpoint.socket;
-    if (agingMs !== null) process.env.BOUNDED_EXEC_MBX_AGING_MS = String(agingMs);
-    else delete process.env.BOUNDED_EXEC_MBX_AGING_MS;
+    if (capabilities.agingMs !== null) process.env[MBX_AGING_MS_ENV] = String(capabilities.agingMs);
+    else delete process.env[MBX_AGING_MS_ENV];
     try {
       const result = await runBoundedExec(
         { command: 'stryker run --concurrency=6', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },

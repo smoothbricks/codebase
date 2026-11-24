@@ -4,8 +4,8 @@ import {
   type EndpointEffect,
   type EndpointEvent,
   type EndpointLife,
+  endpointCapabilities,
   endpointStep,
-  gatesTests,
   spawned,
 } from './endpoint-life.js';
 import { REAP_MS } from './lease-wait.js';
@@ -30,7 +30,9 @@ const RUN_END: EndpointEvent = { type: 'run-end' };
 const EXPIRED: EndpointEvent = { type: 'expired' };
 
 const GATES = '{"type":"capabilities","test_gate":true}\n';
+const GATES_WITH_AGING = '{"type":"capabilities","test_gate":true,"aging_ms":30000}\n';
 const NO_GATE = '{"type":"capabilities","test_gate":false}\n';
+const NO_GATE_WITH_AGING = '{"type":"capabilities","test_gate":false,"aging_ms":30000}\n';
 /** What an mbx that does not know the request answers before it closes the connection. */
 const UNKNOWN = '{"type":"error","error":"unknown request type"}\n';
 
@@ -56,7 +58,7 @@ const eventArb: fc.Arbitrary<EndpointEvent> = fc.oneof(
       fc.constantFrom('SIGKILL', 'SIGTERM').map((signal) => close(null, signal)),
     ),
   },
-  { weight: 4, arbitrary: chunks([GATES, NO_GATE, UNKNOWN, '\n']).map(probe) },
+  { weight: 4, arbitrary: chunks([GATES, GATES_WITH_AGING, NO_GATE, NO_GATE_WITH_AGING, UNKNOWN, '\n']).map(probe) },
   { weight: 1, arbitrary: fc.constant(PROBE_END) },
   { weight: 2, arbitrary: fc.constant(RUN_END) },
   { weight: 2, arbitrary: fc.constant(EXPIRED) },
@@ -143,7 +145,7 @@ describe("the life of a run's reservation endpoint", () => {
         effects: [
           [],
           [{ do: 'probe' }],
-          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'hang-up' }, { do: 'serve', capabilities: { gates: true, agingMs: null } }],
           [{ do: 'close-stdin' }, reap],
           [disarm, { do: 'conclude', ended: { how: 'mbx reservations ended with status 0', clean: true } }],
         ],
@@ -151,7 +153,7 @@ describe("the life of a run's reservation endpoint", () => {
       {
         name: 'an endpoint whose probe ends unanswered is served and gates nothing',
         events: [stdout('listening\n'), PROBE_END, PROBE_END],
-        effects: [[{ do: 'probe' }], [{ do: 'serve', gates: false }], []],
+        effects: [[{ do: 'probe' }], [{ do: 'serve', capabilities: { gates: false, agingMs: null } }], []],
       },
       {
         name: 'a child that says anything else is killed, and refused once it has ended',
@@ -220,7 +222,7 @@ describe("the life of a run's reservation endpoint", () => {
         events: [stdout('listening\n'), probe(NO_GATE), close(null, 'SIGTERM'), RUN_END],
         effects: [
           [{ do: 'probe' }],
-          [{ do: 'hang-up' }, { do: 'serve', gates: false }],
+          [{ do: 'hang-up' }, { do: 'serve', capabilities: { gates: false, agingMs: null } }],
           [],
           [{ do: 'conclude', ended: { how: 'mbx reservations ended on SIGTERM', clean: false } }],
         ],
@@ -230,7 +232,7 @@ describe("the life of a run's reservation endpoint", () => {
         events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, close(null, 'SIGKILL')],
         effects: [
           [{ do: 'probe' }],
-          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'hang-up' }, { do: 'serve', capabilities: { gates: true, agingMs: null } }],
           [{ do: 'close-stdin' }, reap],
           [{ do: 'kill' }, reap],
           [
@@ -250,7 +252,7 @@ describe("the life of a run's reservation endpoint", () => {
         events: [stdout('listening\n'), probe(GATES), RUN_END, EXPIRED, EXPIRED, close(null, 'SIGKILL')],
         effects: [
           [{ do: 'probe' }],
-          [{ do: 'hang-up' }, { do: 'serve', gates: true }],
+          [{ do: 'hang-up' }, { do: 'serve', capabilities: { gates: true, agingMs: null } }],
           [{ do: 'close-stdin' }, reap],
           [{ do: 'kill' }, reap],
           [
@@ -288,15 +290,15 @@ describe("the life of a run's reservation endpoint", () => {
 
   //#region smoo/cowshed!n/a-case-starts-on-a-core
   it('takes only a `capabilities` answer with `test_gate` as an mbx that gates test cases', () => {
-    expect(gatesTests(GATES.trimEnd())).toBe(true);
-    expect(gatesTests(NO_GATE.trimEnd())).toBe(false);
-    expect(gatesTests(UNKNOWN.trimEnd())).toBe(false);
-    expect(gatesTests('{"type":"capabilities"}')).toBe(false);
-    expect(gatesTests('listening')).toBe(false);
-    expect(gatesTests('{"type":"capabilities","test_gate":true')).toBe(false);
+    expect(endpointCapabilities(GATES.trimEnd())).toEqual({ gates: true, agingMs: null });
+    expect(endpointCapabilities(NO_GATE.trimEnd())).toEqual({ gates: false, agingMs: null });
+    expect(endpointCapabilities(UNKNOWN.trimEnd())).toEqual({ gates: false, agingMs: null });
+    expect(endpointCapabilities('{"type":"capabilities"}')).toEqual({ gates: false, agingMs: null });
+    expect(endpointCapabilities('listening')).toEqual({ gates: false, agingMs: null });
+    expect(endpointCapabilities('{"type":"capabilities","test_gate":true')).toEqual({ gates: false, agingMs: null });
   });
 
-  it("serves with the gate its probe's first line answers, and with none when the probe ends first", () => {
+  it("serves with the capabilities its probe's first line answers, and with none when the probe ends first", () => {
     everyOrder((steps) => {
       let reply = '';
       for (const step of steps) {
@@ -305,8 +307,9 @@ describe("the life of a run's reservation endpoint", () => {
         const serve = step.effects.find((effect) => effect.do === 'serve');
         const line = firstLine(reply);
         if (step.event.type === 'probe' && line !== null)
-          expect(serve).toEqual({ do: 'serve', gates: gatesTests(line) });
-        else if (serve !== undefined) expect(serve).toEqual({ do: 'serve', gates: false });
+          expect(serve).toEqual({ do: 'serve', capabilities: endpointCapabilities(line) });
+        else if (serve !== undefined)
+          expect(serve).toEqual({ do: 'serve', capabilities: { gates: false, agingMs: null } });
       }
     });
   });

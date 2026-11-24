@@ -44,7 +44,14 @@ import {
   withMbxLeaf,
   withReservationAfterFixture,
 } from './mbx-pool.js';
-import { describeUnserved, RESERVATIONS_ENV, type Reservation, reserveCores, runEndpoint } from './mbx-reservations.js';
+import {
+  describeUnserved,
+  RESERVATIONS_ENV,
+  type Reservation,
+  reserveCores,
+  runAgingMs,
+  runEndpoint,
+} from './mbx-reservations.js';
 import { killedFromOutside, type RunOutcome, runUntilNotKilledForMemory } from './memory-retry.js';
 import {
   type Capture,
@@ -92,7 +99,7 @@ import { createRunnerLifecycle, withFixtureLifecycle, withRunnerLifecycle } from
 import { CPU_TOKENS_ENV, runnerDemand, sizeRunner, sizeRunnerToGrant } from './runner-sizing.js';
 import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import { type BoundedExecOptions, boundedCommand, type ShellBoundedExecOptions } from './schema.js';
-import { readLastWalls, suiteMinimum } from './suite-minimum.js';
+import { fewestThreadsWithin, readLastWalls, suiteMinimum, suiteWall } from './suite-minimum.js';
 import { createTestResultWriter, type TestResultWriter } from './test-result-writer.js';
 import {
   type BoundedExecRecord,
@@ -1568,9 +1575,15 @@ async function runCommand(
           return;
         }
         queue.waiting();
-        // A whole-suite test leaf names the fewest threads at which its recorded walls keep a test finishing within
-        // its own no-progress bound (specs/cowshed/05_gateway.md, "A minimum for a whole suite").
-        const min = idleTimeoutMs === undefined ? 1 : suiteMinimum([...lastWalls.values()], cpus, idleTimeoutMs);
+        // A whole-suite test leaf names the larger of its liveness minimum (keeping a test finishing within its
+        // no-progress bound) and, when the run's endpoint states the pool's aging bound, its wall floor (keeping its
+        // LPT wall within one aging bound of its full-ask wall; specs/cowshed/05_gateway.md, "A minimum for a whole
+        // suite").
+        const walls = [...lastWalls.values()];
+        const liveness = idleTimeoutMs === undefined ? 1 : suiteMinimum(walls, cpus, idleTimeoutMs);
+        const agingMs = runAgingMs(process.env);
+        const floor = agingMs === null ? 1 : fewestThreadsWithin(walls, cpus, suiteWall(walls, cpus) + agingMs);
+        const min = Math.max(liveness, floor);
         const named = min > 1 ? ` min=${min}` : '';
         tell(`cowshed: mbx reserve wait start cpus=${cpus}${named} priority=${reservedLeaf.priority}\n`);
         const held = reserveCores(endpoint, cpus, reservedLeaf.priority, min, undefined, reservedLeaf.jobStartedMs);

@@ -6,6 +6,7 @@ const IDLE_MS = 180_000;
 const SEED = 20261124;
 const seconds = (...walls: number[]): number[] => walls.map((wall) => wall * 1000);
 
+//#region smoo/cowshed!n/a-minimum-for-a-whole-suite
 describe('the minimum a whole-suite test leaf names', () => {
   it('is no minimum for a leaf with no recorded wall', () => {
     expect(suiteMinimum([], 18, IDLE_MS)).toBe(1);
@@ -132,3 +133,4 @@ describe('the fewest threads to finish a suite within a target wall', () => {
     );
   });
 });
+//#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite

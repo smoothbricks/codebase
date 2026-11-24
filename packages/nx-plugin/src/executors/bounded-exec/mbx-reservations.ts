@@ -6,7 +6,14 @@ import { logger } from 'nx/src/devkit-exports.js';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
-import { type Ended, type EndpointEffect, type EndpointEvent, endpointStep, spawned } from './endpoint-life.js';
+import {
+  type Ended,
+  type EndpointCapabilities,
+  type EndpointEffect,
+  type EndpointEvent,
+  endpointStep,
+  spawned,
+} from './endpoint-life.js';
 import { type MbxPriority, mbxHold, mbxPool } from './mbx-pool.js';
 import {
   type Connection,
@@ -36,6 +43,21 @@ export const RESERVATIONS_ENV = 'MBX_RESERVATIONS_SOCKET';
  * leaves' refusals, never the run's own warning.
  */
 export const RESERVATIONS_UNSERVED_ENV = 'BOUNDED_EXEC_RESERVATIONS_UNSERVED';
+
+/**
+ * The pool's aging bound in milliseconds, published beside {@link TEST_GATE_SERVED_ENV} when the run's endpoint states
+ * `aging_ms` in its capabilities reply. A whole-suite test leaf uses it to floor its minimum against its full-ask wall;
+ * absent, no wall floor applies (specs/cowshed/05_gateway.md, "A minimum for a whole suite").
+ */
+export const MBX_AGING_MS_ENV = 'BOUNDED_EXEC_MBX_AGING_MS';
+
+/** The pool's aging bound in milliseconds from `env`, or null when absent or not a non-negative safe integer. */
+export function runAgingMs(env: Readonly<NodeJS.ProcessEnv>): number | null {
+  const raw = env[MBX_AGING_MS_ENV];
+  if (raw === undefined || !/^\d+$/u.test(raw)) return null;
+  const ms = Number(raw);
+  return Number.isSafeInteger(ms) ? ms : null;
+}
 
 /** What a task's environment says of its run's reservation endpoint. */
 export type RunEndpoint =
@@ -68,7 +90,12 @@ interface Endpoint {
 }
 
 type Started =
-  | { readonly ok: true; readonly endpoint: Endpoint; readonly socket: string; readonly gates: boolean }
+  | {
+      readonly ok: true;
+      readonly endpoint: Endpoint;
+      readonly socket: string;
+      readonly capabilities: EndpointCapabilities;
+    }
   | { readonly ok: false; readonly error: string };
 
 /** The endpoints this process serves, by Nx run id, until that run's `postTasksExecution`. */
@@ -94,14 +121,17 @@ export async function serveRunReservations(
       `bounded-exec: this run's mbx reservation endpoint did not start (${started.error}); its reserved leaves refuse to run`,
     );
     env[RESERVATIONS_UNSERVED_ENV] = started.error;
+    delete env[MBX_AGING_MS_ENV];
     return;
   }
   endpoints.set(context.id, started.endpoint);
   env[RESERVATIONS_ENV] = started.socket;
   delete env[RESERVATIONS_UNSERVED_ENV];
   // A leaf's runner starts every thread of its ask only where the installed mbx's shim takes each case through its gate.
-  if (started.gates) env[TEST_GATE_SERVED_ENV] = '1';
+  if (started.capabilities.gates) env[TEST_GATE_SERVED_ENV] = '1';
   else delete env[TEST_GATE_SERVED_ENV];
+  if (started.capabilities.agingMs !== null) env[MBX_AGING_MS_ENV] = String(started.capabilities.agingMs);
+  else delete env[MBX_AGING_MS_ENV];
 }
 
 /**
@@ -124,7 +154,7 @@ async function learnHeldGate(env: NodeJS.ProcessEnv): Promise<void> {
     return;
   }
   await started.endpoint.end();
-  if (started.gates) env[TEST_GATE_SERVED_ENV] = '1';
+  if (started.capabilities.gates) env[TEST_GATE_SERVED_ENV] = '1';
   else delete env[TEST_GATE_SERVED_ENV];
 }
 
@@ -211,7 +241,7 @@ async function startEndpoint(env: NodeJS.ProcessEnv): Promise<Started> {
         server.stdin.end();
         return;
       case 'serve':
-        answer({ ok: true, endpoint, socket, gates: effect.gates });
+        answer({ ok: true, endpoint, socket, capabilities: effect.capabilities });
         return;
       case 'refuse':
         void remove().then(() => answer({ ok: false, error: effect.why }), fail);

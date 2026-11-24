@@ -1973,7 +1973,8 @@ The policy it holds:
   back as each one exits. A non-Cargo leaf's reservation, and so a nextest run of prebuilt test binaries ("Parallelism
   inside a job"), holds its grant, at most `g` cores, until the leaf concludes ("Tradeoff" under "Status"). Such a
   holder no longer convoys the pool: mbx starts a waiting reservation on whatever cores are free, and lets later
-  requests pass one that cannot start until it has waited 30 s (mbx's pool rule,
+  requests pass one that cannot start until it has waited its aging bound (30 s in the mbx cowshed pins, which its
+  endpoint states; mbx's pool rule,
   [Machine-wide compile scheduling](https://mr-boxington.jdx.dev/scheduling#machine-wide-compile-scheduling)). A held
   job keeps its grant for its life on purpose, bounded by its own declared `g` ("Held jobs", Tradeoff).
 
@@ -2139,17 +2140,27 @@ host's load.
   checkout's background job. An admitted hold is never preempted, and its count never grows: a job granted fewer cores
   than it asked runs on those to its end.
 
-- **A minimum for a whole suite.** A reservation may name a minimum (`min` on the run endpoint's request,
-  `mbx reserve --min`): until it has waited the aging bound it starts only once that many cores are free, then takes
-  what is free up to its ask, and while it gathers, low work and the later requests of its own party (one run endpoint,
-  or one Cargo build's `mbx reserve`) wait behind it; every other request passes it, and two gatherers wait for each
-  other only in the pass order, so none deadlocks. At the aging bound it starts on what is free. A whole-suite test leaf
-  names as its minimum the fewest threads at which its last recorded test walls, longest first, never leave its
-  no-progress bound (180 s on the gates measured) without a test finishing. The walls are the durations its last run's
-  test results recorded; a leaf with none, or with no such bound, names no minimum, and a leaf no count satisfies names
-  its ask or its number of tests, whichever is fewer. Measured 2026-11-10 (the land gate of 07:13-07:32 replayed): a
-  suite started on 2 of its 18 cores ran 693-926 s; with its measured minimum of 3-4 it gathered 4 within 0.2 s from its
-  own run's short leaves and ran 349-517 s, and no other request waited longer.
+- <a id="smoo/cowshed!n/a-minimum-for-a-whole-suite"></a>**A minimum for a whole suite.** A reservation may name a
+  minimum (`min` on the run endpoint's request, `mbx reserve --min`): until it has waited the aging bound it starts only
+  once that many cores are free, then takes what is free up to its ask, and while it gathers, low work and the later
+  requests of its own party (one run endpoint, or one Cargo build's `mbx reserve`) wait behind it; every other request
+  passes it, and two gatherers wait for each other only in the pass order, so none deadlocks. At the aging bound it
+  starts on what is free (`gather_ends_at_the_bound`). A whole-suite test leaf names as its minimum the larger of two
+  counts over its last recorded test walls, scheduled longest first onto the thread that frees first:
+  - **Liveness:** the fewest threads at which no gap longer than its no-progress bound (180 s on the gates measured)
+    passes without a test finishing, or its ask or number of tests (whichever is fewer) when no count satisfies it; one
+    for a leaf with no such bound.
+  - **Wall floor:** when the run's endpoint states the pool's aging bound, the fewest threads at which the suite's LPT
+    wall stays within one aging bound of its LPT wall on the full ask (or the fewest threads that achieve the least wall
+    within the ask when no count reaches it); one when the endpoint does not state that bound. A repository's land turn
+    serializes its lands, so a gate's wall is the land pipeline's bottleneck; a grant never grows, so a suite started
+    short stays short; and a gather costs at most one aging bound. Fewer threads than this floor cost more land
+    throughput than gathering can cost, while more threads add no throughput beyond that bound.
+
+  The walls are the durations its last run's test results recorded; a leaf with none names no minimum. Measured
+  2026-11-10 (the land gate of 07:13-07:32 replayed): a suite started on 2 of its 18 cores ran 693-926 s; with its
+  measured minimum of 3-4 it gathered 4 within 0.2 s from its own run's short leaves and ran 349-517 s, and no other
+  request waited longer.
 
 - **The fence is admission.** A gate's priority in the pool replaces the fence. A gate, the land gate and a train's
   proof alike, is never held ("Declaration"): its leaves are admitted at `normal` ("A land is a gate job") and pass
@@ -2202,20 +2213,22 @@ starts one `mbx reservations <socket>`
 its PATH name, the canonical mbx environment's, which leads with the installed mbx (14_nix.md, "mbx"), on a socket in an
 owned directory of the job's socket namespace, waits for its `listening` line or its end, with no bound on its start,
 since a process's start takes what the host's load makes it take and "Deadlines" bounds only what the kernel completes
-whatever the peer's load, asks it `{"type":"capabilities"}` ("A case starts on a core"), and publishes the socket in
-`MBX_RESERVATIONS_SOCKET`, which every task inherits. The endpoint's life in its run is one pure state machine
-(`endpoint-life.ts`) over what the run observes of its child and of that question's connection; the run's shell maps
-those events in and executes what the machine answers, and decides nothing. Every wait of it ends on an event. The start
-waits for the child's first line, the end of its standard output, or its end: `listening` asks the question, any other
-line is refused and the child killed, and a child that closes its standard output without a line can say none, so it is
-refused too. The question waits for its answer, its connection's end, or the child's end, with no bound on the answer
-("Deadlines": an answer is never bounded by a total): the endpoint is the run's child, whose death the run reads. A
-child that ends before the question is answered was never published: the run refuses it by how it ended, as it does one
-that did not start. The machine's one timer is the reap bound ("Deadlines"), armed only while the child's end is
-awaited: once its standard output ended without a line, once it was killed for its first line, and once the run's
-`postTasksExecution` closed its standard input, which ends it with every grant it still serves. A child that outlives
-the bound is killed and given the bound once more; one a kill does not end is left as it is, but neither it nor its
-pipes keep the run alive. The start's refusal or the run's closing warning names its pid.
+whatever the peer's load, asks it `{"type":"capabilities"}` (learning whether the installed mbx's shim gates test cases,
+"A case starts on a core", and the pool's aging bound `aging_ms`, "A minimum for a whole suite"), and publishes the
+socket in `MBX_RESERVATIONS_SOCKET`, along with those capabilities, which every task inherits; a leaf whose mbx does not
+state `aging_ms` names no wall floor. The endpoint's life in its run is one pure state machine (`endpoint-life.ts`) over
+what the run observes of its child and of that question's connection; the run's shell maps those events in and executes
+what the machine answers, and decides nothing. Every wait of it ends on an event. The start waits for the child's first
+line, the end of its standard output, or its end: `listening` asks the question, any other line is refused and the child
+killed, and a child that closes its standard output without a line can say none, so it is refused too. The question
+waits for its answer, its connection's end, or the child's end, with no bound on the answer ("Deadlines": an answer is
+never bounded by a total): the endpoint is the run's child, whose death the run reads. A child that ends before the
+question is answered was never published: the run refuses it by how it ended, as it does one that did not start. The
+machine's one timer is the reap bound ("Deadlines"), armed only while the child's end is awaited: once its standard
+output ended without a line, once it was killed for its first line, and once the run's `postTasksExecution` closed its
+standard input, which ends it with every grant it still serves. A child that outlives the bound is killed and given the
+bound once more; one a kill does not end is left as it is, but neither it nor its pipes keep the run alive. The start's
+refusal or the run's closing warning names its pid.
 
 A leaf's connection is a second pure machine (`reservation-connection.ts`): every request is answered once, by the pool,
 by its own release or by the connection's end, which also loses every grant still held; an answer that is no reply ends

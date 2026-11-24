@@ -7,6 +7,7 @@ import { standInReservations } from '../../__tests__/stand-in-mbx-reservations.j
 import { TEST_GATE_SERVED_ENV } from './case-gate.js';
 import {
   closeRunReservations,
+  MBX_AGING_MS_ENV,
   RESERVATIONS_ENV,
   RESERVATIONS_UNSERVED_ENV,
   reserveCores,
@@ -201,9 +202,9 @@ process.stdin.resume();
     try {
       await serveRunReservations({ id: 'run-aging-stated' }, mbx.env);
       expect(mbx.env[TEST_GATE_SERVED_ENV]).toBe('1');
-      expect(mbx.env.BOUNDED_EXEC_MBX_AGING_MS).toBe('30000');
-      await closeRunReservations({ id: 'run-aging-stated' });
+      expect(mbx.env[MBX_AGING_MS_ENV]).toBe('30000');
     } finally {
+      await closeRunReservations({ id: 'run-aging-stated' });
       await rm(mbx.root, { recursive: true, force: true });
     }
   });
@@ -218,12 +219,12 @@ process.stdin.resume();
 ' "$2"`,
     );
     try {
-      mbx.env.BOUNDED_EXEC_MBX_AGING_MS = '30000';
+      mbx.env[MBX_AGING_MS_ENV] = '30000';
       await serveRunReservations({ id: 'run-aging-omitted' }, mbx.env);
       expect(mbx.env[TEST_GATE_SERVED_ENV]).toBe('1');
-      expect(mbx.env).not.toHaveProperty('BOUNDED_EXEC_MBX_AGING_MS');
-      await closeRunReservations({ id: 'run-aging-omitted' });
+      expect(mbx.env).not.toHaveProperty(MBX_AGING_MS_ENV);
     } finally {
+      await closeRunReservations({ id: 'run-aging-omitted' });
       await rm(mbx.root, { recursive: true, force: true });
     }
   });

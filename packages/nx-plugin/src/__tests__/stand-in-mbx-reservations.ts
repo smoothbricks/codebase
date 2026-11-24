@@ -63,16 +63,22 @@ export interface StandInReservations {
   close(): Promise<void>;
 }
 
+/** Capabilities the stand-in answers to `{"type":"capabilities"}`; omit to answer an error as an older mbx does. */
+export interface StandInCapabilities {
+  readonly gates?: boolean;
+  readonly agingMs?: number;
+}
+
 /**
  * mbx's reservation endpoint at its published interface: a Unix socket that answers each `reserve` line with
  * `answer`'s grant or refusal and records every connection, reserve and release it hears. It stands in for
  * `mbx reservations`, mbx's own and tested in mbx's suite, so a leaf suite pins only what bounded-exec asks and does
- * with the answer. With `gates` it answers `capabilities` as an mbx whose test shim gates its cases does; without, as
- * one that does not know the request: an error, and the connection's end.
+ * with the answer. With `capabilities` it answers `capabilities` with `test_gate` and, when stated, `aging_ms`;
+ * without, as an mbx that does not know the request: an error, and the connection's end.
  */
 export async function standInReservations(
   answer: (heard: HeardReserve) => StandInAnswer,
-  gates = false,
+  capabilities?: StandInCapabilities,
 ): Promise<StandInReservations> {
   const directory = await ownedSocketDirectory('mbx-r-stand-in-', 'r.sock');
   const socket = join(directory, 'r.sock');
@@ -91,9 +97,14 @@ export async function standInReservations(
     client.on('data', (text: string) => {
       unread += text;
       for (let end = unread.indexOf('\n'); end !== -1; end = unread.indexOf('\n')) {
-        if (gates && unread.slice(0, end) === '{"type":"capabilities"}') {
+        if (capabilities !== undefined && unread.slice(0, end) === '{"type":"capabilities"}') {
           unread = unread.slice(end + 1);
-          client.write('{"type":"capabilities","test_gate":true}\n');
+          const reply: { type: 'capabilities'; test_gate: boolean; aging_ms?: number } = {
+            type: 'capabilities',
+            test_gate: capabilities.gates ?? false,
+            ...(capabilities.agingMs === undefined ? {} : { aging_ms: capabilities.agingMs }),
+          };
+          client.write(`${JSON.stringify(reply)}\n`);
           continue;
         }
         const line = heardLine(unread.slice(0, end));

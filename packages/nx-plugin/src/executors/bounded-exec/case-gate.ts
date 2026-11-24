@@ -18,7 +18,7 @@ import { ownedSocketDirectory } from '../../testing.js';
 export const TEST_GATE_ENV = 'MBX_TEST_GATE';
 /**
  * Set to `1` in a run's environment once its endpoint answered that the installed mbx's shim gates its cases
- * (endpoint-life.ts, `gatesTests`): without it a leaf's runner is sized to its grant.
+ * (endpoint-life.ts, `endpointCapabilities`): without it a leaf's runner is sized to its grant.
  */
 export const TEST_GATE_SERVED_ENV = 'BOUNDED_EXEC_MBX_TEST_GATE';
 /** The line that starts a case. */
