@@ -18,14 +18,49 @@ function sh(cmd: string, args: string[], cwd: string) {
   return { code: r.status ?? -1, out: r.stdout ?? '', err: r.error?.message ?? r.stderr ?? '' };
 }
 
-/** What rustc said about the source it compiled: an empty stderr says nothing. */
+/** One line of rustc's `--error-format=json` stderr. */
+type RustcDiagnostic = { level: string; spans: unknown[]; message: string; rendered: string | null };
+
+function isRustcDiagnostic(v: unknown): v is RustcDiagnostic {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    '$message_type' in v &&
+    v.$message_type === 'diagnostic' &&
+    'level' in v &&
+    typeof v.level === 'string' &&
+    'spans' in v &&
+    Array.isArray(v.spans) &&
+    'message' in v &&
+    typeof v.message === 'string'
+  );
+}
+
+/**
+ * What rustc said about the source it compiled, from its JSON stderr: every error, and every warning that points into a
+ * file. A warning with no span is about the toolchain (xcrun's note while rustc finds the SDK, the "N warnings
+ * emitted" tally), never the compiled Rust. A line that is no rustc diagnostic is kept, so unknown output fails closed.
+ */
 function rustcDiagnostics(stderr: string): string[] {
-  return stderr === '' ? [] : [stderr];
+  return stderr
+    .split('\n')
+    .filter((line) => line !== '')
+    .flatMap((line) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return [line];
+      }
+      if (!isRustcDiagnostic(parsed)) return [line];
+      const counts = parsed.level.startsWith('error') || (parsed.level === 'warning' && parsed.spans.length > 0);
+      return counts ? [parsed.rendered ?? parsed.message] : [];
+    });
 }
 
 /** Compiles with rustc; the claim is its exit status and its diagnostics of the compiled source. */
 function rustc(args: string[], cwd: string) {
-  const r = sh('rustc', args, cwd);
+  const r = sh('rustc', ['--error-format=json', ...args], cwd);
   return { code: r.code, diagnostics: rustcDiagnostics(r.err) };
 }
 
