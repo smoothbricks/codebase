@@ -7227,11 +7227,12 @@ fn main() {
             .layout
             .seed_of(&target.name, &target.incarnation)
             .unwrap();
-        let stopped = daemon.try_wait().unwrap();
-        if stopped.is_none() {
-            daemon.kill().unwrap();
-            daemon.wait_bounded().unwrap();
-        }
+        // The stop waits on kqueue's NOTE_EXIT, which XNU posts before the exiting process can be
+        // reaped (bsd/kern/kern_exit.c `proc_exit`: `proc_knote(p, NOTE_EXIT | …)`, then later
+        // `p->p_stat = SZOMB`), so a WNOHANG check right after it can still see the daemon run. The
+        // bounded reap ends that window; it closes `cat`'s stdin, which ends a daemon the freeze left
+        // alone with a plain exit, so only a signal says the freeze stopped it.
+        let stopped = daemon.wait_bounded().ok();
         drop(listener);
         drop(quiet);
         drop(locked);
@@ -8914,11 +8915,17 @@ fn main() {
                 }),
             },
         );
-        let stopped = daemon.try_wait().unwrap();
-        if stopped.is_none() {
-            daemon.kill().unwrap();
-            daemon.wait_bounded().unwrap();
-        }
+        // As in the freeze test above: the stop concluded on NOTE_EXIT, which XNU posts before the
+        // daemon can be reaped, so the bounded reap is the proof it ended. A daemon the reseed never
+        // signalled outlasts the reap's bound (its loop never exits), fails the reap and is killed then.
+        let stopped = match daemon.wait_bounded() {
+            Ok(status) => Some(status),
+            Err(_) => {
+                daemon.kill().unwrap();
+                daemon.wait_bounded().unwrap();
+                None
+            }
+        };
         let attempt = fs::read_to_string(&admission).unwrap_or_default();
         if let Some(child) = attempt.strip_prefix("admitted ") {
             let child: libc::pid_t = child.parse().unwrap();
