@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'bun:test';
+import type { LockHolders } from '@smoothbricks/procinfo';
 import fc from 'fast-check';
 import { describeLockWait, lockCandidates, lockWaits, type OpenFile, parseLsofTable } from './lock-wait.js';
+
+/** What the kernel's lock record says of each path, as procinfo's `lockHolders` answers it. */
+const records = (entries: Record<string, LockHolders>): ReadonlyMap<string, LockHolders> =>
+  new Map(Object.entries(entries));
+const lock = (pid: number | null, kind: string | null, waiting = false) => ({ pid, kind, exclusive: true, waiting });
 
 // The rows of the 2026-10-21 cargo case: `cargo --frozen test` blocked on the package cache while another cargo held
 // it open. The cwd and txt rows are never lock candidates; the numbered REG row is the only one.
@@ -57,32 +63,55 @@ describe('lockCandidates', () => {
 });
 
 describe('lockWaits', () => {
-  it('names no wait in the 2026-10-21 tree, whose one process held the cache and whose holder ran outside it', () => {
-    expect(lockWaits(incidentRows)).toEqual([]);
+  it('names the 2026-10-21 holder outside the run from the Linux lock record, and the run waiting for it', () => {
+    const record = records({
+      [CACHE]: { state: 'locked', locks: [lock(51234, 'flock'), lock(94769, 'flock', true)] },
+    });
+    expect(lockWaits(incidentRows, record)).toEqual([
+      { path: CACHE, inTree: [94769], waiting: [94769], holders: [51234] },
+    ]);
   });
 
-  it('names a lockable file two processes of the tree hold, with both', () => {
+  it('names no wait on Linux where no process of the tree waits on the record, however many hold the file', () => {
     const tree: OpenFile[] = [...incidentRows, { pid: 94770, fd: '4u', type: 'REG', path: CACHE }];
-    expect(lockWaits(tree)).toEqual([{ path: CACHE, holders: [94769, 94770] }]);
+    const record = records({ [CACHE]: { state: 'locked', locks: [lock(94769, 'flock')] } });
+    expect(lockWaits(tree, record)).toEqual([]);
   });
 
-  it('names no wait for a file two processes hold only through an unnumbered descriptor', () => {
-    const tree: OpenFile[] = [
-      ...incidentRows,
-      { pid: 94770, fd: 'txt', type: 'REG', path: '/usr/lib/libobjc.A.dylib' },
-    ];
-    expect(lockWaits(tree)).toEqual([]);
+  it('names a Darwin holder outside the tree, and one Darwin does not name, as a wait with its holder', () => {
+    for (const holder of [51234, null]) {
+      const record = records({ [CACHE]: { state: 'locked', locks: [lock(holder, null)] } });
+      expect(lockWaits(incidentRows, record)).toEqual([
+        { path: CACHE, inTree: [94769], waiting: [], holders: [holder] },
+      ]);
+    }
   });
 
-  it('counts a process once however many descriptors it holds the file on', () => {
-    const tree: OpenFile[] = [...incidentRows, { pid: 94769, fd: '6u', type: 'REG', path: CACHE }];
-    expect(lockWaits(tree)).toEqual([]);
+  it('names a Darwin lock two processes of the tree hold open, its holder one of them', () => {
+    const tree: OpenFile[] = [...incidentRows, { pid: 94770, fd: '4u', type: 'REG', path: CACHE }];
+    const record = records({ [CACHE]: { state: 'locked', locks: [lock(94770, null)] } });
+    expect(lockWaits(tree, record)).toEqual([{ path: CACHE, inTree: [94769, 94770], waiting: [], holders: [94770] }]);
+    const own = records({ [CACHE]: { state: 'locked', locks: [lock(94769, null)] } });
+    expect(lockWaits(incidentRows, own)).toEqual([]);
+  });
+
+  it('names no wait for an unlocked file, one whose locks were not read, or one held through an unnumbered descriptor', () => {
+    const tree: OpenFile[] = [...incidentRows, { pid: 94770, fd: '4u', type: 'REG', path: CACHE }];
+    expect(lockWaits(tree, records({ [CACHE]: { state: 'unlocked' } }))).toEqual([]);
+    expect(lockWaits(tree, records({ [CACHE]: { state: 'unread', reason: 'not read within 250ms' } }))).toEqual([]);
+    const library = records({ '/usr/lib/libobjc.A.dylib': { state: 'locked', locks: [lock(51234, null)] } });
+    expect(lockWaits(incidentRows, library)).toEqual([]);
   });
 });
 
 describe('describeLockWait', () => {
-  it('names the file and each process of the tree that holds it', () => {
-    expect(describeLockWait({ path: CACHE, holders: [94769, 94770] })).toBe(`${CACHE} open by pid 94769, 94770`);
+  it('names the holder the lock record names, and says so where it names none', () => {
+    expect(describeLockWait({ path: CACHE, inTree: [94769], waiting: [94769], holders: [51234] })).toBe(
+      `${CACHE}, open in the run by pid 94769, which waits for it; held by pid 51234`,
+    );
+    expect(describeLockWait({ path: CACHE, inTree: [94769], waiting: [], holders: [null] })).toBe(
+      `${CACHE}, open in the run by pid 94769; locked, and the holder is not named by the kernel's lock record on this platform`,
+    );
   });
 });
 
@@ -103,7 +132,7 @@ describe('lsof reading properties', () => {
     fc.assert(fc.property(rows, (generated) => expect(parseLsofTable(renderTable(generated))).toEqual(generated)));
   });
 
-  it('names a wait for exactly the lockable paths two or more processes of the tree hold', () => {
+  it('names a wait only for a locked lockable path the run holds, never a holder the record does not hold', () => {
     const samplePaths = ['/a/x', '/a/y', '/b z'];
     const row = fc.record({
       pid: fc.integer({ min: 1, max: 12 }),
@@ -111,25 +140,37 @@ describe('lsof reading properties', () => {
       type: types,
       path: fc.constantFrom(...samplePaths),
     });
+    const held = fc.record({
+      pid: fc.option(fc.integer({ min: 1, max: 20 }), { nil: null }),
+      kind: fc.constantFrom('flock', 'posix', null),
+      exclusive: fc.boolean(),
+      waiting: fc.boolean(),
+    });
+    const record = fc.oneof(
+      fc.constant<LockHolders>({ state: 'unlocked' }),
+      fc.array(held, { minLength: 1, maxLength: 4 }).map((locks): LockHolders => ({ state: 'locked', locks })),
+    );
     fc.assert(
-      fc.property(fc.array(row, { maxLength: 12 }), (tree) => {
-        const waits = lockWaits(tree);
-        const names = waits.map((wait) => wait.path);
-        expect(names).toEqual([...names].sort());
-        expect(new Set(names).size).toBe(names.length);
-        for (const wait of waits) {
-          expect(wait.holders).toEqual([...new Set(wait.holders)].sort((a, b) => a - b));
-          expect(wait.holders.every((pid) => tree.some((file) => file.pid === pid && file.path === wait.path))).toBe(
-            true,
-          );
-        }
-        for (const path of lockCandidates(tree)) {
-          const holders = new Set(
-            tree.filter((file) => file.path === path && file.type === 'REG' && /^\d/.test(file.fd)).map((f) => f.pid),
-          );
-          expect(names.includes(path)).toBe(holders.size >= 2);
-        }
-      }),
+      fc.property(
+        fc.array(row, { maxLength: 12 }),
+        fc.dictionary(fc.constantFrom(...samplePaths), record),
+        (tree, kept) => {
+          const read = records(kept);
+          const waits = lockWaits(tree, read);
+          const names = waits.map((wait) => wait.path);
+          expect(names).toEqual([...names].sort());
+          expect(new Set(names).size).toBe(names.length);
+          const candidates = lockCandidates(tree);
+          for (const wait of waits) {
+            expect(candidates).toContain(wait.path);
+            const locked = read.get(wait.path);
+            expect(locked?.state).toBe('locked');
+            const pids = locked?.state === 'locked' ? locked.locks.map((entry) => entry.pid) : [];
+            for (const holder of wait.holders) expect(pids).toContain(holder);
+            for (const pid of wait.waiting) expect(wait.inTree).toContain(pid);
+          }
+        },
+      ),
     );
   });
 });

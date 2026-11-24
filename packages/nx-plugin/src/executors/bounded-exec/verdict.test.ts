@@ -270,7 +270,7 @@ describe('bounded-exec verdicts', () => {
   });
   it('copies the lock waits the snapshot named into the wedged verdict', () => {
     const cache = '/Users/dev/.cargo/.package-cache';
-    const lockWaits = [{ path: cache, holders: [94769, 94770] }];
+    const lockWaits = [{ path: cache, inTree: [94769], waiting: [94769], holders: [51234] }];
     expect(
       judgeRun({
         exitCode: 143,
@@ -284,13 +284,15 @@ describe('bounded-exec verdicts', () => {
     ).toEqual({ outcome: 'wedged', idleMs: 180_000, elapsedMs: 180_900, tests: [], lockWaits, cpuRising: [] });
   });
 
-  it('names the file processes of the runner tree hold, where one may hold a lock another waits on', () => {
-    const lockWaits = [{ path: '/Users/dev/.cargo/.package-cache', holders: [94769, 94770] }];
+  it("names the holder the kernel's lock record names for the file a wedged run waits on", () => {
+    const lockWaits = [
+      { path: '/Users/dev/.cargo/.package-cache', inTree: [94769], waiting: [94769], holders: [51234] },
+    ];
     expect(
       describeVerdict({ outcome: 'wedged', idleMs: 180_000, elapsedMs: 200_000, tests: [], lockWaits, cpuRising: [] }),
     ).toBe(
       'wedged: no test finished or reported progress for 180000ms after 200000ms; the runner named no test still running; ' +
-        'a lock may be held among the run: /Users/dev/.cargo/.package-cache open by pid 94769, 94770',
+        'waiting on a lock: /Users/dev/.cargo/.package-cache, open in the run by pid 94769, which waits for it; held by pid 51234',
     );
   });
 
@@ -329,17 +331,24 @@ describe('bounded-exec verdicts', () => {
       writeFile(join(directory, VERDICT_FILE), JSON.stringify({ task: 'app:test', hash: '42', verdict: value }));
     await write(verdict);
     expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, lockWaits: [], cpuRising: [] });
-    const named = [{ path: '/fixture/cache', holders: [7, 8] }];
+    const named = [{ path: '/fixture/cache', inTree: [7], waiting: [], holders: [9, null] }];
     await write({ ...verdict, lockWaits: named });
     expect((await readRecord(directory))?.verdict).toEqual({ ...verdict, lockWaits: named, cpuRising: [] });
-    // An earlier build's record, naming the outside holder, reads as the run's pids: the task is not refused.
+    // Records earlier builds wrote still read, so the task is not refused: one naming the outside holders an
+    // open-file census found, and one naming only the tree's processes holding the file.
     await write({
       ...verdict,
-      lockWaits: [{ path: '/fixture/cache', waiters: [7], holders: [{ pid: 9, command: 'cargo' }] }],
+      lockWaits: [
+        { path: '/fixture/cache', waiters: [7], holders: [{ pid: 9, command: 'cargo' }] },
+        { path: '/fixture/other', holders: [7, 8] },
+      ],
     });
     expect((await readRecord(directory))?.verdict).toEqual({
       ...verdict,
-      lockWaits: [{ path: '/fixture/cache', holders: [7] }],
+      lockWaits: [
+        { path: '/fixture/cache', inTree: [7], waiting: [], holders: [9] },
+        { path: '/fixture/other', inTree: [7, 8], waiting: [], holders: [] },
+      ],
       cpuRising: [],
     });
     const rising = [{ pid: 4242, command: 'rustc', gainedMs: 7_000 }];

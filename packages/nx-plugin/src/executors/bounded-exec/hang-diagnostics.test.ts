@@ -2,7 +2,7 @@ import { describe, expect, it, jest } from 'bun:test';
 import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ProcessGroups, RunState } from '@smoothbricks/procinfo';
+import type { LockHolders, ProcessGroups, RunState } from '@smoothbricks/procinfo';
 import * as procinfo from '@smoothbricks/procinfo';
 import { churnFailures, startChurn } from '../../__tests__/churn-group.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -65,10 +65,16 @@ function refused(message: string): Error {
 
 /**
  * procinfo's answers about the processes `table()` holds now, each read as the kernel answers for one pid: a pid in no
- * row is reaped. `groups` is false where the kernel lists no group (Linux). Faked at procinfo's exported boundary, never
- * below it.
+ * row is reaped. `groups` is false where the kernel lists no group (Linux). `locks` is the kernel's lock record of each
+ * path (unlocked where it names none), and each path asked is kept in `asks`. Faked at procinfo's exported boundary,
+ * never below it.
  */
-function readerOf(table: () => readonly FakeProcess[], groups = true): { reader: HangProcessReader; reads(): number } {
+function readerOf(
+  table: () => readonly FakeProcess[],
+  groups = true,
+  locks: Readonly<Record<string, LockHolders>> = {},
+  asks: string[] = [],
+): { reader: HangProcessReader; reads(): number } {
   let reads = 0;
   const find = (pid: number): FakeProcess | undefined => {
     reads += 1;
@@ -128,6 +134,10 @@ function readerOf(table: () => readonly FakeProcess[], groups = true): { reader:
       const entry = find(pid);
       return entry === undefined ? null : (entry.startedUs ?? STARTED_US);
     },
+    lockHolders(path) {
+      asks.push(path);
+      return locks[path] ?? { state: 'unlocked' };
+    },
   };
   return { reader, reads: () => reads };
 }
@@ -167,13 +177,15 @@ function scriptedHost(
   trees: readonly (readonly FakeProcess[])[],
   results: readonly HangProbeResult[] = [],
   sample: (pid: number) => HangProbeResult | Promise<HangProbeResult> = () => exited(SAMPLE_REPORT),
+  locks: Readonly<Record<string, LockHolders>> = {},
 ) {
   const calls: { file: string; args: readonly string[]; timeoutMs: number }[] = [];
   const samples: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
   const traces: { pid: number; args: readonly string[]; timeoutMs: number }[] = [];
   const pauses: number[] = [];
   let tree = trees[0] ?? [];
-  const { reader, reads } = readerOf(() => tree);
+  const lockAsks: string[] = [];
+  const { reader, reads } = readerOf(() => tree, true, locks, lockAsks);
   let index = 0;
   const host: HangDiagnosticHost = {
     platform: 'darwin',
@@ -198,7 +210,7 @@ function scriptedHost(
       return result;
     },
   };
-  return { host, calls, samples, traces, pauses, reads };
+  return { host, calls, samples, traces, pauses, reads, lockAsks };
 }
 
 /** The first complete line a process prints. A stream that ends first fails, naming what it did print. */
@@ -232,7 +244,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('pid=101 pgid=101');
     expect(calls.map((call) => call.file)).toEqual(['sudo']);
     expect(calls[0]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
-    expect(capture.text).toContain('a holder outside the tree is not looked up: /fixture/held-file');
+    expect(capture.text).not.toContain('Lock wait');
     expect(capture.lockWaits).toEqual([]);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
@@ -338,29 +350,55 @@ describe('pre-expiry hang diagnostics', () => {
     }
   });
 
-  it('names a lock wait for a lockable file two processes of the tree hold, and looks up no holder outside it', async () => {
+  it("names the holder the kernel's lock record names for a file a process of the run waits on, asking once per file", async () => {
     const shared =
-      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n' +
-      'grandchild 303 tester 5u REG 1,2 4 123 /fixture/held-file\n';
-    const { host, calls } = scriptedHost([HOST], [exited(shared)]);
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\ngrandchild 303 tester 5u REG 1,2 4 123 /fixture/held-file\n' +
+      'grandchild 303 tester 6r REG 1,2 4 123 /fixture/held-file\n';
+    const record: LockHolders = {
+      state: 'locked',
+      locks: [
+        { pid: 505, kind: 'flock', exclusive: true, waiting: false },
+        { pid: 303, kind: 'flock', exclusive: true, waiting: true },
+      ],
+    };
+    const { host, calls, lockAsks } = scriptedHost([HOST], [exited(shared)], undefined, {
+      '/fixture/held-file': record,
+    });
     const capture = await captureHangDiagnostics(request(), host);
     expect(capture.outcome, capture.text).toBe('holders');
-    expect(capture.lockWaits).toEqual([{ path: '/fixture/held-file', holders: [202, 303] }]);
+    expect(capture.lockWaits).toEqual([{ path: '/fixture/held-file', inTree: [303], waiting: [303], holders: [505] }]);
     expect(capture.text).toContain(
-      "Lock wait (open-handle evidence among the runner's tree, not a kernel lock owner): /fixture/held-file open by pid 202, 303",
+      "Lock wait (the kernel's lock record): /fixture/held-file, open in the run by pid 303, which waits for it; held by pid 505",
     );
+    expect(lockAsks).toEqual(['/fixture/held-file']);
     expect(calls.map((call) => call.file)).toEqual(['sudo']);
   });
 
-  it('stack-samples a holder of a named lock wait that the leaf samples left out', async () => {
-    // Pid 202 has a child, so no leaf sample takes its stack, yet it holds the file the lock wait names: its stack is
-    // what says whether it blocks in the lock call at all.
-    const shared =
-      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n' +
-      'grandchild 303 tester 5u REG 1,2 4 123 /fixture/held-file\n';
-    const { host, samples } = scriptedHost([HOST], [exited(shared)]);
+  it('names a file whose locks were not read within their bound, and no wait for it', async () => {
+    const { host } = scriptedHost([HOST], [exited(fileObservation)], undefined, {
+      '/fixture/held-file': { state: 'unread', reason: "the file's locks were not read within 250ms" },
+    });
     const capture = await captureHangDiagnostics(request(), host);
-    expect(capture.lockWaits.map((wait) => wait.holders)).toEqual([[202, 303]]);
+    expect(capture.lockWaits).toEqual([]);
+    expect(capture.text).toContain("Locks of /fixture/held-file not read: the file's locks were not read within 250ms");
+  });
+
+  it('stack-samples a waiter of a named lock wait that the leaf samples left out', async () => {
+    // Pid 202 has a child, so no leaf sample takes its stack, yet the lock record shows it waiting: its stack is what
+    // says which call it blocks in.
+    const opened =
+      'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nchild 202 tester 7r REG 1,2 4 123 /fixture/held-file\n';
+    const { host, samples } = scriptedHost([HOST], [exited(opened)], undefined, {
+      '/fixture/held-file': {
+        state: 'locked',
+        locks: [
+          { pid: 505, kind: 'posix', exclusive: true, waiting: false },
+          { pid: 202, kind: 'posix', exclusive: true, waiting: true },
+        ],
+      },
+    });
+    const capture = await captureHangDiagnostics(request(), host);
+    expect(capture.lockWaits.map((wait) => wait.waiting)).toEqual([[202]]);
     expect(samples.map((sample) => sample.pid).sort((left, right) => left - right)).toEqual([ROOT, 202, 303, 404]);
     expect(capture.text).toContain('stack sample pid 202 (1s; binary image list omitted)');
   });
@@ -760,14 +798,14 @@ describe('pre-expiry hang diagnostics', () => {
     }
   });
 
-  it('names the lock call a run blocks in by its stack, and looks up no holder outside the runner tree', async () => {
+  it("names a run's flock wait from the kernel's lock record, its Darwin holder unnamed, and the call in its stack", async () => {
     if (process.platform !== 'darwin') return;
     const directory = await mkdtemp(join(tmpdir(), 'hang-lock-wait-'));
     const file = join(directory, 'package-cache');
     await writeFile(file, '');
     // The holder takes the exclusive lock and lives until the test kills it. The run opens the same file, prints
-    // `waiting`, and blocks in flock(2). The holder is outside the runner's tree, so the snapshot names no lock wait and
-    // looks the holder up nowhere: it names the run's lockable file, and the run's stack shows the call it blocks in.
+    // `waiting`, and blocks in flock(2). The holder is outside the runner's tree: Darwin's lock record says the file is
+    // locked and names no flock(2) holder, and the run's stack shows the call it blocks in.
     const holderScript = 'open(F, ">>", $ARGV[0]) or die; flock(F, 2) or die; $| = 1; print "held\\n"; sleep';
     const runScript = 'open(F, ">>", $ARGV[0]) or die; $| = 1; print "waiting\\n"; flock(F, 2) or die; sleep';
     const holder = Bun.spawn(['perl', '-e', holderScript, file], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
@@ -783,8 +821,10 @@ describe('pre-expiry hang diagnostics', () => {
       );
       const path = await realpath(file);
       expect(capture.outcome, capture.text).toBe('holders');
-      expect(capture.lockWaits, capture.text).toEqual([]);
-      expect(capture.text).toContain(`a holder outside the tree is not looked up: ${path}`);
+      expect(capture.lockWaits, capture.text).toEqual([{ path, inTree: [run.pid], waiting: [], holders: [null] }]);
+      expect(capture.text).toContain(
+        "locked, and the holder is not named by the kernel's lock record on this platform",
+      );
       expect(capture.text).toMatch(/flock/);
     } catch (error) {
       failures.push(error);

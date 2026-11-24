@@ -1086,38 +1086,43 @@ binary-image list, and is written to the probe's pipe alone, never to a file in 
 waits in (`read`, `open`, a condition wait), which the open-resource probe cannot. A sample that sudo refuses, that
 fails or that reaches its limit is named, with its stderr, as no stack for that process: it never delays termination and
 does not change the holder outcome, which stacks do not establish. Once the open-resource probe names a lock wait, each
-of its holders the leaf samples left out (up to four) is sampled the same way inside the same window, so the verdict
-carries the call a named holder blocks in, or shows it blocks in none: on 2026-11-10 a gate's two named waiters were
-cowshed controllers holding a shared project lease, which never waits, and neither was sampled. Other platforms record
-that no stack is sampled. The case this answers: a gate run's deadlock was located only from `sample` stacks taken by
-hand while the run hung. On macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an
-explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output, other probe
-stderr or changing process identity is incomplete evidence, never an empty holder set. lsof's mount-table fallback
-(`can't stat() <type> file system <mount>` ... `assuming "dev=<hex>" from mount table`) is the one stderr kept without
-that verdict: it names a mount lsof could not stat(), such as one detaching under a concurrent shed, and omits no
-descriptor of the selected processes. Successful observations with resources, successful observations without matches
-and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission token
-count or one CPU/state sample does not establish CPU starvation or its absence. The snapshot names a lock wait where the
-runner's tree shows one: a regular file two or more of the tree's processes hold on numbered descriptors, naming those
-processes as holder evidence (open handles, not a kernel lock owner), and the verdict records it; the lock call itself
-is not observed. It never looks up who else on the host holds a file open: only a census of every process's files
-answers that, a process stalled in the kernel holds such a census with it, and the repository's NO-HOST-CENSUS rule
-forbids it. Each other regular file the run holds on a numbered descriptor is named once as one whose holder outside the
-runner's tree is not looked up, and the run's own stack samples name the lock call it blocks in. The bound and the kill
-are unchanged. On 2026-10-21 a `cargo --frozen test` that printed `Blocking waiting for file lock on package cache` held
-`~/.cargo/.package-cache` open while a cargo outside the run held its lock: the snapshot names the run's file and the
-`flock` its stack waits in, and leaves that outside cargo unnamed. The tree is read through procinfo
-(../procinfo/01_procinfo.md), never a `ps` census of the process table: from the runner, `childPids` walks its
-descendants, and on Darwin the retained group's `processGroups.pids` adds the members that left the runner's tree; each
-process is read for itself (`processLineages`, `processRunState`, `processArguments`, `cpuTimeNs`, `startedUs`). A
-census of the whole table ran past its one-second limit at load averages of 40-90 on 18 cores and left the snapshots of
-two killed gates with no tree and no stack. A lineage or child list procinfo cannot read leaves the capture incomplete,
-never a smaller tree. Linux lists a group to no one, so there a group member reparented out of the runner's tree is not
-reached, and the snapshot says so. A probe past its limit is ended without being awaited: an ordinary probe by SIGKILL
-to its process group, the privileged one by SIGTERM to `sudo` itself, which relays it to its root command and exits only
-after that command. A group signal from the caller reaches `sudo` but not the command it runs as root, so it would
-orphan `lsof`. While `sudo` starts it holds root's real uid and refuses every signal from the caller; the probe result
-names that refusal rather than claiming the probe ended.
+of its waiters the record names (else each of the run's processes holding the file) that the leaf samples left out (up
+to four) is sampled the same way inside the same window, so the verdict carries the call it blocks in, or shows it
+blocks in none: on 2026-11-10 a gate's two named waiters were cowshed controllers holding a shared project lease, which
+never waits, and neither was sampled. Other platforms record that no stack is sampled. The case this answers: a gate
+run's deadlock was located only from `sample` stacks taken by hand while the run hung. On macOS the open-resource probe
+invokes `/usr/sbin/lsof` through noninteractive sudo, with an explicitly limited ordinary-user fallback. A missing tool,
+denied privilege, timeout, truncated output, other probe stderr or changing process identity is incomplete evidence,
+never an empty holder set. lsof's mount-table fallback (`can't stat() <type> file system <mount>` ...
+`assuming "dev=<hex>" from mount table`) is the one stderr kept without that verdict: it names a mount lsof could not
+stat(), such as one detaching under a concurrent shed, and omits no descriptor of the selected processes. Successful
+observations with resources, successful observations without matches and incomplete/raced captures remain distinct. An
+open file is not proof of a contested lock, and an admission token count or one CPU/state sample does not establish CPU
+starvation or its absence. A lock wait's holder comes from the kernel's lock record of each regular file the run holds
+on a numbered descriptor (procinfo's `lock_holders`, ../procinfo/01_procinfo.md), asked once per file, never from a
+census of who else holds the file open: such a census asks every process on the host and stalls on one stuck in the
+kernel, while the lock record answers for the file alone. On Linux the record names every lock's process and its
+waiters, so a wait is a process of the run the record shows waiting for the file's lock, and its holders are the
+record's other entries. Darwin's record names the first conflicting lock alone, a POSIX holder by its pid and a flock(2)
+holder by none, and no waiter, so there a wait is a holder outside the run, or one the record does not name, or a lock
+on a file two or more of the run's processes hold. A holder the record does not name is said as "locked, and the holder
+is not named by the kernel's lock record on this platform". The verdict records each wait; a file whose locks were not
+read within their bound is named with why, and is no wait. The bound and the kill are unchanged. The case this answers:
+on 2026-10-21 a `cargo --frozen test` that printed `Blocking waiting for file lock on package cache` held
+`~/.cargo/.package-cache` open and was killed at the bound with only its own files in the snapshot, so its holder went
+unnamed; on Linux the record now names that other cargo, and on Darwin it says the file is locked by a holder it does
+not name, beside the `flock` the run's stack waits in. The tree is read through procinfo (../procinfo/01_procinfo.md),
+never a `ps` census of the process table: from the runner, `childPids` walks its descendants, and on Darwin the retained
+group's `processGroups.pids` adds the members that left the runner's tree; each process is read for itself
+(`processLineages`, `processRunState`, `processArguments`, `cpuTimeNs`, `startedUs`). A census of the whole table ran
+past its one-second limit at load averages of 40-90 on 18 cores and left the snapshots of two killed gates with no tree
+and no stack. A lineage or child list procinfo cannot read leaves the capture incomplete, never a smaller tree. Linux
+lists a group to no one, so there a group member reparented out of the runner's tree is not reached, and the snapshot
+says so. A probe past its limit is ended without being awaited: an ordinary probe by SIGKILL to its process group, the
+privileged one by SIGTERM to `sudo` itself, which relays it to its root command and exits only after that command. A
+group signal from the caller reaches `sudo` but not the command it runs as root, so it would orphan `lsof`. While `sudo`
+starts it holds root's real uid and refuses every signal from the caller; the probe result names that refusal rather
+than claiming the probe ended.
 
 **Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times

@@ -23,8 +23,8 @@ import { TEST_FAILURES_FILE, TEST_RESULTS_FILE } from './test-results.js';
  *   chargeable test interval. This proves the suite's completion bound was exceeded, not that every process stopped:
  *   an expensive active fixture can exceed it too. The verdict names tests reported running but never finished and
  *   tests the report says were aborted; diagnostics distinguish a stalled wait from a progressing but oversized
- *   lifecycle. When the snapshot named a lock wait, `lockWaits` names a file two or more processes of the runner's tree
- *   hold on numbered descriptors, and those processes: open-handle evidence, not a kernel lock owner. When it
+ *   lifecycle. When the snapshot named a lock wait, `lockWaits` names the file, the run's processes holding and
+ *   waiting for it, and its holder as the kernel's lock record names it (or that the record names none). When it
  *   named a process whose CPU time rose, `cpuRising` names it: a build inside the test, which is a defect and not a
  *   hang. CPU never restarts the bound, which counts finished tests and the progress running tests report.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
@@ -657,20 +657,39 @@ function isPids(value: unknown): value is number[] {
 }
 
 /**
- * Lock waits as recorded, or `null` when any part of them is malformed. A record an earlier build wrote named the run's
- * pids `waiters` beside the processes outside the run that also held the file; it reads as those run pids, since no
- * holder outside the runner's tree is named any longer, and a task whose last verdict was such a wait still runs.
+ * Lock waits as recorded, or `null` when any part of them is malformed. Two shapes earlier builds wrote still read, so a
+ * task whose last verdict carried one is not refused (the executor reads the record as the task's memory charge): one
+ * naming the run's pids `waiters` beside the holders an open-file census found, read as those run pids and holders;
+ * and one naming only the tree's pids holding the file, read as those pids with no holder.
  */
 function parseLockWaits(value: unknown): LockWait[] | null {
   if (!Array.isArray(value)) return null;
   const waits: LockWait[] = [];
   for (const wait of value) {
-    if (!isObject(wait) || typeof wait.path !== 'string') return null;
-    const holders = isPids(wait.holders) ? wait.holders : isPids(wait.waiters) ? wait.waiters : null;
-    if (holders === null) return null;
-    waits.push({ path: wait.path, holders });
+    const read = isObject(wait) && typeof wait.path === 'string' ? parseLockWait(wait.path, wait) : null;
+    if (read === null) return null;
+    waits.push(read);
   }
   return waits;
+}
+
+function isHolders(value: unknown): value is (number | null)[] {
+  return Array.isArray(value) && value.every((pid) => pid === null || isPid(pid));
+}
+
+function parseLockWait(path: string, wait: Record<string, unknown>): LockWait | null {
+  if (isPids(wait.inTree) && isPids(wait.waiting) && isHolders(wait.holders)) {
+    return { path, inTree: wait.inTree, waiting: wait.waiting, holders: wait.holders };
+  }
+  if (isPids(wait.waiters) && Array.isArray(wait.holders)) {
+    const holders: number[] = [];
+    for (const holder of wait.holders) {
+      if (!isObject(holder) || !isPid(holder.pid)) return null;
+      holders.push(holder.pid);
+    }
+    return { path, inTree: wait.waiters, waiting: [], holders };
+  }
+  return isPids(wait.holders) ? { path, inTree: wait.holders, waiting: [], holders: [] } : null;
 }
 
 /** A recorded volume, wrapped so a well-formed `null` (no RAM volume) differs from a malformed one (`undefined`). */
@@ -770,7 +789,7 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
           ? `its fixture outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`
           : `outlived its ${verdict.limitMs}ms bound (${verdict.elapsedMs}ms)`;
     case 'wedged': {
-      const locks = verdict.lockWaits.map((wait) => `; a lock may be held among the run: ${describeLockWait(wait)}`);
+      const locks = verdict.lockWaits.map((wait) => `; waiting on a lock: ${describeLockWait(wait)}`);
       const cpu = verdict.cpuRising.length > 0 ? [`; ${CPU_RISING_CLASS}: ${describeCpuRises(verdict.cpuRising)}`] : [];
       const running =
         verdict.tests.length > 0

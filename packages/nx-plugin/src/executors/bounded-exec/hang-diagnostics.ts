@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import type { ProcessArguments, RunState } from '@smoothbricks/procinfo';
+import type { LockHolders, ProcessArguments, RunState } from '@smoothbricks/procinfo';
 import * as procinfo from '@smoothbricks/procinfo';
 import { describeTeardown, killProcessGroupNow, TEARDOWN_PATIENCE } from '../../process-group.js';
 import { atClockDeadline } from './awake-clock.js';
@@ -98,7 +98,14 @@ export interface HangDiagnosticHost {
  */
 export type HangProcessReader = Pick<
   typeof procinfo,
-  'childPids' | 'cpuTimeNs' | 'processArguments' | 'processGroups' | 'processLineages' | 'processRunState' | 'startedUs'
+  | 'childPids'
+  | 'cpuTimeNs'
+  | 'lockHolders'
+  | 'processArguments'
+  | 'processGroups'
+  | 'processLineages'
+  | 'processRunState'
+  | 'startedUs'
 >;
 
 /** One process of the runner's tree, as procinfo read it. */
@@ -330,22 +337,32 @@ export function captureHangDiagnostics(
           observed = resources.stdout.trim() !== '';
           if (!observed && answered(resources))
             lines.push('lsof reported no open-file matches within its stated visibility.');
-          // A lock wait is read from the tree's own open files: a lockable file two or more of its processes hold. Who
-          // else on the host holds a file is never looked up: only a census of every process answers that, and a
-          // process stalled in the kernel holds such a census with it. An incomplete census names no wait.
+          // A lock wait comes from the kernel's lock record of each lockable file the tree holds, asked once per file,
+          // never from a census of who else holds it open: that asks every process on the host and stalls on one stuck
+          // in the kernel, where the lock record answers for the file alone. An incomplete census names no wait.
           const rows = incomplete ? [] : parseLsofTable(resources.stdout);
-          waits = lockWaits(rows);
-          const shared = new Set(waits.map((wait) => wait.path));
-          const alone = lockCandidates(rows).filter((path) => !shared.has(path));
-          if (alone.length > 0)
-            lines.push(
-              `Lockable files one process of the runner's tree holds; a holder outside the tree is not looked up: ${alone.join(', ')}`,
-            );
-          // A lock wait is open-handle evidence: only a holder's own stack says whether it blocks in the lock call.
-          // Each holder the leaf samples left out is sampled the same way, inside the same window.
+          const records = new Map<string, LockHolders>();
+          for (const path of lockCandidates(rows)) {
+            let record: LockHolders;
+            try {
+              record = source.processes.lockHolders(path);
+            } catch (error) {
+              record = { state: 'unread', reason: errorText(error) };
+            }
+            records.set(path, record);
+            if (record.state === 'unread') lines.push(`Locks of ${path} not read: ${record.reason}`);
+          }
+          waits = lockWaits(rows, records);
+          // Only a waiter's own stack says which call it blocks in. Each waiter the record names (else each process of
+          // the run holding the file) that the leaf samples left out is sampled the same way, inside the same window.
           const stacked = new Set(leafSamples(before).sampled);
-          const holders = [...new Set(waits.flatMap((wait) => wait.holders))].filter((pid) => !stacked.has(pid));
-          await Promise.all(holders.slice(0, MAX_SAMPLED_LEAVES).map(sampleStack));
+          const named = [...new Set(waits.flatMap((wait) => (wait.waiting.length > 0 ? wait.waiting : wait.inTree)))];
+          await Promise.all(
+            named
+              .filter((pid) => !stacked.has(pid))
+              .slice(0, MAX_SAMPLED_LEAVES)
+              .map(sampleStack),
+          );
         };
         await Promise.all([openFiles(), stackSamples(before), kernelWaits(before)]);
         if (finished) return;
@@ -405,9 +422,7 @@ export function captureHangDiagnostics(
       }
       if (!incomplete) {
         for (const wait of waits) {
-          lines.push(
-            `Lock wait (open-handle evidence among the runner's tree, not a kernel lock owner): ${describeLockWait(wait)}`,
-          );
+          lines.push(`Lock wait (the kernel's lock record): ${describeLockWait(wait)}`);
         }
       }
       finish(incomplete ? 'incomplete' : observed ? 'holders' : 'none');
