@@ -222,17 +222,17 @@ describe('a process group on this host', () => {
     expect(() => signalProcessGroup(Number.NaN, 'SIGKILL')).toThrow();
   });
 
-  it('is left with no member when members fork as the kill goes out, however the caller waits', async () => {
-    // macOS does not hold a fork back for a group signal in flight, so a member forked as SIGKILL goes out is not
-    // reached by it. The churn group forks as fast as it can while the kill is made, and the end of file of its FIFO is
-    // the death of the last member: a kill that is not repeated leaves a case that only the backstop ends. The two
-    // callers, one that can wait for nothing else and one that waits on the event loop, run the same loop.
-    const kills = [
-      ['blocking', (group: number) => killProcessGroupNow(group, TEARDOWN_PATIENCE)],
-      ['on the event loop', (group: number) => killProcessGroup(group, DEADLINE_PATIENCE)],
-    ] as const;
-    for (const [how, kill] of kills) {
-      for (const attempt of [1, 2, 3]) {
+  // macOS does not hold a fork back for a group signal in flight, so a member forked as SIGKILL goes out is not
+  // reached by it. The churn group forks as fast as it can while the kill is made, and the end of file of its FIFO is
+  // the death of the last member: a kill that is not repeated leaves a case that only the backstop ends. The two
+  // callers, one that can wait for nothing else and one that waits on the event loop, run the same loop.
+  const kills = [
+    ['blocking', (group: number) => killProcessGroupNow(group, TEARDOWN_PATIENCE)],
+    ['on the event loop', (group: number) => killProcessGroup(group, DEADLINE_PATIENCE)],
+  ] as const;
+  for (const [how, kill] of kills) {
+    for (const attempt of [1, 2, 3]) {
+      it(`is left with no member when members fork as the kill goes out (${how}, attempt ${attempt})`, async () => {
         const directory = await mkdtemp(join(tmpdir(), 'process-group-'));
         try {
           const churn = await startChurn(directory);
@@ -251,7 +251,7 @@ describe('a process group on this host', () => {
         } finally {
           await rm(directory, { recursive: true, force: true });
         }
-      }
+      });
     }
-  });
+  }
 });
