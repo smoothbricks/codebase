@@ -1864,6 +1864,15 @@ supervisor cannot write, refuses the job's admission with a typed error naming i
 job never runs unplaced (07_api.md). No per-process nice is placed on Linux: inside a cgroup it would order only threads
 within that group, and the class cgroup's weight is what the host sees.
 
+What the code establishes on Linux is the static order above: class cgroups as siblings under the delegated root, each
+with its class's `cpu.weight.nice`, written once when the delegation opens. A cgroup's weight governs every thread in it
+whatever that thread's own nice or policy, so Linux has no counterpart of macOS's QoS-tagged threads. **Open, to be
+measured on a delegated Linux host:** whether changing the background class while a gate holds work, by lowering its
+`cpu.weight` live or by writing its `cpu.idle` 1 (kernel 5.15 and later), and restoring it when no gate does, gives the
+gate more of the contended cores than the static 3:1 without stranding idle cycles, and how fast each change takes
+effect on threads already running. Both files are writable inside the delegation without privilege; neither touches I/O.
+Until that is measured, the static weights stand.
+
 **macOS.** macOS has no cgroups, so the class is the job's nice, `setpriority(PRIO_PROCESS)` alone, placed on the job's
 first process and read back before the command runs (11_shell.md, "Job admission and class placement"). The Clutch
 scheduler runs threads of a higher base priority first and bounds a lower bucket's lateness, so a background thread at
