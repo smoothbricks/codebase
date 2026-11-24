@@ -13,6 +13,10 @@
       "types": "./dist/ts/src/emit.d.ts",
       "default": "./src/emit.ts"
     },
+    "./mbt": {
+      "types": "./dist/ts/src/mbt.d.ts",
+      "default": "./src/mbt.ts"
+    },
     "./package.json": "./package.json"
   },
   "bin": {

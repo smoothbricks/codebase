@@ -39,3 +39,68 @@ def guarded_lists_agree(xs, live, h):
 law all_packets_are_zero:
   for +x: Packet
   {number(x) == 0n : Nat}
+
+# Small state machine for model-based testing conformance.
+type GateState is Data:
+  Closed{}
+  Open{}
+  Locked{}
+
+type GateInput is Data:
+  OpenGate{}
+  CloseGate{}
+  LockGate{}
+  Ping{}
+
+def gate_init() -> GateState:
+  Closed{}
+
+def gate_step(s: GateState, i: GateInput) -> GateState:
+  match s:
+    case Closed{}:
+      match i:
+        case OpenGate{}:
+          Open{}
+        case LockGate{}:
+          Locked{}
+        case CloseGate{}:
+          Closed{}
+        case Ping{}:
+          Closed{}
+    case Open{}:
+      match i:
+        case CloseGate{}:
+          Closed{}
+        case OpenGate{}:
+          Open{}
+        case LockGate{}:
+          Open{}
+        case Ping{}:
+          Open{}
+    case Locked{}:
+      match i:
+        case CloseGate{}:
+          Closed{}
+        case OpenGate{}:
+          Locked{}
+        case LockGate{}:
+          Locked{}
+        case Ping{}:
+          Locked{}
+
+def gate_handled(s: GateState, i: GateInput) -> Bool:
+  match s:
+    case Open{}:
+      match i:
+        case Ping{}:
+          True{}
+        case OpenGate{}:
+          False{}
+        case CloseGate{}:
+          False{}
+        case LockGate{}:
+          False{}
+    case Closed{}:
+      False{}
+    case Locked{}:
+      False{}

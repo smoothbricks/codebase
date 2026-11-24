@@ -18,11 +18,16 @@ bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--manifest path]
 - `--rust-module path`, `--ts-module path` or `--go-module path` writes one binding module instead of standalone
   drivers. `--model-name name` supplies the model's name in its provenance header and manifest (the default is the input
   basename).
+- `--machine name:init=<fn>,step=<fn>,input=<Type>[,handled=<fn>]` (repeatable, `--ts-module` only) emits a state
+  machine descriptor `machine_<name>` and enumerated input list `inputs_<name>()` for `@smoothbricks/bend-emit/mbt`,
+  reusing the emitter's own `enumerate` bounded by `--len`, `--adt-depth`, and `--cap` (refusing if the enumerated input
+  count exceeds `--cap`).
 - `--manifest path` writes a deterministic JSON provenance manifest containing `modelName`, `bendRevision`,
-  `hashAlgorithm` (`"blake3"`), and per-law
-  `{ name, proven, digest, params, hypsCount, corpusCount, propsCount, reachedFns }`. Each law `digest` is the 256-bit
-  BLAKE3 hex digest over the de-Bruijn-normalized checked core type of the law, so alpha-equivalent laws with renamed
-  binders produce identical digests.
+  `hashAlgorithm` (`"blake3"`), per-law
+  `{ name, proven, digest, params, hypsCount, corpusCount, propsCount, reachedFns }`, and per-machine
+  `{ name, init, step, stateType, inputType, handled, inputCount }`. Each law `digest` is the 256-bit BLAKE3 hex digest
+  over the de-Bruijn-normalized checked core type of the law, so alpha-equivalent laws with renamed binders produce
+  identical digests.
 
 The command always takes both positionals; module mode does not use the output directory. Without module mode, it writes
 `<stem>.rs`, `<stem>.goose`, `<stem>.go`, `<stem>.ts` and `run_<stem>.ts`.
@@ -88,6 +93,60 @@ checkout:
 
 The linked command needs no build or checker environment variable. The regular package build emits the public TypeScript
 declarations for publication.
+
+## State machines and model-based testing
+
+`bend-emit` can emit a checked Bend state machine in `--ts-module` mode, and `@smoothbricks/bend-emit/mbt` provides a
+general, zero-dependency in-memory walker over any `Machine<S, I>` (emitted or hand-constructed).
+
+### Machine selection
+
+Select one or more machines with `--machine name:init=<fn>,step=<fn>,input=<Type>[,handled=<fn>]` (or
+`machines: [{ name, init, step, input, handled? }]` in `book.emit`):
+
+- `init` must take 0 parameters and return `State`.
+- `step` must take `(State, Input)` and return `State`; `input` must match `step`'s second parameter type.
+- `handled` (optional) must take `(State, Input)` and return `Bool`.
+- The emitter compiles `init`, `step`, and `handled` into the reachable closure and enumerates `input` using its own
+  `enumerate` (under `--len`, `--adt-depth`, and `--cap`). If `enumerate` yields 0 values or more than `--cap`, emission
+  refuses rather than silently truncating the machine's input alphabet.
+- In `--ts-module`, each machine emits `inputs_<name>()` and `machine_<name>`
+  (`{ name, init, step, inputs, showState, showInput, isHandledSelfLoop? }`), structurally satisfying `Machine<S, I>`
+  with no runtime import in the generated file.
+
+### Unhandled inputs and the declared escape
+
+Because Bend functions are total, a model represents a disallowed or ignored input `i` in state `s` as a self-loop:
+`showState(step(s, i)) === showState(s)`. Checking only state-changing paths misses implementations that accidentally
+mutate state when handed a disallowed input. `@smoothbricks/bend-emit/mbt` therefore treats every model self-loop as an
+**unhandled** input and asserts that applying `i` leaves `showState(project(impl))` unchanged.
+
+When a self-loop is a genuinely handled idempotent transition rather than an ignored input (for example, a heartbeat or
+ping that keeps the same projected state), the model declares it via `handled=<fn>`
+(`isHandledSelfLoop(s, i) === true`). Declared handled self-loops are exercised and counted as handled transitions
+rather than unhandled inputs.
+
+### Runtime walker and generators (`@smoothbricks/bend-emit/mbt`)
+
+`exploreMachine(machine, maxStates)`, `transitionCoveragePaths(graph, excludedKeys?)`, `simplePaths(graph, options)`,
+and `walkMachine(machine, binding, options)` operate on any `Machine<S, I>` in memory, keying states and inputs by
+`showState` and `showInput` with no logging and no tracing dependency. Reachable-state exploration is bounded by an
+explicit `maxStates` budget; exhaustion is always reported in `result.budget` and fails closed.
+
+A binding supplies `{ create(), apply(impl, input) -> impl | 'cannot-drive', project(impl) -> S, excluded? }`. After
+every step, the walker compares `showState(project(impl))` with the model state. `transitions.total` counts every
+reachable `(state, input)` pair (handled and unhandled self-loops alike), and `unhandled` reports
+`{ checked, total, failed }` for the unhandled subset.
+
+- **Generator A (`generator: 'transition-coverage'`)**: computes BFS shortest paths from `init` to every reachable state
+  (preferring non-excluded edges) and emits one path per non-excluded `(state, input)` transition
+  (`shortestPath(init -> s) + (s, i)`), linear in reachable transitions. Fails closed unless
+  `covered / (total - excluded) === 100%`; any step where `apply` returns `'cannot-drive'` for a non-excluded transition
+  leaves that transition uncovered, and any `excluded` row naming no model transition, repeating a transition, or giving
+  an empty `why` fails closed.
+- **Generator B (`generator: 'simple-paths'`)**: enumerates all simple (acyclic, no repeated state key) paths from
+  `init` up to `maxDepth` (bounded by `maxPaths`, default 10,000) to exercise order interactions and alternative routes.
+  Reports coverage and fails closed on state mismatches, unhandled mutations, invalid exclusions, or budget exhaustion.
 
 ## Go binding
 

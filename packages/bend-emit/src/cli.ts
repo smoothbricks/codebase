@@ -1,17 +1,67 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { checkBendFile } from './emit.js';
+import { checkBendFile, type MachineSpec } from './emit.js';
+
+function parseMachineSpec(raw: string): MachineSpec {
+  const colon = raw.indexOf(':');
+  if (colon <= 0 || colon === raw.length - 1) {
+    throw new Error(
+      `bend-emit refuses: invalid --machine ${JSON.stringify(raw)} (expected name:init=<fn>,step=<fn>,input=<Type>[,handled=<fn>])`,
+    );
+  }
+  const name = raw.slice(0, colon);
+  const fields = new Map<string, string>();
+  for (const part of raw.slice(colon + 1).split(',')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0 || eq === part.length - 1) {
+      throw new Error(`bend-emit refuses: invalid --machine field ${JSON.stringify(part)} in ${JSON.stringify(raw)}`);
+    }
+    const key = part.slice(0, eq);
+    const val = part.slice(eq + 1);
+    if (key !== 'init' && key !== 'step' && key !== 'input' && key !== 'handled') {
+      throw new Error(`bend-emit refuses: unknown --machine key ${JSON.stringify(key)} in ${JSON.stringify(raw)}`);
+    }
+    if (fields.has(key)) {
+      throw new Error(`bend-emit refuses: duplicate --machine key ${JSON.stringify(key)} in ${JSON.stringify(raw)}`);
+    }
+    fields.set(key, val);
+  }
+  const init = fields.get('init');
+  const step = fields.get('step');
+  const input = fields.get('input');
+  const handled = fields.get('handled');
+  if (init === undefined || step === undefined || input === undefined) {
+    throw new Error(
+      `bend-emit refuses: --machine ${JSON.stringify(raw)} must specify init=<fn>, step=<fn>, and input=<Type>`,
+    );
+  }
+  return { name, init, step, input, ...(handled !== undefined ? { handled } : {}) };
+}
 
 export async function run(argv: readonly string[]): Promise<void> {
   const [file, outdir, ...rest] = argv;
   if (file === undefined || outdir === undefined) {
     throw new Error(
-      'bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--cap N] [--manifest path]',
+      'bend-emit refuses: usage: bend-emit <model.bend> <outdir> --fns a,b --laws x,y [--machine name:init=f,step=g,input=T[,handled=h]] [--cap N] [--manifest path]',
     );
   }
   const opt = (name: string): string => {
     const i = rest.indexOf(name);
     return i >= 0 ? (rest[i + 1] ?? '') : '';
+  };
+  const opts = (name: string): string[] => {
+    const values: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === name) {
+        const val = rest[i + 1];
+        if (val === undefined || val === '') {
+          throw new Error(`bend-emit refuses: ${name} requires a value`);
+        }
+        values.push(val);
+        i++;
+      }
+    }
+    return values;
   };
   const book = await checkBendFile(file);
   const moduleKind = opt('--rust-module') ? 'rust-module' : opt('--ts-module') ? 'ts-module' : 'go-module';
@@ -19,6 +69,7 @@ export async function run(argv: readonly string[]): Promise<void> {
   const manifestPath = opt('--manifest');
   const modelName = opt('--model-name') || basename(file);
   const stem = basename(file, '.bend');
+  const machines = opts('--machine').map(parseMachineSpec);
   const filteredFlags = rest.filter((arg, i) => {
     if (arg === modulePath) return false;
     if (manifestPath && (arg === '--manifest' || rest[i - 1] === '--manifest')) return false;
@@ -35,6 +86,7 @@ export async function run(argv: readonly string[]): Promise<void> {
     modelName,
     functions: opt('--fns').split(',').filter(Boolean),
     laws: opt('--laws').split(',').filter(Boolean),
+    machines,
     cap: Number(opt('--cap') || '400'),
     listLength: Number(opt('--len') || '3'),
     adtDepth: Number(opt('--adt-depth') || '2'),
