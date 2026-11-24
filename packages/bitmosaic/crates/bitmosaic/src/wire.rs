@@ -26,13 +26,18 @@
 //! plane already answers it by subtraction, so `Stride` costs 4 payload
 //! bytes, `Cone` 11 + n, and `Array` exactly 2n.
 
+use crate::codec::{
+    PatchError, cone_guess, cone_inv_scale, cone_window_rank, read_u16_at, read_u32_at,
+    read_u64_at, read_uleb, read_uleb_checked, select64, stride_magic, stride_quotient, uleb_len,
+    write_uleb,
+};
 use crate::ef::{self, EfLayout, EfRange, EfView};
-use crate::patch::PatchError;
 use crate::{AdmissionClass, AdmissionError};
 use crate::{
     BLOCK_WORDS, Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container, DIR_STRIDE, DRIVE_RATIO_KEYS,
     DRIVE_RATIO_MEMBERS, Range, SUMMARY_WORDS, charge_key_positions, charge_linear,
-    drive_from_small, gallop_drive, merge_and_array_bytes, select_group, stride_and_closed,
+    drive_from_small, gallop_drive, gallop_u32_by, merge_and_array_bytes, select_group,
+    stride_and_closed, stride_and_progression,
 };
 
 /// Bytes identifying a native bitmap image.
@@ -126,78 +131,6 @@ fn parse_header(bytes: &[u8]) -> Result<ImageHeader, AdmissionError> {
     })
 }
 
-// Queries that inspect framing without certifying it retain nullable probe semantics;
-// every parser uses the same canonical ULEB reader as full admission.
-pub(crate) fn read_uleb(bytes: &[u8], at: &mut usize, max: u32) -> Option<u32> {
-    read_uleb_checked(bytes, at, max, AdmissionClass::Count).ok()
-}
-
-pub(crate) fn read_uleb_checked(
-    bytes: &[u8],
-    at: &mut usize,
-    max: u32,
-    class: AdmissionClass,
-) -> Result<u32, AdmissionError> {
-    let start = *at;
-    let mut value = 0u32;
-    for index in 0..5 {
-        let Some(&byte) = bytes.get(*at) else {
-            return Err(AdmissionError::new(
-                class,
-                start,
-                "unsigned LEB128 is truncated",
-            ));
-        };
-        *at += 1;
-        if index == 4 && byte > 0x0f {
-            return Err(AdmissionError::new(
-                class,
-                start,
-                "unsigned LEB128 overflows u32",
-            ));
-        }
-        value |= u32::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            if value > max {
-                return Err(AdmissionError::new(
-                    class,
-                    start,
-                    "unsigned LEB128 exceeds its declared bound",
-                ));
-            }
-            if index != 0 && byte == 0 {
-                return Err(AdmissionError::new(
-                    class,
-                    start,
-                    "unsigned LEB128 is not shortest form",
-                ));
-            }
-            return Ok(value);
-        }
-    }
-    Err(AdmissionError::new(
-        class,
-        start,
-        "unsigned LEB128 has no terminator",
-    ))
-}
-
-pub(crate) const fn uleb_len(value: u32) -> usize {
-    ((32 - (value | 1).leading_zeros()) as usize).div_ceil(7)
-}
-
-pub(crate) fn write_uleb(out: &mut [u8], at: &mut usize, mut value: u32) {
-    loop {
-        let low = (value & 0x7f) as u8;
-        value >>= 7;
-        out[*at] = low | if value == 0 { 0 } else { 0x80 };
-        *at += 1;
-        if value == 0 {
-            break;
-        }
-    }
-}
-
 pub(crate) fn frame_len(body_bytes: usize) -> usize {
     let body = u32::try_from(body_bytes).expect("native body exceeds u32 offset domain");
     let total = IMAGE_ID_LEN + uleb_len(body) + body_bytes;
@@ -256,34 +189,6 @@ pub(crate) const K_ARRAY: u32 = 3;
 /// hashed probe; above it, binary search starts paying log2(C) dependent
 /// loads and the tagged slot plane replaces them with one.
 const SLOT_MIN_CHUNKS: u32 = 64;
-
-// ── unaligned little-endian reads ────────────────────────────────────────
-//
-// Mapped planes carry no alignment guarantee, so every scalar field is read
-// through `from_le_bytes`. On aarch64 and x86-64 that is one load; the kernels
-// that need real alignment ask for it explicitly via `align_to` and fall back
-// to scalar when the mapping does not provide it.
-
-#[inline(always)]
-pub(crate) fn read_u16_at(bytes: &[u8], at: usize) -> u16 {
-    let mut buf = [0u8; 2];
-    buf.copy_from_slice(&bytes[at..at + 2]);
-    u16::from_le_bytes(buf)
-}
-
-#[inline(always)]
-pub(crate) fn read_u32_at(bytes: &[u8], at: usize) -> u32 {
-    let mut buf = [0u8; 4];
-    buf.copy_from_slice(&bytes[at..at + 4]);
-    u32::from_le_bytes(buf)
-}
-
-#[inline(always)]
-pub(crate) fn read_u64_at(bytes: &[u8], at: usize) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[at..at + 8]);
-    u64::from_le_bytes(buf)
-}
 
 // ── geometry ─────────────────────────────────────────────────────────────
 
@@ -617,6 +522,7 @@ fn write_payload(container: &Container, out: &mut [u8]) {
             scale,
             eps,
             residuals,
+            ..
         } => emit_cone(out, *first, *scale, *eps, residuals),
         Container::Array(values) => emit_array(out, values),
         Container::Words { words, .. } => emit_words(out, words),
@@ -1075,10 +981,12 @@ pub(crate) enum CView<'a> {
         first: u16,
         stride: u16,
         len: u16,
+        magic: u64,
     },
     Cone {
         first: u16,
         scale: u64,
+        inv_scale: u64,
         eps: u8,
         residuals: &'a [u8],
     },
@@ -1238,7 +1146,9 @@ fn and_runs_view(runs: RunsView<'_>, other: &CView<'_>) -> u32 {
             right.count(),
             |i| (right.start(i), right.end(i) + 1),
         ),
-        CView::Stride { first, stride, len } => (0..runs.count())
+        CView::Stride {
+            first, stride, len, ..
+        } => (0..runs.count())
             .map(|i| {
                 crate::progression_in_span(
                     runs.start(i),
@@ -1319,6 +1229,7 @@ impl<'a> CView<'a> {
                     first,
                     stride,
                     len: (card - 1) as u16,
+                    magic: stride_magic(stride),
                 }
             }
             K_CONE => {
@@ -1341,6 +1252,7 @@ impl<'a> CView<'a> {
                     first: read_u16_at(head, 0),
                     eps: head[2],
                     scale,
+                    inv_scale: cone_inv_scale(scale),
                     residuals: &head[11..],
                 }
             }
@@ -1409,17 +1321,25 @@ impl<'a> CView<'a> {
                 word_count: u32::from(read_u16_at(payload, 18)),
                 len: card,
             },
-            K_STRIDE => Self::Stride {
-                first: read_u16_at(payload, 0),
-                stride: read_u16_at(payload, 2),
-                len: (card - 1) as u16,
-            },
-            K_CONE => Self::Cone {
-                first: read_u16_at(payload, 0),
-                scale: read_u64_at(payload, 3),
-                eps: payload[2],
-                residuals: &payload[11..],
-            },
+            K_STRIDE => {
+                let stride = read_u16_at(payload, 2);
+                Self::Stride {
+                    first: read_u16_at(payload, 0),
+                    stride,
+                    len: (card - 1) as u16,
+                    magic: stride_magic(stride),
+                }
+            }
+            K_CONE => {
+                let scale = read_u64_at(payload, 3);
+                Self::Cone {
+                    first: read_u16_at(payload, 0),
+                    scale,
+                    inv_scale: cone_inv_scale(scale),
+                    eps: payload[2],
+                    residuals: &payload[11..],
+                }
+            }
             K_ARRAY => Self::Array(payload),
             K_RUNS => Self::Runs(RunsView::from_validated(payload, card)),
             _ => unreachable!("attachment proved the container tag"),
@@ -1444,6 +1364,7 @@ impl<'a> CView<'a> {
             CView::Cone {
                 first,
                 scale,
+                inv_scale,
                 residuals,
                 eps,
             } => {
@@ -1467,7 +1388,8 @@ impl<'a> CView<'a> {
                             "Cone members are not strictly ascending",
                         ));
                     }
-                    let (lo, hi) = cone_window(*first, *scale, *eps, residuals.len(), v);
+                    let (lo, hi) =
+                        cone_window(*first, *scale, *inv_scale, *eps, residuals.len(), v);
                     if i < lo || i >= hi {
                         return Err(error(
                             AdmissionClass::PlaneRange,
@@ -1627,23 +1549,30 @@ impl<'a> CView<'a> {
     fn contains(&self, v: u16) -> bool {
         match self {
             CView::Runs(runs) => runs.contains(v),
-            CView::Stride { first, stride, len } => {
+            CView::Stride {
+                first,
+                stride,
+                len,
+                magic,
+            } => {
                 let (first, stride) = (u32::from(*first), u32::from(*stride));
                 let v = u32::from(v);
                 if v < first || stride == 0 {
                     return v == first;
                 }
-                let q = (v - first) / stride;
+                let q = stride_quotient(v - first, *magic);
                 q <= u32::from(*len) && first + q * stride == v
             }
             CView::Cone {
                 first,
                 scale,
+                inv_scale,
                 eps,
                 residuals,
             } => {
-                let (lo, hi) = cone_window(*first, *scale, *eps, residuals.len(), v);
-                (lo..hi).any(|i| cone_value(*first, *scale, residuals, i) == v)
+                let (lo, hi) = cone_window(*first, *scale, *inv_scale, *eps, residuals.len(), v);
+                let at = cone_window_rank(lo, hi, v, |i| cone_value(*first, *scale, residuals, i));
+                at < hi && cone_value(*first, *scale, residuals, at) == v
             }
             CView::Array(values) => array_search(values, v).is_ok(),
             CView::Words { .. } => self.word(usize::from(v >> 6)) >> (v & 63) & 1 == 1,
@@ -1654,32 +1583,26 @@ impl<'a> CView<'a> {
     fn rank_below(&self, v: u16) -> u32 {
         match self {
             CView::Runs(runs) => runs.rank_below(v),
-            CView::Stride { first, stride, len } => {
-                let (first, stride) = (u32::from(*first), u32::from(*stride));
+            CView::Stride {
+                first, len, magic, ..
+            } => {
+                let first = u32::from(*first);
                 let v = u32::from(v);
                 if v <= first {
                     0
-                // A zero stride holds one value; a nonzero divisor makes the
-                // checked division identical to the raw form it replaces.
                 } else {
-                    (v - 1 - first)
-                        .checked_div(stride.max(1))
-                        .map_or(1, |steps| steps + 1)
-                        .min(u32::from(*len) + 1)
+                    (stride_quotient(v - 1 - first, *magic) + 1).min(u32::from(*len) + 1)
                 }
             }
             CView::Cone {
                 first,
                 scale,
+                inv_scale,
                 eps,
                 residuals,
             } => {
-                let (lo, hi) = cone_window(*first, *scale, *eps, residuals.len(), v);
-                let mut at = lo;
-                while at < hi && cone_value(*first, *scale, residuals, at) < v {
-                    at += 1;
-                }
-                at as u32
+                let (lo, hi) = cone_window(*first, *scale, *inv_scale, *eps, residuals.len(), v);
+                cone_window_rank(lo, hi, v, |i| cone_value(*first, *scale, residuals, i)) as u32
             }
             CView::Array(values) => match array_search(values, v) {
                 Ok(at) | Err(at) => at as u32,
@@ -1712,6 +1635,67 @@ impl<'a> CView<'a> {
                 // open already paid for.
                 charge!(RANK_WORDS, (2 + word - (base + group * DIR_STRIDE)) as u64);
                 count + (self.word(word) & ((1u64 << (v & 63)) - 1)).count_ones()
+            }
+        }
+    }
+
+    /// Members strictly below `v` iff `v` is present, in one descent.
+    #[inline(always)]
+    fn rank_if_present(&self, v: u16) -> Option<u32> {
+        match self {
+            CView::Runs(runs) => {
+                let i = runs.lower_bound(0, v);
+                (i < runs.count() && runs.start(i) <= u32::from(v))
+                    .then(|| runs.before(i) + u32::from(v) - runs.start(i))
+            }
+            CView::Stride {
+                first,
+                stride,
+                len,
+                magic,
+            } => {
+                let (first, stride) = (u32::from(*first), u32::from(*stride));
+                let v = u32::from(v);
+                if v < first || stride == 0 {
+                    return (v == first).then_some(0);
+                }
+                let q = stride_quotient(v - first, *magic);
+                (q <= u32::from(*len) && first + q * stride == v).then_some(q)
+            }
+            CView::Cone {
+                first,
+                scale,
+                inv_scale,
+                eps,
+                residuals,
+            } => {
+                let (lo, hi) = cone_window(*first, *scale, *inv_scale, *eps, residuals.len(), v);
+                let at = cone_window_rank(lo, hi, v, |i| cone_value(*first, *scale, residuals, i));
+                (at < hi && cone_value(*first, *scale, residuals, at) == v).then_some(at as u32)
+            }
+            CView::Array(values) => array_search(values, v).ok().map(|at| at as u32),
+            CView::Words {
+                payload,
+                base_word,
+                word_count,
+                ..
+            } => {
+                let word = usize::from(v >> 6);
+                let base = *base_word as usize;
+                let rel = word.checked_sub(base)?;
+                if rel >= *word_count as usize {
+                    return None;
+                }
+                let w_bits = read_u64_at(payload, WORDS_AT + rel * 8);
+                if (w_bits >> (v & 63)) & 1 == 0 {
+                    return None;
+                }
+                let group = rel / DIR_STRIDE;
+                let mut count = u32::from(Self::dir_entry(payload, *word_count, group));
+                for w in group * DIR_STRIDE..rel {
+                    count += read_u64_at(payload, WORDS_AT + w * 8).count_ones();
+                }
+                Some(count + (w_bits & ((1u64 << (v & 63)) - 1)).count_ones())
             }
         }
     }
@@ -1789,11 +1773,7 @@ impl<'a> CView<'a> {
                     let bits = self.word(w);
                     let ones = bits.count_ones();
                     if remaining < ones {
-                        let mut word = bits;
-                        for _ in 0..remaining {
-                            word &= word - 1;
-                        }
-                        return ((w as u32) * 64 + word.trailing_zeros()) as u16;
+                        return ((w as u32) * 64 + select64(bits, remaining)) as u16;
                     }
                     remaining -= ones;
                     w += 1;
@@ -1812,7 +1792,9 @@ impl<'a> CView<'a> {
                     }
                 }
             }
-            CView::Stride { first, stride, len } => {
+            CView::Stride {
+                first, stride, len, ..
+            } => {
                 let mut v = u32::from(*first);
                 for _ in 0..=u32::from(*len) {
                     f(v as u16);
@@ -1865,10 +1847,16 @@ pub(crate) fn cone_value(first: u16, scale: u64, residuals: &[u8], i: usize) -> 
 /// prediction runs off the residual plane, and an unclamped start would be
 /// returned verbatim as the rank.
 #[inline(always)]
-fn cone_window(first: u16, scale: u64, eps: u8, n: usize, v: u16) -> (usize, usize) {
-    let delta = (u64::from(v).saturating_sub(u64::from(first))) << 32;
-    // Zero scale means "no model": predict 0 (checked_div's None arm).
-    let guess = delta.checked_div(scale).unwrap_or(0) as i64;
+fn cone_window(
+    first: u16,
+    scale: u64,
+    inv_scale: u64,
+    eps: u8,
+    n: usize,
+    v: u16,
+) -> (usize, usize) {
+    let delta = v.saturating_sub(first);
+    let guess = cone_guess(delta, scale, inv_scale) as i64;
     let margin = 2 + i64::from(eps);
     (
         (guess - margin).max(0).min(n as i64) as usize,
@@ -1906,11 +1894,13 @@ fn and_count(a: &CView<'_>, b: &CView<'_>) -> u32 {
                 first: a0,
                 stride: s1,
                 len: n1,
+                ..
             },
             CView::Stride {
                 first: b0,
                 stride: s2,
                 len: n2,
+                ..
             },
         ) => stride_and_closed(
             u32::from(*a0),
@@ -2047,6 +2037,487 @@ fn words_and(
         }
     }
     count
+}
+
+/// Fused 3-way chunk AND cardinality: const-`N = 3` word kernel for `Words`,
+/// two O(1) CRT steps for `Stride`, smallest-card probe otherwise.
+fn and_count_three(a: &CView<'_>, b: &CView<'_>, c: &CView<'_>) -> u32 {
+    match (a, b, c) {
+        (
+            CView::Words {
+                payload: pa,
+                base_word: ba,
+                word_count: ca,
+                ..
+            },
+            CView::Words {
+                payload: pb,
+                base_word: bb,
+                word_count: cb,
+                ..
+            },
+            CView::Words {
+                payload: pc,
+                base_word: bc,
+                word_count: cc,
+                ..
+            },
+        ) => {
+            let lo = (*ba).max(*bb).max(*bc) as usize;
+            let hi = (*ba as usize + *ca as usize)
+                .min(*bb as usize + *cb as usize)
+                .min(*bc as usize + *cc as usize);
+            if lo >= hi {
+                return 0;
+            }
+            let (sa, sb, sc) = (CView::summary(pa), CView::summary(pb), CView::summary(pc));
+            let sm = [sa[0] & sb[0] & sc[0], sa[1] & sb[1] & sc[1]];
+            let live = sm[0].count_ones() + sm[1].count_ones();
+            if live == 0 {
+                return 0;
+            }
+            let wa = CView::words(pa, *ca);
+            let wb = CView::words(pb, *cb);
+            let wc = CView::words(pc, *cc);
+            let xa = &wa[(lo - *ba as usize) * 8..(hi - *ba as usize) * 8];
+            let xb = &wb[(lo - *bb as usize) * 8..(hi - *bb as usize) * 8];
+            let xc = &wc[(lo - *bc as usize) * 8..(hi - *bc as usize) * 8];
+            if live >= 32 {
+                return crate::words_and_count::<3>([xa, xb, xc])
+                    .try_into()
+                    .unwrap_or(u32::MAX);
+            }
+            let mut count = 0u32;
+            for (half, &word_mask) in sm.iter().enumerate() {
+                let mut mask = word_mask;
+                while mask != 0 {
+                    let block = half * 64 + mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let base = block * BLOCK_WORDS;
+                    if base < lo || base >= hi {
+                        continue;
+                    }
+                    for w in 0..BLOCK_WORDS {
+                        let at = (base - lo + w) * 8;
+                        count += (read_u64_at(xa, at) & read_u64_at(xb, at) & read_u64_at(xc, at))
+                            .count_ones();
+                    }
+                }
+            }
+            count
+        }
+        (
+            CView::Stride {
+                first: a0,
+                stride: s1,
+                len: n1,
+                ..
+            },
+            CView::Stride {
+                first: b0,
+                stride: s2,
+                len: n2,
+                ..
+            },
+            CView::Stride {
+                first: c0,
+                stride: s3,
+                len: n3,
+                ..
+            },
+        ) => {
+            let Some((f12, s12, n12)) = stride_and_progression(
+                u32::from(*a0),
+                u32::from((*s1).max(1)),
+                u32::from(*n1) + 1,
+                u32::from(*b0),
+                u32::from((*s2).max(1)),
+                u32::from(*n2) + 1,
+            ) else {
+                return 0;
+            };
+            if n12 == 1 {
+                u32::from(c.contains(f12 as u16))
+            } else {
+                stride_and_closed(
+                    f12,
+                    s12,
+                    n12,
+                    u32::from(*c0),
+                    u32::from((*s3).max(1)),
+                    u32::from(*n3) + 1,
+                )
+            }
+        }
+        _ => {
+            let mut ordered = [*a, *b, *c];
+            ordered.sort_unstable_by_key(CView::cardinality);
+            let mut count = 0u32;
+            ordered[0].for_each(|v| {
+                if ordered[1].contains(v) && ordered[2].contains(v) {
+                    count += 1;
+                }
+            });
+            count
+        }
+    }
+}
+
+/// Fused k-way word-AND popcount across up to 8 `CView::Words` chunks.
+fn words_and_k(chunks: &[CView<'_>]) -> u32 {
+    debug_assert!(!chunks.is_empty() && chunks.len() <= 8);
+    let mut lo = 0usize;
+    let mut hi = CHUNK_WORDS;
+    let mut sm = [u64::MAX; SUMMARY_WORDS];
+    for chunk in chunks {
+        let CView::Words {
+            payload,
+            base_word,
+            word_count,
+            ..
+        } = *chunk
+        else {
+            unreachable!("words_and_k requires Words chunks");
+        };
+        lo = lo.max(base_word as usize);
+        hi = hi.min(base_word as usize + word_count as usize);
+        let s = CView::summary(payload);
+        sm[0] &= s[0];
+        sm[1] &= s[1];
+    }
+    if lo >= hi {
+        return 0;
+    }
+    let live = sm[0].count_ones() + sm[1].count_ones();
+    if live == 0 {
+        return 0;
+    }
+    let mut slices: [&[u8]; 8] = [&[]; 8];
+    let k = chunks.len();
+    for (slot, chunk) in chunks.iter().enumerate() {
+        let CView::Words {
+            payload,
+            base_word,
+            word_count,
+            ..
+        } = *chunk
+        else {
+            unreachable!();
+        };
+        let w = CView::words(payload, word_count);
+        slices[slot] = &w[(lo - base_word as usize) * 8..(hi - base_word as usize) * 8];
+    }
+    if k == 4 && live >= 32 {
+        return crate::words_and_count::<4>([slices[0], slices[1], slices[2], slices[3]])
+            .try_into()
+            .unwrap_or(u32::MAX);
+    }
+    let active = &slices[..k];
+    let mut count = 0u32;
+    if live >= 32 {
+        let words = hi - lo;
+        for w in 0..words {
+            let at = w * 8;
+            let mut bits = read_u64_at(active[0], at);
+            for s in &active[1..] {
+                bits &= read_u64_at(s, at);
+            }
+            count += bits.count_ones();
+        }
+    } else {
+        for (half, &word_mask) in sm.iter().enumerate() {
+            let mut mask = word_mask;
+            while mask != 0 {
+                let block = half * 64 + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let base = block * BLOCK_WORDS;
+                if base < lo || base >= hi {
+                    continue;
+                }
+                for w in 0..BLOCK_WORDS {
+                    let at = (base - lo + w) * 8;
+                    let mut bits = read_u64_at(active[0], at);
+                    for s in &active[1..] {
+                        bits &= read_u64_at(s, at);
+                    }
+                    count += bits.count_ones();
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Chunk-level ascending intersection emitter for [`BitmosaicView::and_into`]:
+/// avoids per-element directory `locate()` and container decode.
+fn chunk_and_into(a: &CView<'_>, b: &CView<'_>, high: u32, emit: &mut impl FnMut(u32)) {
+    match (a, b) {
+        (
+            CView::Words {
+                payload: pa,
+                base_word: ba,
+                word_count: ca,
+                ..
+            },
+            CView::Words {
+                payload: pb,
+                base_word: bb,
+                word_count: cb,
+                ..
+            },
+        ) => {
+            let lo = (*ba).max(*bb) as usize;
+            let hi = (*ba as usize + *ca as usize).min(*bb as usize + *cb as usize);
+            if lo >= hi {
+                return;
+            }
+            let (sa, sb) = (CView::summary(pa), CView::summary(pb));
+            let sm = [sa[0] & sb[0], sa[1] & sb[1]];
+            let live = sm[0].count_ones() + sm[1].count_ones();
+            if live == 0 {
+                return;
+            }
+            let wa = CView::words(pa, *ca);
+            let wb = CView::words(pb, *cb);
+            let xa = &wa[(lo - *ba as usize) * 8..(hi - *ba as usize) * 8];
+            let xb = &wb[(lo - *bb as usize) * 8..(hi - *bb as usize) * 8];
+            if live >= 32 {
+                for w in 0..(hi - lo) {
+                    let at = w * 8;
+                    let mut bits = read_u64_at(xa, at) & read_u64_at(xb, at);
+                    let base = high | (((lo + w) as u32) * 64);
+                    while bits != 0 {
+                        emit(base + bits.trailing_zeros());
+                        bits &= bits - 1;
+                    }
+                }
+            } else {
+                for (half, &word_mask) in sm.iter().enumerate() {
+                    let mut mask = word_mask;
+                    while mask != 0 {
+                        let block = half * 64 + mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        let block_base = block * BLOCK_WORDS;
+                        if block_base < lo || block_base >= hi {
+                            continue;
+                        }
+                        for w in 0..BLOCK_WORDS {
+                            let at = (block_base - lo + w) * 8;
+                            let mut bits = read_u64_at(xa, at) & read_u64_at(xb, at);
+                            let base = high | (((block_base + w) as u32) * 64);
+                            while bits != 0 {
+                                emit(base + bits.trailing_zeros());
+                                bits &= bits - 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (CView::Array(xa), CView::Array(xb)) => {
+            array_bytes_and_into(xa, xb, high, emit);
+        }
+        (
+            CView::Stride {
+                first: a0,
+                stride: s1,
+                len: n1,
+                ..
+            },
+            CView::Stride {
+                first: b0,
+                stride: s2,
+                len: n2,
+                ..
+            },
+        ) => {
+            if let Some((first, step, count)) = stride_and_progression(
+                u32::from(*a0),
+                u32::from((*s1).max(1)),
+                u32::from(*n1) + 1,
+                u32::from(*b0),
+                u32::from((*s2).max(1)),
+                u32::from(*n2) + 1,
+            ) {
+                let mut v = first;
+                for _ in 0..count {
+                    emit(high | v);
+                    v = v.wrapping_add(step);
+                }
+            }
+        }
+        (CView::Runs(ra), CView::Runs(rb)) => {
+            let (na, nb) = (ra.count(), rb.count());
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < na && j < nb {
+                let (alo, ahi) = (ra.start(i), ra.end(i));
+                let (blo, bhi) = (rb.start(j), rb.end(j));
+                let lo = alo.max(blo);
+                let hi = ahi.min(bhi);
+                if lo <= hi {
+                    for v in lo..=hi {
+                        emit(high | v);
+                    }
+                }
+                if ahi <= bhi {
+                    i += 1;
+                }
+                if bhi <= ahi {
+                    j += 1;
+                }
+            }
+        }
+        (
+            CView::Runs(runs),
+            CView::Stride {
+                first, stride, len, ..
+            },
+        )
+        | (
+            CView::Stride {
+                first, stride, len, ..
+            },
+            CView::Runs(runs),
+        ) => {
+            let first = u32::from(*first);
+            let step = u32::from((*stride).max(1));
+            let count = u32::from(*len) + 1;
+            for i in 0..runs.count() {
+                let lo = runs
+                    .start(i)
+                    .saturating_sub(first)
+                    .div_ceil(step)
+                    .min(count);
+                let hi = (runs.end(i) + 1)
+                    .saturating_sub(first)
+                    .div_ceil(step)
+                    .min(count);
+                for k in lo..hi {
+                    emit(high | (first + k * step));
+                }
+            }
+        }
+        _ => {
+            if a.cardinality() <= b.cardinality() {
+                a.for_each(|v| {
+                    if b.contains(v) {
+                        emit(high | u32::from(v));
+                    }
+                });
+            } else {
+                b.for_each(|v| {
+                    if a.contains(v) {
+                        emit(high | u32::from(v));
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Sorted intersection emitter over two unaligned little-endian `u16` byte slices.
+fn array_bytes_and_into(xa: &[u8], xb: &[u8], high: u32, emit: &mut impl FnMut(u32)) {
+    let (na, nb) = (xa.len() / 2, xb.len() / 2);
+    if na == 0 || nb == 0 {
+        return;
+    }
+    if drive_from_small(na, nb, DRIVE_RATIO_MEMBERS) {
+        gallop_array_bytes_into(xa, na, xb, nb, high, emit);
+        return;
+    }
+    if drive_from_small(nb, na, DRIVE_RATIO_MEMBERS) {
+        gallop_array_bytes_into(xb, nb, xa, na, high, emit);
+        return;
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use core::arch::aarch64::*;
+        // SAFETY: neon is statically enabled; loop bounds guarantee 16 bytes on each side.
+        unsafe {
+            while i + 8 <= na && j + 8 <= nb {
+                let va = vreinterpretq_u16_u8(vld1q_u8(xa.as_ptr().add(2 * i)));
+                let vb = vreinterpretq_u16_u8(vld1q_u8(xb.as_ptr().add(2 * j)));
+                let mut eq = vceqq_u16(va, vb);
+                let mut rot = vb;
+                for _ in 0..7 {
+                    rot = vextq_u16(rot, rot, 1);
+                    eq = vorrq_u16(eq, vceqq_u16(va, rot));
+                }
+                let mut mask = vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(eq)), 0);
+                while mask != 0 {
+                    let lane = (mask.trailing_zeros() >> 3) as usize;
+                    emit(high | u32::from(read_u16_at(xa, 2 * (i + lane))));
+                    mask &= !(0xFFu64 << (lane * 8));
+                }
+                let amax = read_u16_at(xa, 2 * (i + 7));
+                let bmax = read_u16_at(xb, 2 * (j + 7));
+                i += 8 * usize::from(amax <= bmax);
+                j += 8 * usize::from(bmax <= amax);
+            }
+        }
+    }
+    while i < na && j < nb {
+        let a = read_u16_at(xa, 2 * i);
+        let b = read_u16_at(xb, 2 * j);
+        if a < b {
+            i += 1;
+        } else if a > b {
+            j += 1;
+        } else {
+            emit(high | u32::from(a));
+            i += 1;
+            j += 1;
+        }
+    }
+}
+
+fn gallop_array_bytes_into(
+    small: &[u8],
+    ns: usize,
+    large: &[u8],
+    nl: usize,
+    high: u32,
+    emit: &mut impl FnMut(u32),
+) {
+    let mut cursor = 0usize;
+    for i in 0..ns {
+        let target = read_u16_at(small, 2 * i);
+        // Inline exponential gallop over `large` from `cursor`.
+        if cursor >= nl {
+            break;
+        }
+        if read_u16_at(large, 2 * cursor) < target {
+            let (mut lo, mut step) = (cursor, 1usize);
+            let mut hi = loop {
+                let probe = lo + step;
+                if probe >= nl {
+                    break nl;
+                }
+                if read_u16_at(large, 2 * probe) >= target {
+                    break probe;
+                }
+                lo = probe;
+                step <<= 1;
+            };
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if read_u16_at(large, 2 * mid) < target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            cursor = hi;
+            if cursor == nl {
+                break;
+            }
+        }
+        if read_u16_at(large, 2 * cursor) == target {
+            emit(high | u32::from(target));
+            cursor += 1;
+        }
+    }
 }
 
 // ── the view ─────────────────────────────────────────────────────────────
@@ -2387,6 +2858,32 @@ impl<'a> BitmosaicView<'a> {
         Self::open_with(bytes, true)
     }
 
+    /// O(1) attach for bytes an earlier certifying pass already admitted.
+    ///
+    /// Checks framing, key width, root tag, and directory geometry bounds so
+    /// no header/directory read can panic, while skipping the per-chunk walk
+    /// and `verify_slot_plane()`. Mirrors [`crate::BitmapView::open_admitted`].
+    #[inline]
+    pub fn open_admitted(bytes: &'a [u8]) -> Option<BitmosaicView<'a>> {
+        let header = parse_header(bytes).ok()?;
+        if header.width != KeyWidth::U32 {
+            return None;
+        }
+        let bytes = &bytes[..header.encoded_len];
+        if header.encoded_len == IMAGE_ID_LEN {
+            return Some(Self {
+                root: Root::Forest(Forest {
+                    bytes,
+                    len: 0,
+                    chunks: 0,
+                    geometry: Geometry::new(0, 0, IMAGE_ID_LEN),
+                }),
+                encoded_len: IMAGE_ID_LEN,
+            });
+        }
+        Self::open_body::<false>(bytes, header.body_offset, header.root, false).ok()
+    }
+
     fn open_with(bytes: &'a [u8], verify: bool) -> Result<BitmosaicView<'a>, AdmissionError> {
         let header = parse_header(bytes)?;
         if header.width != KeyWidth::U32 {
@@ -2575,6 +3072,20 @@ impl<'a> BitmosaicView<'a> {
         }
     }
 
+    /// Members strictly below `value` iff `value` is present, in one descent
+    /// (L0 byproduct: avoids separate `contains` + `rank` lookups).
+    #[inline]
+    pub fn rank_if_present(&self, value: u32) -> Option<u64> {
+        match &self.root {
+            Root::Ef(e) => e.rank_if_present(value),
+            Root::Forest(f) => {
+                let at = f.locate((value >> 16) as u16)?;
+                let low = f.container(at)?.rank_if_present((value & 0xFFFF) as u16)?;
+                Some(u64::from(f.before(at)) + u64::from(low))
+            }
+        }
+    }
+
     /// `k`-th member ascending.
     #[inline]
     pub fn select(&self, k: u64) -> Option<u32> {
@@ -2625,16 +3136,216 @@ impl<'a> BitmosaicView<'a> {
                 charge_key_positions(i + j);
                 count
             }
-            // An EF root is a sparse set by construction — it was published
-            // only because the forest was mostly directory — so enumerating
-            // it against the other side's O(1) probe is the cheap direction.
-            _ => {
+            // Advance a forward/galloping cursor over any EF target instead of
+            // restarting `select_zero` from scratch per element.
+            (Root::Ef(a), Root::Ef(b)) => {
+                let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                let mut cursor = large.probe_cursor();
                 let mut count = 0u64;
-                if self.len() <= other.len() {
-                    self.for_each(|v| count += u64::from(other.contains(v)));
+                small.for_each(|v| count += u64::from(cursor.contains_ascending(v)));
+                count
+            }
+            (Root::Ef(ef), Root::Forest(f)) | (Root::Forest(f), Root::Ef(ef)) => {
+                let mut count = 0u64;
+                if ef.len() <= f.len {
+                    ef.for_each(|v| {
+                        let key = (v >> 16) as u16;
+                        if let Some(at) = f.locate(key)
+                            && f.container(at)
+                                .is_some_and(|c| c.contains((v & 0xFFFF) as u16))
+                        {
+                            count += 1;
+                        }
+                    });
                 } else {
-                    other.for_each(|v| count += u64::from(self.contains(v)));
+                    let mut cursor = ef.probe_cursor();
+                    let min_key = (ef.base >> 16) as u16;
+                    let max_key = (ef.base.saturating_add(ef.span) >> 16) as u16;
+                    let start = f.walk(min_key);
+                    for i in start..f.chunks as usize {
+                        let key = f.key(i);
+                        if key > max_key {
+                            break;
+                        }
+                        let high = u32::from(key) << 16;
+                        if let Some(c) = f.container(i) {
+                            c.for_each(|v| {
+                                count += u64::from(cursor.contains_ascending(high | u32::from(v)));
+                            });
+                        }
+                    }
                 }
+                count
+            }
+        }
+    }
+
+    /// Fused 3-way AND cardinality using the const-`N = 3` word kernel when
+    /// all three chunks are `Words`, with zero heap allocation.
+    pub fn and_len_three(&self, b: &BitmosaicView<'_>, c: &BitmosaicView<'_>) -> u64 {
+        if self.is_empty() || b.is_empty() || c.is_empty() {
+            return 0;
+        }
+        match (&self.root, &b.root, &c.root) {
+            (Root::Forest(fa), Root::Forest(fb), Root::Forest(fc)) => {
+                // Drive from the forest with the fewest chunks.
+                let (driver, p1, p2) = if fa.chunks <= fb.chunks && fa.chunks <= fc.chunks {
+                    (fa, fb, fc)
+                } else if fb.chunks <= fc.chunks {
+                    (fb, fa, fc)
+                } else {
+                    (fc, fa, fb)
+                };
+                let mut count = 0u64;
+                for i in 0..driver.chunks as usize {
+                    let key = driver.key(i);
+                    let Some(j1) = p1.locate(key) else {
+                        continue;
+                    };
+                    let Some(j2) = p2.locate(key) else {
+                        continue;
+                    };
+                    let (Some(c0), Some(c1), Some(c2)) =
+                        (driver.container(i), p1.container(j1), p2.container(j2))
+                    else {
+                        continue;
+                    };
+                    count += u64::from(and_count_three(&c0, &c1, &c2));
+                }
+                count
+            }
+            _ => {
+                let mut ordered = [*self, *b, *c];
+                ordered.sort_unstable_by_key(|v| v.len());
+                let mut count = 0u64;
+                match (&ordered[1].root, &ordered[2].root) {
+                    (Root::Ef(e1), Root::Ef(e2)) => {
+                        let (mut cur1, mut cur2) = (e1.probe_cursor(), e2.probe_cursor());
+                        ordered[0].for_each(|v| {
+                            if cur1.contains_ascending(v) && cur2.contains_ascending(v) {
+                                count += 1;
+                            }
+                        });
+                    }
+                    (Root::Ef(e1), _) => {
+                        let mut cur1 = e1.probe_cursor();
+                        ordered[0].for_each(|v| {
+                            if cur1.contains_ascending(v) && ordered[2].contains(v) {
+                                count += 1;
+                            }
+                        });
+                    }
+                    (_, Root::Ef(e2)) => {
+                        let mut cur2 = e2.probe_cursor();
+                        ordered[0].for_each(|v| {
+                            if ordered[1].contains(v) && cur2.contains_ascending(v) {
+                                count += 1;
+                            }
+                        });
+                    }
+                    _ => {
+                        ordered[0].for_each(|v| {
+                            if ordered[1].contains(v) && ordered[2].contains(v) {
+                                count += 1;
+                            }
+                        });
+                    }
+                }
+                count
+            }
+        }
+    }
+
+    /// Fused k-way AND cardinality across an arbitrary slice of views,
+    /// allocation-free and using const-`N` word kernels for `Words` chunks.
+    pub fn and_len_k(views: &[BitmosaicView<'_>]) -> u64 {
+        match views {
+            [] => 0,
+            [a] => a.len(),
+            [a, b] => a.and_len(b),
+            [a, b, c] => a.and_len_three(b, c),
+            _ => {
+                if views.iter().any(BitmosaicView::is_empty) {
+                    return 0;
+                }
+                let all_forests = views.iter().all(|v| matches!(v.root, Root::Forest(_)));
+                if all_forests && views.len() <= 8 {
+                    let mut driver_idx = 0usize;
+                    let mut min_chunks = u32::MAX;
+                    for (idx, v) in views.iter().enumerate() {
+                        if let Root::Forest(f) = v.root
+                            && f.chunks < min_chunks
+                        {
+                            min_chunks = f.chunks;
+                            driver_idx = idx;
+                        }
+                    }
+                    let Root::Forest(driver) = views[driver_idx].root else {
+                        unreachable!()
+                    };
+                    let k = views.len();
+                    let mut count = 0u64;
+                    let mut chunk_buf = [CView::Array(&[]); 8];
+                    'chunks: for i in 0..driver.chunks as usize {
+                        let key = driver.key(i);
+                        let mut all_words = true;
+                        for (slot, v) in views.iter().enumerate() {
+                            let Root::Forest(f) = v.root else {
+                                unreachable!()
+                            };
+                            let Some(at) = (if slot == driver_idx {
+                                Some(i)
+                            } else {
+                                f.locate(key)
+                            }) else {
+                                continue 'chunks;
+                            };
+                            let Some(cv) = f.container(at) else {
+                                continue 'chunks;
+                            };
+                            if !matches!(cv, CView::Words { .. }) {
+                                all_words = false;
+                            }
+                            chunk_buf[slot] = cv;
+                        }
+                        if all_words {
+                            count += u64::from(words_and_k(&chunk_buf[..k]));
+                        } else {
+                            let mut min_slot = 0usize;
+                            let mut min_card = chunk_buf[0].cardinality();
+                            for (slot, cv) in chunk_buf[..k].iter().enumerate().skip(1) {
+                                let c = cv.cardinality();
+                                if c < min_card {
+                                    min_card = c;
+                                    min_slot = slot;
+                                }
+                            }
+                            chunk_buf[min_slot].for_each(|v| {
+                                for (slot, cv) in chunk_buf[..k].iter().enumerate() {
+                                    if slot != min_slot && !cv.contains(v) {
+                                        return;
+                                    }
+                                }
+                                count += 1;
+                            });
+                        }
+                    }
+                    return count;
+                }
+                let (min_idx, _) = views
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, v)| v.len())
+                    .expect("non-empty views");
+                let mut count = 0u64;
+                views[min_idx].for_each(|v| {
+                    for (idx, other) in views.iter().enumerate() {
+                        if idx != min_idx && !other.contains(v) {
+                            return;
+                        }
+                    }
+                    count += 1;
+                });
                 count
             }
         }
@@ -2653,22 +3364,102 @@ impl<'a> BitmosaicView<'a> {
     /// `dest` shorter than the intersection is a caller sizing error, not a
     /// truncation mode: the surplus is dropped and `debug_assert` fires.
     pub fn and_into(&self, other: &BitmosaicView<'_>, dest: &mut [u32]) -> usize {
-        // Enumerate the smaller side against the larger side's O(1) probe.
-        let (small, large) = if self.len() <= other.len() {
-            (self, other)
-        } else {
-            (other, self)
-        };
         let (mut written, mut hits) = (0usize, 0usize);
-        small.for_each(|v| {
-            if large.contains(v) {
-                hits += 1;
-                if let Some(slot) = dest.get_mut(written) {
-                    *slot = v;
-                    written += 1;
+        let mut emit = |v: u32| {
+            hits += 1;
+            if let Some(slot) = dest.get_mut(written) {
+                *slot = v;
+                written += 1;
+            }
+        };
+        match (&self.root, &other.root) {
+            (Root::Forest(a), Root::Forest(b)) => {
+                let (na, nb) = (a.chunks as usize, b.chunks as usize);
+                if drive_from_small(na, nb, DRIVE_RATIO_KEYS) {
+                    crate::gallop_walk(
+                        na,
+                        |i| a.key(i),
+                        nb,
+                        |j| b.key(j),
+                        |i, j| {
+                            if let (Some(ca), Some(cb)) = (a.container(i), b.container(j)) {
+                                chunk_and_into(&ca, &cb, u32::from(a.key(i)) << 16, &mut emit);
+                            }
+                        },
+                    );
+                } else if drive_from_small(nb, na, DRIVE_RATIO_KEYS) {
+                    crate::gallop_walk(
+                        nb,
+                        |j| b.key(j),
+                        na,
+                        |i| a.key(i),
+                        |j, i| {
+                            if let (Some(ca), Some(cb)) = (a.container(i), b.container(j)) {
+                                chunk_and_into(&ca, &cb, u32::from(a.key(i)) << 16, &mut emit);
+                            }
+                        },
+                    );
+                } else {
+                    let (mut i, mut j) = (0usize, 0usize);
+                    while i < na && j < nb {
+                        let (ka, kb) = (a.key(i), b.key(j));
+                        if ka == kb {
+                            if let (Some(ca), Some(cb)) = (a.container(i), b.container(j)) {
+                                chunk_and_into(&ca, &cb, u32::from(ka) << 16, &mut emit);
+                            }
+                            i += 1;
+                            j += 1;
+                        } else if ka < kb {
+                            i += 1;
+                        } else {
+                            j += 1;
+                        }
+                    }
                 }
             }
-        });
+            (Root::Ef(a), Root::Ef(b)) => {
+                let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                let mut cursor = large.probe_cursor();
+                small.for_each(|v| {
+                    if cursor.contains_ascending(v) {
+                        emit(v);
+                    }
+                });
+            }
+            (Root::Ef(ef), Root::Forest(f)) | (Root::Forest(f), Root::Ef(ef)) => {
+                if ef.len() <= f.len {
+                    ef.for_each(|v| {
+                        let key = (v >> 16) as u16;
+                        if let Some(at) = f.locate(key)
+                            && f.container(at)
+                                .is_some_and(|c| c.contains((v & 0xFFFF) as u16))
+                        {
+                            emit(v);
+                        }
+                    });
+                } else {
+                    let mut cursor = ef.probe_cursor();
+                    let min_key = (ef.base >> 16) as u16;
+                    let max_key = (ef.base.saturating_add(ef.span) >> 16) as u16;
+                    let start = f.walk(min_key);
+                    for i in start..f.chunks as usize {
+                        let key = f.key(i);
+                        if key > max_key {
+                            break;
+                        }
+                        let high = u32::from(key) << 16;
+                        if let Some(c) = f.container(i) {
+                            c.for_each(|v| {
+                                let full = high | u32::from(v);
+                                if cursor.contains_ascending(full) {
+                                    emit(full);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
         debug_assert_eq!(hits, written, "dest must be sized from and_len");
         written
     }
@@ -2708,7 +3499,10 @@ impl<'a> BitmosaicView<'a> {
         }
         let mut expect: Option<(u32, u32, u64, u32)> = None;
         for i in 0..f.chunks as usize {
-            let CView::Stride { first, stride, len } = f.container(i)? else {
+            let CView::Stride {
+                first, stride, len, ..
+            } = f.container(i)?
+            else {
                 return None;
             };
             let base = u32::from(f.key(i)) << 16;
@@ -2761,6 +3555,62 @@ impl<'a> Bitmosaic64View<'a> {
 
     pub fn open_verified(bytes: &'a [u8]) -> Result<Bitmosaic64View<'a>, AdmissionError> {
         Self::open_with(bytes, true)
+    }
+
+    /// O(1) attach for bytes an earlier certifying pass already admitted.
+    ///
+    /// Validates framing, width, directory bounds, and computes `len` /
+    /// `last_before` (plus `single` when `forests == 1`) by touching at most
+    /// the last two child headers — zero full-directory scan and zero chunk
+    /// verification.
+    #[inline]
+    pub fn open_admitted(bytes: &'a [u8]) -> Option<Bitmosaic64View<'a>> {
+        let header = parse_header(bytes).ok()?;
+        if header.width != KeyWidth::U64 {
+            return None;
+        }
+        let bytes = &bytes[..header.encoded_len];
+        let mut at = header.body_offset;
+        let forests = if header.encoded_len == IMAGE_ID_LEN {
+            0
+        } else {
+            read_uleb_checked(bytes, &mut at, u32::MAX, AdmissionClass::Count)
+                .ok()?
+                .checked_add(1)?
+        };
+        let n = forests as usize;
+        let geometry = Geometry64::new(n, at)?;
+        bytes.get(..geometry.payload_at)?;
+        let mut view = Self {
+            bytes,
+            forests,
+            len: 0,
+            geometry,
+            last_before: 0,
+            single: None,
+        };
+        match n {
+            0 => {}
+            1 => {
+                let child = view.forest(0)?;
+                view.len = child.len();
+                view.single = Some(child);
+            }
+            2 => {
+                let c0 = view.forest(0)?;
+                let c1 = view.forest(1)?;
+                view.last_before = c0.len();
+                view.len = view.last_before.checked_add(c1.len())?;
+            }
+            _ => {
+                let prev_before = read_u64_at(bytes, geometry.before_at + 8 * (n - 3));
+                let c_prev = view.forest(n - 2)?;
+                let c_last = view.forest(n - 1)?;
+                view.last_before = prev_before.checked_add(c_prev.len())?;
+                view.len = view.last_before.checked_add(c_last.len())?;
+            }
+        }
+        Some(view)
     }
 
     fn open_with(bytes: &'a [u8], verify: bool) -> Result<Self, AdmissionError> {
@@ -2869,13 +3719,16 @@ impl<'a> Bitmosaic64View<'a> {
         }
     }
 
-    fn child_at(&self, i: usize) -> usize {
-        self.geometry.payload_at
-            + if i == 0 {
-                0
-            } else {
-                read_u32_at(self.bytes, self.geometry.offsets_at + 4 * (i - 1)) as usize
-            }
+    fn child_at(&self, i: usize) -> Option<usize> {
+        if i == 0 {
+            Some(self.geometry.payload_at)
+        } else {
+            self.geometry
+                .payload_at
+                .checked_add(
+                    read_u32_at(self.bytes, self.geometry.offsets_at + 4 * (i - 1)) as usize,
+                )
+        }
     }
 
     fn forest_with(&self, i: usize, verify: bool) -> Result<BitmosaicView<'a>, AdmissionError> {
@@ -2930,11 +3783,11 @@ impl<'a> Bitmosaic64View<'a> {
         if let Some(child) = self.single {
             return (i == 0).then_some(child);
         }
-        let at = self.child_at(i);
+        let at = self.child_at(i)?;
         let end = if i + 1 == self.forests as usize {
             self.bytes.len()
         } else {
-            self.child_at(i + 1)
+            self.child_at(i + 1)?
         };
         let root = (self.bytes[self.geometry.roots_at + i / 8] >> (i % 8)) & 1;
         BitmosaicView::open_body::<false>(self.bytes.get(at..end)?, 0, root, false).ok()
@@ -2950,8 +3803,8 @@ impl<'a> Bitmosaic64View<'a> {
         self.len == 0
     }
 
-    /// Predict-verify over the prefix plane: dense-ordinal populations have
-    /// exactly one forest (high32 = 0), so this resolves in one load.
+    /// Predict-verify over the prefix plane, then O(log n) binary search.
+    /// Dense-ordinal populations have one forest (high32 = 0), resolving in one load.
     #[inline(always)]
     fn locate(&self, high: u32) -> Option<usize> {
         let n = self.forests as usize;
@@ -2966,20 +3819,31 @@ impl<'a> Bitmosaic64View<'a> {
         if high < first {
             return None;
         }
-        (0..n).find(|&i| self.high(i) == high)
+        let at = self.walk(high);
+        (at < n && self.high(at) == high).then_some(at)
     }
 
-    /// Insertion point for `high`: occupied forests strictly below it.
-    ///
-    /// The miss half of [`Self::locate`], which a cursor seek needs and a
-    /// probe does not. Linear for the same reason [`Self::rank`]'s miss path
-    /// is: the directory holds one entry per occupied high-32 region, so it
-    /// is short by construction and never assumed sorted.
+    /// Insertion point for `high`: occupied forests strictly below it, in O(log n).
     #[inline]
     fn walk(&self, high: u32) -> usize {
-        (0..self.forests as usize)
-            .filter(|&i| self.high(i) < high)
-            .count()
+        let n = self.forests as usize;
+        if n <= 16 {
+            let mut at = 0usize;
+            for i in 0..n {
+                at += usize::from(self.high(i) < high);
+            }
+            return at;
+        }
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.high(mid) < high {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     #[inline]
@@ -2991,21 +3855,39 @@ impl<'a> Bitmosaic64View<'a> {
 
     #[inline]
     pub fn rank(&self, value: u64) -> u64 {
-        let high = (value >> 32) as u32;
-        match self.locate(high) {
-            Some(i) => self.before(i) + self.forest(i).map_or(0, |f| f.rank(value as u32)),
-            None => {
-                let forests = self.forests as usize;
-                let at = (0..forests).filter(|&i| self.high(i) < high).count();
-                if at == 0 {
-                    0
-                } else if at == forests {
-                    self.len
-                } else {
-                    self.before(at)
-                }
-            }
+        let n = self.forests as usize;
+        if n == 0 {
+            return 0;
         }
+        let high = (value >> 32) as u32;
+        // Predict-verify first (single load on dense-ordinal populations).
+        let first = self.high(0);
+        let guess = (high.wrapping_sub(first) as usize).min(n - 1);
+        if self.high(guess) == high {
+            return self.before(guess) + self.forest(guess).map_or(0, |f| f.rank(value as u32));
+        }
+        if high < first {
+            return 0;
+        }
+        let at = self.walk(high);
+        if at < n && self.high(at) == high {
+            self.before(at) + self.forest(at).map_or(0, |f| f.rank(value as u32))
+        } else if at == 0 {
+            0
+        } else if at == n {
+            self.len
+        } else {
+            self.before(at)
+        }
+    }
+
+    /// Members strictly below `value` iff `value` is present, in one descent
+    /// (L0 byproduct: avoids separate `contains` + `rank` probes).
+    #[inline]
+    pub fn rank_if_present(&self, value: u64) -> Option<u64> {
+        let i = self.locate((value >> 32) as u32)?;
+        let low = self.forest(i)?.rank_if_present(value as u32)?;
+        Some(self.before(i) + low)
     }
 
     #[inline]
@@ -3014,18 +3896,59 @@ impl<'a> Bitmosaic64View<'a> {
             return None;
         }
         let n = self.forests as usize;
-        let mut at = 0usize;
-        while at + 1 < n && self.before(at + 1) <= k {
-            at += 1;
-        }
+        let at = if n <= 16 {
+            let mut at = 0usize;
+            while at + 1 < n && self.before(at + 1) <= k {
+                at += 1;
+            }
+            at
+        } else {
+            let (mut lo, mut hi) = (0usize, n);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.before(mid) <= k {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo - 1
+        };
         let low = self.forest(at)?.select(k - self.before(at))?;
         Some((u64::from(self.high(at)) << 32) | u64::from(low))
     }
 
+    /// Fused AND cardinality across high-32 forests, skew-adaptive via
+    /// galloping when `min * 8 <= max`.
     pub fn and_len(&self, other: &Bitmosaic64View<'_>) -> u64 {
+        let (na, nb) = (self.forests as usize, other.forests as usize);
+        if na == 0 || nb == 0 {
+            return 0;
+        }
+        if na.saturating_mul(8) <= nb {
+            let mut count = 0u64;
+            let mut cursor = 0usize;
+            for i in 0..na {
+                let target = self.high(i);
+                cursor = gallop_u32_by(nb, cursor, target, |j| other.high(j));
+                if cursor == nb {
+                    break;
+                }
+                if other.high(cursor) == target {
+                    if let (Some(a), Some(b)) = (self.forest(i), other.forest(cursor)) {
+                        count += a.and_len(&b);
+                    }
+                    cursor += 1;
+                }
+            }
+            return count;
+        }
+        if nb.saturating_mul(8) <= na {
+            return other.and_len(self);
+        }
         let mut count = 0u64;
         let (mut i, mut j) = (0usize, 0usize);
-        while i < self.forests as usize && j < other.forests as usize {
+        while i < na && j < nb {
             let (ha, hb) = (self.high(i), other.high(j));
             if ha == hb {
                 if let (Some(a), Some(b)) = (self.forest(i), other.forest(j)) {
@@ -3040,6 +3963,96 @@ impl<'a> Bitmosaic64View<'a> {
             }
         }
         count
+    }
+
+    /// Fused 3-way AND cardinality across u64 views, allocation-free.
+    pub fn and_len_three(&self, b: &Bitmosaic64View<'_>, c: &Bitmosaic64View<'_>) -> u64 {
+        if self.is_empty() || b.is_empty() || c.is_empty() {
+            return 0;
+        }
+        let (driver, p1, p2) = if self.forests <= b.forests && self.forests <= c.forests {
+            (self, b, c)
+        } else if b.forests <= c.forests {
+            (b, self, c)
+        } else {
+            (c, self, b)
+        };
+        let mut count = 0u64;
+        for i in 0..driver.forests as usize {
+            let high = driver.high(i);
+            let Some(j1) = p1.locate(high) else {
+                continue;
+            };
+            let Some(j2) = p2.locate(high) else {
+                continue;
+            };
+            if let (Some(f0), Some(f1), Some(f2)) = (driver.forest(i), p1.forest(j1), p2.forest(j2))
+            {
+                count += f0.and_len_three(&f1, &f2);
+            }
+        }
+        count
+    }
+
+    /// Fused k-way AND cardinality across u64 views, allocation-free.
+    pub fn and_len_k(views: &[Bitmosaic64View<'_>]) -> u64 {
+        match views {
+            [] => 0,
+            [a] => a.len(),
+            [a, b] => a.and_len(b),
+            [a, b, c] => a.and_len_three(b, c),
+            _ => {
+                if views.iter().any(Bitmosaic64View::is_empty) {
+                    return 0;
+                }
+                if views.len() <= 8 {
+                    let (driver_idx, _) = views
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, v)| v.forests)
+                        .expect("non-empty views");
+                    let driver = &views[driver_idx];
+                    let k = views.len();
+                    let empty = BitmosaicView::open_admitted(&EMPTY_U32_IMAGE)
+                        .expect("EMPTY_U32_IMAGE is valid");
+                    let mut buf = [empty; 8];
+                    let mut count = 0u64;
+                    'highs: for i in 0..driver.forests as usize {
+                        let high = driver.high(i);
+                        for (slot, v) in views.iter().enumerate() {
+                            let Some(at) = (if slot == driver_idx {
+                                Some(i)
+                            } else {
+                                v.locate(high)
+                            }) else {
+                                continue 'highs;
+                            };
+                            let Some(f) = v.forest(at) else {
+                                continue 'highs;
+                            };
+                            buf[slot] = f;
+                        }
+                        count += BitmosaicView::and_len_k(&buf[..k]);
+                    }
+                    return count;
+                }
+                let (min_idx, _) = views
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, v)| v.len())
+                    .expect("non-empty views");
+                let mut count = 0u64;
+                views[min_idx].for_each(|v| {
+                    for (idx, other) in views.iter().enumerate() {
+                        if idx != min_idx && !other.contains(v) {
+                            return;
+                        }
+                    }
+                    count += 1;
+                });
+                count
+            }
+        }
     }
 
     /// Ascending walk over every member, high-32 prefixes restored.
@@ -3189,7 +4202,9 @@ impl<'a> CRange<'a> {
                     remaining: view.len - k,
                 }
             }
-            CView::Stride { first, stride, len } => {
+            CView::Stride {
+                first, stride, len, ..
+            } => {
                 let stride = u32::from(stride).max(1);
                 CRange::Stride {
                     next: u32::from(first) + k * stride,

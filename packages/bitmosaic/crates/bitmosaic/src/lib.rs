@@ -28,12 +28,17 @@
 mod admission;
 mod array;
 mod bitmap;
+mod codec;
 mod ef;
 #[cfg(any(test, feature = "bench-internals"))]
 pub mod oracle;
 mod patch;
 mod range;
 mod wire;
+
+use codec::{
+    cone_guess, cone_inv_scale, cone_window_rank, select64, stride_magic, stride_quotient,
+};
 
 pub use admission::{AdmissionClass, AdmissionError};
 pub use bitmap::{BitmapIter, BitmapView, Image, bitmap_len, bitmap_seal, bitmap_set};
@@ -365,9 +370,12 @@ enum Container {
         magic: u64,
     },
     /// first + (i*scale >> 32) + residual[i]; |residual| <= eps.
+    /// `inv_scale` is the freeze-computed reciprocal of `scale` so probes
+    /// never execute a hardware integer division.
     Cone {
         first: u16,
         scale: u64,
+        inv_scale: u64,
         eps: u8,
         residuals: Box<[i8]>,
     },
@@ -472,19 +480,6 @@ impl Container {
         }
     }
 
-    /// `floor(delta / stride)` from the frozen reciprocal, no division.
-    ///
-    /// 32-bit because the per-chunk domain is u16: with
-    /// `magic = ceil(2^32 / stride)` the identity holds for every
-    /// `delta < 2^16`, since the accumulated reciprocal error
-    /// `delta * ((-2^32) mod stride)` is at most `65535 * 65534 < 2^32`.
-    /// A 64-bit reciprocal cannot express `stride == 1` - `ceil(2^64/1)` is
-    /// unrepresentable - and would force a `u128` multiply on the probe path.
-    #[inline(always)]
-    fn quotient(delta: u32, magic: u64) -> u32 {
-        ((delta as u64 * magic) >> 32) as u32
-    }
-
     #[inline]
     fn cone_value(first: u16, scale: u64, residuals: &[i8], i: usize) -> u16 {
         (first as i64 + ((i as u64 * scale) >> 32) as i64 + residuals[i] as i64) as u16
@@ -510,24 +505,26 @@ impl Container {
                 if v < first {
                     return false;
                 }
-                let q = Container::quotient(v - first, *magic);
+                let q = stride_quotient(v - first, *magic);
                 q <= *len as u32 && first + q * stride == v
             }
             Container::Cone {
                 first,
                 scale,
+                inv_scale,
                 eps,
                 residuals,
             } => {
-                let delta = ((v as u64).saturating_sub(*first as u64)) << 32;
-                // `checked_div` answers the zero-scale arm itself: None maps
-                // to a zero prediction, and a nonzero divisor truncates exactly
-                // like the raw division it replaces.
-                let guess = delta.checked_div(*scale).unwrap_or(0) as i64;
+                let delta = v.saturating_sub(*first);
+                let guess = cone_guess(delta, *scale, *inv_scale) as i64;
                 let margin = 2 + *eps as i64;
-                let lo = (guess - margin).max(0) as usize;
-                let hi = ((guess + margin + 1) as usize).min(residuals.len());
-                (lo..hi).any(|i| Self::cone_value(*first, *scale, residuals, i) == v)
+                let n = residuals.len();
+                let lo = (guess - margin).max(0).min(n as i64) as usize;
+                let hi = ((guess + margin + 1) as usize).min(n);
+                let at = cone_window_rank(lo, hi, v, |i| {
+                    Self::cone_value(*first, *scale, residuals, i)
+                });
+                at < hi && Self::cone_value(*first, *scale, residuals, at) == v
             }
             Container::Array(values) => array::contains(&values[..], v),
             // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS = 1024.
@@ -555,34 +552,27 @@ impl Container {
                 if v <= first {
                     0
                 } else {
-                    (Container::quotient(v - 1 - first, *magic) + 1).min(*len as u32 + 1)
+                    (stride_quotient(v - 1 - first, *magic) + 1).min(*len as u32 + 1)
                 }
             }
             Container::Cone {
                 first,
                 scale,
+                inv_scale,
                 eps,
                 residuals,
             } => {
                 // The eps bound guarantees every ordinal before the window's
-                // start holds a value < v; walk only the window.
-                let delta = ((v as u64).saturating_sub(*first as u64)) << 32;
-                // `checked_div` answers the zero-scale arm itself: None maps
-                // to a zero prediction, and a nonzero divisor truncates exactly
-                // like the raw division it replaces.
-                let guess = delta.checked_div(*scale).unwrap_or(0) as i64;
+                // start holds a value < v; bisect only the window.
+                let delta = v.saturating_sub(*first);
+                let guess = cone_guess(delta, *scale, *inv_scale) as i64;
                 let margin = 2 + *eps as i64;
-                // Clamped at BOTH ends: the model's prediction for a probe
-                // above the chunk's last member runs off the residual plane,
-                // and an unclamped start would report that prediction as the
-                // rank. Every member is then below `v`, so `n` is the answer.
-                let start = (guess - margin).max(0).min(residuals.len() as i64) as usize;
-                let hi = ((guess + margin + 1) as usize).min(residuals.len());
-                let mut at = start;
-                while at < hi && Self::cone_value(*first, *scale, residuals, at) < v {
-                    at += 1;
-                }
-                at as u32
+                let n = residuals.len();
+                let lo = (guess - margin).max(0).min(n as i64) as usize;
+                let hi = ((guess + margin + 1) as usize).min(n);
+                cone_window_rank(lo, hi, v, |i| {
+                    Self::cone_value(*first, *scale, residuals, i)
+                }) as u32
             }
             Container::Array(values) => array::rank(&values[..], v) as u32,
             Container::Words { words, dir, .. } => {
@@ -594,6 +584,69 @@ impl Container {
                     count += words[w].count_ones();
                 }
                 count + (words[word] & ((1u64 << (v & 63)) - 1)).count_ones()
+            }
+        }
+    }
+
+    /// Count of members strictly below `v` iff `v` is present, in one descent.
+    #[inline(always)]
+    fn rank_if_present(&self, v: u16) -> Option<u32> {
+        match self {
+            Container::Runs { runs, .. } => {
+                let i = runs.partition_point(|run| run.end < v);
+                let run = runs.get(i)?;
+                (run.start <= v).then(|| u32::from(run.before) + u32::from(v - run.start))
+            }
+            Container::Stride {
+                first,
+                stride,
+                len,
+                magic,
+            } => {
+                let (first, stride) = (*first as u32, *stride as u32);
+                let v = v as u32;
+                if v < first {
+                    return None;
+                }
+                let q = stride_quotient(v - first, *magic);
+                (q <= *len as u32 && first + q * stride == v).then_some(q)
+            }
+            Container::Cone {
+                first,
+                scale,
+                inv_scale,
+                eps,
+                residuals,
+            } => {
+                let delta = v.saturating_sub(*first);
+                let guess = cone_guess(delta, *scale, *inv_scale) as i64;
+                let margin = 2 + *eps as i64;
+                let n = residuals.len();
+                let lo = (guess - margin).max(0).min(n as i64) as usize;
+                let hi = ((guess + margin + 1) as usize).min(n);
+                let at = cone_window_rank(lo, hi, v, |i| {
+                    Self::cone_value(*first, *scale, residuals, i)
+                });
+                (at < hi && Self::cone_value(*first, *scale, residuals, at) == v)
+                    .then_some(at as u32)
+            }
+            Container::Array(values) => {
+                let r = array::rank(&values[..], v);
+                (values.get(r) == Some(&v)).then_some(r as u32)
+            }
+            Container::Words { words, dir, .. } => {
+                let word = (v >> 6) as usize;
+                // SAFETY: v: u16 so word <= 1023 < CHUNK_WORDS = 1024.
+                let w_bits = unsafe { *words.get_unchecked(word) };
+                if (w_bits >> (v & 63)) & 1 == 0 {
+                    return None;
+                }
+                // SAFETY: word <= 1023, so word / DIR_STRIDE <= 255 < dir.len().
+                let mut count = unsafe { *dir.get_unchecked(word / DIR_STRIDE) } as u32;
+                for w in (word / DIR_STRIDE) * DIR_STRIDE..word {
+                    count += words[w].count_ones();
+                }
+                Some(count + (w_bits & ((1u64 << (v & 63)) - 1)).count_ones())
             }
         }
     }
@@ -632,11 +685,7 @@ impl Container {
                     let word_bits = unsafe { *words.get_unchecked(w) };
                     let ones = word_bits.count_ones();
                     if remaining < ones {
-                        let mut word = word_bits;
-                        for _ in 0..remaining {
-                            word &= word - 1;
-                        }
-                        return ((w as u32) * 64 + word.trailing_zeros()) as u16;
+                        return ((w as u32) * 64 + select64(word_bits, remaining)) as u16;
                     }
                     remaining -= ones;
                     w += 1;
@@ -672,11 +721,14 @@ impl Container {
             Container::Cone {
                 first,
                 scale,
+                inv_scale,
+                eps,
                 residuals,
-                ..
             } => ContainerRange::Cone {
                 first: *first,
+                eps: *eps,
                 scale: *scale,
+                inv_scale: *inv_scale,
                 residuals,
                 at: 0,
             },
@@ -1809,8 +1861,8 @@ pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
             rot = vextq_u16(rot, rot, 1);
             eq = vorrq_u16(eq, vceqq_u16(va, rot));
             count += vaddvq_u16(vandq_u16(eq, vdupq_n_u16(1))) as u32;
-            let amax = wire::read_u16_at(a, 2 * (i + 7));
-            let bmax = wire::read_u16_at(b, 2 * (j + 7));
+            let amax = codec::read_u16_at(a, 2 * (i + 7));
+            let bmax = codec::read_u16_at(b, 2 * (j + 7));
             i += 8 * (amax <= bmax) as usize;
             j += 8 * (bmax <= amax) as usize;
         }
@@ -1820,8 +1872,8 @@ pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
         + merge_and_scalar_by(
             na - i,
             nb - j,
-            |at| wire::read_u16_at(a, 2 * (i + at)),
-            |at| wire::read_u16_at(b, 2 * (j + at)),
+            |at| codec::read_u16_at(a, 2 * (i + at)),
+            |at| codec::read_u16_at(b, 2 * (j + at)),
         )
 }
 
@@ -1840,8 +1892,8 @@ pub(crate) fn merge_and_array_bytes(a: &[u8], b: &[u8]) -> u32 {
     merge_and_scalar_by(
         a.len() / 2,
         b.len() / 2,
-        |i| wire::read_u16_at(a, 2 * i),
-        |i| wire::read_u16_at(b, 2 * i),
+        |i| codec::read_u16_at(a, 2 * i),
+        |i| codec::read_u16_at(b, 2 * i),
     )
 }
 
@@ -1893,7 +1945,17 @@ fn merge_and_scalar_by(
     count
 }
 
-fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2: u32) -> u32 {
+/// Closed-form CRT intersection of two finite arithmetic progressions:
+/// `Some((first, step, count))` with `count >= 1`, or `None` if disjoint.
+/// Note: when `count == 1`, `step` may exceed `u16::MAX` (only `first` is used).
+pub(crate) fn stride_and_progression(
+    a0: u32,
+    s1: u32,
+    n1: u32,
+    b0: u32,
+    s2: u32,
+    n2: u32,
+) -> Option<(u32, u32, u32)> {
     fn ext_gcd(a: i64, b: i64) -> (i64, i64, i64) {
         if b == 0 {
             (a, 1, 0)
@@ -1905,7 +1967,7 @@ fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2: u32) -> u3
     let (g, x, _) = ext_gcd(s1 as i64, s2 as i64);
     let diff = b0 as i64 - a0 as i64;
     if diff % g != 0 {
-        return 0;
+        return None;
     }
     let lcm = (s1 as i64 / g) * s2 as i64;
     let mut first = a0 as i64 + ((diff / g) * x).rem_euclid(s2 as i64 / g) * s1 as i64;
@@ -1916,10 +1978,15 @@ fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2: u32) -> u3
     let end =
         (a0 as i64 + (n1 as i64 - 1) * s1 as i64).min(b0 as i64 + (n2 as i64 - 1) * s2 as i64);
     if first > end {
-        0
+        None
     } else {
-        ((end - first) / lcm + 1) as u32
+        let count = ((end - first) / lcm + 1) as u32;
+        Some((first as u32, lcm as u32, count))
     }
+}
+
+pub(crate) fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2: u32) -> u32 {
+    stride_and_progression(a0, s1, n1, b0, s2, n2).map_or(0, |(_, _, count)| count)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1927,10 +1994,21 @@ fn stride_and_closed(a0: u32, s1: u32, n1: u32, b0: u32, s2: u32, n2: u32) -> u3
 // ─────────────────────────────────────────────────────────────────────────
 
 fn freeze_chunk(words: &[u64; CHUNK_WORDS], scratch: &mut Vec<u16>) -> Option<Container> {
+    let n: u32 = words.iter().map(|w| w.count_ones()).sum();
+    freeze_chunk_with_len(words, n, scratch)
+}
+
+fn freeze_chunk_with_len(
+    words: &[u64; CHUNK_WORDS],
+    n: u32,
+    scratch: &mut Vec<u16>,
+) -> Option<Container> {
+    if n == 0 {
+        return None;
+    }
     // Closed-form capacity: the popcount IS the size (G89) - the scratch is
     // the freeze arena, reused across chunks and freezes, never grown after
     // its high-water mark.
-    let n: u32 = words.iter().map(|w| w.count_ones()).sum();
     if n as usize > ARRAY_MAX {
         let first_word = words
             .iter()
@@ -1942,7 +2020,7 @@ fn freeze_chunk(words: &[u64; CHUNK_WORDS], scratch: &mut Vec<u16>) -> Option<Co
                 first,
                 stride,
                 len: (n - 1) as u16,
-                magic: (1u64 << 32).div_ceil(u64::from(stride)),
+                magic: stride_magic(stride),
             },
             Arm::Runs { count } => Container::Runs {
                 runs: runs_from_words(words, count),
@@ -1997,11 +2075,12 @@ fn freeze_members(values: &[u16], plane: Option<&[u64; CHUNK_WORDS]>) -> Option<
             first,
             stride,
             len: (n - 1) as u16,
-            magic: (1u64 << 32).div_ceil(u64::from(stride)),
+            magic: stride_magic(stride),
         },
         Arm::Cone { first, scale, eps } => Container::Cone {
             first,
             scale,
+            inv_scale: cone_inv_scale(scale),
             eps,
             residuals: values
                 .iter()
@@ -2731,6 +2810,10 @@ impl Bitmosaic {
         &self.keys
     }
 
+    pub(crate) fn cumulative(&self) -> &[u64] {
+        &self.cumulative
+    }
+
     pub(crate) fn containers(&self) -> &[Container] {
         &self.containers
     }
@@ -2827,6 +2910,17 @@ impl Bitmosaic {
                 if at == 0 { 0 } else { self.cumulative[at - 1] }
             }
         }
+    }
+
+    /// Count of members strictly below `value` iff `value` is present, in one
+    /// descent (L0 byproduct: avoids separate `contains` + `rank` probes).
+    #[inline]
+    pub fn rank_if_present(&self, value: u32) -> Option<u64> {
+        let key = (value >> 16) as u16;
+        let at = self.locate(key)?;
+        let low = self.containers[at].rank_if_present((value & 0xFFFF) as u16)?;
+        let before = if at == 0 { 0 } else { self.cumulative[at - 1] };
+        Some(before + u64::from(low))
     }
 
     /// k-th member in ascending order.
@@ -3051,42 +3145,156 @@ impl Bitmosaic {
 
     fn combine(&self, other: &Self, keep: [bool; 3]) -> Self {
         let (mut keys, mut containers, mut cumulative) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut i, mut j, mut total) = (0, 0, 0u64);
+        let mut total = 0u64;
         let mut scratch = None;
+        let combine_pair = |a: &Container,
+                            b: &Container,
+                            scratch: &mut Option<AlgebraScratch>|
+         -> Option<Container> {
+            // O(1) CRT fast path for Stride ∩ Stride: zero scratch allocation.
+            if keep == [false, false, true]
+                && let (
+                    Container::Stride {
+                        first: a0,
+                        stride: s1,
+                        len: n1,
+                        ..
+                    },
+                    Container::Stride {
+                        first: b0,
+                        stride: s2,
+                        len: n2,
+                        ..
+                    },
+                ) = (a, b)
+            {
+                return match stride_and_progression(
+                    u32::from(*a0),
+                    u32::from(*s1),
+                    u32::from(*n1) + 1,
+                    u32::from(*b0),
+                    u32::from(*s2),
+                    u32::from(*n2) + 1,
+                ) {
+                    None => None,
+                    Some((first, _, 1)) => Some(Container::Array(Box::from([first as u16]))),
+                    Some((first, step, count)) => Some(Container::Stride {
+                        first: first as u16,
+                        stride: step as u16,
+                        len: (count - 1) as u16,
+                        magic: stride_magic(step as u16),
+                    }),
+                };
+            }
+            let scratch = scratch.get_or_insert_with(|| AlgebraScratch {
+                runs: Vec::new(),
+                plane: [0; CHUNK_WORDS],
+                members: Vec::new(),
+            });
+            match (a, b) {
+                (Container::Runs { runs, .. }, _) => combine_runs(runs, b, keep, scratch),
+                (_, Container::Runs { runs, .. }) => {
+                    combine_runs(runs, a, [keep[1], keep[0], keep[2]], scratch)
+                }
+                (Container::Words { words: wa, .. }, Container::Words { words: wb, .. }) => {
+                    let n = combine_words_plane(wa, wb, keep, &mut scratch.plane);
+                    freeze_chunk_with_len(&scratch.plane, n, &mut scratch.members)
+                }
+                (Container::Array(xa), Container::Array(xb)) => {
+                    combine_arrays(xa, xb, keep, scratch)
+                }
+                (Container::Array(xa), Container::Words { words, .. })
+                | (Container::Words { words, .. }, Container::Array(xa))
+                    if keep == [false, false, true] =>
+                {
+                    scratch.members.clear();
+                    for &v in xa.iter() {
+                        // SAFETY: v: u16 so v >> 6 <= 1023 < CHUNK_WORDS.
+                        if (unsafe { *words.get_unchecked((v >> 6) as usize) } >> (v & 63)) & 1 != 0
+                        {
+                            scratch.members.push(v);
+                        }
+                    }
+                    freeze_members(&scratch.members, None)
+                }
+                _ => {
+                    scratch.plane.fill(0);
+                    a.for_each(|v| {
+                        if if b.contains(v) { keep[2] } else { keep[0] } {
+                            scratch.plane[usize::from(v) / 64] |= 1u64 << (v % 64);
+                        }
+                    });
+                    if keep[1] {
+                        b.for_each(|v| {
+                            if !a.contains(v) {
+                                scratch.plane[usize::from(v) / 64] |= 1u64 << (v % 64);
+                            }
+                        });
+                    }
+                    freeze_chunk(&scratch.plane, &mut scratch.members)
+                }
+            }
+        };
+
+        // Skew-adaptive chunk walk for pure intersection (`and`).
+        if keep == [false, false, true] {
+            let (na, nb) = (self.keys.len(), other.keys.len());
+            if drive_from_small(na, nb, DRIVE_RATIO_KEYS) {
+                gallop_walk(
+                    na,
+                    |i| self.keys[i],
+                    nb,
+                    |j| other.keys[j],
+                    |i, j| {
+                        if let Some(c) =
+                            combine_pair(&self.containers[i], &other.containers[j], &mut scratch)
+                        {
+                            total += u64::from(c.cardinality());
+                            keys.push(self.keys[i]);
+                            containers.push(c);
+                            cumulative.push(total);
+                        }
+                    },
+                );
+                return Self {
+                    keys: keys.into_boxed_slice(),
+                    cumulative: cumulative.into_boxed_slice(),
+                    containers: containers.into_boxed_slice(),
+                };
+            }
+            if drive_from_small(nb, na, DRIVE_RATIO_KEYS) {
+                gallop_walk(
+                    nb,
+                    |j| other.keys[j],
+                    na,
+                    |i| self.keys[i],
+                    |j, i| {
+                        if let Some(c) =
+                            combine_pair(&self.containers[i], &other.containers[j], &mut scratch)
+                        {
+                            total += u64::from(c.cardinality());
+                            keys.push(self.keys[i]);
+                            containers.push(c);
+                            cumulative.push(total);
+                        }
+                    },
+                );
+                return Self {
+                    keys: keys.into_boxed_slice(),
+                    cumulative: cumulative.into_boxed_slice(),
+                    containers: containers.into_boxed_slice(),
+                };
+            }
+        }
+
+        let (mut i, mut j) = (0, 0);
         while i < self.keys.len() || j < other.keys.len() {
             let left = self.keys.get(i).copied();
             let right = other.keys.get(j).copied();
             let (key, container) = match (left, right) {
                 (Some(a), Some(b)) if a == b => {
-                    let scratch = scratch.get_or_insert_with(|| AlgebraScratch {
-                        runs: Vec::new(),
-                        plane: [0; CHUNK_WORDS],
-                        members: Vec::new(),
-                    });
-                    let a = &self.containers[i];
-                    let b = &other.containers[j];
-                    let result = match (a, b) {
-                        (Container::Runs { runs, .. }, _) => combine_runs(runs, b, keep, scratch),
-                        (_, Container::Runs { runs, .. }) => {
-                            combine_runs(runs, a, [keep[1], keep[0], keep[2]], scratch)
-                        }
-                        _ => {
-                            scratch.plane.fill(0);
-                            a.for_each(|v| {
-                                if if b.contains(v) { keep[2] } else { keep[0] } {
-                                    scratch.plane[usize::from(v) / 64] |= 1u64 << (v % 64);
-                                }
-                            });
-                            if keep[1] {
-                                b.for_each(|v| {
-                                    if !a.contains(v) {
-                                        scratch.plane[usize::from(v) / 64] |= 1u64 << (v % 64);
-                                    }
-                                });
-                            }
-                            freeze_chunk(&scratch.plane, &mut scratch.members)
-                        }
-                    };
+                    let result =
+                        combine_pair(&self.containers[i], &other.containers[j], &mut scratch);
                     let key = self.keys[i];
                     i += 1;
                     j += 1;
@@ -3421,6 +3629,10 @@ impl Bitmosaic64 {
         &self.highs
     }
 
+    pub(crate) fn cumulative(&self) -> &[u64] {
+        &self.cumulative
+    }
+
     pub(crate) fn forests(&self) -> &[Bitmosaic] {
         &self.forests
     }
@@ -3467,6 +3679,17 @@ impl Bitmosaic64 {
         }
     }
 
+    /// Count of members strictly below `value` iff `value` is present, in one
+    /// descent (L0 byproduct: avoids separate `contains` + `rank` probes).
+    #[inline]
+    pub fn rank_if_present(&self, value: u64) -> Option<u64> {
+        let high = (value >> 32) as u32;
+        let at = self.locate(high)?;
+        let low = self.forests[at].rank_if_present(value as u32)?;
+        let before = if at == 0 { 0 } else { self.cumulative[at - 1] };
+        Some(before + low)
+    }
+
     /// k-th member in ascending order.
     pub fn select(&self, k: u64) -> Option<u64> {
         if k >= self.len() {
@@ -3487,11 +3710,33 @@ impl Bitmosaic64 {
         Some(((self.highs[at] as u64) << 32) | low as u64)
     }
 
-    /// Fused AND cardinality across forests (allocation-free).
+    /// Fused AND cardinality across forests (allocation-free, skew-adaptive).
     pub fn and_len(&self, other: &Bitmosaic64) -> u64 {
+        let (na, nb) = (self.highs.len(), other.highs.len());
+        if na == 0 || nb == 0 {
+            return 0;
+        }
+        if na.saturating_mul(8) <= nb {
+            let mut count = 0u64;
+            let mut cursor = 0usize;
+            for i in 0..na {
+                let target = self.highs[i];
+                cursor = gallop_u32_by(nb, cursor, target, |j| other.highs[j]);
+                if cursor == nb {
+                    break;
+                }
+                if other.highs[cursor] == target {
+                    count += self.forests[i].and_len(&other.forests[cursor]);
+                    cursor += 1;
+                }
+            }
+            return count;
+        }
+        if nb.saturating_mul(8) <= na {
+            return other.and_len(self);
+        }
         let mut count = 0u64;
         let (mut i, mut j) = (0usize, 0usize);
-        let (na, nb) = (self.highs.len(), other.highs.len());
         while i < na && j < nb {
             let (ha, hb) = (self.highs[i], other.highs[j]);
             if ha == hb {
@@ -3635,24 +3880,398 @@ impl Bitmosaic64 {
         )
     }
 
-    /// Intersect two sorted u64 id slices (the engine's semijoin shape)
-    /// without building anything: chunk-free merged walk reusing the SIMD
-    /// array kernel whenever both runs sit inside one 2^16 block.
+    /// Intersect two strictly ascending u64 id slices (the engine's semijoin
+    /// shape) without building anything: skew-adaptive galloping when
+    /// `min * 8 <= max`, and a block-aligned SIMD array merge whenever both
+    /// runs sit inside one 2^16 block.
     pub fn intersect_sorted(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
         out.clear();
+        let (na, nb) = (a.len(), b.len());
+        if na == 0 || nb == 0 {
+            return;
+        }
+        if na.saturating_mul(8) <= nb {
+            gallop_intersect_u64(a, b, out);
+            return;
+        }
+        if nb.saturating_mul(8) <= na {
+            gallop_intersect_u64(b, a, out);
+            return;
+        }
         let (mut i, mut j) = (0usize, 0usize);
-        while i < a.len() && j < b.len() {
-            let (x, y) = (a[i], b[j]);
-            if x < y {
+        while i < na && j < nb {
+            let (ha, hb) = (a[i] >> 16, b[j] >> 16);
+            if ha < hb {
                 i += 1;
-            } else if x > y {
+                if i < na && (a[i] >> 16) < hb {
+                    i = gallop_u64_slice(a, i, hb << 16);
+                }
+                continue;
+            }
+            if hb < ha {
                 j += 1;
-            } else {
-                out.push(x);
-                i += 1;
-                j += 1;
+                if j < nb && (b[j] >> 16) < ha {
+                    j = gallop_u64_slice(b, j, ha << 16);
+                }
+                continue;
+            }
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            {
+                use core::arch::aarch64::*;
+                // SAFETY: neon is statically enabled; `i + 8 <= na` and
+                // `j + 8 <= nb` guard all four 16-byte loads on each side.
+                unsafe {
+                    while i + 8 <= na
+                        && j + 8 <= nb
+                        && (a[i + 7] >> 16) == ha
+                        && (b[j + 7] >> 16) == ha
+                    {
+                        let ap = a.as_ptr().add(i);
+                        let bp = b.as_ptr().add(j);
+                        let a01 = vld1q_u64(ap);
+                        let a23 = vld1q_u64(ap.add(2));
+                        let a45 = vld1q_u64(ap.add(4));
+                        let a67 = vld1q_u64(ap.add(6));
+                        let va = vcombine_u16(
+                            vmovn_u32(vcombine_u32(vmovn_u64(a01), vmovn_u64(a23))),
+                            vmovn_u32(vcombine_u32(vmovn_u64(a45), vmovn_u64(a67))),
+                        );
+                        let b01 = vld1q_u64(bp);
+                        let b23 = vld1q_u64(bp.add(2));
+                        let b45 = vld1q_u64(bp.add(4));
+                        let b67 = vld1q_u64(bp.add(6));
+                        let vb = vcombine_u16(
+                            vmovn_u32(vcombine_u32(vmovn_u64(b01), vmovn_u64(b23))),
+                            vmovn_u32(vcombine_u32(vmovn_u64(b45), vmovn_u64(b67))),
+                        );
+                        let mut eq = vceqq_u16(va, vb);
+                        let mut rot = vb;
+                        for _ in 0..7 {
+                            rot = vextq_u16(rot, rot, 1);
+                            eq = vorrq_u16(eq, vceqq_u16(va, rot));
+                        }
+                        let mut mask = vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(eq)), 0);
+                        while mask != 0 {
+                            let lane = (mask.trailing_zeros() >> 3) as usize;
+                            out.push(*ap.add(lane));
+                            mask &= !(0xFFu64 << (lane * 8));
+                        }
+                        let amax = *ap.add(7);
+                        let bmax = *bp.add(7);
+                        i += 8 * usize::from(amax <= bmax);
+                        j += 8 * usize::from(bmax <= amax);
+                    }
+                }
+            }
+            // Scalar tail within block `ha` (or whole block on non-NEON).
+            while i < na && j < nb {
+                let (x, y) = (a[i], b[j]);
+                if (x >> 16) != ha || (y >> 16) != ha {
+                    break;
+                }
+                if x < y {
+                    i += 1;
+                } else if x > y {
+                    j += 1;
+                } else {
+                    out.push(x);
+                    i += 1;
+                    j += 1;
+                }
             }
         }
+    }
+}
+
+/// First index in `from..len` with `at(idx) >= target`, via exponential gallop
+/// + bisection. Shared by `Bitmosaic64::and_len` and `Bitmosaic64View::and_len`.
+#[inline(always)]
+pub(crate) fn gallop_u32_by(
+    len: usize,
+    from: usize,
+    target: u32,
+    at: impl Fn(usize) -> u32,
+) -> usize {
+    if from >= len || at(from) >= target {
+        return from.min(len);
+    }
+    let (mut lo, mut step) = (from, 1usize);
+    let mut hi = loop {
+        let probe = lo + step;
+        if probe >= len {
+            break len;
+        }
+        if at(probe) >= target {
+            break probe;
+        }
+        lo = probe;
+        step <<= 1;
+    };
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if at(mid) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
+#[inline(always)]
+fn gallop_u64_slice(slice: &[u64], from: usize, target: u64) -> usize {
+    let len = slice.len();
+    if from >= len || slice[from] >= target {
+        return from.min(len);
+    }
+    let (mut lo, mut step) = (from, 1usize);
+    let mut hi = loop {
+        let probe = lo + step;
+        if probe >= len {
+            break len;
+        }
+        if slice[probe] >= target {
+            break probe;
+        }
+        lo = probe;
+        step <<= 1;
+    };
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if slice[mid] < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
+fn gallop_intersect_u64(small: &[u64], large: &[u64], out: &mut Vec<u64>) {
+    let mut cursor = 0usize;
+    for &x in small {
+        cursor = gallop_u64_slice(large, cursor, x);
+        if cursor == large.len() {
+            break;
+        }
+        if large[cursor] == x {
+            out.push(x);
+            cursor += 1;
+        }
+    }
+}
+
+/// Direct bitwise combine of two `Words` planes into `out`, returning popcount.
+/// Overwrites every word of `out`, so the caller need not zero `out` first.
+fn combine_words_plane(
+    wa: &[u64; CHUNK_WORDS],
+    wb: &[u64; CHUNK_WORDS],
+    keep: [bool; 3],
+    out: &mut [u64; CHUNK_WORDS],
+) -> u32 {
+    let mut count = 0u32;
+    match keep {
+        [false, false, true] => {
+            for w in 0..CHUNK_WORDS {
+                let v = wa[w] & wb[w];
+                out[w] = v;
+                count += v.count_ones();
+            }
+        }
+        [true, true, true] => {
+            for w in 0..CHUNK_WORDS {
+                let v = wa[w] | wb[w];
+                out[w] = v;
+                count += v.count_ones();
+            }
+        }
+        [true, true, false] => {
+            for w in 0..CHUNK_WORDS {
+                let v = wa[w] ^ wb[w];
+                out[w] = v;
+                count += v.count_ones();
+            }
+        }
+        [true, false, false] => {
+            for w in 0..CHUNK_WORDS {
+                let v = wa[w] & !wb[w];
+                out[w] = v;
+                count += v.count_ones();
+            }
+        }
+        [false, true, false] => {
+            for w in 0..CHUNK_WORDS {
+                let v = wb[w] & !wa[w];
+                out[w] = v;
+                count += v.count_ones();
+            }
+        }
+        [true, false, true] => {
+            out.copy_from_slice(wa);
+            return wa.iter().map(|w| w.count_ones()).sum();
+        }
+        [false, true, true] => {
+            out.copy_from_slice(wb);
+            return wb.iter().map(|w| w.count_ones()).sum();
+        }
+        [false, false, false] => return 0,
+    }
+    count
+}
+
+/// Direct sorted merge of two `Array` containers into `scratch.members`,
+/// bypassing the 8 KiB `scratch.plane` unless a union/xor exceeds `ARRAY_MAX`.
+fn combine_arrays(
+    xa: &[u16],
+    xb: &[u16],
+    keep: [bool; 3],
+    scratch: &mut AlgebraScratch,
+) -> Option<Container> {
+    scratch.members.clear();
+    match keep {
+        [false, false, true] => {
+            let (na, nb) = (xa.len(), xb.len());
+            if drive_from_small(na, nb, DRIVE_RATIO_MEMBERS) {
+                let mut tally = Probes::zero();
+                let mut cursor = 0usize;
+                for &v in xa {
+                    cursor = gallop(nb, cursor, v, |j| xb[j], &mut tally);
+                    if cursor == nb {
+                        break;
+                    }
+                    if xb[cursor] == v {
+                        scratch.members.push(v);
+                        cursor += 1;
+                    }
+                }
+            } else if drive_from_small(nb, na, DRIVE_RATIO_MEMBERS) {
+                let mut tally = Probes::zero();
+                let mut cursor = 0usize;
+                for &v in xb {
+                    cursor = gallop(na, cursor, v, |i| xa[i], &mut tally);
+                    if cursor == na {
+                        break;
+                    }
+                    if xa[cursor] == v {
+                        scratch.members.push(v);
+                        cursor += 1;
+                    }
+                }
+            } else {
+                let (mut i, mut j) = (0usize, 0usize);
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_feature = "neon",
+                    target_endian = "little"
+                ))]
+                {
+                    use core::arch::aarch64::*;
+                    // SAFETY: neon is statically enabled; loop bounds guarantee 8 u16s (16 bytes).
+                    unsafe {
+                        while i + 8 <= na && j + 8 <= nb {
+                            let va = vld1q_u16(xa.as_ptr().add(i));
+                            let vb = vld1q_u16(xb.as_ptr().add(j));
+                            let mut eq = vceqq_u16(va, vb);
+                            let mut rot = vb;
+                            for _ in 0..7 {
+                                rot = vextq_u16(rot, rot, 1);
+                                eq = vorrq_u16(eq, vceqq_u16(va, rot));
+                            }
+                            let mut mask = vget_lane_u64(vreinterpret_u64_u8(vmovn_u16(eq)), 0);
+                            while mask != 0 {
+                                let lane = (mask.trailing_zeros() >> 3) as usize;
+                                scratch.members.push(*xa.get_unchecked(i + lane));
+                                mask &= !(0xFFu64 << (lane * 8));
+                            }
+                            let amax = *xa.get_unchecked(i + 7);
+                            let bmax = *xb.get_unchecked(j + 7);
+                            i += 8 * usize::from(amax <= bmax);
+                            j += 8 * usize::from(bmax <= amax);
+                        }
+                    }
+                }
+                while i < na && j < nb {
+                    let (a, b) = (xa[i], xb[j]);
+                    if a < b {
+                        i += 1;
+                    } else if a > b {
+                        j += 1;
+                    } else {
+                        scratch.members.push(a);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            freeze_members(&scratch.members, None)
+        }
+        [true, false, false] => {
+            let (na, nb) = (xa.len(), xb.len());
+            if drive_from_small(na, nb, DRIVE_RATIO_MEMBERS) {
+                let mut tally = Probes::zero();
+                let mut cursor = 0usize;
+                for &v in xa {
+                    cursor = gallop(nb, cursor, v, |j| xb[j], &mut tally);
+                    if cursor < nb && xb[cursor] == v {
+                        cursor += 1;
+                    } else {
+                        scratch.members.push(v);
+                    }
+                }
+            } else {
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < na && j < nb {
+                    let (a, b) = (xa[i], xb[j]);
+                    if a < b {
+                        scratch.members.push(a);
+                        i += 1;
+                    } else if a > b {
+                        j += 1;
+                    } else {
+                        i += 1;
+                        j += 1;
+                    }
+                }
+                scratch.members.extend_from_slice(&xa[i..]);
+            }
+            freeze_members(&scratch.members, None)
+        }
+        [true, true, true] | [true, true, false] => {
+            let emit_both = keep[2];
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < xa.len() && j < xb.len() {
+                let (a, b) = (xa[i], xb[j]);
+                if a < b {
+                    scratch.members.push(a);
+                    i += 1;
+                } else if a > b {
+                    scratch.members.push(b);
+                    j += 1;
+                } else {
+                    if emit_both {
+                        scratch.members.push(a);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+            scratch.members.extend_from_slice(&xa[i..]);
+            scratch.members.extend_from_slice(&xb[j..]);
+            if scratch.members.len() <= ARRAY_MAX {
+                freeze_members(&scratch.members, None)
+            } else {
+                scratch.plane.fill(0);
+                for &v in &scratch.members {
+                    scratch.plane[usize::from(v) / 64] |= 1u64 << (v % 64);
+                }
+                let n = scratch.members.len() as u32;
+                freeze_chunk_with_len(&scratch.plane, n, &mut scratch.members)
+            }
+        }
+        [false, true, false] => combine_arrays(xb, xa, [true, false, false], scratch),
+        [true, false, true] => freeze_members(xa, None),
+        [false, true, true] => freeze_members(xb, None),
+        [false, false, false] => None,
     }
 }
 

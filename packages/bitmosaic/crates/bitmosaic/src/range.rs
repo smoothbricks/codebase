@@ -73,6 +73,7 @@
 //! closed-form or word-popcount kernel, because it never looks at a member.
 //! The ranges add a consumption shape; they retire nothing.
 
+use crate::codec::{cone_guess, cone_window_rank};
 use crate::{Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container};
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -267,7 +268,9 @@ pub(crate) enum ContainerRange<'a> {
     },
     Cone {
         first: u16,
+        eps: u8,
         scale: u64,
+        inv_scale: u64,
         residuals: &'a [i8],
         at: usize,
     },
@@ -348,6 +351,7 @@ impl Range for ContainerRange<'_> {
                 scale,
                 residuals,
                 at,
+                ..
             } => Container::cone_value(*first, *scale, residuals, *at),
             ContainerRange::Array(values) => values[0],
         }
@@ -446,10 +450,61 @@ impl Range for ContainerRange<'_> {
             Self::Array(values) => {
                 *values = &values[crate::array::rank(values, target)..];
             }
-            _ => {
-                while !self.empty() && self.front() < target {
-                    self.pop_front();
+            Self::Words {
+                words,
+                word,
+                bits,
+                remaining,
+            } => {
+                // `bits` belongs to word index `*word - 1`.
+                let here = *word - 1;
+                let goal = usize::from(target >> 6);
+                let mask = !((1u64 << (target & 63)) - 1);
+                if goal == here {
+                    *remaining -= (*bits & !mask).count_ones();
+                    *bits &= mask;
+                } else {
+                    *remaining -= bits.count_ones();
+                    *bits = 0;
+                    while *word < goal {
+                        *remaining -= words[*word].count_ones();
+                        *word += 1;
+                    }
+                    let landing = words[goal];
+                    *remaining -= (landing & !mask).count_ones();
+                    *bits = landing & mask;
+                    *word = goal + 1;
                 }
+                while *bits == 0 {
+                    if *remaining == 0 || *word >= CHUNK_WORDS {
+                        *remaining = 0;
+                        return;
+                    }
+                    *bits = words[*word];
+                    *word += 1;
+                }
+            }
+            Self::Cone {
+                first,
+                eps,
+                scale,
+                inv_scale,
+                residuals,
+                at,
+            } => {
+                let n = residuals.len();
+                let delta = target.saturating_sub(*first);
+                let guess = cone_guess(delta, *scale, *inv_scale) as i64;
+                let margin = 2 + i64::from(*eps);
+                let lo = ((guess - margin).max(0).min(n as i64) as usize).max(*at);
+                let hi = ((guess + margin + 1) as usize).min(n);
+                *at = if lo >= hi {
+                    hi
+                } else {
+                    cone_window_rank(lo, hi, target, |i| {
+                        Container::cone_value(*first, *scale, residuals, i)
+                    })
+                };
             }
         }
     }
@@ -544,6 +599,7 @@ impl Iterator for ContainerRange<'_> {
                 scale,
                 residuals,
                 at,
+                ..
             } => {
                 for i in at..residuals.len() {
                     acc = f(acc, Container::cone_value(first, scale, residuals, i));
@@ -579,11 +635,46 @@ impl ExactSizeIterator for ContainerRange<'_> {
 /// At every non-empty position, `set.len() as usize - range.len()` is the
 /// zero-based ordinal of `range.front()`. Read it before `pop_front`: no
 /// [`Bitmosaic::rank`] call or second directory descent is needed.
+/// First index in ascending `slice` whose value is `>= target`, via
+/// exponential gallop from index 0 followed by bisection: `O(log d)`.
+#[inline(always)]
+fn gallop_slice<T: Copy + Ord>(slice: &[T], target: T) -> usize {
+    let n = slice.len();
+    if n == 0 || slice[0] >= target {
+        return 0;
+    }
+    let (mut lo, mut step) = (0usize, 1usize);
+    let mut hi = loop {
+        let probe = lo + step;
+        if probe >= n {
+            break n;
+        }
+        if slice[probe] >= target {
+            break probe;
+        }
+        lo = probe;
+        step <<= 1;
+    };
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if slice[mid] < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
 #[derive(Clone, Copy)]
 pub struct ForestRange<'a> {
     /// Chunks NOT yet opened; `inner` is the one currently open.
     keys: &'a [u16],
     containers: &'a [Container],
+    /// Exclusive-end cumulative counts parallel to `keys`/`containers`.
+    cumulative: &'a [u64],
+    /// Total cardinality of the owning forest.
+    total: usize,
     /// Chunk key of `inner`, shifted into place.
     high: u32,
     inner: ContainerRange<'a>,
@@ -593,12 +684,15 @@ pub struct ForestRange<'a> {
 impl<'a> ForestRange<'a> {
     #[inline]
     pub(crate) fn new(forest: &'a Bitmosaic) -> Self {
+        let total = forest.len() as usize;
         let mut range = ForestRange {
             keys: forest.keys(),
             containers: forest.containers(),
+            cumulative: forest.cumulative(),
+            total,
             high: 0,
             inner: ContainerRange::Array(&[]),
-            remaining: forest.len() as usize,
+            remaining: total,
         };
         range.open_next();
         range
@@ -615,15 +709,18 @@ impl<'a> ForestRange<'a> {
     #[inline(always)]
     fn open_next(&mut self) {
         while Range::empty(&self.inner) {
-            // keys and containers are parallel planes of equal length, so
-            // one running dry ends the walk.
-            let (Some((&key, keys)), Some((container, containers))) =
-                (self.keys.split_first(), self.containers.split_first())
-            else {
+            // keys, containers, and cumulative are parallel planes of equal
+            // length, so one running dry ends the walk.
+            let (Some((&key, keys)), Some((container, containers)), Some((_, cumulative))) = (
+                self.keys.split_first(),
+                self.containers.split_first(),
+                self.cumulative.split_first(),
+            ) else {
                 return;
             };
             self.keys = keys;
             self.containers = containers;
+            self.cumulative = cumulative;
             self.high = u32::from(key) << 16;
             self.inner = container.range();
         }
@@ -656,11 +753,28 @@ impl Range for ForestRange<'_> {
         if self.empty() || self.front() >= target {
             return;
         }
-        let high = target & 0xffff_0000;
-        while self.remaining != 0 && self.high < high {
-            self.remaining -= self.inner.remaining();
-            self.inner = ContainerRange::Array(&[]);
-            self.open_next();
+        let target_key = (target >> 16) as u16;
+        let high = u32::from(target_key) << 16;
+        if self.high < high {
+            let idx = gallop_slice(self.keys, target_key);
+            if idx == self.keys.len() {
+                self.keys = &[];
+                self.containers = &[];
+                self.cumulative = &[];
+                self.inner = ContainerRange::Array(&[]);
+                self.remaining = 0;
+                return;
+            }
+            if idx == 0 {
+                self.remaining -= self.inner.remaining();
+            } else {
+                self.remaining = self.total - self.cumulative[idx - 1] as usize;
+            }
+            self.high = u32::from(self.keys[idx]) << 16;
+            self.inner = self.containers[idx].range();
+            self.keys = &self.keys[idx + 1..];
+            self.containers = &self.containers[idx + 1..];
+            self.cumulative = &self.cumulative[idx + 1..];
         }
         if self.remaining != 0 && self.high == high {
             let before = self.inner.remaining();
@@ -742,6 +856,8 @@ impl ExactSizeIterator for ForestRange<'_> {
 pub struct Forest64Range<'a> {
     highs: &'a [u32],
     forests: &'a [Bitmosaic],
+    cumulative: &'a [u64],
+    total: usize,
     /// High-32 prefix of `inner`, shifted into place.
     high: u64,
     inner: ForestRange<'a>,
@@ -751,20 +867,25 @@ pub struct Forest64Range<'a> {
 impl<'a> Forest64Range<'a> {
     #[inline]
     pub(crate) fn new(set: &'a Bitmosaic64) -> Self {
+        let total = set.len() as usize;
         let mut range = Forest64Range {
             highs: set.highs(),
             forests: set.forests(),
+            cumulative: set.cumulative(),
+            total,
             high: 0,
             // An empty ForestRange borrowing nothing; `open_next` replaces
             // it immediately when the tier holds any member at all.
             inner: ForestRange {
                 keys: &[],
                 containers: &[],
+                cumulative: &[],
+                total: 0,
                 high: 0,
                 inner: ContainerRange::Array(&[]),
                 remaining: 0,
             },
-            remaining: set.len() as usize,
+            remaining: total,
         };
         range.open_next();
         range
@@ -773,13 +894,16 @@ impl<'a> Forest64Range<'a> {
     #[inline(always)]
     fn open_next(&mut self) {
         while Range::empty(&self.inner) {
-            let (Some((&high, highs)), Some((forest, forests))) =
-                (self.highs.split_first(), self.forests.split_first())
-            else {
+            let (Some((&high, highs)), Some((forest, forests)), Some((_, cumulative))) = (
+                self.highs.split_first(),
+                self.forests.split_first(),
+                self.cumulative.split_first(),
+            ) else {
                 return;
             };
             self.highs = highs;
             self.forests = forests;
+            self.cumulative = cumulative;
             self.high = u64::from(high) << 32;
             self.inner = ForestRange::new(forest);
         }
@@ -812,11 +936,28 @@ impl Range for Forest64Range<'_> {
         if self.empty() || self.front() >= target {
             return;
         }
-        let high = target & 0xffff_ffff_0000_0000;
-        while self.remaining != 0 && self.high < high {
-            self.remaining -= self.inner.remaining;
-            self.inner.remaining = 0;
-            self.open_next();
+        let target_high = (target >> 32) as u32;
+        let high = u64::from(target_high) << 32;
+        if self.high < high {
+            let idx = gallop_slice(self.highs, target_high);
+            if idx == self.highs.len() {
+                self.highs = &[];
+                self.forests = &[];
+                self.cumulative = &[];
+                self.inner.remaining = 0;
+                self.remaining = 0;
+                return;
+            }
+            if idx == 0 {
+                self.remaining -= self.inner.remaining;
+            } else {
+                self.remaining = self.total - self.cumulative[idx - 1] as usize;
+            }
+            self.high = u64::from(self.highs[idx]) << 32;
+            self.inner = ForestRange::new(&self.forests[idx]);
+            self.highs = &self.highs[idx + 1..];
+            self.forests = &self.forests[idx + 1..];
+            self.cumulative = &self.cumulative[idx + 1..];
         }
         if self.remaining != 0 && self.high == high {
             let before = self.inner.remaining;
@@ -1198,6 +1339,16 @@ where
         debug_assert!(!Range::empty(self), "pop_front on an empty range");
         self.step();
     }
+
+    #[inline]
+    fn seek(&mut self, target: T) {
+        if Range::empty(self) || Range::front(self) >= target {
+            return;
+        }
+        self.a.seek(target);
+        self.b.seek(target);
+        self.side = Self::decide(&self.a, &self.b);
+    }
 }
 
 impl<T, A, B> Iterator for OrRange<A, B>
@@ -1270,7 +1421,7 @@ where
         while !self.a.empty() && !self.b.empty() {
             let (x, y) = (self.a.front(), self.b.front());
             if y < x {
-                self.b.pop_front();
+                self.b.seek(x);
             } else if y == x {
                 // Both sources ascend strictly, so this `b` value can never
                 // match again: drop it with the `a` value it killed.
@@ -1306,6 +1457,16 @@ where
     fn pop_front(&mut self) {
         debug_assert!(!Range::empty(self), "pop_front on an empty range");
         self.a.pop_front();
+        self.align();
+    }
+
+    #[inline]
+    fn seek(&mut self, target: T) {
+        if Range::empty(self) || self.a.front() >= target {
+            return;
+        }
+        self.a.seek(target);
+        self.b.seek(target);
         self.align();
     }
 }
@@ -1434,6 +1595,16 @@ where
     fn pop_front(&mut self) {
         debug_assert!(!Range::empty(self), "pop_front on an empty range");
         self.step();
+    }
+
+    #[inline]
+    fn seek(&mut self, target: T) {
+        if Range::empty(self) || Range::front(self) >= target {
+            return;
+        }
+        self.a.seek(target);
+        self.b.seek(target);
+        self.decide();
     }
 }
 

@@ -35,56 +35,20 @@
 //! computed into the scratch first; a refusal returns with the string
 //! exactly as it was.
 
-use core::fmt;
-
+pub use crate::codec::PatchError;
+use crate::codec::{read_u16_at, read_u32_at, read_u64_at, uleb_len};
 use crate::ef::{self, EfLayout, EfView, SAMPLE_STRIDE};
 use crate::wire::{
     BOUNDS_AT, BitmosaicView, CView, ChunkRow, EMPTY_U32_IMAGE, Forest, Geometry, IMAGE_ID_LEN,
     K_ARRAY, K_CONE, K_RUNS, K_STRIDE, K_WORDS, KeyWidth, Root, WORDS_AT, cone_value,
     ef_header_len, emit_array, emit_cone, emit_runs, emit_stride, emit_words, forest_header_len,
-    frame_len, image_header, read_u16_at, read_u32_at, read_u64_at, runs_payload_len,
-    slot_bits_for_span, uleb_len, word_window, words_payload_len, write_directory, write_ef_header,
-    write_forest_header, write_kind,
+    frame_len, image_header, runs_payload_len, slot_bits_for_span, word_window, words_payload_len,
+    write_directory, write_ef_header, write_forest_header, write_kind,
 };
 use crate::{
     ARRAY_MAX, Arm, BLOCK_WORDS, CHUNK_WORDS, CONE_MAX_LEN, DIR_STRIDE, SUMMARY_WORDS, choose_arm,
     cone_residual,
 };
-
-/// Why a write into a fixed-capacity slot was refused. Nothing in the slot
-/// is touched on any of these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PatchError {
-    /// The string needs `needed` bytes and the slot holds fewer. Grow the
-    /// slot to at least `needed` and retry.
-    Capacity { needed: usize },
-    /// The slot does not begin with a well-formed native u32 image. Initialise
-    /// it with `Bitmosaic::write_into_slice` of the set it should hold (the
-    /// empty set included) before patching.
-    Malformed,
-    /// `adds` or `removes` is not strictly ascending. Sort and dedup the
-    /// batch; the patch is one merge pass and needs the order.
-    Unsorted,
-}
-
-impl fmt::Display for PatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PatchError::Capacity { needed } => write!(
-                f,
-                "the native image needs {needed} bytes and the slot holds fewer; grow the slot to at least {needed} bytes and retry"
-            ),
-            PatchError::Malformed => f.write_str(
-                "the slot does not begin with a well-formed native u32 image; initialise it with Bitmosaic::write_into_slice before patching",
-            ),
-            PatchError::Unsorted => f.write_str(
-                "adds and removes must each be strictly ascending; sort and dedup the batch before patching",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PatchError {}
 
 /// What a patch did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -762,7 +726,9 @@ fn stage(plane: &mut [u64; CHUNK_WORDS], container: CView<'_>) {
                 set_bit(plane, read_u16_at(values, 2 * i));
             }
         }
-        CView::Stride { first, stride, len } => {
+        CView::Stride {
+            first, stride, len, ..
+        } => {
             let n = usize::from(len) + 1;
             if stride == 1 {
                 fill_range(plane, usize::from(first), usize::from(first) + n);
@@ -862,7 +828,9 @@ fn merge_sequence<W: Witness>(
             witness,
             members,
         ),
-        CView::Stride { first, stride, len } => merge_members(
+        CView::Stride {
+            first, stride, len, ..
+        } => merge_members(
             (usize::from(len) + 1, |i| {
                 (usize::from(first) + i * usize::from(stride)) as u16
             }),

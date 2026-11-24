@@ -15,7 +15,7 @@
 //! construction, because `low_bits` is chosen so the high plane holds about
 //! as many zeros as ones. No binary search appears on any read path.
 
-use crate::wire::{read_u32_at, read_u64_at, read_uleb_checked};
+use crate::codec::{read_u32_at, read_u64_at, read_uleb_checked, select64};
 use crate::{AdmissionClass, AdmissionError};
 
 /// One sample every 64 ones and every 64 zeros. The samples are absolute
@@ -312,11 +312,7 @@ impl<'a> EfView<'a> {
         loop {
             let ones = u64::from(word.count_ones());
             if remaining < ones {
-                let mut bits = word;
-                for _ in 0..remaining {
-                    bits &= bits - 1;
-                }
-                return (w as u64) * 64 + u64::from(bits.trailing_zeros());
+                return (w as u64) * 64 + u64::from(select64(word, remaining as u32));
             }
             remaining -= ones;
             w += 1;
@@ -348,11 +344,7 @@ impl<'a> EfView<'a> {
         loop {
             let zeros = u64::from(word.count_ones());
             if remaining < zeros {
-                let mut bits = word;
-                for _ in 0..remaining {
-                    bits &= bits - 1;
-                }
-                return (w as u64) * 64 + u64::from(bits.trailing_zeros());
+                return (w as u64) * 64 + u64::from(select64(word, remaining as u32));
             }
             remaining -= zeros;
             w += 1;
@@ -378,10 +370,11 @@ impl<'a> EfView<'a> {
         }
     }
 
+    /// Members strictly below `value` if `value` is present, in one descent.
     #[inline]
-    pub fn contains(&self, value: u32) -> bool {
+    pub fn rank_if_present(&self, value: u32) -> Option<u64> {
         if value < self.base || value > self.base.saturating_add(self.span) {
-            return false;
+            return None;
         }
         let d = u64::from(value - self.base);
         let h = d >> self.layout.low_bits;
@@ -390,15 +383,20 @@ impl<'a> EfView<'a> {
         while k < self.len && self.bit(p) {
             let low = self.low(k);
             if low == want {
-                return true;
+                return Some(k);
             }
             if low > want {
-                return false;
+                return None;
             }
             k += 1;
             p += 1;
         }
-        false
+        None
+    }
+
+    #[inline]
+    pub fn contains(&self, value: u32) -> bool {
+        self.rank_if_present(value).is_some()
     }
 
     /// Members strictly below `value`.
@@ -575,6 +573,97 @@ impl<'a> EfView<'a> {
     pub(crate) fn range(&self) -> EfRange<'a> {
         EfRange::at_rank(*self, 0)
     }
+
+    /// Forward/galloping probe cursor for strictly ascending membership tests
+    /// without restarting `select_zero` per element.
+    #[inline]
+    pub(crate) fn probe_cursor(&self) -> EfProbeCursor<'a> {
+        EfProbeCursor {
+            view: *self,
+            cur_h: 0,
+            k: 0,
+            p: 0,
+            max: self.base.saturating_add(self.span),
+        }
+    }
+}
+
+/// Forward-advancing cursor for strictly ascending probes over an [`EfView`].
+///
+/// Adjacent probes in the same bucket skip zero-selection entirely; nearby
+/// buckets scan forward inside the current high-plane word via `select64`;
+/// distant buckets jump directly via `bucket_start`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EfProbeCursor<'a> {
+    view: EfView<'a>,
+    cur_h: u64,
+    k: u64,
+    p: u64,
+    max: u32,
+}
+
+impl<'a> EfProbeCursor<'a> {
+    /// Whether `value` is present, assuming strictly ascending `value`s.
+    #[inline]
+    pub(crate) fn contains_ascending(&mut self, value: u32) -> bool {
+        if self.k >= self.view.len || value < self.view.base {
+            return false;
+        }
+        if value > self.max {
+            self.k = self.view.len;
+            return false;
+        }
+        let d = u64::from(value - self.view.base);
+        let h = d >> self.view.layout.low_bits;
+        let want = d & ((1u64 << self.view.layout.low_bits) - 1);
+        if h > self.cur_h {
+            let dh = h - self.cur_h;
+            if dh < u64::from(SAMPLE_STRIDE) {
+                let mut rem = dh - 1;
+                let mut w = (self.p / 64) as usize;
+                if w >= self.view.layout.high_words {
+                    self.k = self.view.len;
+                    return false;
+                }
+                let mut word = !self.view.high_word(w) & !((1u64 << (self.p % 64)) - 1);
+                let zero_pos = loop {
+                    let zeros = u64::from(word.count_ones());
+                    if rem < zeros {
+                        break (w as u64) * 64 + u64::from(select64(word, rem as u32));
+                    }
+                    rem -= zeros;
+                    w += 1;
+                    if w >= self.view.layout.high_words {
+                        self.k = self.view.len;
+                        return false;
+                    }
+                    word = !self.view.high_word(w);
+                };
+                self.cur_h = h;
+                self.p = zero_pos + 1;
+                self.k = zero_pos.saturating_sub(h - 1);
+            } else {
+                let (k, p) = self.view.bucket_start(h);
+                self.cur_h = h;
+                self.k = k;
+                self.p = p;
+            }
+        }
+        while self.k < self.view.len && self.view.bit(self.p) {
+            let low = self.view.low(self.k);
+            if low == want {
+                self.k += 1;
+                self.p += 1;
+                return true;
+            }
+            if low > want {
+                return false;
+            }
+            self.k += 1;
+            self.p += 1;
+        }
+        false
+    }
 }
 
 /// Ascending cursor over a borrowed Elias-Fano plane.
@@ -684,9 +773,70 @@ impl<'a> EfRange<'a> {
     /// backwards.
     #[inline]
     pub(crate) fn seek(&mut self, value: u32) {
-        let k = self.view.rank(value);
-        if k > self.k {
-            *self = EfRange::at_rank(self.view, k);
+        if self.empty() || self.front() >= value {
+            return;
         }
+        if value > self.view.base.saturating_add(self.view.span) {
+            self.k = self.view.len;
+            self.bits = 0;
+            return;
+        }
+        let d = u64::from(value - self.view.base);
+        let h = d >> self.view.layout.low_bits;
+        let want = d & ((1u64 << self.view.layout.low_bits) - 1);
+        let cur_p = (self.word as u64).wrapping_sub(1) * 64 + u64::from(self.bits.trailing_zeros());
+        let cur_h = cur_p.saturating_sub(self.k);
+        let (mut k, mut p) = if h <= cur_h {
+            (self.k, cur_p)
+        } else if h - cur_h < u64::from(SAMPLE_STRIDE) {
+            let mut rem = h - cur_h - 1;
+            let mut w = (cur_p / 64) as usize;
+            if w >= self.view.layout.high_words {
+                self.k = self.view.len;
+                self.bits = 0;
+                return;
+            }
+            let mut word = !self.view.high_word(w) & !((1u64 << (cur_p % 64)) - 1);
+            let zero_pos = loop {
+                let zeros = u64::from(word.count_ones());
+                if rem < zeros {
+                    break (w as u64) * 64 + u64::from(select64(word, rem as u32));
+                }
+                rem -= zeros;
+                w += 1;
+                if w >= self.view.layout.high_words {
+                    self.k = self.view.len;
+                    self.bits = 0;
+                    return;
+                }
+                word = !self.view.high_word(w);
+            };
+            (zero_pos.saturating_sub(h - 1), zero_pos + 1)
+        } else {
+            self.view.bucket_start(h)
+        };
+        while k < self.view.len && self.view.bit(p) && self.view.low(k) < want {
+            k += 1;
+            p += 1;
+        }
+        if k >= self.view.len || p >= self.view.layout.high_bits {
+            self.k = self.view.len;
+            self.bits = 0;
+            return;
+        }
+        let mut w = (p / 64) as usize;
+        let mut bits = self.view.high_word(w) & !((1u64 << (p % 64)) - 1);
+        while bits == 0 {
+            w += 1;
+            if w >= self.view.layout.high_words {
+                self.k = self.view.len;
+                self.bits = 0;
+                return;
+            }
+            bits = self.view.high_word(w);
+        }
+        self.word = w + 1;
+        self.bits = bits;
+        self.k = k;
     }
 }
