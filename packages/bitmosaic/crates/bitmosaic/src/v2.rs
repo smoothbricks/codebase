@@ -1501,53 +1501,80 @@ impl<'a> Dir64V2View<'a> {
         Dir64V2Range::new(*self)
     }
 
-    pub fn and_len(&self, other: &Dir64V2View<'_>) -> u64 {
+    /// Sum `on_match(high, a_child, b_child)` over every shared high-32 prefix
+    /// `<= max_hi`, using exponential galloping when child counts are >= 8x
+    /// skewed and a two-pointer merge otherwise.
+    #[inline(always)]
+    fn sum_matching_children(
+        &self,
+        other: &Dir64V2View<'_>,
+        max_hi: u32,
+        mut on_match: impl FnMut(u32, &V2View<'_>, &V2View<'_>) -> u64,
+    ) -> u64 {
         let (na, nb) = (self.children as usize, other.children as usize);
-        let (mut i, mut j, mut count) = (0, 0, 0u64);
-        while i < na && j < nb {
-            let (ha, hb) = (self.high(i), other.high(j));
-            if ha == hb {
-                if let (Some(a), Some(b)) = (self.child(i), other.child(j)) {
-                    count += a.and_len(&b);
+        if na == 0 || nb == 0 {
+            return 0;
+        }
+        let (small, large, ns, nl) = if na.saturating_mul(8) <= nb {
+            (self, other, na, nb)
+        } else if nb.saturating_mul(8) <= na {
+            (other, self, nb, na)
+        } else {
+            let (mut i, mut j, mut count) = (0usize, 0usize, 0u64);
+            while i < na && j < nb {
+                let (ha, hb) = (self.high(i), other.high(j));
+                if ha > max_hi || hb > max_hi {
+                    break;
                 }
-                i += 1;
-                j += 1;
-            } else if ha < hb {
-                i += 1;
-            } else {
-                j += 1;
+                if ha == hb {
+                    if let (Some(a), Some(b)) = (self.child(i), other.child(j)) {
+                        count += on_match(ha, &a, &b);
+                    }
+                    i += 1;
+                    j += 1;
+                } else if ha < hb {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            return count;
+        };
+        let mut count = 0u64;
+        let mut cursor = 0usize;
+        for i in 0..ns {
+            let target = small.high(i);
+            if target > max_hi {
+                break;
+            }
+            cursor = crate::gallop_u32_by(nl, cursor, target, |j| large.high(j));
+            if cursor == nl {
+                break;
+            }
+            if large.high(cursor) == target {
+                if let (Some(a), Some(b)) = (small.child(i), large.child(cursor)) {
+                    count += on_match(target, &a, &b);
+                }
+                cursor += 1;
             }
         }
         count
     }
 
+    pub fn and_len(&self, other: &Dir64V2View<'_>) -> u64 {
+        self.sum_matching_children(other, u32::MAX, |_, a, b| a.and_len(b))
+    }
+
     pub fn and_rank(&self, other: &Dir64V2View<'_>, limit: u64) -> u64 {
         let limit_hi = (limit >> 32) as u32;
         let limit_lo = limit as u32;
-        let (na, nb) = (self.children as usize, other.children as usize);
-        let (mut i, mut j, mut count) = (0, 0, 0u64);
-        while i < na && j < nb {
-            let (ha, hb) = (self.high(i), other.high(j));
-            if ha > limit_hi || hb > limit_hi {
-                break;
-            }
-            if ha == hb {
-                if let (Some(a), Some(b)) = (self.child(i), other.child(j)) {
-                    count += if ha < limit_hi {
-                        a.and_len(&b)
-                    } else {
-                        a.and_rank(&b, limit_lo)
-                    };
-                }
-                i += 1;
-                j += 1;
-            } else if ha < hb {
-                i += 1;
+        self.sum_matching_children(other, limit_hi, |hi, a, b| {
+            if hi < limit_hi {
+                a.and_len(b)
             } else {
-                j += 1;
+                a.and_rank(b, limit_lo)
             }
-        }
-        count
+        })
     }
 }
 
@@ -1626,7 +1653,8 @@ impl Range for Dir64V2Range<'_> {
             return;
         }
         let m = self.view.children as usize;
-        let mut at = self.view.walk(target_hi);
+        let mut at =
+            crate::gallop_u32_by(m, self.child_idx as usize, target_hi, |i| self.view.high(i));
         if at < m && self.view.high(at) == target_hi {
             if let Some(c) = self.view.child(at) {
                 let mut inner = c.range();

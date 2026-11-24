@@ -243,6 +243,19 @@ pub(crate) fn stride_quotient(delta: u32, magic: u64) -> u32 {
     ((u64::from(delta) * magic) >> 32) as u32
 }
 
+/// `ceil(delta / stride)` for `delta <= 65_536` from a reciprocal produced by
+/// [`stride_magic`]. Avoids hardware division on `Stride` seeks and interval
+/// intersections: when `delta > 0`, `delta - 1 < 2^16`, so `stride_quotient`
+/// is exact across the entire `u16` chunk domain (including `end = 65_536`).
+#[inline(always)]
+pub(crate) fn stride_quotient_ceil(delta: u32, magic: u64) -> u32 {
+    if delta == 0 {
+        0
+    } else {
+        stride_quotient(delta - 1, magic) + 1
+    }
+}
+
 /// Initial 15-bit lower-bound reciprocal seed for [`cone_inv_scale`]:
 /// `LUT[idx] = floor(2^21 / (65 + idx))`, guaranteeing `m32_hi * (LUT[idx] << 16) <= 2^62`.
 const CONE_RECIP_LUT: [u16; 64] = {
@@ -319,6 +332,7 @@ pub(crate) fn cone_window_rank(lo: usize, hi: usize, v: u16, at: impl Fn(usize) 
 mod tests {
     use super::{
         cone_guess, cone_inv_scale, cone_window_rank, select64, stride_magic, stride_quotient,
+        stride_quotient_ceil,
     };
 
     fn naive_select64(mut word: u64, rank: u32) -> u32 {
@@ -385,6 +399,13 @@ mod tests {
                     stride_quotient(delta, magic),
                     delta / u32::from(stride),
                     "stride={stride} delta={delta}"
+                );
+            }
+            for delta in 0..=65536u32 {
+                assert_eq!(
+                    stride_quotient_ceil(delta, magic),
+                    delta.div_ceil(u32::from(stride)),
+                    "ceil stride={stride} delta={delta}"
                 );
             }
         }

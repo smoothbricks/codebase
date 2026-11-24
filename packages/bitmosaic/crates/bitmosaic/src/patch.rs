@@ -2699,11 +2699,8 @@ fn build_samples(plane: &[u8], high_bits: u64, ones_out: &mut [u8], zeros_out: &
 
 /// Position of the `r`-th set bit of `word` (`r < popcount`).
 #[inline(always)]
-fn select_in_word(mut word: u64, r: u32) -> u64 {
-    for _ in 0..r {
-        word &= word - 1;
-    }
-    u64::from(word.trailing_zeros())
+fn select_in_word(word: u64, r: u32) -> u64 {
+    u64::from(crate::codec::select64(word, r))
 }
 
 /// 64 bits of `src` from bit `from`, zero past the end.

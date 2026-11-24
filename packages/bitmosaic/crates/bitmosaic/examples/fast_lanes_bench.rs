@@ -1,7 +1,7 @@
 //! Same-binary interleaved A/B direction benchmark for bitmosaic fast lanes.
 //!
-//! Compares each new fast lane against its previous algorithm in one binary
-//! with interleaved paired rounds and a like-arm A/A floor.
+//! Compares each fast lane against its previous algorithm in one binary
+//! with 24 interleaved paired rounds and a like-arm A/A floor.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -11,7 +11,11 @@ fn main() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    use bitmosaic::{AndNotRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView, Range};
+    use bitmosaic::{
+        AndNotRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView, Dir64V2View, Range,
+    };
+
+    const ROUNDS: usize = 24;
 
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
@@ -33,14 +37,15 @@ fn main() {
         mut control: impl FnMut() -> u64,
         mut fast: impl FnMut() -> u64,
     ) {
-        // Warmup.
-        black_box(control());
-        black_box(fast());
+        // Equivalence check + warmup before timing.
+        let c0 = black_box(control());
+        let f0 = black_box(fast());
+        assert_eq!(c0, f0, "benchmark {name}: control ({c0}) != fast ({f0})");
         let mut t_ctrl = Vec::with_capacity(rounds);
         let mut t_fast = Vec::with_capacity(rounds);
         let mut aa_ratios = Vec::with_capacity(rounds);
         for r in 0..rounds {
-            // Interleaved order alternates each round to cancel drift.
+            // Interleaved order alternates each round to cancel host-load drift.
             let (c, f) = if r % 2 == 0 {
                 let t0 = Instant::now();
                 let mut acc = 0u64;
@@ -76,7 +81,7 @@ fn main() {
                 let dc = t0.elapsed().as_nanos() as f64 / iters as f64;
                 (dc, df)
             };
-            // A/A check on fast arm.
+            // Like-arm A/A floor on the fast arm.
             let t2 = Instant::now();
             let mut acc3 = 0u64;
             for _ in 0..iters {
@@ -99,207 +104,24 @@ fn main() {
         let speedup = med_c / med_f;
         let disjoint = max_f < min_c;
         println!(
-            "{name:<32} ctrl={med_c:9.1} ns  fast={med_f:8.1} ns  speedup={speedup:7.2}x  disjoint={disjoint:<5}  A/A={aa_med:4.1}%  (rounds={rounds})"
+            "{name:<36} ctrl={med_c:9.1} ns  fast={med_f:8.1} ns  speedup={speedup:7.2}x  disjoint={disjoint:<5}  A/A={aa_med:4.1}%  (rounds={rounds})"
         );
     }
 
     let mut rng = 0xBEEF_1234_5678_9ABCu64;
 
-    // 1. open_admitted vs open (80-chunk forest with slot plane).
-    let mut slot_vals = Vec::new();
-    for c in 0..80u32 {
-        let hi = (c * 3) << 16;
-        for j in 0..60u32 {
-            slot_vals.push(hi | (j * 500 + (c % 7)));
-        }
-    }
-    let slot_bytes = Bitmosaic::from_sorted(slot_vals).to_bytes();
-    bench_ab(
-        "open_admitted (u32 80ch slot)",
-        11,
-        5_000,
-        || BitmosaicView::open(black_box(&slot_bytes)).unwrap().len(),
-        || {
-            BitmosaicView::open_admitted(black_box(&slot_bytes))
-                .unwrap()
-                .len()
-        },
-    );
-
-    // 2. open_admitted vs open (u64 40-forest).
-    let mut u64_vals = Vec::new();
-    for h in 0..40u64 {
-        let hi = (h * 3 + 1) << 32;
-        for k in 0..100u64 {
-            u64_vals.push(hi | (k * 7));
-        }
-    }
-    let u64_bytes = Bitmosaic64::from_sorted(u64_vals).to_bytes();
-    bench_ab(
-        "open_admitted (u64 40 forests)",
-        11,
-        5_000,
-        || Bitmosaic64View::open(black_box(&u64_bytes)).unwrap().len(),
-        || {
-            Bitmosaic64View::open_admitted(black_box(&u64_bytes))
-                .unwrap()
-                .len()
-        },
-    );
-
-    // 3. rank_if_present vs contains + rank (Words chunk).
-    let words_a_vals = sorted_unique(
-        (0..20_000)
-            .map(|_| (xorshift(&mut rng) % 65_536) as u32)
-            .collect(),
-    );
-    let words_b_vals = sorted_unique(
-        (0..20_000)
-            .map(|_| (xorshift(&mut rng) % 65_536) as u32)
-            .collect(),
-    );
-    let words_a = Bitmosaic::from_sorted(words_a_vals.iter().copied());
-    let words_b = Bitmosaic::from_sorted(words_b_vals.iter().copied());
-    let words_a_bytes = words_a.to_bytes();
-    let words_b_bytes = words_b.to_bytes();
-    let vw_a = BitmosaicView::open_admitted(&words_a_bytes).unwrap();
-    let vw_b = BitmosaicView::open_admitted(&words_b_bytes).unwrap();
-    let probes: Vec<u32> = (0..1_024)
-        .map(|i| words_a_vals[(i * 19) % words_a_vals.len()])
-        .collect();
-    bench_ab(
-        "rank_if_present (1024 Words)",
-        11,
-        500,
-        || {
-            let mut s = 0u64;
-            for &v in &probes {
-                if vw_a.contains(v) {
-                    s = s.wrapping_add(vw_a.rank(v));
-                }
-            }
-            s
-        },
-        || {
-            let mut s = 0u64;
-            for &v in &probes {
-                if let Some(r) = vw_a.rank_if_present(v) {
-                    s = s.wrapping_add(r);
-                }
-            }
-            s
-        },
-    );
-
-    // 4. combine Words × Words (`and`) vs former scalar for_each + contains.
-    bench_ab(
-        "combine Words x Words (and)",
-        11,
-        200,
-        || {
-            let mut plane = [0u64; 1024];
-            for v in words_a.iter() {
-                if words_b.contains(v) {
-                    plane[(v >> 6) as usize] |= 1u64 << (v & 63);
-                }
-            }
-            plane.iter().map(|w| u64::from(w.count_ones())).sum()
-        },
-        || words_a.and(&words_b).len(),
-    );
-
-    // 5. combine Array × Array (`and`) vs former 8 KiB zero+scatter.
-    let arr_a = Bitmosaic::from_sorted(sorted_unique(
-        (0..500)
-            .map(|_| (xorshift(&mut rng) % 65_536) as u32)
-            .collect(),
-    ));
-    let arr_b = Bitmosaic::from_sorted(sorted_unique(
-        (0..500)
-            .map(|_| (xorshift(&mut rng) % 65_536) as u32)
-            .collect(),
-    ));
-    bench_ab(
-        "combine Array x Array (and)",
-        11,
-        1_000,
-        || {
-            let mut plane = [0u64; 1024];
-            for v in arr_a.iter() {
-                if arr_b.contains(v) {
-                    plane[(v >> 6) as usize] |= 1u64 << (v & 63);
-                }
-            }
-            let mut out = Vec::new();
-            for (w, &bits0) in plane.iter().enumerate() {
-                let mut bits = bits0;
-                while bits != 0 {
-                    out.push(w as u32 * 64 + bits.trailing_zeros());
-                    bits &= bits - 1;
-                }
-            }
-            Bitmosaic::from_sorted(out).len()
-        },
-        || arr_a.and(&arr_b).len(),
-    );
-
-    // 6. combine Stride × Stride (`and`) vs former scatter.
-    let st_a = Bitmosaic::from_sorted((0..10_000u32).map(|i| 5 + i * 6));
-    let st_b = Bitmosaic::from_sorted((0..6_000u32).map(|i| 1 + i * 10));
-    bench_ab(
-        "combine Stride x Stride (and)",
-        11,
-        1_000,
-        || {
-            let mut plane = [0u64; 1024];
-            for v in st_a.iter() {
-                if st_b.contains(v) {
-                    plane[(v >> 6) as usize] |= 1u64 << (v & 63);
-                }
-            }
-            let mut out = Vec::new();
-            for (w, &bits0) in plane.iter().enumerate() {
-                let mut bits = bits0;
-                while bits != 0 {
-                    out.push(w as u32 * 64 + bits.trailing_zeros());
-                    bits &= bits - 1;
-                }
-            }
-            Bitmosaic::from_sorted(out).len()
-        },
-        || st_a.and(&st_b).len(),
-    );
-
-    // 7. BitmosaicView::and_into (Words × Words) vs former for_each + contains.
-    let inter_len = vw_a.and_len(&vw_b) as usize;
-    let mut dest_ctrl = vec![0u32; inter_len];
-    let mut dest_fast = vec![0u32; inter_len];
-    bench_ab(
-        "and_into Words x Words",
-        11,
-        500,
-        || {
-            let mut w = 0usize;
-            vw_a.for_each(|v| {
-                if vw_b.contains(v) {
-                    dest_ctrl[w] = v;
-                    w += 1;
-                }
-            });
-            w as u64
-        },
-        || vw_a.and_into(&vw_b, &mut dest_fast) as u64,
-    );
-
-    // 8. AndNotRange skew (|A|=16 vs |B|=100_000): seek vs stepping b.
-    let skew_a = Bitmosaic::from_sorted((0..16u32).map(|i| i * 6_000 + 17));
+    // 1. andnot_skewed_seek (|A|=64, |B|=100_000): AndNotRange::align seek vs stepping b.
+    let skew_a = Bitmosaic::from_sorted((0..64u32).map(|i| i * 1_550 + 17));
     let skew_b = Bitmosaic::from_sorted(0..100_000u32);
+    let skew_a_bytes = skew_a.to_bytes();
+    let skew_b_bytes = skew_b.to_bytes();
+    let skew_va = BitmosaicView::open_admitted(&skew_a_bytes).unwrap();
+    let skew_vb = BitmosaicView::open_admitted(&skew_b_bytes).unwrap();
     bench_ab(
-        "AndNotRange skew (16 vs 100k)",
-        11,
-        2_000,
+        "andnot_skewed_seek (64 vs 100k)",
+        ROUNDS,
+        500,
         || {
-            // Former stepping aligner control.
             let mut a = skew_a.range();
             let mut b = skew_b.range();
             let mut count = 0u64;
@@ -319,11 +141,32 @@ fn main() {
         },
         || AndNotRange::new(skew_a.range(), skew_b.range()).count() as u64,
     );
+    bench_ab(
+        "andnot_skewed_seek_wire (64 vs 100k)",
+        ROUNDS,
+        500,
+        || {
+            let mut a = skew_va.range();
+            let mut b = skew_vb.range();
+            let mut count = 0u64;
+            while !a.empty() {
+                let x = a.front();
+                while !b.empty() && b.front() < x {
+                    b.pop_front();
+                }
+                if !b.empty() && b.front() == x {
+                    b.pop_front();
+                } else {
+                    count += 1;
+                }
+                a.pop_front();
+            }
+            count
+        },
+        || AndNotRange::new(skew_va.range(), skew_vb.range()).count() as u64,
+    );
 
-    // 9. select64 SWAR vs naive bit-clearing loop (via Words::select on 1024 ranks).
-    let select_ranks: Vec<u64> = (0..1_024)
-        .map(|i| ((i * 19 + 7) % words_a_vals.len()) as u64)
-        .collect();
+    // 2. swar_select64 vs serial `bits &= bits - 1` (1024 dense words).
     let sample_words: Vec<(u64, u32)> = (0..1_024)
         .map(|_| {
             let w = xorshift(&mut rng) | (1u64 << 63) | 1;
@@ -332,8 +175,8 @@ fn main() {
         })
         .collect();
     bench_ab(
-        "select64 (1024 dense words)",
-        11,
+        "swar_select64 (1024 dense words)",
+        ROUNDS,
         1_000,
         || {
             let mut acc = 0u64;
@@ -346,8 +189,6 @@ fn main() {
             acc
         },
         || {
-            // Compare Words::select (which uses select64) vs naive word loop indirectly,
-            // plus direct SWAR kernel timing.
             let mut acc = 0u64;
             for &(word, rank) in &sample_words {
                 let s2 = word - ((word >> 1) & 0x5555_5555_5555_5555);
@@ -373,10 +214,319 @@ fn main() {
             acc
         },
     );
-    black_box(
-        select_ranks
-            .iter()
-            .map(|&k| u64::from(vw_a.select(k).unwrap_or(0)))
-            .sum::<u64>(),
+
+    // 3a. cview_stride_contains (owned & wire reciprocal vs udiv `(v - first) / stride`).
+    let stride_first = 13u32;
+    let stride_step = 7u32;
+    let stride_count = 4_000u32;
+    let stride_set =
+        Bitmosaic::from_sorted((0..stride_count).map(|i| stride_first + i * stride_step));
+    let stride_bytes = stride_set.to_bytes();
+    let stride_view = BitmosaicView::open_admitted(&stride_bytes).unwrap();
+    let stride_probes: Vec<u32> = (0..1_024)
+        .map(|i| {
+            let idx = (xorshift(&mut rng) as u32) % stride_count;
+            stride_first + idx * stride_step + (i & 1)
+        })
+        .collect();
+    // Precomputed Lemire reciprocal matching `codec::stride_magic(7)`.
+    let stride_magic = (1u64 << 32).div_ceil(u64::from(stride_step));
+    bench_ab(
+        "stride_contains_kernel (recip/udiv)",
+        ROUNDS,
+        1_000,
+        || {
+            let mut hits = 0u64;
+            let first = black_box(stride_first);
+            let step = black_box(stride_step);
+            let len = black_box(stride_count - 1);
+            for &v in &stride_probes {
+                if v >= first {
+                    let d = v - first;
+                    let q = d / step;
+                    if q <= len && d.is_multiple_of(step) {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        },
+        || {
+            let mut hits = 0u64;
+            let first = black_box(stride_first);
+            let step = black_box(stride_step);
+            let len = black_box(stride_count - 1);
+            let magic = black_box(stride_magic);
+            for &v in &stride_probes {
+                if v >= first {
+                    let q = ((u64::from(v - first) * magic) >> 32) as u32;
+                    if q <= len && first + q * step == v {
+                        hits += 1;
+                    }
+                }
+            }
+            hits
+        },
+    );
+    bench_ab(
+        "cview_stride_contains (owned/wire)",
+        ROUNDS,
+        1_000,
+        || {
+            // Wire open-per-probe vs owned pre-decoded reciprocal.
+            let mut hits = 0u64;
+            for &v in &stride_probes {
+                hits += u64::from(stride_view.contains(v));
+            }
+            hits
+        },
+        || {
+            let mut hits = 0u64;
+            for &v in &stride_probes {
+                hits += u64::from(stride_set.contains(v));
+            }
+            hits
+        },
+    );
+
+    // 3b. cone_contains (owned & wire reciprocal + counted bisection vs checked_div + linear scan).
+    let mut cone_vals = Vec::with_capacity(900);
+    let mut c_rng = 0xC04E_1234_5678_9ABCu64;
+    for i in 0..900u32 {
+        cone_vals.push(400 + i * 61 + (xorshift(&mut c_rng) % 45) as u32);
+    }
+    let cone_vals = sorted_unique(cone_vals);
+    let cone_set = Bitmosaic::from_sorted(cone_vals.iter().copied());
+    let cone_bytes = cone_set.to_bytes();
+    let cone_view = BitmosaicView::open_admitted(&cone_bytes).unwrap();
+    let cone_first = cone_vals[0];
+    let cone_last = *cone_vals.last().unwrap();
+    let cone_n = cone_vals.len();
+    let cone_scale = (u64::from(cone_last - cone_first) << 32) / (cone_n as u64 - 1);
+    let mut cone_res = Vec::with_capacity(cone_n);
+    let mut cone_eps = 0u8;
+    for (i, &v) in cone_vals.iter().enumerate() {
+        let pred = i64::from(cone_first) + ((i as u64 * cone_scale) >> 32) as i64;
+        let r = (i64::from(v) - pred) as i8;
+        cone_eps = cone_eps.max(r.unsigned_abs());
+        cone_res.push(r);
+    }
+    let cone_probes: Vec<u32> = (0..1_024)
+        .map(|i| {
+            let v = cone_vals[(xorshift(&mut rng) as usize) % cone_vals.len()];
+            v + (i & 1)
+        })
+        .collect();
+    bench_ab(
+        "cone_contains_owned (1024, eps~40)",
+        ROUNDS,
+        400,
+        || {
+            let mut hits = 0u64;
+            let scale = black_box(cone_scale);
+            let first = black_box(cone_first);
+            let margin = 2 + i64::from(cone_eps);
+            for &v in &cone_probes {
+                let delta = v.saturating_sub(first);
+                let guess = (u64::from(delta) << 32).checked_div(scale).unwrap_or(0) as i64;
+                let lo = (guess - margin).max(0).min(cone_n as i64) as usize;
+                let hi = ((guess + margin + 1) as usize).min(cone_n);
+                for (i, &res) in cone_res.iter().enumerate().take(hi).skip(lo) {
+                    let m = (i64::from(first) + ((i as u64 * scale) >> 32) as i64 + i64::from(res))
+                        as u32;
+                    if m >= v {
+                        hits += u64::from(m == v);
+                        break;
+                    }
+                }
+            }
+            hits
+        },
+        || {
+            let mut hits = 0u64;
+            for &v in &cone_probes {
+                hits += u64::from(cone_set.contains(v));
+            }
+            hits
+        },
+    );
+    bench_ab(
+        "cone_contains_wire (1024, eps~40)",
+        ROUNDS,
+        400,
+        || {
+            let mut hits = 0u64;
+            let scale = black_box(cone_scale);
+            let first = black_box(cone_first);
+            let margin = 2 + i64::from(cone_eps);
+            for &v in &cone_probes {
+                let delta = v.saturating_sub(first);
+                let guess = (u64::from(delta) << 32).checked_div(scale).unwrap_or(0) as i64;
+                let lo = (guess - margin).max(0).min(cone_n as i64) as usize;
+                let hi = ((guess + margin + 1) as usize).min(cone_n);
+                for (i, &res) in cone_res.iter().enumerate().take(hi).skip(lo) {
+                    let m = (i64::from(first) + ((i as u64 * scale) >> 32) as i64 + i64::from(res))
+                        as u32;
+                    if m >= v {
+                        hits += u64::from(m == v);
+                        break;
+                    }
+                }
+            }
+            hits
+        },
+        || {
+            let mut hits = 0u64;
+            for &v in &cone_probes {
+                hits += u64::from(cone_view.contains(v));
+            }
+            hits
+        },
+    );
+
+    // 4a. bitmosaic64_view_and_len_skewed (8 forests vs 512 forests): galloping vs linear walk.
+    let mut big64_vals = Vec::new();
+    for h in 0..512u64 {
+        let hi = (h * 7 + 1) << 32;
+        for k in 0..16u64 {
+            big64_vals.push(hi | (k * 100 + 3));
+        }
+    }
+    let mut small64_vals = Vec::new();
+    for &h in &[0u64, 64, 128, 192, 256, 320, 400, 511] {
+        let hi = (h * 7 + 1) << 32;
+        for k in 0..8u64 {
+            small64_vals.push(hi | (k * 200 + 3));
+        }
+    }
+    let big64 = Bitmosaic64::from_sorted(big64_vals.iter().copied());
+    let small64 = Bitmosaic64::from_sorted(small64_vals.iter().copied());
+    let big64_bytes = big64.to_bytes();
+    let small64_bytes = small64.to_bytes();
+    let v_big64 = Bitmosaic64View::open_admitted(&big64_bytes).unwrap();
+    let v_small64 = Bitmosaic64View::open_admitted(&small64_bytes).unwrap();
+    let big_highs: Vec<u32> = (0..512u32).map(|h| h * 7 + 1).collect();
+    let small_highs: Vec<u32> = [0u32, 64, 128, 192, 256, 320, 400, 511]
+        .iter()
+        .map(|&h| h * 7 + 1)
+        .collect();
+    let big_children: Vec<Vec<u8>> = (0..512u32)
+        .map(|_| Bitmosaic::from_sorted((0..16u32).map(|k| k * 100 + 3)).to_bytes())
+        .collect();
+    let small_children: Vec<Vec<u8>> = (0..8u32)
+        .map(|_| Bitmosaic::from_sorted((0..8u32).map(|k| k * 200 + 3)).to_bytes())
+        .collect();
+    bench_ab(
+        "bitmosaic64_view_and_len_skewed",
+        ROUNDS,
+        2_000,
+        || {
+            // Former linear two-pointer high-32 directory scan.
+            let (mut i, mut j, mut count) = (0usize, 0usize, 0u64);
+            while i < small_highs.len() && j < big_highs.len() {
+                let (ha, hb) = (small_highs[i], big_highs[j]);
+                if ha == hb {
+                    let a = BitmosaicView::open_admitted(&small_children[i]).unwrap();
+                    let b = BitmosaicView::open_admitted(&big_children[j]).unwrap();
+                    count += a.and_len(&b);
+                    i += 1;
+                    j += 1;
+                } else if ha < hb {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            count
+        },
+        || v_small64.and_len(&v_big64),
+    );
+
+    // 4b. dir64_v2_and_len_skewed (Format 2 Dir64V2View: 8 vs 512 children).
+    let v2_big_bytes = big64.to_v2_bytes();
+    let v2_small_bytes = small64.to_v2_bytes();
+    let d_big64 = Dir64V2View::open(&v2_big_bytes).unwrap();
+    let d_small64 = Dir64V2View::open(&v2_small_bytes).unwrap();
+    bench_ab(
+        "dir64_v2_and_len_skewed (8 vs 512)",
+        ROUNDS,
+        2_000,
+        || {
+            let (mut i, mut j, mut count) = (0usize, 0usize, 0u64);
+            while i < small_highs.len() && j < big_highs.len() {
+                let (ha, hb) = (small_highs[i], big_highs[j]);
+                if ha == hb {
+                    let a = BitmosaicView::open_admitted(&small_children[i]).unwrap();
+                    let b = BitmosaicView::open_admitted(&big_children[j]).unwrap();
+                    count += a.and_len(&b);
+                    i += 1;
+                    j += 1;
+                } else if ha < hb {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+            count
+        },
+        || d_small64.and_len(&d_big64),
+    );
+
+    // 5. words_range_seek (800-word jump inside dense Words chunk: dir jump vs word scan).
+    let dense_vals = sorted_unique(
+        (0..20_000)
+            .map(|_| (xorshift(&mut rng) % 65_536) as u32)
+            .collect(),
+    );
+    let dense_set = Bitmosaic::from_sorted(dense_vals.iter().copied());
+    let dense_bytes = dense_set.to_bytes();
+    let dense_view = BitmosaicView::open_admitted(&dense_bytes).unwrap();
+    let mut dense_words = [0u64; 1024];
+    for &v in &dense_vals {
+        dense_words[(v >> 6) as usize] |= 1u64 << (v & 63);
+    }
+    let jump_target = 52_000u32;
+    bench_ab(
+        "words_range_seek (owned 800-word)",
+        ROUNDS,
+        5_000,
+        || {
+            // Former word-by-word scan to track remaining.
+            let mut rem = dense_vals.len() as u32;
+            let goal = (jump_target >> 6) as usize;
+            let mask = !((1u64 << (jump_target & 63)) - 1);
+            for &word in dense_words.iter().take(goal) {
+                rem -= word.count_ones();
+            }
+            let landing = dense_words[goal];
+            rem -= (landing & !mask).count_ones();
+            u64::from(rem)
+        },
+        || {
+            let mut r = dense_set.range();
+            r.seek(black_box(jump_target));
+            r.len() as u64
+        },
+    );
+    bench_ab(
+        "words_range_seek (wire 800-word)",
+        ROUNDS,
+        5_000,
+        || {
+            let mut rem = dense_vals.len() as u32;
+            let goal = (jump_target >> 6) as usize;
+            let mask = !((1u64 << (jump_target & 63)) - 1);
+            for &word in dense_words.iter().take(goal) {
+                rem -= word.count_ones();
+            }
+            let landing = dense_words[goal];
+            rem -= (landing & !mask).count_ones();
+            u64::from(rem)
+        },
+        || {
+            let mut r = dense_view.range();
+            r.seek(black_box(jump_target));
+            r.remaining()
+        },
     );
 }

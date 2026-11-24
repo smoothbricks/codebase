@@ -41,6 +41,7 @@ mod wire;
 
 use codec::{
     cone_guess, cone_inv_scale, cone_window_rank, select64, stride_magic, stride_quotient,
+    stride_quotient_ceil,
 };
 
 pub use admission::{AdmissionClass, AdmissionError};
@@ -725,13 +726,19 @@ impl Container {
                 next: u32::from(runs[0].start),
                 remaining: *len,
             },
-            Container::Words { words, len, .. } => ContainerRange::words(words, *len),
+            Container::Words {
+                words, dir, len, ..
+            } => ContainerRange::words(words, dir, *len),
             Container::Stride {
-                first, stride, len, ..
+                first,
+                stride,
+                len,
+                magic,
             } => ContainerRange::Stride {
                 next: *first as u32,
                 stride: *stride as u32,
                 remaining: *len as u32 + 1,
+                magic: *magic,
             },
             Container::Cone {
                 first,
@@ -2275,7 +2282,7 @@ fn and_runs(runs: &[Run], other: &Container) -> u32 {
             |i| (u32::from(right[i].start), u32::from(right[i].end) + 1),
         ),
         Container::Stride {
-            first, stride, len, ..
+            first, len, magic, ..
         } => runs
             .iter()
             .map(|run| {
@@ -2283,7 +2290,7 @@ fn and_runs(runs: &[Run], other: &Container) -> u32 {
                     u32::from(run.start),
                     u32::from(run.end) + 1,
                     u32::from(*first),
-                    u32::from(*stride),
+                    *magic,
                     u32::from(*len) + 1,
                 )
             })
@@ -2319,9 +2326,9 @@ fn and_runs(runs: &[Run], other: &Container) -> u32 {
     }
 }
 
-fn progression_in_span(start: u32, end: u32, first: u32, stride: u32, len: u32) -> u32 {
-    let lo = start.saturating_sub(first).div_ceil(stride).min(len);
-    let hi = end.saturating_sub(first).div_ceil(stride).min(len);
+fn progression_in_span(start: u32, end: u32, first: u32, magic: u64, len: u32) -> u32 {
+    let lo = stride_quotient_ceil(start.saturating_sub(first), magic).min(len);
+    let hi = stride_quotient_ceil(end.saturating_sub(first), magic).min(len);
     hi - lo
 }
 
@@ -3999,7 +4006,9 @@ impl Bitmosaic64 {
 }
 
 /// First index in `from..len` with `at(idx) >= target`, via exponential gallop
-/// + bisection. Shared by `Bitmosaic64::and_len` and `Bitmosaic64View::and_len`.
+/// and bisection. Shared across `Bitmosaic64` / `Bitmosaic64View` /
+/// `Dir64V2View` intersections and cursor seeks (`CRange::Array`,
+/// `Bitmosaic64ViewRange`, `Dir64V2Range`).
 #[inline(always)]
 pub(crate) fn gallop_u32_by(
     len: usize,

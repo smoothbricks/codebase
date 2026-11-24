@@ -28,8 +28,8 @@
 
 use crate::codec::{
     PatchError, cone_guess, cone_inv_scale, cone_window_rank, read_u16_at, read_u32_at,
-    read_u64_at, read_uleb, read_uleb_checked, select64, stride_magic, stride_quotient, uleb_len,
-    write_uleb,
+    read_u64_at, read_uleb, read_uleb_checked, select64, stride_magic, stride_quotient,
+    stride_quotient_ceil, uleb_len, write_uleb,
 };
 use crate::ef::{self, EfLayout, EfRange, EfView};
 use crate::{AdmissionClass, AdmissionError};
@@ -1157,14 +1157,14 @@ fn and_runs_view(runs: RunsView<'_>, other: &CView<'_>) -> u32 {
             |i| (right.start(i), right.end(i) + 1),
         ),
         CView::Stride {
-            first, stride, len, ..
+            first, len, magic, ..
         } => (0..runs.count())
             .map(|i| {
                 crate::progression_in_span(
                     runs.start(i),
                     runs.end(i) + 1,
                     u32::from(*first),
-                    u32::from(*stride),
+                    *magic,
                     u32::from(*len) + 1,
                 )
             })
@@ -2380,28 +2380,30 @@ fn chunk_and_into(a: &CView<'_>, b: &CView<'_>, high: u32, emit: &mut impl FnMut
         (
             CView::Runs(runs),
             CView::Stride {
-                first, stride, len, ..
+                first,
+                stride,
+                len,
+                magic,
             },
         )
         | (
             CView::Stride {
-                first, stride, len, ..
+                first,
+                stride,
+                len,
+                magic,
             },
             CView::Runs(runs),
         ) => {
             let first = u32::from(*first);
             let step = u32::from((*stride).max(1));
             let count = u32::from(*len) + 1;
+            let magic = *magic;
             for i in 0..runs.count() {
-                let lo = runs
-                    .start(i)
-                    .saturating_sub(first)
-                    .div_ceil(step)
-                    .min(count);
-                let hi = (runs.end(i) + 1)
-                    .saturating_sub(first)
-                    .div_ceil(step)
-                    .min(count);
+                let lo =
+                    stride_quotient_ceil(runs.start(i).saturating_sub(first), magic).min(count);
+                let hi =
+                    stride_quotient_ceil((runs.end(i) + 1).saturating_sub(first), magic).min(count);
                 for k in lo..hi {
                     emit(high | (first + k * step));
                 }
@@ -4403,15 +4405,20 @@ enum CRange<'a> {
         /// `remaining > 0` — the idempotent-`front` invariant.
         bits: u64,
         remaining: u32,
+        /// Total chunk cardinality (for O(1) directory jumps on long seeks).
+        len: u32,
     },
     Stride {
         next: u32,
         stride: u32,
         remaining: u32,
+        magic: u64,
     },
     Cone {
         first: u16,
+        eps: u8,
         scale: u64,
+        inv_scale: u64,
         residuals: &'a [u8],
         at: usize,
     },
@@ -4478,23 +4485,30 @@ impl<'a> CRange<'a> {
                 }
             }
             CView::Stride {
-                first, stride, len, ..
+                first,
+                stride,
+                len,
+                magic,
             } => {
                 let stride = u32::from(stride).max(1);
                 CRange::Stride {
                     next: u32::from(first) + k * stride,
                     stride,
                     remaining: u32::from(len) + 1 - k,
+                    magic,
                 }
             }
             CView::Cone {
                 first,
+                eps,
                 scale,
+                inv_scale,
                 residuals,
-                ..
             } => CRange::Cone {
                 first,
+                eps,
                 scale,
+                inv_scale,
                 residuals,
                 at: k as usize,
             },
@@ -4526,6 +4540,7 @@ impl<'a> CRange<'a> {
                     bits: read_u64_at(payload, WORDS_AT + w as usize * 8)
                         & !((1u64 << (v & 63)) - 1),
                     remaining: len - k,
+                    len,
                 }
             }
         }
@@ -4567,6 +4582,7 @@ impl Range for CRange<'_> {
                 scale,
                 residuals,
                 at,
+                ..
             } => cone_value(*first, *scale, residuals, *at),
             CRange::Array { values, at } => read_u16_at(values, *at * 2),
         }
@@ -4614,6 +4630,7 @@ impl Range for CRange<'_> {
                 next,
                 stride,
                 remaining,
+                ..
             } => {
                 *next += *stride;
                 *remaining -= 1;
@@ -4662,6 +4679,7 @@ impl Range for CRange<'_> {
                 word_count,
                 bits,
                 remaining,
+                len,
             } => {
                 // `bits` belongs to the absolute word `base_word + word - 1`.
                 let here = base_word.wrapping_add(*word).wrapping_sub(1);
@@ -4694,11 +4712,6 @@ impl Range for CRange<'_> {
                             return;
                         }
                     }
-                    // Leave the current word, then skip whole words. Each
-                    // skipped word costs one load and one popcount, so the
-                    // walk is bounded by the DISTANCE and not by the members.
-                    *remaining = remaining.saturating_sub(bits.count_ones());
-                    *bits = 0;
                     let Some(rel) = goal.checked_sub(*base_word) else {
                         return;
                     };
@@ -4706,15 +4719,35 @@ impl Range for CRange<'_> {
                         *remaining = 0;
                         return;
                     }
-                    while *word < rel {
-                        let skipped = read_u64_at(payload, WORDS_AT + *word as usize * 8);
-                        *remaining = remaining.saturating_sub(skipped.count_ones());
-                        *word += 1;
+                    if rel.saturating_sub(*word) > DIR_STRIDE as u32 {
+                        // Long in-chunk jump: compute exact remaining via the
+                        // rank directory in at most 1 dir load + (DIR_STRIDE - 1)
+                        // words rather than scanning every intermediate word.
+                        let group = rel as usize / DIR_STRIDE;
+                        let mut rank = u32::from(CView::dir_entry(payload, *word_count, group));
+                        for w in group * DIR_STRIDE..rel as usize {
+                            rank += read_u64_at(payload, WORDS_AT + w * 8).count_ones();
+                        }
+                        let landing = read_u64_at(payload, WORDS_AT + rel as usize * 8);
+                        rank += (landing & !mask).count_ones();
+                        *remaining = len.saturating_sub(rank);
+                        *bits = landing & mask;
+                        *word = rel + 1;
+                    } else {
+                        // Short jump (<= DIR_STRIDE words): walk words directly
+                        // without pulling the directory cache line.
+                        *remaining = remaining.saturating_sub(bits.count_ones());
+                        *bits = 0;
+                        while *word < rel {
+                            let skipped = read_u64_at(payload, WORDS_AT + *word as usize * 8);
+                            *remaining = remaining.saturating_sub(skipped.count_ones());
+                            *word += 1;
+                        }
+                        let landing = read_u64_at(payload, WORDS_AT + rel as usize * 8);
+                        *remaining = remaining.saturating_sub((landing & !mask).count_ones());
+                        *bits = landing & mask;
+                        *word = rel + 1;
                     }
-                    let landing = read_u64_at(payload, WORDS_AT + rel as usize * 8);
-                    *remaining = remaining.saturating_sub((landing & !mask).count_ones());
-                    *bits = landing & mask;
-                    *word = rel + 1;
                 }
                 // Same refill the step path runs, for the same reason: the
                 // head must be materialised before `front` is asked for it.
@@ -4731,9 +4764,10 @@ impl Range for CRange<'_> {
                 next,
                 stride,
                 remaining,
+                magic,
             } => {
-                // Closed form: no words, no members, no directory.
-                let steps = (u32::from(target) - *next).div_ceil(*stride);
+                // Closed form via Lemire reciprocal: zero hardware division.
+                let steps = stride_quotient_ceil(u32::from(target) - *next, *magic);
                 if steps >= *remaining {
                     *remaining = 0;
                     return;
@@ -4743,36 +4777,25 @@ impl Range for CRange<'_> {
             }
             CRange::Cone {
                 first,
+                eps,
                 scale,
+                inv_scale,
                 residuals,
                 at,
             } => {
-                // Ascending by construction, and `cone_value` is O(1) at any
-                // index, so the landing ordinal is a bisection of the tail.
-                let mut lo = *at;
-                let mut hi = residuals.len();
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if cone_value(*first, *scale, residuals, mid) < target {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                *at = lo;
+                let (lo, hi) =
+                    cone_window(*first, *scale, *inv_scale, *eps, residuals.len(), target);
+                let lo = lo.max(*at);
+                *at = if lo >= hi {
+                    hi.max(*at)
+                } else {
+                    cone_window_rank(lo, hi, target, |i| cone_value(*first, *scale, residuals, i))
+                };
             }
             CRange::Array { values, at } => {
-                let mut lo = *at;
-                let mut hi = values.len() / 2;
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    if read_u16_at(values, mid * 2) < target {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                *at = lo;
+                *at = gallop_u32_by(values.len() / 2, *at, u32::from(target), |i| {
+                    u32::from(read_u16_at(values, i * 2))
+                });
             }
         }
     }
@@ -5124,7 +5147,7 @@ impl<'a> Bitmosaic64ViewRange<'a> {
             self.open_next();
             return;
         }
-        let mut at = self.view.walk(high);
+        let mut at = gallop_u32_by(n, self.forest as usize, high, |i| self.view.high(i));
         if at < n && self.view.high(at) == high {
             if let Some(forest) = self.view.forest(at) {
                 let mut inner = forest.range();
@@ -5609,5 +5632,54 @@ mod admission_tests {
             (error.class, error.offset),
             (AdmissionClass::PlaneRange, eps_at)
         );
+    }
+
+    #[test]
+    fn wire_cone_seek_never_rewinds_when_window_lies_below_cursor() {
+        let first = 100u16;
+        let eps = 0u8;
+        let scale = 1u64 << 32;
+        let inv_scale = crate::codec::cone_inv_scale(scale);
+        let residuals: [u8; 20] = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (-8i8) as u8,
+            (-6i8) as u8,
+            (-4i8) as u8,
+            (-2i8) as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let mut cursor = super::CRange::Cone {
+            first,
+            eps,
+            scale,
+            inv_scale,
+            residuals: &residuals,
+            at: 10,
+        };
+        assert_eq!(super::Range::front(&cursor), 102);
+        let before = cursor.remaining();
+        super::Range::seek(&mut cursor, 103);
+        let super::CRange::Cone { at, .. } = cursor else {
+            unreachable!();
+        };
+        assert!(
+            at >= 10,
+            "CRange::Cone::seek rewound cursor from 10 to {at}"
+        );
+        assert!(cursor.remaining() <= before);
     }
 }

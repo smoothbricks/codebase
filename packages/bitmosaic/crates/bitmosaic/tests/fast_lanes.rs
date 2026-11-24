@@ -11,8 +11,8 @@
 use std::collections::BTreeSet;
 
 use bitmosaic::{
-    AndNotRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView, EMPTY_U32_IMAGE,
-    EMPTY_U64_IMAGE, OrRange, Range, XorRange,
+    AndNotRange, Bitmosaic, Bitmosaic64, Bitmosaic64View, BitmosaicView, Dir64V2View,
+    EMPTY_U32_IMAGE, EMPTY_U64_IMAGE, OrRange, Range, XorRange,
 };
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -711,5 +711,452 @@ fn intersect_sorted_simd_and_gallop_match_oracle() {
         assert_eq!(out, want);
         Bitmosaic64::intersect_sorted(&b, &a, &mut out);
         assert_eq!(out, want);
+    }
+}
+
+#[test]
+fn words_dir_jump_and_wire_container_range_seeks_match_oracle() {
+    let corpus = u32_corpus();
+    // Targets inside a single 65,536-value chunk spanning same-word, <=4-word,
+    // and long >4-word jumps (50..900 words), plus exact boundaries and tail.
+    let chunk_targets = [
+        0u32,
+        1,
+        17,
+        63,
+        64,
+        128,
+        191,
+        255,
+        256,
+        319,
+        320,
+        500,
+        1_024,
+        4_096,
+        12_345,
+        32_768,
+        55_555,
+        65_000,
+        65_535,
+        65_536,
+        150_000,
+        300_000,
+        u32::MAX,
+    ];
+    for (idx, values) in corpus.iter().enumerate() {
+        let set = Bitmosaic::from_sorted(values.iter().copied());
+        let bytes = set.to_bytes();
+        let view = BitmosaicView::open_admitted(&bytes).unwrap();
+
+        // Sequential monotone seeks on owned ForestRange and wire BitmosaicViewRange.
+        let mut r_owned = set.range();
+        let mut r_wire = view.range();
+        for &t in &chunk_targets {
+            r_owned.seek(t);
+            r_wire.seek(t);
+            let pos = values.partition_point(|&v| v < t);
+            assert_eq!(
+                r_owned.len(),
+                values.len() - pos,
+                "owned len after seek({t}) shape={idx}"
+            );
+            assert_eq!(
+                r_wire.remaining() as usize,
+                values.len() - pos,
+                "wire remaining after seek({t}) shape={idx}"
+            );
+            if pos < values.len() {
+                assert_eq!(r_owned.front(), values[pos], "owned front shape={idx}");
+                assert_eq!(r_wire.front(), values[pos], "wire front shape={idx}");
+            } else {
+                assert!(r_owned.empty());
+                assert!(r_wire.empty());
+            }
+        }
+
+        // Fresh single long jump straight into the tail (exercises Words dir jump,
+        // Cone O(1) window seek, Stride reciprocal seek, Array gallop seek).
+        for &t in &[5_000u32, 32_768, 60_000] {
+            let mut r_owned = set.range();
+            let mut r_wire = view.range();
+            r_owned.seek(t);
+            r_wire.seek(t);
+            let pos = values.partition_point(|&v| v < t);
+            assert_eq!(r_owned.len(), values.len() - pos);
+            assert_eq!(r_wire.remaining() as usize, values.len() - pos);
+            assert_eq!(r_owned.collect::<Vec<_>>(), &values[pos..]);
+            assert_eq!(r_wire.collect::<Vec<_>>(), &values[pos..]);
+        }
+    }
+
+    // Runs × Stride exact intersection (owned + wire and_len and and_into).
+    let mut runs_vals = Vec::new();
+    for b in 0..30u32 {
+        let start = b * 2_000 + 50;
+        runs_vals.extend(start..start + 400);
+    }
+    let stride_vals: Vec<u32> = (0..2_000u32).map(|i| 7 + i * 31).collect();
+    let s_runs = Bitmosaic::from_sorted(runs_vals.iter().copied());
+    let s_stride = Bitmosaic::from_sorted(stride_vals.iter().copied());
+    let b_runs = s_runs.to_bytes();
+    let b_stride = s_stride.to_bytes();
+    let v_runs = BitmosaicView::open_admitted(&b_runs).unwrap();
+    let v_stride = BitmosaicView::open_admitted(&b_stride).unwrap();
+    let o_runs: BTreeSet<u32> = runs_vals.iter().copied().collect();
+    let o_stride: BTreeSet<u32> = stride_vals.iter().copied().collect();
+    let want: Vec<u32> = o_runs.intersection(&o_stride).copied().collect();
+    assert_eq!(s_runs.and_len(&s_stride), want.len() as u64);
+    assert_eq!(v_runs.and_len(&v_stride), want.len() as u64);
+    let mut buf = vec![0u32; want.len()];
+    let n = v_runs.and_into(&v_stride, &mut buf);
+    assert_eq!(n, want.len());
+    assert_eq!(buf, want);
+}
+
+#[test]
+fn u64_view_and_dir64_v2_gallop_and_seeks_match_oracle() {
+    let mut many_vals = Vec::new();
+    for h in 0..200u64 {
+        let hi = (h * 5 + 3) << 32;
+        for k in 0..12u64 {
+            many_vals.push(hi | (k * 100 + 7));
+        }
+    }
+    let few_vals: Vec<u64> = vec![
+        (3u64 << 32) | 207,
+        (253u64 << 32) | 507,
+        (503u64 << 32) | 707,
+        (998u64 << 32) | 1_107,
+    ];
+    let s_many = Bitmosaic64::from_sorted(many_vals.iter().copied());
+    let s_few = Bitmosaic64::from_sorted(few_vals.iter().copied());
+
+    // Format 1 Bitmosaic64ViewRange sequential forward galloping seeks.
+    let b_many = s_many.to_bytes();
+    let v_many = Bitmosaic64View::open_admitted(&b_many).unwrap();
+    let mut r64 = v_many.range();
+    for &t in &[
+        0u64,
+        (3u64 << 32) | 300,
+        (8u64 << 32) | 1,
+        (103u64 << 32) | 507,
+        (500u64 << 32),
+        (998u64 << 32) | 1_107,
+        u64::MAX,
+    ] {
+        r64.seek(t);
+        let pos = many_vals.partition_point(|&v| v < t);
+        assert_eq!(r64.remaining() as usize, many_vals.len() - pos);
+        if pos < many_vals.len() {
+            assert_eq!(r64.front(), many_vals[pos]);
+        } else {
+            assert!(r64.empty());
+        }
+    }
+
+    // Format 2 Dir64V2View skewed and_len, and_rank (both orientations), and Dir64V2Range::seek.
+    let v2_many_bytes = s_many.to_v2_bytes();
+    let v2_few_bytes = s_few.to_v2_bytes();
+    let d_many = Dir64V2View::open(&v2_many_bytes).expect("Dir64V2View many");
+    let d_few = Dir64V2View::open(&v2_few_bytes).expect("Dir64V2View few");
+    let o_many: BTreeSet<u64> = many_vals.iter().copied().collect();
+    let o_few: BTreeSet<u64> = few_vals.iter().copied().collect();
+    let inter: Vec<u64> = o_many.intersection(&o_few).copied().collect();
+
+    assert_eq!(d_many.and_len(&d_few), inter.len() as u64);
+    assert_eq!(d_few.and_len(&d_many), inter.len() as u64);
+    for &limit in &[
+        0u64,
+        (3u64 << 32) | 207,
+        (3u64 << 32) | 208,
+        (253u64 << 32) | 507,
+        (503u64 << 32) | 800,
+        (998u64 << 32) | 1_107,
+        u64::MAX,
+    ] {
+        let want = inter.iter().filter(|&&v| v < limit).count() as u64;
+        assert_eq!(
+            d_many.and_rank(&d_few, limit),
+            want,
+            "many.and_rank({limit})"
+        );
+        assert_eq!(
+            d_few.and_rank(&d_many, limit),
+            want,
+            "few.and_rank({limit})"
+        );
+    }
+
+    let mut r_v2 = d_many.range();
+    for &t in &[
+        0u64,
+        (3u64 << 32) | 300,
+        (8u64 << 32) | 1,
+        (103u64 << 32) | 507,
+        (500u64 << 32),
+        (998u64 << 32) | 1_107,
+        u64::MAX,
+    ] {
+        r_v2.seek(t);
+        let pos = many_vals.partition_point(|&v| v < t);
+        if pos < many_vals.len() {
+            assert!(!r_v2.empty());
+            assert_eq!(r_v2.front(), many_vals[pos]);
+        } else {
+            assert!(r_v2.empty());
+        }
+    }
+}
+
+/// Build an irregular dense `Words` chunk occupying `[start_word, end_word)`
+/// inside `chunk_high << 16`, with >= 14 pseudo-random bits per word (including
+/// bit 0 and bit 63 on boundary words) so the container freezes as `Words` with
+/// an exact span-tight window `[start_word, end_word)` (both multiples of 4).
+fn make_words_chunk(chunk_high: u32, start_word: u32, end_word: u32, seed: u64) -> Vec<u32> {
+    let mut rng = seed;
+    let mut vals = Vec::new();
+    let high = chunk_high << 16;
+    for w in start_word..end_word {
+        let mut word = 0u64;
+        for _ in 0..16 {
+            word |= 1u64 << (xorshift(&mut rng) & 63);
+        }
+        // Pin low and high bits on first/last word so the span window is exact.
+        if w == start_word {
+            word |= 1u64 << 1;
+        }
+        if w + 1 == end_word {
+            word |= (1u64 << 3) | (1u64 << 61);
+        }
+        while word != 0 {
+            let bit = word.trailing_zeros();
+            vals.push(high | (w * 64 + bit));
+            word &= word - 1;
+        }
+    }
+    vals
+}
+
+#[test]
+fn words_dir_jump_exact_stride_group_boundaries_owned_and_wire() {
+    // DIR_STRIDE = 4 words. Exercise both a full-chunk Words container
+    // (words 0..1024, base_word=0, last group 255 = words 1020..1024) and a
+    // span-tight Words container (words 100..600, base_word=100, last group
+    // words 596..600) on BOTH owned `ForestRange` and wire `BitmosaicViewRange`.
+    const DIR_STRIDE: u32 = 4;
+
+    let shapes: [(u32, u32, u64); 2] = [
+        (0, 1024, 0xD1A0_0001_5EED_0001),
+        (100, 600, 0xD1A0_0002_5EED_0002),
+    ];
+
+    for (start_w, end_w, seed) in shapes {
+        let vals = make_words_chunk(0, start_w, end_w, seed);
+        assert!(
+            vals.len() > 4_096,
+            "fixture must exceed ARRAY_MAX to freeze as Words"
+        );
+        let set = Bitmosaic::from_sorted(vals.iter().copied());
+        let bytes = set.to_bytes();
+        let view = BitmosaicView::open_admitted(&bytes).unwrap();
+        assert!(!view.is_elias_fano());
+
+        let check_jump = |start_target: Option<u32>, goal_target: u32, label: &str| {
+            let mut r_owned = set.range();
+            let mut r_wire = view.range();
+            if let Some(s) = start_target {
+                r_owned.seek(s);
+                r_wire.seek(s);
+            }
+            r_owned.seek(goal_target);
+            r_wire.seek(goal_target);
+            let pos = vals.partition_point(|&v| v < goal_target);
+            let want = &vals[pos..];
+            assert_eq!(
+                r_owned.len(),
+                want.len(),
+                "owned len mismatch ({label}, start_w={start_w}, goal={goal_target})"
+            );
+            assert_eq!(
+                r_wire.remaining() as usize,
+                want.len(),
+                "wire remaining mismatch ({label}, start_w={start_w}, goal={goal_target})"
+            );
+            if let Some(&first) = want.first() {
+                assert_eq!(r_owned.front(), first, "owned front ({label})");
+                assert_eq!(r_wire.front(), first, "wire front ({label})");
+            } else {
+                assert!(r_owned.empty(), "owned empty ({label})");
+                assert!(r_wire.empty(), "wire empty ({label})");
+            }
+            assert_eq!(
+                r_owned.collect::<Vec<_>>(),
+                want,
+                "owned tail mismatch ({label})"
+            );
+            assert_eq!(
+                r_wire.collect::<Vec<_>>(),
+                want,
+                "wire tail mismatch ({label})"
+            );
+        };
+
+        // Cursor starts at `here = start_w`, `*word = start_w + 1`:
+        // - `goal = start_w + DIR_STRIDE`     -> `goal - here == DIR_STRIDE`, `goal - *word == DIR_STRIDE - 1` (also group first word!)
+        // - `goal = start_w + DIR_STRIDE + 1` -> `goal - *word == DIR_STRIDE` (exact threshold: short path)
+        // - `goal = start_w + DIR_STRIDE + 2` -> `goal - *word == DIR_STRIDE + 1` (exact threshold + 1: dir-jump path!)
+        for bit in [0u32, 17, 63] {
+            check_jump(
+                None,
+                (start_w + DIR_STRIDE) * 64 + bit,
+                "from start: +DIR_STRIDE from here (group first word)",
+            );
+            check_jump(
+                None,
+                (start_w + DIR_STRIDE + 1) * 64 + bit,
+                "from start: exact DIR_STRIDE words past *word",
+            );
+            check_jump(
+                None,
+                (start_w + DIR_STRIDE + 2) * 64 + bit,
+                "from start: DIR_STRIDE + 1 words past *word (dir jump)",
+            );
+        }
+
+        // Same boundary check starting from an unaligned word (`start_w + 1`, so `*word = start_w + 2`).
+        let unaligned_start = Some((start_w + 1) * 64);
+        for bit in [0u32, 31, 63] {
+            check_jump(
+                unaligned_start,
+                (start_w + 1 + DIR_STRIDE) * 64 + bit,
+                "from unaligned: +DIR_STRIDE from here",
+            );
+            check_jump(
+                unaligned_start,
+                (start_w + 2 + DIR_STRIDE) * 64 + bit,
+                "from unaligned: exact DIR_STRIDE past *word",
+            );
+            check_jump(
+                unaligned_start,
+                (start_w + 2 + DIR_STRIDE + 1) * 64 + bit,
+                "from unaligned: DIR_STRIDE + 1 past *word (dir jump)",
+            );
+        }
+
+        // Goals at a group's first word via directory jump (zero intra-group loop iterations).
+        for group_offset in [2u32, 17, 64] {
+            let group_first_word = start_w + group_offset * DIR_STRIDE;
+            for bit in [0u32, 23, 63] {
+                check_jump(
+                    None,
+                    group_first_word * 64 + bit,
+                    "dir jump to group first word",
+                );
+            }
+        }
+
+        // Goals in the last group: first word, middle words, last word, and past-the-end exhaustion.
+        let last_group_first = end_w - DIR_STRIDE;
+        for w in last_group_first..end_w {
+            for bit in [0u32, 30, 63] {
+                check_jump(None, w * 64 + bit, "dir jump into last group");
+            }
+        }
+        let last_val = *vals.last().unwrap();
+        check_jump(None, last_val, "dir jump to exact last member");
+        check_jump(None, last_val + 1, "dir jump past last member (exhaust)");
+        if end_w < 1024 {
+            check_jump(
+                None,
+                end_w * 64,
+                "dir jump past span-tight word_count (exhaust)",
+            );
+        }
+    }
+}
+
+#[test]
+fn wire_words_opened_mid_chunk_then_far_dir_jumps() {
+    // Multi-chunk forest:
+    // - chunk 0: tiny Array chunk so the cursor begins in chunk 0
+    // - chunk 1: full-span Words chunk (words 0..1024, base_word=0)
+    // - chunk 2: span-tight Words chunk (words 100..600, base_word=100)
+    // - chunk 3: trailing Array chunk so BitmosaicViewRange.remaining tracks
+    //            trailing chunks across mid-chunk open + far jump + rollover.
+    let mut all_vals = vec![10u32, 20, 30];
+    all_vals.extend(make_words_chunk(1, 0, 1024, 0xABCD_0001_1111_2222));
+    all_vals.extend(make_words_chunk(2, 100, 600, 0xABCD_0002_3333_4444));
+    all_vals.extend([(3 << 16) | 42, (3 << 16) | 999]);
+
+    let set = Bitmosaic::from_sorted(all_vals.iter().copied());
+    let bytes = set.to_bytes();
+    let view = BitmosaicView::open_admitted(&bytes).unwrap();
+    assert!(!view.is_elias_fano());
+
+    // Helper: seek from chunk 0 into the MIDDLE of a Words chunk (triggers
+    // `seek_forest` -> `CRange::at_rank(container, k)` with `k > 0`), then
+    // issue a sequence of monotone in-chunk jumps crossing DIR_STRIDE,
+    // exact DIR_STRIDE / DIR_STRIDE+1, group first word, last group, and
+    // rollover into the next chunk.
+    let sequences: [&[u32]; 2] = [
+        // Enter chunk 1 mid-chunk at word 20 (k > 0), then jump across strides.
+        &[
+            (1 << 16) | (20 * 64 + 13),   // open CRange::Words mid-chunk (k > 0)
+            (1 << 16) | (25 * 64 + 5),    // +4 words past *word (exact DIR_STRIDE)
+            (1 << 16) | (31 * 64 + 29),   // +5 words past *word (DIR_STRIDE + 1 -> dir jump!)
+            (1 << 16) | (256 * 64),       // far dir jump to group 64 first word
+            (1 << 16) | (700 * 64 + 40),  // far dir jump across 111 groups
+            (1 << 16) | (1020 * 64),      // last group first word
+            (1 << 16) | (1023 * 64 + 62), // past last member of chunk 1 -> rolls to chunk 2
+        ],
+        // Enter chunk 2 (span-tight, base_word=100) mid-chunk at word 140 (k > 0),
+        // then jump across strides and roll into chunk 3.
+        &[
+            (2 << 16) | (140 * 64 + 19), // open span-tight CRange::Words mid-chunk (k > 0)
+            (2 << 16) | (145 * 64 + 7),  // +4 words past *word (exact DIR_STRIDE)
+            (2 << 16) | (151 * 64 + 33), // +5 words past *word (DIR_STRIDE + 1 -> dir jump!)
+            (2 << 16) | (300 * 64),      // far dir jump to group first word (rel 200)
+            (2 << 16) | (596 * 64),      // last group first word (rel 496)
+            (2 << 16) | (599 * 64 + 62), // past last member of chunk 2 -> rolls to chunk 3
+        ],
+    ];
+
+    for (seq_idx, targets) in sequences.iter().enumerate() {
+        let mut r_owned = set.range();
+        let mut r_wire = view.range();
+        for (step, &t) in targets.iter().enumerate() {
+            r_owned.seek(t);
+            r_wire.seek(t);
+            let pos = all_vals.partition_point(|&v| v < t);
+            let want = &all_vals[pos..];
+            assert_eq!(
+                r_owned.len(),
+                want.len(),
+                "owned len seq={seq_idx} step={step} target={t:#x}"
+            );
+            assert_eq!(
+                r_wire.remaining() as usize,
+                want.len(),
+                "wire remaining seq={seq_idx} step={step} target={t:#x}"
+            );
+            assert_eq!(
+                r_owned.front(),
+                want[0],
+                "owned front seq={seq_idx} step={step}"
+            );
+            assert_eq!(
+                r_wire.front(),
+                want[0],
+                "wire front seq={seq_idx} step={step}"
+            );
+            // Drain a saved snapshot after the mid-chunk dir jumps to verify
+            // every subsequent word load and chunk rollover is exact.
+            assert_eq!(
+                r_wire.save().collect::<Vec<_>>(),
+                want,
+                "wire drained tail seq={seq_idx} step={step} target={t:#x}"
+            );
+        }
     }
 }

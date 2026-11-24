@@ -73,8 +73,8 @@
 //! closed-form or word-popcount kernel, because it never looks at a member.
 //! The ranges add a consumption shape; they retire nothing.
 
-use crate::codec::{cone_guess, cone_window_rank};
-use crate::{Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container};
+use crate::codec::{cone_guess, cone_window_rank, stride_quotient_ceil};
+use crate::{Bitmosaic, Bitmosaic64, CHUNK_WORDS, Container, DIR_STRIDE};
 
 // ─────────────────────────────────────────────────────────────────────────
 // The protocol
@@ -254,17 +254,23 @@ impl<R: Range> Range for RangeIter<R> {
 pub(crate) enum ContainerRange<'a> {
     Words {
         words: &'a [u64; CHUNK_WORDS],
+        /// Cumulative popcount directory (every `DIR_STRIDE` words), enabling
+        /// O(1)-load directory jumps on long in-chunk seeks.
+        dir: &'a [u16],
         /// Index of the next word to load; `bits` belongs to `word - 1`.
         word: usize,
         /// Unconsumed set bits of the word at `word - 1`. Non-zero whenever
         /// `remaining > 0` — the invariant that makes `front` a pure read.
         bits: u64,
         remaining: u32,
+        /// Total chunk cardinality (for exact `len - rank` on directory jump).
+        len: u32,
     },
     Stride {
         next: u32,
         stride: u32,
         remaining: u32,
+        magic: u64,
     },
     Cone {
         first: u16,
@@ -295,7 +301,7 @@ impl<'a> ContainerRange<'a> {
     /// either way, and it stops at `remaining == 0` rather than scanning the
     /// chunk's empty tail.
     #[inline]
-    pub(crate) fn words(words: &'a [u64; CHUNK_WORDS], len: u32) -> Self {
+    pub(crate) fn words(words: &'a [u64; CHUNK_WORDS], dir: &'a [u16], len: u32) -> Self {
         let (mut word, mut bits) = (0usize, 0u64);
         if len != 0 {
             while bits == 0 && word < CHUNK_WORDS {
@@ -305,9 +311,11 @@ impl<'a> ContainerRange<'a> {
         }
         ContainerRange::Words {
             words,
+            dir,
             word,
             bits,
             remaining: len,
+            len,
         }
     }
 
@@ -379,6 +387,7 @@ impl Range for ContainerRange<'_> {
                 word,
                 bits,
                 remaining,
+                ..
             } => {
                 *bits &= *bits - 1;
                 *remaining -= 1;
@@ -406,6 +415,7 @@ impl Range for ContainerRange<'_> {
                 next,
                 stride,
                 remaining,
+                ..
             } => {
                 *next += *stride;
                 *remaining -= 1;
@@ -440,10 +450,9 @@ impl Range for ContainerRange<'_> {
                 next,
                 stride,
                 remaining,
+                magic,
             } => {
-                let skip = (u32::from(target) - *next)
-                    .div_ceil(*stride)
-                    .min(*remaining);
+                let skip = stride_quotient_ceil(u32::from(target) - *next, *magic).min(*remaining);
                 *next += skip * *stride;
                 *remaining -= skip;
             }
@@ -452,9 +461,11 @@ impl Range for ContainerRange<'_> {
             }
             Self::Words {
                 words,
+                dir,
                 word,
                 bits,
                 remaining,
+                len,
             } => {
                 // `bits` belongs to word index `*word - 1`.
                 let here = *word - 1;
@@ -463,6 +474,20 @@ impl Range for ContainerRange<'_> {
                 if goal == here {
                     *remaining -= (*bits & !mask).count_ones();
                     *bits &= mask;
+                } else if goal - *word > DIR_STRIDE {
+                    // Long in-chunk jump: compute exact remaining via the rank
+                    // directory in at most 1 dir load + (DIR_STRIDE - 1) words
+                    // instead of scanning up to 1024 words.
+                    let group = goal / DIR_STRIDE;
+                    let mut rank = u32::from(dir[group]);
+                    for w in group * DIR_STRIDE..goal {
+                        rank += words[w].count_ones();
+                    }
+                    let landing = words[goal];
+                    rank += (landing & !mask).count_ones();
+                    *remaining = *len - rank;
+                    *bits = landing & mask;
+                    *word = goal + 1;
                 } else {
                     *remaining -= bits.count_ones();
                     *bits = 0;
@@ -499,7 +524,7 @@ impl Range for ContainerRange<'_> {
                 let lo = ((guess - margin).max(0).min(n as i64) as usize).max(*at);
                 let hi = ((guess + margin + 1) as usize).min(n);
                 *at = if lo >= hi {
-                    hi
+                    hi.max(*at)
                 } else {
                     cone_window_rank(lo, hi, target, |i| {
                         Container::cone_value(*first, *scale, residuals, i)
@@ -564,6 +589,7 @@ impl Iterator for ContainerRange<'_> {
                 mut word,
                 mut bits,
                 remaining,
+                ..
             } => {
                 if remaining == 0 {
                     return acc;
@@ -587,6 +613,7 @@ impl Iterator for ContainerRange<'_> {
                 mut next,
                 stride,
                 remaining,
+                ..
             } => {
                 for _ in 0..remaining {
                     acc = f(acc, next as u16);
@@ -1646,4 +1673,48 @@ fn min_upper(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 #[inline]
 fn sum_upper(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     a.zip(b).map(|(x, y)| x.saturating_add(y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContainerRange, Range};
+    use crate::codec::cone_inv_scale;
+
+    #[test]
+    fn cone_seek_never_rewinds_when_window_lies_below_cursor() {
+        // Cursor at `at = 10` where a negative residual pushes `front()` below
+        // the linear prediction (`100 + 10 - 8 = 102`) so seeking `target = 103`
+        // produces a cone window `[lo_raw, hi) = [1, 6)` strictly below `*at = 10`
+        // (`lo = 10 >= hi = 6`). Without `hi.max(*at)`, `*at` would rewind to 6.
+        let first = 100u16;
+        let eps = 0u8;
+        let scale = 1u64 << 32;
+        let inv_scale = cone_inv_scale(scale);
+        let residuals: [i8; 20] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -8, -6, -4, -2, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut cursor = ContainerRange::Cone {
+            first,
+            eps,
+            scale,
+            inv_scale,
+            residuals: &residuals,
+            at: 10,
+        };
+        assert_eq!(cursor.front(), 102);
+        let before_remaining = cursor.remaining();
+        cursor.seek(103);
+        let ContainerRange::Cone { at, .. } = cursor else {
+            unreachable!();
+        };
+        assert!(
+            at >= 10,
+            "ContainerRange::Cone::seek rewound cursor from at=10 to at={at}"
+        );
+        assert!(
+            cursor.remaining() <= before_remaining,
+            "ContainerRange::Cone::seek grew remaining from {before_remaining} to {}",
+            cursor.remaining()
+        );
+    }
 }
