@@ -241,15 +241,6 @@ function isSpanContextForBinding<B extends OpContextBinding>(
   return isSpanContext<OpContextOf<B>>(value) && Reflect.get(value, '_schema') === binding.logBinding.logSchema;
 }
 
-function isTracerForBinding<B extends OpContextBinding>(value: unknown, binding: B): value is Tracer<B> {
-  const logBinding = typeof value === 'object' && value !== null ? Reflect.get(value, 'logBinding') : null;
-  return (
-    typeof logBinding === 'object' &&
-    logBinding !== null &&
-    Reflect.get(logBinding, 'logSchema') === binding.logBinding.logSchema
-  );
-}
-
 function isTracerInstance(value: unknown): value is Tracer<OpContextBinding> {
   return (
     typeof value === 'object' &&
@@ -338,6 +329,38 @@ interface TraceSink {
   readonly traceId: string;
 }
 
+/** One open test run: its tracer, its root `test-run` span, and the handle that ends that span. */
+interface ActiveTestRun<B extends OpContextBinding> {
+  readonly tracer: Tracer<B>;
+  readonly rootCtx: HarnessSpanContext<B>;
+  readonly rootTrace: Promise<unknown>;
+  readonly resolve: () => void;
+}
+
+/** Opens a new test run: constructs its tracer and starts a fresh `test-run` root span. */
+function startTestRun<B extends OpContextBinding>(options: TracerFactoryOptions<B>): ActiveTestRun<B> {
+  const tracer = createRootTracer(options);
+  const state: {
+    rootCtx: HarnessSpanContext<B> | null;
+    resolve: (() => void) | null;
+  } = { rootCtx: null, resolve: null };
+  const rootTrace = tracer.trace('test-run', (ctx) => {
+    state.rootCtx = ctx;
+    return new Promise<void>((resolve) => {
+      state.resolve = resolve;
+    });
+  });
+  if (state.rootCtx === null || state.resolve === null) {
+    throw new Error('Test harness tracer did not open its test-run root span');
+  }
+  return {
+    tracer,
+    rootCtx: state.rootCtx,
+    rootTrace,
+    resolve: state.resolve,
+  };
+}
+
 /**
  * Ends a test run: lets the root `test-run` span end, flushes the tracer and always closes it.
  *
@@ -348,26 +371,30 @@ interface TraceSink {
  */
 async function endTestRun<B extends OpContextBinding>(
   scope: 'instance' | 'global',
-  tracer: Tracer<B>,
-  rootTrace: Promise<unknown> | null,
-  sink: TraceSink | undefined,
+  run: ActiveTestRun<B>,
+  sqlite: SQLiteWriterConfig | undefined,
 ): Promise<void> {
+  cleanupDebug(`${scope}.afterAll:start`);
+  cleanupDebugActiveHandles(`${scope}.afterAll:handles:start`);
+  const sink: TraceSink | undefined = sqlite
+    ? { path: sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, traceId: run.rootCtx.buffer.trace_id }
+    : undefined;
   try {
-    if (rootTrace) {
-      cleanupDebug(`${scope}.rootTrace:await:start`);
-      await rootTrace;
-      cleanupDebug(`${scope}.rootTrace:await:end`);
-    }
-    cleanupDebug(`${scope}.tracer.flush:start`, { tracer: tracer.constructor.name });
-    await tracer.flush();
-    cleanupDebug(`${scope}.tracer.flush:end`, { tracer: tracer.constructor.name });
+    cleanupDebug(`${scope}.rootTrace:resolve`);
+    run.resolve();
+    cleanupDebug(`${scope}.rootTrace:await:start`);
+    await run.rootTrace;
+    cleanupDebug(`${scope}.rootTrace:await:end`);
+    cleanupDebug(`${scope}.tracer.flush:start`, { tracer: run.tracer.constructor.name });
+    await run.tracer.flush();
+    cleanupDebug(`${scope}.tracer.flush:end`, { tracer: run.tracer.constructor.name });
     if (sink) console.log(`\n[trace] trace_id: ${sink.traceId} -> ${sink.path}`);
   } catch (error) {
     const where = sink ? ` trace_id: ${sink.traceId} -> ${sink.path}` : '';
     console.error(`[lmao/testing] SQLite flush error:${where}`, error);
     throw error;
   } finally {
-    await closeTracer(tracer);
+    await closeTracer(run.tracer);
     cleanupDebugActiveHandles(`${scope}.afterAll:handles:end`);
     cleanupDebug(`${scope}.afterAll:end`);
   }
@@ -499,80 +526,56 @@ function createTestTracerInstance<
   binding: OpContextBinding<LogSchema<TFields>, FF, Deps, UserCtx>,
   options?: BunTestSetupOptions<TExt>,
 ): BunTestTracerInstance<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
-  let activeBinding: RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt> | null = null;
-  let tracer: Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> | null = null;
-  let verboseTrace = false;
-  let rootCtx: HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> | null = null;
-  let resolveTestRun: (() => void) | null = null;
-  let rootTracePromise: Promise<unknown> | null = null;
-  let isSetup = false;
+  type InstanceBinding = RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>;
+  let runConfig: TracerFactoryOptions<InstanceBinding> | null = null;
+  let activeRun: ActiveTestRun<InstanceBinding> | null = null;
 
-  const als = new AsyncLocalStorage<HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>>>();
+  const als = new AsyncLocalStorage<HarnessSpanContext<InstanceBinding>>();
 
-  function assertRootCtx(): HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
-    if (!rootCtx || !activeBinding || !isSpanContextForBinding(rootCtx, activeBinding)) {
-      throw new Error('Call setup() before wiring bun:test wrappers');
+  function ensureRun(missingSetupMessage: string): ActiveTestRun<InstanceBinding> {
+    if (runConfig === null) {
+      throw new Error(missingSetupMessage);
     }
-    return rootCtx;
+    activeRun ??= startTestRun(runConfig);
+    return activeRun;
   }
 
-  function assertTracer(): Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
-    if (!tracer || !activeBinding || !isTracerForBinding(tracer, activeBinding)) {
-      throw new Error('Call setup() in preload before tests');
-    }
-    return tracer;
+  function assertRootCtx(): HarnessSpanContext<InstanceBinding> {
+    return ensureRun('Call setup() before wiring bun:test wrappers').rootCtx;
+  }
+
+  function assertTracer(): Tracer<InstanceBinding> {
+    return ensureRun('Call setup() in preload before tests').tracer;
   }
 
   return {
     setup(): void {
-      if (isSetup) {
+      if (runConfig !== null) {
         return;
       }
-      isSetup = true;
 
       const extendedBinding = createRuntimeHarnessBinding(binding, options);
-      activeBinding = extendedBinding;
-
-      verboseTrace = isVerboseTraceEnabled(options?.verbose);
-
-      const activeTracer = createRootTracer({
+      const verboseTrace = isVerboseTraceEnabled(options?.verbose);
+      runConfig = {
         binding: extendedBinding,
         sqlite: options?.sqlite,
         verbose: verboseTrace,
-      });
+      };
 
-      tracer = activeTracer;
-      rootTracePromise = activeTracer.trace('test-run', (ctx) => {
-        rootCtx = ctx;
-        return new Promise<void>((resolve) => {
-          resolveTestRun = resolve;
-        });
-      });
+      activeRun = startTestRun(runConfig);
 
       _afterAll(async () => {
-        cleanupDebug('instance.afterAll:start');
-        cleanupDebugActiveHandles('instance.afterAll:handles:start');
-        if (resolveTestRun) {
-          cleanupDebug('instance.rootTrace:resolve');
-          resolveTestRun();
-          resolveTestRun = null;
-        }
-
-        const rootTrace = rootTracePromise;
-        rootTracePromise = null;
-        if (tracer) {
-          const sink =
-            options?.sqlite && rootCtx
-              ? { path: options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, traceId: rootCtx.buffer.trace_id }
-              : undefined;
-          await endTestRun('instance', tracer, rootTrace, sink);
+        const run = activeRun;
+        activeRun = null;
+        if (run !== null) {
+          await endTestRun('instance', run, runConfig?.sqlite);
         }
       });
     },
 
-    useTestSpan(): HarnessSpanContext<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
+    useTestSpan(): HarnessSpanContext<InstanceBinding> {
       const ctx = als.getStore();
-      if (!ctx || !activeBinding || !isSpanContextForBinding(ctx, activeBinding)) {
+      if (!ctx || !runConfig || !isSpanContextForBinding(ctx, runConfig.binding)) {
         throw new Error('useTestSpan() called outside of a traced it()');
       }
       return ctx;
@@ -583,10 +586,9 @@ function createTestTracerInstance<
       return ctx ? formatTestName(ctx) : undefined;
     },
 
-    getTracer(): Tracer<RuntimeHarnessBinding<TFields, FF, Deps, UserCtx, TExt>> {
+    getTracer(): Tracer<InstanceBinding> {
       return assertTracer();
     },
-
     createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
       const describeStack: string[] = [];
       const wrappedIt = wrapBunRegistration(bunTestModule.it, traceTests(describeStack, assertRootCtx, als));
@@ -600,18 +602,23 @@ function createTestTracerInstance<
   };
 }
 
-// Global singleton — one root tracer for the entire bun test run
-let _tracer: unknown = null;
-let _verboseTrace = false;
-
-// Root span context, its resolver, and the trace promise — one root per test run
-let _rootCtx: unknown = null;
-let _resolveTestRun: (() => void) | null = null;
-let _rootTracePromise: Promise<unknown> | null = null;
+// Global singleton — setup config survives across per-file runs in a --no-isolate worker;
+// the active run is cleared on preload afterAll and reopened by the next file's first traced test.
+let _globalRunConfig: TracerFactoryOptions<OpContextBinding> | null = null;
+let _globalActiveRun: ActiveTestRun<OpContextBinding> | null = null;
+let _globalAfterAllRegistered = false;
 
 // AsyncLocalStorage for propagating SpanContext to test bodies.
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
+
+function ensureGlobalRun(missingInitMessage: string): ActiveTestRun<OpContextBinding> {
+  if (_globalRunConfig === null) {
+    throw new Error(missingInitMessage);
+  }
+  _globalActiveRun ??= startTestRun(_globalRunConfig);
+  return _globalActiveRun;
+}
 
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
 export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: BunTestSetupOptions): void {
@@ -623,49 +630,31 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
       ? buildHarnessSchemaExtensions(opContext, undefined)
       : buildHarnessSchemaExtensions(opContext, options.extraTestColumns);
   const extendedSchema = opContext.logBinding.logSchema.extend(harnessSchema);
-  const extendedBinding = {
+  const extendedBinding: OpContextBinding = {
     ...opContext,
     logBinding: { ...opContext.logBinding, logSchema: extendedSchema },
   };
 
-  _verboseTrace = isVerboseTraceEnabled(options?.verbose);
-
-  const tracer = createRootTracer({
+  const verbose = isVerboseTraceEnabled(options?.verbose);
+  _globalRunConfig = {
     binding: extendedBinding,
     sqlite: options?.sqlite,
-    verbose: _verboseTrace,
-  });
-  _tracer = tracer;
+    verbose,
+  };
+  _globalActiveRun = startTestRun(_globalRunConfig);
 
-  // Create the single root trace — a long-lived promise keeps it alive
-  _rootTracePromise = tracer.trace('test-run', (ctx) => {
-    _rootCtx = ctx;
-    return new Promise<void>((resolve) => {
-      _resolveTestRun = resolve;
+  // Register global teardown once — each preload afterAll ends the current run and clears it so the next
+  // file's first traced test opens a fresh root and tracer.
+  if (!_globalAfterAllRegistered) {
+    _globalAfterAllRegistered = true;
+    _afterAll(async () => {
+      const run = _globalActiveRun;
+      _globalActiveRun = null;
+      if (run !== null) {
+        await endTestRun('global', run, _globalRunConfig?.sqlite);
+      }
     });
-  });
-
-  // Register global teardown — resolve root, wait for span-end, then flush tracer outputs
-  _afterAll(async () => {
-    cleanupDebug('global.afterAll:start');
-    cleanupDebugActiveHandles('global.afterAll:handles:start');
-    // Resolve the root promise — triggers span-end write via _executeWithContext .then()
-    if (_resolveTestRun) {
-      cleanupDebug('global.rootTrace:resolve');
-      _resolveTestRun();
-      _resolveTestRun = null;
-    }
-    const rootTrace = _rootTracePromise;
-    _rootTracePromise = null;
-
-    if (isTracerInstance(_tracer)) {
-      const sink =
-        options?.sqlite && isSpanContext(_rootCtx)
-          ? { path: options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH, traceId: _rootCtx.buffer.trace_id }
-          : undefined;
-      await endTestRun('global', _tracer, rootTrace, sink);
-    }
-  });
+  }
 }
 
 /**
@@ -679,19 +668,22 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
  * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
  */
 export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
-  if (!isSpanContext(_rootCtx)) {
+  if (_globalRunConfig === null) {
     if (_activeSuiteTracer) {
       return _activeSuiteTracer.createBunTestMock(bunTestModule);
     }
     throw new Error('Call initTraceTestRun() before createBunTestMock()');
   }
 
-  const rootCtx = _rootCtx;
   const describeStack: string[] = [];
 
   const wrappedIt = wrapBunRegistration(
     bunTestModule.it,
-    traceTests(describeStack, () => rootCtx, _als),
+    traceTests(
+      describeStack,
+      () => ensureGlobalRun('Call initTraceTestRun() before createBunTestMock()').rootCtx,
+      _als,
+    ),
   );
   return {
     ...bunTestModule,
@@ -752,8 +744,7 @@ export function getTracer(): Tracer<OpContextBinding> {
     return tracer;
   }
 
-  if (!isTracerInstance(_tracer)) throw new Error('Call initTraceTestRun() in preload before tests');
-  return _tracer;
+  return ensureGlobalRun('Call initTraceTestRun() in preload before tests').tracer;
 }
 
 /** Runs one registered callback, given the values Bun passed, the callback's declared parameter count, and the call. */
