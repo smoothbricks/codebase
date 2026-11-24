@@ -80,10 +80,36 @@ export function suiteMinimum(recordedWallsMs: readonly number[], want: number, i
   return most;
 }
 
-export function suiteWall(_recordedWallsMs: readonly number[], _threads: number): number {
-  return -1;
+/**
+ * The LPT makespan of the recorded walls on `threads` threads: the last finish time when the walls run longest first,
+ * each on the thread that frees first. Zero for a leaf with no recorded wall.
+ */
+export function suiteWall(recordedWallsMs: readonly number[], threads: number): number {
+  if (recordedWallsMs.length === 0) return 0;
+  const longestFirst = [...recordedWallsMs].sort((a, b) => b - a);
+  return finishTimes(longestFirst, Math.min(Math.max(1, threads), longestFirst.length)).at(-1) ?? 0;
 }
 
-export function fewestThreadsWithin(_recordedWallsMs: readonly number[], _want: number, _targetMs: number): number {
-  return 0;
+/**
+ * The fewest threads, from one to the lesser of `want` and the number of walls, at which the recorded walls' LPT wall
+ * finishes within `targetMs`. A grant never grows, so a suite of many short tests keeps finishing on one core and runs
+ * every test in turn unless its minimum also floors its wall. When no count reaches `targetMs` (a test longer than the
+ * target, or an ask too small), the fewest threads that achieve the least wall over that range, so the leaf never asks
+ * for threads that cannot shorten its wall. One, which is no minimum, for a leaf with no recorded wall.
+ */
+export function fewestThreadsWithin(recordedWallsMs: readonly number[], want: number, targetMs: number): number {
+  if (recordedWallsMs.length === 0) return 1;
+  const longestFirst = [...recordedWallsMs].sort((a, b) => b - a);
+  const most = Math.min(want, longestFirst.length);
+  let bestThreads = 1;
+  let bestWall = Number.POSITIVE_INFINITY;
+  for (let threads = 1; threads <= most; threads++) {
+    const wall = finishTimes(longestFirst, threads).at(-1) ?? 0;
+    if (wall <= targetMs) return threads;
+    if (wall < bestWall) {
+      bestWall = wall;
+      bestThreads = threads;
+    }
+  }
+  return bestThreads;
 }
