@@ -1920,7 +1920,11 @@ where
             Ok(success())
         }
         Command::Revoke(args) => revoke(service, output, json, args).await,
-        Command::Unadopt(UnadoptArgs { abandon, force }) => {
+        Command::Unadopt(UnadoptArgs {
+            abandon,
+            force,
+            repo_id: _,
+        }) => {
             let report = service
                 .remove_project(RemoveProjectOptions { force, abandon })
                 .await?;
@@ -5477,19 +5481,23 @@ where
     let root = &resolved.root;
     // An adoption that recorded only its intent has nothing to unbind, and opening it would
     // resume it; unadopt discards it before any opening (02_workspaces.md, "Checkout layouts").
-    if matches!(&cli.command, Command::Unadopt(_))
-        && let Some(repo) = ProjectRuntime::discard_intent_only_adoption(root, None).await?
-    {
-        if cli.global.json {
-            output.success(EmptyResult {}).map_err(output_error)?;
+    if let Command::Unadopt(args) = &cli.command {
+        let requested_repo_id = args.repo_id.as_deref().map(os_repo_id_ref).transpose()?;
+        if let Some(repo) =
+            ProjectRuntime::discard_intent_only_adoption(root, requested_repo_id.as_ref(), None)
+                .await?
+        {
+            if cli.global.json {
+                output.success(EmptyResult {}).map_err(output_error)?;
+            }
+            output
+                .guidance(&format!(
+                    "discarded the unfinished adoption of {repo}: it had recorded its intent and \
+                     nothing else"
+                ))
+                .map_err(output_error)?;
+            return Ok(success());
         }
-        output
-            .guidance(&format!(
-                "discarded the unfinished adoption of {repo}: it had recorded its intent and \
-                 nothing else"
-            ))
-            .map_err(output_error)?;
-        return Ok(success());
     }
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;

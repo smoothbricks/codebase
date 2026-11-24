@@ -160,6 +160,7 @@ pub const PARITY: &[Row] = &[
     row("unadopt", "", field(&[("coordinator.removeProject", "")], &[member("Coordinator.removeProject")])),
     row("unadopt", "abandon", field(&[("coordinator.removeProject", "options.abandon")], &[argument("Coordinator.removeProject", 0, "abandon")])),
     row("unadopt", "force", field(&[("coordinator.removeProject", "options.force")], &[argument("Coordinator.removeProject", 0, "force")])),
+    row("unadopt", "repo-id", Counterpart::CliOnly { reason: "intent-only adoption discard runs before opening a project, where no Coordinator exists yet because opening resumes the adopt (02_workspaces.md, \"Checkout layouts\")" }),
 
     row("setup", "", Counterpart::CliOnly { reason: SETUP_DIALOG }),
     row("setup", "uninstall", Counterpart::CliOnly { reason: SETUP_DIALOG }),

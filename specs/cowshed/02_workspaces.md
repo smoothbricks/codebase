@@ -316,11 +316,12 @@ workspace, listed or never published, under the gate `rm` applies: a session who
 `cowshed push` wrote keeps, retires with no flag, and one holding work main lacks refuses the unadopt, named. Then it
 detaches main, swaps the retained `<root>.pre-cowshed` tree back against whatever publication left at the checkout path
 — the emptied mountpoint directory — and removes the displaced artifact. The checkout path is never absent while it runs
-either. An adoption that recorded its intent and nothing else (no binding, no main image, a journal holding only main's
-unfinished adopt) has nothing to unbind and is never opened, since opening resumes it: `unadopt` finds its store by the
-identity adopt derives from the checkout's remotes and, while no adopt holds main's intent lease, removes it through the
-unbinding's own terminal-storage path, leaving no store directory; any other store without a binding refuses, naming
-what it holds.
+either. <a id="smoo/cowshed!n/unadopt-intent-only-repo-id"></a>An adoption that recorded its intent and nothing else (no
+binding, no main image, a journal holding only main's unfinished adopt) has nothing to unbind and is never opened, since
+opening resumes it: `unadopt` finds its store by the identity adopt derives from the checkout's remotes, or the one
+`--repo-id` names when it has none; with remotes, `--repo-id` must match one, as for adopt. While no adopt holds main's
+intent lease, it removes the store through the unbinding's own terminal-storage path, leaving no store directory; any
+other store without a binding refuses, naming what it holds.
 
 Unadopt refuses (exit 4) when main's head is contained by neither the retained checkout's head nor a remote ref: commits
 made in main after adoption would be lost with its image. `unadopt --abandon` authorizes exactly that loss and keeps it
@@ -1685,17 +1686,17 @@ no clone with only its slot binding to release. A retirement refused there, say 
 journaled with that refusal. Kept journaled with no refusal of its own, such a fork held its clone, and every build
 volume it registered, deferred behind it on every pass.
 
-`cowshed unadopt [--abandon] [--force]` (`Coordinator::remove_project`) is the adoption rollback described in "Checkout
-layouts"; `rm` has no rollback mode, and plain `cowshed rm main` requires `--force` and a clean `git status` (exit 4
-otherwise). It removes the whole project in one call: every session workspace, including clones a create never
-published, under the given `--force`/`--abandon`; each removal has already committed its release when collection begins;
-collects the project's own storage, never what other projects share (01_storage.md, "Shared temporary scratch"); with
-`--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits they hold, which `--abandon`
-authorizes losing (01_storage.md); and retires main, whose final unbinding moves the project's released images into the
-store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is idempotent, so a refusal leaves the rest
-to the same command. A collection that still finds the store changed under it (another process) is refused as retryable
-— `Conflict` with `Retry::GcPlanStale` — and the same command finishes the removal; callers never sleep and retry `gc`
-themselves.
+`cowshed unadopt [--abandon] [--force] [--repo-id <owner/repo>]` (`Coordinator::remove_project`) is the adoption
+rollback described in "Checkout layouts"; `rm` has no rollback mode, and plain `cowshed rm main` requires `--force` and
+a clean `git status` (exit 4 otherwise). It removes the whole project in one call: every session workspace, including
+clones a create never published, under the given `--force`/`--abandon`; each removal has already committed its release
+when collection begins; collects the project's own storage, never what other projects share (01_storage.md, "Shared
+temporary scratch"); with `--abandon` deletes the abandon bundles in `sessions/.trash`, the only copy of the commits
+they hold, which `--abandon` authorizes losing (01_storage.md); and retires main, whose final unbinding moves the
+project's released images into the store's `.deleting` and nudges the gateway ("Checkout layouts"). Each step is
+idempotent, so a refusal leaves the rest to the same command. A collection that still finds the store changed under it
+(another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the same command finishes the
+removal; callers never sleep and retry `gc` themselves.
 
 ## `cowshed attach` / `cowshed detach`
 

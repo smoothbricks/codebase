@@ -499,7 +499,7 @@ Two namespaces both present, or a malformed intent, are refused by name instead 
 `--repo-id` is an identity override, not a remote check. `origin` may already point at the renamed repository, may still
 use the old path, or may be absent; cowshed does not inspect or rewrite it.
 
-### `cowshed unadopt [--abandon] [--force]`
+### `cowshed unadopt [--abandon] [--force] [--repo-id <owner/repo>]`
 
 The reverse of `adopt`, for the whole project. It retires every session workspace, listed or never published, under the
 containment gate `rm` applies, collects their images, then puts the pre-adoption checkout back and unbinds the project.
@@ -507,8 +507,10 @@ Run it from the checkout, or name the project with `--project`; it takes no work
 holds, or the ref `cowshed push` wrote keeps, retires with no flag, however young; one holding work main lacks refuses
 the unadopt, named. `--force` stops each session's own running jobs instead of waiting for them, and waives nothing
 else. Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`. An adoption that recorded
-its intent and nothing else, interrupted before it wrote anything else, is discarded the same way: unadopt removes its
-store directory without opening it, and refuses while an adopt still runs.
+its intent and nothing else, interrupted before it wrote anything else, is discarded the same way: unadopt finds its
+store by the identity adopt derives from the checkout's remotes, or the one `--repo-id <owner/repo>` names when it has
+none (with remotes, `--repo-id` must match one, as for `adopt`), removes its store directory without opening it, and
+refuses while an adopt still runs.
 
 Before the swap, every `refs/cowshed/*` ref `push` wrote into main is fetched into the retained checkout and read back,
 so the pushed branches outlive the project there; stderr says so. Unadopt refuses (exit 4) when main's head is in

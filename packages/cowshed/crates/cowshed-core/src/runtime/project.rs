@@ -973,17 +973,20 @@ impl ProjectRuntime {
     /// `cowshed unadopt` of an adoption that recorded its intent and nothing else
     /// (02_workspaces.md, "Checkout layouts"): no repository binding, no main image, and a
     /// journal holding only main's unfinished adopt. Opening such a project would resume the
-    /// adoption, so this runs before any opening. Answers the identity whose store it removed, or
-    /// `None` when the checkout's identity is bound, claimed by an interrupted unadopt, or never
-    /// stored: the ordinary unadopt answers those. An unbound store in any other state refuses,
-    /// naming what it holds.
+    /// adoption, so this runs before any opening. Finds the store by the identity adopt derives
+    /// from the checkout's remotes, or `requested_repo_id` when the checkout has none (with
+    /// remotes, an explicit id must match a candidate, as for adopt). Answers the identity whose
+    /// store it removed, or `None` when the checkout's identity is bound, claimed by an
+    /// interrupted unadopt, or never stored: the ordinary unadopt answers those. An unbound store
+    /// in any other state refuses, naming what it holds.
     /// With no supplied storage, validates the canonical host store; otherwise uses the
     /// caller's already-validated store and leaves its teardown to the caller.
     pub async fn discard_intent_only_adoption(
         project_root: &Path,
+        requested_repo_id: Option<&RepoId>,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
     ) -> Result<Option<RepoId>> {
-        discard_intent_only_adoption(project_root, storage).await
+        discard_intent_only_adoption(project_root, requested_repo_id, storage).await
     }
 
     /// Opens the production runtime for a background verb a land or fork starts
@@ -2669,11 +2672,13 @@ impl ProjectActor {
 }
 /// The store of an adoption that recorded its intent and nothing else, removed
 /// ([`ProjectRuntime::discard_intent_only_adoption`]). The identity is the one adopt derives from
-/// the checkout's remotes. The adopt's intent lease must be free, since a held one is a live
-/// adopt, and it is held through the removal so none starts meanwhile. The removal is the
-/// unbinding's own, binding-absent path ([`finish_restored_project_unbinding`]).
+/// the checkout's remotes, or `requested_repo_id` when the checkout has none; with remotes, an
+/// explicit id must match a candidate, as for adopt. The adopt's intent lease must be free, since
+/// a held one is a live adopt, and it is held through the removal so none starts meanwhile. The
+/// removal is the unbinding's own, binding-absent path ([`finish_restored_project_unbinding`]).
 async fn discard_intent_only_adoption(
     project_root: &Path,
+    requested_repo_id: Option<&RepoId>,
     supplied: Option<crate::storage::bootstrap::ValidatedHostStorage>,
 ) -> Result<Option<RepoId>> {
     use crate::storage::recovery::{
@@ -2704,7 +2709,7 @@ async fn discard_intent_only_adoption(
     {
         return Ok(None);
     }
-    let candidate = binding_from_git(&git, None).await?;
+    let candidate = binding_from_git(&git, requested_repo_id).await?;
     let repo_id = candidate
         .primary()
         .map_err(native_integrity_error)?

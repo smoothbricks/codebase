@@ -421,6 +421,9 @@ pub struct UnadoptArgs {
     pub abandon: bool,
     /// Stop each session's own running jobs instead of waiting for them.
     pub force: bool,
+    /// Explicit repository identity for discarding an intent-only adoption when the checkout has
+    /// no Git remotes; with remotes, must match a remote candidate as for `adopt`.
+    pub repo_id: Option<OsString>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkArgs {
@@ -932,7 +935,7 @@ pub fn cli_command() -> ClapCommand {
             flag("quarantine"),
             flag("re-adopt"),
         ]))
-        .subcommand(leaf("unadopt").args([flag("abandon"), flag("force")]))
+        .subcommand(leaf("unadopt").args([flag("abandon"), flag("force"), value("repo-id")]))
         .subcommand(leaf("setup").args([
             flag("uninstall"),
             flag("force"),
@@ -2666,6 +2669,10 @@ const UNADOPT: CommandSpec = CommandSpec {
             spelling: "--force",
             meaning: "stop each session workspace's own running jobs instead of waiting for them; it waives nothing else, and main's own retirement takes no force",
         },
+        Opt {
+            spelling: "--repo-id <owner/repo>",
+            meaning: "identity of an intent-only adoption to discard when the checkout has no remotes; with remotes, must match one, as for `adopt`",
+        },
     ],
 };
 
@@ -2673,6 +2680,7 @@ fn parse_unadopt(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Unadopt(UnadoptArgs {
         abandon: flagged(matches, "abandon"),
         force: flagged(matches, "force"),
+        repo_id: os(matches, "repo-id"),
     }))
 }
 const SETUP: CommandSpec = CommandSpec {
@@ -5940,11 +5948,53 @@ mod tests {
             unadopt(&["unadopt", "--abandon", "--force"]).unwrap(),
             UnadoptArgs {
                 abandon: true,
-                force: true
+                force: true,
+                repo_id: None,
             }
         );
         assert!(unadopt(&["unadopt", "--purge"]).is_err());
         assert!(unadopt(&["unadopt", "main"]).is_err());
+    }
+
+    #[test]
+    fn unadopt_parses_repo_id() {
+        let Command::Unadopt(args) = parse_args(["unadopt", "--repo-id", "acme/widget"])
+            .expect("unadopt accepts --repo-id")
+            .command
+        else {
+            panic!("expected unadopt");
+        };
+        assert_eq!(
+            args,
+            UnadoptArgs {
+                abandon: false,
+                force: false,
+                repo_id: Some(OsString::from("acme/widget")),
+            }
+        );
+
+        let Command::Unadopt(combined) = parse_args([
+            "unadopt",
+            "--abandon",
+            "--force",
+            "--repo-id",
+            "acme/widget",
+        ])
+        .expect("unadopt accepts --repo-id with --abandon and --force")
+        .command
+        else {
+            panic!("expected unadopt");
+        };
+        assert_eq!(
+            combined,
+            UnadoptArgs {
+                abandon: true,
+                force: true,
+                repo_id: Some(OsString::from("acme/widget")),
+            }
+        );
+
+        assert!(parse_args(["unadopt", "--repo-id"]).is_err());
     }
 
     /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on

@@ -832,6 +832,7 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
     let discard = || {
         ProjectRuntime::discard_intent_only_adoption(
             &fixture.checkout,
+            None,
             Some(fixture.storage.clone()),
         )
     };
@@ -848,6 +849,24 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
         "a refusal discards nothing"
     );
     drop(adopting);
+
+    let other = RepoId::parse("other/repo").expect("other repo id");
+    let mismatch = ProjectRuntime::discard_intent_only_adoption(
+        &fixture.checkout,
+        Some(&other),
+        Some(fixture.storage.clone()),
+    )
+    .await
+    .expect_err("a --repo-id that matches no remote refuses as for adopt");
+    assert_eq!(
+        mismatch.code,
+        cowshed_core::ErrorCode::Conflict,
+        "{mismatch:?}"
+    );
+    assert!(
+        fixture.journal_path().exists(),
+        "a mismatched --repo-id discards nothing"
+    );
 
     assert_eq!(
         discard()
@@ -867,6 +886,86 @@ async fn unadopt_discards_an_adoption_that_recorded_only_its_intent() {
     );
 }
 
+//#region smoo/cowshed!n/unadopt-intent-only-repo-id
+/// A checkout with no Git remote whose store holds an intent-only adoption under an explicit
+/// identity is discarded whole by `unadopt --repo-id <owner/repo>`, leaving no store directory
+/// (02_workspaces.md, "Checkout layouts").
+#[tokio::test]
+async fn unadopt_discards_an_intent_only_adoption_with_no_remote_given_repo_id() {
+    let fixture = Fixture::new("unadopt-intent-only-no-remote");
+    let project = fixture.layout().project().clone();
+    fs::create_dir_all(&project.sessions).unwrap();
+    LifecycleIntentJournal::update(&census(), &fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Adopt {
+            options: AdoptOptions {
+                path: Some(fixture.checkout.clone()),
+                repo_id: Some(fixture.repo.clone()),
+                capacity: None,
+                quarantine: false,
+                re_adopt: false,
+                filesystem: None,
+            },
+        });
+        Ok(())
+    })
+    .expect("journal an adopt that recorded only its intent");
+    for lock in [
+        project.project_root.join("main.dmg.lock"),
+        project.sessions.join("main.intent.lock"),
+    ] {
+        fs::write(&lock, b"").unwrap();
+    }
+
+    let refusal = ProjectRuntime::discard_intent_only_adoption(
+        &fixture.checkout,
+        None,
+        Some(fixture.storage.clone()),
+    )
+    .await
+    .expect_err("a remoteless checkout without --repo-id refuses");
+    assert_eq!(
+        refusal.code,
+        cowshed_core::ErrorCode::EnvironmentMissing,
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.message.contains("no remote"),
+        "expected no-remote refusal: {refusal:?}"
+    );
+    assert!(
+        project.project_root.exists(),
+        "a refusal leaves the store directory intact"
+    );
+
+    assert_eq!(
+        ProjectRuntime::discard_intent_only_adoption(
+            &fixture.checkout,
+            Some(&fixture.repo),
+            Some(fixture.storage.clone()),
+        )
+        .await
+        .expect("the intent-only adoption is discarded"),
+        Some(fixture.repo.clone())
+    );
+    assert!(
+        !project.project_root.exists(),
+        "no store directory is left: {}",
+        project.project_root.display()
+    );
+    assert_eq!(
+        ProjectRuntime::discard_intent_only_adoption(
+            &fixture.checkout,
+            Some(&fixture.repo),
+            Some(fixture.storage.clone()),
+        )
+        .await
+        .expect("nothing is left to discard"),
+        None,
+        "with no store, the ordinary unadopt answers"
+    );
+}
+//#endregion smoo/cowshed!n/unadopt-intent-only-repo-id
+
 //#region smoo/cowshed!n/project-root-lookup
 /// A bound project's main names its checkout by its own entry in the store, whatever that entry
 /// is: a disk image, or a dataset project's mount record or home directory (09_substrates.md,
@@ -883,6 +982,7 @@ async fn a_bound_project_with_no_remote_is_found_from_its_checkout() {
     assert_eq!(
         ProjectRuntime::discard_intent_only_adoption(
             &fixture.checkout,
+            None,
             Some(fixture.storage.clone()),
         )
         .await
