@@ -3,16 +3,16 @@
 //! behind one byte, read where it lies.
 //!
 //! [`BitmapView`] is the form's direct entry (§11): a caller that knows its bytes are a Bitmap pays no dispatch
-//! on the control. [`Image::open`] is the entry for a caller that does not: it tells the format by the first
-//! byte (§3, §10) and names every root of format 2 this version of the crate does not read.
+//! on the control.
 
 use crate::admission::{AdmissionClass, AdmissionError};
-use crate::wire::{Bitmosaic64View, BitmosaicView};
+use crate::codec::select64;
+use crate::range::Range;
 
 /// The control's form bit: set on every Bitmap, clear on every other control.
-const BITMAP: u8 = 0x80;
+pub(crate) const BITMAP_TAG: u8 = 0x80;
 /// The greatest member the form holds: bit 7 of bitmap byte 126.
-const LAST_MEMBER: u32 = 8 * 127 - 1;
+pub(crate) const BITMAP_LAST_MEMBER: u32 = 8 * 127 - 1;
 
 /// A Bitmap image, borrowed. It holds the caller's slice from the control on, not only the image: the
 /// image's extent comes from the control, and the bytes after it are the caller's own, so a word is one
@@ -37,14 +37,14 @@ impl<'a> BitmapView<'a> {
                 "a Bitmap has no control byte",
             ));
         };
-        if control & BITMAP == 0 {
+        if control & BITMAP_TAG == 0 {
             return Err(AdmissionError::new(
                 AdmissionClass::Kind,
                 0,
                 "the control is not a Bitmap's",
             ));
         }
-        let n = usize::from(control & !BITMAP);
+        let n = usize::from(control & !BITMAP_TAG);
         match image.get(n) {
             None => Err(AdmissionError::new(
                 AdmissionClass::Extent,
@@ -65,8 +65,8 @@ impl<'a> BitmapView<'a> {
     #[inline]
     pub fn open_admitted(image: &'a [u8]) -> Option<Self> {
         let control = *image.first()?;
-        let n = usize::from(control & !BITMAP);
-        (control & BITMAP != 0 && n < image.len()).then_some(Self { image, n })
+        let n = usize::from(control & !BITMAP_TAG);
+        (control & BITMAP_TAG != 0 && n < image.len()).then_some(Self { image, n })
     }
 
     /// The image's length in bytes: the control and the bitmap.
@@ -96,28 +96,24 @@ impl<'a> BitmapView<'a> {
     }
 
     /// Little-endian word `i` of the bitmap: bit `j` is the member `64 i + j`. Bits past the bitmap are
-    /// zero, and so is every word past it.
+    /// zero, and so is every word past it. Never reads past the image's extent (§12.2).
     #[inline]
     pub fn word(&self, i: usize) -> u64 {
         let Some(held) = self.n.checked_sub(8 * i).filter(|held| *held != 0) else {
             return 0;
         };
         let from = 1 + 8 * i;
-        let loaded = match self.image.get(from..from + 8) {
-            Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
-            None => {
-                let mut word = [0u8; 8];
-                let rest = self.image.get(from..).unwrap_or_default();
-                for (to, byte) in word.iter_mut().zip(rest) {
-                    *to = *byte;
-                }
-                u64::from_le_bytes(word)
-            }
-        };
         if held >= 8 {
-            loaded
+            // SAFETY-by-bounds: `from + 8 <= 1 + self.n <= self.image.len()`.
+            match self.image.get(from..from + 8) {
+                Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
+                None => 0,
+            }
         } else {
-            loaded & ((1u64 << (8 * held)) - 1)
+            let mut word = [0u8; 8];
+            let rest = self.image.get(from..from + held).unwrap_or_default();
+            word[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(word)
         }
     }
 
@@ -141,6 +137,108 @@ impl<'a> BitmapView<'a> {
         whole + (self.word(v / 64) & ((1u64 << (v % 64)) - 1)).count_ones()
     }
 
+    /// Members strictly below `v` iff `v` is present, in one pass (L0 byproduct).
+    #[inline]
+    pub fn rank_if_present(&self, v: u32) -> Option<u32> {
+        let v_usize = v as usize;
+        if v_usize >= 8 * self.n {
+            return None;
+        }
+        let w_idx = v_usize / 64;
+        let bit = v_usize % 64;
+        let w = self.word(w_idx);
+        if (w >> bit) & 1 == 0 {
+            return None;
+        }
+        let whole: u32 = (0..w_idx).map(|i| self.word(i).count_ones()).sum();
+        Some(whole + (w & ((1u64 << bit) - 1)).count_ones())
+    }
+
+    /// The `k`-th member ascending (0-indexed); `None` when `k >= len()`.
+    ///
+    /// Licensed by `specs/bitmosaic/laws/bitmap_probe.bend` (`select_skips_whole_words`,
+    /// `select_stays_in_its_word`, `rank_of_select`, `select_is_a_member`).
+    #[inline]
+    pub fn select(&self, mut k: u32) -> Option<u32> {
+        let words = self.n.div_ceil(8);
+        for i in 0..words {
+            let w = self.word(i);
+            let ones = w.count_ones();
+            if k < ones {
+                return Some((i as u32) * 64 + select64(w, k));
+            }
+            k -= ones;
+        }
+        None
+    }
+
+    /// Least member at or above `v`; `None` when every member is below `v`.
+    ///
+    /// Equal to `select(rank(v))` (`specs/bitmosaic/laws/seek.bend`), answered directly by
+    /// masking the starting word and scanning forward with `trailing_zeros`.
+    #[inline]
+    pub fn seek(&self, v: u32) -> Option<u32> {
+        let v_usize = v as usize;
+        if v_usize >= 8 * self.n {
+            return None;
+        }
+        let words = self.n.div_ceil(8);
+        let mut i = v_usize / 64;
+        let first = self.word(i) & (u64::MAX << (v_usize % 64));
+        if first != 0 {
+            return Some((i as u32) * 64 + first.trailing_zeros());
+        }
+        i += 1;
+        while i < words {
+            let w = self.word(i);
+            if w != 0 {
+                return Some((i as u32) * 64 + w.trailing_zeros());
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Cardinality of the intersection of two Bitmaps, word by word (`bitmap_probe.bend`).
+    #[inline]
+    pub fn and_len(&self, other: &BitmapView<'_>) -> u32 {
+        let words = self.n.min(other.n).div_ceil(8);
+        (0..words)
+            .map(|i| (self.word(i) & other.word(i)).count_ones())
+            .sum()
+    }
+
+    /// Members of the intersection of two Bitmaps strictly below `v`.
+    #[inline]
+    pub fn and_rank(&self, other: &BitmapView<'_>, v: u32) -> u32 {
+        let limit = (v as usize).min(8 * self.n.min(other.n));
+        let whole: u32 = (0..limit / 64)
+            .map(|i| (self.word(i) & other.word(i)).count_ones())
+            .sum();
+        let tail = self.word(limit / 64) & other.word(limit / 64) & ((1u64 << (limit % 64)) - 1);
+        whole + tail.count_ones()
+    }
+
+    /// Ascending internal walk over all members, allocation-free.
+    #[inline]
+    pub fn for_each(&self, mut f: impl FnMut(u32)) {
+        let words = self.n.div_ceil(8);
+        for i in 0..words {
+            let mut w = self.word(i);
+            let base = (i as u32) * 64;
+            while w != 0 {
+                f(base + w.trailing_zeros());
+                w &= w - 1;
+            }
+        }
+    }
+
+    /// Ascending pull cursor implementing [`Range`] and [`Iterator`], with O(words) [`Range::seek`].
+    #[inline]
+    pub fn range(&self) -> BitmapRange<'a> {
+        BitmapRange::new(*self)
+    }
+
     /// The members, ascending.
     #[inline]
     pub fn iter(&self) -> BitmapIter<'a> {
@@ -150,6 +248,32 @@ impl<'a> BitmapView<'a> {
             word: 0,
             base: 0,
         }
+    }
+
+    /// Greatest member in the bitmap, or `None` when empty.
+    #[inline]
+    pub(crate) fn last_member(&self) -> Option<u32> {
+        let words = self.n.div_ceil(8);
+        for i in (0..words).rev() {
+            let w = self.word(i);
+            if w != 0 {
+                return Some((i as u32) * 64 + (63 - w.leading_zeros()));
+            }
+        }
+        None
+    }
+
+    /// Least member in the bitmap, or `None` when empty.
+    #[inline]
+    pub(crate) fn first_member(&self) -> Option<u32> {
+        let words = self.n.div_ceil(8);
+        for i in 0..words {
+            let w = self.word(i);
+            if w != 0 {
+                return Some((i as u32) * 64 + w.trailing_zeros());
+            }
+        }
+        None
     }
 }
 
@@ -184,6 +308,101 @@ impl Iterator for BitmapIter<'_> {
     }
 }
 
+/// Ascending [`Range`] cursor over a [`BitmapView`]. Copy, allocation-free, with idempotent `front`.
+#[derive(Clone, Copy, Debug)]
+pub struct BitmapRange<'a> {
+    view: BitmapView<'a>,
+    /// Next word index to load; `word` belongs to `next - 1`.
+    next: usize,
+    /// Unconsumed set bits of the current word; 0 iff exhausted.
+    word: u64,
+}
+
+impl<'a> BitmapRange<'a> {
+    #[inline]
+    fn new(view: BitmapView<'a>) -> Self {
+        let mut r = Self {
+            view,
+            next: 0,
+            word: 0,
+        };
+        r.refill();
+        r
+    }
+
+    #[inline]
+    fn refill(&mut self) {
+        let words = self.view.n.div_ceil(8);
+        while self.word == 0 && self.next < words {
+            self.word = self.view.word(self.next);
+            self.next += 1;
+        }
+    }
+}
+
+impl Range for BitmapRange<'_> {
+    type Item = u32;
+
+    #[inline(always)]
+    fn empty(&self) -> bool {
+        self.word == 0
+    }
+
+    #[inline(always)]
+    fn front(&self) -> u32 {
+        debug_assert!(self.word != 0, "front on an empty BitmapRange");
+        ((self.next - 1) as u32) * 64 + self.word.trailing_zeros()
+    }
+
+    #[inline(always)]
+    fn pop_front(&mut self) {
+        debug_assert!(self.word != 0, "pop_front on an empty BitmapRange");
+        self.word &= self.word - 1;
+        if self.word == 0 {
+            self.refill();
+        }
+    }
+
+    #[inline]
+    fn seek(&mut self, target: u32) {
+        if self.word == 0 || self.front() >= target {
+            return;
+        }
+        let t = target as usize;
+        if t >= 8 * self.view.n {
+            self.word = 0;
+            self.next = self.view.n.div_ceil(8);
+            return;
+        }
+        let goal = t / 64;
+        let cur = self.next - 1;
+        let mask = u64::MAX << (t % 64);
+        if goal == cur {
+            self.word &= mask;
+        } else {
+            self.word = self.view.word(goal) & mask;
+            self.next = goal + 1;
+        }
+        if self.word == 0 {
+            self.refill();
+        }
+    }
+}
+
+impl Iterator for BitmapRange<'_> {
+    type Item = u32;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.empty() {
+            return None;
+        }
+        let v = self.front();
+        self.pop_front();
+        Some(v)
+    }
+}
+
 /// The length of the Bitmap whose greatest member is `last`: `2 + last div 8`. The form ends at member
 /// 1,015 (129 bytes would be asked for 1,016: [`bitmap_set`] and [`bitmap_seal`] refuse it).
 #[inline]
@@ -196,7 +415,7 @@ pub const fn bitmap_len(last: u32) -> usize {
 /// `image`. It borrows `image` for this call alone, so a caller writes other bytes between calls.
 #[inline]
 pub fn bitmap_set(image: &mut [u8], v: u32) -> bool {
-    if v > LAST_MEMBER {
+    if v > BITMAP_LAST_MEMBER {
         return false;
     }
     match image.get_mut(1 + (v >> 3) as usize) {
@@ -213,61 +432,35 @@ pub fn bitmap_set(image: &mut [u8], v: u32) -> bool {
 /// zero: the control would then name a bitmap that ends in a zero byte, which no reader admits.
 #[inline]
 pub fn bitmap_seal(image: &mut [u8], last: u32) -> Option<usize> {
-    if last > LAST_MEMBER {
+    if last > BITMAP_LAST_MEMBER {
         return None;
     }
     let n = 1 + (last >> 3) as usize;
     if *image.get(n)? == 0 {
         return None;
     }
-    *image.first_mut()? = BITMAP | n as u8;
+    *image.first_mut()? = BITMAP_TAG | n as u8;
     Some(1 + n)
 }
 
-/// An image, by what its first byte says it is (§3 and §10).
-#[derive(Clone, Copy, Debug)]
-pub enum Image<'a> {
-    /// Format 2, the Bitmap root.
-    Bitmap(BitmapView<'a>),
-    /// Format 1 (`42 4D 53`), a `u32` set, verified.
-    Format1(BitmosaicView<'a>),
-    /// Format 1, a `u64` set, verified.
-    Format1Wide(Bitmosaic64View<'a>),
-}
-
-impl<'a> Image<'a> {
-    /// Admit the image at the start of `bytes` whatever its format. A format-1 image is admitted as
-    /// `open_verified` admits it. Of format 2 this version of the crate reads the Bitmap root; every other
-    /// root is refused by name, as `kind` at the control.
-    pub fn open(bytes: &'a [u8]) -> Result<Self, AdmissionError> {
-        let refuse = |what| Err(AdmissionError::new(AdmissionClass::Kind, 0, what));
-        match bytes {
-            [] => Err(AdmissionError::new(
-                AdmissionClass::Extent,
-                0,
-                "an image has no control byte",
-            )),
-            [control, ..] if control & BITMAP != 0 => BitmapView::open(bytes).map(Self::Bitmap),
-            [0x42, 0x4D, 0x53, control, ..] if control & 1 != 0 => {
-                Bitmosaic64View::open_verified(bytes).map(Self::Format1Wide)
-            }
-            [0x42, ..] => BitmosaicView::open_verified(bytes).map(Self::Format1),
-            [0x00, ..] => refuse("the control 00 is no image"),
-            [0x01, ..] => {
-                refuse("format 2's u32 directory is not read by this version of the crate")
-            }
-            [0x02, ..] => {
-                refuse("format 2's Elias-Fano root is not read by this version of the crate")
-            }
-            [0x03, ..] => {
-                refuse("format 2's u64 directory is not read by this version of the crate")
-            }
-            [0x20..=0x23, ..] => {
-                refuse("format 2's Single root is not read by this version of the crate")
-            }
-            [0x40..=0x43, ..] => refuse("the control is kept for a later format"),
-            [0x60..=0x63, ..] => refuse("the control is unassigned"),
-            [_, ..] => refuse("format 2's List root is not read by this version of the crate"),
-        }
+/// Write a complete Bitmap image for an ascending slice `members` directly into `out`, returning its
+/// length (`1` for empty, `2 + last / 8` otherwise). Returns `None` if `members` contains a member past
+/// `1015` or `out` is too short. Allocation-free.
+#[inline]
+pub fn write_bitmap(members: &[u32], out: &mut [u8]) -> Option<usize> {
+    let Some(&last) = members.last() else {
+        *out.first_mut()? = BITMAP_TAG;
+        return Some(1);
+    };
+    if last > BITMAP_LAST_MEMBER {
+        return None;
     }
+    let len = bitmap_len(last);
+    let buf = out.get_mut(..len)?;
+    buf[0] = BITMAP_TAG | (len - 1) as u8;
+    buf[1..].fill(0);
+    for &v in members {
+        buf[1 + (v >> 3) as usize] |= 1 << (v & 7);
+    }
+    Some(len)
 }

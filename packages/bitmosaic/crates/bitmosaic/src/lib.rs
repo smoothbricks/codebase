@@ -30,10 +30,12 @@ mod array;
 mod bitmap;
 mod codec;
 mod ef;
+mod list;
 #[cfg(any(test, feature = "bench-internals"))]
 pub mod oracle;
 mod patch;
 mod range;
+mod v2;
 mod wire;
 
 use codec::{
@@ -41,11 +43,22 @@ use codec::{
 };
 
 pub use admission::{AdmissionClass, AdmissionError};
-pub use bitmap::{BitmapIter, BitmapView, Image, bitmap_len, bitmap_seal, bitmap_set};
-pub use ef::EfView;
+pub use bitmap::{
+    BitmapIter, BitmapRange, BitmapView, bitmap_len, bitmap_seal, bitmap_set, write_bitmap,
+};
+pub use ef::{Ef2Range, Ef2View, EfView, ef2_len, write_ef2};
+pub use list::{
+    ListRange, ListView, SingleRange, SingleView, list_len, single_len, write_list, write_single,
+};
 pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,
     patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,
+};
+pub use v2::{
+    Dir64V2Range, Dir64V2View, EMPTY_V2_IMAGE, Format, Image, ImageForm, ImageHeaderV2, V2Range,
+    V2View, V264Range, V264View, forest_len_v2, image_header_v2, image_len_v2, patch_v2,
+    patch_v2_witnessed, patched_len_bound_v2, to_v2_bytes_u64, write_forest_into_v2,
+    write_image_into_v2,
 };
 
 /// Same-binary control for sparse patch measurements; absent from shipped builds.

@@ -746,7 +746,7 @@ impl Bitmosaic {
         self.write_body(plan, &mut out[at..]);
     }
 
-    fn forest_body_bytes(&self) -> usize {
+    pub(crate) fn forest_body_bytes(&self) -> usize {
         if self.is_empty() {
             return 0;
         }
@@ -758,6 +758,16 @@ impl Bitmosaic {
         self.containers()
             .iter()
             .fold(geometry.payload_at, |at, c| at + payload_len(c))
+    }
+
+    /// Write the Format 1/2 shared forest body (without frame header) into `out`.
+    pub(crate) fn write_forest_body(&self, out: &mut [u8]) {
+        self.write_body(
+            Plan::Forest {
+                body_bytes: out.len(),
+            },
+            out,
+        );
     }
 
     fn forest_bytes(&self) -> usize {
@@ -2906,6 +2916,271 @@ impl<'a> BitmosaicView<'a> {
             });
         }
         Self::open_body::<true>(bytes, header.body_offset, header.root, verify)
+    }
+
+    /// Attach a Format 2 `u32` directory (`0x01`, `body_bytes` varint, forest body) without
+    /// altering Format 1's `Root`, `ViewCursor`, or hot directory functions.
+    pub(crate) fn open_forest_v2<const CHECK: bool>(
+        bytes: &'a [u8],
+        body_offset: usize,
+        verify: bool,
+    ) -> Result<Self, AdmissionError> {
+        Self::open_body::<CHECK>(bytes, body_offset, ROOT_FOREST, verify)
+    }
+
+    /// Verify that every chunk in a Format 2 forest directory uses §8.4's canonical container
+    /// and exact Cone `(scale, eps)`. Zero heap allocation.
+    pub(crate) fn verify_forest_canonical(&self) -> Result<(), AdmissionError> {
+        let Root::Forest(f) = &self.root else {
+            return Ok(());
+        };
+        for i in 0..f.chunks as usize {
+            let Some(container) = f.container(i) else {
+                continue;
+            };
+            let origin = f.payload_at(i);
+            let card = container.cardinality() as usize;
+            match container {
+                CView::Stride { .. } => {
+                    if card < 2 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "singleton chunk must be Array, not Stride",
+                        ));
+                    }
+                }
+                CView::Words {
+                    payload,
+                    word_count,
+                    ..
+                } => {
+                    if card <= crate::ARRAY_MAX {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Words chunk is below the dense threshold",
+                        ));
+                    }
+                    let mut prev = 0u64;
+                    let mut runs = 0usize;
+                    for w in 0..word_count as usize {
+                        let word = read_u64_at(payload, WORDS_AT + w * 8);
+                        runs += (word & !((word << 1) | prev)).count_ones() as usize;
+                        prev = word >> 63;
+                    }
+                    if 6 * runs < crate::WORDS_HEAP_BYTES {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Words chunk should be Runs under §8.4",
+                        ));
+                    }
+                }
+                CView::Runs(runs) => {
+                    let r = runs.count();
+                    if card == 1 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "singleton chunk must be Array, not Runs",
+                        ));
+                    }
+                    if r == 1 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "single-run chunk must be Stride, not Runs",
+                        ));
+                    }
+                    if r == card {
+                        let step = runs.start(1) - runs.start(0);
+                        if (2..r).all(|j| runs.start(j) - runs.start(j - 1) == step) {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Canonical,
+                                origin,
+                                "arithmetic progression chunk must be Stride, not Runs",
+                            ));
+                        }
+                    }
+                    if card > crate::ARRAY_MAX {
+                        if 6 * r >= crate::WORDS_HEAP_BYTES {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Canonical,
+                                origin,
+                                "Runs chunk should be Words under §8.4",
+                            ));
+                        }
+                    } else {
+                        if 6 * r >= 2 * card {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Canonical,
+                                origin,
+                                "Runs chunk should be Array under §8.4",
+                            ));
+                        }
+                        if card <= crate::CONE_MAX_LEN && 16 + card <= 6 * r {
+                            let first = runs.start(0) as u16;
+                            let last = runs.end(r - 1) as u16;
+                            let scale = (u64::from(last - first) << 32) / (card as u64 - 1);
+                            let mut idx = 0usize;
+                            let mut fits = true;
+                            'runs_cone: for j in 0..r {
+                                for v in runs.start(j)..=runs.end(j) {
+                                    let pred =
+                                        i64::from(first) + ((idx as u64 * scale) >> 32) as i64;
+                                    if (i64::from(v) - pred).abs() > crate::CONE_MAX_EPS {
+                                        fits = false;
+                                        break 'runs_cone;
+                                    }
+                                    idx += 1;
+                                }
+                            }
+                            if fits {
+                                return Err(AdmissionError::new(
+                                    AdmissionClass::Canonical,
+                                    origin,
+                                    "Runs chunk should be Cone under §8.4",
+                                ));
+                            }
+                        }
+                    }
+                }
+                CView::Array(values) => {
+                    if card == 1 {
+                        continue;
+                    }
+                    if card > crate::ARRAY_MAX {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Array chunk exceeds ARRAY_MAX",
+                        ));
+                    }
+                    let first = read_u16_at(values, 0);
+                    let second = read_u16_at(values, 2);
+                    let step = u32::from(second - first);
+                    let mut is_stride = true;
+                    let mut runs = 1usize;
+                    let mut prev = first;
+                    for j in 1..card {
+                        let v = read_u16_at(values, 2 * j);
+                        let d = u32::from(v - prev);
+                        if d != step {
+                            is_stride = false;
+                        }
+                        if d != 1 {
+                            runs += 1;
+                        }
+                        prev = v;
+                    }
+                    if is_stride {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "arithmetic progression chunk must be Stride, not Array",
+                        ));
+                    }
+                    if 6 * runs < 2 * card {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Array chunk should be Runs under §8.4",
+                        ));
+                    }
+                    if card <= crate::CONE_MAX_LEN && 16 + card <= 2 * card {
+                        let scale = (u64::from(prev - first) << 32) / (card as u64 - 1);
+                        let mut fits = true;
+                        for j in 0..card {
+                            let v = read_u16_at(values, 2 * j);
+                            let pred = i64::from(first) + ((j as u64 * scale) >> 32) as i64;
+                            if (i64::from(v) - pred).abs() > crate::CONE_MAX_EPS {
+                                fits = false;
+                                break;
+                            }
+                        }
+                        if fits {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Canonical,
+                                origin,
+                                "Array chunk should be Cone under §8.4",
+                            ));
+                        }
+                    }
+                }
+                CView::Cone {
+                    first,
+                    scale,
+                    eps,
+                    residuals,
+                    ..
+                } => {
+                    if !(16..=crate::CONE_MAX_LEN).contains(&card) {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Cone chunk cardinality is outside §8.4's Cone range",
+                        ));
+                    }
+                    let v0 = cone_value(first, scale, residuals, 0);
+                    let v1 = cone_value(first, scale, residuals, 1);
+                    let step = u32::from(v1 - v0);
+                    let mut is_stride = true;
+                    let mut runs = 1usize;
+                    let mut prev = v0;
+                    let mut max_abs = (residuals[0] as i8).unsigned_abs();
+                    for j in 1..card {
+                        let v = cone_value(first, scale, residuals, j);
+                        let d = u32::from(v - prev);
+                        if d != step {
+                            is_stride = false;
+                        }
+                        if d != 1 {
+                            runs += 1;
+                        }
+                        max_abs = max_abs.max((residuals[j] as i8).unsigned_abs());
+                        prev = v;
+                    }
+                    if is_stride {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "arithmetic progression chunk must be Stride, not Cone",
+                        ));
+                    }
+                    if 6 * runs < 16 + card {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Cone chunk should be Runs under §8.4",
+                        ));
+                    }
+                    if first != v0 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin,
+                            "Cone first differs from its least member",
+                        ));
+                    }
+                    let want_scale = (u64::from(prev - v0) << 32) / (card as u64 - 1);
+                    if scale != want_scale {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin + 3,
+                            "Cone scale differs from §8.4",
+                        ));
+                    }
+                    if i64::from(max_abs) > crate::CONE_MAX_EPS || eps != max_abs {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Canonical,
+                            origin + 2,
+                            "Cone eps differs from §8.4",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Attach one bounded body; trusted child probes skip already-admitted directory checks.

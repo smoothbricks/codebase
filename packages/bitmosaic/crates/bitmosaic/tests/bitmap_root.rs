@@ -237,30 +237,34 @@ fn bytes_a_pass_admitted_open_without_the_last_byte_rule() {
 
 //#region smoo/bitmosaic!n/control-byte
 #[test]
-fn the_general_entry_tells_the_format_and_names_what_it_does_not_read() {
+fn the_general_entry_tells_the_format_and_admits_every_format_2_root() {
     let corpus = corpus();
     for row in corpus["u32"].as_array().expect("u32 rows") {
         let sealed = hex(row["sealed"].as_str().expect("sealed"));
         let form = row["form"].as_str().expect("form");
-        match Image::open(&sealed) {
-            Ok(Image::Bitmap(view)) => {
+        let want = members(row);
+        match Image::open(&sealed).expect("every format-2 corpus row is admitted") {
+            Image::Bitmap(view) => {
                 assert_eq!(form, "Bitmap");
-                assert_eq!(view.iter().collect::<Vec<_>>(), members(row));
+                assert_eq!(view.iter().collect::<Vec<_>>(), want);
             }
-            Ok(other) => panic!("{form} read as {other:?}"),
-            Err(e) => {
-                assert_ne!(form, "Bitmap");
-                assert_eq!((e.class, e.offset), (AdmissionClass::Kind, 0));
-                let named = match form {
-                    "Directory" => "u32 directory",
-                    other => other,
-                };
-                assert!(
-                    e.what.contains(named),
-                    "{form} is refused by name: {}",
-                    e.what
-                );
+            Image::Single(view) => {
+                assert_eq!(form, "Single");
+                assert_eq!(view.range().collect::<Vec<_>>(), want);
             }
+            Image::List(view) => {
+                assert_eq!(form, "List");
+                assert_eq!(view.range().collect::<Vec<_>>(), want);
+            }
+            Image::EliasFano(view) => {
+                assert_eq!(form, "Elias-Fano");
+                assert_eq!(view.range().collect::<Vec<_>>(), want);
+            }
+            Image::Directory(view) => {
+                assert_eq!(form, "Directory");
+                assert_eq!(view.range().collect::<Vec<_>>(), want);
+            }
+            other => panic!("{form} read as {other:?}"),
         }
     }
     let kind = |bytes: &[u8]| {
@@ -269,7 +273,6 @@ fn the_general_entry_tells_the_format_and_names_what_it_does_not_read() {
         e.what
     };
     assert!(kind(&[0x00]).contains("no image"));
-    assert!(kind(&[0x03, 0x00]).contains("u64 directory"));
     assert!(kind(&[0x41]).contains("later format"));
     assert!(kind(&[0x60, 0x05]).contains("unassigned"));
     assert_eq!(

@@ -68,6 +68,37 @@ pub(crate) fn read_u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+#[inline(always)]
+pub(crate) fn read_u24_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from(bytes[at]) | (u32::from(bytes[at + 1]) << 8) | (u32::from(bytes[at + 2]) << 16)
+}
+
+/// Minimum byte width `W(x)` in `1..=4` needed to encode `x` little-endian (§2).
+#[inline(always)]
+pub(crate) const fn width_of(x: u32) -> usize {
+    1 + (x >= 256) as usize + (x >= 65_536) as usize + (x >= 16_777_216) as usize
+}
+
+/// Read a little-endian unsigned integer of `width` bytes (`1..=4`) without
+/// reading past `bytes[at + width]`.
+#[inline(always)]
+pub(crate) fn read_uint_le(bytes: &[u8], at: usize, width: usize) -> u32 {
+    match width {
+        1 => u32::from(bytes[at]),
+        2 => u32::from(read_u16_at(bytes, at)),
+        3 => read_u24_at(bytes, at),
+        4 => read_u32_at(bytes, at),
+        _ => unreachable!("width must be in 1..=4"),
+    }
+}
+
+/// Write the low `width` bytes (`1..=4`) of `value` in little-endian order.
+#[inline(always)]
+pub(crate) fn write_uint_le(out: &mut [u8], at: usize, value: u32, width: usize) {
+    let le = value.to_le_bytes();
+    out[at..at + width].copy_from_slice(&le[..width]);
+}
+
 // ── canonical ULEB128 ────────────────────────────────────────────────────
 
 // Queries that inspect framing without certifying it retain nullable probe semantics;

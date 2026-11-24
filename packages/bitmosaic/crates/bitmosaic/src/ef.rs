@@ -15,7 +15,8 @@
 //! construction, because `low_bits` is chosen so the high plane holds about
 //! as many zeros as ones. No binary search appears on any read path.
 
-use crate::codec::{read_u32_at, read_u64_at, read_uleb_checked, select64};
+use crate::codec::{read_u32_at, read_u64_at, read_uleb_checked, select64, uleb_len, write_uleb};
+use crate::range::Range;
 use crate::{AdmissionClass, AdmissionError};
 
 /// One sample every 64 ones and every 64 zeros. The samples are absolute
@@ -838,5 +839,997 @@ impl<'a> EfRange<'a> {
         self.word = w + 1;
         self.bits = bits;
         self.k = k;
+    }
+}
+
+// ── Format 2 lean Elias-Fano (§6) ────────────────────────────────────────
+
+/// Control byte of a Format 2 Elias-Fano image (§3, §6).
+pub(crate) const EF2_CONTROL: u8 = 0x02;
+
+/// Geometry of a Format 2 lean Elias-Fano plane (§6):
+/// - high plane in whole BYTES (`ceil((buckets + n) / 8)`), not whole 64-bit words
+/// - first zero-sample (zero #0) is NOT stored: `floor((buckets - 1) / 64)` entries
+/// - no `body_bytes` framing: self-delimiting from `(n, first, span)` alone
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ef2Layout {
+    pub(crate) low_bits: u8,
+    pub(crate) high_bytes: usize,
+    pub(crate) high_words: usize,
+    /// Bit positions in the high plane: `(span >> low_bits) + n + 1`.
+    pub(crate) high_bits: u64,
+    /// Zeros in the high plane = bucket count = `(span >> low_bits) + 1`.
+    pub(crate) zeros: u64,
+    pub(crate) low_bytes: usize,
+    pub(crate) ones_samples: usize,
+    pub(crate) zero_samples: usize,
+}
+
+impl Ef2Layout {
+    /// Closed-form geometry for Format 2 Elias-Fano (`n >= 2`, `n <= span + 1`).
+    pub(crate) fn new(n: u64, span: u64) -> Option<Self> {
+        if n < 2 || span > u64::from(u32::MAX) || n > span + 1 {
+            return None;
+        }
+        let mut low_bits = if span <= n {
+            0u8
+        } else {
+            ((63 - span.leading_zeros()) - (63 - n.leading_zeros())) as u8
+        };
+        if low_bits != 0 && (span >> low_bits) < n {
+            low_bits -= 1;
+        }
+        let buckets = (span >> low_bits) + 1;
+        let high_bits = buckets.checked_add(n)?;
+        if high_bits - 1 > u64::from(u32::MAX) {
+            return None;
+        }
+        let high_bytes = usize::try_from(high_bits.div_ceil(8)).ok()?;
+        let high_words = high_bytes.div_ceil(8);
+        let low_bytes = usize::try_from((n * u64::from(low_bits)).div_ceil(8)).ok()?;
+        Some(Self {
+            low_bits,
+            high_bytes,
+            high_words,
+            high_bits,
+            zeros: buckets,
+            low_bytes,
+            ones_samples: usize::try_from((n - 1) / u64::from(SAMPLE_STRIDE)).ok()?,
+            zero_samples: usize::try_from((buckets - 1) / u64::from(SAMPLE_STRIDE)).ok()?,
+        })
+    }
+
+    #[inline(always)]
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.high_bytes + self.low_bytes + (self.ones_samples + self.zero_samples) * 4
+    }
+
+    #[inline(always)]
+    pub(crate) fn low_at(&self) -> usize {
+        self.high_bytes
+    }
+
+    #[inline(always)]
+    pub(crate) fn ones_at(&self) -> usize {
+        self.low_at() + self.low_bytes
+    }
+
+    #[inline(always)]
+    pub(crate) fn zeros_at(&self) -> usize {
+        self.ones_at() + self.ones_samples * 4
+    }
+}
+
+/// Closed-form total byte length of a Format 2 Elias-Fano image (§6) from `n >= 2`, `first`, and
+/// `span = last - first`. Returns `None` if `n < 2` or the geometry overflows.
+#[inline]
+pub fn ef2_len(n: u64, first: u32, span: u32) -> Option<usize> {
+    let layout = Ef2Layout::new(n, u64::from(span))?;
+    let n_minus_1 = u32::try_from(n - 1).ok()?;
+    let header = 1 + uleb_len(n_minus_1) + uleb_len(first) + uleb_len(span);
+    header.checked_add(layout.payload_bytes())
+}
+
+/// Encode a Format 2 lean Elias-Fano image from an ascending iterator of `n >= 2` distinct values
+/// with `first` and `span = last - first` into `out` (which must be at least `ef2_len` bytes).
+/// Returns the exact bytes written. Allocation-free.
+pub(crate) fn encode_ef2_into(
+    values: impl Iterator<Item = u32>,
+    n: u64,
+    first: u32,
+    span: u32,
+    layout: Ef2Layout,
+    out: &mut [u8],
+) -> usize {
+    let mut at = 0usize;
+    out[at] = EF2_CONTROL;
+    at += 1;
+    write_uleb(out, &mut at, (n - 1) as u32);
+    write_uleb(out, &mut at, first);
+    write_uleb(out, &mut at, span);
+    let payload_len = layout.payload_bytes();
+    let payload = &mut out[at..at + payload_len];
+    payload.fill(0);
+    let (high, rest) = payload.split_at_mut(layout.high_bytes);
+    let (low, samples) = rest.split_at_mut(layout.low_bytes);
+    let (ones_s, zero_s) = samples.split_at_mut(layout.ones_samples * 4);
+
+    let mask = (1u64 << layout.low_bits) - 1;
+    let stride = u64::from(SAMPLE_STRIDE);
+    // Format 2 skips zero #0; first stored zero-sample is zero #64.
+    let mut next_zero = stride;
+    let mut count = 0u64;
+    for (k, v) in values.enumerate() {
+        let k = k as u64;
+        let d = u64::from(v - first);
+        let h = d >> layout.low_bits;
+        let p = h + k;
+
+        high[(p / 8) as usize] |= 1u8 << (p % 8);
+
+        while next_zero < h {
+            let slot = (next_zero / stride - 1) as usize * 4;
+            zero_s[slot..slot + 4].copy_from_slice(&((next_zero + k) as u32).to_le_bytes());
+            next_zero += stride;
+        }
+
+        if k != 0 && k.is_multiple_of(stride) {
+            let slot = (k / stride - 1) as usize * 4;
+            ones_s[slot..slot + 4].copy_from_slice(&(p as u32).to_le_bytes());
+        }
+
+        if layout.low_bits != 0 {
+            let bit = k * u64::from(layout.low_bits);
+            let byte = (bit / 8) as usize;
+            let window = ((d & mask) << (bit % 8)).to_le_bytes();
+            let width = ((bit % 8 + u64::from(layout.low_bits)).div_ceil(8)) as usize;
+            for i in 0..width {
+                low[byte + i] |= window[i];
+            }
+        }
+        count = k + 1;
+    }
+    while next_zero < layout.zeros {
+        let slot = (next_zero / stride - 1) as usize * 4;
+        zero_s[slot..slot + 4].copy_from_slice(&((next_zero + count) as u32).to_le_bytes());
+        next_zero += stride;
+    }
+    at + payload_len
+}
+
+/// Write a Format 2 lean Elias-Fano image for an ascending slice `members` (`n >= 2`) directly into
+/// `out`, returning its byte length. Returns `None` if `members.len() < 2` or `out` is too short.
+/// Allocation-free.
+pub fn write_ef2(members: &[u32], out: &mut [u8]) -> Option<usize> {
+    let n = members.len() as u64;
+    if n < 2 {
+        return None;
+    }
+    let first = members[0];
+    let last = members[members.len() - 1];
+    let span = last.checked_sub(first)?;
+    let layout = Ef2Layout::new(n, u64::from(span))?;
+    let total =
+        1 + uleb_len((n - 1) as u32) + uleb_len(first) + uleb_len(span) + layout.payload_bytes();
+    if out.len() < total {
+        return None;
+    }
+    Some(encode_ef2_into(
+        members.iter().copied(),
+        n,
+        first,
+        span,
+        layout,
+        out,
+    ))
+}
+
+/// Borrowed Format 2 lean Elias-Fano view (§6). Zero-allocation; never reads past `extent` (§12.2).
+#[derive(Clone, Copy, Debug)]
+pub struct Ef2View<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) layout: Ef2Layout,
+    pub(crate) base: u32,
+    pub(crate) span: u32,
+    pub(crate) len: u64,
+    pub(crate) extent: usize,
+}
+
+impl<'a> Ef2View<'a> {
+    /// Admit a Format 2 Elias-Fano image at the start of `image` (structural checks: control `0x02`,
+    /// canonical varints, `n >= 2`, `n <= span + 1`, `first + span <= u32::MAX`, full payload
+    /// extent, and zero pad bits).
+    pub fn open(image: &'a [u8]) -> Result<Self, AdmissionError> {
+        Self::open_with(image, false)
+    }
+
+    /// [`Self::open`] plus full member, order, sample, and span verification (§11).
+    pub fn open_verified(image: &'a [u8]) -> Result<Self, AdmissionError> {
+        Self::open_with(image, true)
+    }
+
+    /// O(1) attach for an already-admitted Format 2 Elias-Fano image (checks control, header
+    /// varints, and payload extent without scanning planes).
+    #[inline]
+    pub fn open_admitted(image: &'a [u8]) -> Option<Self> {
+        if *image.first()? != EF2_CONTROL {
+            return None;
+        }
+        let mut at = 1usize;
+        let len =
+            u64::from(read_uleb_checked(image, &mut at, u32::MAX, AdmissionClass::Count).ok()?) + 1;
+        let base = read_uleb_checked(image, &mut at, u32::MAX, AdmissionClass::PlaneRange).ok()?;
+        let span = read_uleb_checked(image, &mut at, u32::MAX, AdmissionClass::PlaneRange).ok()?;
+        base.checked_add(span)?;
+        let layout = Ef2Layout::new(len, u64::from(span))?;
+        let extent = at.checked_add(layout.payload_bytes())?;
+        let payload = image.get(at..extent)?;
+        Some(Self {
+            bytes: payload,
+            layout,
+            base,
+            span,
+            len,
+            extent,
+        })
+    }
+
+    fn open_with(image: &'a [u8], verify: bool) -> Result<Self, AdmissionError> {
+        let Some(&control) = image.first() else {
+            return Err(AdmissionError::new(
+                AdmissionClass::Extent,
+                0,
+                "an Elias-Fano image has no control byte",
+            ));
+        };
+        if control != EF2_CONTROL {
+            return Err(AdmissionError::new(
+                AdmissionClass::Kind,
+                0,
+                "the control is not Elias-Fano's",
+            ));
+        }
+        let mut at = 1usize;
+        let count_at = at;
+        let len = u64::from(read_uleb_checked(
+            image,
+            &mut at,
+            u32::MAX,
+            AdmissionClass::Count,
+        )?) + 1;
+        if len < 2 {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                count_at,
+                "Elias-Fano requires at least two members",
+            ));
+        }
+        let base = read_uleb_checked(image, &mut at, u32::MAX, AdmissionClass::PlaneRange)?;
+        let span_at = at;
+        let span = read_uleb_checked(image, &mut at, u32::MAX, AdmissionClass::PlaneRange)?;
+        if base.checked_add(span).is_none() {
+            return Err(AdmissionError::new(
+                AdmissionClass::PlaneRange,
+                span_at,
+                "EF base plus span overflows u32",
+            ));
+        }
+        if len > u64::from(span) + 1 {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                count_at,
+                "EF cardinality exceeds its member span",
+            ));
+        }
+        let layout = Ef2Layout::new(len, u64::from(span)).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "EF geometry exceeds its position domain",
+            )
+        })?;
+        let extent = at.checked_add(layout.payload_bytes()).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "EF extent overflows the address space",
+            )
+        })?;
+        let payload = image.get(at..extent).ok_or_else(|| {
+            AdmissionError::new(
+                AdmissionClass::Extent,
+                at,
+                "EF image is cut short of its planes",
+            )
+        })?;
+        let high_used = layout.high_bits % 8;
+        if high_used != 0 && payload[layout.high_bytes - 1] >> high_used != 0 {
+            return Err(AdmissionError::new(
+                AdmissionClass::BitPad,
+                at + layout.high_bytes - 1,
+                "EF high-plane tail bits are not zero",
+            ));
+        }
+        let low_used = (len * u64::from(layout.low_bits)) % 8;
+        if low_used != 0 && payload[layout.low_at() + layout.low_bytes - 1] >> low_used != 0 {
+            return Err(AdmissionError::new(
+                AdmissionClass::BitPad,
+                at + layout.low_at() + layout.low_bytes - 1,
+                "EF low-plane tail bits are not zero",
+            ));
+        }
+        let view = Self {
+            bytes: payload,
+            layout,
+            base,
+            span,
+            len,
+            extent,
+        };
+        if verify {
+            view.verify_members().map_err(|error| error.shifted(at))?;
+        }
+        Ok(view)
+    }
+
+    /// Total image length in bytes (including control and header varints).
+    #[inline(always)]
+    pub fn extent(&self) -> usize {
+        self.extent
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn first(&self) -> u32 {
+        self.base
+    }
+
+    #[inline(always)]
+    pub fn span(&self) -> u32 {
+        self.span
+    }
+
+    /// Word `w` of the byte-granular high plane, clipped at `high_bytes` so no read ever touches
+    /// bytes past the high plane or past the image extent (§12.2).
+    #[inline(always)]
+    pub(crate) fn high_word(&self, w: usize) -> u64 {
+        let from = w * 8;
+        let Some(held) = self.layout.high_bytes.checked_sub(from) else {
+            return 0;
+        };
+        if held >= 8 {
+            read_u64_at(self.bytes, from)
+        } else {
+            let mut buf = [0u8; 8];
+            buf[..held].copy_from_slice(&self.bytes[from..from + held]);
+            u64::from_le_bytes(buf)
+        }
+    }
+
+    /// Read the `k`-th low field without reading past the image's extent (§12.2).
+    #[inline(always)]
+    pub(crate) fn low(&self, k: u64) -> u64 {
+        if self.layout.low_bits == 0 {
+            return 0;
+        }
+        let bit = k * u64::from(self.layout.low_bits);
+        let at = self.layout.low_at() + (bit / 8) as usize;
+        let window = if at + 5 <= self.bytes.len() {
+            u64::from(read_u32_at(self.bytes, at)) | (u64::from(self.bytes[at + 4]) << 32)
+        } else {
+            let mut buf = [0u8; 8];
+            let rem = self.bytes.len().saturating_sub(at).min(5);
+            buf[..rem].copy_from_slice(&self.bytes[at..at + rem]);
+            u64::from_le_bytes(buf)
+        };
+        (window >> (bit % 8)) & ((1u64 << self.layout.low_bits) - 1)
+    }
+
+    #[inline(always)]
+    pub(crate) fn bit(&self, p: u64) -> bool {
+        p < self.layout.high_bits && ((self.bytes[(p / 8) as usize] >> (p % 8)) & 1) == 1
+    }
+
+    /// Bit position of the `k`-th one (0-indexed), or `high_bits` if unverified and short.
+    #[inline]
+    pub(crate) fn select_one(&self, k: u64) -> u64 {
+        let s = k / u64::from(SAMPLE_STRIDE);
+        let start = if s == 0 {
+            0
+        } else {
+            u64::from(read_u32_at(
+                self.bytes,
+                self.layout.ones_at() + (s as usize - 1) * 4,
+            ))
+        };
+        let mut remaining = k - s * u64::from(SAMPLE_STRIDE);
+        let mut w = (start / 64) as usize;
+        if w >= self.layout.high_words {
+            return self.layout.high_bits;
+        }
+        let mut word = self.high_word(w) & !((1u64 << (start % 64)) - 1);
+        loop {
+            let ones = u64::from(word.count_ones());
+            if remaining < ones {
+                return ((w as u64) * 64 + u64::from(select64(word, remaining as u32)))
+                    .min(self.layout.high_bits);
+            }
+            remaining -= ones;
+            w += 1;
+            if w >= self.layout.high_words {
+                return self.layout.high_bits;
+            }
+            word = self.high_word(w);
+        }
+    }
+
+    /// Bit position of the `z`-th zero (0-indexed), or `high_bits` past the plane.
+    /// Zero-sample 0 is not stored in Format 2, so `z < 64` starts at bit 0.
+    #[inline]
+    pub(crate) fn select_zero(&self, z: u64) -> u64 {
+        if z >= self.layout.zeros {
+            return self.layout.high_bits;
+        }
+        let s = z / u64::from(SAMPLE_STRIDE);
+        let start = if s == 0 {
+            0
+        } else {
+            u64::from(read_u32_at(
+                self.bytes,
+                self.layout.zeros_at() + (s as usize - 1) * 4,
+            ))
+        };
+        let mut remaining = z - s * u64::from(SAMPLE_STRIDE);
+        let mut w = (start / 64) as usize;
+        if w >= self.layout.high_words {
+            return self.layout.high_bits;
+        }
+        let mut word = !self.high_word(w) & !((1u64 << (start % 64)) - 1);
+        loop {
+            let zeros = u64::from(word.count_ones());
+            if remaining < zeros {
+                return ((w as u64) * 64 + u64::from(select64(word, remaining as u32)))
+                    .min(self.layout.high_bits);
+            }
+            remaining -= zeros;
+            w += 1;
+            if w >= self.layout.high_words {
+                return self.layout.high_bits;
+            }
+            word = !self.high_word(w);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn bucket_start(&self, h: u64) -> (u64, u64) {
+        if h == 0 {
+            (0, 0)
+        } else {
+            let p = self.select_zero(h - 1);
+            (p.saturating_sub(h - 1), p + 1)
+        }
+    }
+
+    #[inline]
+    pub fn rank_if_present(&self, value: u32) -> Option<u64> {
+        if value < self.base || value > self.base.saturating_add(self.span) {
+            return None;
+        }
+        let d = u64::from(value - self.base);
+        let h = d >> self.layout.low_bits;
+        let want = d & ((1u64 << self.layout.low_bits) - 1);
+        let (mut k, mut p) = self.bucket_start(h);
+        while k < self.len && self.bit(p) {
+            let low = self.low(k);
+            if low == want {
+                return Some(k);
+            }
+            if low > want {
+                return None;
+            }
+            k += 1;
+            p += 1;
+        }
+        None
+    }
+
+    #[inline]
+    pub fn contains(&self, value: u32) -> bool {
+        self.rank_if_present(value).is_some()
+    }
+
+    #[inline]
+    pub fn rank(&self, value: u32) -> u64 {
+        if value <= self.base {
+            return 0;
+        }
+        if value > self.base.saturating_add(self.span) {
+            return self.len;
+        }
+        let d = u64::from(value - self.base);
+        let h = d >> self.layout.low_bits;
+        let want = d & ((1u64 << self.layout.low_bits) - 1);
+        let (mut k, mut p) = self.bucket_start(h);
+        while k < self.len && self.bit(p) && self.low(k) < want {
+            k += 1;
+            p += 1;
+        }
+        k
+    }
+
+    #[inline]
+    pub fn select(&self, k: u64) -> Option<u32> {
+        if k >= self.len {
+            return None;
+        }
+        let p = self.select_one(k);
+        let high = p.wrapping_sub(k);
+        Some(
+            self.base
+                .wrapping_add(((high << self.layout.low_bits) | self.low(k)) as u32),
+        )
+    }
+
+    /// Least member at or above `value`; `None` when every member is below `value` (`seek.bend`).
+    #[inline]
+    pub fn seek(&self, value: u32) -> Option<u32> {
+        if value <= self.base {
+            return Some(self.base);
+        }
+        if value > self.base.saturating_add(self.span) {
+            return None;
+        }
+        let d = u64::from(value - self.base);
+        let h = d >> self.layout.low_bits;
+        let want = d & ((1u64 << self.layout.low_bits) - 1);
+        let (mut k, mut p) = self.bucket_start(h);
+        while k < self.len && self.bit(p) {
+            let low = self.low(k);
+            if low >= want {
+                return Some(
+                    self.base
+                        .wrapping_add(((h << self.layout.low_bits) | low) as u32),
+                );
+            }
+            k += 1;
+            p += 1;
+        }
+        if k >= self.len || p >= self.layout.high_bits {
+            return None;
+        }
+        // Scan forward from `p` for the next set bit (first member of a later bucket).
+        let mut w = (p / 64) as usize;
+        let mut word = self.high_word(w) & !((1u64 << (p % 64)) - 1);
+        while word == 0 {
+            w += 1;
+            if w >= self.layout.high_words {
+                return None;
+            }
+            word = self.high_word(w);
+        }
+        let next_p = (w as u64) * 64 + u64::from(word.trailing_zeros());
+        let high = next_p.wrapping_sub(k);
+        Some(
+            self.base
+                .wrapping_add(((high << self.layout.low_bits) | self.low(k)) as u32),
+        )
+    }
+
+    pub fn for_each(&self, mut f: impl FnMut(u32)) {
+        let mut k = 0u64;
+        let mut w = 0usize;
+        while k < self.len && w < self.layout.high_words {
+            let mut bits = self.high_word(w);
+            let base_pos = (w as u64) * 64;
+            while bits != 0 && k < self.len {
+                let b = u64::from(bits.trailing_zeros());
+                bits &= bits - 1;
+                let high = base_pos + b - k;
+                f(self
+                    .base
+                    .wrapping_add(((high << self.layout.low_bits) | self.low(k)) as u32));
+                k += 1;
+            }
+            w += 1;
+        }
+    }
+
+    #[inline]
+    pub fn range(&self) -> Ef2Range<'a> {
+        Ef2Range::at_rank(*self, 0)
+    }
+
+    #[inline]
+    pub(crate) fn probe_cursor(&self) -> Ef2ProbeCursor<'a> {
+        Ef2ProbeCursor {
+            view: *self,
+            cur_h: 0,
+            k: 0,
+            p: 0,
+            max: self.base.saturating_add(self.span),
+        }
+    }
+
+    pub fn and_len(&self, other: &Ef2View<'_>) -> u64 {
+        let (small, large) = if self.len <= other.len {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let mut cursor = large.probe_cursor();
+        let mut count = 0u64;
+        small.for_each(|v| count += u64::from(cursor.contains_ascending(v)));
+        count
+    }
+
+    pub fn and_rank(&self, other: &Ef2View<'_>, limit: u32) -> u64 {
+        let (small, large) = if self.len <= other.len {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let mut cursor = large.probe_cursor();
+        let mut count = 0u64;
+        let mut r = small.range();
+        while !r.empty() {
+            let v = r.front();
+            if v >= limit {
+                break;
+            }
+            count += u64::from(cursor.contains_ascending(v));
+            r.pop_front();
+        }
+        count
+    }
+
+    fn verify_members(&self) -> Result<(), AdmissionError> {
+        let last = self.base + self.span;
+        let stride = u64::from(SAMPLE_STRIDE);
+        let (mut ones, mut zeros) = (0u64, 0u64);
+        let mut prev: Option<u32> = None;
+        for w in 0..self.layout.high_words {
+            let word = self.high_word(w);
+            let base_pos = (w as u64) * 64;
+            let live = self.layout.high_bits.saturating_sub(base_pos).min(64);
+            for b in 0..live {
+                let p = base_pos + b;
+                if (word >> b) & 1 == 1 {
+                    if ones >= self.len {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Count,
+                            (p / 8) as usize,
+                            "EF high plane has too many members",
+                        ));
+                    }
+                    if ones == 0 && p != 0 {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Placement,
+                            0,
+                            "EF first member position is not zero",
+                        ));
+                    }
+                    if ones != 0 && ones.is_multiple_of(stride) {
+                        let sample_at = self.layout.ones_at() + (ones / stride - 1) as usize * 4;
+                        if u64::from(read_u32_at(self.bytes, sample_at)) != p {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Placement,
+                                sample_at,
+                                "EF member sample names the wrong bit",
+                            ));
+                        }
+                    }
+                    let high = p - ones;
+                    let value = (high << self.layout.low_bits) | self.low(ones);
+                    let value_at = self.member_byte(ones, p);
+                    if value > u64::from(self.span) {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::PlaneRange,
+                            value_at,
+                            "EF member exceeds its declared span",
+                        ));
+                    }
+                    let value = self.base + value as u32;
+                    if prev.is_some_and(|q| q >= value) {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::MapOrder,
+                            value_at,
+                            "EF members are not strictly ascending",
+                        ));
+                    }
+                    prev = Some(value);
+                    ones += 1;
+                } else {
+                    if zeros >= self.layout.zeros {
+                        return Err(AdmissionError::new(
+                            AdmissionClass::Count,
+                            (p / 8) as usize,
+                            "EF high plane has too many buckets",
+                        ));
+                    }
+                    if zeros != 0 && zeros.is_multiple_of(stride) {
+                        let sample_at = self.layout.zeros_at() + (zeros / stride - 1) as usize * 4;
+                        if u64::from(read_u32_at(self.bytes, sample_at)) != p {
+                            return Err(AdmissionError::new(
+                                AdmissionClass::Placement,
+                                sample_at,
+                                "EF bucket sample names the wrong bit",
+                            ));
+                        }
+                    }
+                    zeros += 1;
+                }
+            }
+        }
+        if ones != self.len || zeros != self.layout.zeros {
+            return Err(AdmissionError::new(
+                AdmissionClass::Count,
+                0,
+                "EF high-plane counts disagree with the header",
+            ));
+        }
+        if prev != Some(last) {
+            return Err(AdmissionError::new(
+                AdmissionClass::PlaneRange,
+                self.member_byte(self.len - 1, self.layout.high_bits - 1),
+                "EF final member differs from base plus span",
+            ));
+        }
+        Ok(())
+    }
+
+    fn member_byte(&self, ordinal: u64, high_position: u64) -> usize {
+        if self.layout.low_bits == 0 {
+            (high_position / 8) as usize
+        } else {
+            self.layout.low_at() + (ordinal * u64::from(self.layout.low_bits) / 8) as usize
+        }
+    }
+}
+
+/// Forward-advancing probe cursor over an [`Ef2View`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ef2ProbeCursor<'a> {
+    view: Ef2View<'a>,
+    cur_h: u64,
+    k: u64,
+    p: u64,
+    max: u32,
+}
+
+impl<'a> Ef2ProbeCursor<'a> {
+    #[inline]
+    pub(crate) fn contains_ascending(&mut self, value: u32) -> bool {
+        if self.k >= self.view.len || value < self.view.base {
+            return false;
+        }
+        if value > self.max {
+            self.k = self.view.len;
+            return false;
+        }
+        let d = u64::from(value - self.view.base);
+        let h = d >> self.view.layout.low_bits;
+        let want = d & ((1u64 << self.view.layout.low_bits) - 1);
+        if h > self.cur_h {
+            let dh = h - self.cur_h;
+            if dh < u64::from(SAMPLE_STRIDE) {
+                let mut rem = dh - 1;
+                let mut w = (self.p / 64) as usize;
+                if w >= self.view.layout.high_words {
+                    self.k = self.view.len;
+                    return false;
+                }
+                let mut word = !self.view.high_word(w) & !((1u64 << (self.p % 64)) - 1);
+                let zero_pos = loop {
+                    let zeros = u64::from(word.count_ones());
+                    if rem < zeros {
+                        break (w as u64) * 64 + u64::from(select64(word, rem as u32));
+                    }
+                    rem -= zeros;
+                    w += 1;
+                    if w >= self.view.layout.high_words {
+                        self.k = self.view.len;
+                        return false;
+                    }
+                    word = !self.view.high_word(w);
+                };
+                self.cur_h = h;
+                self.p = zero_pos + 1;
+                self.k = zero_pos.saturating_sub(h - 1);
+            } else {
+                let (k, p) = self.view.bucket_start(h);
+                self.cur_h = h;
+                self.k = k;
+                self.p = p;
+            }
+        }
+        while self.k < self.view.len && self.view.bit(self.p) {
+            let low = self.view.low(self.k);
+            if low == want {
+                self.k += 1;
+                self.p += 1;
+                return true;
+            }
+            if low > want {
+                return false;
+            }
+            self.k += 1;
+            self.p += 1;
+        }
+        false
+    }
+}
+
+/// Ascending [`Range`] cursor over a Format 2 [`Ef2View`].
+#[derive(Clone, Copy, Debug)]
+pub struct Ef2Range<'a> {
+    view: Ef2View<'a>,
+    word: usize,
+    bits: u64,
+    k: u64,
+}
+
+impl<'a> Ef2Range<'a> {
+    pub(crate) fn at_rank(view: Ef2View<'a>, k: u64) -> Self {
+        let p = if k >= view.len {
+            view.layout.high_bits
+        } else {
+            view.select_one(k)
+        };
+        if p >= view.layout.high_bits {
+            return Self {
+                view,
+                word: 0,
+                bits: 0,
+                k: view.len,
+            };
+        }
+        let w = (p / 64) as usize;
+        Self {
+            view,
+            word: w + 1,
+            bits: view.high_word(w) & !((1u64 << (p % 64)) - 1),
+            k,
+        }
+    }
+
+    #[inline(always)]
+    pub fn remaining(&self) -> u64 {
+        self.view.len - self.k
+    }
+}
+
+impl Range for Ef2Range<'_> {
+    type Item = u32;
+
+    #[inline(always)]
+    fn empty(&self) -> bool {
+        self.k >= self.view.len
+    }
+
+    #[inline(always)]
+    fn front(&self) -> u32 {
+        debug_assert!(!self.empty(), "front on an empty Ef2Range");
+        let p = (self.word as u64).wrapping_sub(1) * 64 + u64::from(self.bits.trailing_zeros());
+        let high = p.wrapping_sub(self.k);
+        self.view
+            .base
+            .wrapping_add(((high << self.view.layout.low_bits) | self.view.low(self.k)) as u32)
+    }
+
+    #[inline(always)]
+    fn pop_front(&mut self) {
+        debug_assert!(!self.empty(), "pop_front on an empty Ef2Range");
+        if self.bits == 0 {
+            self.k = self.view.len;
+            return;
+        }
+        self.bits &= self.bits - 1;
+        self.k += 1;
+        while self.bits == 0 && self.k < self.view.len {
+            if self.word >= self.view.layout.high_words {
+                self.k = self.view.len;
+                return;
+            }
+            self.bits = self.view.high_word(self.word);
+            self.word += 1;
+        }
+    }
+
+    #[inline]
+    fn seek(&mut self, value: u32) {
+        if self.empty() || self.front() >= value {
+            return;
+        }
+        if value > self.view.base.saturating_add(self.view.span) {
+            self.k = self.view.len;
+            self.bits = 0;
+            return;
+        }
+        let d = u64::from(value - self.view.base);
+        let h = d >> self.view.layout.low_bits;
+        let want = d & ((1u64 << self.view.layout.low_bits) - 1);
+        let cur_p = (self.word as u64).wrapping_sub(1) * 64 + u64::from(self.bits.trailing_zeros());
+        let cur_h = cur_p.saturating_sub(self.k);
+        let (mut k, mut p) = if h <= cur_h {
+            (self.k, cur_p)
+        } else if h - cur_h < u64::from(SAMPLE_STRIDE) {
+            let mut rem = h - cur_h - 1;
+            let mut w = (cur_p / 64) as usize;
+            if w >= self.view.layout.high_words {
+                self.k = self.view.len;
+                self.bits = 0;
+                return;
+            }
+            let mut word = !self.view.high_word(w) & !((1u64 << (cur_p % 64)) - 1);
+            let zero_pos = loop {
+                let zeros = u64::from(word.count_ones());
+                if rem < zeros {
+                    break (w as u64) * 64 + u64::from(select64(word, rem as u32));
+                }
+                rem -= zeros;
+                w += 1;
+                if w >= self.view.layout.high_words {
+                    self.k = self.view.len;
+                    self.bits = 0;
+                    return;
+                }
+                word = !self.view.high_word(w);
+            };
+            (zero_pos.saturating_sub(h - 1), zero_pos + 1)
+        } else {
+            self.view.bucket_start(h)
+        };
+        while k < self.view.len && self.view.bit(p) && self.view.low(k) < want {
+            k += 1;
+            p += 1;
+        }
+        if k >= self.view.len || p >= self.view.layout.high_bits {
+            self.k = self.view.len;
+            self.bits = 0;
+            return;
+        }
+        let mut w = (p / 64) as usize;
+        let mut bits = self.view.high_word(w) & !((1u64 << (p % 64)) - 1);
+        while bits == 0 {
+            w += 1;
+            if w >= self.view.layout.high_words {
+                self.k = self.view.len;
+                self.bits = 0;
+                return;
+            }
+            bits = self.view.high_word(w);
+        }
+        self.word = w + 1;
+        self.bits = bits;
+        self.k = k;
+    }
+}
+
+impl Iterator for Ef2Range<'_> {
+    type Item = u32;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.empty() {
+            return None;
+        }
+        let v = self.front();
+        self.pop_front();
+        Some(v)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = usize::try_from(self.remaining()).unwrap_or(usize::MAX);
+        (n, Some(n))
     }
 }

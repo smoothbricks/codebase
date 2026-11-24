@@ -19,6 +19,8 @@ pub enum AdmissionClass {
     BitPad,
     /// A reference or sample disagrees with its computed position.
     Placement,
+    /// A well-formed image is not the canonical form of its set.
+    Canonical,
 }
 impl AdmissionClass {
     /// Stable wire-refusal spelling; diagnostics never depend on enum debug names.
@@ -33,6 +35,7 @@ impl AdmissionClass {
             Self::PlaneRange => "plane-range",
             Self::BitPad => "bit-pad",
             Self::Placement => "placement",
+            Self::Canonical => "canonical",
         }
     }
 }
