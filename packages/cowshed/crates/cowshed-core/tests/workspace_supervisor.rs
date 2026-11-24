@@ -8973,7 +8973,7 @@ async fn the_keepers_own_successor_coming_up_is_no_use_of_the_shed() {
     h.handle.wait(successor.request.job_id).await.unwrap();
     pass_idle(&h, NX_IDLE - died_after + NX_PROBES).await;
     assert!(
-        !running_after_probe(&h, &mut daemon).await,
+        stopped_after_probe(&h, &mut daemon).await,
         "the shed's bound runs from its last real use, not from its keeper's successor coming up"
     );
     pass_idle(&h, NX_PROBES).await;
@@ -9051,6 +9051,17 @@ impl LiveDaemon {
     /// Whether the stand-in still runs: stopping it is what the keeper does to an idle daemon.
     fn running(&mut self) -> bool {
         self.process.try_wait().unwrap().is_none()
+    }
+
+    /// Whether the keeper's stop ended the stand-in. The stop waits on kqueue's NOTE_EXIT, and XNU
+    /// posts NOTE_EXIT before the exiting process can be reaped (bsd/kern/kern_exit.c `proc_exit`:
+    /// `proc_knote(p, NOTE_EXIT | …)`, then later `p->p_stat = SZOMB`), so a WNOHANG `try_wait`
+    /// right after the probe can still see it running under load. The bounded reap ends that window,
+    /// and its end says who ended it: the reap closes `cat`'s stdin, which ends a stand-in the keeper
+    /// left alone with a plain exit, so only SIGTERM says the keeper stopped it.
+    fn stopped_by_keeper(&mut self) -> bool {
+        use std::os::unix::process::ExitStatusExt as _;
+        self.process.wait_bounded().unwrap().signal() == Some(libc::SIGTERM)
     }
 }
 
@@ -9365,6 +9376,13 @@ async fn running_after_probe(h: &Harness, daemon: &mut LiveDaemon) -> bool {
     daemon.running()
 }
 
+/// Whether the keeper's probe in flight stopped `daemon` ([`running_after_probe`]'s converse,
+/// proven by the reap [`LiveDaemon::stopped_by_keeper`] takes, not by a check that races the exit).
+async fn stopped_after_probe(h: &Harness, daemon: &mut LiveDaemon) -> bool {
+    h.handle.nx_daemon_keeper().await.unwrap();
+    daemon.stopped_by_keeper()
+}
+
 async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
     shed_with_live_nx_daemon_publishing_after(name, Duration::ZERO).await
 }
@@ -9445,7 +9463,7 @@ async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
     assert!(daemon.running(), "a daemon is kept for the whole interval");
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert!(
-        !running_after_probe(&h, &mut daemon).await,
+        stopped_after_probe(&h, &mut daemon).await,
         "the idle daemon is stopped"
     );
     assert!(
@@ -9511,7 +9529,7 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
     assert!(daemon.running(), "the interval starts when the job ends");
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(
-        !running_after_probe(&h, &mut daemon).await,
+        stopped_after_probe(&h, &mut daemon).await,
         "the daemon stops once the shed is idle"
     );
 }
@@ -9544,7 +9562,7 @@ async fn a_jobs_idle_interval_starts_once_its_end_has_concluded() {
     );
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(
-        !running_after_probe(&h, &mut daemon).await,
+        stopped_after_probe(&h, &mut daemon).await,
         "the daemon stops once the shed is idle"
     );
 }
@@ -9572,7 +9590,7 @@ async fn a_shed_s_ledger_alone_says_it_is_in_use_and_its_supervisor_answers_thro
     tokio::time::sleep(Duration::from_secs(60)).await;
     let walked = cowshed_core::build_volume::nx::process_table_walks() - walks;
     assert!(
-        !running_after_probe(&h, &mut daemon).await,
+        stopped_after_probe(&h, &mut daemon).await,
         "a client the ledger does not hold keeps no daemon"
     );
     assert_eq!(
@@ -9625,7 +9643,7 @@ async fn a_shed_supervisor_is_idle_only_once_its_nx_daemon_is_gone() {
         "a live daemon is something to come back for"
     );
     tokio::time::sleep(NX_IDLE + Duration::from_secs(60)).await;
-    assert!(!running_after_probe(&h, &mut daemon).await);
+    assert!(stopped_after_probe(&h, &mut daemon).await);
     assert!(
         h.handle.idle().await.unwrap(),
         "no job, no session and no daemon: nothing is left"
