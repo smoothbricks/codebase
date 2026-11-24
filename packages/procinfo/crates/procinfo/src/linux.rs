@@ -1,6 +1,7 @@
 //! Linux's readings of a process: procfs (`/proc/<pid>/stat`, `status`, `statm`, `exe`,
-//! `cmdline`, `comm`, `fd` and `net/tcp`). `cmdline` alone waits on the process's own state, its
-//! memory map, so it is read on procinfo's reader thread under a bound ([`bounded_cmdline`]).
+//! `cmdline`, `comm`, `fd`, `net/tcp` and `/proc/locks`). `cmdline` waits on the process's own
+//! state, its memory map, and a path's metadata on its file system, so both are read on
+//! procinfo's reader threads under a bound ([`bounded_cmdline`], [`lock_holders`]).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -8,7 +9,8 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    DescriptorName, GroupMember, NameKinds, ProcessArguments, ProcessLineage, RunState, Unread,
+    DescriptorName, GroupMember, HeldLock, LockHolders, NameKinds, ProcessArguments,
+    ProcessLineage, RunState, Unread,
 };
 /// [`running`] from procfs: a pid without a stat has been reaped, and state `Z` (zombie) or `X`
 /// (dead) has exited.
@@ -109,6 +111,44 @@ fn bounded_cmdline(pid: libc::pid_t) -> io::Result<Option<io::Result<Vec<u8>>>> 
 
 /// The kernel's name for process `pid` (`/proc/<pid>/comm`): it keeps the name in the task and
 /// hands it out under the task's own lock, never the memory map's.
+/// How long reading a file's locks may take: stat(2) of its path waits on the file system, which
+/// a process or server stalled in the kernel can hold.
+const LOCK_BOUND: Duration = CMDLINE_BOUND;
+
+static LOCK_READER: crate::bounded::BoundedReader = crate::bounded::BoundedReader::new();
+
+/// [`lock_holders`] from `/proc/locks`: the kernel's record of every file lock, matched to the
+/// file by the device and inode stat(2) gives its path, so no process is visited.
+pub fn lock_holders(path: &std::path::Path) -> io::Result<LockHolders> {
+    let path = path.to_owned();
+    LOCK_READER
+        .read(LOCK_BOUND, move || file_locks(&path))?
+        .unwrap_or_else(|| {
+            Ok(LockHolders::Unread(format!(
+                "the file's locks were not read within {LOCK_BOUND:?}"
+            )))
+        })
+}
+
+fn file_locks(path: &std::path::Path) -> io::Result<LockHolders> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    let file = crate::proc_locks::FileId {
+        major: libc::major(metadata.dev()),
+        minor: libc::minor(metadata.dev()),
+        inode: metadata.ino(),
+    };
+    let table = std::fs::read_to_string("/proc/locks")
+        .map_err(|error| io::Error::new(error.kind(), format!("/proc/locks: {error}")))?;
+    let locks: Vec<HeldLock> = crate::proc_locks::locks_of(&table, file)?;
+    Ok(if locks.is_empty() {
+        LockHolders::Unlocked
+    } else {
+        LockHolders::Locked(locks)
+    })
+}
 fn command_name(pid: libc::pid_t) -> io::Result<Vec<u8>> {
     let mut name = std::fs::read(format!("/proc/{pid}/comm"))?;
     if name.last() == Some(&b'\n') {

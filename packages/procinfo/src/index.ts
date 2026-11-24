@@ -60,6 +60,24 @@ export type DescriptorNames =
 /** `getloadavg(3)`: the average run-queue length over the last 1, 5 and 15 minutes. */
 export type HostLoad = { readonly one: number; readonly five: number; readonly fifteen: number };
 
+/**
+ * One lock the kernel records on a file: the process it names (`null` where it names none: an open-file-description
+ * lock, a pid outside this reader's pid namespace, a Darwin flock(2) lock), its kind (`flock`, `posix`, `ofd`, `lease`,
+ * another the record names, or `null` on Darwin), whether it is exclusive, and whether that process waits for it.
+ */
+export type FileLock = {
+  readonly pid: number | null;
+  readonly kind: string | null;
+  readonly exclusive: boolean;
+  readonly waiting: boolean;
+};
+
+/** What the kernel's lock record says of a file, or why it was not read within its bound. */
+export type LockHolders =
+  | { readonly state: 'unlocked' }
+  | { readonly state: 'locked'; readonly locks: readonly FileLock[] }
+  | { readonly state: 'unread'; readonly reason: string };
+
 /** The run state as the addon answers it, before it is narrowed to {@link RunState}. */
 interface NativeRunState {
   readonly state: string;
@@ -101,6 +119,16 @@ interface ProcinfoAddon {
   };
   sandboxed(pid: number): boolean;
   hostLoad(): HostLoad | null | undefined;
+  lockHolders(path: string): {
+    readonly state: string;
+    readonly locks: readonly {
+      readonly pid?: number | null;
+      readonly kind?: string | null;
+      readonly exclusive: boolean;
+      readonly waiting: boolean;
+    }[];
+    readonly reason?: string | null;
+  };
 }
 
 const ADDON_EXPORTS = [
@@ -118,6 +146,7 @@ const ADDON_EXPORTS = [
   'descriptorNames',
   'sandboxed',
   'hostLoad',
+  'lockHolders',
 ] as const satisfies readonly (keyof ProcinfoAddon)[];
 
 function isProcinfoAddon(module: unknown): module is ProcinfoAddon {
@@ -332,4 +361,32 @@ export function sandboxed(pid: number): boolean {
 /** The host's load now, or `null` when the kernel will not report all three averages. */
 export function hostLoad(): HostLoad | null {
   return addon().hostLoad() ?? null;
+}
+
+/**
+ * Who holds the locks of the file at `path`, as the kernel's own lock record names them: Linux's `/proc/locks`, matched
+ * by device and inode, with waiters; Darwin's `fcntl(F_GETLK)`, the first conflicting lock, a flock(2) holder unnamed.
+ * No process is visited and no lock taken. A caller holding fcntl locks on the file must not ask: closing the probe's
+ * descriptor drops them (POSIX).
+ */
+export function lockHolders(path: string): LockHolders {
+  const read = addon().lockHolders(path);
+  switch (read.state) {
+    case 'unlocked':
+      return { state: 'unlocked' };
+    case 'locked':
+      return {
+        state: 'locked',
+        locks: read.locks.map(({ pid, kind, exclusive, waiting }) => ({
+          pid: pid ?? null,
+          kind: kind ?? null,
+          exclusive,
+          waiting,
+        })),
+      };
+    case 'unread':
+      return { state: 'unread', reason: read.reason ?? 'no reason given' };
+    default:
+      throw new Error(`the procinfo addon answered an unknown lock state ${read.state}`);
+  }
 }

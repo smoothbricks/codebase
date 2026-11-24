@@ -1,6 +1,7 @@
 //! Darwin's readings of a process: libproc (`proc_pidinfo`, `proc_pidfdinfo`,
 //! `proc_listpgrppids`, `proc_listchildpids`, `proc_pid_rusage`), `sysctl(KERN_PROCARGS2)`,
-//! libsystem_sandbox's `sandbox_check` and the Mach timebase.
+//! libsystem_sandbox's `sandbox_check`, the Mach timebase, and `fcntl(F_GETLK)` for a file's
+//! locks.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -9,8 +10,66 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    DescriptorName, GroupMember, NameKinds, ProcessArguments, ProcessLineage, RunState, Unread,
+    DescriptorName, GroupMember, HeldLock, LockHolders, NameKinds, ProcessArguments,
+    ProcessLineage, RunState, Unread,
 };
+
+/// How long reading a file's locks may take: opening its path waits on the file system, which a
+/// process or server stalled in the kernel can hold.
+const LOCK_BOUND: Duration = Duration::from_millis(250);
+
+static LOCK_READER: crate::bounded::BoundedReader = crate::bounded::BoundedReader::new();
+
+/// [`lock_holders`] from `fcntl(F_GETLK)`: a whole-file write-lock probe on a read-only
+/// descriptor of the file, which takes no lock and answers the first lock it conflicts with,
+/// read locks included. Darwin answers a POSIX lock with its holder's pid and a flock(2) lock
+/// with none, and names no kind. Closing the probe's descriptor drops every fcntl lock the
+/// calling process itself holds on the file (POSIX), so a caller holding one must not ask.
+pub fn lock_holders(path: &std::path::Path) -> io::Result<LockHolders> {
+    let path = path.to_owned();
+    LOCK_READER
+        .read(LOCK_BOUND, move || probe_locks(&path))?
+        .unwrap_or_else(|| {
+            Ok(LockHolders::Unread(format!(
+                "the file's locks were not read within {LOCK_BOUND:?}"
+            )))
+        })
+}
+
+fn probe_locks(path: &std::path::Path) -> io::Result<LockHolders> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+    let mut probe = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_WRLCK,
+        l_whence: libc::c_short::try_from(libc::SEEK_SET).map_err(io::Error::other)?,
+    };
+    // SAFETY: `probe` is live storage F_GETLK reads and writes; the descriptor is open.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut probe) } == -1 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("F_GETLK of {}: {error}", path.display()),
+        ));
+    }
+    if probe.l_type == libc::F_UNLCK {
+        return Ok(LockHolders::Unlocked);
+    }
+    Ok(LockHolders::Locked(vec![HeldLock {
+        holder: (probe.l_pid > 0).then_some(probe.l_pid),
+        kind: None,
+        exclusive: probe.l_type == libc::F_WRLCK,
+        waiting: false,
+    }]))
+}
 /// Whether the process `pid` names has not exited. A zombie -- exited, not yet reaped by its
 /// parent -- has: the null signal is never asked, because `kill(pid, 0)` succeeds on a zombie
 /// (POSIX requires it), and a daemon reparented to launchd stays one until launchd gets round to

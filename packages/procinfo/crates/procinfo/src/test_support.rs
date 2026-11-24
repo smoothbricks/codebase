@@ -46,6 +46,28 @@ impl Drop for Reaped {
     }
 }
 
+/// A child forked by a test, killed and reaped when dropped, however the test ends.
+pub(crate) struct Forked(pub(crate) libc::pid_t);
+
+impl Forked {
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.0
+    }
+}
+
+impl Drop for Forked {
+    fn drop(&mut self) {
+        if self.0 <= 0 {
+            return;
+        }
+        // SAFETY: the pid is this test's own unreaped child; status is live storage.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(self.0, &raw mut status, 0);
+        }
+    }
+}
 /// Block until the child `pid` has exited, leaving it unreaped: a zombie its parent still holds.
 pub(crate) fn exited_unreaped(pid: u32) -> io::Result<()> {
     // SAFETY: an all-zero `siginfo_t` is valid storage for the call to fill.

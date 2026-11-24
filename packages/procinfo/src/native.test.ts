@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { type ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { ADDON_DIRECTORIES } from './addon.js';
 import {
@@ -12,6 +14,7 @@ import {
   descriptorNames,
   hostLoad,
   listeningPorts,
+  lockHolders,
   ownDescriptorName,
   processArguments,
   processGroups,
@@ -257,6 +260,29 @@ describe('sandboxed', () => {
   });
 });
 
+describe('lockHolders', () => {
+  it('reads an unlocked file as unlocked, and a flock holder as locked: named on Linux, unnamed on Darwin', async () => {
+    const path = join(tmpdir(), `procinfo-lock-${process.pid}`);
+    writeFileSync(path, '');
+    try {
+      expect(lockHolders(path)).toEqual({ state: 'unlocked' });
+      const { pid } = await started(
+        `exec perl -e 'use Fcntl ":flock"; open(F, ">>", $ARGV[0]) or die; flock(F, LOCK_EX) or die; $| = 1; print "held\\n"; sleep' "$0"`,
+        { args: [path] },
+      );
+      expect(lockHolders(path)).toEqual({
+        state: 'locked',
+        locks: [
+          process.platform === 'linux'
+            ? { pid, kind: 'flock', exclusive: true, waiting: false }
+            : { pid: null, kind: null, exclusive: true, waiting: false },
+        ],
+      });
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+});
 describe('hostLoad', () => {
   it('reports all three averages', () => {
     const load = hostLoad();

@@ -1,7 +1,8 @@
 //! A read that can wait on another process's kernel state, run on a reader thread under a bound,
 //! so its caller is answered at the bound however long the kernel holds the read
 //! (specs/procinfo/01_procinfo.md, "Scope"): Linux's `cmdline`, which the kernel copies out of the
-//! process's memory under its memory-map lock.
+//! process's memory under its memory-map lock, and a file's locks, whose path stat(2) or open(2)
+//! reaches through a file system a stalled process or server can hold.
 
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};

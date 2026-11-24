@@ -342,6 +342,62 @@ pub fn descriptor_names(
     })
 }
 
+/// One lock the kernel records on a file: the process it names (`null` where it names none), its
+/// kind (`null` on Darwin), whether it is exclusive, and whether that process waits for it.
+#[napi(object)]
+pub struct FileLock {
+    pub pid: Option<i32>,
+    pub kind: Option<String>,
+    pub exclusive: bool,
+    pub waiting: bool,
+}
+
+/// What the kernel's lock record says of a file: `state` is `unlocked`, `locked` (with `locks`)
+/// or `unread` (with `reason`).
+#[napi(object)]
+pub struct LockHolders {
+    pub state: String,
+    pub locks: Vec<FileLock>,
+    pub reason: Option<String>,
+}
+
+/// Who holds the locks of the file at `path`, as the kernel's lock record names them.
+#[napi(js_name = "lockHolders")]
+pub fn lock_holders(env: Env, path: String) -> napi::Result<LockHolders> {
+    let read = procinfo::lock_holders(std::path::Path::new(&path))
+        .map_err(|error| unread(env, format!("the locks of {path}"), &error))?;
+    Ok(match read {
+        procinfo::LockHolders::Unlocked => LockHolders {
+            state: "unlocked".to_owned(),
+            locks: Vec::new(),
+            reason: None,
+        },
+        procinfo::LockHolders::Locked(locks) => LockHolders {
+            state: "locked".to_owned(),
+            locks: locks
+                .into_iter()
+                .map(|lock| FileLock {
+                    pid: lock.holder,
+                    kind: lock.kind.map(|kind| match kind {
+                        procinfo::LockKind::Flock => "flock".to_owned(),
+                        procinfo::LockKind::Posix => "posix".to_owned(),
+                        procinfo::LockKind::OpenFileDescription => "ofd".to_owned(),
+                        procinfo::LockKind::Lease => "lease".to_owned(),
+                        procinfo::LockKind::Other(name) => name.to_lowercase(),
+                    }),
+                    exclusive: lock.exclusive,
+                    waiting: lock.waiting,
+                })
+                .collect(),
+            reason: None,
+        },
+        procinfo::LockHolders::Unread(reason) => LockHolders {
+            state: "unread".to_owned(),
+            locks: Vec::new(),
+            reason: Some(reason),
+        },
+    })
+}
 /// Whether the process `pid` may run sandboxed; `false` proves a live, unsandboxed process.
 #[napi]
 pub fn sandboxed(env: Env, pid: i32) -> napi::Result<bool> {

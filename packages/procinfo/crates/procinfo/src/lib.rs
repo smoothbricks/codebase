@@ -1,19 +1,20 @@
-//! Host process facts, each read from the kernel's own record of one process or one group:
-//! libproc, sysctl and libsystem_sandbox on Darwin (`macos.rs`), procfs on Linux (`linux.rs`).
-//! Nothing here spawns a process or walks the whole process table, so a process stalled in the
-//! kernel cannot stall the reader (specs/procinfo/01_procinfo.md).
+//! Host process facts, each read from the kernel's own record of one process, one group, or one
+//! file's locks: libproc, sysctl, fcntl and libsystem_sandbox on Darwin (`macos.rs`), procfs on
+//! Linux (`linux.rs`). Nothing here spawns a process or walks the whole process table, so a
+//! process stalled in the kernel cannot stall the reader (specs/procinfo/01_procinfo.md).
 
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-#[cfg(any(target_os = "linux", test))]
 mod bounded;
 mod host_load;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "linux", test))]
+mod proc_locks;
 #[cfg(test)]
 mod test_support;
 
@@ -26,7 +27,7 @@ use macos as platform;
 // Each fact is read from its platform's own kernel, selected here and nowhere else.
 pub use platform::{
     child_pids, cpu_time, descriptor_name, descriptor_names, lineage, listening_ports,
-    process_arguments, resident_bytes, run_state, running, sandboxed, started,
+    lock_holders, process_arguments, resident_bytes, run_state, running, sandboxed, started,
 };
 // A process group's members, where the kernel lists them (`proc_listpgrppids`). Linux lists a
 // group only to a census of `/proc`, so procinfo offers no group facts there: cowshed's Linux job
@@ -51,6 +52,46 @@ pub struct ProcessArguments {
     pub name_only: bool,
 }
 
+/// The kind of a file lock, as Linux's lock record names it ([`lock_holders`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockKind {
+    /// flock(2), held by an open file description.
+    Flock,
+    /// fcntl(2) record locks and lockf(3), held by a process.
+    Posix,
+    /// fcntl(2) open-file-description locks (`F_OFD_SETLK`), held by no process.
+    OpenFileDescription,
+    /// A lease (`F_SETLEASE`).
+    Lease,
+    /// A kind the record names that procinfo does not, by its name.
+    Other(String),
+}
+
+/// One lock the kernel records on a file: who holds it (or waits for it), when the record names
+/// a process, its kind, when the record names it, and whether it is exclusive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldLock {
+    /// The process the record names; `None` where it names none (an open-file-description lock,
+    /// a pid outside this reader's pid namespace, or a Darwin flock(2) lock).
+    pub holder: Option<libc::pid_t>,
+    /// `None` on Darwin, whose record names no kind.
+    pub kind: Option<LockKind>,
+    pub exclusive: bool,
+    /// A process blocked waiting for the lock, not holding it (Linux records waiters).
+    pub waiting: bool,
+}
+
+/// What the kernel's lock record says of a file ([`lock_holders`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LockHolders {
+    Unlocked,
+    /// Each lock and waiter the record holds for the file; Darwin answers the first conflicting
+    /// lock alone.
+    Locked(Vec<HeldLock>),
+    /// The file's locks were not read within their bound: reaching the file waits on a file
+    /// system a process or server stalled in the kernel holds. Says why.
+    Unread(String),
+}
 /// What the kernel shows a process doing, as `ps` names its state. A wait on a process that gave
 /// up names it, so the reader tells a process stuck in the kernel apart from one merely running
 /// long: an `Uninterruptible` one is in a kernel call no signal ends, SIGKILL included, until
@@ -497,5 +538,158 @@ mod tests {
         assert_eq!(next, Some(7));
         assert!(failed.is_err(), "{failed:?}");
         assert_eq!(after, Some(9));
+    }
+
+    /// A child that takes `lock` on its own descriptor of `path` and holds it until it is killed.
+    /// It is forked, so it opens and locks with system calls alone and then waits, calling nothing
+    /// that allocates; the parent reads one byte that says the lock is held.
+    fn locking_child(
+        path: &std::ffi::CStr,
+        lock: fn(libc::c_int) -> libc::c_int,
+    ) -> test_support::Forked {
+        let mut ready = [0; 2];
+        // SAFETY: `ready` is live storage for the two descriptors pipe(2) writes.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        // SAFETY: the child calls only async-signal-safe functions before it waits for its end.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: `path` outlives the fork, and every call here is async-signal-safe.
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_RDWR);
+                let held: u8 = u8::from(fd >= 0 && lock(fd) == 0);
+                libc::write(ready[1], (&raw const held).cast(), 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let child = test_support::Forked(pid);
+        let mut held = 0_u8;
+        // SAFETY: the parent closes its write end and reads one byte into live storage.
+        let read = unsafe {
+            libc::close(ready[1]);
+            let read = libc::read(ready[0], (&raw mut held).cast(), 1);
+            libc::close(ready[0]);
+            read
+        };
+        assert!(
+            pid > 0 && read == 1 && held == 1,
+            "the child holds its lock"
+        );
+        child
+    }
+
+    /// An exclusive POSIX record lock on the whole file, as lockf(3) takes it.
+    fn posix_lock(fd: libc::c_int) -> libc::c_int {
+        // SAFETY: lockf takes a descriptor and two integers.
+        unsafe { libc::lockf(fd, libc::F_LOCK, 0) }
+    }
+
+    /// An exclusive flock(2) lock.
+    fn whole_file_lock(fd: libc::c_int) -> libc::c_int {
+        // SAFETY: flock takes a descriptor and an integer.
+        unsafe { libc::flock(fd, libc::LOCK_EX) }
+    }
+
+    fn lock_file(name: &str) -> (std::path::PathBuf, std::ffi::CString) {
+        let path =
+            std::env::temp_dir().join(format!("procinfo-lock-{name}-{}", std::process::id()));
+        std::fs::write(&path, b"").expect("create the locked file");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a path");
+        (path, c_path)
+    }
+
+    /// A POSIX record lock's holder is named by the kernel's lock record on both platforms, and
+    /// a second look finds it unchanged: the probe takes no lock of its own.
+    #[test]
+    fn a_lockf_holder_is_named_by_the_lock_record() {
+        let (path, c_path) = lock_file("posix");
+        let unlocked = lock_holders(&path);
+        let child = locking_child(&c_path, posix_lock);
+        let first = lock_holders(&path);
+        let second = lock_holders(&path);
+        let pid = child.pid();
+        drop(child);
+        std::fs::remove_file(&path).expect("remove the locked file");
+        let kind = if cfg!(target_os = "linux") {
+            Some(LockKind::Posix)
+        } else {
+            None
+        };
+        assert_eq!(unlocked.expect("read"), LockHolders::Unlocked);
+        let expected = LockHolders::Locked(vec![HeldLock {
+            holder: Some(pid),
+            kind,
+            exclusive: true,
+            waiting: false,
+        }]);
+        assert_eq!(first.expect("read"), expected);
+        assert_eq!(second.expect("read again"), expected);
+    }
+
+    /// A flock(2) holder: Linux's lock record names it; Darwin's answers the file locked with no
+    /// holder, which is said as such, never guessed.
+    #[test]
+    fn a_flock_holder_is_named_on_linux_and_unnamed_on_darwin() {
+        let (path, c_path) = lock_file("flock");
+        let child = locking_child(&c_path, whole_file_lock);
+        let read = lock_holders(&path);
+        let pid = child.pid();
+        drop(child);
+        std::fs::remove_file(&path).expect("remove the locked file");
+        let expected = if cfg!(target_os = "linux") {
+            HeldLock {
+                holder: Some(pid),
+                kind: Some(LockKind::Flock),
+                exclusive: true,
+                waiting: false,
+            }
+        } else {
+            HeldLock {
+                holder: None,
+                kind: None,
+                exclusive: true,
+                waiting: false,
+            }
+        };
+        assert_eq!(read.expect("read"), LockHolders::Locked(vec![expected]));
+    }
+
+    /// /proc/locks names a file by its device, `MAJOR:MINOR` in hex, and its inode in decimal
+    /// (fs/locks.c). Only the asked file's entries are kept, waiters (`->`) marked as waiting,
+    /// and a pid of -1 (an open-file-description lock) or 0 (outside the reader's pid
+    /// namespace) is no holder anyone can name.
+    #[test]
+    fn proc_locks_lines_are_read_by_device_and_inode() {
+        let table = "1: POSIX  ADVISORY  WRITE 1234 1f:02:131074 0 EOF\n\
+                     1: -> POSIX  ADVISORY  WRITE 1235 1f:02:131074 0 EOF\n\
+                     2: FLOCK  ADVISORY  WRITE 5678 1f:02:131074 0 EOF\n\
+                     3: OFDLCK ADVISORY  READ  -1 1f:02:131074 0 EOF\n\
+                     4: POSIX  ADVISORY  READ  0 1f:02:131074 0 EOF\n\
+                     5: FLOCK  ADVISORY  WRITE 42 1f:03:131074 0 EOF\n\
+                     6: FLOCK  ADVISORY  WRITE 43 31:02:131074 0 EOF\n\
+                     7: LEASE  ACTIVE    READ 77 1f:02:999 0 EOF\n";
+        let file = crate::proc_locks::FileId {
+            major: 0x1f,
+            minor: 2,
+            inode: 131_074,
+        };
+        let held = |holder, kind, exclusive, waiting| HeldLock {
+            holder,
+            kind: Some(kind),
+            exclusive,
+            waiting,
+        };
+        assert_eq!(
+            crate::proc_locks::locks_of(table, file).expect("parse"),
+            vec![
+                held(Some(1234), LockKind::Posix, true, false),
+                held(Some(1235), LockKind::Posix, true, true),
+                held(Some(5678), LockKind::Flock, true, false),
+                held(None, LockKind::OpenFileDescription, false, false),
+                held(None, LockKind::Posix, false, false),
+            ]
+        );
+        assert!(crate::proc_locks::locks_of("1: POSIX ADVISORY\n", file).is_err());
     }
 }
