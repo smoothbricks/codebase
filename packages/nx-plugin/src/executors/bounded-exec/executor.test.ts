@@ -2228,6 +2228,72 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
   });
 
+  //#region smoo/cowshed!n/a-minimum-for-a-whole-suite
+  const runWallFloorLeaf = async (agingMs: number | null) => {
+    // 600 tests of 1 s each, asking for 6 cores, idleTimeoutMs = 180 s:
+    // - liveness alone: on 1 thread a test finishes every 1 s <= 180 s, so liveness = 1.
+    // - LPT wall on full ask (6 threads): 600 / 6 * 1 s = 100 s.
+    // - with aging_ms = 30 s, target wall = 100 s + 30 s = 130 s.
+    // - walls on 4, 5, 6 threads are 150 s, 120 s, 100 s -> fewest within 130 s is 5.
+    // - without aging_ms, no wall floor applies -> min = 1 (omitted on the request).
+    const workspace = await createWorkspace();
+    const bin = join(workspace.root, 'stand-in-stryker');
+    await mkdir(bin);
+    await writeFile(join(bin, 'stryker'), '#!/bin/sh\necho ran\n', { mode: 0o755 });
+    const directory = join(workspace.root, 'record');
+    await mkdir(directory);
+    const lines = Array.from({ length: 600 }, (_, i) => JSON.stringify({ id: `suite::t-${i}`, durationMs: 1_000 }));
+    await writeFile(join(directory, TEST_RESULTS_FILE), `${lines.join('\n')}\n`);
+    const endpoint = await standInReservations((heard) => heard.cpus);
+    const saved = {
+      PATH: process.env.PATH,
+      MBX_SCHEDULER: process.env.MBX_SCHEDULER,
+      MBX_CACHE_DIR: process.env.MBX_CACHE_DIR,
+      [RESERVATIONS_ENV]: process.env[RESERVATIONS_ENV],
+      BOUNDED_EXEC_MBX_AGING_MS: process.env.BOUNDED_EXEC_MBX_AGING_MS,
+    };
+    process.env.PATH = `${bin}:${saved.PATH ?? ''}`;
+    process.env.MBX_SCHEDULER = '1';
+    process.env.MBX_CACHE_DIR = join(workspace.root, 'mbx-cache');
+    process.env[RESERVATIONS_ENV] = endpoint.socket;
+    if (agingMs !== null) process.env.BOUNDED_EXEC_MBX_AGING_MS = String(agingMs);
+    else delete process.env.BOUNDED_EXEC_MBX_AGING_MS;
+    try {
+      const result = await runBoundedExec(
+        { command: 'stryker run --concurrency=6', idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
+        { ...workspace.context, record: { task: { id: 'app:test', hash: null }, directory } },
+        createProcessTreeKiller(),
+        null,
+      );
+      await endpoint.released(1);
+      return {
+        result,
+        reserves: endpoint.reserves.map(({ cpus, priority, min }) => ({ cpus, priority, min })),
+      };
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await endpoint.close();
+    }
+  };
+
+  it('floors a whole-suite leaf minimum so its LPT wall stays within one aging bound of its full ask', async () => {
+    const { result, reserves } = await runWallFloorLeaf(30_000);
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain('cowshed: mbx reserve wait start cpus=6 min=5 priority=low\n');
+    expect(reserves).toEqual([{ cpus: 6, priority: 'low', min: 5 }]);
+  });
+
+  it('names no wall-floor minimum when the endpoint omits the aging bound', async () => {
+    const { result, reserves } = await runWallFloorLeaf(null);
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain('cowshed: mbx reserve wait start cpus=6 priority=low\n');
+    expect(reserves).toEqual([{ cpus: 6, priority: 'low', min: null }]);
+  });
+  //#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite
+
   //#region smoo/cowshed!n/a-case-starts-on-a-core
   /**
    * A prebuilt nextest leaf that asks for six cores and is granted one. Its stand-in runner prints its thread count

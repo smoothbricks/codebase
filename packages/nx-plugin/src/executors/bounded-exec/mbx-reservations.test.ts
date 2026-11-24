@@ -188,6 +188,47 @@ process.stdin.resume();
   });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
 
+  //#region smoo/cowshed!n/a-minimum-for-a-whole-suite
+  it("publishes the pool's aging bound from capabilities to the run's tasks", async () => {
+    const mbx = await standInMbx(
+      `exec '${process.execPath}' -e '
+const server = require("node:net").createServer((client) => client.on("data", () => client.write(JSON.stringify({ type: "capabilities", test_gate: true, aging_ms: 30000 }) + "\\n")));
+server.listen(process.argv.at(-1), () => console.log("listening"));
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+' "$2"`,
+    );
+    try {
+      await serveRunReservations({ id: 'run-aging-stated' }, mbx.env);
+      expect(mbx.env[TEST_GATE_SERVED_ENV]).toBe('1');
+      expect(mbx.env.BOUNDED_EXEC_MBX_AGING_MS).toBe('30000');
+      await closeRunReservations({ id: 'run-aging-stated' });
+    } finally {
+      await rm(mbx.root, { recursive: true, force: true });
+    }
+  });
+
+  it('clears any inherited aging bound when the endpoint omits aging_ms', async () => {
+    const mbx = await standInMbx(
+      `exec '${process.execPath}' -e '
+const server = require("node:net").createServer((client) => client.on("data", () => client.write(JSON.stringify({ type: "capabilities", test_gate: true }) + "\\n")));
+server.listen(process.argv.at(-1), () => console.log("listening"));
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+' "$2"`,
+    );
+    try {
+      mbx.env.BOUNDED_EXEC_MBX_AGING_MS = '30000';
+      await serveRunReservations({ id: 'run-aging-omitted' }, mbx.env);
+      expect(mbx.env[TEST_GATE_SERVED_ENV]).toBe('1');
+      expect(mbx.env).not.toHaveProperty('BOUNDED_EXEC_MBX_AGING_MS');
+      await closeRunReservations({ id: 'run-aging-omitted' });
+    } finally {
+      await rm(mbx.root, { recursive: true, force: true });
+    }
+  });
+  //#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite
+
   it('says why an endpoint did not start, and publishes none', async () => {
     const mbx = await standInMbx("echo 'mbx: reservations need scheduler.enabled' >&2\nexit 1");
     const warn = jest.spyOn(logger, 'warn').mockImplementation(() => {});

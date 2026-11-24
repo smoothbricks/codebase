@@ -312,6 +312,48 @@ describe("the life of a run's reservation endpoint", () => {
   });
   //#endregion smoo/cowshed!n/a-case-starts-on-a-core
 
+  //#region smoo/cowshed!n/a-minimum-for-a-whole-suite
+  it('serves the pool aging bound from a capabilities answer and keeps gates as today', () => {
+    const withAging = live([
+      stdout('listening\n'),
+      probe('{"type":"capabilities","test_gate":true,"aging_ms":30000}\n'),
+    ]);
+    expect(effectsOf(withAging).find((effect) => effect.do === 'serve')).toEqual({
+      do: 'serve',
+      capabilities: { gates: true, agingMs: 30_000 },
+    });
+
+    const zeroAgingNoGate = live([
+      stdout('listening\n'),
+      probe('{"type":"capabilities","test_gate":false,"aging_ms":0}\n'),
+    ]);
+    expect(effectsOf(zeroAgingNoGate).find((effect) => effect.do === 'serve')).toEqual({
+      do: 'serve',
+      capabilities: { gates: false, agingMs: 0 },
+    });
+  });
+
+  it('serves a null aging bound when capabilities omit aging_ms or state an invalid one', () => {
+    const omitted = live([stdout('listening\n'), probe(GATES)]);
+    expect(effectsOf(omitted).find((effect) => effect.do === 'serve')).toEqual({
+      do: 'serve',
+      capabilities: { gates: true, agingMs: null },
+    });
+
+    for (const invalid of [
+      '{"type":"capabilities","test_gate":true,"aging_ms":-1}\n',
+      '{"type":"capabilities","test_gate":true,"aging_ms":"30000"}\n',
+      '{"type":"capabilities","test_gate":true,"aging_ms":1.5}\n',
+    ]) {
+      const steps = live([stdout('listening\n'), probe(invalid)]);
+      expect(effectsOf(steps).find((effect) => effect.do === 'serve')).toEqual({
+        do: 'serve',
+        capabilities: { gates: false, agingMs: null },
+      });
+    }
+  });
+  //#endregion smoo/cowshed!n/a-minimum-for-a-whole-suite
+
   it("answers its start once, and its run's end once and only after it served", () => {
     everyOrder((steps) => {
       expect(count(steps, 'serve') + count(steps, 'refuse')).toBeLessThanOrEqual(1);
