@@ -5471,6 +5471,7 @@ mod tests {
         );
 
         for id in layout.list().unwrap() {
+            holds_gone(&layout, &id);
             let release = host.release_build_volume(&layout, &id).unwrap();
             assert!(
                 matches!(release, BuildVolumeRelease::Deleted { .. }),
@@ -5679,6 +5680,7 @@ mod tests {
 
         fn release_all(&self) {
             for id in self.layout.list().unwrap() {
+                holds_gone(&self.layout, &id);
                 let release = self.host.release_build_volume(&self.layout, &id).unwrap();
                 assert!(
                     matches!(release, BuildVolumeRelease::Deleted { .. }),
@@ -5686,6 +5688,53 @@ mod tests {
                 );
             }
         }
+
+        /// A child that keeps a copy of a shared hold on volume `id` for `held` and then exits,
+        /// as the copy another thread's spawn makes of a hold's descriptor keeps the hold past this
+        /// process's close (cowshed-os `fork_lock`). This process's own copy is closed on return.
+        fn hold_copy(&self, id: &BuildVolumeId, held: Duration) -> HoldCopy {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .open(self.layout.hold_path(id))
+                .unwrap();
+            cowshed_os::test_backstop::FileBackstop::lock_shared_bounded(&file).unwrap();
+            let micros = libc::useconds_t::try_from(held.as_micros()).unwrap();
+            // SAFETY: the child calls only async-signal-safe functions before it exits.
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                // SAFETY: async-signal-safe; the child keeps its inherited copy until it exits.
+                unsafe {
+                    libc::usleep(micros);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork a child keeping the hold's copy");
+            drop(file);
+            HoldCopy(pid)
+        }
+    }
+
+    /// The child [`Scratch::hold_copy`] forked, reaped when dropped.
+    struct HoldCopy(libc::pid_t);
+
+    impl Drop for HoldCopy {
+        fn drop(&mut self) {
+            // A child this test forked, which exits on its own once its copy has kept the hold.
+            cowshed_os::test_backstop::waitpid(self.0, 0).unwrap();
+        }
+    }
+
+    /// Every hold on volume `id` is gone, as a waiter's grant within the test backstop proves
+    /// it: a probe right after a hold dropped can still find a transient kernel copy of the hold's
+    /// descriptor from another thread's spawn, which no census names (16_build_volumes.md, "A job's
+    /// end"). A test releases a volume only after this.
+    fn holds_gone(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
+        assert!(
+            layout
+                .holds_gone_within(id, cowshed_os::test_backstop::BACKSTOP)
+                .unwrap(),
+            "a hold on {id} outlived the test backstop"
+        );
     }
 
     /// Before an exec pays for build-state discovery, the volume its job must hold is probed:
@@ -7128,7 +7177,7 @@ fn main() {
 
         let scratch = Scratch::directory("seed-late-daemon");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
-        let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let (topic_checkout, topic_volume, mount) = scratch.linked_checkout("topic", 1);
         let state = BuildVolumeState {
             paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
             fingerprint: None,
@@ -7186,7 +7235,11 @@ fn main() {
         drop(listener);
         drop(quiet);
         drop(locked);
+        // A transient kernel copy of a hold's descriptor, as another thread's spawn makes one
+        // (16_build_volumes.md, "A job's end"): it keeps the hold for a moment past its close.
+        let copy = scratch.hold_copy(&topic_volume, Duration::from_millis(200));
         scratch.release_all();
+        drop(copy);
         assert_eq!(
             stopped.and_then(|status| status.signal()),
             Some(libc::SIGTERM),
@@ -9740,6 +9793,7 @@ fn main() {
         );
 
         // The incident's end state: main's link names a volume that is gone.
+        holds_gone(&scratch.layout, &topic);
         let released = scratch
             .host
             .release_build_volume(&scratch.layout, &topic)
@@ -10097,6 +10151,7 @@ fn main() {
         ));
         drop(job);
         for id in [&seed, &superseded, &live] {
+            holds_gone(&scratch.layout, id);
             let release = scratch.host.release_build_volume(&scratch.layout, id);
             assert!(
                 matches!(release, Ok(BuildVolumeRelease::Deleted { .. })),

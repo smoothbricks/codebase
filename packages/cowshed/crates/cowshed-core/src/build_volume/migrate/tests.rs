@@ -533,6 +533,12 @@ fn directory_first_touch_resumes_the_early_pointer_and_publishes_record_last() {
         fs::read_to_string(checkout.join("source.rs")).unwrap(),
         "source stays"
     );
+    // Only a waiter's grant proves the migration's holds gone (16_build_volumes.md, "A job's end").
+    assert!(
+        layout
+            .holds_gone_within(&id, cowshed_os::test_backstop::BACKSTOP)
+            .unwrap()
+    );
     let release = host.release_build_volume(&layout, &id).unwrap();
     assert!(
         matches!(

@@ -2369,7 +2369,9 @@ mod tests {
         fs::write(layout.image(&claimed), b"registered bytes").unwrap();
         assert!(layout.register_claimed(&claim, &registration).is_err());
         drop(claim);
-        assert!(layout.claim_release(&claimed).unwrap().is_some());
+        // Released, the claim is granted again: to a waiter, since a probe right after the close can
+        // still find a transient copy of its descriptor (16_build_volumes.md, "A job's end").
+        layout.claim_release_granted(&claimed).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
