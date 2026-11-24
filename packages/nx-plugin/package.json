@@ -554,7 +554,7 @@
         "inputs": [
           "{projectRoot}/src/executors/bounded-exec/__tests__/go-link-barrier-toolexec.cjs",
           {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh go version"
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh sh -c 'go version && go env CGO_ENABLED GOFLAGS GOARM64 GOAMD64'"
           },
           {
             "externalDependencies": []
