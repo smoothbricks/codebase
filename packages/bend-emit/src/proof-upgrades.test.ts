@@ -18,6 +18,17 @@ function sh(cmd: string, args: string[], cwd: string) {
   return { code: r.status ?? -1, out: r.stdout ?? '', err: r.error?.message ?? r.stderr ?? '' };
 }
 
+/** What rustc said about the source it compiled: an empty stderr says nothing. */
+function rustcDiagnostics(stderr: string): string[] {
+  return stderr === '' ? [] : [stderr];
+}
+
+/** Compiles with rustc; the claim is its exit status and its diagnostics of the compiled source. */
+function rustc(args: string[], cwd: string) {
+  const r = sh('rustc', args, cwd);
+  return { code: r.code, diagnostics: rustcDiagnostics(r.err) };
+}
+
 test('BLAKE3 matches official test vectors including multi-chunk input', () => {
   // Official BLAKE3 vectors: empty, "abc", 2048-byte (2 chunks) and 3500-byte (4 chunks) sequential bytes (i % 251)
   expect(blake3Hex('')).toBe('af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262');
@@ -75,8 +86,7 @@ fn main() {
 }
 `,
     );
-    const compile = sh('rustc', ['--edition', '2021', 'main.rs', '-o', 'main_bin'], dir);
-    expect({ code: compile.code, err: compile.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'main.rs', '-o', 'main_bin'], dir)).toEqual({ code: 0, diagnostics: [] });
     const exec = sh('./main_bin', [], dir);
     expect({ code: exec.code, err: exec.err }).toEqual({ code: 0, err: '' });
   });
@@ -107,8 +117,7 @@ test('D2: IsTrue(p) hypotheses and claims emit and pass across Rust, Go, TS, inc
     writeFileSync(join(dir, 'seek.go'), em.go);
     writeFileSync(join(dir, 'seek.ts'), em.typescript);
 
-    const rsBuild = sh('rustc', ['--edition', '2021', 'seek.rs', '-o', 'seek_rs'], dir);
-    expect({ code: rsBuild.code, err: rsBuild.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'seek.rs', '-o', 'seek_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     const goBuild = sh('go', ['build', '-o', 'seek_go', 'seek.go'], dir);
     expect({ code: goBuild.code, err: goBuild.err }).toEqual({ code: 0, err: '' });
 
@@ -324,8 +333,7 @@ law ctz_shl_nonzero:
     writeFileSync(join(dir, 'arith_bits.go'), em.go);
     writeFileSync(join(dir, 'arith_bits.ts'), em.typescript);
 
-    const rsBuild = sh('rustc', ['--edition', '2021', 'arith_bits.rs', '-o', 'arith_rs'], dir);
-    expect({ code: rsBuild.code, err: rsBuild.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'arith_bits.rs', '-o', 'arith_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     const goBuild = sh('go', ['build', '-o', 'arith_go', 'arith_bits.go'], dir);
     expect({ code: goBuild.code, err: goBuild.err }).toEqual({ code: 0, err: '' });
 
@@ -495,8 +503,7 @@ law result_done_returns_value:
     writeFileSync(join(dir, 'generic_adt.go'), em.go);
     writeFileSync(join(dir, 'generic_adt.ts'), em.typescript);
 
-    const rsBuild = sh('rustc', ['--edition', '2021', 'generic_adt.rs', '-o', 'gen_rs'], dir);
-    expect({ code: rsBuild.code, err: rsBuild.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'generic_adt.rs', '-o', 'gen_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     const goBuild = sh('go', ['build', '-o', 'gen_go', 'generic_adt.go'], dir);
     expect({ code: goBuild.code, err: goBuild.err }).toEqual({ code: 0, err: '' });
 
@@ -632,8 +639,7 @@ fn main() {
 }
 `,
     );
-    const rsBuild = sh('rustc', ['--edition', '2021', 'tco_main.rs', '-o', 'tco_rs'], dir);
-    expect({ code: rsBuild.code, err: rsBuild.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'tco_main.rs', '-o', 'tco_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     expect(sh('./tco_rs', [], dir).code).toBe(0);
 
     writeFileSync(join(dir, 'model.ts'), tsMod.source);
@@ -687,11 +693,7 @@ test('Conformance fixture (conformance.bend) agrees across Rust, Go, TS and pass
     writeFileSync(join(dir, 'conformance.go'), em.go);
     writeFileSync(join(dir, 'conformance.ts'), em.typescript);
 
-    expect(sh('rustc', ['--edition', '2021', 'conformance.rs', '-o', 'conf_rs'], dir)).toEqual({
-      code: 0,
-      out: '',
-      err: '',
-    });
+    expect(rustc(['--edition', '2021', 'conformance.rs', '-o', 'conf_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     expect(sh('go', ['build', '-o', 'conf_go', 'conformance.go'], dir)).toEqual({ code: 0, out: '', err: '' });
 
     const rsRun = sh('./conf_rs', [], dir);
@@ -792,8 +794,7 @@ law anc_depth_nonneg:
     writeFileSync(join(dir, 'rec_tree.go'), em.go);
     writeFileSync(join(dir, 'rec_tree.ts'), em.typescript);
 
-    const rsBuild = sh('rustc', ['--edition', '2021', 'rec_tree.rs', '-o', 'rec_rs'], dir);
-    expect({ code: rsBuild.code, err: rsBuild.err }).toEqual({ code: 0, err: '' });
+    expect(rustc(['--edition', '2021', 'rec_tree.rs', '-o', 'rec_rs'], dir)).toEqual({ code: 0, diagnostics: [] });
     const goBuild = sh('go', ['build', '-o', 'rec_go', 'rec_tree.go'], dir);
     expect({ code: goBuild.code, err: goBuild.err }).toEqual({ code: 0, err: '' });
 
@@ -871,4 +872,17 @@ law climb_none:
     writeFileSync(file, em.source);
     expect(typeErrors(file)).toEqual([]);
   });
+});
+
+// rustc warns when xcrun writes to stderr while it finds the SDK. In the sandbox the first cold xcrun call prints
+// `DVTDeveloperPaths: Failed to get length of DARWIN_USER_CACHE_DIR`, which rustc reports as a warning with no source
+// span: it says nothing about the emitted Rust. Both fixtures are rustc's --error-format=json stderr as captured.
+test('a toolchain warning without a source span is no diagnostic of the compiled Rust', () => {
+  const stderr = readFileSync(join(import.meta.dir, '../test/testdata/rustc-xcrun-cold-cache.jsonl'), 'utf8');
+  expect(rustcDiagnostics(stderr)).toEqual([]);
+});
+
+test('a warning that points into the compiled Rust is a diagnostic', () => {
+  const stderr = readFileSync(join(import.meta.dir, '../test/testdata/rustc-unused-variable.jsonl'), 'utf8');
+  expect(rustcDiagnostics(stderr)).toEqual([expect.stringContaining('unused variable: `x`')]);
 });
